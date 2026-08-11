@@ -1229,7 +1229,11 @@ pub fn build(b: *std.Build) void {
     // target keeps user-supplied -Dtarget overrides intact while making the
     // no-argument path use Zig's bundled libc startup objects.
     const default_target: std.Target.Query = if (builtin.os.tag == .linux)
-        .{ .cpu_arch = builtin.cpu.arch, .os_tag = .linux, .abi = .gnu }
+        .{
+            .cpu_arch = builtin.cpu.arch,
+            .os_tag = .linux,
+            .abi = .gnu,
+        }
     else
         .{};
     const target = b.standardTargetOptions(.{ .default_target = default_target });
@@ -1245,7 +1249,6 @@ pub fn build(b: *std.Build) void {
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
-    const include_ha_tests_in_aggregates = b.option(bool, "ha-tests", "Include hot-standby HA suites in aggregate test steps") orelse true;
     const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused runtime artifact: cli, data, inference, metadata, or standalone");
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
@@ -1978,6 +1981,15 @@ pub fn build(b: *std.Build) void {
     usermgr_storage_test_mod.addImport("antfly_platform", platform_mod);
     lib_test_mod.addImport("usermgr_storage", usermgr_storage_test_mod);
 
+    const usermgr_storage_data_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    usermgr_storage_data_runtime_test_mod.addImport("antfly_root", data_runtime_test_mod);
+    usermgr_storage_data_runtime_test_mod.addImport("antfly_platform", platform_mod);
+    data_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_data_runtime_test_mod);
+
     const embedded_deps = .{
         build_options,
         lmdb_engine_mod,
@@ -2618,6 +2630,22 @@ pub fn build(b: *std.Build) void {
     const run_httpx_tests = b.addRunArtifact(httpx_tests);
     const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");
     lib_httpx_test_step.dependOn(&run_httpx_tests.step);
+
+    const common_http_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/common_http_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    common_http_test_mod.addImport("raft_engine", raft_engine_mod);
+    common_http_test_mod.addImport("antfly_platform", platform_mod);
+    common_http_test_mod.addImport("httpx", httpx_mod);
+    const common_http_tests = b.addTest(.{
+        .root_module = common_http_test_mod,
+    });
+    common_http_tests.root_module.link_libc = true;
+    const run_common_http_tests = b.addRunArtifact(common_http_tests);
+    const common_http_test_step = b.step("common-http-test", "Run common HTTP listener and client tests");
+    common_http_test_step.dependOn(&run_common_http_tests.step);
 
     const httpx_transport_regression_tests = b.addTest(.{
         .root_module = httpx_mod,
@@ -3913,12 +3941,17 @@ pub fn build(b: *std.Build) void {
         "data server fail-closed sync policy rejects primary writes before local commit",
         "data server block sync policy waits for standby acknowledgement before commit returns",
         "data server propagates standby HA write gate into provisioned write sources",
+        "storage.ha data runtime default seed snapshot derives standalone groups from metadata only",
+        "storage.ha data runtime rejects concurrent seed capture before waiting on mutation barrier",
         "storage.ha data server rejects writes and owner jobs after primary promotion fence",
         "data server applies routed HA replication records through standby write gate",
         "data server pulls and applies HA standby replication through internal HTTP client",
+        "data server HA state change synchronously adopts promotion and rewires live HTTP executor",
+        "data server promotion open failure preserves retryable standby",
         "data server resumes HA standby replication from durable progress after restart",
+        "data runtime records and backs off HA standby replication round failures",
+        "data runtime HA replication HTTP budget covers base64 apply envelope",
         "data server keeps upstream replication availability failures nonfatal",
-        "data runtime records HA standby replication round failures",
         "data runtime records HA standby apply failures without stopping run round",
     };
     const lib_data_runtime_tests = b.addTest(.{
@@ -4682,6 +4715,9 @@ pub fn build(b: *std.Build) void {
 
     const lib_api_auth_default_filters = [_][]const u8{
         "api http server requires auth on public routes when enabled",
+        "continuous HA rejects non-replicated public mutations before handlers",
+        "continuous HA freezes pre-existing restore workers and resumption",
+        "continuous HA allows a configured RemoteApply batch write",
         "api http server document scan requires table read permission",
         "api http server returns retryable not leader when local reconcile lease is lost",
         "api http server returns retryable not leader when metadata proposal is dropped",
@@ -4690,7 +4726,7 @@ pub fn build(b: *std.Build) void {
         "api http server cluster backup succeeds after load balanced metadata timeout retry",
         "api http server does not advertise a retry after cluster backup side effects begin",
         "api http server dispatches HA admin and internal executors",
-        "api http server protects HA admin routes while exempting HA internal routes",
+        "api http server requires exact HA bearer token for internal replication routes",
         "api http server forbids non-admin secret access when auth is enabled",
         "api http server query builder requires table read permission when auth is enabled",
         "api http server restricts runtime schema debug to admins when auth is enabled",
@@ -5204,6 +5240,7 @@ pub fn build(b: *std.Build) void {
             "provisioned stateless batch retries definite aborts to the production bound",
             "bound table write source backs up and restores a local table",
             "bound table write source backs up and restores a portable local table",
+            "provisioned table write source backs up and restores a local table",
             "provisioned table write source backs up a portable local table",
             "provisioned table write source backs up and restores a local table",
             "provisioned native backup restore repeats through shared read and write owners",
@@ -5212,6 +5249,8 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source path invalidation clears shared vector read cache",
             "provisioned table restore retry repairs exact incomplete restore state through active writer",
             "provisioned restore repair source deinit cancels sleeping retry worker",
+            "provisioned restore repair worker retries transient step failures to completion",
+            "provisioned table write source restore repair completion retires cached vector read state",
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache blocks same-root generation replacement while stale lease stays live",
             "provisioned transition writer fences exact supplied table metadata",
@@ -5309,6 +5348,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "public table batch handler maps doc identity unavailable errors",
             "public table batch handler maps write unavailable errors",
+            "public table batch handler exposes pending HA durability without claiming rollback",
             "public table batch handler preserves ambiguous write outcomes",
             "public table batch handler maps HA write gate errors",
             "public table batch handler returns concise dense repair backpressure",
@@ -5465,6 +5505,7 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
             "managed startup catch-up allocation failure preserves bounded retry",
+            "standby HA replay reconciles managed indexes without opening the public write gate",
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
             "managed db open modes never drain resolver backfill on raft apply",
             "replica root reconcile enqueues newly admitted managed full text repair",
@@ -5751,6 +5792,23 @@ pub fn build(b: *std.Build) void {
     const ha_test_step = b.step("ha-test", "Run hot-standby HA storage tests");
     ha_test_step.dependOn(&run_ha_tests.step);
 
+    // cmd/ha.zig is imported by the top-level CLI, but Zig does not discover
+    // tests recursively through imports. Keep the offline artifact parser and
+    // dispatch contracts in the HA gate explicitly so lifecycle commands cannot
+    // ship uncompiled without making the HA gate execute unrelated CLI flows.
+    const ha_cli_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/cmd/ha.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ha_cli_test_mod.addImport("antfly-zig", lib_mod);
+    const ha_cli_tests = b.addTest(.{
+        .root_module = ha_cli_test_mod,
+        .filters = &.{"ha cmd artifact"},
+    });
+    const run_ha_cli_tests = b.addRunArtifact(ha_cli_tests);
+    ha_test_step.dependOn(&run_ha_cli_tests.step);
+
     const lsm_backend_runtime_filters = selectTestFilters(b, &.{"storage.lsm_backend."});
     const lsm_backend_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -5941,9 +5999,7 @@ pub fn build(b: *std.Build) void {
     var chaos_progress_tail: ?*std.Build.Step = null;
     chaos_progress_tail = chainLabeledRun(b, lib_metadata_vopr_chaos_tests, "lib-metadata-vopr-chaos-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_lsm_backend_chaos_tests, "lib-lsm-backend-chaos-test", chaos_progress_tail);
-    if (include_ha_tests_in_aggregates) {
-        chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
-    }
+    chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
     const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad legacy metadata and raft chaos simulation soaks");
@@ -6111,6 +6167,7 @@ pub fn build(b: *std.Build) void {
             "standalone bridge shared adapter preserves protocol headers and absent body",
             "standalone protocol bridge releases converted request headers",
             "standalone runtime antfarm path guards keep api routes reserved",
+            "standalone startup checkpoint readiness requires applied and safe-read progress",
             "parse cli accepts config path",
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
@@ -6121,6 +6178,7 @@ pub fn build(b: *std.Build) void {
             "standalone HA standby replication flags require upstream and slot",
             "standalone HA string classifier distinguishes missing padded and valid values",
             "standalone HA runtime rejects ambiguous role flags",
+            "standalone HA roles freeze startup-local mutation producers",
             "antfly config uses cli override before common config",
             "standalone public api caps keep alive request reuse",
             "standalone public api body limit matches common http listener",
@@ -6144,6 +6202,13 @@ pub fn build(b: *std.Build) void {
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",
             "standalone metadata finalizes schema migration from resident runtime evidence",
             "standalone unified server lifecycle propagates startup failure",
+            "runtime lease watchdog fetch and validation failures publish no bootstrap capability",
+            "runtime lease watchdog retains a bounded Kubernetes response budget",
+            "runtime lease watchdog prefers a DNS-verified Kubernetes API host and retains the injected port",
+            "Lease executor rejects unscoped request shapes",
+            "Lease executor accepts optional CertificateRequest with projected CA and verified hostname",
+            "Lease executor accepts TLS 1.2 optional CertificateRequest",
+            "Lease executor rejects optional CertificateRequest hostname mismatch",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -6215,9 +6280,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_standalone_runtime_test_step);
-    if (include_ha_tests_in_aggregates) {
-        unit_test_step.dependOn(ha_test_step);
-    }
+    unit_test_step.dependOn(ha_test_step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_runtime_tests.step);
     unit_test_step.dependOn(&run_raft_restore_tests.step);
@@ -6250,9 +6313,7 @@ pub fn build(b: *std.Build) void {
 
     var unit_progress_tail: ?*std.Build.Step = null;
     unit_progress_tail = chainLabeledRunStep(b, run_unit_progress_root_tests, "lib-root-test", unit_progress_tail);
-    if (include_ha_tests_in_aggregates) {
-        unit_progress_tail = chainLabeledRun(b, ha_tests, "ha-test", unit_progress_tail);
-    }
+    unit_progress_tail = chainLabeledRun(b, ha_tests, "ha-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, lib_template_tests, "lib-template-test", unit_progress_tail);
     unit_test_progress_step.dependOn(unit_progress_tail.?);
 
@@ -6930,9 +6991,6 @@ pub fn build(b: *std.Build) void {
         unit_storage_shard_names,
         unit_storage_shard_max_rss,
     ) |shard_filters, shard_name, shard_max_rss| {
-        if (!include_ha_tests_in_aggregates and std.mem.eql(u8, shard_name, "storage-ha-tests")) {
-            continue;
-        }
         const unit_storage_tests = b.addTest(.{
             .name = shard_name,
             .root_module = lib_test_mod,
@@ -7110,6 +7168,7 @@ pub fn build(b: *std.Build) void {
         &run_lib_onnx_tests.step,
         &run_httpx_json_tests.step,
         &run_httpx_tests.step,
+        &run_common_http_tests.step,
         &run_api_json_helpers_tests.step,
         &run_antfly_client_pkg_tests.step,
         &run_lib_unit_tests.step,
@@ -7781,9 +7840,7 @@ pub fn build(b: *std.Build) void {
     run_compat.addArg("compat/cases");
     const compat_step = b.step("compat", "Run the shared compatibility corpus");
     compat_step.dependOn(&run_compat.step);
-    if (include_ha_tests_in_aggregates) {
-        compat_step.dependOn(&run_lib_ha_compat_tests.step);
-    }
+    compat_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const search_benchmark_index_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_index.zig"),

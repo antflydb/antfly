@@ -59,6 +59,7 @@ pub const StorageUserStore = struct {
         .load_api_keys = loadApiKeys,
         .save_api_key = saveApiKey,
         .delete_api_key = deleteApiKey,
+        .export_portable_seed = exportPortableSeed,
     };
 
     pub fn init(alloc: Allocator, store: backend_erased.NamespaceStore) StorageUserStore {
@@ -203,7 +204,132 @@ pub const StorageUserStore = struct {
         txn.abort();
         return false;
     }
+
+    fn exportPortableSeed(ptr: *anyopaque, alloc: Allocator, generation: []const u8) ![]u8 {
+        const self: *StorageUserStore = @ptrCast(@alignCast(ptr));
+        return try exportPortableSeedFromStore(alloc, &self.store, generation);
+    }
 };
+
+pub const portable_seed_format_version: u16 = 1;
+pub const PortableSeedEntry = struct {
+    namespace: []const u8,
+    key_base64: []const u8,
+    value_base64: []const u8,
+};
+pub const PortableSeed = struct {
+    format_version: u16 = portable_seed_format_version,
+    generation: []const u8,
+    entries: []const PortableSeedEntry,
+};
+
+const OwnedPortableSeedEntry = struct {
+    namespace: []u8,
+    key_base64: []u8,
+    value_base64: []u8,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.namespace);
+        alloc.free(self.key_base64);
+        alloc.free(self.value_base64);
+        self.* = undefined;
+    }
+};
+
+fn exportPortableSeedFromStore(alloc: Allocator, store: *backend_erased.NamespaceStore, generation: []const u8) ![]u8 {
+    if (generation.len == 0) return error.InvalidPortableAuthSeedGeneration;
+    var entries = std.ArrayList(OwnedPortableSeedEntry).empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit(alloc);
+    }
+    const namespaces = [_]struct { name: []const u8, namespace: backend_types.Namespace }{
+        .{ .name = users_namespace.name.?, .namespace = users_namespace },
+        .{ .name = casbin_namespace.name.?, .namespace = casbin_namespace },
+    };
+    for (namespaces) |item| {
+        var txn = try store.beginRead();
+        defer txn.abort();
+        var cursor = try txn.openCursor(item.namespace);
+        defer cursor.close();
+        var next = try cursor.first();
+        while (next) |entry| : (next = try cursor.next()) {
+            try entries.append(alloc, .{
+                .namespace = try alloc.dupe(u8, item.name),
+                .key_base64 = try encodeBase64(alloc, entry.key),
+                .value_base64 = try encodeBase64(alloc, entry.value),
+            });
+        }
+    }
+    std.mem.sort(OwnedPortableSeedEntry, entries.items, {}, struct {
+        fn lessThan(_: void, left: OwnedPortableSeedEntry, right: OwnedPortableSeedEntry) bool {
+            const ns = std.mem.order(u8, left.namespace, right.namespace);
+            if (ns != .eq) return ns == .lt;
+            return std.mem.order(u8, left.key_base64, right.key_base64) == .lt;
+        }
+    }.lessThan);
+    return try std.json.Stringify.valueAlloc(alloc, PortableSeed{
+        .generation = generation,
+        .entries = @ptrCast(entries.items),
+    }, .{});
+}
+
+pub fn materializePortableSeedToPath(
+    alloc: Allocator,
+    target_root: []const u8,
+    expected_generation: []const u8,
+    artifact_json: []const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(PortableSeed, alloc, artifact_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return error.InvalidPortableAuthSeed;
+    defer parsed.deinit();
+    if (parsed.value.format_version != portable_seed_format_version or
+        !std.mem.eql(u8, parsed.value.generation, expected_generation))
+        return error.InvalidPortableAuthSeed;
+
+    var backend = try lsm_backend.BackendHandle.open(alloc, target_root, .{ .flush_threshold = 1 });
+    defer backend.close();
+    var store = try backend.backend.runtimeNamespaceStore(alloc);
+    defer store.deinit();
+    var batch = try store.beginBatch();
+    errdefer batch.abort();
+    var previous_namespace: []const u8 = "";
+    var previous_key: []const u8 = "";
+    for (parsed.value.entries) |entry| {
+        const namespace = if (std.mem.eql(u8, entry.namespace, users_namespace.name.?))
+            users_namespace
+        else if (std.mem.eql(u8, entry.namespace, casbin_namespace.name.?))
+            casbin_namespace
+        else
+            return error.InvalidPortableAuthSeed;
+        const order = std.mem.order(u8, previous_namespace, entry.namespace);
+        if (previous_namespace.len > 0 and (order == .gt or
+            (order == .eq and std.mem.order(u8, previous_key, entry.key_base64) != .lt)))
+            return error.NonCanonicalPortableAuthSeed;
+        const key = decodeBase64Owned(alloc, entry.key_base64) catch return error.InvalidPortableAuthSeed;
+        defer alloc.free(key);
+        const value = decodeBase64Owned(alloc, entry.value_base64) catch return error.InvalidPortableAuthSeed;
+        defer alloc.free(value);
+        if (key.len == 0 or !validPortableSeedKey(namespace, key)) return error.InvalidPortableAuthSeed;
+        try batch.put(namespace, key, value);
+        previous_namespace = entry.namespace;
+        previous_key = entry.key_base64;
+    }
+    try batch.commit();
+}
+
+fn validPortableSeedKey(namespace: backend_types.Namespace, key: []const u8) bool {
+    if (std.mem.eql(u8, namespace.name.?, users_namespace.name.?)) {
+        return std.mem.startsWith(u8, key, "userpass:") or
+            std.mem.startsWith(u8, key, "usermeta:") or
+            std.mem.startsWith(u8, key, "apikey:");
+    }
+    return std.mem.startsWith(u8, key, "p::") or
+        std.mem.startsWith(u8, key, "p2::") or
+        std.mem.startsWith(u8, key, "g::");
+}
 
 pub const StorageCasbinAdapter = struct {
     alloc: Allocator,
@@ -526,4 +652,91 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
     try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", validated.metadata_json);
     try std.testing.expectEqual(@as(usize, 1), validated.permissions.len);
     try std.testing.expectEqual(@as(usize, 1), validated.row_filter.len);
+}
+
+test "portable auth seed preserves credentials policies roles filters and api keys" {
+    const alloc = std.testing.allocator;
+    var source_backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1 });
+    defer source_backend.close();
+    var source_runtime = try source_backend.runtimeNamespaceStore(alloc);
+    defer source_runtime.deinit();
+    var source_users = StorageUserStore.init(alloc, source_runtime);
+    var source_casbin = StorageCasbinAdapter.init(alloc, source_runtime);
+    var source = try user_manager.UserManager.init(
+        alloc,
+        source_users.iface(),
+        try user_manager.initDefaultEnforcer(alloc, source_casbin.iface()),
+    );
+    defer source.deinit();
+
+    var admin = try user_manager.Permission.initOwned(alloc, .@"*", "*", .admin);
+    defer admin.deinit(alloc);
+    var alice = try source.createUserWithMetadata("alice", "secret", &.{admin}, "{\"tenant_id\":\"acme\"}");
+    defer alice.deinit(alloc);
+    var reader = try user_manager.Permission.initOwned(alloc, .table, "docs", .read);
+    defer reader.deinit(alloc);
+    try source.addPermissionToSubject("role:tenant-reader", reader);
+    try source.addRoleToUser("alice", "role:tenant-reader");
+    try source.setSubjectRowFilter("role:tenant-reader", "docs", "{\"term\":{\"tenant_id\":{\"$auth\":\"metadata.tenant_id\"}}}");
+    var key_filter = try user_manager.RowFilterEntry.initOwned(alloc, "docs", "{\"term\":{\"tier\":\"gold\"}}");
+    defer key_filter.deinit(alloc);
+    var key = try source.createApiKey("alice", "ci", &.{reader}, &.{key_filter}, null);
+    defer key.deinit(alloc);
+
+    var lease = source.acquireSeedCaptureLease();
+    const artifact = try source.exportPortableSeedWithLease(alloc, "seed-auth-7", &lease);
+    lease.release();
+    defer alloc.free(artifact);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const target = try std.fs.path.join(alloc, &.{ root, "auth" });
+    defer alloc.free(target);
+    try materializePortableSeedToPath(alloc, target, "seed-auth-7", artifact);
+
+    var target_backend = try lsm_backend.BackendHandle.open(alloc, target, .{ .flush_threshold = 1 });
+    defer target_backend.close();
+    var target_runtime = try target_backend.backend.runtimeNamespaceStore(alloc);
+    defer target_runtime.deinit();
+    var target_users = StorageUserStore.init(alloc, target_runtime);
+    var target_casbin = StorageCasbinAdapter.init(alloc, target_runtime);
+    var restored = try user_manager.UserManager.init(
+        alloc,
+        target_users.iface(),
+        try user_manager.initDefaultEnforcer(alloc, target_casbin.iface()),
+    );
+    defer restored.deinit();
+
+    var authenticated = try restored.authenticateUser("alice", "secret");
+    defer authenticated.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", authenticated.metadata_json);
+    try std.testing.expect(try restored.enforce("alice", .table, "docs", .read));
+    const roles = try restored.getRolesForUser("alice");
+    defer {
+        for (roles) |role| alloc.free(role);
+        alloc.free(roles);
+    }
+    try std.testing.expectEqual(@as(usize, 1), roles.len);
+    try std.testing.expectEqualStrings("role:tenant-reader", roles[0]);
+    const filters = try restored.getRowFilters("alice");
+    defer {
+        for (filters) |*filter| filter.deinit(alloc);
+        alloc.free(filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), filters.len);
+    try std.testing.expectEqualStrings("docs", filters[0].table);
+    var validated = try restored.validateApiKey(key.key.key_id, key.key_secret);
+    defer validated.deinit(alloc);
+    try std.testing.expectEqualStrings("alice", validated.username);
+    try std.testing.expectEqual(@as(usize, 1), validated.permissions.len);
+    try std.testing.expectEqual(@as(usize, 1), validated.row_filter.len);
+
+    const wrong_target = try std.fs.path.join(alloc, &.{ root, "wrong-auth" });
+    defer alloc.free(wrong_target);
+    try std.testing.expectError(
+        error.InvalidPortableAuthSeed,
+        materializePortableSeedToPath(alloc, wrong_target, "seed-auth-8", artifact),
+    );
 }

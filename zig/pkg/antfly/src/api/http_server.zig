@@ -35,6 +35,7 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_authority = @import("../metadata/authority.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
+const extension_lifecycle = @import("../extensions/lifecycle.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -72,6 +73,7 @@ const table_reads = if (builtin.is_test) @import("table_reads.zig") else @import
 const table_router = @import("table_router.zig");
 const table_writes = if (builtin.is_test) @import("table_writes.zig") else @import("table_write_source.zig");
 const table_index_config = @import("table_index_config.zig");
+const ha_mutation_inventory = @import("../storage/ha/mutation_inventory.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
@@ -630,7 +632,19 @@ pub const ApiHttpServerConfig = struct {
     session_store_path: ?[]const u8 = null,
     session_store_scope: transactions_api.SessionStoreScope = .node_local,
     ha_admin_executor: ?http_common.RequestExecutor = null,
+    /// Dedicated HA administration credential. This is intentionally separate
+    /// from native user authentication and other internal admin surfaces.
+    ha_admin_bearer_token: ?[]const u8 = null,
     ha_internal_executor: ?http_common.RequestExecutor = null,
+    /// When continuous standalone HA is active, only mutations classified as
+    /// synchronously replicated may reach their handler. Non-replicated
+    /// security, catalog, restore, and workflow state fails closed before any
+    /// local side effect.
+    ha_failover_safe_mutations_only: bool = false,
+    /// True only when the owning runtime has configured fail-closed
+    /// synchronous RemoteApply. The route classifier alone cannot establish
+    /// the active durability policy.
+    ha_remote_apply_mutations_enabled: bool = false,
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
@@ -2393,6 +2407,10 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn runSessionMaintenanceOnce(self: *ApiHttpServer) !void {
+        // Durable transaction, repair, and reprocess job checkpoints are
+        // primary-local. Their mutating routes are rejected in continuous HA,
+        // and their cleanup/resume loop must remain frozen for the same reason.
+        if (!self.mutationBackgroundExecutionPermitted()) return;
         self.retryPendingTransactionRecovery(32) catch |err| {
             std.log.warn("failed to advance stable transaction recovery err={s}", .{@errorName(err)});
         };
@@ -2413,6 +2431,10 @@ pub const ApiHttpServer = struct {
                 std.log.warn("failed to reap table repair background jobs err={s}", .{@errorName(err)});
             };
         }
+    }
+
+    fn mutationBackgroundExecutionPermitted(self: *const ApiHttpServer) bool {
+        return !self.cfg.ha_failover_safe_mutations_only;
     }
 
     fn retryPendingTransactionRecovery(self: *ApiHttpServer, limit: usize) !void {
@@ -3466,6 +3488,10 @@ pub const ApiHttpServer = struct {
         if (std.mem.eql(u8, path, routes.Routes.ai_catalog) and self.cfg.ard_public_catalog_enabled) return false;
         if (std.mem.eql(u8, path, routes.Routes.agent_card) or std.mem.eql(u8, path, routes.Routes.agent_card_legacy)) return false;
         if (std.mem.startsWith(u8, path, routes.Routes.internal_groups_prefix)) return false;
+        // HA administration has a separate runtime-owned bearer credential.
+        // Do not interpret that token as a native user API key before the HA
+        // dispatcher can validate it.
+        if (isHaAdminPath(path)) return false;
         if (isHaInternalPath(path)) return false;
         return true;
     }
@@ -3652,6 +3678,20 @@ pub const ApiHttpServer = struct {
             }
         }
 
+        if (self.cfg.ha_failover_safe_mutations_only) {
+            if (ha_mutation_inventory.classify(req.method, uri_parts.path)) |mutation| {
+                if (mutation.disposition == .reject or
+                    (mutation.disposition == .remote_apply and !self.cfg.ha_remote_apply_mutations_enabled))
+                {
+                    return try jsonResponseWithStatus(self.alloc, 503, .{
+                        .@"error" = "mutation is not continuously replicated while HA is active",
+                        .code = "ha_mutation_not_replicated",
+                        .surface = @tagName(mutation.surface),
+                    });
+                }
+            }
+        }
+
         if (try self.dispatchStorageMaintenanceRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchHaRoutes(req, uri_parts)) |resp| return resp;
         try self.resumeRestoreJobsOnce();
@@ -3778,10 +3818,30 @@ pub const ApiHttpServer = struct {
 
     fn dispatchHaRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
         if (isHaAdminPath(uri_parts.path)) {
+            const expected = (self.cfg.ha_admin_bearer_token orelse self.cfg.admin_bearer_token) orelse
+                return try textResponse(self.alloc, 403, "HA admin API disabled without authentication");
+            if (expected.len == 0)
+                return try textResponse(self.alloc, 403, "HA admin API disabled without authentication");
+            const authorization = req.authorization orelse return try unauthorizedResponse(self.alloc);
+            if (!std.mem.startsWith(u8, authorization, "Bearer ") or
+                !constantTimeEql(expected, authorization["Bearer ".len..]))
+            {
+                return try unauthorizedResponse(self.alloc);
+            }
             const ha_exec = self.cfg.ha_admin_executor orelse return null;
             return try ha_exec.execute(self.alloc, req);
         }
         if (isHaInternalPath(uri_parts.path)) {
+            const expected = self.cfg.admin_bearer_token orelse
+                return try textResponse(self.alloc, 403, "HA internal API disabled without authentication");
+            if (expected.len == 0)
+                return try textResponse(self.alloc, 403, "HA internal API disabled without authentication");
+            const authorization = req.authorization orelse return try unauthorizedResponse(self.alloc);
+            if (!std.mem.startsWith(u8, authorization, "Bearer ") or
+                !constantTimeEql(expected, authorization["Bearer ".len..]))
+            {
+                return try unauthorizedResponse(self.alloc);
+            }
             const ha_exec = self.cfg.ha_internal_executor orelse return null;
             return try ha_exec.execute(self.alloc, req);
         }
@@ -9056,6 +9116,11 @@ pub const ApiHttpServer = struct {
             => return error.Backpressured,
             error.DenseRepairBackpressure => return error.DenseRepairBackpressure,
             error.LeaderUnavailable => return error.WriteUnavailable,
+            error.HASyncCommitWouldBlock,
+            error.HASyncCommitWaitLimitExceeded,
+            error.HASyncCommitWaitMissingContext,
+            error.HASyncCommitWaitStandbyNotInPolicy,
+            => return error.HAWriteDurabilityPending,
             error.RaftBatchWriteOutcomeUnknown => return error.WriteOutcomeUnknown,
             // The public batch path is atomic: multi-group writes use 2PC and
             // the single-group fast path is one Raft command. Preserve the
@@ -11288,6 +11353,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn restoreExecutionPermitted(self: *ApiHttpServer) bool {
+        if (self.cfg.ha_failover_safe_mutations_only) return false;
         if (self.restore_dispatch_paused.load(.acquire)) return false;
         const guard = self.cfg.restore_execution_guard orelse return true;
         const term = self.restore_leadership_term.load(.acquire);
@@ -12472,6 +12538,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn resumeRestoreJobsOnce(self: *ApiHttpServer) !void {
+        if (self.cfg.ha_failover_safe_mutations_only) return;
         if (self.restore_jobs_resumed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         self.schedulePendingRestoreJobs() catch |err| {
             self.restore_jobs_resumed.store(false, .release);
@@ -14073,7 +14140,7 @@ fn installExtensionOnService(
     extension_name: []const u8,
     request: extension_domain.InstallExtensionRequest,
 ) !extension_domain.InstalledExtension {
-    return try extension_domain.lifecycle.installOnService(service, alloc, extension_name, request);
+    return try extension_lifecycle.installOnService(service, alloc, extension_name, request);
 }
 
 fn updateExtensionOnService(
@@ -14082,7 +14149,7 @@ fn updateExtensionOnService(
     extension_name: []const u8,
     request: extension_domain.UpdateExtensionRequest,
 ) !extension_domain.InstalledExtension {
-    return try extension_domain.lifecycle.updateOnService(service, alloc, extension_name, request);
+    return try extension_lifecycle.updateOnService(service, alloc, extension_name, request);
 }
 
 fn dropExtensionOnService(
@@ -14091,15 +14158,15 @@ fn dropExtensionOnService(
     extension_name: []const u8,
     request: extension_domain.DropExtensionRequest,
 ) !void {
-    return try extension_domain.lifecycle.dropOnService(service, alloc, extension_name, request);
+    return try extension_lifecycle.dropOnService(service, alloc, extension_name, request);
 }
 
 fn enableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !extension_domain.InstalledExtension {
-    return try extension_domain.lifecycle.enableOnService(service, alloc, extension_name);
+    return try extension_lifecycle.enableOnService(service, alloc, extension_name);
 }
 
 fn disableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !extension_domain.InstalledExtension {
-    return try extension_domain.lifecycle.disableOnService(service, alloc, extension_name);
+    return try extension_lifecycle.disableOnService(service, alloc, extension_name);
 }
 
 fn configureExtensionOnService(
@@ -14108,7 +14175,7 @@ fn configureExtensionOnService(
     extension_name: []const u8,
     request: extension_domain.ConfigureExtensionRequest,
 ) !extension_domain.InstalledExtension {
-    return try extension_domain.lifecycle.configureOnService(service, alloc, extension_name, request);
+    return try extension_lifecycle.configureOnService(service, alloc, extension_name, request);
 }
 
 fn restoreExtensionsOnService(
@@ -14119,7 +14186,7 @@ fn restoreExtensionsOnService(
     dependencies: []const extension_domain.ExtensionDependency,
 ) !void {
     if (installed.len == 0 and members.len == 0 and dependencies.len == 0) return;
-    try extension_domain.lifecycle.restoreOnService(service, installed, members, dependencies);
+    try extension_lifecycle.restoreOnService(service, installed, members, dependencies);
 }
 
 fn findExtensionPackageVersion(snapshot: *const metadata_api.AdminSnapshot, name: []const u8, version: []const u8) ?*const extension_domain.PackageManifest {
@@ -21270,6 +21337,233 @@ test "api http server requires auth on public routes when enabled" {
     try std.testing.expectEqual(@as(u16, 200), readyz.status);
 }
 
+test "continuous HA rejects non-replicated public mutations before handlers" {
+    const Rejection = struct {
+        @"error": []const u8,
+        code: []const u8,
+        surface: []const u8,
+    };
+    const FakeSource = struct {
+        created: bool = false,
+        table_record: metadata_table_manager.TableRecord = .{
+            .table_id = 1,
+            .name = "docs",
+            .description = "docs table",
+            .schema_json = "{\"kind\":\"demo\"}",
+            .indexes_json = "{\"full_text_index_v0\":{}}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        },
+        range_record: metadata_table_manager.RangeRecord = .{
+            .group_id = 10,
+            .table_id = 1,
+            .start_key = "",
+            .end_key = null,
+        },
+        empty_tables: [0]metadata_table_manager.TableRecord = .{},
+        empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
+        empty_stores: [0]metadata_table_manager.StoreRecord = .{},
+        empty_placements: [0]raft_reconciler.PlacementIntent = .{},
+        empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{},
+        empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{},
+
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .create_table = createTable,
+                .wait_table_lifecycle = waitTableLifecycle,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
+        }
+
+        fn rangeSlice(self: *@This()) []metadata_table_manager.RangeRecord {
+            return @as([*]metadata_table_manager.RangeRecord, @ptrCast(&self.range_record))[0..1];
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = if (self.created) self.tableSlice() else self.empty_tables[0..],
+                .ranges = if (self.created) self.rangeSlice() else self.empty_ranges[0..],
+                .stores = self.empty_stores[0..],
+                .placement_intents = self.empty_placements[0..],
+                .split_transitions = self.empty_splits[0..],
+                .merge_transitions = self.empty_merges[0..],
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.created = true;
+        }
+
+        fn waitTableLifecycle(ptr: *anyopaque, _: []const u8, expected: TableVisibility) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(expected == .present, self.created);
+        }
+    };
+
+    var auth = try initTestAuthManager(std.testing.allocator);
+    try bindTestAuthManager(std.testing.allocator, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var source = FakeSource{};
+    var config = ApiHttpServerConfig{ .user_manager = &auth.manager };
+    // This test is intentionally source-compatible with the pre-guard
+    // revision. There, the field is absent and the same behavioral fixture
+    // fails with HAAcknowledgedMutationLostAfterPromotion instead of compile
+    // noise. On the fixed revision it activates the HA guard.
+    if (comptime @hasField(ApiHttpServerConfig, "ha_failover_safe_mutations_only")) {
+        @field(config, "ha_failover_safe_mutations_only") = true;
+    }
+    var server = ApiHttpServer.init(std.testing.allocator, config, source.iface(), null, null);
+
+    const cases = [_]struct {
+        method: http_common.Method,
+        uri: []const u8,
+        body: []const u8,
+        surface: []const u8,
+    }{
+        .{ .method = .POST, .uri = "/auth/v1/users/alice", .body = "{\"password\":\"secret\"}", .surface = "auth_user" },
+        .{ .method = .PUT, .uri = "/secrets/inference.api-key", .body = "{}", .surface = "secret" },
+        .{ .method = .POST, .uri = "/tables/docs", .body = "{\"num_shards\":1,\"description\":\"docs table\"}", .surface = "table_catalog" },
+        .{ .method = .POST, .uri = "/tables/docs/batch", .body = "{}", .surface = "document_batch" },
+        .{ .method = .POST, .uri = "/tables/docs/merge", .body = "{}", .surface = "document_merge" },
+        .{ .method = .PUT, .uri = "/tables/docs/schema", .body = "{}", .surface = "table_schema" },
+        .{ .method = .POST, .uri = "/tables/docs/indexes/title", .body = "{}", .surface = "table_index" },
+        .{ .method = .POST, .uri = "/backup", .body = "{}", .surface = "backup" },
+        .{ .method = .POST, .uri = "/tables/docs/backup", .body = "{}", .surface = "backup" },
+        .{ .method = .POST, .uri = "/restore", .body = "{}", .surface = "cluster_restore" },
+        .{ .method = .POST, .uri = "/transactions/begin", .body = "{}", .surface = "transaction_session" },
+        .{ .method = .POST, .uri = "/tables/docs/repair/run", .body = "{}", .surface = "artifact_repair" },
+    };
+    var auth_status: u16 = 0;
+    var catalog_status: u16 = 0;
+    var rejected: usize = 0;
+    for (cases) |case| {
+        var response = try server.handle(.{ .method = case.method, .uri = case.uri, .body = case.body });
+        defer response.deinit(std.testing.allocator);
+        if (std.mem.eql(u8, case.surface, "auth_user")) auth_status = response.status;
+        if (std.mem.eql(u8, case.surface, "table_catalog")) catalog_status = response.status;
+        if (response.status != 503) continue;
+        rejected += 1;
+        var parsed = try std.json.parseFromSlice(Rejection, std.testing.allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("mutation is not continuously replicated while HA is active", parsed.value.@"error");
+        try std.testing.expectEqualStrings("ha_mutation_not_replicated", parsed.value.code);
+        try std.testing.expectEqualStrings(case.surface, parsed.value.surface);
+    }
+
+    // Before the guard, both requests were acknowledged against primary-local
+    // state even though a promoted standby had neither mutation. Make that red
+    // leg an invariant failure with a stable behavioral error.
+    if (auth_status == 201 and catalog_status == 200) {
+        try std.testing.expect(source.created);
+        const primary_users = try auth.manager.listUsers();
+        defer freeOwnedStrings(std.testing.allocator, primary_users);
+        try std.testing.expectEqual(@as(usize, 1), primary_users.len);
+
+        var promoted_auth = try initTestAuthManager(std.testing.allocator);
+        try bindTestAuthManager(std.testing.allocator, &promoted_auth);
+        defer promoted_auth.manager.deinit();
+        defer promoted_auth.policy_store.deinit();
+        defer promoted_auth.store.deinit();
+        const promoted_users = try promoted_auth.manager.listUsers();
+        defer freeOwnedStrings(std.testing.allocator, promoted_users);
+        try std.testing.expectEqual(@as(usize, 0), promoted_users.len);
+        const promoted_source = FakeSource{};
+        try std.testing.expect(!promoted_source.created);
+        return error.HAAcknowledgedMutationLostAfterPromotion;
+    }
+
+    try std.testing.expectEqual(cases.len, rejected);
+    try std.testing.expect(!source.created);
+    const users = try auth.manager.listUsers();
+    defer freeOwnedStrings(std.testing.allocator, users);
+    try std.testing.expectEqual(@as(usize, 0), users.len);
+
+    // Read availability is unchanged by the mutation policy.
+    var health = try server.handle(.{ .method = .GET, .uri = routes.Routes.healthz });
+    defer health.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), health.status);
+}
+
+test "continuous HA freezes pre-existing restore workers and resumption" {
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .ha_failover_safe_mutations_only = true,
+    }, source.iface(), null, null);
+
+    try std.testing.expect(!server.restoreExecutionPermitted());
+    try std.testing.expect(!server.mutationBackgroundExecutionPermitted());
+    try std.testing.expectError(error.NotLeader, server.ensureRestoreActive(null));
+    try server.resumeRestoreJobsOnce();
+    try std.testing.expect(!server.restore_jobs_resumed.load(.acquire));
+    try server.pollRestoreJobsOnce();
+    try std.testing.expect(!server.restore_jobs_resumed.load(.acquire));
+}
+
+test "continuous HA allows a configured RemoteApply batch write" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ha-remote-apply-batch", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .start_index_workers = false });
+    defer db.close();
+    var table_source = table_writes.BoundTableWriteSource.init("docs", &db);
+
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .ha_failover_safe_mutations_only = true,
+        .ha_remote_apply_mutations_enabled = true,
+    }, source.iface(), null, table_source.source());
+    const body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:ha\":{\"title\":\"remote-apply\"}}}");
+    defer alloc.free(body);
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = body,
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), response.status);
+    var found = (try db.lookup(alloc, "doc:ha", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, found.json, "remote-apply") != null);
+}
+
 test "api http server document scan requires table read permission" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -21408,6 +21702,7 @@ test "api http server dispatches HA admin and internal executors" {
     var admin_exec = RecordingExecutor{ .alloc = alloc, .body = "{\"handler\":\"ha-admin\"}" };
     var internal_exec = RecordingExecutor{ .alloc = alloc, .body = "{\"handler\":\"ha-internal\"}" };
     var server = ApiHttpServer.init(alloc, .{
+        .admin_bearer_token = "ha-internal-secret",
         .ha_admin_executor = admin_exec.executor(),
         .ha_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
@@ -21415,6 +21710,7 @@ test "api http server dispatches HA admin and internal executors" {
     var admin_resp = try server.handle(.{
         .method = .GET,
         .uri = admin_routes.ha_primary_status ++ "?max_lag_lsn=0",
+        .authorization = "Bearer ha-internal-secret",
     });
     defer admin_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
@@ -21426,6 +21722,7 @@ test "api http server dispatches HA admin and internal executors" {
     var internal_resp = try server.handle(.{
         .method = .POST,
         .uri = internal_api_routes.ha_replication_status,
+        .authorization = "Bearer ha-internal-secret",
         .body = "{\"slot_name\":\"standby-a\"}",
     });
     defer internal_resp.deinit(alloc);
@@ -21438,11 +21735,11 @@ test "api http server dispatches HA admin and internal executors" {
 
     var missing = try server.handle(.{ .method = .GET, .uri = admin_routes.ha });
     defer missing.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), missing.status);
-    try std.testing.expectEqual(@as(usize, 2), admin_exec.calls);
+    try std.testing.expectEqual(@as(u16, 401), missing.status);
+    try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
 }
 
-test "api http server protects HA admin routes while exempting HA internal routes" {
+test "api http server requires exact HA bearer token for internal replication routes" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
         fn iface(self: *@This()) StatusSource {
@@ -21504,6 +21801,7 @@ test "api http server protects HA admin routes while exempting HA internal route
     var server = ApiHttpServer.init(alloc, .{
         .auth_enabled = true,
         .user_manager = &auth.manager,
+        .admin_bearer_token = "ha-internal-secret",
         .ha_admin_executor = admin_exec.executor(),
         .ha_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
@@ -21521,26 +21819,83 @@ test "api http server protects HA admin routes while exempting HA internal route
         .authorization = reader_auth,
     });
     defer forbidden.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 403), forbidden.status);
+    try std.testing.expectEqual(@as(u16, 401), forbidden.status);
     try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
-    var authorized = try server.handle(.{
+    var native_admin_rejected = try server.handle(.{
         .method = .GET,
         .uri = admin_routes.ha_primary_status,
         .authorization = admin_auth,
+    });
+    defer native_admin_rejected.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), native_admin_rejected.status);
+    try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
+
+    var authorized = try server.handle(.{
+        .method = .GET,
+        .uri = admin_routes.ha_primary_status,
+        .authorization = "Bearer ha-internal-secret",
     });
     defer authorized.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), authorized.status);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
 
+    const internal_routes = [_][]const u8{
+        internal_api_routes.ha_replication_identify,
+        internal_api_routes.ha_replication_slots,
+        internal_api_routes.ha_replication_start,
+        internal_api_routes.ha_replication_status,
+    };
+    for (internal_routes) |path| {
+        var internal_missing = try server.handle(.{ .method = .GET, .uri = path });
+        defer internal_missing.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 401), internal_missing.status);
+        try std.testing.expectEqual(@as(usize, 0), internal_exec.calls);
+
+        var internal_wrong = try server.handle(.{
+            .method = .GET,
+            .uri = path,
+            .authorization = "Bearer wrong-token",
+        });
+        defer internal_wrong.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 401), internal_wrong.status);
+        try std.testing.expectEqual(@as(usize, 0), internal_exec.calls);
+    }
+
     var internal = try server.handle(.{
         .method = .GET,
         .uri = internal_api_routes.ha_replication_identify,
+        .authorization = "Bearer ha-internal-secret",
     });
     defer internal.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), internal.status);
+    try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
+
+    var disabled_server = ApiHttpServer.init(alloc, .{
+        .ha_internal_executor = internal_exec.executor(),
+    }, source.iface(), null, null);
+    var disabled = try disabled_server.handle(.{
+        .method = .GET,
+        .uri = internal_api_routes.ha_replication_identify,
+        .authorization = "Bearer ha-internal-secret",
+    });
+    defer disabled.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), disabled.status);
+    try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
+
+    var empty_token_server = ApiHttpServer.init(alloc, .{
+        .admin_bearer_token = "",
+        .ha_internal_executor = internal_exec.executor(),
+    }, source.iface(), null, null);
+    var empty_token = try empty_token_server.handle(.{
+        .method = .GET,
+        .uri = internal_api_routes.ha_replication_identify,
+        .authorization = "Bearer ",
+    });
+    defer empty_token.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), empty_token.status);
     try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
 }
 

@@ -22,6 +22,7 @@ const serializeToSlice = array_list_writer_mod.serializeToSlice;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Io = std.Io;
+const HostName = Io.net.HostName;
 
 const types = @import("../core/types.zig");
 const meta = @import("../core/meta.zig");
@@ -66,6 +67,8 @@ pub const ClientConfig = struct {
     max_response_size: usize = types.default_max_body_size,
     max_response_headers: usize = 256,
     verify_ssl: bool = true,
+    /// Optional explicit CA bundle file. When set, system roots are not loaded.
+    tls_ca_file: ?[]const u8 = null,
     /// Enable HTTP/2 via "prior knowledge" mode (RFC 7540 §3.4).
     /// The client sends the h2 preface directly without ALPN negotiation.
     /// When Zig's stdlib exposes ALPN, this will additionally negotiate h2.
@@ -78,6 +81,9 @@ pub const ClientConfig = struct {
     pool_max_connections: u32 = 20,
     pool_max_per_host: u32 = 5,
     max_cookies: usize = 1000,
+    /// Cache only addresses that have completed a TCP connection. A failed
+    /// cached address is evicted before the next DNS lookup.
+    cache_resolved_addresses: bool = false,
     /// Send a PING health check after this many ms of no frames received on
     /// an H2 connection. 0 = disabled. Similar to Go's http2.Transport.ReadIdleTimeout.
     h2_read_idle_timeout_ms: u64 = 30_000,
@@ -365,6 +371,8 @@ pub const Client = struct {
     /// Protects h2_conns from concurrent fiber access during connection
     /// creation (getOrCreateH2Conn yields on DNS, connect, TLS handshake).
     h2_mutex: Io.Mutex = Io.Mutex.init,
+    resolved_addresses: std.StringHashMapUnmanaged(Address) = .{},
+    resolved_addresses_mutex: Io.Mutex = Io.Mutex.init,
 
     const Self = @This();
 
@@ -398,7 +406,10 @@ pub const Client = struct {
             .io = io,
             .config = config,
             .pool = ConnectionPool.initWithConfig(allocator, io, pool_cfg, {}),
-            .tls_pool = TlsPool.initWithConfig(allocator, io, pool_cfg, .{ .verify_ssl = config.verify_ssl }),
+            .tls_pool = TlsPool.initWithConfig(allocator, io, pool_cfg, .{
+                .verify_ssl = config.verify_ssl,
+                .ca_file = config.tls_ca_file,
+            }),
         };
     }
 
@@ -413,6 +424,9 @@ pub const Client = struct {
         self.cookies.deinit(self.allocator);
         self.pool.deinit();
         self.tls_pool.deinit();
+        var address_it = self.resolved_addresses.iterator();
+        while (address_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.resolved_addresses.deinit(self.allocator);
 
         // Clean up cached HTTP/2 connections.
         var h2_it = self.h2_conns.iterator();
@@ -1114,6 +1128,53 @@ pub const Client = struct {
         socket.setRequestDeadline(deadline_ms);
     }
 
+    fn connectHost(self: *Self, host: []const u8, port: u16) !Socket {
+        if (!self.config.cache_resolved_addresses) {
+            return try Socket.connectHost(host, port, self.io);
+        }
+
+        var key_buffer: [HostName.max_len + 8]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buffer, "{s}:{d}", .{ host, port }) catch
+            return error.InvalidHostName;
+        if (self.cachedResolvedAddress(key)) |address| {
+            if (Socket.connect(address, self.io)) |socket| return socket else |_| {
+                self.removeCachedResolvedAddress(key);
+            }
+        }
+
+        const connected = try Socket.connectHostResolved(host, port, self.io);
+        self.cacheResolvedAddress(key, connected.address) catch {};
+        return connected.socket;
+    }
+
+    fn cachedResolvedAddress(self: *Self, key: []const u8) ?Address {
+        self.resolved_addresses_mutex.lockUncancelable(self.io);
+        defer self.resolved_addresses_mutex.unlock(self.io);
+        return self.resolved_addresses.get(key);
+    }
+
+    fn removeCachedResolvedAddress(self: *Self, key: []const u8) void {
+        self.resolved_addresses_mutex.lockUncancelable(self.io);
+        const removed = self.resolved_addresses.fetchRemove(key);
+        self.resolved_addresses_mutex.unlock(self.io);
+        if (removed) |entry| self.allocator.free(entry.key);
+    }
+
+    fn cacheResolvedAddress(self: *Self, key: []const u8, address: Address) !void {
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+
+        self.resolved_addresses_mutex.lockUncancelable(self.io);
+        defer self.resolved_addresses_mutex.unlock(self.io);
+        const result = try self.resolved_addresses.getOrPut(self.allocator, owned_key);
+        if (result.found_existing) {
+            self.allocator.free(owned_key);
+        } else {
+            result.key_ptr.* = owned_key;
+        }
+        result.value_ptr.* = address;
+    }
+
     fn responseSizeLimit(self: *const Self, req: *const Request) usize {
         return @min(req.max_response_size orelse self.config.max_response_size, self.config.max_response_size);
     }
@@ -1210,8 +1271,7 @@ pub const Client = struct {
             }
 
             // Non-pooled TLS fallback (keep_alive disabled).
-            const addr = try resolveAddress(self.io, host, port);
-            var socket = try Socket.connect(addr, self.io);
+            var socket = try self.connectHost(host, port);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             interrupt.publish(&socket, self.io);
@@ -1232,8 +1292,7 @@ pub const Client = struct {
             return self.executeOnSocket(&conn.socket, req, &ok);
         }
 
-        const addr = try resolveAddress(self.io, host, port);
-        var socket = try Socket.connect(addr, self.io);
+        var socket = try self.connectHost(host, port);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
         interrupt.publish(&socket, self.io);
@@ -1283,8 +1342,7 @@ pub const Client = struct {
                 return self.executeOnTlsToWriter(&tls_conn.session, req, writer, progress_cb, progress_ctx, &ok);
             }
 
-            const addr = try resolveAddress(self.io, host, port);
-            var socket = try Socket.connect(addr, self.io);
+            var socket = try self.connectHost(host, port);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             interrupt.publish(&socket, self.io);
@@ -1305,8 +1363,7 @@ pub const Client = struct {
             return self.executeOnSocketToWriter(&conn.socket, req, writer, progress_cb, progress_ctx, &ok);
         }
 
-        const addr = try resolveAddress(self.io, host, port);
-        var socket = try Socket.connect(addr, self.io);
+        var socket = try self.connectHost(host, port);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
         interrupt.publish(&socket, self.io);
@@ -1398,7 +1455,8 @@ pub const Client = struct {
 
     /// Creates a new TLS session on a socket and executes a request.
     fn executeOnNewTls(self: *Self, socket: *Socket, host: []const u8, req: *Request) !Response {
-        const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        tls_cfg.ca_file = self.config.tls_ca_file;
         var session = TlsSession.init(tls_cfg, self.io);
         defer session.deinit();
         session.attachSocket(socket);
@@ -1415,7 +1473,8 @@ pub const Client = struct {
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
     ) !Response {
-        const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        tls_cfg.ca_file = self.config.tls_ca_file;
         var session = TlsSession.init(tls_cfg, self.io);
         defer session.deinit();
         session.attachSocket(socket);
@@ -1454,8 +1513,7 @@ pub const Client = struct {
         entry.recv_running = false;
         errdefer self.allocator.destroy(entry);
 
-        const addr = try resolveAddress(self.io, host, port);
-        entry.socket = try Socket.connect(addr, self.io);
+        entry.socket = try self.connectHost(host, port);
         // Guard socket close only until fibers take ownership (recv_running).
         // After fibers start, the errdefer at line ~521 handles shutdown.
         errdefer if (!entry.recv_running) entry.socket.close();
@@ -1467,6 +1525,7 @@ pub const Client = struct {
 
         if (is_tls) {
             var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+            tls_cfg.ca_file = self.config.tls_ca_file;
             tls_cfg.alpn_protocols = &.{ "h2", "http/1.1" };
             entry.session = TlsSession.init(tls_cfg, self.io);
             errdefer entry.session.deinit();

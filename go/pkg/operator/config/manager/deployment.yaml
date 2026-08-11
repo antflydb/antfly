@@ -38,7 +38,6 @@ spec:
         args:
         - --leader-elect
         - --enable-inference-controllers=true
-        - --enable-hot-standby-ha=false
         env:
         - name: ANTFLY_HA_ADMIN_TOKEN
           valueFrom:

@@ -63,6 +63,7 @@ const change_journal_mod = @import("derived/change_journal.zig");
 const ha_effects_mod = @import("../ha/effects.zig");
 const ha_commit_gate_mod = @import("../ha/commit_gate.zig");
 const ha_fencing_mod = @import("../ha/fencing.zig");
+const ha_mutation_barrier_mod = @import("../ha/mutation_barrier.zig");
 const ha_primary_mod = @import("../ha/primary.zig");
 const ha_public_gate_state_mod = @import("../ha/public_gate_state.zig");
 const ha_replication_record_mod = @import("../ha/replication_record.zig");
@@ -85,6 +86,7 @@ const vectorindex_mod = @import("antfly_vectorindex");
 const embedder_mod = @import("enrichment/embedder.zig");
 const asset_producer_mod = @import("enrichment/asset_producer.zig");
 const document_extraction_mod = @import("enrichment/document_extraction.zig");
+const portable_backup = @import("../portable_backup.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("enrichment/chunker_stub.zig")
 else
@@ -380,6 +382,8 @@ pub const OpenOptions = struct {
 
 pub const OpenMode = OpenOptions.OpenMode;
 
+pub const HAMutationBarrier = ha_mutation_barrier_mod.MutationBarrier;
+
 fn deinitOwnedEnrichmentConfig(alloc: Allocator, cfg: *enrichment_runtime_mod.Config) void {
     if (cfg.dense_embedder) |dense_embedder| {
         dense_embedder.deinit(alloc);
@@ -397,6 +401,16 @@ fn deinitOwnedEnrichmentConfig(alloc: Allocator, cfg: *enrichment_runtime_mod.Co
 
 pub const HAAsyncEffectMirror = struct {
     primary: *ha_primary_mod.Primary,
+    /// Shared across every DB/catalog writer owned by one HA runtime. Mutations
+    /// hold a shared lease from before their first persistent side effect until
+    /// WAL publication and the sync durability decision finish. Seed capture
+    /// takes the exclusive lease before choosing its checkpoint.
+    mutation_barrier: ?*HAMutationBarrier = null,
+    /// Serializes the final client-write gate check, HA WAL append, and sync
+    /// acknowledgement with a node-local promotion fence. When configured,
+    /// every acknowledged write is wholly before or wholly after the frozen
+    /// former-primary boundary.
+    transition_mutex: ?*std.atomic.Mutex = null,
     last_lsn: ?*std.atomic.Value(u64) = null,
     failure_count: ?*std.atomic.Value(u64) = null,
     sync_policy: ha_primary_mod.SyncPolicy = .{},
@@ -3085,6 +3099,32 @@ pub const DB = struct {
         try enforceHAWriteGateOptional(self.ha_write_gate);
     }
 
+    fn haMutationBarrier(self: *const DB) ?*HAMutationBarrier {
+        var barrier: ?*HAMutationBarrier = null;
+        const mirrors = .{
+            self.ha_async_effect_mirror,
+            self.ha_async_batch_mirror,
+            self.ha_async_metadata_mirror,
+        };
+        inline for (mirrors) |maybe_mirror| {
+            if (maybe_mirror) |mirror| {
+                if (mirror.mutation_barrier) |candidate| {
+                    if (barrier) |configured| {
+                        std.debug.assert(configured == candidate);
+                    } else {
+                        barrier = candidate;
+                    }
+                }
+            }
+        }
+        return barrier;
+    }
+
+    fn acquireHAMutationShared(self: *const DB) ?HAMutationBarrier.SharedLease {
+        const barrier = self.haMutationBarrier() orelse return null;
+        return barrier.acquireShared();
+    }
+
     fn mirrorHAReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
         var ctx = self.batchContext();
         mirrorHAReplayPayloadBestEffortContext(&ctx, payload);
@@ -4272,6 +4312,9 @@ pub const DB = struct {
     }
 
     pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         if (!config.enabled) return .{};
         if (config.replicated_metadata) {
             return try transaction_runtime_mod.recoverOnce(
@@ -4347,6 +4390,8 @@ pub const DB = struct {
     }
 
     pub fn beginBulkIngestSession(self: *DB) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try beginExternalDenseBulkSessionTrackedWait(self.async_context, self.backend_runtime.io());
         errdefer finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
@@ -4371,6 +4416,8 @@ pub const DB = struct {
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         var external_session_tracked = true;
@@ -4409,6 +4456,8 @@ pub const DB = struct {
     }
 
     pub fn beginDenseAutoBulkIngestSession(self: *DB) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try beginExternalDenseBulkSessionTrackedWait(self.async_context, self.backend_runtime.io());
         errdefer finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
@@ -4420,6 +4469,8 @@ pub const DB = struct {
     }
 
     pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
@@ -4432,6 +4483,8 @@ pub const DB = struct {
     }
 
     pub fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         {
@@ -4469,6 +4522,8 @@ pub const DB = struct {
     }
 
     fn finishDenseAutoBulkIngestSessionWithOptionsInternal(self: *DB, options: backend_types.BulkIngestFinishOptions, notify_executor: bool) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         var external_session_tracked = true;
@@ -4502,6 +4557,8 @@ pub const DB = struct {
     }
 
     pub fn abortDenseAutoBulkIngestSession(self: *DB) void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         lockApply(self);
         {
             defer self.core.unlockApply();
@@ -4514,6 +4571,8 @@ pub const DB = struct {
     }
 
     pub fn abortPrimaryStoreAutoBulkIngestSession(self: *DB) void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         lockApply(self);
         defer self.core.unlockApply();
         const resources = self.core.batchExecutionResources();
@@ -4523,6 +4582,8 @@ pub const DB = struct {
     }
 
     pub fn abortBulkIngestSession(self: *DB) void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         lockApply(self);
         {
             defer self.core.unlockApply();
@@ -4764,6 +4825,12 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        return try self.runLsmMaintenanceStepWithHAMutationHeld();
+    }
+
+    fn runLsmMaintenanceStepWithHAMutationHeld(self: *DB) !bool {
         if (try self.core.index_manager.runLsmObsoleteReclaimDue()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -4784,6 +4851,8 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -4802,6 +4871,8 @@ pub const DB = struct {
     }
 
     pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
         const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
@@ -4812,6 +4883,8 @@ pub const DB = struct {
     }
 
     pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
         const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
@@ -4834,6 +4907,8 @@ pub const DB = struct {
     }
 
     pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         var steps: usize = 0;
         while (steps < max_steps) : (steps += 1) {
             var progressed = false;
@@ -4843,7 +4918,7 @@ pub const DB = struct {
             if (!progressed) {
                 const wake_due = if (self.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
                 if (!wake_due) break;
-                if (!try self.runLsmMaintenanceStep()) break;
+                if (!try self.runLsmMaintenanceStepWithHAMutationHeld()) break;
             }
         }
         return steps;
@@ -5103,6 +5178,8 @@ pub const DB = struct {
         limit: usize,
     ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
 
         const prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(self.alloc);
@@ -5139,6 +5216,8 @@ pub const DB = struct {
     }
 
     fn deleteDocumentArtifactChildRangeOutboxEntry(self: *DB, key: []const u8) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
@@ -5310,6 +5389,8 @@ pub const DB = struct {
 
     pub fn applyDocumentArtifactChildRangeBatch(self: *DB, child_batch: DocumentArtifactChildRangeApplyBatch) anyerror!u64 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         if (child_batch.artifact_writes.len == 0 and
             child_batch.artifact_delete_keys.len == 0 and
@@ -5468,6 +5549,8 @@ pub const DB = struct {
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (!opts.bypass_ha_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
+        var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         if (!opts.bypass_ha_write_gate) try self.enforceHAWriteGate();
         if (!opts.bypass_ha_write_gate) try self.preflightHABatchSyncCommit();
         const total_start_ns = monotonicTimeNs();
@@ -7811,6 +7894,8 @@ pub const DB = struct {
         update: types.DocumentArtifactChildRangePlacementUpdate,
     ) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try self.executor.failIfUnhealthy();
 
@@ -13300,6 +13385,8 @@ pub const DB = struct {
 
     pub fn updateRange(self: *DB, byte_range: types.ByteRange) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
@@ -13362,6 +13449,9 @@ pub const DB = struct {
     }
 
     pub fn setSplitState(self: *DB, state: ?types.SplitState) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         if (state == null) {
@@ -13390,12 +13480,18 @@ pub const DB = struct {
     }
 
     pub fn setSplitDeltaFinalSeq(self: *DB, seq: u64) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.saveSplitDeltaFinalSeq(seq);
     }
 
     pub fn clearSplitDeltaFinalSeq(self: *DB) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.clearSplitDeltaFinalSeq();
@@ -13769,12 +13865,18 @@ pub const DB = struct {
     }
 
     pub fn clearSplitDeltaEntries(self: *DB) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.clearSplitDeltas();
     }
 
     pub fn createShadowIndexManager(self: *DB, split_key: []const u8, original_range_end: []const u8) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         if (self.shadow != null) return error.ShadowIndexManagerExists;
@@ -13813,6 +13915,9 @@ pub const DB = struct {
     }
 
     pub fn closeShadowIndexManager(self: *DB) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         const shadow = self.shadow orelse return;
         shadow.manager.deinit();
         self.alloc.destroy(shadow.manager);
@@ -13836,6 +13941,9 @@ pub const DB = struct {
         dest_dir2: []const u8,
         prepare_only: bool,
     ) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         _ = dest_dir1;
         while (true) {
             const target_sequence = self.core.nextDerivedSequence();
@@ -13869,6 +13977,9 @@ pub const DB = struct {
     }
 
     pub fn finalizeSplit(self: *DB, new_range: types.ByteRange) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         try finalizeSplitLocked(self, new_range);
@@ -14239,16 +14350,34 @@ pub const DB = struct {
             return true;
         }
         if (std.mem.eql(u8, phase, "rebuild_artifacts")) {
-            std.log.info("restore runtime repair phase=rebuild_stored_embeddings", .{});
-            _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+            std.log.info("restore runtime repair rebuild stored embedding artifacts path={s}", .{self.core.path});
+            const rebuilt = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+            std.log.info("restore runtime repair rebuilt stored embedding artifacts path={s} count={d}", .{ self.core.path, rebuilt });
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "replay_enrichments", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "replay_enrichments")) {
             if (self.core.hasGeneratedEnrichmentTargets()) {
-                if (self.enrichment_runtime == null) return error.RestoreRepairRequiresEnrichmentRuntime;
-                std.log.info("restore runtime repair phase=replay_enrichments", .{});
-                _ = try self.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+                const runtime = self.enrichment_runtime orelse return error.RestoreRepairRequiresEnrichmentRuntime;
+                std.log.info("restore runtime repair replay generated enrichments path={s}", .{self.core.path});
+                // A restored enrichment checkpoint can be equal to the first
+                // destination replay sequence even when the destination has
+                // no generated artifacts. Quiesce the worker before resetting
+                // and appending so it cannot advance the checkpoint across an
+                // empty replay window between those two operations.
+                runtime.stop();
+                errdefer if (self.optional_runtime_workers_enabled) {
+                    runtime.start() catch |start_err| {
+                        std.log.warn("restore runtime repair enrichment restart failed path={s} err={}", .{ self.core.path, start_err });
+                    };
+                };
+                try runtime.resumeFrom(0, self.core.nextDerivedSequence());
+                const generated_refs = try self.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+                // Restore opens with optional workers disabled and drains them
+                // synchronously. Starting a background worker here races the
+                // foreground catch-up in the next phase over index mutation.
+                if (self.optional_runtime_workers_enabled) try runtime.start();
+                std.log.info("restore runtime repair replayed generated enrichments path={s} refs={d}", .{ self.core.path, generated_refs });
             }
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "drain_async", false);
             return true;
@@ -14266,6 +14395,7 @@ pub const DB = struct {
         if (std.mem.eql(u8, phase, "rebuild_replayed_artifacts")) {
             std.log.info("restore runtime repair phase=rebuild_replayed_embeddings", .{});
             _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+            _ = try self.repairRestoreDenseArtifactCoverageFromFinalArtifacts(alloc);
             _ = try self.rebuildSparseIndexesForTargetCoverage(alloc);
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "sync_indexes", false);
             return true;
@@ -14278,10 +14408,14 @@ pub const DB = struct {
             // watermark or a rebuilding checkpoint. A restore must not publish
             // its completion marker until both forms of debt converge.
             _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+            try self.completeRestoreDenseArtifactRepairs(alloc);
             if (try self.hasPendingDenseArtifactRebuild(alloc) or
                 try self.denseArtifactWatermarkRepairNeeded(alloc))
             {
-                return error.RestoreRuntimeRepairIncomplete;
+                return error.RestoreDenseArtifactRebuildIncomplete;
+            }
+            if (self.core.index_manager.hasRepairUnavailableIndexes()) {
+                return error.RestoreIndexAvailabilityIncomplete;
             }
             try self.saveAllLiveIndexStatusSnapshots(alloc);
             try self.core.index_manager.syncAll(true);
@@ -14323,24 +14457,36 @@ pub const DB = struct {
         self.core.index_manager.clearDenseHbcCaches();
     }
 
-    pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
+    fn setSchemaGuarded(self: *DB, table_schema: schema_mod.TableSchema) !void {
         try self.enforceHAWriteGate();
         try self.preflightHAMetadataSyncCommit();
         try self.core.setSchema(table_schema);
         try self.mirrorHASchemaMetadataCommit(table_schema);
     }
 
-    pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+    pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.setSchemaGuarded(table_schema);
+    }
+
+    fn setSchemaJsonGuarded(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
         var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
         const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
         defer schema_mod.freeSchema(alloc, runtime_schema);
 
-        try self.setSchema(runtime_schema);
+        try self.setSchemaGuarded(runtime_schema);
         try self.core.putStoreBatch(&.{.{
             .key = public_schema_json_key,
             .value = schema_json,
         }}, &.{});
+    }
+
+    pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.setSchemaJsonGuarded(alloc, schema_json);
     }
 
     pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
@@ -14372,6 +14518,9 @@ pub const DB = struct {
         created_at_ns: u64,
         participants: []const []const u8,
     ) !transactions_mod.TxnId {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.beginTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, created_at_ns, participants);
@@ -14404,6 +14553,9 @@ pub const DB = struct {
         coordinator: bool,
         retain_terminal: bool,
     ) !transactions_mod.TxnId {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetention(
@@ -14422,6 +14574,9 @@ pub const DB = struct {
         intents: []const transactions_mod.WriteIntent,
         predicates: []const transactions_mod.VersionPredicate,
     ) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer identity_upsert_keys.deinit(self.alloc);
         for (intents) |intent| {
@@ -14503,6 +14658,9 @@ pub const DB = struct {
         commit_version: u64,
         sync_level: types.SyncLevel,
     ) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         if (status != .committed) {
             lockApply(self);
             defer self.core.unlockApply();
@@ -14585,6 +14743,9 @@ pub const DB = struct {
     }
 
     pub fn markTransactionParticipantResolved(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.markTransactionParticipantResolved(txn_id, participant);
@@ -14610,6 +14771,9 @@ pub const DB = struct {
     }
 
     pub fn recoverTransactions(self: *DB, cutoff_timestamp: u64, resolution_timestamp: u64) !transactions_mod.RecoveryStats {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         const resolved_finalized = try self.resolveFinalizedTransactionIntentsForRecovery(resolution_timestamp);
         lockApply(self);
         defer self.core.unlockApply();
@@ -15268,6 +15432,9 @@ pub const DB = struct {
 
     fn addIndexWithAdmission(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode) !?u128 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         var structural_guard = self.beginIndexStructuralMutation("index creation", cfg.name);
         defer structural_guard.deinit();
         // Generated artifact namespaces can be shared across differently named
@@ -15312,6 +15479,9 @@ pub const DB = struct {
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.addEnrichment(cfg);
@@ -15319,6 +15489,9 @@ pub const DB = struct {
 
     pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.upsertEnrichment(cfg);
@@ -15326,6 +15499,9 @@ pub const DB = struct {
 
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         {
             lockApply(self);
             defer self.core.unlockApply();
@@ -15353,6 +15529,9 @@ pub const DB = struct {
         options: ResolverUpsertOptions,
     ) !index_manager_mod.IndexManager.ResolverUpsertResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         const upsert_result = blk: {
             lockApply(self);
             defer self.core.unlockApply();
@@ -15412,6 +15591,9 @@ pub const DB = struct {
 
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         try self.retireResolverReplayBeforeCatalogRemoval();
 
         const retirement_sequence = blk: {
@@ -15624,6 +15806,8 @@ pub const DB = struct {
         key: []const u8,
     ) !u64 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try self.executor.failIfUnhealthy();
 
@@ -16550,6 +16734,9 @@ pub const DB = struct {
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         var structural_guard = self.beginIndexStructuralMutation("index deletion", name);
         defer structural_guard.deinit();
         const restart_enrichment = self.quiesceEnrichmentForStructuralMutation();
@@ -16644,6 +16831,9 @@ pub const DB = struct {
 
     pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.deleteEnrichment(kind, name);
@@ -17148,16 +17338,40 @@ pub const DB = struct {
     }
 
     fn runRestoreRepairDrainAsync(self: *DB) !void {
-        // Earlier repair phases synchronously rebuild restored runtime state.
-        // At this point replay-driven runtimes must publish a fresh query view
-        // before the final index sync/complete marker. Keep the drain scoped to
-        // derived/replay stages: large portable restores can still leave
-        // substantial posting or LSM maintenance debt, and queries remain
-        // correct while that background-maintenance debt is paid down.
+        // Generated enrichment replay is asynchronous with respect to the
+        // replay append performed by the preceding repair phase. The restore
+        // completion marker is also the query-readiness barrier, so drain all
+        // replay stages to a stable sequence before publishing it. Keep
+        // posting, text-merge, artifact-metadata, and LSM maintenance outside
+        // this barrier; those can continue in the background without hiding
+        // logically restored query results.
+        if (self.enrichment_runtime) |runtime| {
+            const before = runtime.stats();
+            std.log.info("restore runtime repair enrichment drain begin path={s} applied={d} target={d} processed={d} skipped={d}", .{
+                self.core.path,
+                before.applied_sequence,
+                before.target_sequence,
+                before.processed_requests,
+                before.skip_by_hash_count,
+            });
+        }
+        // Do not truncate the replay journal here: subsequent restore repair
+        // phases still use its durable target to prove derived-state coverage.
         try self.drainReplayStagesUntilStableWithOptions(.{
             .truncate_replay = false,
             .wait_for_enrichment_retries = true,
         });
+        if (self.enrichment_runtime) |runtime| {
+            const after = runtime.stats();
+            std.log.info("restore runtime repair enrichment drain complete path={s} applied={d} target={d} processed={d} skipped={d} errors={d}", .{
+                self.core.path,
+                after.applied_sequence,
+                after.target_sequence,
+                after.processed_requests,
+                after.skip_by_hash_count,
+                after.error_count,
+            });
+        }
         try self.flushAppliedSequencesForIdle();
     }
 
@@ -18212,6 +18426,110 @@ pub const DB = struct {
 
     fn denseArtifactWatermarkRepairNeeded(self: *DB, alloc: Allocator) !bool {
         return (try self.repairDenseArtifactAppliedSequencesFromCoverage(alloc, false)) > 0;
+    }
+
+    /// Restore repair operates on a private staged generation with index
+    /// workers disabled. Replay can change the final artifact set after an
+    /// earlier counter bootstrap, so recompute each durable counter from that
+    /// final store and rebuild any unpublished generation whose exact coverage
+    /// differs. No live shadow-generation job is needed or allowed here.
+    fn repairRestoreDenseArtifactCoverageFromFinalArtifacts(self: *DB, alloc: Allocator) !usize {
+        var target_counts = try self.collectDenseArtifactTargetCounts(alloc, null);
+        defer target_counts.deinit(alloc);
+
+        var names = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (names.items) |name| alloc.free(name);
+            names.deinit(alloc);
+        }
+        for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
+            if (!try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, entry.config)) continue;
+            const expected = target_counts.per_target_index.get(dense_index_idx) orelse 0;
+            var raw: [8]u8 = undefined;
+            std.mem.writeInt(u64, raw[0..8], expected, .little);
+            const counter_key = try denseArtifactTargetCounterKeyAlloc(alloc, entry.config.name);
+            defer alloc.free(counter_key);
+            try self.core.store.put(counter_key, &raw);
+            if (entry.index.stats().active_count == expected) continue;
+            try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+        }
+        if (names.items.len > 0 and self.start_index_workers) return error.RestoreRuntimeRepairIncomplete;
+
+        var rebuilt: usize = 0;
+        for (names.items) |name| {
+            try self.core.index_manager.resetDenseIndexForArtifactRebuild(name);
+            rebuilt += try rebuildDenseIndexForTargetCoverageContext(self.async_context, name, 2048);
+        }
+        if (names.items.len > 0) self.clearDenseHbcCaches();
+        return rebuilt;
+    }
+
+    /// Portable restore owns the complete logical corpus and rebuilds every
+    /// derived projection before publication. Missing-counter and surplus
+    /// coverage debt can therefore be repaired from the final restored
+    /// snapshot without waiting for the ordinary background generation-repair
+    /// worker. Clear only the matching durable debt after counter coverage,
+    /// replay, and checkpoint identity all prove the active generation
+    /// queryable.
+    fn completeRestoreDenseArtifactRepairs(self: *DB, alloc: Allocator) !void {
+        var state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
+            error.FileNotFound, error.DurableIndexRepairStateUnavailable => return,
+            else => return err,
+        };
+        defer state.deinit(alloc);
+
+        for (state.entries.items) |entry| {
+            if (entry.intent.trigger != .artifact_counter_missing and
+                entry.intent.trigger != .artifact_coverage_mismatch)
+            {
+                continue;
+            }
+            const cfg = self.core.index_manager.get(entry.intent.index_name) orelse
+                return error.RestoreDenseIndexProofIncomplete;
+            if (cfg.kind != .dense_vector or
+                types.indexConfigHash(cfg.*) != entry.intent.config_hash)
+            {
+                return error.RestoreDenseConfigProofIncomplete;
+            }
+
+            if (entry.intent.trigger == .artifact_counter_missing) {
+                try self.ensureDenseArtifactTargetCounterForRepair(
+                    alloc,
+                    cfg.*,
+                    entry.intent.repair_id,
+                    null,
+                );
+            }
+            const expected = (try loadDenseArtifactTargetCounter(alloc, self.core.store, cfg.name)) orelse
+                return error.RestoreDenseCounterProofIncomplete;
+            const dense = self.core.index_manager.denseIndex(cfg.name) orelse
+                return error.RestoreDenseIndexProofIncomplete;
+            if (!denseCoverageMatchesTarget(dense.index.stats().active_count, expected)) {
+                return error.RestoreDenseCoverageProofIncomplete;
+            }
+
+            const applied = try self.core.loadAppliedSequence(alloc, cfg.name);
+            const target = try self.probeDerivedReplayTargetSequence(
+                alloc,
+                self.core.replaySource(),
+                .{ .name = cfg.name, .kind = .dense_vector },
+                applied,
+            );
+            const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
+            if (applied < target or
+                checkpoint.status != .clean or
+                checkpoint.applied_sequence < target or
+                checkpoint.config_hash != entry.intent.config_hash)
+            {
+                return error.RestoreDenseCheckpointIncomplete;
+            }
+
+            // This is restore-owned metadata debt, not a shadow-generation
+            // attempt, so there is no candidate phase chain to advance. Once
+            // the restored active generation has passed the full proof above,
+            // remove the stale discovery intent directly.
+            try self.removeIndexRepairIntentAndPin(alloc, entry.intent.repair_id);
+        }
     }
 
     fn repairDenseArtifactAppliedSequencesIfCovered(self: *DB, alloc: Allocator) !usize {
@@ -30923,6 +31241,8 @@ fn collectGraphArtifactsForDocIndex(
 
 fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []const u8, sync_level: types.SyncLevel) !void {
     if (keys.len == 0) return;
+    var ha_mutation = acquireHAMutationSharedContext(ctx);
+    defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
     ctx.apply_mutex.lockExclusive();
     var apply_mutex_held = true;
@@ -31065,7 +31385,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     }
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
-    mirrorHAReplayPayloadBestEffortContext(ctx, replay_payload);
+    try mirrorHAReplayPayloadCommitContext(ctx, replay_payload);
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
     defer sync_targets.deinit(ctx.alloc);
     ctx.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
@@ -31123,6 +31443,8 @@ fn appendDerivedBatchRecord(self: *DB, batch: derived_types.DerivedBatch) !u64 {
 }
 
 fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !u64 {
+    var ha_mutation = acquireHAMutationSharedContext(ctx);
+    defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
     ctx.apply_mutex.lockExclusive();
     defer ctx.apply_mutex.unlockExclusive();
@@ -31130,7 +31452,7 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     const payload = try encodeChangeRecordPayload(ctx, batch, sequence);
     defer ctx.alloc.free(payload);
     try ctx.store.appendReplayOpaque(ctx.alloc, sequence, payload);
-    mirrorHAReplayPayloadBestEffortContext(ctx, payload);
+    try mirrorHAReplayPayloadCommitContext(ctx, payload);
     ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
     return sequence;
 }
@@ -31160,8 +31482,38 @@ fn enforceHAWriteGateOptional(gate: ?HAWriteGate) !void {
     try configured.check();
 }
 
+fn haMutationBarrierFromContext(ctx: *const BatchExecutionContext) ?*HAMutationBarrier {
+    var barrier: ?*HAMutationBarrier = null;
+    const mirrors = .{
+        ctx.ha_async_effect_mirror,
+        ctx.ha_async_batch_mirror,
+        ctx.ha_async_metadata_mirror,
+    };
+    inline for (mirrors) |maybe_mirror| {
+        if (maybe_mirror) |mirror| {
+            if (mirror.mutation_barrier) |candidate| {
+                if (barrier) |configured| {
+                    std.debug.assert(configured == candidate);
+                } else {
+                    barrier = candidate;
+                }
+            }
+        }
+    }
+    return barrier;
+}
+
+fn acquireHAMutationSharedContext(ctx: *const BatchExecutionContext) ?HAMutationBarrier.SharedLease {
+    const barrier = haMutationBarrierFromContext(ctx) orelse return null;
+    return barrier.acquireShared();
+}
+
 fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, payload: []const u8) void {
     const mirror = ctx.ha_async_effect_mirror orelse return;
+    const transition_mutex = mirror.transition_mutex;
+    if (transition_mutex) |mutex| lockAtomic(mutex);
+    defer if (transition_mutex) |mutex| mutex.unlock();
+    enforceHAWriteGateOptional(ctx.ha_write_gate) catch return;
     lockAtomic(ctx.log_mutex);
     defer ctx.log_mutex.*.unlock();
     const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(mirror.primary, payload, .{
@@ -31177,6 +31529,13 @@ fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, pay
 
 fn mirrorHAReplayPayloadCommitContext(ctx: *const BatchExecutionContext, payload: []const u8) !void {
     const mirror = ctx.ha_async_effect_mirror orelse return;
+    const transition_mutex = mirror.transition_mutex;
+    if (transition_mutex) |mutex| lockAtomic(mutex);
+    var transition_locked = transition_mutex != null;
+    defer if (transition_locked) transition_mutex.?.unlock();
+    // The local store has already committed. Always represent that mutation in
+    // the HA tail; a fence that arrived after the preflight gate may reject the
+    // client acknowledgement below, but must not create an unlogged local fork.
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
@@ -31191,11 +31550,30 @@ fn mirrorHAReplayPayloadCommitContext(ctx: *const BatchExecutionContext, payload
         if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
         break :blk lsn;
     };
+    // Standby status acknowledgements use the same runtime transition mutex.
+    // Release it while waiting for remote progress, then reacquire it to make
+    // the final client acknowledgement linearizable with fencing.
+    if (transition_mutex) |mutex| {
+        mutex.unlock();
+        transition_locked = false;
+    }
     try evaluateHAMirrorCommitGate(mirror, lsn);
+    if (transition_mutex) |mutex| {
+        lockAtomic(mutex);
+        transition_locked = true;
+    }
+    // Authority can expire while a synchronous replication wait is in flight.
+    // Recheck before returning success while the transition mutex is still held
+    // so a stale writer can never acknowledge an already-replicated mutation.
+    try enforceHAWriteGateOptional(ctx.ha_write_gate);
 }
 
 fn mirrorHABatchMutationBestEffortContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) void {
     const mirror = ctx.ha_async_batch_mirror orelse return;
+    const transition_mutex = mirror.transition_mutex;
+    if (transition_mutex) |mutex| lockAtomic(mutex);
+    defer if (transition_mutex) |mutex| mutex.unlock();
+    enforceHAWriteGateOptional(ctx.ha_write_gate) catch return;
     lockAtomic(ctx.log_mutex);
     defer ctx.log_mutex.*.unlock();
     const lsn = ha_effects_mod.appendBatchMutationRequest(ctx.alloc, mirror.primary, request, .{
@@ -31211,6 +31589,13 @@ fn mirrorHABatchMutationBestEffortContext(ctx: *const BatchExecutionContext, req
 
 fn mirrorHABatchMutationCommitContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) !void {
     const mirror = ctx.ha_async_batch_mirror orelse return;
+    const transition_mutex = mirror.transition_mutex;
+    if (transition_mutex) |mutex| lockAtomic(mutex);
+    var transition_locked = transition_mutex != null;
+    defer if (transition_locked) transition_mutex.?.unlock();
+    // The local store has already committed. Always append before applying the
+    // final authority check so rejoin cannot mistake local divergence for an
+    // exact fork boundary.
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
@@ -31225,7 +31610,16 @@ fn mirrorHABatchMutationCommitContext(ctx: *const BatchExecutionContext, request
         if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
         break :blk lsn;
     };
+    if (transition_mutex) |mutex| {
+        mutex.unlock();
+        transition_locked = false;
+    }
     try evaluateHAMirrorCommitGate(mirror, lsn);
+    if (transition_mutex) |mutex| {
+        lockAtomic(mutex);
+        transition_locked = true;
+    }
+    try enforceHAWriteGateOptional(ctx.ha_write_gate);
 }
 
 fn mirrorHAEncodedBatchMutationCommitContext(ctx: *const BatchExecutionContext, payload: []const u8) !void {
@@ -31249,6 +31643,10 @@ fn mirrorHAEncodedBatchMutationCommitContext(ctx: *const BatchExecutionContext, 
 
 fn mirrorHASchemaMetadataBestEffortContext(ctx: *const BatchExecutionContext, table_schema: schema_mod.TableSchema) void {
     const mirror = ctx.ha_async_metadata_mirror orelse return;
+    const transition_mutex = mirror.transition_mutex;
+    if (transition_mutex) |mutex| lockAtomic(mutex);
+    defer if (transition_mutex) |mutex| mutex.unlock();
+    enforceHAWriteGateOptional(ctx.ha_write_gate) catch return;
     lockAtomic(ctx.log_mutex);
     defer ctx.log_mutex.*.unlock();
     const lsn = ha_effects_mod.appendSchemaMetadataMutation(ctx.alloc, mirror.primary, table_schema, .{
@@ -31264,6 +31662,12 @@ fn mirrorHASchemaMetadataBestEffortContext(ctx: *const BatchExecutionContext, ta
 
 fn mirrorHASchemaMetadataCommitContext(ctx: *const BatchExecutionContext, table_schema: schema_mod.TableSchema) !void {
     const mirror = ctx.ha_async_metadata_mirror orelse return;
+    const transition_mutex = mirror.transition_mutex;
+    if (transition_mutex) |mutex| lockAtomic(mutex);
+    var transition_locked = transition_mutex != null;
+    defer if (transition_locked) transition_mutex.?.unlock();
+    // As with document batches, committed metadata must remain represented in
+    // the HA tail even when authority expires before acknowledgement.
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
@@ -31278,7 +31682,16 @@ fn mirrorHASchemaMetadataCommitContext(ctx: *const BatchExecutionContext, table_
         if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
         break :blk lsn;
     };
+    if (transition_mutex) |mutex| {
+        mutex.unlock();
+        transition_locked = false;
+    }
     try evaluateHAMirrorCommitGate(mirror, lsn);
+    if (transition_mutex) |mutex| {
+        lockAtomic(mutex);
+        transition_locked = true;
+    }
+    try enforceHAWriteGateOptional(ctx.ha_write_gate);
 }
 
 fn preflightHAMirrorSyncCommitContext(ctx: *const BatchExecutionContext, mirror: ?HAAsyncEffectMirror) !void {
@@ -32388,6 +32801,8 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
 
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     var batch_ctx = ctx.batchContext();
+    var ha_mutation = acquireHAMutationSharedContext(&batch_ctx);
+    defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(batch_ctx.ha_write_gate);
     const replay_deleted_keys = try concatKeyViews(batch_ctx.alloc, batch.deleted_keys, artifact_delete_keys);
     defer batch_ctx.alloc.free(replay_deleted_keys);
@@ -32428,7 +32843,7 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
         if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
             try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), &.{}, artifact_delete_keys);
         }
-        mirrorHAReplayPayloadBestEffortContext(&batch_ctx, payload);
+        try mirrorHAReplayPayloadCommitContext(&batch_ctx, payload);
         batch_ctx.executor.trackBacklogBytes(reserved_sequence, @intCast(payload.len)) catch {};
         break :blk reserved_sequence;
     };
@@ -59585,6 +60000,84 @@ test "storage.ha db mirrors appended derived replay records into HA stream" {
     try std.testing.expectEqual(change_journal_mod.TargetHint.graph, decoded.record.target_hints[0]);
 }
 
+test "storage.ha db waits for remote apply before completing derived enrichment" {
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 201,
+        .shard_id = 3,
+        .table_id = 9,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    const SyncWait = struct {
+        calls: u64 = 0,
+
+        fn wait(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            try std.testing.expectEqual(ha_primary_mod.DurabilityMode.remote_apply, policy.mode);
+            try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, target_lsn);
+        }
+    };
+
+    var wait_state = SyncWait{};
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var waits = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .identity_namespace = .{ .shard_id = 3, .table_id = 9 },
+        .ha_async_effect_mirror = .{
+            .primary = &primary,
+            .last_lsn = &last_lsn,
+            .sync_policy = .{
+                .mode = .remote_apply,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = SyncWait.wait,
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_wait_count = &waits,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_v1", "mentions", "doc:b");
+    defer alloc.free(artifact_key);
+    const changed_artifact_keys = [_][]const u8{artifact_key};
+    const sequence = try appendDerivedBatchRecord(&db, .{
+        .changed_artifact_keys = changed_artifact_keys[0..],
+    });
+
+    try std.testing.expectEqual(@as(u64, 1), sequence);
+    try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
+    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+}
+
 test "storage.ha db mirrors committed batch mutations into HA stream for standby apply" {
     const alloc = std.testing.allocator;
 
@@ -59683,6 +60176,231 @@ test "storage.ha db mirrors committed batch mutations into HA stream for standby
     var found = (try standby_db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", found.json);
+}
+
+test "storage.ha seed capture barrier prevents local commit without matching wal" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.heap.c_allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 251,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+
+    var barrier: HAMutationBarrier = .{};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .mutation_barrier = &barrier,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    var capture = barrier.acquireExclusive();
+    var write_probe = ConcurrentWriteProbe{ .db = &db };
+    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+    errdefer {
+        capture.release();
+        write_thread.join();
+    }
+
+    try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
+    var attempts: usize = 0;
+    while (attempts < 10_000) : (attempts += 1) {
+        if (barrier.pendingSharedAcquisitions() > 0) break;
+        std.Thread.yield() catch {};
+    }
+
+    try std.testing.expect(barrier.pendingSharedAcquisitions() > 0);
+    try std.testing.expectEqual(@as(u8, 0), write_probe.done.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
+    try std.testing.expect((try db.get(alloc, "doc:b")) == null);
+
+    capture.release();
+    write_thread.join();
+    try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 1), write_probe.done.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    const stored = (try db.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", stored);
+}
+
+test "storage.ha fence cannot strand a local commit beyond the HA tail" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.heap.c_allocator;
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 251,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    var public_gate = ha_public_gate_state_mod.State{};
+    public_gate.configurePrimary(&primary, false);
+    var transition_mutex: std.atomic.Mutex = .unlocked;
+    var barrier: HAMutationBarrier = .{};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .mutation_barrier = &barrier,
+            .transition_mutex = &transition_mutex,
+        },
+        .ha_write_gate = .{ .shared = .{ .state = &public_gate } },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    lockAtomic(&transition_mutex);
+    var transition_locked = true;
+    var write_probe = ConcurrentWriteProbe{ .db = &db };
+    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var thread_joined = false;
+    errdefer {
+        if (transition_locked) transition_mutex.unlock();
+        if (!thread_joined) write_thread.join();
+    }
+    try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
+    var local_commit_observed = false;
+    for (0..10_000) |_| {
+        if (try db.get(alloc, "doc:b")) |stored| {
+            alloc.free(stored);
+            local_commit_observed = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(local_commit_observed);
+    try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
+
+    public_gate.publishPrimaryFence(true);
+    transition_mutex.unlock();
+    transition_locked = false;
+    write_thread.join();
+    thread_joined = true;
+
+    try std.testing.expectEqual(@as(u8, 1), write_probe.failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    const stored = (try db.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", stored);
+}
+
+test "storage.ha schema json mutation does not reacquire shared barrier behind queued capture" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 253,
+        .shard_id = 6,
+        .table_id = 12,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    var barrier: HAMutationBarrier = .{};
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var failures = std.atomic.Value(u64).init(0);
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .identity_namespace = .{ .shard_id = 6, .table_id = 12 },
+        .ha_async_metadata_mirror = .{
+            .primary = &primary,
+            .mutation_barrier = &barrier,
+            .last_lsn = &last_lsn,
+            .failure_count = &failures,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const CaptureProbe = struct {
+        barrier: *HAMutationBarrier,
+        started: std.atomic.Value(u8) = .init(0),
+        acquired: std.atomic.Value(u8) = .init(0),
+        release: std.atomic.Value(u8) = .init(0),
+
+        fn run(self: *@This()) void {
+            self.started.store(1, .release);
+            var capture = self.barrier.acquireExclusive();
+            self.acquired.store(1, .release);
+            while (self.release.load(.acquire) == 0) std.Thread.yield() catch {};
+            capture.release();
+        }
+    };
+
+    var outer = barrier.acquireShared();
+    var probe = CaptureProbe{ .barrier = &barrier };
+    const capture_thread = try std.Thread.spawn(.{}, CaptureProbe.run, .{&probe});
+    errdefer {
+        outer.release();
+        probe.release.store(1, .release);
+        capture_thread.join();
+    }
+    try std.testing.expect(waitForAtomicFlag(&probe.started, 1, 10_000));
+    var capture_queued = false;
+    for (0..10_000) |_| {
+        if (barrier.pendingExclusiveAcquisitions() != 0) {
+            capture_queued = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(capture_queued);
+
+    const schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+    ;
+    try db.setSchemaJsonGuarded(alloc, schema_json);
+    outer.release();
+    try std.testing.expect(waitForAtomicFlag(&probe.acquired, 1, 10_000));
+    probe.release.store(1, .release);
+    capture_thread.join();
+
+    const stored = (try db.getSchemaJson(alloc)) orelse return error.TestExpectedEqual;
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings(schema_json, stored);
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
 }
 
 test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
@@ -59910,6 +60628,120 @@ test "storage.ha db session sync wait satisfies remote apply through standby DB 
     var found = (try standby_db.lookup(alloc, "doc:remote-apply", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"remote-apply\"}", found.json);
+}
+
+test "storage.ha db allows progress but rejects acknowledgement when fenced during remote apply wait" {
+    const alloc = std.testing.allocator;
+
+    var primary_db_path_buf: [256]u8 = undefined;
+    const primary_db_path = tempPath(&primary_db_path_buf);
+    defer cleanupTempDir(primary_db_path);
+    var standby_db_path_buf: [256]u8 = undefined;
+    const standby_db_path = tempPath(&standby_db_path_buf);
+    defer cleanupTempDir(standby_db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    const identity = ha_standby_mod.Identity{
+        .cluster_id = 262,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
+    defer standby.close();
+    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
+        .ha_write_gate = .{ .standby = &standby },
+        .start_index_workers = false,
+    });
+    defer standby_db.close();
+
+    var public_gate = ha_public_gate_state_mod.State{};
+    public_gate.configurePrimary(&primary, false);
+
+    var transition_mutex: std.atomic.Mutex = .unlocked;
+    const FencingRemoteApplyWait = struct {
+        session: HASessionSyncWait,
+        transition_mutex: *std.atomic.Mutex,
+        public_gate: *ha_public_gate_state_mod.State,
+        calls: u64 = 0,
+
+        fn wait(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            // Remote progress must be able to enter while the client waits;
+            // authority is serialized again for the final acknowledgement.
+            try std.testing.expect(self.transition_mutex.tryLock());
+            self.transition_mutex.unlock();
+            try HASessionSyncWait.wait(&self.session, primary_arg, target_lsn, policy);
+            // Fence only after remote apply. The final client gate must observe
+            // this transition after reacquiring the same mutex.
+            lockAtomic(self.transition_mutex);
+            self.public_gate.publishPrimaryFence(true);
+            self.transition_mutex.unlock();
+        }
+    };
+    var wait_state = FencingRemoteApplyWait{
+        .session = .{
+            .alloc = alloc,
+            .slot_name = "standby-a",
+            .standby = &standby,
+            .apply_ctx = &standby_db,
+            .apply_fn = DB.applyHAReplicationRecordCallback,
+        },
+        .transition_mutex = &transition_mutex,
+        .public_gate = &public_gate,
+    };
+    const standby_names = [_][]const u8{"standby-a"};
+    var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .transition_mutex = &transition_mutex,
+            .sync_policy = .{
+                .mode = .remote_apply,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = FencingRemoteApplyWait.wait,
+        },
+        .ha_write_gate = .{ .shared = .{ .state = &public_gate } },
+        .start_index_workers = false,
+    });
+    defer primary_db.close();
+
+    try std.testing.expectError(error.HAFencedPrimary, primary_db.batch(.{
+        .writes = &.{.{ .key = "doc:authority-expired", .value = "{\"title\":\"replicated-but-not-acknowledged\"}" }},
+        .sync_level = .write,
+    }));
+    try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
+
+    // The mutation committed locally and reached remote apply before fencing,
+    // but the stale client receives an error rather than success.
+    var local = (try primary_db.lookup(alloc, "doc:authority-expired", .{})) orelse return error.TestExpectedEqual;
+    defer local.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"replicated-but-not-acknowledged\"}", local.json);
+    var remote = (try standby_db.lookup(alloc, "doc:authority-expired", .{})) orelse return error.TestExpectedEqual;
+    defer remote.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"replicated-but-not-acknowledged\"}", remote.json);
+    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
 }
 
 test "storage.ha db session sync wait remote write acknowledges durable receive despite apply failure" {
@@ -83002,6 +83834,7 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         var deterministic = embedder_mod.DeterministicDenseEmbedder{};
         var restored = try DB.open(alloc, std.mem.span(restore_path), .{
             .primary_backend = primary_backend,
+            .start_index_workers = false,
             .enrichment = .{
                 .owner_id = "worker-a",
                 .dense_embedder = deterministic.interface(),
@@ -83012,10 +83845,39 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         var targets_before = try restored.collectDenseArtifactTargetCounts(alloc, null);
         defer targets_before.deinit(alloc);
         const target_count_before = targets_before.per_target_index.get(0) orelse return error.TestUnexpectedResult;
+
+        // A replay race can leave an index-only vector that has no matching
+        // stored artifact. Restore repair owns this unpublished generation and
+        // must rebuild it to exact artifact coverage before publication.
+        var ghost_vector = [_]f32{ 0, 1, 0 };
+        try restored.core.index_manager.denseIndex("dv_v1").?.index.insert(0xdead_beef, &ghost_vector);
+        try std.testing.expectEqual(
+            target_count_before + 1,
+            restored.core.index_manager.denseIndex("dv_v1").?.index.stats().active_count,
+        );
+
+        const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, "dv_v1");
+        defer alloc.free(counter_key);
+        var stale_counter: [8]u8 = undefined;
+        std.mem.writeInt(u64, stale_counter[0..8], target_count_before - 1, .little);
+        try restored.core.store.put(counter_key, &stale_counter);
+        try std.testing.expectEqual(
+            @as(?u64, target_count_before - 1),
+            try DB.loadDenseArtifactTargetCounter(alloc, restored.core.store, "dv_v1"),
+        );
+
         try std.testing.expect(try restored.repairRestoreRuntimeStateIfNeeded(alloc));
         var targets_after = try restored.collectDenseArtifactTargetCounts(alloc, null);
         defer targets_after.deinit(alloc);
         try std.testing.expectEqual(target_count_before, targets_after.per_target_index.get(0) orelse return error.TestUnexpectedResult);
+        try std.testing.expectEqual(
+            target_count_before,
+            restored.core.index_manager.denseIndex("dv_v1").?.index.stats().active_count,
+        );
+        try std.testing.expectEqual(
+            @as(?u64, target_count_before),
+            try DB.loadDenseArtifactTargetCounter(alloc, restored.core.store, "dv_v1"),
+        );
 
         const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
         defer alloc.free(query_vec);
@@ -83056,6 +83918,144 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
         defer alloc.free(query_vec);
         var after = try waitForSearchResult(alloc, &reopened, .{
+            .index_name = "dv_v1",
+            .dense = .{ .vector = query_vec, .k = 3 },
+            .return_mode = .parent,
+        }, 1);
+        defer after.deinit();
+        try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
+    }
+
+    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(restore_path))).?;
+    defer restore_state.deinit(alloc);
+    try std.testing.expect(restore_state.runtime_repair_complete);
+    try std.testing.expectEqualStrings("complete", restore_state.phase);
+}
+
+test "db restore repair does not complete before regenerated chunk embeddings are query visible" {
+    const alloc = std.testing.allocator;
+
+    var src_buf: [256]u8 = undefined;
+    const src_path = tempPath(&src_buf);
+    defer cleanupTempDir(src_path);
+
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(alloc);
+
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var db = try DB.open(alloc, std.mem.span(src_path), .{
+            .primary_backend = primary_backend,
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = deterministic.interface(),
+            },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        try portable_backup.exportPortable(alloc, db.core.store, &portable);
+    }
+
+    // Portable import starts with an empty runtime-index directory and restores
+    // only portable logical state. Remove imported embedding artifacts while
+    // retaining chunks to reproduce the CI snapshot precisely.
+    {
+        var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+        });
+        defer restored.close();
+        try portable_backup.importPortable(alloc, restored.core.store, portable.items);
+
+        const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
+        defer alloc.free(chunk_prefix);
+        const chunk_records = try restored.core.store.scanPrefix(alloc, chunk_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, chunk_records);
+        try std.testing.expect(chunk_records.len > 0);
+        for (chunk_records) |chunk| {
+            const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk.key, "dv_v1");
+            defer alloc.free(embedding_key);
+            try restored.core.store.delete(embedding_key);
+        }
+
+        // A restored source checkpoint can equal the destination's first
+        // regenerated replay sequence even though the destination runtime
+        // index is empty. Repair must reset this projection boundary or the
+        // enrichment worker will skip sequence 1 as already applied.
+        try enrichment_state.saveProjectionCheckpoint(
+            restored.core.store,
+            enrichment_runtime_mod.scope_name,
+            .{ .applied_sequence = 1 },
+        );
+    }
+
+    try DB.markRestorePrimaryRestoredForPathWithArtifact(
+        alloc,
+        std.mem.span(restore_path),
+        "snap1",
+        "file:///tmp/backups",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "snapshots/snap1",
+        7001,
+    );
+    try DB.markRestoreRuntimeRepairNeeded(alloc, std.mem.span(restore_path));
+    try std.testing.expect(try DB.restoreRuntimeRepairNeededForPath(alloc, std.mem.span(restore_path)));
+
+    // Keep every repair phase isolated in writer-no-replay mode so background
+    // workers cannot accidentally make the assertion pass.
+    while (try DB.restoreRuntimeRepairNeededForPath(alloc, std.mem.span(restore_path))) {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = deterministic.interface(),
+            },
+        });
+        defer restored.close();
+
+        try std.testing.expect(try restored.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    }
+
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = deterministic.interface(),
+            },
+        });
+        defer restored.close();
+
+        const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
+        defer alloc.free(query_vec);
+        var after = try waitForSearchResult(alloc, &restored, .{
             .index_name = "dv_v1",
             .dense = .{ .vector = query_vec, .k = 3 },
             .return_mode = .parent,

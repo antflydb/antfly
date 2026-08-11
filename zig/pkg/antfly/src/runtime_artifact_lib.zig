@@ -39,6 +39,10 @@ else
     struct {};
 
 const cli_runtime = if (unit_options.unit == .cli) @import("cli_runtime.zig") else struct {};
+// Local HA administration owns storage handles and seed lifecycle artifacts.
+// Keep it with the distributed/storage unit so the small remote-client CLI
+// archive does not code-generate a second copy of the HA storage closure.
+const ha_runtime = if (unit_options.unit == .distributed) @import("cmd/ha.zig") else struct {};
 const data_runtime = if (unit_options.unit == .distributed) @import("data/runtime.zig") else struct {};
 const metadata_runtime = if (unit_options.unit == .distributed) @import("metadata/runtime.zig") else struct {};
 const serverless_runtime = if (unit_options.unit == .distributed) @import("cmd/serverless.zig") else struct {};
@@ -219,6 +223,10 @@ fn runData(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterat
     return data_runtime.runFromIterator(init, "antfly", args);
 }
 
+fn runHa(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
+    return ha_runtime.runFromIterator(init, "antfly", args);
+}
+
 fn runMetadata(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
     return metadata_runtime.runFromIterator(init, "antfly", args);
 }
@@ -242,6 +250,10 @@ fn cliEntry(context: *const bridge.Context) callconv(.c) c_int {
 
 fn dataEntry(context: *const bridge.Context) callconv(.c) c_int {
     return runtimeEntry(context, "data", runData);
+}
+
+fn haEntry(context: *const bridge.Context) callconv(.c) c_int {
+    return runtimeEntry(context, "ha", runHa);
 }
 
 fn metadataEntry(context: *const bridge.Context) callconv(.c) c_int {
@@ -297,6 +309,7 @@ comptime {
             // C ABI library names link this exact compiled artifact.
             _ = storage_kernel_exports;
             exportInternal(&dataEntry, "antfly_runtime_data");
+            exportInternal(&haEntry, "antfly_runtime_ha");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
             exportInternal(&serverlessEntry, "antfly_runtime_serverless");
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");

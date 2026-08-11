@@ -996,10 +996,19 @@ pub const Server = struct {
     /// the Io backend supports it (Kqueue on macOS, io_uring on Linux).
     /// Falls back to synchronous handling if concurrency is unavailable.
     pub fn listen(self: *Self) !void {
+        // A server is single-use once stopped. In particular, do not let a
+        // startup/shutdown race re-bind a listener after its owner has begun
+        // tearing down the handler state referenced by this server.
+        if (self.shutdown_mode.load(.acquire) != 0) return;
         if (self.listener == null) try self.bind();
+        if (self.shutdown_mode.load(.acquire) != 0) return;
         self.running = true;
         self.listen_started.store(true, .release);
         defer self.listen_started.store(false, .release);
+        if (self.shutdown_mode.load(.acquire) != 0) {
+            self.running = false;
+            return;
+        }
 
         if (self.config.tls_cert_path != null or self.config.tls_key_path != null) {
             std.debug.print("Warning: tls_cert_path/tls_key_path are set but server TLS is not yet supported (Zig 0.16). Use a TLS-terminating reverse proxy.\n", .{});
@@ -3180,6 +3189,19 @@ test "stop publishes synchronized listener-thread shutdown" {
     try std.testing.expect(server.running);
     try std.testing.expectEqual(@as(u8, 2), server.shutdown_mode.load(.acquire));
     try std.testing.expect(server.listener == null);
+
+    // The running flag belongs to an already-started listener and is cleared
+    // when that listener observes the stop. Exercise the distinct
+    // stop-before-listen race with a server that has not started yet.
+    var not_started = Server.init(allocator, std.testing.io);
+    defer not_started.deinit();
+    not_started.stop();
+
+    // A concurrent owner may call stop before the listener thread reaches
+    // listen(). That late listen must not resurrect the server.
+    try not_started.listen();
+    try std.testing.expect(!not_started.running);
+    try std.testing.expect(not_started.listener == null);
 }
 
 test "requestStop only publishes synchronized listener-thread work" {

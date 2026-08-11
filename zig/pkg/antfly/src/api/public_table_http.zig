@@ -65,6 +65,7 @@ pub const TableApi = struct {
         DenseRepairBackpressure,
         Unavailable,
         WriteUnavailable,
+        HAWriteDurabilityPending,
         OutcomeUnknown,
         CommittedPending,
         WriteOutcomeUnknown,
@@ -633,6 +634,10 @@ pub fn handleTableBatch(
         },
         error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "maintenance routes unavailable on query-only runtime") },
         error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
+        error.HAWriteDurabilityPending => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, "write committed locally; standby durability acknowledgment pending"),
+        },
         error.OutcomeUnknown => return .{
             .status = 500,
             .body = try alloc.dupe(u8, "transaction outcome is unknown; do not retry this stateless batch because it may already have committed; use a transaction session for retryable commits"),
@@ -1967,6 +1972,47 @@ test "public table batch handler preserves ambiguous write outcomes" {
 
     try std.testing.expectEqual(@as(u16, 409), resp.status);
     try std.testing.expectEqualStrings("write outcome unknown", resp.body);
+}
+
+test "public table batch handler exposes pending HA durability without claiming rollback" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) TableApi.ExecuteBatchError!void {
+            return error.HAWriteDurabilityPending;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings(
+        "write committed locally; standby durability acknowledgment pending",
+        resp.body,
+    );
 }
 
 test "public table batch handler maps doc identity unavailable errors" {

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const antfly = @import("../cli_root.zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const admin_api = antfly.admin;
 const ha = antfly.ha;
@@ -115,9 +116,23 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
 }
 
 pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+    if (argv.len > 0 and std.mem.eql(u8, argv[0], "artifact")) {
+        try runArtifactArgv(alloc, io, argv[1..]);
+        return;
+    }
     var parsed = try parseLocalArgs(alloc, argv);
     defer parsed.deinit(alloc);
     if (parsed.command_args.len == 0) return error.HaCommandMissing;
+    if (std.mem.eql(u8, parsed.command_args[0], "artifact")) {
+        if (parsed.options.remote_url != null or parsed.options.remote_token_env != null or
+            parsed.options.wantsPrimary() or parsed.options.wantsStandby() or
+            parsed.options.fence_wal != null or parsed.options.former_primary_log != null)
+        {
+            return error.SeedArtifactCannotUseAdminHandles;
+        }
+        try runArtifactArgv(alloc, io, parsed.command_args[1..]);
+        return;
+    }
 
     if (parsed.options.remote_url) |remote_url| {
         if (parsed.options.wantsPrimary() or parsed.options.wantsStandby() or
@@ -202,6 +217,498 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
 
     std.Io.File.stdout().writeStreamingAll(io, rendered.body) catch {};
     std.Io.File.stdout().writeStreamingAll(io, "\n") catch {};
+}
+
+const ArtifactAction = enum { publish, restore, verify, activate, prune, gc_source, gc_target, delete_prefix };
+
+const ArtifactFlag = enum {
+    location,
+    generation,
+    slot,
+    manifest,
+    content_root,
+    capture_receipt,
+    capture_receipt_sha256,
+    staging_root,
+    target_root,
+    capture_root,
+    slot_activation_receipt,
+    ha_cluster_id,
+    ha_shard_id,
+    ha_table_id,
+    ha_timeline_id,
+    ha_epoch,
+    minimum_checkpoint_lsn,
+    topology_id,
+    topology_generation,
+    node_id,
+    target_pvc_name,
+    target_pvc_uid,
+    target_local_node_id,
+    target_replica_id,
+    retain_generations,
+    protect_generation,
+    operation_id,
+    retry_token,
+    instance_id,
+    prefix_sha256,
+    credentials_secret_name,
+    delete_all,
+    request_sha256,
+};
+
+const PrefixCleanupOptions = struct {
+    operation_id: ?[]const u8 = null,
+    retry_token: ?[]const u8 = null,
+    instance_id: ?[]const u8 = null,
+    topology_id: ?[]const u8 = null,
+    topology_generation: ?u64 = null,
+    prefix_sha256: ?[]const u8 = null,
+    credentials_secret_name: ?[]const u8 = null,
+    delete_all: bool = false,
+    request_sha256: ?[]const u8 = null,
+
+    fn finish(self: PrefixCleanupOptions, location: ?[]const u8) !ha.seed_prefix_cleanup.Request {
+        return .{
+            .version = ha.seed_prefix_cleanup.request_version,
+            .kind = ha.seed_prefix_cleanup.request_kind,
+            .operation_id = self.operation_id orelse return error.SeedPrefixCleanupOperationIdMissing,
+            .retry_token = self.retry_token orelse return error.SeedPrefixCleanupRetryTokenMissing,
+            .instance_id = self.instance_id orelse return error.SeedPrefixCleanupInstanceIdMissing,
+            .topology_id = self.topology_id orelse return error.TopologyIdMissing,
+            .topology_generation = self.topology_generation orelse return error.TopologyGenerationMissing,
+            .location = location orelse return error.SeedLocationMissing,
+            .prefix_sha256 = self.prefix_sha256 orelse return error.SeedPrefixCleanupPrefixDigestMissing,
+            .credentials_secret_name = self.credentials_secret_name orelse return error.SeedPrefixCleanupCredentialsSecretMissing,
+            .delete_all = self.delete_all,
+            .request_sha256 = self.request_sha256 orelse return error.SeedPrefixCleanupRequestDigestMissing,
+        };
+    }
+};
+
+const ActivationBindingOptions = struct {
+    topology_id: ?[]const u8 = null,
+    topology_generation: ?u64 = null,
+    node_id: ?[]const u8 = null,
+    target_pvc_name: ?[]const u8 = null,
+    target_pvc_uid: ?[]const u8 = null,
+
+    fn requested(self: ActivationBindingOptions) bool {
+        return self.topology_id != null or self.topology_generation != null or self.node_id != null or
+            self.target_pvc_name != null or self.target_pvc_uid != null;
+    }
+
+    fn finish(self: ActivationBindingOptions) !?ha.seed_activation.ActivationBinding {
+        if (!self.requested()) return null;
+        return .{
+            .topology_id = self.topology_id orelse return error.TopologyIdMissing,
+            .topology_generation = self.topology_generation orelse return error.TopologyGenerationMissing,
+            .node_id = self.node_id orelse return error.NodeIdMissing,
+            .target_pvc_name = self.target_pvc_name orelse return error.TargetPVCNameMissing,
+            .target_pvc_uid = self.target_pvc_uid orelse return error.TargetPVCUIDMissing,
+        };
+    }
+};
+
+const ArtifactOptions = struct {
+    action: ArtifactAction,
+    location: ?[]const u8 = null,
+    generation: ?[]const u8 = null,
+    slot_name: ?[]const u8 = null,
+    manifest_path: ?[]const u8 = null,
+    content_root: ?[]const u8 = null,
+    capture_receipt_path: ?[]const u8 = null,
+    capture_receipt_sha256: ?[]const u8 = null,
+    staging_root: ?[]const u8 = null,
+    target_root: ?[]const u8 = null,
+    capture_root: ?[]const u8 = null,
+    slot_activation_receipt_path: ?[]const u8 = null,
+    identity: IdentityOptions = .{},
+    binding: ActivationBindingOptions = .{},
+    minimum_checkpoint_lsn: u64 = 0,
+    target_local_node_id: ?u64 = null,
+    target_replica_id: ?u64 = null,
+    retain_generations: usize = 2,
+    protected_generations: []const []const u8 = &.{},
+    owns_protected_generations: bool = false,
+    cleanup: PrefixCleanupOptions = .{},
+
+    fn deinit(self: *ArtifactOptions, alloc: std.mem.Allocator) void {
+        if (self.owns_protected_generations) alloc.free(self.protected_generations);
+        self.* = undefined;
+    }
+};
+
+fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+    var options = try parseArtifactArgs(alloc, argv);
+    defer options.deinit(alloc);
+
+    switch (options.action) {
+        .publish => {
+            const generation = options.generation orelse return error.SeedGenerationMissing;
+            const slot_name = options.slot_name orelse return error.SeedSlotMissing;
+            const location = options.location orelse return error.SeedLocationMissing;
+            const manifest_path = options.manifest_path orelse return error.SeedManifestMissing;
+            const content_root = options.content_root orelse return error.SeedContentRootMissing;
+            const capture_receipt_path = options.capture_receipt_path orelse return error.CaptureReceiptMissing;
+            const capture_receipt_sha256 = try requireCaptureReceiptDigest(options.capture_receipt_sha256);
+            const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
+            const manifest_bytes = try readArtifactFileAlloc(alloc, manifest_path, (ha.seed_artifact.Limits{}).max_manifest_bytes);
+            defer alloc.free(manifest_bytes);
+            const capture_receipt_json = try readArtifactFileAlloc(alloc, capture_receipt_path, (ha.seed_artifact.Limits{}).max_receipt_bytes);
+            defer alloc.free(capture_receipt_json);
+            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
+            defer opened.deinit();
+            var result = try ha.seed_artifact.publish(alloc, .{
+                .client = &opened.client,
+                .bucket = opened.bucket,
+                .prefix = opened.prefix,
+            }, .{
+                .generation = generation,
+                .slot_name = slot_name,
+                .manifest_bytes = manifest_bytes,
+                .content_root = content_root,
+                .capture_receipt_json = capture_receipt_json,
+                .capture_receipt_sha256 = capture_receipt_sha256,
+                .binding = binding,
+            });
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.receipt_json);
+        },
+        .restore => {
+            const generation = options.generation orelse return error.SeedGenerationMissing;
+            const slot_name = options.slot_name orelse return error.SeedSlotMissing;
+            const location = options.location orelse return error.SeedLocationMissing;
+            const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
+            const capture_receipt_sha256 = try requireCaptureReceiptDigest(options.capture_receipt_sha256);
+            const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
+            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
+            defer opened.deinit();
+            var result = try ha.seed_artifact.restoreToStaging(alloc, .{
+                .client = &opened.client,
+                .bucket = opened.bucket,
+                .prefix = opened.prefix,
+            }, .{
+                .expected = .{
+                    .generation = generation,
+                    .slot_name = slot_name,
+                    .identity = try options.identity.finish(),
+                    .minimum_checkpoint_lsn = options.minimum_checkpoint_lsn,
+                    .binding = binding,
+                    .capture_receipt_sha256 = capture_receipt_sha256,
+                },
+                .staging_root = staging_root,
+            });
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.receipt_json);
+        },
+        .verify => {
+            const generation = options.generation orelse return error.SeedGenerationMissing;
+            const slot_name = options.slot_name orelse return error.SeedSlotMissing;
+            const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
+            const capture_receipt_sha256 = try requireCaptureReceiptDigest(options.capture_receipt_sha256);
+            const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
+            try ha.seed_artifact.verifyStaged(alloc, staging_root, .{
+                .generation = generation,
+                .slot_name = slot_name,
+                .identity = try options.identity.finish(),
+                .minimum_checkpoint_lsn = options.minimum_checkpoint_lsn,
+                .binding = binding,
+                .capture_receipt_sha256 = capture_receipt_sha256,
+            }, .{});
+            std.Io.File.stdout().writeStreamingAll(io, "{\"verified\":true}\n") catch {};
+        },
+        .activate => {
+            const generation = options.generation orelse return error.SeedGenerationMissing;
+            const slot_name = options.slot_name orelse return error.SeedSlotMissing;
+            const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
+            const target_root = options.target_root orelse return error.SeedActivationTargetMissing;
+            const capture_receipt_sha256 = try requireCaptureReceiptDigest(options.capture_receipt_sha256);
+            const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
+            const target_local_node_id = options.target_local_node_id orelse return error.TargetLocalNodeIdMissing;
+            const target_replica_id = options.target_replica_id orelse return error.TargetReplicaIdMissing;
+            if (target_local_node_id == 0) return error.InvalidTargetLocalNodeId;
+            if (target_replica_id == 0) return error.InvalidTargetReplicaId;
+            var result = try ha.seed_activation.activate(alloc, .{
+                .staging_root = staging_root,
+                .target_root = target_root,
+                .expected = .{
+                    .generation = generation,
+                    .slot_name = slot_name,
+                    .identity = try options.identity.finish(),
+                    .minimum_checkpoint_lsn = options.minimum_checkpoint_lsn,
+                    .binding = binding,
+                    .capture_receipt_sha256 = capture_receipt_sha256,
+                },
+                .binding = binding,
+                .materialization = .{
+                    .target_local_node_id = target_local_node_id,
+                    .target_replica_id = target_replica_id,
+                },
+                .pod_uid = try resolveHAPodUID(),
+            });
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.active_receipt_json);
+        },
+        .prune => {
+            const generation = options.generation orelse return error.SeedGenerationMissing;
+            const slot_name = options.slot_name orelse return error.SeedSlotMissing;
+            const location = options.location orelse return error.SeedLocationMissing;
+            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
+            defer opened.deinit();
+            var result = try ha.seed_artifact.prune(alloc, .{
+                .client = &opened.client,
+                .bucket = opened.bucket,
+                .prefix = opened.prefix,
+            }, .{
+                .slot_name = slot_name,
+                .current_generation = generation,
+                .retain_generations = options.retain_generations,
+            });
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.result_json);
+        },
+        .gc_source => {
+            const generation = options.generation orelse return error.SeedGenerationMissing;
+            const slot_name = options.slot_name orelse return error.SeedSlotMissing;
+            const location = options.location orelse return error.SeedLocationMissing;
+            const capture_root = options.capture_root orelse return error.SeedCaptureRootMissing;
+            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
+            defer opened.deinit();
+            var result = try ha.seed_capture.prunePublishedGenerations(alloc, .{
+                .store = .{
+                    .client = &opened.client,
+                    .bucket = opened.bucket,
+                    .prefix = opened.prefix,
+                },
+                .capture_root = capture_root,
+                .generation = generation,
+                .slot_name = slot_name,
+                .protected_generations = options.protected_generations,
+                .retain_generations = options.retain_generations,
+            });
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.result_json);
+        },
+        .gc_target => {
+            const target_root = options.target_root orelse return error.SeedActivationTargetMissing;
+            const receipt_path = options.slot_activation_receipt_path orelse
+                return error.SeedActivationCheckpointMissing;
+            var result = try ha.seed_activation.pruneActivatedGenerations(alloc, .{
+                .target_root = target_root,
+                .slot_activation_receipt_path = receipt_path,
+                .protected_generations = options.protected_generations,
+                .retain_generations = options.retain_generations,
+            });
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.result_json);
+        },
+        .delete_prefix => {
+            const request = try options.cleanup.finish(options.location);
+            // Validate every controller-bound field and digest before opening a
+            // remote client, so malformed cleanup authority has no side effect.
+            try ha.seed_prefix_cleanup.validateRequestAuthority(alloc, request);
+            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initExistingS3RemoteUri(alloc, request.location);
+            defer opened.deinit();
+            var result = try ha.seed_prefix_cleanup.deleteAll(alloc, .{
+                .client = &opened.client,
+                .bucket = opened.bucket,
+                .prefix = opened.prefix,
+            }, request, .{});
+            defer result.deinit(alloc);
+            try writeArtifactResult(io, result.receipt_json);
+        },
+    }
+}
+
+fn parseArtifactArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ArtifactOptions {
+    if (argv.len == 0) return error.SeedArtifactActionMissing;
+    var options = ArtifactOptions{ .action = if (std.mem.eql(u8, argv[0], "publish"))
+        .publish
+    else if (std.mem.eql(u8, argv[0], "restore"))
+        .restore
+    else if (std.mem.eql(u8, argv[0], "verify"))
+        .verify
+    else if (std.mem.eql(u8, argv[0], "activate"))
+        .activate
+    else if (std.mem.eql(u8, argv[0], "prune"))
+        .prune
+    else if (std.mem.eql(u8, argv[0], "gc-source"))
+        .gc_source
+    else if (std.mem.eql(u8, argv[0], "gc-target"))
+        .gc_target
+    else if (std.mem.eql(u8, argv[0], "delete-prefix"))
+        .delete_prefix
+    else
+        return error.InvalidSeedArtifactAction };
+    var protected_generations = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer protected_generations.deinit(alloc);
+    var seen_flags = std.EnumSet(ArtifactFlag).initEmpty();
+    var idx: usize = 1;
+    while (idx < argv.len) {
+        const raw_flag = argv[idx];
+        idx += 1;
+        const flag = artifactFlag(raw_flag) orelse return error.InvalidSeedArtifactFlag;
+        if (!artifactFlagAllowed(options.action, flag)) return error.SeedArtifactFlagNotAllowedForAction;
+        if (flag != .protect_generation) {
+            if (seen_flags.contains(flag)) return error.DuplicateSeedArtifactFlag;
+            seen_flags.insert(flag);
+        }
+        switch (flag) {
+            .location => options.location = try artifactValue(argv, &idx),
+            .generation => options.generation = try artifactValue(argv, &idx),
+            .slot => options.slot_name = try artifactValue(argv, &idx),
+            .manifest => options.manifest_path = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .content_root => options.content_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .capture_receipt => options.capture_receipt_path = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .capture_receipt_sha256 => options.capture_receipt_sha256 = try artifactValue(argv, &idx),
+            .staging_root => options.staging_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .target_root => options.target_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .capture_root => options.capture_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .slot_activation_receipt => options.slot_activation_receipt_path = try absoluteArtifactPath(try artifactValue(argv, &idx)),
+            .ha_cluster_id => options.identity.cluster_id = try parseU64(try artifactValue(argv, &idx)),
+            .ha_shard_id => options.identity.shard_id = try parseU64(try artifactValue(argv, &idx)),
+            .ha_table_id => options.identity.table_id = try parseU64(try artifactValue(argv, &idx)),
+            .ha_timeline_id => options.identity.timeline_id = try parseU64(try artifactValue(argv, &idx)),
+            .ha_epoch => options.identity.epoch = try parseU64(try artifactValue(argv, &idx)),
+            .minimum_checkpoint_lsn => options.minimum_checkpoint_lsn = try parseU64(try artifactValue(argv, &idx)),
+            .topology_id => {
+                const raw = try artifactValue(argv, &idx);
+                if (options.action == .delete_prefix)
+                    options.cleanup.topology_id = raw
+                else
+                    options.binding.topology_id = raw;
+            },
+            .topology_generation => {
+                const raw = try parseU64(try artifactValue(argv, &idx));
+                if (options.action == .delete_prefix)
+                    options.cleanup.topology_generation = raw
+                else
+                    options.binding.topology_generation = raw;
+            },
+            .node_id => options.binding.node_id = try artifactValue(argv, &idx),
+            .target_pvc_name => options.binding.target_pvc_name = try artifactValue(argv, &idx),
+            .target_pvc_uid => options.binding.target_pvc_uid = try artifactValue(argv, &idx),
+            .target_local_node_id => options.target_local_node_id = try parseU64(try artifactValue(argv, &idx)),
+            .target_replica_id => options.target_replica_id = try parseU64(try artifactValue(argv, &idx)),
+            .retain_generations => {
+                options.retain_generations = std.math.cast(usize, try parseU64(try artifactValue(argv, &idx))) orelse return error.InvalidSeedRetention;
+                if (options.retain_generations == 0) return error.InvalidSeedRetention;
+            },
+            .protect_generation => {
+                const generation = try artifactValue(argv, &idx);
+                if (!ha_validation.isIdentifier(generation)) return error.InvalidProtectedSeedGeneration;
+                if (protected_generations.items.len >= 256) return error.TooManyProtectedSeedGenerations;
+                for (protected_generations.items) |previous| {
+                    if (std.mem.eql(u8, previous, generation)) return error.DuplicateProtectedSeedGeneration;
+                }
+                try protected_generations.append(alloc, generation);
+            },
+            .operation_id => options.cleanup.operation_id = try artifactValue(argv, &idx),
+            .retry_token => options.cleanup.retry_token = try artifactValue(argv, &idx),
+            .instance_id => options.cleanup.instance_id = try artifactValue(argv, &idx),
+            .prefix_sha256 => options.cleanup.prefix_sha256 = try artifactValue(argv, &idx),
+            .credentials_secret_name => options.cleanup.credentials_secret_name = try artifactValue(argv, &idx),
+            .delete_all => options.cleanup.delete_all = true,
+            .request_sha256 => options.cleanup.request_sha256 = try artifactValue(argv, &idx),
+        }
+    }
+    options.protected_generations = try protected_generations.toOwnedSlice(alloc);
+    options.owns_protected_generations = true;
+    return options;
+}
+
+fn artifactFlag(raw: []const u8) ?ArtifactFlag {
+    const names = std.StaticStringMap(ArtifactFlag).initComptime(.{
+        .{ "--location", .location },
+        .{ "--generation", .generation },
+        .{ "--slot", .slot },
+        .{ "--manifest", .manifest },
+        .{ "--content-root", .content_root },
+        .{ "--capture-receipt", .capture_receipt },
+        .{ "--capture-receipt-sha256", .capture_receipt_sha256 },
+        .{ "--staging-root", .staging_root },
+        .{ "--target-root", .target_root },
+        .{ "--capture-root", .capture_root },
+        .{ "--slot-activation-receipt", .slot_activation_receipt },
+        .{ "--ha-cluster-id", .ha_cluster_id },
+        .{ "--ha-shard-id", .ha_shard_id },
+        .{ "--ha-table-id", .ha_table_id },
+        .{ "--ha-timeline-id", .ha_timeline_id },
+        .{ "--ha-epoch", .ha_epoch },
+        .{ "--minimum-checkpoint-lsn", .minimum_checkpoint_lsn },
+        .{ "--topology-id", .topology_id },
+        .{ "--topology-generation", .topology_generation },
+        .{ "--node-id", .node_id },
+        .{ "--target-pvc-name", .target_pvc_name },
+        .{ "--target-pvc-uid", .target_pvc_uid },
+        .{ "--target-local-node-id", .target_local_node_id },
+        .{ "--target-replica-id", .target_replica_id },
+        .{ "--retain-generations", .retain_generations },
+        .{ "--protect-generation", .protect_generation },
+        .{ "--operation-id", .operation_id },
+        .{ "--retry-token", .retry_token },
+        .{ "--instance-id", .instance_id },
+        .{ "--prefix-sha256", .prefix_sha256 },
+        .{ "--credentials-secret-name", .credentials_secret_name },
+        .{ "--delete-all", .delete_all },
+        .{ "--request-sha256", .request_sha256 },
+    });
+    return names.get(raw);
+}
+
+fn artifactFlagAllowed(action: ArtifactAction, flag: ArtifactFlag) bool {
+    return switch (flag) {
+        .location => action == .publish or action == .restore or action == .prune or action == .gc_source or action == .delete_prefix,
+        .generation, .slot => action != .gc_target and action != .delete_prefix,
+        .manifest, .content_root => action == .publish,
+        .capture_receipt => action == .publish,
+        .capture_receipt_sha256 => action == .publish or action == .restore or action == .verify or action == .activate,
+        .staging_root => action == .restore or action == .verify or action == .activate,
+        .target_root => action == .activate or action == .gc_target,
+        .capture_root => action == .gc_source,
+        .slot_activation_receipt => action == .gc_target,
+        .ha_cluster_id, .ha_shard_id, .ha_table_id, .ha_timeline_id, .ha_epoch, .minimum_checkpoint_lsn => action == .restore or action == .verify or action == .activate,
+        .topology_id, .topology_generation => action == .publish or action == .restore or action == .verify or action == .activate or action == .delete_prefix,
+        .node_id, .target_pvc_name, .target_pvc_uid => action == .publish or action == .restore or action == .verify or action == .activate,
+        .target_local_node_id, .target_replica_id => action == .activate,
+        .retain_generations => action == .prune or action == .gc_source or action == .gc_target,
+        .protect_generation => action == .gc_source or action == .gc_target,
+        .operation_id, .retry_token, .instance_id, .prefix_sha256, .credentials_secret_name, .delete_all, .request_sha256 => action == .delete_prefix,
+    };
+}
+
+fn artifactValue(argv: []const []const u8, idx: *usize) ![]const u8 {
+    if (idx.* >= argv.len) return error.FlagValueMissing;
+    const out = argv[idx.*];
+    idx.* += 1;
+    return out;
+}
+
+fn absoluteArtifactPath(path: []const u8) ![]const u8 {
+    if (!ha_validation.isAbsoluteNormalizedPath(path)) return error.InvalidSeedArtifactPath;
+    return path;
+}
+
+fn requireCaptureReceiptDigest(raw_digest: ?[]const u8) ![]const u8 {
+    const digest = raw_digest orelse return error.CaptureReceiptDigestMissing;
+    if (digest.len != Sha256.digest_length * 2) return error.InvalidCaptureReceiptDigest;
+    for (digest) |byte| {
+        if ((byte < '0' or byte > '9') and (byte < 'a' or byte > 'f'))
+            return error.InvalidCaptureReceiptDigest;
+    }
+    return digest;
+}
+
+fn readArtifactFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_bytes));
+}
+
+fn writeArtifactResult(io: std.Io, body: []const u8) !void {
+    std.Io.File.stdout().writeStreamingAll(io, body) catch return error.SeedArtifactOutputFailed;
+    std.Io.File.stdout().writeStreamingAll(io, "\n") catch return error.SeedArtifactOutputFailed;
 }
 
 fn runRemoteArgv(
@@ -974,6 +1481,13 @@ fn resolveRemoteBearerToken(alloc: std.mem.Allocator, options: LocalOptions) !?[
     return try alloc.dupe(u8, token);
 }
 
+fn resolveHAPodUID() !?[]const u8 {
+    const raw_z = std.c.getenv("ANTFLY_POD_UID") orelse return null;
+    const pod_uid = std.mem.trim(u8, std.mem.span(raw_z), " \t\r\n");
+    if (!ha_validation.isIdentifier(pod_uid)) return error.HAPodUIDInvalid;
+    return pod_uid;
+}
+
 const HAPathField = enum {
     primary_log,
     primary_slots,
@@ -1078,13 +1592,19 @@ fn printUsage(argv0: []const u8) void {
         \\  --ha-epoch N
         \\
         \\examples:
+        \\  {s} ha artifact publish --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --manifest /source/manifest.afha --content-root /source/content
+        \\  {s} ha artifact restore --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --staging-root /target/seed --ha-cluster-id 1 --ha-shard-id 0 --ha-table-id 0 --ha-timeline-id 1 --ha-epoch 1 --minimum-checkpoint-lsn 42
+        \\  {s} ha artifact activate --generation seed-standby-a-42 --slot standby-a --staging-root /target/.antfly-ha/staging --target-root /target --target-local-node-id 2 --target-replica-id 1 --ha-cluster-id 1 --ha-shard-id 0 --ha-table-id 0 --ha-timeline-id 1 --ha-epoch 1 --minimum-checkpoint-lsn 42
+        \\  {s} ha artifact prune --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --retain-generations 2
+        \\  {s} ha artifact gc-source --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --capture-root /source/.antfly-ha/captures --retain-generations 2 --protect-generation seed-standby-a-41
+        \\  {s} ha artifact gc-target --target-root /target --slot-activation-receipt /checkpoint/seeded-slot-activation.json --retain-generations 2 --protect-generation seed-standby-a-41
         \\  {s} ha --ha-url http://127.0.0.1:8081 --ha-token-env ANTFLY_HA_ADMIN_TOKEN -- status primary
         \\  {s} ha --primary-log /var/lib/antfly/ha/primary.wal --primary-slots /var/lib/antfly/ha/slots --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- slot list
         \\  {s} ha --standby-log /var/lib/antfly/ha/standby.wal --standby-progress /var/lib/antfly/ha/progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- status standby
         \\  {s} ha --primary-log /var/lib/antfly/ha/primary.wal --primary-slots /var/lib/antfly/ha/slots --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- write check --role primary
         \\  {s} ha --standby-log /var/lib/antfly/ha/standby.wal --standby-progress /var/lib/antfly/ha/progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- owner-job check --role standby --kind derived-effect-writer
         \\
-    , .{ argv0, argv0, argv0, argv0, argv0, argv0 });
+    , .{ argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0 });
 }
 
 test "ha cmd parses local handles before admin command" {
@@ -1145,6 +1665,277 @@ test "ha cmd local handles default shard and table identity to whole instance" {
     try std.testing.expectEqual(@as(u64, 0), standby_identity.table_id);
     try std.testing.expectEqual(@as(u64, 1), standby_identity.timeline_id);
     try std.testing.expectEqual(@as(u64, 2), standby_identity.epoch);
+}
+
+test "ha cmd artifact parses offline seed activation target and identity" {
+    const alloc = std.testing.allocator;
+    var options = try parseArtifactArgs(alloc, &.{
+        "activate",
+        "--generation",
+        "seed-standby-a-10",
+        "--slot",
+        "standby-a",
+        "--staging-root",
+        "/target/.antfly-ha/staging",
+        "--target-root",
+        "/target",
+        "--ha-cluster-id",
+        "100",
+        "--ha-shard-id",
+        "0",
+        "--ha-table-id",
+        "0",
+        "--ha-timeline-id",
+        "4",
+        "--ha-epoch",
+        "6",
+        "--minimum-checkpoint-lsn",
+        "10",
+        "--topology-id",
+        "topology-a",
+        "--topology-generation",
+        "3",
+        "--node-id",
+        "standby-a",
+        "--target-pvc-name",
+        "standby-a-data",
+        "--target-pvc-uid",
+        "pvc-uid-1",
+        "--target-local-node-id",
+        "77",
+        "--target-replica-id",
+        "9",
+    });
+    defer options.deinit(alloc);
+    try std.testing.expectEqual(ArtifactAction.activate, options.action);
+    try std.testing.expectEqualStrings("/target/.antfly-ha/staging", options.staging_root.?);
+    try std.testing.expectEqualStrings("/target", options.target_root.?);
+    try std.testing.expectEqual(@as(u64, 100), options.identity.cluster_id.?);
+    try std.testing.expectEqual(@as(u64, 10), options.minimum_checkpoint_lsn);
+    try std.testing.expectEqualStrings("topology-a", options.binding.topology_id.?);
+    try std.testing.expectEqual(@as(u64, 3), options.binding.topology_generation.?);
+    try std.testing.expectEqualStrings("pvc-uid-1", options.binding.target_pvc_uid.?);
+    try std.testing.expect(@hasField(ArtifactOptions, "target_local_node_id"));
+    try std.testing.expect(@hasField(ArtifactOptions, "target_replica_id"));
+    try std.testing.expectEqual(@as(u64, 77), options.target_local_node_id.?);
+    try std.testing.expectEqual(@as(u64, 9), options.target_replica_id.?);
+}
+
+test "ha cmd artifact accepts portable publish and restore topology pvc binding" {
+    const alloc = std.testing.allocator;
+    const binding_args = [_][]const u8{
+        "--topology-id",         "topology-a",
+        "--topology-generation", "9",
+        "--node-id",             "primary-a",
+        "--target-pvc-name",     "standby-a-data",
+        "--target-pvc-uid",      "pvc-uid-9",
+    };
+    var publish_argv = std.ArrayListUnmanaged([]const u8).empty;
+    defer publish_argv.deinit(alloc);
+    try publish_argv.appendSlice(alloc, &.{
+        "publish",        "--location",      "s3://ha-seeds/topology-a",
+        "--generation",   "seed-9",          "--slot",
+        "standby-a",      "--manifest",      "/source/manifest.afha",
+        "--content-root", "/source/content",
+    });
+    try publish_argv.appendSlice(alloc, &binding_args);
+    var publish = try parseArtifactArgs(alloc, publish_argv.items);
+    defer publish.deinit(alloc);
+    const publish_binding = (try publish.binding.finish()) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("topology-a", publish_binding.topology_id);
+    try std.testing.expectEqual(@as(u64, 9), publish_binding.topology_generation);
+    try std.testing.expectEqualStrings("pvc-uid-9", publish_binding.target_pvc_uid);
+
+    var restore_argv = std.ArrayListUnmanaged([]const u8).empty;
+    defer restore_argv.deinit(alloc);
+    try restore_argv.appendSlice(alloc, &.{
+        "restore",         "--location",     "s3://ha-seeds/topology-a",
+        "--generation",    "seed-9",         "--slot",
+        "standby-a",       "--staging-root", "/target/staging",
+        "--ha-cluster-id", "1",              "--ha-timeline-id",
+        "1",               "--ha-epoch",     "1",
+    });
+    try restore_argv.appendSlice(alloc, &binding_args);
+    var restore = try parseArtifactArgs(alloc, restore_argv.items);
+    defer restore.deinit(alloc);
+    try std.testing.expect((try restore.binding.finish()) != null);
+}
+
+test "ha cmd artifact requires capture receipt digest chain flags" {
+    const alloc = std.testing.allocator;
+    var options = try parseArtifactArgs(alloc, &.{
+        "publish",
+        "--location",
+        "s3://ha-seeds/topology-a",
+        "--generation",
+        "seed-9",
+        "--slot",
+        "standby-a",
+        "--manifest",
+        "/source/manifest.afha",
+        "--content-root",
+        "/source/content",
+        "--capture-receipt",
+        "/source/COMPLETE.json",
+        "--capture-receipt-sha256",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--topology-id",
+        "topology-a",
+        "--topology-generation",
+        "9",
+        "--node-id",
+        "primary-a",
+        "--target-pvc-name",
+        "standby-a-data",
+        "--target-pvc-uid",
+        "pvc-uid-9",
+    });
+    defer options.deinit(alloc);
+    try std.testing.expect(@hasField(ArtifactOptions, "capture_receipt_path"));
+    try std.testing.expect(@hasField(ArtifactOptions, "capture_receipt_sha256"));
+    try std.testing.expectEqualStrings("/source/COMPLETE.json", options.capture_receipt_path.?);
+    try std.testing.expectEqualStrings(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        options.capture_receipt_sha256.?,
+    );
+    try std.testing.expectEqualStrings(
+        options.capture_receipt_sha256.?,
+        try requireCaptureReceiptDigest(options.capture_receipt_sha256),
+    );
+}
+
+test "ha cmd artifact parses lifecycle-gated source and target generation gc actions" {
+    const alloc = std.testing.allocator;
+    var source = try parseArtifactArgs(alloc, &.{
+        "gc-source",
+        "--location",
+        "s3://ha-seeds/cluster-a",
+        "--generation",
+        "seed-standby-a-42",
+        "--slot",
+        "standby-a",
+        "--capture-root",
+        "/source/.antfly-ha/captures",
+        "--retain-generations",
+        "2",
+        "--protect-generation",
+        "seed-standby-a-41",
+        "--protect-generation",
+        "seed-standby-a-40",
+    });
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(ArtifactAction.gc_source, source.action);
+    try std.testing.expectEqualStrings("/source/.antfly-ha/captures", source.capture_root.?);
+    try std.testing.expectEqual(@as(usize, 2), source.protected_generations.len);
+
+    var target = try parseArtifactArgs(alloc, &.{
+        "gc-target",
+        "--target-root",
+        "/target",
+        "--slot-activation-receipt",
+        "/checkpoint/seeded-slot-activation.json",
+        "--retain-generations",
+        "2",
+        "--protect-generation",
+        "seed-standby-a-41",
+    });
+    defer target.deinit(alloc);
+    try std.testing.expectEqual(ArtifactAction.gc_target, target.action);
+    try std.testing.expectEqualStrings("/checkpoint/seeded-slot-activation.json", target.slot_activation_receipt_path.?);
+    try std.testing.expectEqual(@as(usize, 1), target.protected_generations.len);
+}
+
+test "ha cmd artifact parses exact controller-authorized seed prefix deletion" {
+    const alloc = std.testing.allocator;
+    var options = try parseArtifactArgs(alloc, &.{
+        "delete-prefix",
+        "--location",
+        "s3://ha-bucket/instances/instance-a/ha-seeds/",
+        "--operation-id",
+        "ha-seed-delete-0123456789abcdef0123456789abcdef",
+        "--retry-token",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--instance-id",
+        "instance-a",
+        "--topology-id",
+        "topology-a",
+        "--topology-generation",
+        "7",
+        "--prefix-sha256",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "--credentials-secret-name",
+        "instance-a-ha-seed-store",
+        "--delete-all",
+        "--request-sha256",
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    });
+    defer options.deinit(alloc);
+    try std.testing.expectEqual(ArtifactAction.delete_prefix, options.action);
+    try std.testing.expectEqualStrings("instance-a", options.cleanup.instance_id.?);
+    try std.testing.expectEqualStrings("topology-a", options.cleanup.topology_id.?);
+    try std.testing.expectEqual(@as(u64, 7), options.cleanup.topology_generation.?);
+    try std.testing.expect(options.cleanup.delete_all);
+
+    try std.testing.expectError(error.SeedArtifactFlagNotAllowedForAction, parseArtifactArgs(alloc, &.{
+        "delete-prefix",
+        "--generation",
+        "seed-a",
+    }));
+    try std.testing.expectError(error.DuplicateSeedArtifactFlag, parseArtifactArgs(alloc, &.{
+        "delete-prefix",
+        "--delete-all",
+        "--delete-all",
+    }));
+}
+
+test "ha cmd artifact rejects flags that the selected action would ignore" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.SeedArtifactFlagNotAllowedForAction, parseArtifactArgs(alloc, &.{
+        "prune",
+        "--location",
+        "s3://ha-seeds/cluster-a",
+        "--generation",
+        "seed-standby-a-42",
+        "--slot",
+        "standby-a",
+        "--protect-generation",
+        "seed-standby-a-41",
+    }));
+    try std.testing.expectError(error.SeedArtifactFlagNotAllowedForAction, parseArtifactArgs(alloc, &.{
+        "gc-source",
+        "--target-root",
+        "/target",
+    }));
+    try std.testing.expectError(error.SeedArtifactFlagNotAllowedForAction, parseArtifactArgs(alloc, &.{
+        "gc-target",
+        "--generation",
+        "seed-standby-a-42",
+    }));
+    try std.testing.expectError(error.SeedArtifactFlagNotAllowedForAction, parseArtifactArgs(alloc, &.{
+        "publish",
+        "--retain-generations",
+        "2",
+    }));
+}
+
+test "ha cmd artifact rejects duplicate single-valued flags" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.DuplicateSeedArtifactFlag, parseArtifactArgs(alloc, &.{
+        "gc-source",
+        "--generation",
+        "seed-standby-a-42",
+        "--generation",
+        "seed-standby-a-43",
+    }));
+    try std.testing.expectError(error.DuplicateProtectedSeedGeneration, parseArtifactArgs(alloc, &.{
+        "gc-target",
+        "--protect-generation",
+        "seed-standby-a-41",
+        "--protect-generation",
+        "seed-standby-a-41",
+    }));
 }
 
 test "ha cmd parses remote admin URL before command" {
@@ -1335,6 +2126,10 @@ test "ha cmd remote commands prefer typed admin routes" {
     }, recorder.executor());
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_standby_bootstrap);
+    // Production bootstrap keeps the seed slot in the seeding lifecycle until
+    // the target has durably published its activation receipt. Model that
+    // explicit transition before asking the standby to consume later WAL.
+    try primary.activateSeededSlot("standby-seed", testIdentity().timeline_id, 2, 2, 2);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "status",
@@ -1406,6 +2201,16 @@ test "ha cmd remote commands prefer typed admin routes" {
     }, recorder.executor());
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_commit_append);
+
+    // Fence acquisition upgrades the caller's stale observation to the former
+    // primary's live durable tail. Catch the standby up before promotion so the
+    // integration test proves that stronger boundary is honored end to end.
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "stream",
+        "once",
+        "--slot",
+        "standby-seed",
+    }, recorder.executor());
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "commit",

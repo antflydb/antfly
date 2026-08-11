@@ -39,6 +39,7 @@ pub fn classifyHAString(value_or_null: ?[]const u8) HAStringValidation {
 
 pub fn isIdentifier(raw: []const u8) bool {
     if (raw.len == 0 or raw.len > 128) return false;
+    if (std.mem.eql(u8, raw, ".") or std.mem.eql(u8, raw, "..")) return false;
     for (raw) |byte| {
         if (!isIdentifierByte(byte)) return false;
     }
@@ -138,6 +139,8 @@ test "storage.ha validation checks identifiers env names and normalized paths" {
     try std.testing.expect(isIdentifier("primary-a.1:zone"));
     try std.testing.expect(!isIdentifier("primary a"));
     try std.testing.expect(!isIdentifier(""));
+    try std.testing.expect(!isIdentifier("."));
+    try std.testing.expect(!isIdentifier(".."));
 
     try std.testing.expect(isEnvVarName("ANTFLY_HA_ADMIN_TOKEN"));
     try std.testing.expect(isEnvVarName("_ANTFLY9"));

@@ -16,13 +16,11 @@
 
 const std = @import("std");
 const client = @import("client_runtime.zig");
-const ha = @import("cmd/ha.zig");
 
 pub fn runFromIterator(
     init: std.process.Init,
     command: []const u8,
     args: *std.process.Args.Iterator,
 ) !void {
-    if (std.mem.eql(u8, command, "ha")) return ha.runFromIterator(init, "antfly", args);
     return client.runFromIterator(init, command, args);
 }

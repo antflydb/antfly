@@ -2787,6 +2787,12 @@ pub const IndexManager = struct {
         return self.repair_unavailable_indexes.contains(name);
     }
 
+    pub fn hasRepairUnavailableIndexes(self: *IndexManager) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return self.repair_unavailable_indexes.count() != 0;
+    }
+
     fn clearRepairUnavailableIndexes(self: *IndexManager) void {
         var it = self.repair_unavailable_indexes.keyIterator();
         while (it.next()) |key| self.alloc.free(key.*);

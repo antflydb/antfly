@@ -340,6 +340,7 @@ fn commandErrorStatus(err: anyerror) u16 {
     return switch (err) {
         error.PrimaryUnavailable,
         error.SlotAlreadyExists,
+        error.SlotSeeding,
         error.SlotInactive,
         error.SlotRequiresReseed,
         error.WalNoLongerRetained,
@@ -519,6 +520,50 @@ test "storage.ha internal http adapter serves replication pull and status update
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+}
+
+test "storage.ha internal http adapter reports seeding slot as a lifecycle conflict" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "seeding-slot-conflict");
+    defer paths.deinit(alloc);
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    const backup = try primary.beginBaseBackup(.{
+        .slot_name = "standby-a",
+        .manifest_id = "base-standby-a",
+    });
+
+    var server = Server.init(alloc, &primary);
+    const start_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"slot_name\":\"standby-a\",\"from_lsn\":{d},\"max_records\":1}}",
+        .{backup.backup_lsn + 1},
+    );
+    defer alloc.free(start_body);
+    var start = try server.handle(.{
+        .method = .POST,
+        .uri = internal_api.routes.ha_replication_start,
+        .body = start_body,
+    });
+    defer start.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), start.status);
+    try std.testing.expectEqualStrings("SlotSeeding", start.body);
+
+    const status_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"slot_name\":\"standby-a\",\"timeline_id\":1,\"received_lsn\":{d},\"applied_lsn\":{d},\"safe_read_lsn\":{d}}}",
+        .{ backup.backup_lsn, backup.backup_lsn, backup.backup_lsn },
+    );
+    defer alloc.free(status_body);
+    var status = try server.handle(.{
+        .method = .POST,
+        .uri = internal_api.routes.ha_replication_status,
+        .body = status_body,
+    });
+    defer status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), status.status);
+    try std.testing.expectEqualStrings("SlotSeeding", status.body);
 }
 
 fn generatedRoutePathAlloc(alloc: Allocator, path: []const u8) ![]u8 {

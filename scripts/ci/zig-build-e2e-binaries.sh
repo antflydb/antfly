@@ -28,9 +28,12 @@ export ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$repo_root/zig/.zig-cache}"
 export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-/tmp/antfly-ci-zig-global}"
 mkdir -p "$HOME" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 
-target="${ANTFLY_CI_ZIG_TARGET:-x86_64-linux-gnu}"
 cpu="${ANTFLY_CI_ZIG_CPU:-baseline}"
 optimize="${ANTFLY_CI_ZIG_OPTIMIZE:-Debug}"
+target_args=()
+if [[ -n "${ANTFLY_CI_ZIG_TARGET:-}" ]]; then
+  target_args+=("-Dtarget=$ANTFLY_CI_ZIG_TARGET")
+fi
 strip="${ANTFLY_CI_ZIG_STRIP:-false}"
 build_capi="${ANTFLY_CI_BUILD_CAPI:-false}"
 
@@ -60,7 +63,7 @@ if [[ "$build_capi" == "true" ]]; then
 fi
 
 python3 tools/run_bounded_zig_build.py --zig zig -- build \
-  -Dtarget="$target" \
+  "${target_args[@]}" \
   -Dcpu="$cpu" \
   -Doptimize="$optimize" \
   -Dstrip="$strip" \

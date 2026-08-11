@@ -62,14 +62,14 @@ fn mainImpl(init: std.process.Init) !void {
     // Server-side subcommands dispatch into independently generated runtime
     // units through the narrow internal ABI.
     if (std.mem.eql(u8, subcommand, "data")) return runRuntimeUnit(.data, subcommand, init, &args);
-    if (std.mem.eql(u8, subcommand, "ha")) return runRuntimeUnit(.cli, subcommand, init, &args);
+    if (std.mem.eql(u8, subcommand, "ha")) return runRuntimeUnit(.ha, subcommand, init, &args);
     if (std.mem.eql(u8, subcommand, "inference")) return runRuntimeUnit(.inference, subcommand, init, &args);
     // Lite serve embeds the standalone runtime, so keep the entire Lite
     // command in that codegen unit instead of pulling it into the CLI.
     if (std.mem.eql(u8, subcommand, "lite")) return runRuntimeUnit(.standalone, subcommand, init, &args);
     if (std.mem.eql(u8, subcommand, "metadata")) return runRuntimeUnit(.metadata, subcommand, init, &args);
     if (std.mem.eql(u8, subcommand, "serverless")) return runRuntimeUnit(.serverless, subcommand, init, &args);
-    if (std.mem.eql(u8, subcommand, "standalone")) return runRuntimeUnit(.standalone, subcommand, init, &args);
+    if (isStandaloneSubcommand(subcommand)) return runRuntimeUnit(.standalone, subcommand, init, &args);
 
     if (std.mem.eql(u8, subcommand, "cloud")) {
         const code = try runAntflyCloud(init.gpa, init.io, &args);
@@ -94,10 +94,11 @@ fn mainImpl(init: std.process.Init) !void {
     return error.InvalidArguments;
 }
 
-const RuntimeRole = enum { cli, data, inference, metadata, serverless, standalone };
+const RuntimeRole = enum { cli, data, ha, inference, metadata, serverless, standalone };
 
 extern fn antfly_runtime_cli(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_ha(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_inference(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
@@ -132,12 +133,23 @@ fn runRuntimeUnit(
     const code = switch (role) {
         .cli => antfly_runtime_cli(&context),
         .data => antfly_runtime_data(&context),
+        .ha => antfly_runtime_ha(&context),
         .inference => antfly_runtime_inference(&context),
         .metadata => antfly_runtime_metadata(&context),
         .serverless => antfly_runtime_serverless(&context),
         .standalone => antfly_runtime_standalone(&context),
     };
     if (code != 0) std.process.exit(@intCast(code));
+}
+
+fn isStandaloneSubcommand(subcommand: []const u8) bool {
+    return std.mem.eql(u8, subcommand, "standalone") or std.mem.eql(u8, subcommand, "swarm");
+}
+
+test "legacy swarm subcommand selects the standalone runtime" {
+    try std.testing.expect(isStandaloneSubcommand("standalone"));
+    try std.testing.expect(isStandaloneSubcommand("swarm"));
+    try std.testing.expect(!isStandaloneSubcommand("data"));
 }
 
 fn runAntflyCloud(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u8 {

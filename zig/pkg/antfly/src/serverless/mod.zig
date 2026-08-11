@@ -30,6 +30,7 @@ pub const graph_segment = @import("graph_segment/mod.zig");
 pub const document_projection = @import("document_projection.zig");
 pub const search_sources = @import("search_sources.zig");
 pub const enrichment = @import("enrichment/mod.zig");
+pub const object_store_support = @import("object_store_support.zig");
 
 pub const PublishedGeneration = manifest.PublishedGeneration;
 pub const Manifest = manifest.Manifest;

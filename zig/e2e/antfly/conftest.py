@@ -973,9 +973,10 @@ class InferenceGeneratorServer:
 
 
 class OpenAiEmbeddingServer:
-    def __init__(self, host: str = "127.0.0.1"):
+    def __init__(self, host: str = "127.0.0.1", response_delay_s: float = 0.0):
         port = find_free_port()
         self.url = f"http://{host}:{port}"
+        self.response_delay_s = response_delay_s
 
         outer = self
 
@@ -991,6 +992,9 @@ class OpenAiEmbeddingServer:
                 inputs = payload.get("input", [])
                 if isinstance(inputs, str):
                     inputs = [inputs]
+
+                if outer.response_delay_s > 0:
+                    time.sleep(outer.response_delay_s)
 
                 model = payload.get("model", "text-embedding-3-small")
                 data = []
@@ -1644,6 +1648,13 @@ def openai_embedder():
 
 
 @pytest.fixture(scope="function")
+def slow_openai_embedder():
+    server = OpenAiEmbeddingServer(response_delay_s=2.0)
+    yield server.url
+    server.stop()
+
+
+@pytest.fixture(scope="function")
 def rate_limited_openai_embedder():
     server = RateLimitedOpenAiEmbeddingServer()
     yield server
@@ -1746,6 +1757,11 @@ def stateful_api(request: pytest.FixtureRequest):
 
         def _raise_request_error(self, err: requests.RequestException) -> None:
             raise_request_error_with_logs(err, self._server)
+
+        def debug_logs(self) -> str:
+            if self._server is None:
+                return ""
+            return self._server.debug_logs().strip()
 
         def _check(self, response: requests.Response) -> Any:
             if response.status_code >= 400:

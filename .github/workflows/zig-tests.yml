@@ -16,10 +16,6 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-cache
   ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-global-cache
-  # Required PR/push/scheduled aggregates skip the gated HA suites. Manual
-  # dispatch retains the full HA test surface until the paired Colony and
-  # Antfly HA changes land.
-  ZIG_BUILD_FLAGS: ${{ github.event_name == 'workflow_dispatch' && '-Dha-tests=true' || '-Dha-tests=false' }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -346,7 +342,7 @@ jobs:
             echo "::endgroup::"
 
             echo "::group::antfly unit watchdog process tree"
-            ps -eo pid,ppid,stat,etime,cmd | grep -E "PID|zig build|zig-local|/test|make zig-unit-test|make -C ./zig unit-test" || true
+            ps -eo pid,ppid,stat,etime,cmd | awk 'NR == 1 || /zig build|zig-local|\/test|make zig-unit-test|make -C \.\/zig unit-test/' || true
             echo "::endgroup::"
 
             local pids
@@ -418,7 +414,7 @@ jobs:
 
           (
             set +e
-            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test ZIG_BUILD_FLAGS="${ZIG_BUILD_FLAGS} --build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}" 2>&1 | tee -a "$unit_log"
+            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}" 2>&1 | tee -a "$unit_log"
             exit "${PIPESTATUS[0]}"
           ) &
           unit_pid="$!"
@@ -557,7 +553,7 @@ jobs:
       - name: Run full Zig unit tests
         run: |
           set +e
-          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="${ZIG_BUILD_FLAGS} --build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}"
+          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}"
           status="$?"
           if [ "$status" -ne 0 ] && [ -d /sys/fs/cgroup ]; then
             echo "::group::unit failure cgroup memory"
@@ -652,7 +648,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          chaos-test ${ZIG_BUILD_FLAGS}
+          chaos-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 

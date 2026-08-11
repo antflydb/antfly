@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const casbin = @import("antfly_casbin");
 
 const Allocator = std.mem.Allocator;
@@ -283,6 +284,7 @@ pub const UserStore = struct {
         load_api_keys: *const fn (ptr: *anyopaque, alloc: Allocator) anyerror![]ApiKeyRecord,
         save_api_key: *const fn (ptr: *anyopaque, alloc: Allocator, record: *const ApiKeyRecord) anyerror!void,
         delete_api_key: *const fn (ptr: *anyopaque, key_id: []const u8) anyerror!bool,
+        export_portable_seed: ?*const fn (ptr: *anyopaque, alloc: Allocator, generation: []const u8) anyerror![]u8 = null,
     };
 
     pub fn loadUsers(self: UserStore, alloc: Allocator) ![]User {
@@ -307,6 +309,11 @@ pub const UserStore = struct {
 
     pub fn deleteApiKey(self: UserStore, key_id: []const u8) !bool {
         return try self.vtable.delete_api_key(self.ptr, key_id);
+    }
+
+    pub fn exportPortableSeed(self: UserStore, alloc: Allocator, generation: []const u8) ![]u8 {
+        const export_fn = self.vtable.export_portable_seed orelse return error.PortableAuthSeedUnsupported;
+        return try export_fn(self.ptr, alloc, generation);
     }
 };
 
@@ -437,6 +444,34 @@ pub const UserManager = struct {
     users: std.StringHashMapUnmanaged([]u8) = .{},
     user_metadata: std.StringHashMapUnmanaged([]u8) = .{},
     api_keys: std.StringHashMapUnmanaged(ApiKeyRecord) = .{},
+    mutation_mutex: std.atomic.Mutex = .unlocked,
+
+    /// Held by HA seed capture from before auth export until the complete
+    /// data+auth generation has been durably published. All auth mutations use
+    /// the same mutex, so no mutation can land in only one side of the seed.
+    pub const SeedCaptureLease = struct {
+        manager: *UserManager,
+
+        pub fn release(self: *@This()) void {
+            self.manager.mutation_mutex.unlock();
+            self.* = undefined;
+        }
+    };
+
+    pub fn acquireSeedCaptureLease(self: *UserManager) SeedCaptureLease {
+        lockMutationMutex(&self.mutation_mutex);
+        return .{ .manager = self };
+    }
+
+    pub fn exportPortableSeedWithLease(
+        self: *UserManager,
+        alloc: Allocator,
+        generation: []const u8,
+        lease: *const SeedCaptureLease,
+    ) ![]u8 {
+        if (lease.manager != self) return error.InvalidAuthSeedCaptureLease;
+        return try self.store.exportPortableSeed(alloc, generation);
+    }
 
     pub fn init(alloc: Allocator, store: UserStore, enforcer: casbin.Enforcer) !UserManager {
         var manager = UserManager{
@@ -506,6 +541,18 @@ pub const UserManager = struct {
     }
 
     pub fn createUserWithMetadata(
+        self: *UserManager,
+        username: []const u8,
+        password: []const u8,
+        initial_policies: []const Permission,
+        metadata_json: []const u8,
+    ) !User {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
+        return try self.createUserWithMetadataUnlocked(username, password, initial_policies, metadata_json);
+    }
+
+    fn createUserWithMetadataUnlocked(
         self: *UserManager,
         username: []const u8,
         password: []const u8,
@@ -588,6 +635,8 @@ pub const UserManager = struct {
     }
 
     pub fn updatePassword(self: *UserManager, username: []const u8, new_password: []const u8) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
         const existing = self.users.getPtr(username) orelse return error.UserNotFound;
         const metadata_json = self.user_metadata.get(username) orelse "{}";
         const new_hash = try hashPassword(self.alloc, new_password);
@@ -603,6 +652,8 @@ pub const UserManager = struct {
     }
 
     pub fn deleteUser(self: *UserManager, username: []const u8) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
         const removed = self.users.fetchRemove(username) orelse return error.UserNotFound;
         defer {
             self.alloc.free(removed.key);
@@ -623,7 +674,7 @@ pub const UserManager = struct {
             if (!std.mem.eql(u8, entry.value_ptr.key.username, username)) continue;
             try owned_key_ids.append(self.alloc, try self.alloc.dupe(u8, entry.key_ptr.*));
         }
-        for (owned_key_ids.items) |key_id| try self.deleteApiKey(username, key_id);
+        for (owned_key_ids.items) |key_id| try self.deleteApiKeyUnlocked(username, key_id);
         _ = try self.enforcer.removeFilteredPolicy(0, &.{username});
         _ = try self.enforcer.removeFilteredGroupingPolicy(0, &.{username});
         _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{username});
@@ -652,6 +703,12 @@ pub const UserManager = struct {
     }
 
     pub fn addPermissionToSubject(self: *UserManager, subject: []const u8, permission: Permission) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
+        return try self.addPermissionToSubjectUnlocked(subject, permission);
+    }
+
+    fn addPermissionToSubjectUnlocked(self: *UserManager, subject: []const u8, permission: Permission) !void {
         _ = try self.enforcer.addPolicy(&.{
             subject,
             permission.resource_type.slice(),
@@ -661,8 +718,10 @@ pub const UserManager = struct {
     }
 
     pub fn addPermissionToUser(self: *UserManager, username: []const u8, permission: Permission) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
         if (!self.users.contains(username)) return error.UserNotFound;
-        try self.addPermissionToSubject(username, permission);
+        try self.addPermissionToSubjectUnlocked(username, permission);
     }
 
     pub fn removePermissionFromUser(
@@ -671,6 +730,8 @@ pub const UserManager = struct {
         resource_name: []const u8,
         resource_type: ResourceType,
     ) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
         if (!self.users.contains(username)) return error.UserNotFound;
         const removed = if (std.mem.eql(u8, resource_name, "*"))
             try self.enforcer.removeFilteredPolicy(0, &.{ username, resource_type.slice() })
@@ -705,23 +766,39 @@ pub const UserManager = struct {
     }
 
     pub fn addRoleToSubject(self: *UserManager, subject: []const u8, role: []const u8) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
+        return try self.addRoleToSubjectUnlocked(subject, role);
+    }
+
+    fn addRoleToSubjectUnlocked(self: *UserManager, subject: []const u8, role: []const u8) !void {
         if (subject.len == 0 or role.len == 0) return error.InvalidRole;
         _ = try self.enforcer.addNamedPolicy("g", &.{ subject, role });
     }
 
     pub fn addRoleToUser(self: *UserManager, username: []const u8, role: []const u8) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
         if (!self.users.contains(username)) return error.UserNotFound;
-        try self.addRoleToSubject(username, role);
+        try self.addRoleToSubjectUnlocked(username, role);
     }
 
     pub fn removeRoleFromSubject(self: *UserManager, subject: []const u8, role: []const u8) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
+        return try self.removeRoleFromSubjectUnlocked(subject, role);
+    }
+
+    fn removeRoleFromSubjectUnlocked(self: *UserManager, subject: []const u8, role: []const u8) !void {
         const removed = try self.enforcer.removeFilteredNamedPolicy("g", 0, &.{ subject, role });
         if (!removed) return error.RoleNotFound;
     }
 
     pub fn removeRoleFromUser(self: *UserManager, username: []const u8, role: []const u8) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
         if (!self.users.contains(username)) return error.UserNotFound;
-        try self.removeRoleFromSubject(username, role);
+        try self.removeRoleFromSubjectUnlocked(username, role);
     }
 
     pub fn getRolesForUser(self: *const UserManager, username: []const u8) ![][]u8 {
@@ -827,6 +904,12 @@ pub const UserManager = struct {
     }
 
     pub fn setSubjectRowFilter(self: *UserManager, subject: []const u8, table: []const u8, filter_json: []const u8) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
+        return try self.setSubjectRowFilterUnlocked(subject, table, filter_json);
+    }
+
+    fn setSubjectRowFilterUnlocked(self: *UserManager, subject: []const u8, table: []const u8, filter_json: []const u8) !void {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, filter_json, .{});
         parsed.deinit();
         _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{ subject, table });
@@ -834,18 +917,28 @@ pub const UserManager = struct {
     }
 
     pub fn setRowFilter(self: *UserManager, username: []const u8, table: []const u8, filter_json: []const u8) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
         if (!self.users.contains(username)) return error.UserNotFound;
-        try self.setSubjectRowFilter(username, table, filter_json);
+        try self.setSubjectRowFilterUnlocked(username, table, filter_json);
     }
 
     pub fn removeSubjectRowFilter(self: *UserManager, subject: []const u8, table: []const u8) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
+        return try self.removeSubjectRowFilterUnlocked(subject, table);
+    }
+
+    fn removeSubjectRowFilterUnlocked(self: *UserManager, subject: []const u8, table: []const u8) !void {
         const removed = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{ subject, table });
         if (!removed) return error.RowFilterNotFound;
     }
 
     pub fn removeRowFilter(self: *UserManager, username: []const u8, table: []const u8) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
         if (!self.users.contains(username)) return error.UserNotFound;
-        try self.removeSubjectRowFilter(username, table);
+        try self.removeSubjectRowFilterUnlocked(username, table);
     }
 
     pub fn getSubjectRowFilter(self: *const UserManager, subject: []const u8, table: []const u8) ![]u8 {
@@ -945,6 +1038,8 @@ pub const UserManager = struct {
         row_filter: []const RowFilterEntry,
         expires_at_ns: ?u64,
     ) !CreatedApiKey {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
         if (!self.users.contains(username)) return error.UserNotFound;
 
         for (permissions) |perm| {
@@ -1045,6 +1140,12 @@ pub const UserManager = struct {
     }
 
     pub fn deleteApiKey(self: *UserManager, username: []const u8, key_id: []const u8) !void {
+        lockMutationMutex(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
+        return try self.deleteApiKeyUnlocked(username, key_id);
+    }
+
+    fn deleteApiKeyUnlocked(self: *UserManager, username: []const u8, key_id: []const u8) !void {
         const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
         if (!std.mem.eql(u8, record.key.username, username)) return error.ApiKeyNotFound;
         const removed = self.api_keys.fetchRemove(key_id) orelse return error.ApiKeyNotFound;
@@ -1071,6 +1172,17 @@ pub fn ensureDefaultAdminUser(manager: *UserManager) !void {
         else => return err,
     };
     existing.deinit(manager.alloc);
+}
+
+fn lockMutationMutex(mutex: *std.atomic.Mutex) void {
+    var attempts: usize = 0;
+    while (!mutex.tryLock()) : (attempts += 1) {
+        if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
+            std.atomic.spinLoopHint();
+        } else {
+            std.Thread.yield() catch {};
+        }
+    }
 }
 
 pub fn initDefaultEnforcer(alloc: Allocator, adapter: casbin.Adapter) !casbin.Enforcer {
@@ -1414,6 +1526,44 @@ test "usermgr create authenticate and persist users through store" {
     defer loaded.deinit(alloc);
     try std.testing.expectEqualStrings("alice", loaded.username);
     try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", loaded.metadata_json);
+}
+
+test "usermgr HA seed lease excludes auth mutations until capture completes" {
+    const alloc = std.testing.allocator;
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try UserManager.init(alloc, store.iface(), try initDefaultEnforcer(alloc, policy_store.iface()));
+    defer manager.deinit();
+    var alice = try manager.createUser("alice", "before", &.{});
+    defer alice.deinit(alloc);
+
+    var started = std.atomic.Value(bool).init(false);
+    var finished = std.atomic.Value(bool).init(false);
+    const Context = struct {
+        manager: *UserManager,
+        started: *std.atomic.Value(bool),
+        finished: *std.atomic.Value(bool),
+
+        fn run(ctx: *@This()) void {
+            ctx.started.store(true, .release);
+            ctx.manager.updatePassword("alice", "after") catch @panic("auth mutation failed");
+            ctx.finished.store(true, .release);
+        }
+    };
+    var ctx = Context{ .manager = &manager, .started = &started, .finished = &finished };
+    var lease = manager.acquireSeedCaptureLease();
+    const thread = try std.Thread.spawn(.{}, Context.run, .{&ctx});
+    while (!started.load(.acquire)) std.atomic.spinLoopHint();
+    var attempts: usize = 0;
+    while (attempts < 1024) : (attempts += 1) std.Thread.yield() catch {};
+    try std.testing.expect(!finished.load(.acquire));
+    lease.release();
+    thread.join();
+    try std.testing.expect(finished.load(.acquire));
+    var authenticated = try manager.authenticateUser("alice", "after");
+    defer authenticated.deinit(alloc);
 }
 
 test "usermgr default admin seed is idempotent and grants admin" {

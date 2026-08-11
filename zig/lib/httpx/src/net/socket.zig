@@ -86,6 +86,56 @@ pub const Socket = struct {
         return .{ .handle = stream.socket.handle, .io = io };
     }
 
+    /// Resolves a host and tries each concrete address in resolver order.
+    ///
+    /// This intentionally does not use `HostName.connect`: Zig 0.16 can race
+    /// cancellation of the losing happy-eyeballs task against completion of
+    /// its nested DNS future. Resolving first also preserves IPv6-to-IPv4
+    /// fallback when only one family is listening.
+    pub const HostConnectResult = struct {
+        socket: Socket,
+        address: Address,
+    };
+
+    pub fn connectHostResolved(host: []const u8, port: u16, io: Io) !HostConnectResult {
+        if (Address.resolve(io, host, port)) |addr| {
+            return .{ .socket = try connect(addr, io), .address = addr };
+        } else |_| {}
+
+        const host_name = try HostName.init(host);
+        var canonical_name_buffer: [HostName.max_len]u8 = undefined;
+        var lookup_buffer: [32]HostName.LookupResult = undefined;
+        var lookup_queue: Io.Queue(HostName.LookupResult) = .init(&lookup_buffer);
+        try HostName.lookup(host_name, io, &lookup_queue, .{
+            .port = port,
+            .canonical_name_buffer = &canonical_name_buffer,
+        });
+
+        var last_connect_error: ?anyerror = null;
+        while (true) {
+            const result = lookup_queue.getOne(io) catch |err| switch (err) {
+                error.Closed => break,
+                else => return err,
+            };
+            switch (result) {
+                .address => |address| {
+                    const socket = connect(address, io) catch |err| {
+                        last_connect_error = err;
+                        continue;
+                    };
+                    return .{ .socket = socket, .address = address };
+                },
+                .canonical_name => {},
+            }
+        }
+        if (last_connect_error) |err| return err;
+        return error.UnknownHostName;
+    }
+
+    pub fn connectHost(host: []const u8, port: u16, io: Io) !Self {
+        return (try connectHostResolved(host, port, io)).socket;
+    }
+
     /// Creates a socket from a raw handle (e.g. from accept).
     pub fn fromHandle(handle: net.Socket.Handle, io: Io) Self {
         return .{ .handle = handle, .io = io };
