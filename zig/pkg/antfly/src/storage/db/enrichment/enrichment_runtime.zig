@@ -3514,7 +3514,7 @@ fn processDocumentExtractionAsset(
             if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type,
             @errorName(err),
             "document extraction failed",
-            documentExtractionFailureStage(err, "document_extraction"),
+            document_extraction_mod.failureStage(err, "document_extraction"),
             manifest_key,
             previous_child_ranges,
             existing_state,
@@ -3695,7 +3695,7 @@ fn processDocumentExtractionAsset(
             collect_ctx.info.content_type,
             @errorName(err),
             "document extraction materialization failed",
-            documentExtractionFailureStage(err, "document_materialization"),
+            document_extraction_mod.failureStage(err, "document_materialization"),
             manifest_key,
             previous_child_ranges,
             existing_state,
@@ -3777,45 +3777,6 @@ fn processDocumentExtractionAsset(
     });
     try storePutBatchWithRetry(runtime, writes.items, deletes.items);
     clearRuntimeKVBatch(runtime, &writes, &deletes);
-}
-
-fn documentExtractionFailureStage(err: anyerror, fallback: []const u8) []const u8 {
-    return switch (err) {
-        error.InvalidFlateStream,
-        error.MalformedLzw,
-        error.MalformedPredictorData,
-        error.MalformedRunLength,
-        error.MalformedAscii85,
-        error.MalformedAsciiHex,
-        error.UnsupportedStreamFilter,
-        error.UnsupportedPredictor,
-        error.DecodedStreamTooLarge,
-        error.PdfDecodeWorkingSetTooLarge,
-        => "pdf_stream_decode",
-        error.UnsupportedPdfRendering,
-        error.RenderedPageTooLarge,
-        error.InvalidPageBox,
-        => "pdf_page_render",
-        error.InvalidType1,
-        error.TruncatedType1,
-        error.UnsupportedType1,
-        => "pdf_font_outline",
-        error.InvalidPdfHeader,
-        error.MissingPdfEof,
-        error.MissingStartXref,
-        error.MissingTrailer,
-        error.InvalidStartXref,
-        error.InvalidXref,
-        error.CyclicXref,
-        error.UnsupportedXrefFormat,
-        error.ExpectedTrailerDict,
-        error.MalformedXrefStream,
-        error.MalformedXrefTable,
-        error.InvalidObjectStream,
-        error.InvalidPageTree,
-        => "pdf_structure",
-        else => fallback,
-    };
 }
 
 fn writeDocumentExtractionFailureManifest(

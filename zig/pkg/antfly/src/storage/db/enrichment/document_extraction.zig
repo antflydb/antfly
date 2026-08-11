@@ -15,37 +15,50 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const pdf = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+// The PDF package has a dedicated test artifact. Keeping it out of the already
+// large Antfly unit-test root prevents the Zig compiler and test process from
+// approaching the 15 GiB CI runner limit. Production builds and the PDF/OCR
+// E2E binary still use the full implementation.
+const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     struct {
         pub const reader = struct {
+            pub const DecodeLimits = struct {
+                max_decoded_stream_bytes: usize = 64 * 1024 * 1024,
+                max_working_set_bytes: usize = 96 * 1024 * 1024,
+            };
+
             pub const Reader = struct {
-                pub fn init(_: Allocator, _: []const u8) !Reader {
+                pub fn init(_: Allocator, _: []const u8) anyerror!Reader {
+                    return error.PdfExtractionUnavailable;
+                }
+
+                pub fn initWithDecodeLimits(_: Allocator, _: []const u8, _: DecodeLimits) anyerror!Reader {
                     return error.PdfExtractionUnavailable;
                 }
 
                 pub fn deinit(_: *Reader) void {}
 
-                pub fn pageCount(_: *Reader) !usize {
+                pub fn pageCount(_: *Reader) anyerror!usize {
                     return 0;
                 }
 
-                pub fn extractPageTextAlloc(_: *Reader, _: usize) ![]u8 {
+                pub fn extractPageTextAlloc(_: *Reader, _: usize) anyerror![]u8 {
                     return error.PdfExtractionUnavailable;
                 }
 
-                pub fn extractPageTextAnalysisAlloc(_: *Reader, _: usize) !PageTextAnalysis {
+                pub fn extractPageTextAnalysisAlloc(_: *Reader, _: usize) anyerror!PageTextAnalysis {
                     return error.PdfExtractionUnavailable;
                 }
 
-                pub fn extractPageTextRunsAlloc(_: *const Reader, _: usize) ![]TextRun {
+                pub fn extractPageTextRunsAlloc(_: *const Reader, _: usize) anyerror![]TextRun {
                     return error.PdfExtractionUnavailable;
                 }
 
-                pub fn extractPageBox(_: *Reader, _: usize) !struct { min_x: f64, min_y: f64, max_x: f64, max_y: f64 } {
+                pub fn extractPageBox(_: *Reader, _: usize) anyerror!struct { min_x: f64, min_y: f64, max_x: f64, max_y: f64 } {
                     return error.PdfExtractionUnavailable;
                 }
 
-                pub fn extractPageRotation(_: *const Reader, _: usize) !?i32 {
+                pub fn extractPageRotation(_: *const Reader, _: usize) anyerror!?i32 {
                     return error.PdfExtractionUnavailable;
                 }
             };
@@ -84,11 +97,11 @@ const pdf = if (builtin.os.tag == .freestanding or build_options.bench_minimal_d
             }
         };
 
-        pub fn renderPagePngAlloc(_: Allocator, _: []const u8, _: usize, _: u16, _: u64) ![]u8 {
+        pub fn renderPagePngAlloc(_: Allocator, _: []const u8, _: usize, _: u16, _: u64) anyerror![]u8 {
             return error.PdfRenderingUnavailable;
         }
 
-        pub fn renderParsedPagePngAlloc(_: Allocator, _: *reader.Reader, _: usize, _: u16, _: u64) ![]u8 {
+        pub fn renderParsedPagePngAlloc(_: Allocator, _: *reader.Reader, _: usize, _: u16, _: u64) anyerror![]u8 {
             return error.PdfRenderingUnavailable;
         }
 
@@ -100,7 +113,7 @@ const pdf = if (builtin.os.tag == .freestanding or build_options.bench_minimal_d
             height: u32,
         };
 
-        pub fn renderParsedPagePngAdaptiveAlloc(_: Allocator, _: *reader.Reader, _: usize, _: u16, _: u64, _: u32) !RenderedPagePng {
+        pub fn renderParsedPagePngAdaptiveAlloc(_: Allocator, _: *reader.Reader, _: usize, _: u16, _: u64, _: u32) anyerror!RenderedPagePng {
             return error.PdfRenderingUnavailable;
         }
     }
@@ -116,6 +129,8 @@ else
     @import("../../../template_remote.zig");
 
 const Allocator = std.mem.Allocator;
+
+pub const pdf_runtime_available = builtin.os.tag != .freestanding and !builtin.is_test and !build_options.bench_minimal_deps;
 
 pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.RemoteContentConfig) u64 {
     if (comptime builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
@@ -178,6 +193,47 @@ pub fn remoteContentErrorIsPermanent(err: anyerror) bool {
     };
 }
 
+/// Stable pipeline stage used by terminal extraction manifests. Callers pass a
+/// route-level fallback for errors that are not specific to PDF internals.
+pub fn failureStage(err: anyerror, fallback: []const u8) []const u8 {
+    return switch (err) {
+        error.InvalidFlateStream,
+        error.MalformedLzw,
+        error.MalformedPredictorData,
+        error.MalformedRunLength,
+        error.MalformedAscii85,
+        error.MalformedAsciiHex,
+        error.UnsupportedStreamFilter,
+        error.UnsupportedPredictor,
+        error.DecodedStreamTooLarge,
+        error.PdfDecodeWorkingSetTooLarge,
+        => "pdf_stream_decode",
+        error.UnsupportedPdfRendering,
+        error.RenderedPageTooLarge,
+        error.InvalidPageBox,
+        => "pdf_page_render",
+        error.InvalidType1,
+        error.TruncatedType1,
+        error.UnsupportedType1,
+        => "pdf_font_outline",
+        error.InvalidPdfHeader,
+        error.MissingPdfEof,
+        error.MissingStartXref,
+        error.MissingTrailer,
+        error.InvalidStartXref,
+        error.InvalidXref,
+        error.CyclicXref,
+        error.UnsupportedXrefFormat,
+        error.ExpectedTrailerDict,
+        error.MalformedXrefStream,
+        error.MalformedXrefTable,
+        error.InvalidObjectStream,
+        error.InvalidPageTree,
+        => "pdf_structure",
+        else => fallback,
+    };
+}
+
 test "remote fetch classification retries only transient failures" {
     try std.testing.expect(remoteHttpStatusIsTransient(408));
     try std.testing.expect(remoteHttpStatusIsTransient(425));
@@ -194,6 +250,10 @@ test "remote fetch classification retries only transient failures" {
     try std.testing.expect(remoteContentErrorIsPermanent(error.InvalidFormat));
     try std.testing.expect(!remoteContentErrorIsPermanent(error.ConnectionResetByPeer));
     try std.testing.expect(!remoteContentErrorIsPermanent(error.TimedOut));
+
+    try std.testing.expectEqualStrings("pdf_structure", failureStage(error.InvalidPdfHeader, "document_extraction"));
+    try std.testing.expectEqualStrings("pdf_stream_decode", failureStage(error.InvalidFlateStream, "document_extraction"));
+    try std.testing.expectEqualStrings("document_extraction", failureStage(error.InvalidDocumentExtractionConfig, "document_extraction"));
 }
 
 pub const default_ocr_model = "antflydb/Florence-2-base";
@@ -3687,13 +3747,23 @@ test "OCR page request preserves explicit and generic reader prompts" {
         .method = @constCast("pdf_ocr_pending"),
         .page_number = 1,
     };
-    const explicit = try ocrPagePartsJsonAlloc(alloc, .{ .ocr_model = "antflydb/Florence-2-base", .ocr_prompt = "custom instruction" }, "pdf", "application/pdf", unit, "png");
-    defer alloc.free(explicit);
-    try std.testing.expect(std.mem.indexOf(u8, explicit, "custom instruction") != null);
+    {
+        const explicit = try ocrPagePartsJsonAlloc(alloc, .{ .ocr_model = "antflydb/Florence-2-base", .ocr_prompt = "custom instruction" }, "pdf", "application/pdf", unit, "png");
+        defer alloc.free(explicit);
+        try std.testing.expect(std.mem.indexOf(u8, explicit, "custom instruction") != null);
+    }
 
-    const generic = try ocrPagePartsJsonAlloc(alloc, .{}, "pdf", "application/pdf", unit, "png");
-    defer alloc.free(generic);
-    try std.testing.expect(std.mem.indexOf(u8, generic, "Render tables as Markdown") != null);
+    // An empty config intentionally selects Antfly's default Florence reader
+    // and its <OCR> task token. Exercise the generic prompt with the same
+    // provider metadata that a parsed non-Florence reader config carries.
+    {
+        const generic = try ocrPagePartsJsonAlloc(alloc, .{
+            .ocr_config_json = "{\"provider\":\"generic-reader\"}",
+            .ocr_model = "generic/vision-reader",
+        }, "pdf", "application/pdf", unit, "png");
+        defer alloc.free(generic);
+        try std.testing.expect(std.mem.indexOf(u8, generic, "Render tables as Markdown") != null);
+    }
 }
 
 test "OCR prompt echo detection covers Florence task and canonical prompts" {

@@ -25647,7 +25647,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         error.OutOfMemory => return err,
         else => {
             if (!document_extraction_mod.remoteContentErrorIsPermanent(err)) return err;
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", artifact_writes);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", artifact_writes);
             return;
         },
     };
@@ -25658,7 +25658,7 @@ fn computeDocumentExtractionAssetRequestDerived(
                 return error.RemoteDocumentFetchFailed;
             const message = try std.fmt.allocPrint(alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
             defer alloc.free(message);
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, "RemoteDocumentFetchFailed", message, artifact_writes);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, "RemoteDocumentFetchFailed", message, "remote_content_http", artifact_writes);
             return;
         },
     };
@@ -25686,7 +25686,7 @@ fn computeDocumentExtractionAssetRequestDerived(
     var extraction = document_extraction_mod.extractDownloadedAlloc(alloc, downloaded_mut, source_url, config) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "document extraction failed", artifact_writes);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "document extraction failed", document_extraction_mod.failureStage(err, "document_extraction"), artifact_writes);
             return;
         },
     };
@@ -27829,6 +27829,7 @@ fn documentExtractionFailureManifestPayloadAlloc(
     to_generation: u64,
     error_code: []const u8,
     error_message: []const u8,
+    error_stage: []const u8,
 ) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -27865,6 +27866,7 @@ fn documentExtractionFailureManifestPayloadAlloc(
     var error_first = true;
     try appendJsonFieldString(alloc, &out, &error_first, "code", error_code);
     try appendJsonFieldString(alloc, &out, &error_first, "message", error_message);
+    try appendJsonFieldString(alloc, &out, &error_first, "stage", error_stage);
     try out.append(alloc, '}');
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
@@ -27883,6 +27885,7 @@ fn appendDocumentExtractionFailureManifest(
     to_generation: u64,
     error_code: []const u8,
     error_message: []const u8,
+    error_stage: []const u8,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
 ) !void {
     var previous_state = DocumentExtractionPreviousState{};
@@ -27903,6 +27906,7 @@ fn appendDocumentExtractionFailureManifest(
         to_generation,
         error_code,
         error_message,
+        error_stage,
     );
     defer alloc.free(manifest);
     try artifact_writes.append(alloc, .{
@@ -27930,6 +27934,7 @@ test "db document extraction failure manifest preserves prior artifacts" {
         5,
         "RemoteDocumentFetchFailed",
         "remote content download failed",
+        "remote_content_download",
     );
     defer alloc.free(manifest);
 
@@ -27938,6 +27943,7 @@ test "db document extraction failure manifest preserves prior artifacts" {
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"start_key\":\"unit:1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"start_key\":\"chunk:1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"last_error\":{\"code\":\"RemoteDocumentFetchFailed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"stage\":\"remote_content_download\"") != null);
 }
 
 fn extractAssetSourceValue(
@@ -50082,6 +50088,11 @@ test "db document extraction completes image OCR with reader producer" {
 }
 
 test "db document extraction attempts forced OCR for a scanned PDF" {
+    // The real PDF implementation is covered by lib-pdf-test and the
+    // production-binary PDF/OCR E2E suite. The aggregate Antfly test root uses
+    // the lightweight PDF stub to stay below constrained CI memory limits.
+    if (!document_extraction_mod.pdf_runtime_available) return error.SkipZigTest;
+
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
