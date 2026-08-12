@@ -988,7 +988,7 @@ fn ensureIndexDefinition(
     }
     if (existing) |existing_cfg| {
         if (try indexConfigsEqual(alloc, existing_cfg, desired)) {
-            if (desired.kind == .full_text) {
+            if (db_mod.DB.indexKindSupportsManagedGenerationRepair(desired.kind)) {
                 if (try db.materializeManagedIndexAdmission(alloc, desired.name) != null) {
                     summary.pending += 1;
                 }
@@ -1012,28 +1012,14 @@ fn ensureIndexDefinition(
         .config_json = desired.config_json,
         .coverage_generation = desired.coverage_generation,
     };
-    if (!db_mod.DB.indexKindSupportsManagedGenerationRepair(desired.kind)) {
-        // Algebraic admission is O(1): the base index starts observing writes
-        // immediately and its adaptive materializations own their own bounded
-        // lifecycle. It must not enter generation repair, which deliberately
-        // has no algebraic shadow rebuilder.
-        db.addIndex(admitted) catch |err| switch (err) {
-            error.IndexArtifactCleanupPending => {
-                summary.pending += 1;
-                return;
-            },
-            else => return err,
-        };
-    } else {
-        const repair_id = db.admitManagedIndex(admitted) catch |err| switch (err) {
-            error.IndexArtifactCleanupPending => {
-                summary.pending += 1;
-                return;
-            },
-            else => return err,
-        };
-        if (repair_id != null) summary.pending += 1;
-    }
+    const repair_id = db.admitManagedIndex(admitted) catch |err| switch (err) {
+        error.IndexArtifactCleanupPending => {
+            summary.pending += 1;
+            return;
+        },
+        else => return err,
+    };
+    if (repair_id != null) summary.pending += 1;
     summary.added += 1;
 }
 
@@ -2091,7 +2077,7 @@ test "table provisioner reconciles stored algebraic metadata without public type
     try std.testing.expect(db.core.index_manager.algebraicIndex("alg") != null);
 }
 
-test "table provisioner admits algebraic index on a non-empty table without repair debt" {
+test "table provisioner admits algebraic index on a non-empty table through generation repair" {
     const path = "/tmp/antfly-metadata-table-provisioner-algebraic-non-empty";
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -2117,10 +2103,10 @@ test "table provisioner admits algebraic index on a non-empty table without repa
     ;
     const summary = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
     try std.testing.expectEqual(@as(usize, 1), summary.indexes_added);
-    try std.testing.expectEqual(@as(usize, 0), summary.indexes_pending);
+    try std.testing.expectEqual(@as(usize, 1), summary.indexes_pending);
     try std.testing.expect(db.core.index_manager.algebraicIndex("alg") != null);
-    try std.testing.expect(!db.core.index_manager.repairUnavailable("alg"));
-    try std.testing.expect(!try db.hasPendingIndexRepairIntents(std.testing.allocator));
+    try std.testing.expect(db.core.index_manager.repairUnavailable("alg"));
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(std.testing.allocator));
 }
 
 test "table provisioner extracts public algebraic metadata as internal config" {

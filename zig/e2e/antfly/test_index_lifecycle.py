@@ -173,6 +173,30 @@ def _ready_index(stateful_api, table_name: str, index_name: str, *, expected_doc
     return stats
 
 
+def _ready_algebraic_index(stateful_api, table_name: str, index_name: str) -> dict | None:
+    try:
+        index_info = stateful_api.get_index(table_name, index_name)
+    except Exception:
+        return None
+    return ready_index_status(index_info, require_query_fresh=True)
+
+
+def _algebraic_aggregations(stateful_api, table_name: str) -> dict:
+    result = stateful_api.query_table(
+        table_name,
+        {
+            "limit": 1,
+            "aggregations": {
+                "amount_sum": {"type": "sum", "field": "amount"},
+                "category_terms": {"type": "terms", "field": "category", "size": 10},
+            },
+        },
+    )
+    responses = result.get("responses", [result])
+    assert responses
+    return responses[0].get("aggregations", {})
+
+
 def test_ready_index_status_requires_current_coverage_observation():
     ready_status = {
         "status": {
@@ -318,6 +342,93 @@ def test_stateful_table_accepts_public_full_text_create_index(stateful_api):
     detail = stateful_api.get_index(table_name, "search_idx")
     assert detail["config"]["name"] == "search_idx"
     assert detail["config"]["type"] == "full_text"
+
+
+def test_stateful_managed_algebraic_generation_rebuild_catches_up_and_reopens(stateful_api):
+    table_name = f"managed_algebraic_generation_{time.time_ns()}"
+    index_name = "analytics_idx"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert _table_name(created) == table_name
+    stateful_api.update_schema(
+        table_name,
+        {
+            "default_type": "doc",
+            "document_schemas": {
+                "doc": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "category": {"type": "keyword"},
+                            "amount": {"type": "number"},
+                        },
+                    }
+                }
+            },
+        },
+    )
+    initial = stateful_api.batch_write(
+        table_name,
+        inserts={
+            "doc:a": {"category": "tools", "amount": 3},
+            "doc:b": {"category": "books", "amount": 5},
+        },
+        sync_level="write",
+    )
+    assert initial["inserted"] == 2
+
+    assert (
+        stateful_api.create_index(
+            table_name,
+            index_name,
+            {
+                "name": index_name,
+                "type": "algebraic",
+                "derive_from_schema": True,
+            },
+        )
+        == {}
+    )
+    # This write lands after admission while the snapshot generation may still
+    # be building. Durable replay must carry it into the activated generation.
+    concurrent = stateful_api.batch_write(
+        table_name,
+        inserts={"doc:c": {"category": "tools", "amount": 7}},
+        sync_level="write",
+    )
+    assert concurrent["inserted"] == 1
+
+    ready = wait_until(
+        lambda: _ready_algebraic_index(stateful_api, table_name, index_name),
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert ready is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name),
+        indent=2,
+        sort_keys=True,
+    )
+    aggregations = _algebraic_aggregations(stateful_api, table_name)
+    assert aggregations["amount_sum"]["value"] == 15
+    assert {
+        bucket["key"]: bucket["doc_count"]
+        for bucket in aggregations["category_terms"]["buckets"]
+    } == {"books": 1, "tools": 2}
+
+    assert stateful_api.supports_restart
+    stateful_api.restart_server()
+    reopened = wait_until(
+        lambda: _ready_algebraic_index(stateful_api, table_name, index_name),
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert reopened is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name),
+        indent=2,
+        sort_keys=True,
+    )
+    reopened_aggregations = _algebraic_aggregations(stateful_api, table_name)
+    assert reopened_aggregations == aggregations
 
 
 def test_stateful_table_registers_public_artifact_enrichment_for_default_full_text(stateful_api):

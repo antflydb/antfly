@@ -115,6 +115,7 @@ inline fn checkDenseSearchCancelled(req: hbc_mod.SearchRequest) !void {
     }
 }
 const repair_shadow_root_prefix = ".repair-shadow-";
+const canonical_algebraic_generation = "canonical";
 const repair_shadow_in_progress_file = ".antfly-repair-shadow-in-progress";
 const repair_shadow_in_progress_magic = "antfly-repair-shadow-in-progress-v1\n";
 var bench_hbc_tree_counter: platform.atomic.Value(u64) = .init(0);
@@ -5070,6 +5071,24 @@ pub const IndexManager = struct {
             self.applied_sequence_checkpoint_path,
             name,
         );
+        const canonical_namespace = try std.fmt.allocPrint(
+            self.alloc,
+            "{s}/{s}",
+            .{ canonical_algebraic_generation, name },
+        );
+        defer self.alloc.free(canonical_namespace);
+        try self.deleteAlgebraicStorageNamespace(canonical_namespace);
+        if (!std.mem.eql(u8, active_path, canonical_path)) {
+            const indexes_dir = std.fs.path.dirname(active_path) orelse return error.InvalidIndexRootPointer;
+            const repair_root = std.fs.path.dirname(indexes_dir) orelse return error.InvalidIndexRootPointer;
+            const active_namespace = try std.fmt.allocPrint(
+                self.alloc,
+                "{s}/{s}",
+                .{ std.fs.path.basename(repair_root), name },
+            );
+            defer self.alloc.free(active_namespace);
+            try self.deleteAlgebraicStorageNamespace(active_namespace);
+        }
         if (!std.mem.eql(u8, active_path, canonical_path)) try self.deleteIndexDirUsingIoIfPresentFallible(active_path);
         try self.deleteIndexDirUsingIoIfPresentFallible(canonical_path);
     }
@@ -5431,8 +5450,11 @@ pub const IndexManager = struct {
         for (self.dense_indexes.items) |entry| self.cleanupCanonicalRootAfterPointer(entry.config.name);
         for (self.sparse_indexes.items) |entry| self.cleanupCanonicalRootAfterPointer(entry.config.name);
         for (self.graph_indexes.items) |entry| self.cleanupCanonicalRootAfterPointer(entry.config.name);
-        for (self.algebraic_indexes.items) |entry| self.cleanupCanonicalRootAfterPointer(entry.config.name);
-        for (self.status_only_index_configs) |cfg| self.cleanupCanonicalRootAfterPointer(cfg.name);
+        for (self.algebraic_indexes.items) |entry| self.cleanupCanonicalAlgebraicGenerationAfterPointer(entry.config.name);
+        for (self.status_only_index_configs) |cfg| switch (cfg.kind) {
+            .algebraic => self.cleanupCanonicalAlgebraicGenerationAfterPointer(cfg.name),
+            else => self.cleanupCanonicalRootAfterPointer(cfg.name),
+        };
 
         var active_roots = std.StringHashMapUnmanaged(void).empty;
         defer {
@@ -5456,7 +5478,54 @@ pub const IndexManager = struct {
             const path = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, entry.name }) catch continue;
             defer self.alloc.free(path);
             if (repairShadowRootInProgress(path)) continue;
+            self.cleanupAlgebraicNamespacesInRepairRoot(io, path, entry.name) catch |err| {
+                std.log.warn("failed to collect inactive algebraic generation root={s} err={s}", .{ entry.name, @errorName(err) });
+                continue;
+            };
             deleteIndexDirIfPresent(path);
+        }
+    }
+
+    fn cleanupAlgebraicNamespacesInRepairRoot(
+        self: *IndexManager,
+        io: std.Io,
+        shadow_path: []const u8,
+        generation: []const u8,
+    ) !void {
+        const indexes_path = try std.fmt.allocPrint(self.alloc, "{s}/indexes", .{shadow_path});
+        defer self.alloc.free(indexes_path);
+        var indexes_dir = std.Io.Dir.cwd().openDir(io, indexes_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer indexes_dir.close(io);
+        var iter = indexes_dir.iterate();
+        while (try iter.next(io)) |entry| {
+            const storage_namespace = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ generation, entry.name });
+            defer self.alloc.free(storage_namespace);
+            try self.deleteAlgebraicStorageNamespace(storage_namespace);
+        }
+    }
+
+    fn cleanupCanonicalAlgebraicGenerationAfterPointer(self: *IndexManager, name: []const u8) void {
+        const target_path = self.indexPath(name) catch return;
+        defer self.alloc.free(target_path);
+        const pointer = self.readActiveIndexRootPointer(target_path, name) catch return;
+        if (pointer) |value| {
+            self.alloc.free(value);
+            const storage_namespace = std.fmt.allocPrint(
+                self.alloc,
+                "{s}/{s}",
+                .{ canonical_algebraic_generation, name },
+            ) catch return;
+            defer self.alloc.free(storage_namespace);
+            self.deleteAlgebraicStorageNamespace(storage_namespace) catch |err| {
+                std.log.warn("failed to collect canonical algebraic generation name={s} err={s}", .{ name, @errorName(err) });
+                return;
+            };
+            pruneCanonicalIndexRootAfterPointerInstall(target_path) catch |err| {
+                std.log.warn("failed to prune previous canonical index root name={s} err={s}", .{ name, @errorName(err) });
+            };
         }
     }
 
@@ -6939,6 +7008,32 @@ pub const IndexManager = struct {
             try deletes.append(self.alloc, entry.key);
         }
         try store.putBatch(&.{}, deletes.items);
+    }
+
+    pub fn deleteAlgebraicStorageNamespace(self: *IndexManager, storage_namespace: []const u8) !void {
+        const store = self.primary_store orelse return error.PrimaryStoreUnavailable;
+        const fact_prefix = try algebraic_mod.index.storagePrefixAlloc(self.alloc, storage_namespace);
+        defer self.alloc.free(fact_prefix);
+        try self.deleteKeysWithPrefix(store, fact_prefix);
+        const tuple_prefix = try algebraic_mod.index.tupleStoragePrefixAlloc(self.alloc, storage_namespace);
+        defer self.alloc.free(tuple_prefix);
+        try self.deleteKeysWithPrefix(store, tuple_prefix);
+        const dictionary_prefix = try algebraic_mod.index.dictionaryStoragePrefixAlloc(self.alloc, storage_namespace);
+        defer self.alloc.free(dictionary_prefix);
+        try self.deleteKeysWithPrefix(store, dictionary_prefix);
+
+        const registry_prefix = try algebraic_mod.index.dictionaryRegistryPrefixAlloc(self.alloc);
+        defer self.alloc.free(registry_prefix);
+        const entries = try store.scanPrefix(self.alloc, registry_prefix);
+        defer docstore_mod.DocStore.freeResults(self.alloc, entries);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(self.alloc);
+        for (entries) |entry| {
+            if (algebraic_mod.index.dictionaryRegistryKeyBelongsToNamespace(entry.key, storage_namespace)) {
+                try deletes.append(self.alloc, entry.key);
+            }
+        }
+        if (deletes.items.len > 0) try store.putBatch(&.{}, deletes.items);
     }
 
     pub fn rebuildGraphSplitDestination(self: *IndexManager, lower: []const u8, upper: []const u8) !usize {
@@ -9599,6 +9694,27 @@ pub const IndexManager = struct {
         return try self.alloc.dupe(u8, trimmed);
     }
 
+    /// Algebraic data lives in the primary store, so its physical namespace
+    /// must follow the same active-root pointer as filesystem-backed indexes.
+    /// New indexes always use an explicit generation; there is intentionally
+    /// no logical-name/legacy fallback.
+    fn algebraicStorageNamespaceAlloc(self: *const IndexManager, name: []const u8) ![]u8 {
+        const canonical_path = try self.indexPath(name);
+        defer self.alloc.free(canonical_path);
+        if (try self.readActiveIndexRootPointer(canonical_path, name)) |relative| {
+            defer self.alloc.free(relative);
+            const separator = std.mem.indexOfScalar(u8, relative, '/') orelse return error.InvalidIndexRootPointer;
+            return try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ relative[0..separator], name });
+        }
+
+        const base_name = std.fs.path.basename(self.base_path);
+        const generation = if (std.mem.startsWith(u8, base_name, repair_shadow_root_prefix))
+            base_name
+        else
+            canonical_algebraic_generation;
+        return try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ generation, name });
+    }
+
     fn writeActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8, relative_active_path: []const u8) !void {
         if (builtin.os.tag == .freestanding) return;
         if (!validRelativeRepairIndexRoot(std.fs.path.basename(canonical_path), relative_active_path)) return error.InvalidIndexRootPointer;
@@ -10418,7 +10534,14 @@ pub const IndexManager = struct {
                 return .{ .graph = entry };
             },
             .algebraic => {
-                var index = try algebraic_mod.index.Index.open(self.alloc, cfg.name, cfg.config_json);
+                const storage_namespace = try self.algebraicStorageNamespaceAlloc(cfg.name);
+                defer self.alloc.free(storage_namespace);
+                var index = try algebraic_mod.index.Index.openWithStorageNamespace(
+                    self.alloc,
+                    cfg.name,
+                    storage_namespace,
+                    cfg.config_json,
+                );
                 var index_moved = false;
                 errdefer if (!index_moved) {
                     var doomed = index;
