@@ -68,12 +68,12 @@ jobs:
           # PIC storage kernel as the initial 19.25GiB group. This fits the
           # unchanged 20,000MiB cap. With product composition moved out of the
           # kernel, inference starts when distributed finishes and overlaps the
-          # storage tail at an 18.25GiB claim. The short enrichment and remote
-          # CLI units also wait for distributed; max_rss admission holds them
-          # until capacity remains. Explicit build dependencies keep Zig's
-          # randomized traversal from admitting downstream units ahead of the
-          # two initial critical units. The pod reserve covers runner state,
-          # linker work, page cache, and drift.
+          # storage tail at an 18.25GiB claim. API, enrichment, and remote CLI
+          # wait for storage; max_rss admission starts each as capacity becomes
+          # available alongside inference. Explicit build dependencies keep
+          # Zig's randomized traversal from admitting downstream units ahead
+          # of the two initial critical units. The pod reserve covers runner
+          # state, linker work, page cache, and drift.
           cd zig
           runner_root="$(dirname "$(dirname "$RUNNER_TEMP")")"
           node_bin="$runner_root/externals/node24/bin/node"

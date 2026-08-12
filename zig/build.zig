@@ -9326,11 +9326,11 @@ pub fn build(b: *std.Build) void {
             // overlap. The default topology schedules API (7 GiB) with combined
             // application/storage (11 GiB), then inference (8 GiB) with the
             // latter after API. The physical-source experiment schedules
-            // storage (10.25 GiB) with distributed/API/composition (9 GiB),
+            // storage (10.25 GiB) with distributed/standalone control (9 GiB),
             // then admits inference after distributed so its 8 GiB claim can
-            // overlap the storage tail at 18.25 GiB. Serverless/CLI and
-            // enrichment wait for storage; together with inference their
-            // claims total only 17 GiB.
+            // overlap the storage tail at 18.25 GiB. API, serverless/CLI, and
+            // enrichment wait for storage; max_rss admission overlaps the
+            // combinations that fit alongside inference.
             //
             // This is still concurrent code generation; it only prevents a
             // short or later unit from consuming the claim needed by a
@@ -9600,10 +9600,11 @@ pub fn build(b: *std.Build) void {
             // Zig's build runner uses these claims to run as many LLVM codegen
             // steps concurrently as fit in available RAM. The explicit gates
             // above establish the initial groups described above, then overlap
-            // inference with the storage tail and the two short units after
-            // storage. Storage and enrichment are PIC because the
-            // executable and C ABI libraries share both archives; all three
-            // consumers reuse the same analyzed and optimized graphs.
+            // inference with the storage tail and admits the three downstream
+            // units after storage as their claims fit. Storage and enrichment
+            // are PIC because the executable and C ABI libraries share both
+            // archives; all three consumers reuse the same analyzed and
+            // optimized graphs.
             if (unit_enabled and (owns_storage_kernel or unit == .enrichment_compute)) {
                 libantfly_link_mod.linkLibrary(role_artifact);
             }

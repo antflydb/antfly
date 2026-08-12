@@ -4473,21 +4473,75 @@ chain. This does not complete the architecture goal: storage and inference
 remain the next heavy roots, and neither may be hidden with more RAM, swap,
 cache priming, or serialization.
 
+Normal-runner run `31643584514`, job `94271808409`, built the exact pushed
+commit `42b494546` successfully on the unchanged runner. All 43 archive steps,
+six compiler-report captures, source-selection and failure-identity gates,
+artifact checks, and upload passed:
+
+| Unit | Runner time | LLVM | Files | Declarations | Zig MaxRSS |
+|---|---:|---:|---:|---:|---:|
+| Storage + local query | 482.880 s | 473.049 s | 667 | 30,618 | 8 GiB |
+| Data/metadata/HA + standalone | 297.394 s | 289.441 s | 667 | 23,952 | 5 GiB |
+| API kernel | 244.981 s | 238.614 s | 517 | 19,418 | 5 GiB |
+| Serverless + remote CLI | 211.154 s | 204.531 s | 564 | 15,189 | 4 GiB |
+| Inference | 444.092 s | 393.655 s | 711 | 26,640 | 7 GiB |
+| Enrichment compute | 32.552 s | 30.050 s | 130 | 3,508 | 1 GiB |
+
+The complete cold archive took 16:14.57, improving the Phase 4aa runner by
+2:30.19. Process-tree peak RSS was 7,968,692 KiB with zero swap. Distributed
+and API are both comfortably below the 380-second gate, and inference becomes
+eligible after 297.394 seconds rather than after the former 536.737-second
+combined control compiler. The runner reproduced 2,305 repository-file
+instances, 1,257 unique files, 1,048 duplicate instances, and 3,607,360 B of
+repeated named text. The static executable was 72,995,616 B and `libantfly.so`
+was 18,910,408 B. The executable remained static AArch64 and LMDB-free; the C
+API remained below 20 MiB and exposed no private runtime symbols.
+
+Decision: **keep**. The runner evidence accepts the API split and confirms
+that the post-main physical-storage source leak remains closed. Storage and
+inference are now the only units above the normal-runner target.
+
+### Phase 4ac: rejected top-level inference splits
+
+Fresh ARM64 Linux musl `ReleaseFast` probes measured exact production entry
+surfaces without changing release outputs. All used fresh local/global caches,
+baseline CPU, normal compiler concurrency, embedded native inference, and the
+same disabled ONNX/Metal/system-BLAS configuration as the release job:
+
+| Probe | Cold time | Zig MaxRSS | Allocatable object bytes |
+|---|---:|---:|---:|
+| Full inference command only | 238.660 s | 5 GiB | 20,045,431 B |
+| Embedded standalone host only | 162.900 s | 3 GiB | 13,842,966 B |
+| Dedicated inference server only | 161.850 s | 4 GiB | 13,824,466 B |
+| Offline command families only | 215.870 s | 5 GiB | 17,782,686 B |
+
+The complete inference archive on the matched production build was 250.276
+seconds locally. Command plus host would therefore require 401.560 seconds of
+compiler work, 151.284 seconds more than co-generation. Separating dedicated
+server from offline tools would require 377.720 seconds, 127.444 seconds more
+than co-generation, while the 215.870-second offline half would still be
+unlikely to satisfy the 380-second Linux gate under the observed runner/local
+scaling. Both alternatives repeat the shared model, graph, tokenizer, and
+server implementation instead of establishing an ownership boundary.
+
+Decision: **reject both top-level splits and remove the measurement roots**.
+The next inference experiment must first move a complete heavyweight operation
+family behind a compiled engine ABI so consumers do not each instantiate the
+same server/model implementation. Merely separating CLI dispatch, standalone
+hosting, or offline command names is counterproductive.
+
 ## Holistic target architecture
 
-The current structural candidate is the opt-in five-unit source-selected
+The current structural candidate is the opt-in six-unit source-selected
 topology above: storage plus local query, distributed/API control, serverless
-plus remote CLI, enrichment compute, and inference. It gives distributed/API
-and serverless only control sources, co-generates physical local-query
-execution with its storage owner, and keeps compute-heavy inference/enrichment
-isolated. The local cold combined storage/query unit is now 265.177 seconds,
-below the 350-second preferred gate. The preceding Phase 4y topology on the
-normal Linux runner
-measured 599.665 seconds for storage/query, versus 664.411 seconds for the
-immediately preceding matched six-unit repeat. The topology therefore has
-runner reliability evidence and a controlled 64.746-second improvement. The
-Phase 4y source-selection repair and Phase 4aa product split have now passed on
-that runner. They are the ownership/reliability baseline, but all three heavy
+plus remote CLI, enrichment compute, inference, and an independent API kernel.
+It gives distributed, API, and serverless only control sources, co-generates
+physical local-query execution with its storage owner, and keeps compute-heavy
+inference/enrichment isolated. The current normal-runner storage/query unit is
+482.880 seconds and the complete archive is 16:14.57. The Phase 4y
+source-selection repair, Phase 4aa product split, and Phase 4ab API split have
+all passed on the unchanged runner. They are the ownership/reliability
+baseline, but storage and inference
 units still miss the 380-second gate.
 
 The reopened target is a modular monolith with one compiled physical-storage
