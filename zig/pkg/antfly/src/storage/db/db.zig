@@ -58315,9 +58315,12 @@ test "db shared enrichment repair regenerates one physical artifact once" {
     try std.testing.expectEqual(@as(u64, 1), first.reprocessed);
     try std.testing.expectEqual(@as(u64, 1), first.repaired);
     try std.testing.expect(first.debt_remaining);
-    try std.testing.expectEqual(@as(u64, 1), second.scanned);
+    // The first replay publishes the shared artifact to every consumer and
+    // atomically retires their debt. The cursor came from the pre-repair page,
+    // so following it is valid but must not rediscover already-retired work.
+    try std.testing.expectEqual(@as(u64, 0), second.scanned);
     try std.testing.expectEqual(@as(u64, 0), second.reprocessed);
-    try std.testing.expectEqual(@as(u64, 1), second.repaired);
+    try std.testing.expectEqual(@as(u64, 0), second.repaired);
     try std.testing.expect(!second.debt_remaining);
     try std.testing.expectEqual(@as(usize, 1), after.total_requests - before.total_requests);
     try std.testing.expectEqual(@as(usize, 1), after.successful_requests - before.successful_requests);
