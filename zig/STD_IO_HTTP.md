@@ -215,9 +215,10 @@ that end state:
   been deleted. Built-in MCP tools now submit an explicit
   `McpApplicationOperation` union with the authenticated identity instead of
   manufacturing REST requests and calling the public dispatcher. Several
-  operation arms still delegate to legacy response-returning application
-  helpers; extracting those final operation results is the remaining MCP
-  boundary, rather than retaining an HTTP fallback.
+  operation arms now call typed table index, backup, restore, and batch
+  operations directly. Query is the remaining arm that delegates to a legacy
+  response-returning application helper; extracting that result is the last
+  MCP application boundary, rather than retaining an HTTP fallback.
 - Public table-repair and document-artifact reprocess job handlers now return
   owned typed responses directly to their concrete `httpx` routes. The
   residual synthetic public dispatcher has a temporary one-way adapter for

@@ -1028,7 +1028,7 @@ pub fn handleTableListIndexes(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index list failed") },
     };
-    return .{ .status = 200, .body = response_body };
+    return .{ .status = 200, .body = response_body, .json = true };
 }
 
 pub fn handleTableGetIndex(
@@ -1041,7 +1041,7 @@ pub fn handleTableGetIndex(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index lookup failed") },
     };
-    return .{ .status = 200, .body = response_body };
+    return .{ .status = 200, .body = response_body, .json = true };
 }
 
 pub fn handleTableCreateIndex(
@@ -1067,7 +1067,7 @@ pub fn handleTableCreateIndex(
         },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index create failed") },
     };
-    return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
+    return .{ .status = 201, .body = try alloc.dupe(u8, "{}"), .json = true };
 }
 
 pub fn handleTableDeleteIndex(
@@ -1083,7 +1083,7 @@ pub fn handleTableDeleteIndex(
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index delete failed") },
     };
-    return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
+    return .{ .status = 201, .body = try alloc.dupe(u8, "{}"), .json = true };
 }
 
 pub fn handlePutArtifactEnrichment(

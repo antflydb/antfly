@@ -11343,19 +11343,19 @@ pub const ApiHttpServer = struct {
                 return contextual_operations.json(body, false);
             },
             .list_indexes => |request| {
-                var response = try self.handlePublicTableListIndexes(request.table_name);
+                var response = try public_table_http.handleTableListIndexes(self.alloc, request.table_name, self.tableApi());
                 defer response.deinit(self.alloc);
-                return try contextualResponseFromLegacy(self.alloc, response);
+                return try contextualResponseFromPublicTable(self.alloc, response);
             },
             .create_index => |request| {
-                var response = try self.handlePublicTableCreateIndex(request.table_name, request.index_name, request.body);
+                var response = try public_table_http.handleTableCreateIndex(self.alloc, request.table_name, request.index_name, request.body, self.tableApi());
                 defer response.deinit(self.alloc);
-                return try contextualResponseFromLegacy(self.alloc, response);
+                return try contextualResponseFromPublicTable(self.alloc, response);
             },
             .drop_index => |request| {
-                var response = try self.handlePublicTableDeleteIndex(request.table_name, request.index_name);
+                var response = try public_table_http.handleTableDeleteIndex(self.alloc, request.table_name, request.index_name, self.tableApi());
                 defer response.deinit(self.alloc);
-                return try contextualResponseFromLegacy(self.alloc, response);
+                return try contextualResponseFromPublicTable(self.alloc, response);
             },
             .get_document => |request| return try self.executeMcpGetDocument(request, authenticated_identity),
             .sample_documents => |request| return try self.executeMcpSampleDocuments(request, authenticated_identity),
@@ -11365,9 +11365,17 @@ pub const ApiHttpServer = struct {
                 return try contextualResponseFromLegacy(self.alloc, response);
             },
             .backup => |request| {
-                var response = try self.handlePublicTableBackup(request.table_name, request.body);
+                var response = try public_table_http.handleTableBackup(
+                    self.alloc,
+                    request.table_name,
+                    request.body,
+                    self.tableApi(),
+                    self.cfg.secret_store,
+                    self.cfg.node_config,
+                    self.sharedApiIo(),
+                );
                 defer response.deinit(self.alloc);
-                return try contextualResponseFromLegacy(self.alloc, response);
+                return try contextualResponseFromPublicTable(self.alloc, response);
             },
             .restore => |request| {
                 var response = try self.handlePublicTableRestore(
@@ -11380,9 +11388,9 @@ pub const ApiHttpServer = struct {
                 return try cloneContextualResponse(self.alloc, response);
             },
             .batch => |request| {
-                var response = try self.handlePublicTableBatch(request.table_name, request.body);
+                var response = try public_table_http.handleTableBatch(self.alloc, request.table_name, request.body, self.tableApi());
                 defer response.deinit(self.alloc);
-                return try contextualResponseFromLegacy(self.alloc, response);
+                return try contextualResponseFromPublicTable(self.alloc, response);
             },
         }
     }
@@ -14309,6 +14317,29 @@ fn cloneContextualResponse(alloc: std.mem.Allocator, response: contextual_operat
         .public_cors = response.public_cors,
         .headers = headers,
     };
+}
+
+fn contextualResponseFromPublicTable(
+    alloc: std.mem.Allocator,
+    response: public_table_http.OwnedResponse,
+) !contextual_operations.OwnedResponse {
+    var result = contextual_operations.OwnedResponse{
+        .status = response.status,
+        .content_type = if (response.json) "application/json" else "text/plain",
+        .body = try alloc.dupe(u8, response.body),
+    };
+    errdefer result.deinit(alloc);
+    if (response.retry_after_seconds) |seconds| {
+        result.headers = try alloc.alloc(contextual_operations.Header, 1);
+        var value_buf: [10]u8 = undefined;
+        const value = try std.fmt.bufPrint(&value_buf, "{d}", .{seconds});
+        result.headers[0] = ownedContextualHeader(alloc, "Retry-After", value) catch |err| {
+            alloc.free(result.headers);
+            result.headers = &.{};
+            return err;
+        };
+    }
+    return result;
 }
 
 fn contextualResponseFromLegacy(alloc: std.mem.Allocator, response: http_common.HttpResponse) !contextual_operations.OwnedResponse {
