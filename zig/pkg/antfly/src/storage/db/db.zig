@@ -6469,13 +6469,50 @@ pub const DB = struct {
 
     const RepairShadowCleanupWork = struct {
         manager: *index_manager_mod.IndexManager,
+        lane: background_runtime_mod.DurableJobLane,
+        owner_id: u64,
+
+        const pages_per_job: usize = 8;
+        const retries_per_job: usize = 8;
+        const retry_initial_ms: i64 = 25;
+        const retry_max_ms: i64 = 1000;
 
         fn run(ptr: *anyopaque) anyerror!void {
             const work: *@This() = @ptrCast(@alignCast(ptr));
+            var pages: usize = 0;
+            var retries: usize = 0;
             while (true) {
-                work.manager.cleanupInactiveRepairShadowRoots();
+                const progressed = work.manager.cleanupInactiveRepairShadowRootsPage() catch |err| {
+                    retries += 1;
+                    if (retries == 1 or std.math.isPowerOfTwo(retries))
+                        std.log.warn("repair-generation cleanup retry attempt={} err={s}", .{ retries, @errorName(err) });
+                    const shift: u6 = @intCast(@min(retries - 1, 5));
+                    const delay_ms = if (builtin.is_test) 1 else @min(retry_initial_ms << shift, retry_max_ms);
+                    work.manager.checkpointIo().sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
+                    if (retries >= retries_per_job) {
+                        work.manager.repair_cleanup_state.store(0, .release);
+                        scheduleInactiveRepairShadowCleanupContext(work.manager, work.lane, work.owner_id);
+                        return;
+                    }
+                    continue;
+                };
+                retries = 0;
+                if (progressed) {
+                    pages += 1;
+                    if (pages < pages_per_job) continue;
+                    // Orphaned key deletion is itself durable. Yield the shared
+                    // cleanup lane between bounded slices and rediscover the
+                    // first remaining namespace on the next job.
+                    work.manager.repair_cleanup_state.store(0, .release);
+                    scheduleInactiveRepairShadowCleanupContext(work.manager, work.lane, work.owner_id);
+                    return;
+                }
                 if (work.manager.repair_cleanup_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-                if (work.manager.repair_cleanup_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) continue;
+                if (work.manager.repair_cleanup_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
+                    pages = 0;
+                    continue;
+                }
+                return;
             }
         }
 
@@ -6486,24 +6523,36 @@ pub const DB = struct {
     };
 
     fn scheduleInactiveRepairShadowCleanup(self: *DB) void {
-        if (self.core.index_manager.repair_cleanup_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
-            _ = self.core.index_manager.repair_cleanup_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
+        scheduleInactiveRepairShadowCleanupContext(
+            self.core.index_manager,
+            self.backend_runtime.durable_jobs,
+            self.repair_cleanup_owner_id,
+        );
+    }
+
+    fn scheduleInactiveRepairShadowCleanupContext(
+        manager: *index_manager_mod.IndexManager,
+        lane: background_runtime_mod.DurableJobLane,
+        owner_id: u64,
+    ) void {
+        if (manager.repair_cleanup_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
+            _ = manager.repair_cleanup_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
             return;
         }
         const work = std.heap.page_allocator.create(RepairShadowCleanupWork) catch {
-            self.core.index_manager.repair_cleanup_state.store(0, .release);
+            manager.repair_cleanup_state.store(0, .release);
             return;
         };
-        work.* = .{ .manager = self.core.index_manager };
-        self.backend_runtime.durable_jobs.submit(.{
-            .owner_id = self.repair_cleanup_owner_id,
+        work.* = .{ .manager = manager, .lane = lane, .owner_id = owner_id };
+        lane.submit(.{
+            .owner_id = owner_id,
             .class = .cleanup,
             .ptr = work,
             .run = RepairShadowCleanupWork.run,
             .deinit = RepairShadowCleanupWork.deinit,
         }) catch |err| {
             std.heap.page_allocator.destroy(work);
-            self.core.index_manager.repair_cleanup_state.store(0, .release);
+            manager.repair_cleanup_state.store(0, .release);
             std.log.warn("deferred index-generation cleanup was not scheduled err={s}", .{@errorName(err)});
         };
     }
@@ -10895,7 +10944,7 @@ pub const DB = struct {
                 .{ candidate[0..separator], entry.intent.index_name },
             );
             defer alloc.free(storage_namespace);
-            try self.core.index_manager.deleteAlgebraicStorageNamespace(storage_namespace);
+            while (!try self.core.index_manager.deleteAlgebraicStorageNamespacePage(storage_namespace)) {}
         }
         var io_impl = threadedIo();
         defer io_impl.deinit();
@@ -12365,18 +12414,15 @@ pub const DB = struct {
             defer io_impl.deinit();
             if (!shadow_installed and !candidate_reopenable) {
                 if (cfg.kind == .algebraic) {
-                    const storage_namespace = std.fmt.allocPrint(
-                        alloc,
-                        "{s}/{s}",
-                        .{ std.fs.path.basename(shadow_base), cfg.name },
-                    ) catch null;
-                    if (storage_namespace) |value| {
-                        defer alloc.free(value);
-                        self.core.index_manager.deleteAlgebraicStorageNamespace(value) catch {};
-                    }
+                    // Leave the index directory as a durable namespace marker.
+                    // Once the in-progress marker is cleared, paged orphan
+                    // cleanup can resume after failure or process restart.
+                    index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch {};
+                    self.scheduleInactiveRepairShadowCleanup();
+                } else {
+                    index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch {};
+                    std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_base) catch {};
                 }
-                index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch {};
-                std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_base) catch {};
             }
             alloc.free(shadow_base);
         }
@@ -53595,7 +53641,7 @@ test "db repair issue list exposes algebraic generation debt as repairable" {
     try std.testing.expectEqual(@as(u64, 0), repair.unresolved);
     try std.testing.expect(!repair.debt_remaining);
 
-    db.core.index_manager.cleanupInactiveRepairShadowRoots();
+    while (try db.core.index_manager.cleanupInactiveRepairShadowRootsPage()) {}
     const canonical_prefix = try algebraic_mod.index.storagePrefixAlloc(alloc, "canonical/alg_v1");
     defer alloc.free(canonical_prefix);
     const canonical_rows = try db.core.store.scanPrefix(alloc, canonical_prefix);

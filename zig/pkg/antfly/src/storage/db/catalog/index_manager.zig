@@ -4198,7 +4198,18 @@ pub const IndexManager = struct {
         dense_metadata = 2,
         derived_coverage = 3,
         finalization = 4,
+        algebraic_canonical_facts = 5,
+        algebraic_canonical_tuples = 6,
+        algebraic_canonical_dictionary = 7,
+        algebraic_canonical_registry = 8,
+        algebraic_active_facts = 9,
+        algebraic_active_tuples = 10,
+        algebraic_active_dictionary = 11,
+        algebraic_active_registry = 12,
     };
+
+    const AlgebraicCleanupGeneration = enum { canonical, active };
+    const AlgebraicCleanupFamily = enum { facts, tuples, dictionary, registry };
 
     const GeneratedArtifactCleanupRecord = struct {
         phase: GeneratedArtifactCleanupPhase,
@@ -4738,6 +4749,7 @@ pub const IndexManager = struct {
     fn prepareGeneratedArtifactCleanupPlan(
         self: *IndexManager,
         name: []const u8,
+        kind: types.IndexKind,
         coverage_generation: u64,
         owned_chunk_name: ?[]const u8,
         owned_embedding_name: ?[]const u8,
@@ -4745,7 +4757,11 @@ pub const IndexManager = struct {
         var plan = GeneratedArtifactCleanupPlan{ .alloc = self.alloc };
         errdefer plan.deinit();
         plan.key = try internal_keys.indexArtifactCleanupKeyAlloc(self.alloc, name, coverage_generation);
-        plan.value = try self.encodeGeneratedArtifactCleanupRecord(.generated_artifacts, owned_chunk_name, owned_embedding_name, null);
+        const initial_phase: GeneratedArtifactCleanupPhase = if (kind == .algebraic)
+            .algebraic_canonical_facts
+        else
+            .generated_artifacts;
+        plan.value = try self.encodeGeneratedArtifactCleanupRecord(initial_phase, owned_chunk_name, owned_embedding_name, null);
         return plan;
     }
 
@@ -4802,6 +4818,14 @@ pub const IndexManager = struct {
                 defer self.alloc.free(prefix);
                 return try self.drainGeneratedArtifactCleanupMetadataPage(store, key, record, prefix, .finalization);
             },
+            .algebraic_canonical_facts => return try self.drainGeneratedArtifactCleanupAlgebraicPage(store, key, record, .canonical, .facts, .algebraic_canonical_tuples),
+            .algebraic_canonical_tuples => return try self.drainGeneratedArtifactCleanupAlgebraicPage(store, key, record, .canonical, .tuples, .algebraic_canonical_dictionary),
+            .algebraic_canonical_dictionary => return try self.drainGeneratedArtifactCleanupAlgebraicPage(store, key, record, .canonical, .dictionary, .algebraic_canonical_registry),
+            .algebraic_canonical_registry => return try self.drainGeneratedArtifactCleanupAlgebraicPage(store, key, record, .canonical, .registry, .algebraic_active_facts),
+            .algebraic_active_facts => return try self.drainGeneratedArtifactCleanupAlgebraicPage(store, key, record, .active, .facts, .algebraic_active_tuples),
+            .algebraic_active_tuples => return try self.drainGeneratedArtifactCleanupAlgebraicPage(store, key, record, .active, .tuples, .algebraic_active_dictionary),
+            .algebraic_active_dictionary => return try self.drainGeneratedArtifactCleanupAlgebraicPage(store, key, record, .active, .dictionary, .algebraic_active_registry),
+            .algebraic_active_registry => return try self.drainGeneratedArtifactCleanupAlgebraicPage(store, key, record, .active, .registry, .finalization),
             .finalization => return .{ .found = true, .completed = true },
             .generated_artifacts => {},
         }
@@ -4939,6 +4963,57 @@ pub const IndexManager = struct {
         return .{ .found = true, .completed = false };
     }
 
+    fn algebraicCleanupStorageNamespaceAlloc(
+        self: *IndexManager,
+        index_name: []const u8,
+        generation: AlgebraicCleanupGeneration,
+    ) ![]u8 {
+        if (generation == .canonical) {
+            return try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ canonical_algebraic_generation, index_name });
+        }
+        const canonical_path = try self.indexPath(index_name);
+        defer self.alloc.free(canonical_path);
+        const active_path = try self.activeIndexPath(index_name);
+        defer self.alloc.free(active_path);
+        if (std.mem.eql(u8, active_path, canonical_path)) {
+            return try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ canonical_algebraic_generation, index_name });
+        }
+        const indexes_dir = std.fs.path.dirname(active_path) orelse return error.InvalidIndexRootPointer;
+        const repair_root = std.fs.path.dirname(indexes_dir) orelse return error.InvalidIndexRootPointer;
+        return try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ std.fs.path.basename(repair_root), index_name });
+    }
+
+    fn algebraicCleanupPrefixAlloc(
+        self: *IndexManager,
+        storage_namespace: []const u8,
+        family: AlgebraicCleanupFamily,
+    ) ![]u8 {
+        return switch (family) {
+            .facts => try algebraic_mod.index.storagePrefixAlloc(self.alloc, storage_namespace),
+            .tuples => try algebraic_mod.index.tupleStoragePrefixAlloc(self.alloc, storage_namespace),
+            .dictionary => try algebraic_mod.index.dictionaryStoragePrefixAlloc(self.alloc, storage_namespace),
+            .registry => try algebraic_mod.index.dictionaryRegistryPrefixAlloc(self.alloc, storage_namespace),
+        };
+    }
+
+    fn drainGeneratedArtifactCleanupAlgebraicPage(
+        self: *IndexManager,
+        store: anytype,
+        key: []const u8,
+        record: GeneratedArtifactCleanupRecord,
+        generation: AlgebraicCleanupGeneration,
+        family: AlgebraicCleanupFamily,
+        next_phase: GeneratedArtifactCleanupPhase,
+    ) !GeneratedArtifactCleanupDrainResult {
+        const index_name = try internal_keys.indexArtifactCleanupNameAlloc(self.alloc, key);
+        defer self.alloc.free(index_name);
+        const storage_namespace = try self.algebraicCleanupStorageNamespaceAlloc(index_name, generation);
+        defer self.alloc.free(storage_namespace);
+        const prefix = try self.algebraicCleanupPrefixAlloc(storage_namespace, family);
+        defer self.alloc.free(prefix);
+        return try self.drainGeneratedArtifactCleanupMetadataPage(store, key, record, prefix, next_phase);
+    }
+
     pub fn drainGeneratedArtifactCleanupOutboxPage(self: *IndexManager, store: anytype) !GeneratedArtifactCleanupDrainResult {
         const prefix = try internal_keys.indexArtifactCleanupRootPrefixAlloc(self.alloc);
         defer self.alloc.free(prefix);
@@ -5071,24 +5146,8 @@ pub const IndexManager = struct {
             self.applied_sequence_checkpoint_path,
             name,
         );
-        const canonical_namespace = try std.fmt.allocPrint(
-            self.alloc,
-            "{s}/{s}",
-            .{ canonical_algebraic_generation, name },
-        );
-        defer self.alloc.free(canonical_namespace);
-        try self.deleteAlgebraicStorageNamespace(canonical_namespace);
-        if (!std.mem.eql(u8, active_path, canonical_path)) {
-            const indexes_dir = std.fs.path.dirname(active_path) orelse return error.InvalidIndexRootPointer;
-            const repair_root = std.fs.path.dirname(indexes_dir) orelse return error.InvalidIndexRootPointer;
-            const active_namespace = try std.fmt.allocPrint(
-                self.alloc,
-                "{s}/{s}",
-                .{ std.fs.path.basename(repair_root), name },
-            );
-            defer self.alloc.free(active_namespace);
-            try self.deleteAlgebraicStorageNamespace(active_namespace);
-        }
+        // Algebraic keyspaces are drained in bounded, cursor-backed outbox
+        // phases before finalization reaches this filesystem-only tail.
         if (!std.mem.eql(u8, active_path, canonical_path)) try self.deleteIndexDirUsingIoIfPresentFallible(active_path);
         try self.deleteIndexDirUsingIoIfPresentFallible(canonical_path);
     }
@@ -5116,7 +5175,7 @@ pub const IndexManager = struct {
                 const index_path = try self.indexPath(name);
                 defer self.alloc.free(index_path);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
-                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, coverageGenerationForConfig(entry.config), null, null);
+                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, entry.config.kind, coverageGenerationForConfig(entry.config), null, null);
                 defer cleanup.deinit();
                 try self.persistCatalogExcludingWithAtomicMutation(
                     store,
@@ -5151,6 +5210,7 @@ pub const IndexManager = struct {
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
                 var artifact_cleanup = try self.prepareGeneratedArtifactCleanupPlan(
                     name,
+                    entry.config.kind,
                     coverageGenerationForConfig(entry.config),
                     owned_chunk_name,
                     owned_embedding_name,
@@ -5184,6 +5244,7 @@ pub const IndexManager = struct {
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
                 var artifact_cleanup = try self.prepareGeneratedArtifactCleanupPlan(
                     name,
+                    entry.config.kind,
                     coverageGenerationForConfig(entry.config),
                     owned_chunk_name,
                     owned_embedding_name,
@@ -5205,7 +5266,7 @@ pub const IndexManager = struct {
                 const index_path = try self.indexPath(name);
                 defer self.alloc.free(index_path);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
-                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, coverageGenerationForConfig(entry.config), null, null);
+                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, entry.config.kind, coverageGenerationForConfig(entry.config), null, null);
                 defer cleanup.deinit();
                 try self.persistCatalogExcludingWithAtomicMutation(
                     store,
@@ -5226,7 +5287,7 @@ pub const IndexManager = struct {
                 const index_path = try self.indexPath(name);
                 defer self.alloc.free(index_path);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
-                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, coverageGenerationForConfig(entry.config), null, null);
+                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, entry.config.kind, coverageGenerationForConfig(entry.config), null, null);
                 defer cleanup.deinit();
                 try self.persistCatalogExcludingWithAtomicMutation(
                     store,
@@ -5437,8 +5498,12 @@ pub const IndexManager = struct {
         return std.mem.eql(u8, active_path, candidate_path);
     }
 
-    pub fn cleanupInactiveRepairShadowRoots(self: *IndexManager) void {
-        if (builtin.os.tag == .freestanding) return;
+    /// Advance at most one bounded algebraic key-deletion batch while also
+    /// collecting filesystem-only generations. Deleted keys are the durable
+    /// cursor for orphan generations: restart discovery resumes at the first
+    /// remaining family without retaining an in-memory scan result.
+    pub fn cleanupInactiveRepairShadowRootsPage(self: *IndexManager) !bool {
+        if (builtin.os.tag == .freestanding) return false;
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
 
@@ -5450,9 +5515,11 @@ pub const IndexManager = struct {
         for (self.dense_indexes.items) |entry| self.cleanupCanonicalRootAfterPointer(entry.config.name);
         for (self.sparse_indexes.items) |entry| self.cleanupCanonicalRootAfterPointer(entry.config.name);
         for (self.graph_indexes.items) |entry| self.cleanupCanonicalRootAfterPointer(entry.config.name);
-        for (self.algebraic_indexes.items) |entry| self.cleanupCanonicalAlgebraicGenerationAfterPointer(entry.config.name);
+        for (self.algebraic_indexes.items) |entry| {
+            if (try self.cleanupCanonicalAlgebraicGenerationAfterPointerPage(entry.config.name)) return true;
+        }
         for (self.status_only_index_configs) |cfg| switch (cfg.kind) {
-            .algebraic => self.cleanupCanonicalAlgebraicGenerationAfterPointer(cfg.name),
+            .algebraic => if (try self.cleanupCanonicalAlgebraicGenerationAfterPointerPage(cfg.name)) return true,
             else => self.cleanupCanonicalRootAfterPointer(cfg.name),
         };
 
@@ -5462,40 +5529,41 @@ pub const IndexManager = struct {
             while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
             active_roots.deinit(self.alloc);
         }
-        self.collectActiveRepairShadowRoots(&active_roots) catch return;
+        try self.collectActiveRepairShadowRoots(&active_roots);
 
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
-        var dir = std.Io.Dir.cwd().openDir(io, self.base_path, .{ .iterate = true }) catch return;
+        var dir = std.Io.Dir.cwd().openDir(io, self.base_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
         defer dir.close(io);
 
         var iter = dir.iterate();
-        while (iter.next(io) catch null) |entry| {
+        while (try iter.next(io)) |entry| {
             if (entry.kind != .directory) continue;
             if (!std.mem.startsWith(u8, entry.name, repair_shadow_root_prefix)) continue;
             if (active_roots.contains(entry.name)) continue;
-            const path = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, entry.name }) catch continue;
+            const path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, entry.name });
             defer self.alloc.free(path);
             if (repairShadowRootInProgress(path)) continue;
-            self.cleanupAlgebraicNamespacesInRepairRoot(io, path, entry.name) catch |err| {
-                std.log.warn("failed to collect inactive algebraic generation root={s} err={s}", .{ entry.name, @errorName(err) });
-                continue;
-            };
+            if (try self.cleanupAlgebraicNamespacesInRepairRootPage(io, path, entry.name)) return true;
             deleteIndexDirIfPresent(path);
         }
+        return false;
     }
 
-    fn cleanupAlgebraicNamespacesInRepairRoot(
+    fn cleanupAlgebraicNamespacesInRepairRootPage(
         self: *IndexManager,
         io: std.Io,
         shadow_path: []const u8,
         generation: []const u8,
-    ) !void {
+    ) !bool {
         const indexes_path = try std.fmt.allocPrint(self.alloc, "{s}/indexes", .{shadow_path});
         defer self.alloc.free(indexes_path);
         var indexes_dir = std.Io.Dir.cwd().openDir(io, indexes_path, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return,
+            error.FileNotFound => return false,
             else => return err,
         };
         defer indexes_dir.close(io);
@@ -5503,30 +5571,27 @@ pub const IndexManager = struct {
         while (try iter.next(io)) |entry| {
             const storage_namespace = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ generation, entry.name });
             defer self.alloc.free(storage_namespace);
-            try self.deleteAlgebraicStorageNamespace(storage_namespace);
+            if (!try self.deleteAlgebraicStorageNamespacePage(storage_namespace)) return true;
         }
+        return false;
     }
 
-    fn cleanupCanonicalAlgebraicGenerationAfterPointer(self: *IndexManager, name: []const u8) void {
-        const target_path = self.indexPath(name) catch return;
+    fn cleanupCanonicalAlgebraicGenerationAfterPointerPage(self: *IndexManager, name: []const u8) !bool {
+        const target_path = try self.indexPath(name);
         defer self.alloc.free(target_path);
-        const pointer = self.readActiveIndexRootPointer(target_path, name) catch return;
+        const pointer = try self.readActiveIndexRootPointer(target_path, name);
         if (pointer) |value| {
             self.alloc.free(value);
-            const storage_namespace = std.fmt.allocPrint(
+            const storage_namespace = try std.fmt.allocPrint(
                 self.alloc,
                 "{s}/{s}",
                 .{ canonical_algebraic_generation, name },
-            ) catch return;
+            );
             defer self.alloc.free(storage_namespace);
-            self.deleteAlgebraicStorageNamespace(storage_namespace) catch |err| {
-                std.log.warn("failed to collect canonical algebraic generation name={s} err={s}", .{ name, @errorName(err) });
-                return;
-            };
-            pruneCanonicalIndexRootAfterPointerInstall(target_path) catch |err| {
-                std.log.warn("failed to prune previous canonical index root name={s} err={s}", .{ name, @errorName(err) });
-            };
+            if (!try self.deleteAlgebraicStorageNamespacePage(storage_namespace)) return true;
+            try pruneCanonicalIndexRootAfterPointerInstall(target_path);
         }
+        return false;
     }
 
     fn cleanupCanonicalRootAfterPointer(self: *const IndexManager, name: []const u8) void {
@@ -5589,6 +5654,7 @@ pub const IndexManager = struct {
             const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
             var artifact_cleanup = try self.prepareGeneratedArtifactCleanupPlan(
                 name,
+                cfg.kind,
                 coverageGenerationForConfig(cfg),
                 owned_chunk_name,
                 owned_embedding_name,
@@ -7010,30 +7076,35 @@ pub const IndexManager = struct {
         try store.putBatch(&.{}, deletes.items);
     }
 
-    pub fn deleteAlgebraicStorageNamespace(self: *IndexManager, storage_namespace: []const u8) !void {
+    fn deleteKeysWithPrefixPage(self: *IndexManager, store: anytype, prefix: []const u8) !bool {
+        const entries = try store.scanPrefixPage(self.alloc, prefix, null, generated_artifact_cleanup_scan_limit);
+        defer docstore_mod.DocStore.freeResults(self.alloc, entries);
+        if (entries.len == 0) return true;
+
+        const deletes = try self.alloc.alloc([]const u8, entries.len);
+        defer self.alloc.free(deletes);
+        for (entries, 0..) |entry, i| deletes[i] = entry.key;
+        try store.putBatch(&.{}, deletes);
+        // A following page verifies exhaustion. This keeps one call bounded to
+        // one storage batch even when a family contains exactly one short page.
+        return false;
+    }
+
+    pub fn deleteAlgebraicStorageNamespacePage(self: *IndexManager, storage_namespace: []const u8) !bool {
         const store = self.primary_store orelse return error.PrimaryStoreUnavailable;
         const fact_prefix = try algebraic_mod.index.storagePrefixAlloc(self.alloc, storage_namespace);
         defer self.alloc.free(fact_prefix);
-        try self.deleteKeysWithPrefix(store, fact_prefix);
+        if (!try self.deleteKeysWithPrefixPage(store, fact_prefix)) return false;
         const tuple_prefix = try algebraic_mod.index.tupleStoragePrefixAlloc(self.alloc, storage_namespace);
         defer self.alloc.free(tuple_prefix);
-        try self.deleteKeysWithPrefix(store, tuple_prefix);
+        if (!try self.deleteKeysWithPrefixPage(store, tuple_prefix)) return false;
         const dictionary_prefix = try algebraic_mod.index.dictionaryStoragePrefixAlloc(self.alloc, storage_namespace);
         defer self.alloc.free(dictionary_prefix);
-        try self.deleteKeysWithPrefix(store, dictionary_prefix);
+        if (!try self.deleteKeysWithPrefixPage(store, dictionary_prefix)) return false;
 
-        const registry_prefix = try algebraic_mod.index.dictionaryRegistryPrefixAlloc(self.alloc);
+        const registry_prefix = try algebraic_mod.index.dictionaryRegistryPrefixAlloc(self.alloc, storage_namespace);
         defer self.alloc.free(registry_prefix);
-        const entries = try store.scanPrefix(self.alloc, registry_prefix);
-        defer docstore_mod.DocStore.freeResults(self.alloc, entries);
-        var deletes = std.ArrayListUnmanaged([]const u8).empty;
-        defer deletes.deinit(self.alloc);
-        for (entries) |entry| {
-            if (algebraic_mod.index.dictionaryRegistryKeyBelongsToNamespace(entry.key, storage_namespace)) {
-                try deletes.append(self.alloc, entry.key);
-            }
-        }
-        if (deletes.items.len > 0) try store.putBatch(&.{}, deletes.items);
+        return try self.deleteKeysWithPrefixPage(store, registry_prefix);
     }
 
     pub fn rebuildGraphSplitDestination(self: *IndexManager, lower: []const u8, upper: []const u8) !usize {
@@ -23363,6 +23434,175 @@ test "remove persists generated artifact cleanup debt until same-name recreation
     try std.testing.expectError(error.NotFound, store.get(alloc, coverage_probe));
     try std.testing.expectError(error.NotFound, store.get(alloc, cleanup_key));
     try manager.addManaged(&store, cfg, null);
+}
+
+test "algebraic retirement pages generation keys and resumes from its durable cursor" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "algebraic-retirement-pages");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    const cfg: types.IndexConfig = .{
+        .name = "alg_v1",
+        .kind = .algebraic,
+        .config_json =
+        \\{
+        \\  "table": "docs",
+        \\  "schema_version": 1,
+        \\  "capability_fingerprint": "test-capability",
+        \\  "group_fields": [{"name":"customer","path":"customer","type":"string"}],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}],
+        \\  "materializations": []
+        \\}
+        ,
+    };
+    var cleanup_key: ?[]u8 = null;
+    defer if (cleanup_key) |key| alloc.free(key);
+    const canonical_namespace = "canonical/alg_v1";
+    const fact_prefix = try algebraic_mod.index.storagePrefixAlloc(alloc, canonical_namespace);
+    defer alloc.free(fact_prefix);
+    const registry_prefix = try algebraic_mod.index.dictionaryRegistryPrefixAlloc(alloc, canonical_namespace);
+    defer alloc.free(registry_prefix);
+    const unrelated_registry_prefix = try algebraic_mod.index.dictionaryRegistryPrefixAlloc(alloc, "canonical/other");
+    defer alloc.free(unrelated_registry_prefix);
+    const unrelated_registry_key = try std.fmt.allocPrint(alloc, "{s}|8:unrelated", .{unrelated_registry_prefix});
+    defer alloc.free(unrelated_registry_key);
+
+    {
+        var manager = try IndexManager.init(alloc, std.mem.span(path));
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.add(&store, cfg);
+
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer writes.deinit(alloc);
+        var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_keys.items) |owned| alloc.free(owned);
+            owned_keys.deinit(alloc);
+        }
+        for (0..IndexManager.generated_artifact_cleanup_scan_limit + 1) |i| {
+            const row_key = try std.fmt.allocPrint(alloc, "{s}|8:{d:0>8}", .{ fact_prefix, i });
+            try owned_keys.append(alloc, row_key);
+            try writes.append(alloc, .{ .key = row_key, .value = "fact" });
+        }
+        const registry_key = try std.fmt.allocPrint(alloc, "{s}|8:registry", .{registry_prefix});
+        try owned_keys.append(alloc, registry_key);
+        try writes.append(alloc, .{ .key = registry_key, .value = "owner" });
+        try writes.append(alloc, .{ .key = unrelated_registry_key, .value = "other-owner" });
+        try store.putBatch(writes.items, &.{});
+
+        try std.testing.expect(try manager.remove(&store, cfg.name));
+        const cleanup_prefix = try internal_keys.indexArtifactCleanupIndexPrefixAlloc(alloc, cfg.name);
+        defer alloc.free(cleanup_prefix);
+        const cleanup_rows = try store.scanPrefixPage(alloc, cleanup_prefix, null, 1);
+        defer docstore_mod.DocStore.freeResults(alloc, cleanup_rows);
+        try std.testing.expectEqual(@as(usize, 1), cleanup_rows.len);
+        cleanup_key = try alloc.dupe(u8, cleanup_rows[0].key);
+        // Algebraic retirement starts directly in its generation keyspaces;
+        // unrelated index kinds do not pay for empty algebraic phases.
+        var first_fact_page = try manager.drainGeneratedArtifactCleanupOutboxPage(&store);
+        defer first_fact_page.deinit();
+        try std.testing.expect(first_fact_page.found);
+        try std.testing.expect(!first_fact_page.completed);
+
+        const remaining = try store.scanPrefix(alloc, fact_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, remaining);
+        try std.testing.expectEqual(@as(usize, 1), remaining.len);
+        const raw_record = try store.get(alloc, cleanup_key.?);
+        defer alloc.free(raw_record);
+        const record = try IndexManager.decodeGeneratedArtifactCleanupRecord(raw_record);
+        try std.testing.expectEqual(IndexManager.GeneratedArtifactCleanupPhase.algebraic_canonical_facts, record.phase);
+        try std.testing.expect(record.cursor != null);
+    }
+
+    // A fresh manager has no in-memory cursor; the outbox record is sufficient
+    // to finish the exact generation without touching another namespace.
+    {
+        var restarted = try IndexManager.init(alloc, std.mem.span(path));
+        defer restarted.deinit();
+        restarted.bindPrimaryStore(&store);
+        while (true) {
+            var result = try restarted.drainGeneratedArtifactCleanupOutboxPage(&store);
+            defer result.deinit();
+            if (!result.found) break;
+            if (result.completed) {
+                try restarted.finalizeRetiredIndexStorage(&store, result.index_name);
+                try store.delete(result.key);
+            }
+        }
+    }
+
+    const facts_after = try store.scanPrefix(alloc, fact_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, facts_after);
+    try std.testing.expectEqual(@as(usize, 0), facts_after.len);
+    const registry_after = try store.scanPrefix(alloc, registry_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, registry_after);
+    try std.testing.expectEqual(@as(usize, 0), registry_after.len);
+    const unrelated = try store.get(alloc, unrelated_registry_key);
+    defer alloc.free(unrelated);
+    try std.testing.expectEqualStrings("other-owner", unrelated);
+    try std.testing.expectError(error.NotFound, store.get(alloc, cleanup_key.?));
+}
+
+test "orphan algebraic generation cleanup resumes from deleted durable pages" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "orphan-algebraic-pages");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    const generation = ".repair-shadow-orphan";
+    const index_name = "alg_v1";
+    const orphan_index_path = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes/{s}", .{ path, generation, index_name });
+    defer alloc.free(orphan_index_path);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, orphan_index_path);
+
+    const storage_namespace = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ generation, index_name });
+    defer alloc.free(storage_namespace);
+    const fact_prefix = try algebraic_mod.index.storagePrefixAlloc(alloc, storage_namespace);
+    defer alloc.free(fact_prefix);
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |owned| alloc.free(owned);
+        owned_keys.deinit(alloc);
+    }
+    for (0..IndexManager.generated_artifact_cleanup_scan_limit + 1) |i| {
+        const row_key = try std.fmt.allocPrint(alloc, "{s}|8:{d:0>8}", .{ fact_prefix, i });
+        try owned_keys.append(alloc, row_key);
+        try writes.append(alloc, .{ .key = row_key, .value = "fact" });
+    }
+    try store.putBatch(writes.items, &.{});
+
+    {
+        var manager = try IndexManager.init(alloc, std.mem.span(path));
+        defer manager.deinit();
+        manager.bindPrimaryStore(&store);
+        try std.testing.expect(try manager.cleanupInactiveRepairShadowRootsPage());
+        const remaining = try store.scanPrefix(alloc, fact_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, remaining);
+        try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    }
+
+    // No volatile cursor is required for orphan roots: deleting each bounded
+    // page is the checkpoint, and filesystem discovery identifies the exact
+    // generation again after restart.
+    {
+        var restarted = try IndexManager.init(alloc, std.mem.span(path));
+        defer restarted.deinit();
+        restarted.bindPrimaryStore(&store);
+        while (try restarted.cleanupInactiveRepairShadowRootsPage()) {}
+    }
+    const remaining = try store.scanPrefix(alloc, fact_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
 test "generated artifact cleanup isolates malformed tombstones" {

@@ -62,18 +62,8 @@ pub fn dictionaryStoragePrefixAlloc(alloc: Allocator, storage_namespace: []const
     return try token.canonicalTupleAlloc(alloc, &.{ "dictionary:v1", storage_namespace });
 }
 
-pub fn dictionaryRegistryPrefixAlloc(alloc: Allocator) ![]u8 {
-    return try token.canonicalTupleAlloc(alloc, &.{"dictionary_registry:v1"});
-}
-
-pub fn dictionaryRegistryKeyBelongsToNamespace(key: []const u8, storage_namespace: []const u8) bool {
-    const root = token.componentAt(key, 0) catch return false;
-    if (!std.mem.eql(u8, root.payload, "dictionary_registry:v1")) return false;
-    const encoded_identity = token.componentAt(key, root.next) catch return false;
-    const identity_root = token.componentAt(encoded_identity.payload, 0) catch return false;
-    if (!std.mem.eql(u8, identity_root.payload, "dictionary:v1")) return false;
-    const scope = token.componentAt(encoded_identity.payload, identity_root.next) catch return false;
-    return std.mem.eql(u8, scope.payload, storage_namespace);
+pub fn dictionaryRegistryPrefixAlloc(alloc: Allocator, storage_namespace: []const u8) ![]u8 {
+    return try token.canonicalTupleAlloc(alloc, &.{ "dictionary_registry:v1", storage_namespace });
 }
 pub const path_fact_exists_constraint_value = "pathfact-exists:v1";
 const path_fact_any_constraint_tag = "pathfact-any:v1";
