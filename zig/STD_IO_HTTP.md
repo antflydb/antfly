@@ -68,9 +68,11 @@ that end state:
   dispatcher.
 - Metadata table restore, split, merge, and replication-source exact-cutover
   reseed now use the same operation layer and concrete `httpx` routes. The
-  metadata router no longer registers any contextual catch-all; the residual
-  request executor exists only for simulation callers that still need to move
-  to typed operations or real `httpx` transport before it can be deleted.
+  metadata router no longer registers any contextual catch-all. Its manual
+  dispatcher, public request executor, synthetic `handle` entry point, and
+  legacy request/response conversion have been deleted. Metadata integration
+  and simulation fixtures use a real `httpx` test runtime with owned listener
+  tasks and stop/join teardown.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

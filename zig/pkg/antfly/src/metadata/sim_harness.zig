@@ -17,6 +17,7 @@ const metadata_api = @import("api.zig");
 const metadata_control_loop = @import("control_loop.zig");
 const metadata_http_client = @import("http_client.zig");
 const metadata_http_server = @import("http_server.zig");
+const metadata_http_test_runtime = @import("http_test_runtime.zig");
 const metadata_mod = @import("mod.zig");
 const metadata_reconcile_lease = @import("reconcile_lease.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -5791,7 +5792,7 @@ fn startMetadataAdminServers(
     alloc: std.mem.Allocator,
     cluster: *MetadataHttpClusterSimulation,
     shared_io: *std.Io.Threaded,
-    listeners: *[N]std_http_listener.StdHttpListener,
+    listeners: *[N]metadata_http_test_runtime.Runtime,
     servers: *[N]metadata_http_server.MetadataHttpServer,
     sources: *[N]MetadataAdminSimSource,
     base_uris: *[N][]const u8,
@@ -5806,8 +5807,7 @@ fn startMetadataAdminServers(
     for (0..N) |i| {
         sources[i] = .{ .node = cluster.node(i) };
         servers[i] = metadata_http_server.MetadataHttpServer.init(alloc, .{}, sources[i].iface());
-        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), shared_io);
-        try listeners[i].start();
+        listeners[i] = try metadata_http_test_runtime.Runtime.startShared(http_alloc, shared_io.io(), &servers[i]);
         started += 1;
     }
 
@@ -5831,17 +5831,14 @@ fn requestNodeShutdownViaSimAdmin(
     var source = MetadataAdminSimSource{ .node = cluster.node(source_index) };
     var server = metadata_http_server.MetadataHttpServer.init(cluster.alloc, .{}, source.iface());
     defer server.deinit();
-
-    const path = try std.fmt.allocPrint(cluster.alloc, "/internal/v1/nodes/{d}/shutdown", .{node_id});
-    defer cluster.alloc.free(path);
-
-    var response = try server.handle(.{
-        .method = .PUT,
-        .uri = path,
-        .body = "{\"type\":\"remove\",\"reason\":\"sim\"}",
-    });
-    defer response.deinit(cluster.alloc);
-    try std.testing.expectEqual(@as(u16, 202), response.status);
+    var runtime = try metadata_http_test_runtime.Runtime.startOwned(cluster.alloc, &server);
+    defer runtime.deinit();
+    const base_uri = try runtime.baseUri(cluster.alloc);
+    defer cluster.alloc.free(base_uri);
+    var executor = std_http_executor.StdHttpExecutor.init(cluster.alloc, .{});
+    defer executor.deinit();
+    var client = metadata_http_client.MetadataHttpClient.init(cluster.alloc, executor.executor());
+    try client.requestNodeShutdown(base_uri, node_id, "{\"type\":\"remove\",\"reason\":\"sim\"}");
 }
 
 test "metadata http cluster simulation drives table placement convergence" {
@@ -6243,7 +6240,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -6443,7 +6440,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;

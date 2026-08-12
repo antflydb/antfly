@@ -19,6 +19,7 @@ const raft_engine = @import("raft_engine");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_http_client = @import("../metadata/http_client.zig");
 const metadata_http_server = @import("../metadata/http_server.zig");
+const metadata_http_test_runtime = @import("../metadata/http_test_runtime.zig");
 const metadata_mod = @import("../metadata/mod.zig");
 const metadata_service = @import("../metadata/service.zig");
 const metadata_sim = @import("../metadata/sim_harness.zig");
@@ -1357,7 +1358,7 @@ const MetadataAdminSimSource = struct {
 fn startMetadataAdminServers(
     comptime N: usize,
     cluster: *metadata_sim.MetadataHttpClusterSimulation,
-    listeners: *[N]std_http_listener.StdHttpListener,
+    listeners: *[N]metadata_http_test_runtime.Runtime,
     servers: *[N]metadata_http_server.MetadataHttpServer,
     sources: *[N]MetadataAdminSimSource,
     base_uris: *[N][]const u8,
@@ -1365,8 +1366,7 @@ fn startMetadataAdminServers(
     for (0..N) |i| {
         sources[i] = .{ .node = cluster.node(i) };
         servers[i] = metadata_http_server.MetadataHttpServer.init(std.testing.allocator, .{}, sources[i].iface());
-        listeners[i] = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, servers[i].executor());
-        try listeners[i].start();
+        listeners[i] = try metadata_http_test_runtime.Runtime.startOwned(std.testing.allocator, &servers[i]);
     }
     for (0..N) |i| base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
 }
@@ -1668,7 +1668,7 @@ test "public api multi-node e2e routes transaction commit from a non-host node" 
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -1869,7 +1869,7 @@ test "public api multi-node e2e commits cross-table transactions atomically" {
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -3674,7 +3674,7 @@ test "public api multi-node e2e retries transaction commit once after topology c
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -3919,7 +3919,7 @@ test "public api multi-node e2e fails transaction commit after repeated topology
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -4155,7 +4155,7 @@ test "public api multi-node e2e retries transaction session commit once after to
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -4441,7 +4441,7 @@ test "public api multi-node e2e retries cross-table transaction session commit o
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -4776,7 +4776,7 @@ test "public api multi-node e2e fails transaction session commit after repeated 
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -5066,7 +5066,7 @@ test "public api multi-node e2e recovers unresolved distributed transaction afte
     try cluster.publishClusterNodes(metadata_leader_index);
     try cluster.publishClusterStores(metadata_leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -5325,7 +5325,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -5705,7 +5705,7 @@ test "public api multi-node e2e routes graph queries from a non-host node" {
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -5901,7 +5901,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -6340,7 +6340,7 @@ test "public api multi-node e2e routes merge flow from a non-host node" {
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -6653,7 +6653,7 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -6891,7 +6891,7 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -7122,7 +7122,7 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -7469,7 +7469,7 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;

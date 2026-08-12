@@ -21,6 +21,7 @@ const raft_engine = @import("raft_engine");
 const platform = @import("antfly_platform");
 const tracing = @import("../tracing/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
+const metadata_http_client = @import("http_client.zig");
 const platform_time = @import("antfly_platform").time;
 const thread_config = @import("../runtime_thread_config.zig");
 
@@ -1806,10 +1807,12 @@ test "metadata runtime metrics expose memory ownership buckets" {
     try server.start();
     try server.bootstrapLocal(group_ids.main_metadata_group_id, 1);
 
-    if (server.server.owned_admin_http_server) |admin| {
-        var resp = try admin.handle(.{ .method = .GET, .uri = antfly.metadata.http_routes.Routes.status });
-        defer resp.deinit(std.testing.allocator);
-    }
+    const admin_base_uri = try server.server.adminBaseUri(std.testing.allocator);
+    defer std.testing.allocator.free(admin_base_uri);
+    var admin_executor = antfly.raft.transport.StdHttpExecutor.init(std.testing.allocator, .{});
+    defer admin_executor.deinit();
+    var admin_client = metadata_http_client.MetadataHttpClient.init(std.testing.allocator, admin_executor.executor());
+    _ = try admin_client.fetchStatus(admin_base_uri);
 
     var health = HealthSource{ .server = &server };
     var buf: [128 * 1024]u8 = undefined;
@@ -1908,6 +1911,12 @@ test "metadata runtime memory soak diagnostic" {
     try server.runRound();
 
     const admin = server.server.owned_admin_http_server orelse return error.MissingMetadataAdminServer;
+    _ = admin;
+    const admin_base_uri = try server.server.adminBaseUri(server.alloc);
+    defer server.alloc.free(admin_base_uri);
+    var admin_executor = antfly.raft.transport.StdHttpExecutor.init(server.alloc, .{});
+    defer admin_executor.deinit();
+    var admin_client = metadata_http_client.MetadataHttpClient.init(server.alloc, admin_executor.executor());
     printMetadataMemorySoakSample("baseline", 0, svc.memoryDiagnostics(), server.metadataRaftStorageDiagnostics());
 
     var round: usize = 0;
@@ -1947,10 +1956,9 @@ test "metadata runtime memory soak diagnostic" {
         });
         try server.runRound();
 
-        var status_resp = try admin.handle(.{ .method = .GET, .uri = antfly.metadata.http_routes.Routes.status });
-        defer status_resp.deinit(server.alloc);
-        var snapshot_resp = try admin.handle(.{ .method = .GET, .uri = antfly.metadata.http_routes.Routes.admin_snapshot });
-        defer snapshot_resp.deinit(server.alloc);
+        _ = try admin_client.fetchStatus(admin_base_uri);
+        var snapshot = try admin_client.fetchSnapshot(admin_base_uri);
+        snapshot.deinit();
 
         if ((round + 1) % sample_every == 0) {
             printMetadataMemorySoakSample("sample", round + 1, svc.memoryDiagnostics(), server.metadataRaftStorageDiagnostics());

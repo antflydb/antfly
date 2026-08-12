@@ -1060,25 +1060,12 @@ pub const AdminSource = struct {
 };
 
 pub const MetadataHttpServer = struct {
-    alloc: std.mem.Allocator,
-    cfg: MetadataHttpServerConfig,
     source: AdminSource,
 
     pub fn init(alloc: std.mem.Allocator, cfg: MetadataHttpServerConfig, source: AdminSource) MetadataHttpServer {
-        return .{
-            .alloc = alloc,
-            .cfg = cfg,
-            .source = source,
-        };
-    }
-
-    pub fn executor(self: *MetadataHttpServer) http_common.RequestExecutor {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .execute = execute,
-            },
-        };
+        _ = alloc;
+        _ = cfg;
+        return .{ .source = source };
     }
 
     pub fn deinit(self: *MetadataHttpServer) void {
@@ -1947,136 +1934,6 @@ pub const MetadataHttpServer = struct {
         _ = ctx.status(202);
         return self.trackedJson(ctx, result);
     }
-
-    fn contextualRoute(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
-        const method: http_common.Method = switch (ctx.request.method) {
-            .GET => .GET,
-            .POST => .POST,
-            .PUT => .PUT,
-            .DELETE => .DELETE,
-            else => return ctx.status(405).text("method not allowed"),
-        };
-        const headers = try ctx.allocator.alloc(http_common.RequestHeader, ctx.request.headers.entries.items.len);
-        defer ctx.allocator.free(headers);
-        for (ctx.request.headers.entries.items, 0..) |entry, index|
-            headers[index] = .{ .name = entry.name, .value = entry.value };
-        var response = try self.handleWithAllocator(ctx.allocator, .{
-            .method = method,
-            .uri = ctx.request.uri.raw,
-            .headers = headers,
-            .authorization = ctx.header("authorization"),
-            .content_type = ctx.header("content-type"),
-            .body = (try ctx.body()) orelse "",
-        });
-        defer response.deinit(ctx.allocator);
-        _ = ctx.status(response.status);
-        if (response.content_type) |content_type| try ctx.setHeader("content-type", content_type);
-        for (response.headers) |header| try ctx.setHeader(header.name, header.value);
-        _ = ctx.response.body(response.body);
-        return ctx.response.build();
-    }
-
-    pub fn handle(self: *MetadataHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
-        return self.handleWithAllocator(self.alloc, req);
-    }
-
-    fn handleWithAllocator(self: *MetadataHttpServer, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-        _ = self.cfg;
-        switch (req.method) {
-            .GET => {},
-            .POST => {
-                if (routes.Routes.matchInternalTableRestore(req.uri)) |table| {
-                    var restore_req = parseInternalTableRestoreRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid restore request");
-                    defer restore_req.deinit();
-                    self.source.restoreTable(
-                        alloc,
-                        table.table_name,
-                        restore_req.value.location,
-                        restore_req.value.connection,
-                        restore_req.value.artifact_backup_id,
-                        &restore_req.value.manifest,
-                    ) catch |err| {
-                        if (backups_api.backupLocationErrorMessage(err)) |msg| {
-                            return try textResponse(alloc, 400, msg);
-                        }
-                        switch (err) {
-                            error.TableAlreadyExists => return try textResponse(alloc, 409, "table already exists"),
-                            error.InvalidBackupRequest, error.UnsupportedBackupFormat, error.UnsupportedBackupMigrationState => {
-                                return try textResponse(alloc, 400, "invalid restore request");
-                            },
-                            error.BackupIntegrityMissing,
-                            error.BackupArtifactIntegrityMismatch,
-                            error.BackupArtifactMissing,
-                            error.BackupArtifactFormatMismatch,
-                            => return try textResponse(alloc, 400, backups_api.integrity_failure_message),
-                            error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                            else => return err,
-                        }
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
-                if (routes.Routes.matchInternalTableSplit(req.uri)) |table| {
-                    const split_req = parseSplitRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid split request");
-                    defer alloc.free(split_req.split_key);
-                    validateSplitRequestDocIdentity(self.source, table.table_name, split_req) catch |err| switch (err) {
-                        error.TableNotFound, error.RangeNotFound => return try textResponse(alloc, 404, "not found"),
-                        error.DocIdentityNamespaceMismatch => return try textResponse(alloc, 409, "doc identity namespace mismatch"),
-                        else => return try textResponse(alloc, 400, "invalid split request"),
-                    };
-                    self.source.requestSplit(alloc, table.table_name, split_req) catch |err| switch (err) {
-                        error.TableNotFound, error.RangeNotFound => return try textResponse(alloc, 404, "not found"),
-                        error.DocIdentityNamespaceMismatch => return try textResponse(alloc, 409, "doc identity namespace mismatch"),
-                        error.SplitInProgress, error.ConflictingSplitTransition => return try textResponse(alloc, 409, "split already in progress"),
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return try textResponse(alloc, 400, "invalid split request"),
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
-                if (routes.Routes.matchInternalTableMerge(req.uri)) |table| {
-                    const merge_req = parseMergeRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid merge request");
-                    validateMergeRequestDocIdentity(self.source, table.table_name, merge_req) catch |err| switch (err) {
-                        error.TableNotFound, error.RangeNotFound => return try textResponse(alloc, 404, "not found"),
-                        error.DocIdentityNamespaceMismatch => return try textResponse(alloc, 409, "doc identity namespace mismatch"),
-                        else => return try textResponse(alloc, 400, "invalid merge request"),
-                    };
-                    self.source.requestMerge(alloc, table.table_name, merge_req) catch |err| switch (err) {
-                        error.TableNotFound, error.RangeNotFound => return try textResponse(alloc, 404, "not found"),
-                        error.DocIdentityNamespaceMismatch => return try textResponse(alloc, 409, "doc identity namespace mismatch"),
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return try textResponse(alloc, 400, "invalid merge request"),
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
-                if (routes.Routes.matchInternalTableReplicationSourceReseedExactCutover(req.uri)) |source_path| {
-                    var result = self.source.reseedReplicationSourceExactCutover(alloc, source_path.table_name, source_path.source_ordinal) catch |err| switch (err) {
-                        error.TableNotFound, error.UnknownReplicationSource => return try textResponse(alloc, 404, "not found"),
-                        error.InvalidReplicationSourceConfig, error.UnsupportedReplicationSource => return try textResponse(alloc, 400, "invalid replication source"),
-                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
-                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return err,
-                    };
-                    defer result.deinit(alloc);
-                    return .{
-                        .status = 202,
-                        .content_type = try alloc.dupe(u8, "application/json"),
-                        .body = try std.fmt.allocPrint(alloc, "{{\"slot_name\":\"{s}\",\"publication_name\":\"{s}\"}}", .{ result.slot_name, result.publication_name }),
-                    };
-                }
-            },
-            .PUT => {},
-            .DELETE => {},
-        }
-        return try textResponse(alloc, 404, "not found");
-    }
-
-    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
-        return self.handleWithAllocator(alloc, req) catch |err| {
-            if (metadata_authority.isRetryableError(err)) return try notLeaderResponse(alloc);
-            return err;
-        };
-    }
 };
 
 const InternalTableRestoreRequest = table_operations.RestoreRequest;
@@ -2084,19 +1941,6 @@ const InternalTableRestoreRequest = table_operations.RestoreRequest;
 /// The ingress data node validates and content-binds the manifest using the
 /// named connection. Metadata persists that authority identifier and exact
 /// artifact identity without requiring backup credentials itself.
-fn parseInternalTableRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(InternalTableRestoreRequest) {
-    const parsed = try std.json.parseFromSlice(InternalTableRestoreRequest, alloc, body, .{ .allocate = .alloc_always });
-    errdefer parsed.deinit();
-    try backups_api.validateBackupId(parsed.value.backup_id);
-    try backups_api.validateBackupId(parsed.value.artifact_backup_id);
-    if (parsed.value.location.len == 0 or parsed.value.location.len > 4096) return error.InvalidBackupRequest;
-    if (parsed.value.connection.len == 0 or parsed.value.connection.len > 256) return error.InvalidBackupRequest;
-    if (!std.mem.eql(u8, parsed.value.backup_id, parsed.value.manifest.backup_id))
-        return error.InvalidBackupRequest;
-    try backups_api.validateTableManifest(alloc, &parsed.value.manifest, parsed.value.backup_id);
-    return parsed;
-}
-
 fn testInternalTableRestoreRequestBodyAlloc(
     alloc: std.mem.Allocator,
     backup_id: []const u8,
@@ -3052,65 +2896,8 @@ fn deriveGroupId(table_name: []const u8, key: []const u8, seed: u64, reserved: u
     return id;
 }
 
-fn jsonResponse(alloc: std.mem.Allocator, source: AdminSource, value: anytype) !http_common.HttpResponse {
-    const body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    errdefer alloc.free(body);
-    source.recordJsonResponseAllocation(body.len);
-    return .{
-        .status = 200,
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = body,
-    };
-}
-
 fn jsonBodyOrEmptyObject(body: []const u8) []const u8 {
     return if (body.len == 0) "{}" else body;
-}
-
-fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "text/plain"),
-        .body = try alloc.dupe(u8, body),
-    };
-}
-
-fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    const headers = try alloc.alloc(http_common.Header, 2);
-    var initialized_headers: usize = 0;
-    errdefer {
-        for (headers[0..initialized_headers]) |*header| header.deinit(alloc);
-        alloc.free(headers);
-    }
-
-    var retry_after_name: ?[]u8 = try alloc.dupe(u8, "Retry-After");
-    errdefer if (retry_after_name) |value| alloc.free(value);
-    var retry_after_value: ?[]u8 = try alloc.dupe(u8, "1");
-    errdefer if (retry_after_value) |value| alloc.free(value);
-    headers[0] = .{ .name = retry_after_name.?, .value = retry_after_value.? };
-    retry_after_name = null;
-    retry_after_value = null;
-    initialized_headers += 1;
-
-    var not_leader_name: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_header);
-    errdefer if (not_leader_name) |value| alloc.free(value);
-    var not_leader_value: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_value);
-    errdefer if (not_leader_value) |value| alloc.free(value);
-    headers[1] = .{ .name = not_leader_name.?, .value = not_leader_value.? };
-    not_leader_name = null;
-    not_leader_value = null;
-    initialized_headers += 1;
-
-    const content_type = try alloc.dupe(u8, "application/json");
-    errdefer alloc.free(content_type);
-    const body = try alloc.dupe(u8, "{\"error\":\"metadata leader unavailable\"}");
-    errdefer alloc.free(body);
-    return .{
-        .status = 503,
-        .content_type = content_type,
-        .headers = headers,
-        .body = body,
-    };
 }
 
 fn freeStoreStatusReport(alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) void {

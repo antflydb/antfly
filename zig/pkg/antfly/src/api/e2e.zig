@@ -20,6 +20,7 @@ const raft_engine = @import("raft_engine");
 const metadata_mod = @import("../metadata/mod.zig");
 const metadata_http_client = @import("../metadata/http_client.zig");
 const metadata_http_server = @import("../metadata/http_server.zig");
+const metadata_http_test_runtime = @import("../metadata/http_test_runtime.zig");
 const metadata_service = @import("../metadata/service.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const data_runtime = @import("../data/runtime.zig");
@@ -238,15 +239,14 @@ fn startMetadataAdminListener(
     alloc: std.mem.Allocator,
     svc: *metadata_service.MetadataService,
     server: *metadata_http_server.MetadataHttpServer,
-    listener: *std_http_listener.StdHttpListener,
+    listener: *metadata_http_test_runtime.Runtime,
 ) ![]u8 {
     server.* = metadata_http_server.MetadataHttpServer.init(
         alloc,
         .{},
         metadata_http_server.AdminSource.fromMetadataService(svc),
     );
-    listener.* = std_http_listener.StdHttpListener.init(alloc, .{}, server.executor());
-    try listener.start();
+    listener.* = try metadata_http_test_runtime.Runtime.startOwned(alloc, server);
     return try listener.baseUri(alloc);
 }
 
@@ -2451,7 +2451,7 @@ test "public api split e2e backs up drops and restores a table" {
     try runMetadataUntilIncarnationReady(&svc);
 
     var metadata_admin_server: metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_listener: std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listener: metadata_http_test_runtime.Runtime = undefined;
     const metadata_api = try startMetadataAdminListener(
         std.testing.allocator,
         &svc,
@@ -2612,7 +2612,7 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     try runMetadataUntilIncarnationReady(&svc);
 
     var metadata_admin_server: metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_listener: std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listener: metadata_http_test_runtime.Runtime = undefined;
     const metadata_api = try startMetadataAdminListener(
         std.testing.allocator,
         &svc,
@@ -2839,7 +2839,7 @@ test "split data runtime registers a store with metadata" {
     try svc.runRound();
 
     var metadata_admin_server: metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_listener: std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listener: metadata_http_test_runtime.Runtime = undefined;
     const metadata_api = try startMetadataAdminListener(
         std.testing.allocator,
         &svc,
@@ -2965,7 +2965,7 @@ test "split data runtime serves retrieval agent pipeline queries" {
     try svc.runRound();
 
     var metadata_admin_server: metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_listener: std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listener: metadata_http_test_runtime.Runtime = undefined;
     const metadata_api = try startMetadataAdminListener(
         std.testing.allocator,
         &svc,
@@ -6775,7 +6775,7 @@ test "public api smoke e2e queries across split ranges" {
     try svc.runRound();
 
     var metadata_admin_server: metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_listener: std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listener: metadata_http_test_runtime.Runtime = undefined;
     const metadata_api = try startMetadataAdminListener(
         std.testing.allocator,
         &svc,
@@ -6995,7 +6995,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     try svc.runRound();
 
     var metadata_admin_server: metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_listener: std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listener: metadata_http_test_runtime.Runtime = undefined;
     const metadata_api = try startMetadataAdminListener(
         std.testing.allocator,
         &svc,
@@ -7699,7 +7699,7 @@ test "public api e2e reports unsupported multi-range tables in cluster backup" {
     try svc.runRound();
 
     var metadata_admin_server: metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_listener: std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listener: metadata_http_test_runtime.Runtime = undefined;
     const metadata_api = try startMetadataAdminListener(
         std.testing.allocator,
         &svc,
@@ -7896,7 +7896,7 @@ test "public api smoke e2e commits transaction across split ranges" {
     try svc.runRound();
 
     var metadata_admin_server: metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_listener: std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listener: metadata_http_test_runtime.Runtime = undefined;
     const metadata_api = try startMetadataAdminListener(
         std.testing.allocator,
         &svc,
@@ -8271,7 +8271,7 @@ test "public api smoke e2e queries after merge finalization" {
     try svc.runRound();
 
     var metadata_admin_server: metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_listener: std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listener: metadata_http_test_runtime.Runtime = undefined;
     const metadata_api = try startMetadataAdminListener(
         std.testing.allocator,
         &svc,
