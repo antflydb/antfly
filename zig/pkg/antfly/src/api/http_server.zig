@@ -4113,10 +4113,10 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
         var parsed = metadata_openapi.server.parseQueryBuilderAgentBody(self.alloc, body) catch
-            return try contextual_operations.textAlloc(self.alloc, 400, "invalid query builder request");
+            return try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request");
         defer parsed.deinit();
         if (parsed.value.intent.len == 0)
-            return try contextual_operations.textAlloc(self.alloc, 400, "invalid query builder request");
+            return try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request");
 
         var table_context: ?query_builder_agent.QueryBuilderTableContext = null;
         defer if (table_context) |context| freeQueryBuilderTableContext(self.alloc, context);
@@ -4124,10 +4124,10 @@ pub const ApiHttpServer = struct {
         if (parsed.value.table) |table_name| {
             if (authenticated_identity) |identity| {
                 if (!permissionsAllow(identity.permissions, .table, table_name, .read))
-                    return try contextual_operations.textAlloc(self.alloc, 403, "forbidden");
+                    return try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
             }
             table_context = self.loadQueryBuilderTableContext(table_name) catch |err| switch (err) {
-                error.TableNotFound => return try contextual_operations.textAlloc(self.alloc, 404, "not found"),
+                error.TableNotFound => return try contextual_operations.jsonErrorAlloc(self.alloc, 404, "not found"),
                 else => return err,
             };
             if (self.table_reads) |reads| {
@@ -4182,14 +4182,14 @@ pub const ApiHttpServer = struct {
             &collected_context,
             generation_runner.iface(),
         ) catch |err| return switch (err) {
-            error.InvalidQueryBuilderRequest => try contextual_operations.textAlloc(self.alloc, 400, "invalid query builder request"),
-            error.DocIdentityNamespaceMismatch => try contextual_operations.textAlloc(self.alloc, 503, "doc identity unavailable"),
-            error.QueryEmbeddingInputTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "query embedding input too large"),
+            error.InvalidQueryBuilderRequest => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request"),
+            error.DocIdentityNamespaceMismatch => try contextual_operations.jsonErrorAlloc(self.alloc, 503, "doc identity unavailable"),
+            error.QueryEmbeddingInputTooLarge => try contextual_operations.jsonErrorAlloc(self.alloc, 413, "query embedding input too large"),
             error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(self.alloc, 429, "query embedding overloaded"),
             error.EmbedRateLimited => try contextualRetryableTextResponse(self.alloc, 429, "query embedding rate limited"),
             error.EmbedTransientFailure => try contextualRetryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
-            error.EmbedUpstreamFailure => try contextual_operations.textAlloc(self.alloc, 502, "query embedding provider failed"),
-            error.Timeout => try contextual_operations.textAlloc(self.alloc, 504, "query embedding timed out"),
+            error.EmbedUpstreamFailure => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "query embedding provider failed"),
+            error.Timeout => try contextual_operations.jsonErrorAlloc(self.alloc, 504, "query embedding timed out"),
             else => return err,
         };
         return contextual_operations.json(
@@ -5483,6 +5483,77 @@ pub const ApiHttpServer = struct {
         if (!self.cfg.auth_enabled) return true;
         const identity = authenticated_identity orelse return false;
         return permissionsAllow(identity.permissions, .@"*", "*", .admin);
+    }
+
+    pub fn shouldRetryConfiguredMetadataMutation(
+        self: *const ApiHttpServer,
+        err: anyerror,
+        elapsed_ns: u64,
+        attempt_count: usize,
+    ) bool {
+        return self.metadata_mutation_retry_policy.shouldRetry(err, elapsed_ns, attempt_count);
+    }
+
+    pub fn metadataMutationRetryPollNs(self: *const ApiHttpServer) u64 {
+        return self.metadata_mutation_retry_policy.poll_ns;
+    }
+
+    pub fn encodeTableRuntimeSchemaDebugAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?[]u8 {
+        var snapshot = (try self.source.adminSnapshot()) orelse return null;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
+        const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &snapshot, &storage_status_buf);
+        const observed = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+        defer self.freeObservedDynamicFieldCapabilitySets(observed);
+        if (storage_statuses != null) storage_status_buf[0].observed_dynamic_field_capability_sets = observed;
+
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
+        defer arena_impl.deinit();
+        const response = (try tables_api.buildSingleTableStatusWithRuntimeSchemaDebug(
+            arena_impl.allocator(),
+            &snapshot,
+            table_name,
+            storage_statuses,
+        )) orelse return null;
+        return try std.json.Stringify.valueAlloc(alloc, response, .{});
+    }
+
+    pub fn encodeIndexRuntimeSchemaDebugAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) !?[]u8 {
+        var snapshot = (try self.source.adminSnapshot()) orelse return null;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+
+        var local_statuses = try self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot);
+        defer if (local_statuses) |*status| status.deinit(self.alloc);
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+        const body = (try indexes_api.encodeSingleIndex(
+            arena,
+            &snapshot,
+            table_name,
+            index_name,
+            if (local_statuses) |*status| status else null,
+        )) orelse return null;
+        var value = try parseOwnedJsonValueAlloc(arena, body);
+        if (value != .object) return error.InvalidIndexResponse;
+        const observed = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+        defer self.freeObservedDynamicFieldCapabilitySets(observed);
+        try value.object.put(
+            arena,
+            try arena.dupe(u8, "debug"),
+            try tables_api.buildTableIndexRuntimeSchemaDebugValueWithObserved(arena, table, index_name, observed),
+        );
+        return try std.json.Stringify.valueAlloc(alloc, value, .{});
     }
 
     pub fn documentArtifactManifestOptionsForRequest(
@@ -8018,7 +8089,7 @@ pub const ApiHttpServer = struct {
         index_name: []const u8,
     ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
+        var snapshot = (self.source.cachedAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
         var lookup = (indexes_api.lookupSingleIndexConfig(alloc, table.indexes_json, index_name) catch return error.InternalFailure) orelse return error.NotFound;
@@ -9575,7 +9646,7 @@ pub const ApiHttpServer = struct {
             error.CorruptInput,
             error.UnsupportedVersion,
             error.Corrupted,
-            => contextual_operations.json(try public_table_http.tableStorageUnreadableBody(self.alloc, err), false),
+            => contextual_operations.jsonWithStatus(500, try public_table_http.tableStorageUnreadableBody(self.alloc, err), false),
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return try contextual_operations.textAlloc(self.alloc, 500, "query failed");
@@ -11502,6 +11573,10 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
             return try service.adminSnapshot();
         }
 
+        fn cachedAdminSnapshot(ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot {
+            return try adminSnapshot(ptr);
+        }
+
         fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
             const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
             service.freeAdminSnapshot(snapshot);
@@ -11543,6 +11618,7 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
         .vtable = &.{
             .status = V.status,
             .admin_snapshot = V.adminSnapshot,
+            .cached_admin_snapshot = V.cachedAdminSnapshot,
             .free_admin_snapshot = V.freeAdminSnapshot,
             .create_table = V.createTable,
             .drop_table = V.dropTable,
@@ -17890,9 +17966,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     defer public_catalog.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), public_catalog.status);
     try std.testing.expectEqualStrings("application/json", public_catalog.content_type.?);
-    try std.testing.expectEqual(@as(usize, 1), public_catalog.headers.len);
-    try std.testing.expectEqualStrings("Access-Control-Allow-Origin", public_catalog.headers[0].name);
-    try std.testing.expectEqualStrings("*", public_catalog.headers[0].value);
+    try std.testing.expectEqualStrings("*", public_catalog.header("Access-Control-Allow-Origin").?);
     try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/ai-registry+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/mcp-server+json\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
@@ -18083,7 +18157,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     });
     defer authorized_well_known.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), authorized_well_known.status);
-    try std.testing.expectEqual(@as(usize, 0), authorized_well_known.headers.len);
+    try std.testing.expect(authorized_well_known.header("Access-Control-Allow-Origin") == null);
     try std.testing.expect(std.mem.indexOf(u8, authorized_well_known.body, "\"type\":\"application/mcp-server+json\"") != null);
 
     var forbidden_spec = try executeHttpxTestRequest(&server, .{
@@ -18184,9 +18258,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     defer public_well_known.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), public_well_known.status);
     try std.testing.expectEqualStrings("application/json", public_well_known.content_type.?);
-    try std.testing.expectEqual(@as(usize, 1), public_well_known.headers.len);
-    try std.testing.expectEqualStrings("Access-Control-Allow-Origin", public_well_known.headers[0].name);
-    try std.testing.expectEqualStrings("*", public_well_known.headers[0].value);
+    try std.testing.expectEqualStrings("*", public_well_known.header("Access-Control-Allow-Origin").?);
     try std.testing.expect(std.mem.indexOf(u8, public_well_known.body, "\"type\":\"application/ai-registry+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, public_well_known.body, "\"type\":\"application/mcp-server+json\"") == null);
 
@@ -18197,7 +18269,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     });
     defer public_flag_authenticated_well_known.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), public_flag_authenticated_well_known.status);
-    try std.testing.expectEqual(@as(usize, 0), public_flag_authenticated_well_known.headers.len);
+    try std.testing.expect(public_flag_authenticated_well_known.header("Access-Control-Allow-Origin") == null);
     try std.testing.expect(std.mem.indexOf(u8, public_flag_authenticated_well_known.body, "\"type\":\"application/mcp-server+json\"") != null);
 }
 
@@ -19419,9 +19491,7 @@ test "api http server requires auth on public routes when enabled" {
     defer unauthorized.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
     try std.testing.expectEqualStrings("application/json", unauthorized.content_type.?);
-    try std.testing.expectEqual(@as(usize, 1), unauthorized.headers.len);
-    try std.testing.expectEqualStrings("WWW-Authenticate", unauthorized.headers[0].name);
-    try std.testing.expectEqualStrings("Basic realm=\"antfly\"", unauthorized.headers[0].value);
+    try std.testing.expectEqualStrings("Basic realm=\"antfly\"", unauthorized.header("WWW-Authenticate").?);
     var unauthorized_body = try std.json.parseFromSlice(ErrorResponse, std.testing.allocator, unauthorized.body, .{});
     defer unauthorized_body.deinit();
     try std.testing.expectEqualStrings("unauthorized", unauthorized_body.value.@"error");
@@ -19732,8 +19802,8 @@ test "api http server document scan requires table read permission" {
     });
     defer forbidden.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), forbidden.status);
-    try std.testing.expectEqualStrings("text/plain", forbidden.content_type.?);
-    try std.testing.expectEqualStrings("forbidden", forbidden.body);
+    try std.testing.expectEqualStrings("application/json", forbidden.content_type.?);
+    try std.testing.expectEqualStrings("{\"error\":\"forbidden\"}", forbidden.body);
 
     const secrets_reader_auth = try encodeBasicAuthorization(alloc, "secrets-reader", "reader");
     defer alloc.free(secrets_reader_auth);
@@ -20276,8 +20346,8 @@ test "api http server forbids non-admin secret access when auth is enabled" {
     });
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), resp.status);
-    try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
-    try std.testing.expectEqualStrings("forbidden", resp.body);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("{\"error\":\"forbidden\"}", resp.body);
 }
 
 test "api http server query builder requires table read permission when auth is enabled" {
@@ -20460,8 +20530,8 @@ test "api http server restricts runtime schema debug to admins when auth is enab
     });
     defer reader_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), reader_resp.status);
-    try std.testing.expectEqualStrings("text/plain", reader_resp.content_type.?);
-    try std.testing.expectEqualStrings("forbidden", reader_resp.body);
+    try std.testing.expectEqualStrings("application/json", reader_resp.content_type.?);
+    try std.testing.expectEqualStrings("{\"error\":\"forbidden\"}", reader_resp.body);
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
@@ -20959,9 +21029,9 @@ test "api http server returns json user auth errors" {
     try std.testing.expectEqual(@as(u16, 400), bad_delete_resp.status);
     try std.testing.expectEqualStrings("application/json", bad_delete_resp.content_type.?);
 
-    var bad_delete_body = try std.json.parseFromSlice(ErrorResponse, alloc, bad_delete_resp.body, .{});
+    var bad_delete_body = try std.json.parseFromSlice(ErrorResponse, alloc, bad_delete_resp.body, .{ .ignore_unknown_fields = true });
     defer bad_delete_body.deinit();
-    try std.testing.expectEqualStrings("missing resourceType", bad_delete_body.value.@"error");
+    try std.testing.expectEqualStrings("missing_query_param", bad_delete_body.value.@"error");
 
     var bad_row_filter_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
@@ -20973,7 +21043,7 @@ test "api http server returns json user auth errors" {
     try std.testing.expectEqual(@as(u16, 400), bad_row_filter_resp.status);
     try std.testing.expectEqualStrings("application/json", bad_row_filter_resp.content_type.?);
 
-    var bad_row_filter_body = try std.json.parseFromSlice(ErrorResponse, alloc, bad_row_filter_resp.body, .{});
+    var bad_row_filter_body = try std.json.parseFromSlice(ErrorResponse, alloc, bad_row_filter_resp.body, .{ .ignore_unknown_fields = true });
     defer bad_row_filter_body.deinit();
     try std.testing.expectEqualStrings("invalid row filter", bad_row_filter_body.value.@"error");
 }
@@ -21007,7 +21077,7 @@ test "api http server rejects secret writes without a local secret store" {
     });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 503), resp.status);
-    try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", resp.content_type.?);
     try std.testing.expectEqualStrings("secret management not available in multi-node mode", resp.body);
 }
 
@@ -22185,6 +22255,7 @@ test "api http server serves retrieval agent event stream" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{ .experimental = true }, source.iface(), table_source.source(), null);
+    defer server.deinit();
     const retrieval_body =
         \\{"query":"find hello","stream":true,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
     ;
@@ -22231,7 +22302,7 @@ test "api http server serves retrieval agent event stream" {
         .method = .POST,
         .uri = routes.Routes.a2a,
         .content_type = "application/json",
-        .body = "{\"jsonrpc\":\"2.0\",\"id\":\"retrieval-stream\",\"method\":\"message/stream\",\"params\":{\"taskId\":\"rt1\",\"contextId\":\"rc1\",\"message\":{\"kind\":\"message\",\"role\":\"user\",\"metadata\":{\"skill\":\"retrieval\"},\"parts\":[{\"kind\":\"text\",\"text\":\"find hello\"},{\"kind\":\"data\",\"data\":{\"table\":\"docs\",\"limit\":5}}]}}}",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":\"retrieval-stream\",\"method\":\"message/stream\",\"params\":{\"taskId\":\"rt1\",\"contextId\":\"rc1\",\"message\":{\"kind\":\"message\",\"role\":\"user\",\"metadata\":{\"skill\":\"retrieval\"},\"parts\":[{\"kind\":\"text\",\"text\":\"find hello\"},{\"kind\":\"data\",\"data\":{\"queries\":[{\"table\":\"docs\",\"full_text_search\":{\"query\":\"body:hello\"},\"limit\":5}]}}]}}}",
     });
     defer a2a_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), a2a_resp.status);
@@ -25268,7 +25339,7 @@ test "api http server keeps session maintenance off public request paths" {
         .{
             .session_store_path = session_path,
             .session_router = owner_router.iface(),
-            .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
+            .session_owner_lease_ttl_ns = 5 * std.time.ns_per_s,
             .session_owner_lease_renew_interval_ns = std.time.ns_per_ms,
         },
         source.iface(),
@@ -25362,7 +25433,7 @@ test "api http server can renew owned session leases via explicit maintenance ho
         .{
             .session_store_path = session_path,
             .session_router = owner_router.iface(),
-            .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
+            .session_owner_lease_ttl_ns = 5 * std.time.ns_per_s,
             .session_owner_lease_renew_interval_ns = std.time.ns_per_ms,
         },
         source.iface(),
@@ -25404,7 +25475,7 @@ test "api http server can renew owned session leases via explicit maintenance ho
         .{
             .session_store_path = session_path,
             .session_router = adopter_router.iface(),
-            .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
+            .session_owner_lease_ttl_ns = 5 * std.time.ns_per_s,
         },
         source.iface(),
         null,
@@ -25868,11 +25939,13 @@ test "api http server serves internal group transaction routes" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
     defer server.deinit();
     const txn_id = try distributed_txn.parseTxnIdHex("00112233445566778899aabbccddeeff");
+    const participant = try distributed_txn.participantIdForGroup(std.testing.allocator, "docs", 7);
+    defer std.testing.allocator.free(participant);
 
     const begin_body = try distributed_txn.encodeTxnBeginRequest(std.testing.allocator, .{
         .txn_id = txn_id,
         .begin_timestamp = 10_000,
-        .participants = &.{"group:7"},
+        .participants = &.{participant},
     });
     defer std.testing.allocator.free(begin_body);
     var begin_resp = try executeHttpxTestRequest(&server, .{
@@ -25940,11 +26013,12 @@ test "api http server serves internal group transaction routes" {
 
     var lookup = (try db.lookup(alloc, "doc:a", .{})).?;
     defer lookup.deinit(alloc);
-    const stored = try std.json.parseFromSliceLeaky(StoredTitle, alloc, lookup.json, .{
+    var stored = try std.json.parseFromSlice(StoredTitle, alloc, lookup.json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
-    try std.testing.expectEqualStrings("alpha", stored.title);
+    defer stored.deinit();
+    try std.testing.expectEqualStrings("alpha", stored.value.title);
 }
 
 test "api http server serves table metadata list and detail" {
@@ -27420,6 +27494,7 @@ test "api http server serves table create and drop" {
                 .vtable = &.{
                     .status = status,
                     .admin_snapshot = adminSnapshot,
+                    .cached_admin_snapshot = cachedAdminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_table = createTable,
                     .drop_table = dropTable,
@@ -27453,6 +27528,10 @@ test "api http server serves table create and drop" {
                 .split_transitions = @constCast(self.empty_splits[0..]),
                 .merge_transitions = @constCast(self.empty_merges[0..]),
             };
+        }
+
+        fn cachedAdminSnapshot(ptr: *anyopaque) !?metadata_api.AdminSnapshot {
+            return try adminSnapshot(ptr);
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
@@ -27542,7 +27621,7 @@ test "api http server serves table create and drop" {
     });
     defer duplicate_create_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 409), duplicate_create_resp.status);
-    try std.testing.expectEqualStrings("text/plain", duplicate_create_resp.content_type.?);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", duplicate_create_resp.content_type.?);
     try std.testing.expectEqualStrings("table already exists", duplicate_create_resp.body);
 
     var drop_resp = try executeHttpxTestRequest(&server, .{
@@ -32813,17 +32892,17 @@ test "api http server distributed index lookup join uses group-local queries" {
                 201 => blk: {
                     self.group_201_queries += 1;
                     const body = if (wants_a)
-                        "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}"
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}"
                     else
-                        "{\"responses\":[{\"hits\":{\"total\":0,\"max_score\":0,\"hits\":[]}}]}";
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[]}}]}";
                     break :blk .{ .json = try inner_alloc.dupe(u8, body) };
                 },
                 202 => blk: {
                     self.group_202_queries += 1;
                     const body = if (wants_z)
-                        "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}"
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}"
                     else
-                        "{\"responses\":[{\"hits\":{\"total\":0,\"max_score\":0,\"hits\":[]}}]}";
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[]}}]}";
                     break :blk .{ .json = try inner_alloc.dupe(u8, body) };
                 },
                 else => return error.TestUnexpectedResult,
@@ -32945,17 +33024,17 @@ test "api http server distributed shuffle join uses group-local queries" {
                 201 => blk: {
                     self.group_201_queries += 1;
                     const body = if (wants_a)
-                        "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}"
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}"
                     else
-                        "{\"responses\":[{\"hits\":{\"total\":0,\"max_score\":0,\"hits\":[]}}]}";
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[]}}]}";
                     break :blk .{ .json = try inner_alloc.dupe(u8, body) };
                 },
                 202 => blk: {
                     self.group_202_queries += 1;
                     const body = if (wants_z)
-                        "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}"
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}"
                     else
-                        "{\"responses\":[{\"hits\":{\"total\":0,\"max_score\":0,\"hits\":[]}}]}";
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[]}}]}";
                     break :blk .{ .json = try inner_alloc.dupe(u8, body) };
                 },
                 else => return error.TestUnexpectedResult,
@@ -33033,6 +33112,7 @@ test "api http server join partition worker joins left rows locally" {
                     .lookup = lookup,
                     .scan = scan,
                     .query = query,
+                    .query_group_local = queryGroupLocal,
                 },
             };
         }
@@ -33045,19 +33125,13 @@ test "api http server join partition worker joins left rows locally" {
             return error.UnsupportedOperation;
         }
 
-        fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+        fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             try std.testing.expectEqualStrings("customers", table_name);
-            const wants_a = std.mem.indexOf(u8, req.filter_query_json, "cust:a") != null;
-            const wants_z = std.mem.indexOf(u8, req.filter_query_json, "cust:z") != null;
-            const body = if (wants_a and wants_z)
-                "{\"responses\":[{\"hits\":{\"total\":2,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}},{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}"
-            else if (wants_a)
-                "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}"
-            else if (wants_z)
-                "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}"
-            else
-                "{\"responses\":[{\"hits\":{\"total\":0,\"max_score\":0,\"hits\":[]}}]}";
-            return .{ .json = try inner_alloc.dupe(u8, body) };
+            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":2,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}},{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}") };
+        }
+
+        fn queryGroupLocal(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return query(ptr, inner_alloc, table_name, req, consistency);
         }
     };
 
@@ -33107,6 +33181,7 @@ test "api http server join partition worker tracks matched right ids for right j
                     .lookup = lookup,
                     .scan = scan,
                     .query = query,
+                    .query_group_local = queryGroupLocal,
                 },
             };
         }
@@ -33121,7 +33196,11 @@ test "api http server join partition worker tracks matched right ids for right j
 
         fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             try std.testing.expectEqualStrings("customers", table_name);
-            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":2,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}},{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}") };
+            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}") };
+        }
+
+        fn queryGroupLocal(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return query(ptr, inner_alloc, table_name, req, consistency);
         }
     };
 
@@ -33357,14 +33436,14 @@ test "api http server distributed right shuffle appends unmatched right rows aft
 
         fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             try std.testing.expectEqualStrings("customers", table_name);
-            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":2,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}},{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}") };
+            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":2,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}},{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}") };
         }
 
         fn queryGroupLocal(_: *anyopaque, inner_alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             try std.testing.expectEqualStrings("customers", table_name);
             return switch (group_id) {
-                201 => .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}") },
-                202 => .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}") },
+                201 => .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}") },
+                202 => .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}") },
                 else => return error.TestUnexpectedResult,
             };
         }
@@ -33499,7 +33578,7 @@ test "api http server join partition worker fetches remote partition rows" {
             return switch (group_id) {
                 201 => blk: {
                     self.local_group_queries += 1;
-                    break :blk .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}") };
+                    break :blk .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}") };
                 },
                 else => return error.TestUnexpectedResult,
             };

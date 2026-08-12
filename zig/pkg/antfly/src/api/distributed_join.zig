@@ -2919,7 +2919,7 @@ pub fn executeJoinRowsLocalTyped(
     defer owned_req.deinit(alloc);
 
     var hits = std.json.Array.init(alloc);
-    errdefer {
+    defer {
         for (hits.items) |*item| deinitJsonValue(alloc, item);
         hits.deinit();
     }
@@ -3092,16 +3092,17 @@ pub fn executeJoinPartitionWorkerLocalTyped(
         for (owned) |*hit| deinitJsonValue(alloc, hit);
         alloc.free(owned);
     };
-    const right_hits = if (req.right_group_ids.len > 0 and req.join.nested_join == null)
-        collectJoinPartitionRightRows(worker_ctx, job_store, alloc, source, worker_group_id, req) catch |err| {
+    const right_hits = if (req.right_group_ids.len > 0 and req.join.nested_join == null) blk: {
+        right_hits_owned = collectJoinPartitionRightRows(worker_ctx, job_store, alloc, source, worker_group_id, req) catch |err| {
             std.log.warn("join partition right-row collection failed worker_group_id={d} partition_index={d} err={}", .{
                 worker_group_id,
                 req.partition_index,
                 err,
             });
             return err;
-        }
-    else blk: {
+        };
+        break :blk right_hits_owned.?;
+    } else blk: {
         var right_result = try executeRightJoinBroadcastQueryLocal(worker_ctx, job_store, alloc, source, req.join, req.left_hits, .{});
         defer right_result.deinit(alloc);
         right_hits_owned = try alloc.alloc(std.json.Value, right_result.hits.len);

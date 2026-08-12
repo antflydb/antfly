@@ -645,6 +645,7 @@ pub fn handleTableBatch(
         error.CommittedPending => return .{
             .status = 202,
             .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithStatus("committed_pending")),
+            .json = true,
         },
         // Do not use a retryable 5xx: clients must reconcile an ambiguous
         // commit result instead of blindly replaying non-idempotent transforms.
@@ -659,6 +660,7 @@ pub fn handleTableBatch(
     return .{
         .status = 201,
         .body = try batch_api.encodeBatchResponse(alloc, batch_req.result()),
+        .json = true,
     };
 }
 
@@ -911,6 +913,7 @@ pub fn handleTableBackup(
     return .{
         .status = 201,
         .body = try backups_api.encodeBackupSuccess(alloc),
+        .json = true,
     };
 }
 
@@ -964,8 +967,8 @@ pub fn handleTableRestore(
         error.UnsupportedBackupMigrationState => return .{ .status = 400, .body = try alloc.dupe(u8, "restore does not support active schema migration") },
         error.UnsupportedMultiRangeTable => return .{ .status = 400, .body = try alloc.dupe(u8, "restore does not support multi-range tables") },
         error.UnsupportedBackupFormat => return .{ .status = 400, .body = try alloc.dupe(u8, "restore does not support this backup layout") },
-        error.RestoreDurabilityPending => return .{ .status = 202, .body = try backups_api.encodeRestoreDurabilityPending(alloc) },
-        error.RestoreDurabilityConfirmed => return .{ .status = 200, .body = try backups_api.encodeRestoreDurabilityConfirmed(alloc) },
+        error.RestoreDurabilityPending => return .{ .status = 202, .body = try backups_api.encodeRestoreDurabilityPending(alloc), .json = true },
+        error.RestoreDurabilityConfirmed => return .{ .status = 200, .body = try backups_api.encodeRestoreDurabilityConfirmed(alloc), .json = true },
         error.BackupIntegrityFailure => return .{ .status = 422, .body = try alloc.dupe(u8, backups_api.integrity_failure_message) },
         error.InvalidBackupRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "restore failed") },
@@ -974,6 +977,7 @@ pub fn handleTableRestore(
     return .{
         .status = 202,
         .body = try backups_api.encodeRestoreTriggered(alloc),
+        .json = true,
     };
 }
 
@@ -1130,7 +1134,7 @@ pub fn handleListArtifactEnrichments(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment list failed") },
     };
-    return .{ .status = 200, .body = response_body };
+    return .{ .status = 200, .body = response_body, .json = true };
 }
 
 pub fn handleDocumentArtifactManifest(

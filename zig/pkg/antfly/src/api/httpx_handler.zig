@@ -229,7 +229,19 @@ pub const AntflyApiHandler = struct {
 
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         self.api_server.recordHandledRequest();
-        return next.call(ctx);
+        return next.call(ctx) catch |err| {
+            if (metadata_authority.isRetryableError(err)) return metadataNotLeaderResponse(ctx);
+            return err;
+        };
+    }
+
+    fn metadataNotLeaderResponse(ctx: *httpx.Context) !httpx.Response {
+        _ = ctx.status(503);
+        try ctx.setHeader("content-type", "application/json");
+        try ctx.setHeader("Retry-After", "1");
+        try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
+        _ = ctx.response.body("{\"error\":\"metadata leader unavailable\"}");
+        return ctx.response.build();
     }
 
     fn registerRoutesWithOptions(
@@ -2015,6 +2027,11 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn jsonErrorResponse(ctx: *httpx.Context, status: u16, message: []const u8) !httpx.Response {
+        _ = ctx.status(status);
+        return ctx.json(.{ .@"error" = message });
+    }
+
     fn textResponse(ctx: *httpx.Context, status: u16, body: []const u8) !httpx.Response {
         _ = ctx.status(status);
         try ctx.setHeader("content-type", "text/plain");
@@ -2098,7 +2115,7 @@ pub const AntflyApiHandler = struct {
         const authenticated = identity.*.?;
 
         if (http_server_mod.requiresAdminPermission(path) and !http_server_mod.permissionsAllow(authenticated.permissions, .@"*", "*", .admin)) {
-            return try textResponse(ctx, 403, "forbidden");
+            return try jsonErrorResponse(ctx, 403, "forbidden");
         }
         const method = requestMethod(ctx) orelse return null;
         const required_permission = http_server_mod.requiredPermissionForRequest(ctx.allocator, method, path) catch |err| switch (err) {
@@ -2108,7 +2125,7 @@ pub const AntflyApiHandler = struct {
         if (required_permission) |required| {
             defer required.deinit(ctx.allocator);
             if (!http_server_mod.permissionsAllow(authenticated.permissions, required.resource_type, required.resource, required.permission_type)) {
-                return try textResponse(ctx, 403, "forbidden");
+                return try jsonErrorResponse(ctx, 403, "forbidden");
             }
         }
         return null;
@@ -3183,6 +3200,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
+        if (try self.api_server.txn_sessions.getTerminalCommit(self.api_server.alloc, txn_id)) |terminal_value| {
+            var terminal = terminal_value;
+            defer terminal.deinit(self.api_server.alloc);
+            _ = ctx.status(409);
+            return ctx.text("transaction is already committed");
+        }
         if (!self.api_server.txn_sessions.remove(self.api_server.alloc, txn_id)) {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -3335,20 +3358,17 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const body_data = (try ctx.body()) orelse {
-            _ = ctx.status(400);
-            return ctx.text("invalid eval request");
+            return jsonErrorResponse(ctx, 400, "invalid eval request");
         };
         var parsed = metadata_openapi.server.parseEvaluateBody(alloc, body_data) catch {
-            _ = ctx.status(400);
-            return ctx.text("invalid eval request");
+            return jsonErrorResponse(ctx, 400, "invalid eval request");
         };
         defer parsed.deinit();
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const response = retrieval_agent.buildEvalResponse(arena_impl.allocator(), parsed.value) catch |err| switch (err) {
             error.InvalidEvalRequest => {
-                _ = ctx.status(400);
-                return ctx.text("invalid eval request");
+                return jsonErrorResponse(ctx, 400, "invalid eval request");
             },
             else => return err,
         };
@@ -3360,8 +3380,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse {
-            _ = ctx.status(400);
-            return ctx.text("invalid query builder request");
+            return jsonErrorResponse(ctx, 400, "invalid query builder request");
         };
         var response = try self.api_server.executeQueryBuilderAgent(body_data, authenticated_identity);
         defer response.deinit(self.api_server.alloc);
@@ -3590,6 +3609,13 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_table_name);
+        if (http_server_mod.runtimeSchemaDebugRequested(ctx.request.uri.query orelse "")) {
+            if (!self.api_server.runtimeSchemaDebugAllowed(authenticated_identity)) return jsonErrorResponse(ctx, 403, "forbidden");
+            const debug_body = (try self.api_server.encodeTableRuntimeSchemaDebugAlloc(alloc, decoded_table_name)) orelse
+                return jsonErrorResponse(ctx, 404, "not found");
+            defer alloc.free(debug_body);
+            return jsonResponse(ctx, 200, debug_body);
+        }
         var snapshot = (try self.api_server.source.adminSnapshot()) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -3656,10 +3682,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("unsupported table index configuration");
         };
         std.log.info("public create table begin table={s}", .{decoded_table_name});
-        const metadata_create_timeout_ns = http_server_mod.default_metadata_mutation_retry_timeout_ns;
-        const metadata_create_poll_ns = http_server_mod.default_metadata_mutation_retry_poll_ns;
         const metadata_create_start_ns = platform_time.monotonicNs();
+        var metadata_create_attempts: usize = 0;
         while (true) {
+            metadata_create_attempts += 1;
             self.api_server.source.createTable(alloc, decoded_table_name, create_req) catch |err| switch (err) {
                 error.TableAlreadyExists => {
                     _ = ctx.status(409);
@@ -3675,18 +3701,18 @@ pub const AntflyApiHandler = struct {
                 },
                 error.UnexpectedHttpStatus => {
                     const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
-                    if (!http_server_mod.shouldRetryMetadataMutation(err, elapsed_ns, metadata_create_timeout_ns)) {
+                    if (!self.api_server.shouldRetryConfiguredMetadataMutation(err, elapsed_ns, metadata_create_attempts)) {
                         std.log.err("public create table metadata create failed table={s} err={}", .{ decoded_table_name, err });
                         return err;
                     }
-                    sleepNs(metadata_create_poll_ns);
+                    sleepNs(self.api_server.metadataMutationRetryPollNs());
                     continue;
                 },
                 else => {
                     if (metadata_authority.isRetryableError(err)) {
                         const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
-                        if (http_server_mod.shouldRetryMetadataMutation(err, elapsed_ns, metadata_create_timeout_ns)) {
-                            sleepNs(metadata_create_poll_ns);
+                        if (self.api_server.shouldRetryConfiguredMetadataMutation(err, elapsed_ns, metadata_create_attempts)) {
+                            sleepNs(self.api_server.metadataMutationRetryPollNs());
                             continue;
                         }
                         return error.NotLeader;
@@ -4430,6 +4456,13 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
+        if (http_server_mod.runtimeSchemaDebugRequested(ctx.request.uri.query orelse "")) {
+            if (!self.api_server.runtimeSchemaDebugAllowed(authenticated_identity)) return jsonErrorResponse(ctx, 403, "forbidden");
+            const debug_body = (try self.api_server.encodeIndexRuntimeSchemaDebugAlloc(ctx.allocator, decoded_table_name, decoded_index_name)) orelse
+                return jsonErrorResponse(ctx, 404, "not found");
+            defer ctx.allocator.free(debug_body);
+            return jsonResponse(ctx, 200, debug_body);
+        }
         var resp = try public_table_http.handleTableGetIndex(ctx.allocator, decoded_table_name, decoded_index_name, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
     }
@@ -4857,19 +4890,16 @@ pub const AntflyApiHandler = struct {
             return ctx.text("user management not configured");
         };
         const body_data = (try ctx.body()) orelse {
-            _ = ctx.status(400);
-            return ctx.text("invalid row filter");
+            return jsonErrorResponse(ctx, 400, "invalid row filter");
         };
         var parsed_filter = usermgr_openapi.server.parseSetRowFilterBody(alloc, body_data) catch {
-            _ = ctx.status(400);
-            return ctx.text("invalid row filter");
+            return jsonErrorResponse(ctx, 400, "invalid row filter");
         };
         defer parsed_filter.deinit();
         const normalized_filter = try std.json.Stringify.valueAlloc(alloc, parsed_filter.value, .{});
         defer alloc.free(normalized_filter);
         http_server_mod.validateAuthRowFilterJson(alloc, normalized_filter) catch {
-            _ = ctx.status(400);
-            return ctx.text("invalid row filter");
+            return jsonErrorResponse(ctx, 400, "invalid row filter");
         };
         manager.setRowFilter(user_name, table, normalized_filter) catch |err| switch (err) {
             error.UserNotFound => {
@@ -4877,8 +4907,7 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("not found");
             },
             else => {
-                _ = ctx.status(400);
-                return ctx.text("invalid row filter");
+                return jsonErrorResponse(ctx, 400, "invalid row filter");
             },
         };
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
@@ -4966,23 +4995,19 @@ pub const AntflyApiHandler = struct {
             return ctx.text("user management not configured");
         };
         const body_data = (try ctx.body()) orelse {
-            _ = ctx.status(400);
-            return ctx.text("invalid row filter");
+            return jsonErrorResponse(ctx, 400, "invalid row filter");
         };
         var parsed_filter = usermgr_openapi.server.parseSetSubjectRowFilterBody(alloc, body_data) catch {
-            _ = ctx.status(400);
-            return ctx.text("invalid row filter");
+            return jsonErrorResponse(ctx, 400, "invalid row filter");
         };
         defer parsed_filter.deinit();
         const normalized_filter = try std.json.Stringify.valueAlloc(alloc, parsed_filter.value, .{});
         defer alloc.free(normalized_filter);
         http_server_mod.validateAuthRowFilterJson(alloc, normalized_filter) catch {
-            _ = ctx.status(400);
-            return ctx.text("invalid row filter");
+            return jsonErrorResponse(ctx, 400, "invalid row filter");
         };
         manager.setSubjectRowFilter(subject, table, normalized_filter) catch {
-            _ = ctx.status(400);
-            return ctx.text("invalid row filter");
+            return jsonErrorResponse(ctx, 400, "invalid row filter");
         };
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();

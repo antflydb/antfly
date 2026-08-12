@@ -70,6 +70,12 @@ pub fn json(body: []u8, public_cors: bool) OwnedResponse {
     };
 }
 
+pub fn jsonWithStatus(status: u16, body: []u8, public_cors: bool) OwnedResponse {
+    var response = json(body, public_cors);
+    response.status = status;
+    return response;
+}
+
 pub fn bytes(content_type: []const u8, body: []u8) OwnedResponse {
     return .{
         .content_type = content_type,
@@ -82,6 +88,14 @@ pub fn textAlloc(alloc: std.mem.Allocator, status: u16, body: []const u8) !Owned
         .status = status,
         .content_type = "text/plain",
         .body = try alloc.dupe(u8, body),
+    };
+}
+
+pub fn jsonErrorAlloc(alloc: std.mem.Allocator, status: u16, message: []const u8) !OwnedResponse {
+    return .{
+        .status = status,
+        .content_type = "application/json",
+        .body = try std.fmt.allocPrint(alloc, "{{\"error\":{f}}}", .{std.json.fmt(message, .{})}),
     };
 }
 
