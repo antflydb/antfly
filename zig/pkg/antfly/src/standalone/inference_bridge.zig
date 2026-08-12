@@ -34,6 +34,9 @@ pub const Operation = enum(u32) {
     generate_text = 8,
     generate_messages = 9,
     embed_dense_parts = 10,
+    read_images = 11,
+    transcribe_audio = 12,
+    extract = 13,
 };
 
 pub const String = extern struct {
@@ -95,11 +98,6 @@ pub const ConfigureContext = extern struct {
     resource_manager: *anyopaque,
     io: ?*const anyopaque,
     out_failure: *FailureIdentity,
-};
-
-pub const ProviderContext = extern struct {
-    handle: *anyopaque,
-    out_provider: *anyopaque,
 };
 
 pub const CancellationProbeFn = *const fn (?*const anyopaque) callconv(.c) u8;
@@ -238,7 +236,6 @@ pub const RoutesContext = extern struct {
 
 pub extern fn antfly_standalone_inference_create(context: *const CreateContext) callconv(.c) Status;
 pub extern fn antfly_standalone_inference_configure(context: *const ConfigureContext) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_provider(context: *const ProviderContext) callconv(.c) void;
 pub extern fn antfly_standalone_inference_embed_dense(
     request: *const DenseEmbeddingRequest,
     out_result: *DenseEmbeddingResult,
@@ -284,6 +281,21 @@ pub extern fn antfly_standalone_inference_generate_messages(
 pub extern fn antfly_standalone_inference_embed_dense_parts(
     request: *const DensePartsRequest,
     out_result: *DenseEmbeddingResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub extern fn antfly_standalone_inference_read_images(
+    request: *const JsonOperationRequest,
+    out_result: *BytesResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub extern fn antfly_standalone_inference_transcribe_audio(
+    request: *const JsonOperationRequest,
+    out_result: *BytesResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub extern fn antfly_standalone_inference_extract(
+    request: *const JsonOperationRequest,
+    out_result: *BytesResult,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 pub extern fn antfly_standalone_inference_register_routes(context: *const RoutesContext) callconv(.c) Status;

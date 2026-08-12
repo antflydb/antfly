@@ -6263,6 +6263,8 @@ pub fn build(b: *std.Build) void {
             "dense adapter preserves registered failure identity and rejects wrong origin",
             "simple inference operations retain their distinct failure origins",
             "generation ABI preserves domain errors and rich message JSON",
+            "media ABI clones consumer-owned result identities",
+            "media and extraction operations preserve distinct failure identity",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",

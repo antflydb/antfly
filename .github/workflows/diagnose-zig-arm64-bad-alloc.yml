@@ -214,7 +214,9 @@ jobs:
           storage_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-storage-kernel_zcu.o' -print -quit)"
           distributed_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-distributed_zcu.o' -print -quit)"
           enrichment_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-enrichment_compute_zcu.o' -print -quit)"
-          if [ -z "$storage_object" ] || [ -z "$distributed_object" ] || [ -z "$enrichment_object" ]; then
+          inference_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-inference_zcu.o' -print -quit)"
+          cli_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-cli_zcu.o' -print -quit)"
+          if [ -z "$storage_object" ] || [ -z "$distributed_object" ] || [ -z "$enrichment_object" ] || [ -z "$inference_object" ] || [ -z "$cli_object" ]; then
             echo "Zig runtime objects were not found for emitted-overlap analysis" >&2
             exit 1
           fi
@@ -228,6 +230,8 @@ jobs:
             --object "storage=$storage_object" \
             --object "distributed=$distributed_object" \
             --object "enrichment=$enrichment_object" \
+            --object "inference=$inference_object" \
+            --object "cli=$cli_object" \
             --top-groups 30 \
             --json | tee "$RUNNER_TEMP/linked-runtime-reports/summary.json"
 

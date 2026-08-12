@@ -4077,15 +4077,73 @@ callbacks are consumer-local shims, and failures are attributed to the distinct
 `embed_dense_parts` operation. The linked build, 50 focused tests, and graph
 boundary gates pass with this typed cut.
 
+ABI 37 completes the replacement for image reading, transcription, and
+extraction. Their domain requests are already URL- and JSON-based, so each
+operation sends one bounded JSON document and receives one provider-owned JSON
+byte result. The consumer parses and deep-clones reader and transcription
+results into its allocator; extraction adopts a copied JSON response with its
+normal allocator identity. Expected reader, transcriber, audio, Whisper, and
+extraction failures have append-only statuses. Each retains its exact operation
+and `inference_runtime` origin, while undeclared failures retain their exact
+name/hash under `.internal`.
+
+With every callback migrated, linked mode now constructs the complete
+`AntflyProvider` table in the consumer around only the opaque lifecycle handle.
+`ProviderContext`, `antfly_standalone_inference_provider`, and the inference
+archive's raw Zig function table export are removed. Inline test composition
+may still build a direct Zig table because no independently code-generated
+boundary exists there. A graph gate rejects reintroduction of the removed raw
+tokens and prevents the inference client from importing the inference host or
+runtime implementation.
+
+The completed boundary passed the linked native Debug build, 52/52 focused
+standalone tests, 92/92 exhaustive owner/status tests, 11/11 CAPI tests, all
+three graph gates, and 18/18 analyzer tests, all with zero leaks. A local
+`ReleaseFast` wire benchmark measured complete JSON encode/decode round trips
+at 2.73 microseconds for 32 image URLs, 12.13 microseconds for 32 structured
+reader results, and 50.35 microseconds for a 100-segment transcription. These
+costs are negligible beside the corresponding model and remote-content work;
+there is still exactly one ABI call per coarse inference operation.
+
+A cold Apple-Silicon cross-build used Zig 0.16.0, fresh local/global caches,
+ARM64 Linux musl `ReleaseFast`, stripping, production LSM-only mode, the opt-in
+five-unit topology, and normal concurrency. The comparison is against the
+documented Phase 4u/4w cold results; unchanged-unit movement is small enough to
+show the scale but is not a repeated matched causal estimate:
+
+| Unit | Previous local result | Complete inference ABI | Change |
+|---|---:|---:|---:|
+| Storage/query | 302.038 s | 296.573 s | -5.465 s |
+| Distributed/API control | 238.758 s | 227.750 s | -11.008 s |
+| Inference | 237.220 s | 227.505 s | -9.715 s |
+| Remote CLI | 39.342 s | 37.638 s | -1.704 s |
+| Enrichment compute | 17.503 s | 17.086 s | -0.417 s |
+
+The critical storage/query unit remains below the preferred 350-second local
+gate. Distributed analyzed 544 repository files / 765,202 lines and 28,618
+declarations; inference analyzed 523 / 577,239 and 25,051 declarations. Across
+all five units there are 1,747 repository-file instances, 1,223 unique files,
+and 524 duplicate instances, versus 1,744 / 1,221 / 523 before the cut. The
+complete emitted overlap is 1,947,510 B, effectively identical to the prior
+1,947,522 B. The raw provider table therefore was an unsupported ABI and a
+correctness liability, but Zig's lazy analysis had already prevented it from
+causing the large compiler-graph leak hypothesized in Phase 4v.
+
+The storage object is 31,340,248 B, the stripped static executable is
+61,462,304 B, and stripped `libantfly.so` is 17,877,824 B, below its 20 MiB
+budget. The executable is AArch64, has no dynamic section, and its strings
+contain no LMDB entry-point names. The CAPI dynamic-symbol audit exposes no
+private runtime, inference, API-kernel, storage-owner, snapshot, restore, or
+data-apply symbols.
+
 Decision: **keep this as the identity and ownership template for the remaining
-coarse inference operations**. It is a prerequisite slice, not yet a compiler
-graph win: media and extraction still come
-from the transitional raw Zig provider table. Because that table still exists,
-a cold `ReleaseFast` compiler comparison would not measure the intended root
-removal. Migrate the remaining callbacks using the same status/envelope and
-provider-owned-result rules, then delete `ProviderContext`,
-`linkedInferenceProvider`, and the raw provider export before taking the
-authoritative cold graph, time, RSS, and artifact measurement.
+coarse runtime boundaries and retain the completed inference cut for
+correctness**. As a compilation experiment it misses the documented 30--45
+second material-improvement threshold and does not reduce aggregate graph or
+emitted duplication, so it is not the next build-performance solution. Normal
+runner timing/RSS and repeated reliability evidence remain required. Continue
+the goal loop with the actual remaining emitted overlap, led by API/control and
+storage sources, without merging inference back into the critical unit.
 
 ## Holistic target architecture
 

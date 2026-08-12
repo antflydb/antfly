@@ -104,7 +104,7 @@ class ImportGraphTest(unittest.TestCase):
             target for _, target in analyzer.CODEGEN_BOUNDARIES
         } | set(analyzer.CONTROL_WAL_CONSUMERS) | {
             analyzer.NATIVE_WAL_IMPLEMENTATION,
-        }:
+        } | {source for source, _ in analyzer.INFERENCE_ABI_FORBIDDEN_TOKENS}:
             path = self.root / name
             if not path.exists():
                 self.write(name, "pub const value = 1;\n")
@@ -185,6 +185,19 @@ class ImportGraphTest(unittest.TestCase):
             "standalone/inference_host.zig -> standalone/runtime.zig",
             diagnostics.getvalue(),
         )
+
+    def test_codegen_boundary_rejects_raw_inference_provider_export(self):
+        self.write_codegen_boundaries()
+        self.write(
+            "standalone/inference_bridge.zig",
+            "pub const ProviderContext = extern struct {};\n",
+        )
+        graph = analyzer.ImportGraph(self.root)
+
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            self.assertFalse(analyzer.check_codegen_boundary(graph))
+        self.assertIn("removed raw inference ABI token ProviderContext", diagnostics.getvalue())
 
     def test_codegen_boundary_accepts_control_wal_runtime_selector(self):
         self.write_codegen_boundaries()

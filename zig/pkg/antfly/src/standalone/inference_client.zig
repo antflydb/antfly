@@ -20,6 +20,9 @@ const std = @import("std");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const inference_types = @import("../inference/types.zig");
 const template = @import("../template.zig");
+const readers = @import("antfly_readers");
+const transcribing = @import("antfly_transcribing");
+const extracting = @import("antfly_extracting");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const bridge = @import("inference_bridge.zig");
 const failure_identity = @import("runtime_failure_identity");
@@ -65,20 +68,25 @@ const linked_list_models_api = ListModelsApi{
     .destroy = bridge.antfly_standalone_inference_bytes_result_destroy,
 };
 
-pub fn installProviderAdapters(provider: *managed_embedder.AntflyProvider) void {
-    // Preserve the provider's existing opaque Node handle while this migration
-    // is mixed: both the ABI shims and the remaining legacy callbacks consume
-    // that same handle. Once every callback is migrated, the provider table
-    // export and this transitional constraint disappear together.
-    provider.embed_dense_texts = embedDenseTexts;
-    provider.embed_dense_texts_with_context = embedDenseTextsWithContext;
-    provider.embed_sparse_texts = embedSparseTexts;
-    provider.embed_dense_parts = embedDenseParts;
-    provider.embed_dense_parts_with_context = embedDensePartsWithContext;
-    provider.rerank_texts = rerankTexts;
-    provider.list_models_json = listModelsJson;
-    provider.generate_text = generateText;
-    provider.generate_messages = generateMessages;
+/// Build the complete consumer-local provider table. Only the opaque lifecycle
+/// handle and dependency-neutral ABI calls cross into the inference archive;
+/// no Zig function pointer or error union originates in that archive.
+pub fn linkedProvider(inference_handle: *anyopaque) managed_embedder.AntflyProvider {
+    return .{
+        .ptr = inference_handle,
+        .embed_dense_texts = embedDenseTexts,
+        .embed_dense_texts_with_context = embedDenseTextsWithContext,
+        .embed_sparse_texts = embedSparseTexts,
+        .embed_dense_parts = embedDenseParts,
+        .embed_dense_parts_with_context = embedDensePartsWithContext,
+        .rerank_texts = rerankTexts,
+        .list_models_json = listModelsJson,
+        .generate_text = generateText,
+        .generate_messages = generateMessages,
+        .read_images = readImages,
+        .transcribe_audio = transcribeAudio,
+        .extract = extract,
+    };
 }
 
 fn embedDenseTexts(
@@ -380,6 +388,205 @@ fn callBytesOperation(
     return try alloc.dupe(u8, if (result.byte_count == 0) &.{} else result.bytes.?[0..result.byte_count]);
 }
 
+fn readImages(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: readers.Request,
+) anyerror![]readers.Result {
+    const payload = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(payload);
+    const bytes = try callJsonOperation(
+        alloc,
+        .read_images,
+        bridge.antfly_standalone_inference_read_images,
+        handle,
+        model,
+        payload,
+    );
+    defer alloc.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSliceLeaky([]readers.Result, arena.allocator(), bytes, .{});
+    if (parsed.len != request.images.len) return error.InvalidReadResultCount;
+    return try cloneReaderResults(alloc, parsed);
+}
+
+fn cloneReaderResults(alloc: std.mem.Allocator, parsed: []const readers.Result) ![]readers.Result {
+    const results = try alloc.alloc(readers.Result, parsed.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (results[0..initialized]) |*result| readers.deinitResult(alloc, result);
+        alloc.free(results);
+    }
+    for (parsed, 0..) |result, i| {
+        var owned = readers.Result{
+            .text = try alloc.dupe(u8, result.text),
+            .fields_json = null,
+            .regions_json = null,
+        };
+        errdefer readers.deinitResult(alloc, &owned);
+        owned.fields_json = if (result.fields_json) |value| try alloc.dupe(u8, value) else null;
+        owned.regions_json = if (result.regions_json) |value| try alloc.dupe(u8, value) else null;
+        results[i] = owned;
+        initialized += 1;
+    }
+    return results;
+}
+
+fn transcribeAudio(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: transcribing.Request,
+) anyerror!transcribing.Response {
+    const payload = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(payload);
+    const bytes = try callJsonOperation(
+        alloc,
+        .transcribe_audio,
+        bridge.antfly_standalone_inference_transcribe_audio,
+        handle,
+        model,
+        payload,
+    );
+    defer alloc.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(transcribing.Response, arena.allocator(), bytes, .{});
+    return try cloneTranscriptionResponse(alloc, parsed);
+}
+
+fn extract(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: extracting.Request,
+) anyerror!extracting.Response {
+    const payload = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(payload);
+    return .{
+        .allocator = alloc,
+        .json = try callJsonOperation(
+            alloc,
+            .extract,
+            bridge.antfly_standalone_inference_extract,
+            handle,
+            model,
+            payload,
+        ),
+    };
+}
+
+fn callJsonOperation(
+    alloc: std.mem.Allocator,
+    operation: bridge.Operation,
+    comptime execute: anytype,
+    handle: *anyopaque,
+    model: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    const request = bridge.JsonOperationRequest{
+        .handle = handle,
+        .model = .init(model),
+        .payload_json = .init(payload),
+    };
+    return callBytesOperation(alloc, operation, execute, &request);
+}
+
+fn cloneTranscriptionResponse(
+    alloc: std.mem.Allocator,
+    response: transcribing.Response,
+) !transcribing.Response {
+    var out = transcribing.Response{
+        .text = if (response.text) |value| try alloc.dupe(u8, value) else null,
+        .language = null,
+        .duration_ms = response.duration_ms,
+        .segments = null,
+        .speakers = null,
+    };
+    errdefer transcribing.deinitResponse(alloc, &out);
+    out.language = if (response.language) |value| try alloc.dupe(u8, value) else null;
+    if (response.segments) |segments| {
+        const owned = try alloc.alloc(transcribing.Segment, segments.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned[0..initialized]) |*segment| freeTranscriptionSegment(alloc, segment);
+            alloc.free(owned);
+        }
+        for (segments, 0..) |segment, i| {
+            var item = transcribing.Segment{
+                .text = if (segment.text) |value| try alloc.dupe(u8, value) else null,
+                .start_ms = segment.start_ms,
+                .end_ms = segment.end_ms,
+                .speaker = null,
+                .words = null,
+            };
+            errdefer freeTranscriptionSegment(alloc, &item);
+            item.speaker = if (segment.speaker) |value| try alloc.dupe(u8, value) else null;
+            item.words = try cloneTranscriptionWords(alloc, segment.words);
+            owned[i] = item;
+            initialized += 1;
+        }
+        out.segments = owned;
+    }
+    if (response.speakers) |speakers| {
+        const owned = try alloc.alloc(transcribing.Speaker, speakers.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned[0..initialized]) |speaker| {
+                if (speaker.id) |value| alloc.free(@constCast(value));
+                if (speaker.label) |value| alloc.free(@constCast(value));
+            }
+            alloc.free(owned);
+        }
+        for (speakers, 0..) |speaker, i| {
+            var item = transcribing.Speaker{
+                .id = if (speaker.id) |value| try alloc.dupe(u8, value) else null,
+                .label = null,
+            };
+            errdefer if (item.id) |value| alloc.free(@constCast(value));
+            item.label = if (speaker.label) |value| try alloc.dupe(u8, value) else null;
+            owned[i] = item;
+            initialized += 1;
+        }
+        out.speakers = owned;
+    }
+    return out;
+}
+
+fn freeTranscriptionSegment(alloc: std.mem.Allocator, segment: *transcribing.Segment) void {
+    if (segment.text) |value| alloc.free(@constCast(value));
+    if (segment.speaker) |value| alloc.free(@constCast(value));
+    if (segment.words) |words| {
+        for (words) |word| if (word.word) |value| alloc.free(@constCast(value));
+        alloc.free(@constCast(words));
+    }
+    segment.* = undefined;
+}
+
+fn cloneTranscriptionWords(
+    alloc: std.mem.Allocator,
+    words_optional: ?[]const transcribing.WordTimestamp,
+) !?[]transcribing.WordTimestamp {
+    const words = words_optional orelse return null;
+    const owned = try alloc.alloc(transcribing.WordTimestamp, words.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |word| if (word.word) |value| alloc.free(@constCast(value));
+        alloc.free(owned);
+    }
+    for (words, 0..) |word, i| {
+        owned[i] = .{
+            .word = if (word.word) |value| try alloc.dupe(u8, value) else null,
+            .start_ms = word.start_ms,
+            .end_ms = word.end_ms,
+        };
+        initialized += 1;
+    }
+    return owned;
+}
+
 fn cancellationProbe(context: ?*const anyopaque) callconv(.c) u8 {
     const raw_context = context orelse return 0;
     const flag: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw_context));
@@ -656,4 +863,59 @@ test "generation ABI preserves domain errors and rich message JSON" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.len);
     try std.testing.expectEqualStrings("hello", parsed.value[0].content.?.text);
+}
+
+test "media ABI clones consumer-owned result identities" {
+    const source_results = [_]readers.Result{.{
+        .text = "caption",
+        .fields_json = "{\"kind\":\"chart\"}",
+        .regions_json = "[]",
+    }};
+    const reader_results = try cloneReaderResults(std.testing.allocator, &source_results);
+    defer {
+        for (reader_results) |*result| readers.deinitResult(std.testing.allocator, result);
+        std.testing.allocator.free(reader_results);
+    }
+    try std.testing.expectEqualStrings("caption", reader_results[0].text);
+    try std.testing.expect(reader_results[0].text.ptr != source_results[0].text.ptr);
+
+    const words = [_]transcribing.WordTimestamp{.{ .word = "hello", .start_ms = 1, .end_ms = 2 }};
+    const segments = [_]transcribing.Segment{.{
+        .text = "hello",
+        .speaker = "speaker-1",
+        .words = &words,
+    }};
+    const speakers = [_]transcribing.Speaker{.{ .id = "1", .label = "speaker-1" }};
+    var transcription = try cloneTranscriptionResponse(std.testing.allocator, .{
+        .text = "hello",
+        .language = "en",
+        .duration_ms = 10,
+        .segments = &segments,
+        .speakers = &speakers,
+    });
+    defer transcribing.deinitResponse(std.testing.allocator, &transcription);
+    try std.testing.expectEqualStrings("hello", transcription.text.?);
+    try std.testing.expectEqualStrings("speaker-1", transcription.segments.?[0].speaker.?);
+    try std.testing.expectEqualStrings("hello", transcription.segments.?[0].words.?[0].word.?);
+}
+
+test "media and extraction operations preserve distinct failure identity" {
+    inline for (.{
+        .{ .operation = bridge.Operation.read_images, .err = error.UnsupportedReaderProvider, .status = bridge.Status.unsupported_reader_provider },
+        .{ .operation = bridge.Operation.read_images, .err = error.ReadBatchTooLarge, .status = bridge.Status.read_batch_too_large },
+        .{ .operation = bridge.Operation.read_images, .err = error.InvalidReadResultCount, .status = bridge.Status.invalid_read_result_count },
+        .{ .operation = bridge.Operation.transcribe_audio, .err = error.UnsupportedTranscriberProvider, .status = bridge.Status.unsupported_transcriber_provider },
+        .{ .operation = bridge.Operation.transcribe_audio, .err = error.UnsupportedAudioInput, .status = bridge.Status.unsupported_audio_input },
+        .{ .operation = bridge.Operation.transcribe_audio, .err = error.InvalidWhisperDecoderConfig, .status = bridge.Status.invalid_whisper_decoder_config },
+        .{ .operation = bridge.Operation.extract, .err = error.InvalidExtractionConfig, .status = bridge.Status.invalid_extraction_config },
+        .{ .operation = bridge.Operation.extract, .err = error.InvalidExtractionResponse, .status = bridge.Status.invalid_extraction_response },
+    }) |case| {
+        const failure = failure_identity.failureFromError(
+            case.err,
+            .inference_runtime,
+            bridge.abi_version,
+            @intFromEnum(case.operation),
+        );
+        try std.testing.expectError(case.err, acceptFailure(case.status, &failure, case.operation));
+    }
 }

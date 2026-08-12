@@ -503,7 +503,6 @@ comptime {
             exportInternal(&inferenceEntry, "antfly_runtime_inference");
             exportInternal(&standaloneInferenceCreate, "antfly_standalone_inference_create");
             exportInternal(&standaloneInferenceConfigure, "antfly_standalone_inference_configure");
-            exportInternal(&standaloneInferenceProvider, "antfly_standalone_inference_provider");
             exportInternal(&standaloneInferenceEmbedDense, "antfly_standalone_inference_embed_dense");
             exportInternal(&standaloneInferenceDenseResultDestroy, "antfly_standalone_inference_dense_result_destroy");
             exportInternal(&standaloneInferenceEmbedSparse, "antfly_standalone_inference_embed_sparse");
@@ -515,6 +514,9 @@ comptime {
             exportInternal(&standaloneInferenceGenerateText, "antfly_standalone_inference_generate_text");
             exportInternal(&standaloneInferenceGenerateMessages, "antfly_standalone_inference_generate_messages");
             exportInternal(&standaloneInferenceEmbedDenseParts, "antfly_standalone_inference_embed_dense_parts");
+            exportInternal(&standaloneInferenceReadImages, "antfly_standalone_inference_read_images");
+            exportInternal(&standaloneInferenceTranscribeAudio, "antfly_standalone_inference_transcribe_audio");
+            exportInternal(&standaloneInferenceExtract, "antfly_standalone_inference_extract");
             exportInternal(&standaloneInferenceRegisterRoutes, "antfly_standalone_inference_register_routes");
             exportInternal(&standaloneInferenceDestroy, "antfly_standalone_inference_destroy");
         },
@@ -536,10 +538,6 @@ fn standaloneInferenceConfigure(context: *const standalone_inference_bridge.Conf
         return reportStandaloneInferenceFailure(context.out_failure, .configure, err);
     };
     return .ok;
-}
-
-fn standaloneInferenceProvider(context: *const standalone_inference_bridge.ProviderContext) callconv(.c) void {
-    standalone_inference_host.linkedInferenceProvider(context);
 }
 
 fn standaloneInferenceEmbedDense(
@@ -653,6 +651,45 @@ fn standaloneInferenceEmbedDenseParts(
     out_failure.* = .{};
     standalone_inference_host.linkedInferenceEmbedDenseParts(request, out_result) catch |err| {
         return reportStandaloneInferenceFailure(out_failure, .embed_dense_parts, err);
+    };
+    return .ok;
+}
+
+fn standaloneInferenceReadImages(
+    request: *const standalone_inference_bridge.JsonOperationRequest,
+    out_result: *standalone_inference_bridge.BytesResult,
+    out_failure: *standalone_inference_bridge.FailureIdentity,
+) callconv(.c) standalone_inference_bridge.Status {
+    out_result.* = .{};
+    out_failure.* = .{};
+    standalone_inference_host.linkedInferenceReadImages(request, out_result) catch |err| {
+        return reportStandaloneInferenceFailure(out_failure, .read_images, err);
+    };
+    return .ok;
+}
+
+fn standaloneInferenceTranscribeAudio(
+    request: *const standalone_inference_bridge.JsonOperationRequest,
+    out_result: *standalone_inference_bridge.BytesResult,
+    out_failure: *standalone_inference_bridge.FailureIdentity,
+) callconv(.c) standalone_inference_bridge.Status {
+    out_result.* = .{};
+    out_failure.* = .{};
+    standalone_inference_host.linkedInferenceTranscribeAudio(request, out_result) catch |err| {
+        return reportStandaloneInferenceFailure(out_failure, .transcribe_audio, err);
+    };
+    return .ok;
+}
+
+fn standaloneInferenceExtract(
+    request: *const standalone_inference_bridge.JsonOperationRequest,
+    out_result: *standalone_inference_bridge.BytesResult,
+    out_failure: *standalone_inference_bridge.FailureIdentity,
+) callconv(.c) standalone_inference_bridge.Status {
+    out_result.* = .{};
+    out_failure.* = .{};
+    standalone_inference_host.linkedInferenceExtract(request, out_result) catch |err| {
+        return reportStandaloneInferenceFailure(out_failure, .extract, err);
     };
     return .ok;
 }

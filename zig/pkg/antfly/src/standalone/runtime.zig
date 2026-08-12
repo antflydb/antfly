@@ -1768,12 +1768,7 @@ pub fn runFromIterator(
     };
     if (comptime inline_inference_codegen) {
         try inference_host.linkedInferenceConfigure(&configure_context);
-        var provider: antfly.inference.managed_embedder.AntflyProvider = undefined;
-        inference_host.linkedInferenceProvider(&.{
-            .handle = antfly_node,
-            .out_provider = &provider,
-        });
-        data_server.setAntflyProvider(provider);
+        data_server.setAntflyProvider(inference_host.inlineInferenceProvider(antfly_node));
     } else {
         try consumeInferenceFailure(
             inference_bridge.antfly_standalone_inference_configure(&configure_context),
@@ -1781,13 +1776,7 @@ pub fn runFromIterator(
             .configure,
         );
 
-        var provider: antfly.inference.managed_embedder.AntflyProvider = undefined;
-        inference_bridge.antfly_standalone_inference_provider(&.{
-            .handle = antfly_node,
-            .out_provider = &provider,
-        });
-        inference_client.installProviderAdapters(&provider);
-        data_server.setAntflyProvider(provider);
+        data_server.setAntflyProvider(inference_client.linkedProvider(antfly_node));
     }
 
     // Initialize API server (wires caches + sources) without binding a listener.

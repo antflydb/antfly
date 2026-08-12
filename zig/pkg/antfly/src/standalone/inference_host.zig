@@ -262,7 +262,7 @@ pub fn linkedInferenceEmbedDense(
     defer alloc.free(texts);
     for (input_strings, 0..) |input, i| texts[i] = input.slice();
 
-    const node: *inference.server.Node = @ptrCast(@alignCast(handle));
+    const node = linkedInferenceNode(handle);
     const io = node.session_manager.io orelse std.Io.Threaded.global_single_threaded.io();
     const deadline_ns: ?u64 = if (request.has_deadline != 0) request.deadline_ns else null;
     const vectors = try node.embedDenseTextsDirectWithContext(
@@ -332,7 +332,7 @@ pub fn linkedInferenceEmbedDenseParts(
             } },
         };
     }
-    const node: *inference.server.Node = @ptrCast(@alignCast(request.handle.?));
+    const node = linkedInferenceNode(request.handle.?);
     const io = node.session_manager.io orelse std.Io.Threaded.global_single_threaded.io();
     const deadline_ns: ?u64 = if (request.has_deadline != 0) request.deadline_ns else null;
     const vectors = try localAntflyEmbedDensePartsWithExecutionContext(
@@ -414,7 +414,7 @@ pub fn linkedInferenceEmbedSparse(
     defer alloc.free(texts);
     for (input_strings, 0..) |input, i| texts[i] = input.slice();
 
-    const node: *inference.server.Node = @ptrCast(@alignCast(request.handle.?));
+    const node = linkedInferenceNode(request.handle.?);
     const vectors = try node.embedSparseTextsDirect(alloc, request.model.slice(), texts);
     errdefer {
         for (vectors) |*vector| vector.deinit(alloc);
@@ -464,7 +464,7 @@ pub fn linkedInferenceRerank(
     const documents = try alloc.alloc([]const u8, input.len);
     defer alloc.free(documents);
     for (input, 0..) |document, i| documents[i] = document.slice();
-    const node: *inference.server.Node = @ptrCast(@alignCast(request.handle.?));
+    const node = linkedInferenceNode(request.handle.?);
     const values = try node.rerankTextsDirect(
         alloc,
         request.model.slice(),
@@ -496,7 +496,7 @@ pub fn linkedInferenceListModels(
     if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
     if (request._reserved0 != 0 or request.handle == null) return error.InvalidArgument;
     const alloc = std.heap.c_allocator;
-    const node: *inference.server.Node = @ptrCast(@alignCast(request.handle.?));
+    const node = linkedInferenceNode(request.handle.?);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const bytes = try node.listModelsJsonAlloc(alloc, io_impl.io());
@@ -524,7 +524,7 @@ pub fn linkedInferenceGenerateText(
     defer alloc.free(contents);
     for (role_wire, 0..) |role, i| roles[i] = role.slice();
     for (content_wire, 0..) |content, i| contents[i] = content.slice();
-    const node: *inference.server.Node = @ptrCast(@alignCast(request.handle.?));
+    const node = linkedInferenceNode(request.handle.?);
     const bytes = try node.generateTextDirect(alloc, request.model.slice(), roles, contents);
     try publishBytesResult(bytes, out_result);
 }
@@ -556,6 +556,62 @@ pub fn linkedInferenceGenerateMessages(
     try publishBytesResult(bytes, out_result);
 }
 
+pub fn linkedInferenceReadImages(
+    request: *const inference_bridge.JsonOperationRequest,
+    out_result: *inference_bridge.BytesResult,
+) !void {
+    try validateJsonOperationRequest(request);
+    const alloc = std.heap.c_allocator;
+    const parsed = try std.json.parseFromSlice(antfly.readers.Request, alloc, request.payload_json.slice(), .{});
+    defer parsed.deinit();
+    const node = linkedInferenceNode(request.handle.?);
+    const results = try node.readImagesDirect(alloc, request.model.slice(), parsed.value);
+    defer {
+        for (results) |*result| antfly.readers.deinitResult(alloc, result);
+        alloc.free(results);
+    }
+    const bytes = try std.json.Stringify.valueAlloc(alloc, results, .{});
+    try publishBytesResult(bytes, out_result);
+}
+
+pub fn linkedInferenceTranscribeAudio(
+    request: *const inference_bridge.JsonOperationRequest,
+    out_result: *inference_bridge.BytesResult,
+) !void {
+    try validateJsonOperationRequest(request);
+    const alloc = std.heap.c_allocator;
+    const parsed = try std.json.parseFromSlice(antfly.transcribing.Request, alloc, request.payload_json.slice(), .{});
+    defer parsed.deinit();
+    const node = linkedInferenceNode(request.handle.?);
+    var response = try node.transcribeAudioDirect(alloc, request.model.slice(), parsed.value);
+    defer antfly.transcribing.deinitResponse(alloc, &response);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, response, .{});
+    try publishBytesResult(bytes, out_result);
+}
+
+pub fn linkedInferenceExtract(
+    request: *const inference_bridge.JsonOperationRequest,
+    out_result: *inference_bridge.BytesResult,
+) !void {
+    try validateJsonOperationRequest(request);
+    const alloc = std.heap.c_allocator;
+    const parsed = try std.json.parseFromSlice(antfly.extracting.Request, alloc, request.payload_json.slice(), .{});
+    defer parsed.deinit();
+    const node = linkedInferenceNode(request.handle.?);
+    var response = try node.extractDirect(alloc, request.model.slice(), parsed.value);
+    defer response.deinit();
+    try publishBytesResult(try alloc.dupe(u8, response.json), out_result);
+}
+
+fn validateJsonOperationRequest(request: *const inference_bridge.JsonOperationRequest) !void {
+    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
+    if (request._reserved0 != 0 or request.handle == null or
+        request.payload_json.len > 256 * 1024 * 1024)
+    {
+        return error.InvalidArgument;
+    }
+}
+
 fn publishBytesResult(bytes: []u8, out_result: *inference_bridge.BytesResult) !void {
     const alloc = std.heap.c_allocator;
     errdefer alloc.free(bytes);
@@ -576,10 +632,15 @@ pub fn linkedInferenceBytesResultDestroy(result: *inference_bridge.BytesResult) 
     result.* = .{};
 }
 
-pub fn linkedInferenceProvider(context: *const inference_bridge.ProviderContext) void {
-    const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
-    const provider: *antfly.inference.managed_embedder.AntflyProvider = @ptrCast(@alignCast(context.out_provider));
-    provider.* = localAntflyProvider(&state.node);
+fn linkedInferenceNode(handle: *anyopaque) *inference.server.Node {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    return &state.node;
+}
+
+/// Direct Zig table used only when inference is compiled into the same unit.
+/// Linked production composition uses consumer-local ABI shims instead.
+pub fn inlineInferenceProvider(handle: *anyopaque) antfly.inference.managed_embedder.AntflyProvider {
+    return localAntflyProvider(linkedInferenceNode(handle));
 }
 
 pub fn linkedInferenceRegisterRoutes(context: *const inference_bridge.RoutesContext) !void {

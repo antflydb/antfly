@@ -62,7 +62,6 @@ comptime {
         "antfly_standalone_inference_configure",
         "antfly_standalone_inference_create",
         "antfly_standalone_inference_destroy",
-        "antfly_standalone_inference_provider",
         "antfly_standalone_inference_register_routes",
     }) |name| {
         @export(&unavailableExecutableRuntimeDependency, .{

@@ -60,6 +60,15 @@ CODEGEN_BOUNDARIES = (
     ("standalone/inference_host.zig", "standalone/runtime.zig"),
     ("standalone/inference_host.zig", "data/runtime.zig"),
     ("standalone/inference_host.zig", "metadata/runtime.zig"),
+    ("standalone/inference_client.zig", "standalone/inference_host.zig"),
+    ("standalone/inference_client.zig", "inference_runtime/runtime.zig"),
+)
+
+INFERENCE_ABI_FORBIDDEN_TOKENS = (
+    ("standalone/inference_bridge.zig", "ProviderContext"),
+    ("standalone/inference_bridge.zig", "antfly_standalone_inference_provider"),
+    ("runtime_artifact_lib.zig", "antfly_standalone_inference_provider"),
+    ("standalone/runtime.zig", "antfly_standalone_inference_provider"),
 )
 
 # Control-plane consumers must use the storage-free WAL facade.  The facade
@@ -838,6 +847,16 @@ def check_codegen_boundary(graph: ImportGraph) -> bool:
         clean = False
         rendered = " -> ".join(graph.relative_name(item) for item in path)
         print(f"codegen boundary violation: {rendered}", file=sys.stderr)
+
+    for source_name, token in INFERENCE_ABI_FORBIDDEN_TOKENS:
+        source = graph.resolve_source(source_name)
+        if token not in source.read_text(encoding="utf-8"):
+            continue
+        clean = False
+        print(
+            f"codegen boundary violation: {source_name} contains removed raw inference ABI token {token}",
+            file=sys.stderr,
+        )
 
     native_wal = graph.resolve_source(NATIVE_WAL_IMPLEMENTATION)
     for source_name in CONTROL_WAL_CONSUMERS:
