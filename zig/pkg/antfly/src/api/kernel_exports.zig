@@ -25,6 +25,7 @@ const ha_http_operation = @import("../storage/ha/http_operation.zig");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
 const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 
@@ -373,8 +374,7 @@ pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi
     defer http_context.deinit();
     http_context.params = params;
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.stream);
-    state.handler.api_server.recordHandledRequest();
-    var response = route.handler.invoke(&http_context) catch |err| return fail(err);
+    var response = state.handler.dispatchLinkedRoute(&http_context, route.handler) catch |err| return fail(err);
     errdefer response.deinit();
 
     const response_state = alloc.create(HttpResponseState) catch |err| return fail(err);
@@ -563,4 +563,114 @@ fn metadataPathMatches(metadata_path: []const u8, registered_path: []const u8) b
         registered_index += 1;
     }
     return metadata_index == metadata_path.len and registered_index == registered_path.len;
+}
+
+const KernelIngressTestStatus = struct {
+    fn source(self: *@This()) server_mod.StatusSource {
+        return .{ .ptr = self, .vtable = &.{ .status = status } };
+    }
+
+    fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+        return .{
+            .metadata_group_id = 1,
+            .metrics = .{},
+            .projected_stores = 1,
+        };
+    }
+};
+
+const KernelIngressTestRoutes = struct {
+    var mutation_calls: usize = 0;
+
+    fn mutation(ctx: *httpx.Context) !httpx.Response {
+        mutation_calls += 1;
+        return ctx.text("unexpected mutation execution");
+    }
+
+    fn metadataNotLeader(_: *httpx.Context) !httpx.Response {
+        return error.NotLeader;
+    }
+};
+
+fn responseHeader(response: abi.HttpResponseView, name: []const u8) ?[]const u8 {
+    const headers = if (response.headers_ptr) |ptr| ptr[0..response.headers_len] else return null;
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name.slice(), name)) return header.value.slice();
+    }
+    return null;
+}
+
+test "linked API dispatch preserves kernel-owned ingress policy" {
+    const alloc = std.testing.allocator;
+    var status_source = KernelIngressTestStatus{};
+    const api_server = try alloc.create(server_mod.ApiHttpServer);
+    defer alloc.destroy(api_server);
+    api_server.* = server_mod.ApiHttpServer.init(
+        alloc,
+        .{ .ha_failover_safe_mutations_only = true },
+        status_source.source(),
+        null,
+        null,
+    );
+    defer api_server.deinit();
+
+    var state = HandlerState{
+        .alloc = alloc,
+        .handler = .{ .api_server = api_server },
+        .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{}),
+        .route_validator = httpx.Router.init(alloc),
+    };
+    defer state.io_impl.?.deinit();
+    defer state.route_validator.deinit();
+
+    KernelIngressTestRoutes.mutation_calls = 0;
+    var mutation_route = RouteState{
+        .owner = &state,
+        .handler = httpx.Handler.from(KernelIngressTestRoutes.mutation),
+    };
+    const mutation_request = abi.HttpRequestView{
+        .method = .post,
+        .path = abi.Bytes.init("/db/v1/tables/docs"),
+        .body = abi.Bytes.init("{}"),
+    };
+    var mutation_response_handle: ?*anyopaque = null;
+    var mutation_response: abi.HttpResponseView = undefined;
+    const mutation_status = handlerHandleHttp(&.{
+        .abi_version = abi.abi_version,
+        .route_handle = &mutation_route,
+        .request = &mutation_request,
+        .out_response_handle = &mutation_response_handle,
+        .out_response = &mutation_response,
+    });
+    try std.testing.expect(mutation_status.isOk());
+    defer handlerDestroyHttpResponse(mutation_response_handle.?);
+    try std.testing.expectEqual(@as(u16, 503), mutation_response.status);
+    try std.testing.expectEqual(@as(usize, 0), KernelIngressTestRoutes.mutation_calls);
+    try std.testing.expect(std.mem.indexOf(u8, mutation_response.body.slice(), "ha_mutation_not_replicated") != null);
+
+    var retry_route = RouteState{
+        .owner = &state,
+        .handler = httpx.Handler.from(KernelIngressTestRoutes.metadataNotLeader),
+    };
+    const retry_request = abi.HttpRequestView{
+        .method = .get,
+        .path = abi.Bytes.init("/db/v1/tables/docs"),
+        .body = abi.Bytes.init(""),
+    };
+    var retry_response_handle: ?*anyopaque = null;
+    var retry_response: abi.HttpResponseView = undefined;
+    const retry_status = handlerHandleHttp(&.{
+        .abi_version = abi.abi_version,
+        .route_handle = &retry_route,
+        .request = &retry_request,
+        .out_response_handle = &retry_response_handle,
+        .out_response = &retry_response,
+    });
+    try std.testing.expect(retry_status.isOk());
+    defer handlerDestroyHttpResponse(retry_response_handle.?);
+    try std.testing.expectEqual(@as(u16, 503), retry_response.status);
+    try std.testing.expectEqualStrings("1", responseHeader(retry_response, "Retry-After").?);
+    try std.testing.expectEqualStrings("true", responseHeader(retry_response, "X-Antfly-Metadata-Not-Leader").?);
+    try std.testing.expectEqualStrings("{\"error\":\"metadata leader unavailable\"}", retry_response.body.slice());
+    try std.testing.expectEqual(@as(u64, 2), api_server.requestStats().request_count);
 }

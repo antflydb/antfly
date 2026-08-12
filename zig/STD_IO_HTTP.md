@@ -39,10 +39,12 @@ that end state:
   `ApiHttpServer`, not handler-local or listener-local limits. Generated HTTP,
   MCP, A2A, extension-host, and other in-process entry points therefore share
   the same capacity and rejection metrics.
-- Continuous-HA mutation safety is enforced by inventory-backed `httpx`
-  middleware across generated, contextual, and internal routes. Removing the
-  compatibility dispatcher therefore cannot remove the fail-closed mutation
-  gate or let a new non-GET route bypass classification.
+- Continuous-HA mutation safety is enforced by one inventory-backed ingress
+  policy across generated, contextual, and internal routes. Direct handlers
+  install it as `httpx` middleware; linked handlers enter the same API-kernel
+  policy before invoking a route from the manifest. Removing the compatibility
+  dispatcher therefore cannot remove the fail-closed mutation gate or let a
+  new non-GET route bypass classification.
 - Process roles share signal cancellation and one absolute shutdown deadline.
 - Listener address reuse and listener sharing are independent policies:
   `SO_REUSEADDR` supports deterministic restart, while `SO_REUSEPORT` is an
@@ -1043,13 +1045,16 @@ used by operation contexts, storage/search internals, inference generation,
 and outbound requests. There is no ABI fast flag or dependence on Zig atomic
 layout; the callback is the only cancellation contract.
 
-Production request accounting happens inside linked dispatch, where the API
-kernel owns the metric, rather than relying on direct-registration middleware
-that is absent from opaque builds. ABI versions were advanced with these
-layout changes; old callers fail prefix validation rather than interpreting a
-new structure with an old layout. Cancellation metrics are owned and exported
-by `HttpRuntime`; kernel handler statistics retain only application admission
-state, avoiding duplicated or partially observed transport counters.
+Application ingress policy happens inside linked dispatch, where the API
+kernel owns request accounting, continuous-HA mutation classification, and
+retryable metadata-authority response mapping. It must not rely on direct-
+registration middleware, which is absent from opaque builds, or duplicate
+application configuration in each host runtime. ABI versions were advanced
+with these layout changes; old callers fail prefix validation rather than
+interpreting a new structure with an old layout. Cancellation metrics are
+owned and exported by `HttpRuntime`; kernel handler statistics retain only
+application admission state, avoiding duplicated or partially observed
+transport counters.
 
 Passing an opaque server pointer may remain as a same-toolchain migration step,
 but it is not the final ABI contract. Kernel-created objects must still be

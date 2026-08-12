@@ -148,10 +148,7 @@ pub const AntflyApiHandler = struct {
 
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         self.api_server.recordHandledRequest();
-        return next.call(ctx) catch |err| {
-            if (metadata_authority.isRetryableError(err)) return metadataNotLeaderResponse(ctx);
-            return err;
-        };
+        return next.call(ctx) catch |err| mapIngressError(ctx, err);
     }
 
     /// Continuous-HA mutation safety belongs to ingress policy, not to a
@@ -159,17 +156,36 @@ pub const AntflyApiHandler = struct {
     /// classifier consumes canonical application paths, so generated
     /// `/db/v1` routes and root contextual routes share one inventory.
     fn enforceHaMutationPolicy(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
-        if (!self.api_server.cfg.ha_failover_safe_mutations_only) return next.call(ctx);
+        if (try self.haMutationRejection(ctx)) |response| return response;
+        return next.call(ctx);
+    }
+
+    /// Dispatch one route through the application-owned ingress policy.
+    ///
+    /// Direct registrations install the same policy as `httpx` middleware.
+    /// Independently code-generated runtimes cannot carry that middleware
+    /// through the route-manifest ABI, so their dispatch export must enter here
+    /// instead of invoking the manifest's raw route handler. Keeping the
+    /// policy in the API kernel also prevents host runtimes from duplicating
+    /// application configuration or error classification.
+    pub fn dispatchLinkedRoute(self: *AntflyApiHandler, ctx: *httpx.Context, route_handler: httpx.Handler) !httpx.Response {
+        self.api_server.recordHandledRequest();
+        if (try self.haMutationRejection(ctx)) |response| return response;
+        return route_handler.invoke(ctx) catch |err| mapIngressError(ctx, err);
+    }
+
+    fn haMutationRejection(self: *AntflyApiHandler, ctx: *httpx.Context) !?httpx.Response {
+        if (!self.api_server.cfg.ha_failover_safe_mutations_only) return null;
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
-        const mutation = classifyHaMutation(ctx.request.method, path) orelse return next.call(ctx);
+        const mutation = classifyHaMutation(ctx.request.method, path) orelse return null;
         if (mutation.disposition != .reject and
             (mutation.disposition != .remote_apply or self.api_server.cfg.ha_remote_apply_mutations_enabled))
         {
-            return next.call(ctx);
+            return null;
         }
 
         _ = ctx.status(503);
-        return ctx.json(.{
+        return try ctx.json(.{
             .@"error" = "mutation is not continuously replicated while HA is active",
             .code = "ha_mutation_not_replicated",
             .surface = @tagName(mutation.surface),
@@ -201,6 +217,11 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
         _ = ctx.response.body("{\"error\":\"metadata leader unavailable\"}");
         return ctx.response.build();
+    }
+
+    fn mapIngressError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (metadata_authority.isRetryableError(err)) return metadataNotLeaderResponse(ctx);
+        return err;
     }
 
     fn registerRoutesWithOptions(

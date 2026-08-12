@@ -3533,6 +3533,7 @@ pub fn build(b: *std.Build) void {
         "api http public sort capability gate validates mapped sortable fields",
         "api http public sort capability gate fails closed for uncovered observed dynamic fields",
         "generated route policy inventory is unique and describes wire modes",
+        "linked API dispatch preserves kernel-owned ingress policy",
         "linked transport projects the universal request cancellation callback",
         "linked callbacks preserve streaming and cancellation semantics",
         "httpx production path sheds 128 abandoned queries and preserves control recovery",
