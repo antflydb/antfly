@@ -5,8 +5,10 @@
 
 //! Transport-neutral metadata administration mutation operations.
 
+const std = @import("std");
 const operation = @import("../api/operation.zig");
 const metadata_api = @import("api.zig");
+const metadata_table_manager = @import("table_manager.zig");
 
 pub const Source = struct {
     ptr: *anyopaque,
@@ -16,6 +18,7 @@ pub const Source = struct {
         validate_publication: *const fn (*anyopaque, metadata_api.CatalogPublicationContract) anyerror!bool,
         validate_table_publication: *const fn (*anyopaque, metadata_api.CatalogTablePublicationContract) anyerror!bool,
         trigger_reallocate: *const fn (*anyopaque) anyerror!void,
+        upsert_schema_progress: *const fn (*anyopaque, std.mem.Allocator, metadata_table_manager.SchemaProgressRecord) anyerror!void,
     };
 };
 
@@ -44,10 +47,19 @@ pub const Operations = struct {
         try request.ensureActive();
         try self.source.vtable.trigger_reallocate(self.source.ptr);
     }
+
+    pub fn upsertSchemaProgress(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        record: metadata_table_manager.SchemaProgressRecord,
+    ) !void {
+        try request.ensureActive();
+        try self.source.vtable.upsert_schema_progress(self.source.ptr, alloc, record);
+    }
 };
 
 test "metadata admin mutations reject canceled work before reaching their source" {
-    const std = @import("std");
     const FakeSource = struct {
         calls: usize = 0,
 
@@ -67,6 +79,11 @@ test "metadata admin mutations reject canceled work before reaching their source
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
         }
+
+        fn upsertSchemaProgress(ptr: *anyopaque, _: std.mem.Allocator, _: metadata_table_manager.SchemaProgressRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
     };
 
     var source = FakeSource{};
@@ -76,6 +93,7 @@ test "metadata admin mutations reject canceled work before reaching their source
             .validate_publication = FakeSource.validatePublication,
             .validate_table_publication = FakeSource.validateTablePublication,
             .trigger_reallocate = FakeSource.triggerReallocate,
+            .upsert_schema_progress = FakeSource.upsertSchemaProgress,
         },
     } };
     var canceled = std.atomic.Value(bool).init(true);

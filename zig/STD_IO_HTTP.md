@@ -51,8 +51,8 @@ that end state:
   group-placement, and node-shutdown status reads now use transport-neutral
   operations with owned aggregate results. Their concrete, method-specific
   `httpx` handlers bypass the metadata method/path dispatcher. Catalog
-  publication validation and reallocation mutations use the same direct typed
-  path.
+  publication validation, reallocation, and schema-progress mutations use the
+  same direct typed path.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

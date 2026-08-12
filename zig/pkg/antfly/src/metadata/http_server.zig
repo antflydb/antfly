@@ -1127,10 +1127,10 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_reallocate, httpx.Handler.bind(self, metadataTriggerReallocate));
+        try server.post(routes.Routes.internal_schema_progress, httpx.Handler.bind(self, metadataUpsertSchemaProgress));
 
         const static_paths = [_][]const u8{
             routes.Routes.internal_nodes,
-            routes.Routes.internal_schema_progress,
             routes.Routes.internal_extension_restore,
         };
         inline for (static_paths) |path| try server.any(path, handler);
@@ -1314,6 +1314,7 @@ pub const MetadataHttpServer = struct {
                 .validate_publication = validatePublicationOperation,
                 .validate_table_publication = validateTablePublicationOperation,
                 .trigger_reallocate = triggerReallocateOperation,
+                .upsert_schema_progress = upsertSchemaProgressOperation,
             },
         } };
     }
@@ -1331,6 +1332,11 @@ pub const MetadataHttpServer = struct {
     fn triggerReallocateOperation(ptr: *anyopaque) !void {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.source.triggerReallocate();
+    }
+
+    fn upsertSchemaProgressOperation(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.SchemaProgressRecord) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.upsertSchemaProgress(alloc, record);
     }
 
     fn metadataMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
@@ -1364,6 +1370,16 @@ pub const MetadataHttpServer = struct {
 
     fn metadataTriggerReallocate(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         self.mutationOperations().triggerReallocate(requestContext(ctx)) catch |err|
+            return metadataMutationError(ctx, err);
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataUpsertSchemaProgress(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse "";
+        var parsed = std.json.parseFromSlice(metadata_table_manager.SchemaProgressRecord, ctx.allocator, body, .{}) catch
+            return ctx.status(400).text("invalid schema progress request");
+        defer parsed.deinit();
+        self.mutationOperations().upsertSchemaProgress(ctx.allocator, requestContext(ctx), parsed.value) catch |err|
             return metadataMutationError(ctx, err);
         return ctx.status(202).text("accepted");
     }
@@ -1511,14 +1527,6 @@ pub const MetadataHttpServer = struct {
                     const report = parseNodeStatusReport(alloc, req.body, node_id) catch return try textResponse(alloc, 400, "invalid node status request");
                     self.source.reportStoreStatus(alloc, report) catch |err| switch (err) {
                         error.UnknownStore => return try textResponse(alloc, 404, "node not found"),
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
-                if (std.mem.eql(u8, req.uri, routes.Routes.internal_schema_progress)) {
-                    const record = parseSchemaProgressRecord(req.body) catch return try textResponse(alloc, 400, "invalid schema progress request");
-                    self.source.upsertSchemaProgress(alloc, record) catch |err| switch (err) {
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return err,
                     };
@@ -2539,12 +2547,6 @@ fn cloneParsedRuntimeIndexStatus(
         .replay_target_sequence = parsed.replay_target_sequence orelse 0,
         .replay_catch_up_required = parsed.replay_catch_up_required orelse false,
     };
-}
-
-fn parseSchemaProgressRecord(body: []const u8) !metadata_table_manager.SchemaProgressRecord {
-    const parsed = try std.json.parseFromSlice(metadata_table_manager.SchemaProgressRecord, std.heap.page_allocator, body, .{});
-    defer parsed.deinit();
-    return parsed.value;
 }
 
 fn parseU64Field(value: std.json.Value) !u64 {
