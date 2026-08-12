@@ -13,6 +13,69 @@ const std = @import("std");
 const httpx = @import("httpx");
 const http_server = @import("http_server.zig");
 const httpx_handler = @import("httpx_handler.zig");
+const http_common = @import("../raft/transport/http_common.zig");
+const std_http_executor = @import("../raft/transport/std_http_executor.zig");
+
+/// Exercise one compact request through the production `httpx` registrar and
+/// listener. Generated data paths are canonicalized below `/db/v1`; root
+/// probes and contextual protocols retain their Kubernetes/protocol paths.
+pub fn executeOnce(
+    alloc: std.mem.Allocator,
+    api: *http_server.ApiHttpServer,
+    req: http_common.HttpRequest,
+) !http_common.HttpResponse {
+    var runtime = try Runtime.startOwned(alloc, api);
+    defer runtime.deinit();
+
+    const base_uri = try runtime.baseUri(alloc);
+    defer alloc.free(base_uri);
+    const canonical_path = try canonicalRequestPath(alloc, req.uri);
+    defer alloc.free(canonical_path);
+    const absolute_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_uri, canonical_path });
+    defer alloc.free(absolute_uri);
+
+    var executor = std_http_executor.StdHttpExecutor.init(alloc, .{});
+    defer executor.deinit();
+    return executor.executor().execute(alloc, .{
+        .method = req.method,
+        .uri = absolute_uri,
+        .headers = req.headers,
+        .source_node_id = req.source_node_id,
+        .authorization = req.authorization,
+        .content_type = req.content_type,
+        .timeout_ms = req.timeout_ms,
+        .body = req.body,
+        .cancellation = req.cancellation,
+        .delivery_tracker = req.delivery_tracker,
+    });
+}
+
+fn canonicalRequestPath(alloc: std.mem.Allocator, uri: []const u8) ![]u8 {
+    if (std.mem.startsWith(u8, uri, "/db/v1") or isRootRoute(uri)) return alloc.dupe(u8, uri);
+    return std.fmt.allocPrint(alloc, "/db/v1{s}", .{uri});
+}
+
+fn isRootRoute(uri: []const u8) bool {
+    const root_prefixes = [_][]const u8{
+        "/healthz",
+        "/readyz",
+        "/auth/v1",
+        "/internal/v1",
+        "/agents/retrieval",
+        "/mcp/v1",
+        "/a2a",
+        "/.well-known/",
+        "/ard/v1",
+        "/extensions/v1",
+        "/agents/v1/extensions/",
+        "/admin/",
+        "/ha/",
+    };
+    for (root_prefixes) |prefix| {
+        if (std.mem.startsWith(u8, uri, prefix)) return true;
+    }
+    return false;
+}
 
 pub const Runtime = struct {
     alloc: std.mem.Allocator,

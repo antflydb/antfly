@@ -1346,40 +1346,6 @@ pub fn executeA2aRequest(
     return contextual_operations.json(try dispatcher.handleJsonRpc(server_ptr.alloc, body), false);
 }
 
-pub fn isA2aStreamingRequest(alloc: std.mem.Allocator, req: http_common.HttpRequest) bool {
-    return req.method == .POST and isJsonRpcMethod(alloc, req.body, "message/stream");
-}
-
-pub fn handleA2aStreamingRequest(
-    server_ptr: anytype,
-    req: http_common.HttpRequest,
-    writer: http_common.StreamWriter,
-    query_embedding_security_scope: anytype,
-    authenticated_identity: anytype,
-) !bool {
-    var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
-    defer arena_impl.deinit();
-    if (!isJsonRpcMethod(arena_impl.allocator(), req.body, "message/stream")) return false;
-
-    try writer.start(server_ptr.alloc, .{
-        .status = 200,
-        .content_type = "text/event-stream",
-    });
-
-    var dispatcher = try buildA2aDispatcher(
-        server_ptr,
-        arena_impl.allocator(),
-        req.authorization,
-        query_embedding_security_scope,
-        authenticated_identity,
-    );
-    var sink = A2aLiveSseSink{ .writer = writer };
-    try dispatcher.handleJsonRpcStream(server_ptr.alloc, req.body, sink.iface());
-    try writer.writeAll("event: done\ndata: {}\n\n");
-    try writer.flush();
-    return true;
-}
-
 const A2aSseSink = struct {
     out: std.ArrayListUnmanaged(u8) = .empty,
 
@@ -1393,23 +1359,8 @@ const A2aSseSink = struct {
     }
 };
 
-const A2aLiveSseSink = struct {
-    writer: http_common.StreamWriter,
-
-    fn iface(self: *@This()) a2a.StreamSink {
-        return .{ .ptr = self, .emit_fn = emit };
-    }
-
-    fn emit(ptr: *anyopaque, alloc: std.mem.Allocator, event: std.json.Value) !void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        try writeSseJsonEvent(alloc, self.writer, "message", event);
-        try self.writer.flush();
-    }
-};
-
-/// Build the A2A card as an owned application result without allocating a
-/// legacy HTTP response. The caller owns the returned JSON with
-/// `server_ptr.alloc`.
+/// Build the A2A card as an owned application result. The caller owns the
+/// returned JSON with `server_ptr.alloc`.
 pub fn a2aCardJsonAlloc(
     server_ptr: anytype,
     query_embedding_security_scope: anytype,
@@ -1573,18 +1524,6 @@ fn buildA2aDispatcher(
     return dispatcher;
 }
 
-fn jsonBodyResponseWithStatus(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
-    return try bodyResponseWithStatus(alloc, status, "application/json", body);
-}
-
-fn bodyResponseWithStatus(alloc: std.mem.Allocator, status: u16, content_type: []const u8, body: []const u8) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, content_type),
-        .body = try alloc.dupe(u8, body),
-    };
-}
-
 fn contextualResponseFromMcpResult(alloc: std.mem.Allocator, result: mcp.HttpResult) !contextual_operations.OwnedResponse {
     var headers = try alloc.alloc(contextual_operations.Header, result.headers.len);
     var initialized: usize = 0;
@@ -1613,22 +1552,6 @@ fn contextualResponseFromMcpResult(alloc: std.mem.Allocator, result: mcp.HttpRes
     };
 }
 
-fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "text/plain"),
-        .body = try alloc.dupe(u8, body),
-    };
-}
-
-fn eventStreamResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "text/event-stream"),
-        .body = try alloc.dupe(u8, body),
-    };
-}
-
 fn isJsonRpcMethod(alloc: std.mem.Allocator, body: []const u8, method_name: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return false;
     defer parsed.deinit();
@@ -1647,17 +1570,6 @@ fn appendSseJsonEvent(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)
     try out.appendSlice(alloc, "data: ");
     try out.appendSlice(alloc, body);
     try out.appendSlice(alloc, "\n\n");
-}
-
-fn writeSseJsonEvent(alloc: std.mem.Allocator, writer: http_common.StreamWriter, event_name: []const u8, value: std.json.Value) !void {
-    const body = try stringifyJsonValue(alloc, value);
-    defer alloc.free(body);
-    try writer.writeAll("event: ");
-    try writer.writeAll(event_name);
-    try writer.writeAll("\n");
-    try writer.writeAll("data: ");
-    try writer.writeAll(body);
-    try writer.writeAll("\n\n");
 }
 
 fn jsonStringArg(value: std.json.Value, key: []const u8) ?[]const u8 {

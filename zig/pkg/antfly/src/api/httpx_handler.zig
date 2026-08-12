@@ -204,6 +204,7 @@ pub const AntflyApiHandler = struct {
     /// instance. Runtime roles call this common registrar instead of carrying
     /// their own duplicate route arrays or active-handler globals.
     pub fn registerRoutes(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        try self.installMiddleware(server);
         return self.registerRoutesWithOptions(server, true, true);
     }
 
@@ -211,13 +212,24 @@ pub const AntflyApiHandler = struct {
     /// kernel (listener publication, maintenance admission, and initialized
     /// API state), so it supplies the two root probe handlers itself.
     pub fn registerRoutesWithoutProbes(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        try self.installMiddleware(server);
         return self.registerRoutesWithOptions(server, true, false);
     }
 
     /// Metadata owns a distinct administration surface and must not expose
     /// data-node protocol or internal-group routes on its admin listener.
     pub fn registerGeneratedRoutesWithProbes(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        try self.installMiddleware(server);
         return self.registerRoutesWithOptions(server, false, true);
+    }
+
+    fn installMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        try server.use(httpx.Middleware.bind("antfly-request-stats", self, recordRequest));
+    }
+
+    fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
+        self.api_server.recordHandledRequest();
+        return next.call(ctx);
     }
 
     fn registerRoutesWithOptions(
@@ -271,7 +283,6 @@ pub const AntflyApiHandler = struct {
             try server.post(routes.a2a, httpx.Handler.bind(self, a2aRoute));
             const a2a_card_handler = httpx.Handler.bind(self, a2aCardRoute);
             try server.get(routes.agent_card, a2a_card_handler);
-            try server.get(routes.agent_card_legacy, a2a_card_handler);
         }
 
         const ard_handler = httpx.Handler.bind(self, ardRoute);
@@ -2133,6 +2144,7 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const body = try self.api_server.listConnectionsJsonAlloc(alloc, params.types, params.include, params.refresh);
+        defer alloc.free(body);
         try ctx.setHeader("content-type", "application/json");
         _ = ctx.response.body(body);
         return ctx.response.build();

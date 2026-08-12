@@ -60,7 +60,6 @@ pub const Routes = struct {
     pub const extension_disable_suffix = "/disable";
     pub const extension_objects_suffix = "/objects";
     pub const extension_config_suffix = "/config";
-    pub const agent_card_legacy = "/.well-known/agent.json";
     pub const agent_card = "/.well-known/agent-card.json";
     pub const backup = "/backup";
     pub const restore = "/restore";

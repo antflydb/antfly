@@ -15,6 +15,7 @@
 const std = @import("std");
 const kernel_abi = @import("kernel_abi.zig");
 const builtin = @import("builtin");
+const test_runtime_support = if (builtin.is_test) @import("http_test_runtime.zig") else struct {};
 const platform = @import("antfly_platform");
 const build_options = @import("build_options");
 const scraping = @import("antfly_scraping");
@@ -3508,24 +3509,6 @@ pub const ApiHttpServer = struct {
         return try self.txn_sessions.cleanupExpired(self.alloc, cutoff_ns);
     }
 
-    fn requiresAuthentication(self: *const ApiHttpServer, path: []const u8) bool {
-        if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null) return false;
-        if (self.cfg.user_manager == null and self.cfg.trusted_principal_secret == null) return false;
-        if (std.mem.eql(u8, path, routes.Routes.ai_catalog) and self.cfg.ard_public_catalog_enabled) return false;
-        if (std.mem.eql(u8, path, routes.Routes.agent_card) or std.mem.eql(u8, path, routes.Routes.agent_card_legacy)) return false;
-        if (std.mem.startsWith(u8, path, routes.Routes.internal_groups_prefix)) return false;
-        // HA administration has a separate runtime-owned bearer credential.
-        // Do not interpret that token as a native user API key before the HA
-        // dispatcher can validate it.
-        if (isHaAdminPath(path)) return false;
-        if (isHaInternalPath(path)) return false;
-        return true;
-    }
-
-    fn requestCarriesAuthentication(_: *const ApiHttpServer, req: http_common.HttpRequest) bool {
-        return req.authorization != null or req.header(trusted_principal_header) != null;
-    }
-
     pub fn authenticateRequest(self: *ApiHttpServer, request: AuthenticatedRequest) !AuthenticatedIdentity {
         if (request.trusted_principal) |trusted_principal| {
             const token = std.mem.trim(u8, trusted_principal, " \t\r\n");
@@ -3664,144 +3647,6 @@ pub const ApiHttpServer = struct {
             .metadata_json = metadata_json,
             .roles = try self.alloc.alloc([]u8, 0),
         };
-    }
-
-    /// Executes one explicitly registered non-OpenAPI route. Runtime roles
-    /// reach this only through AntflyApiHandler's contextual route manifest;
-    /// unprefixed aliases for generated `/db/v1` operations are never
-    /// registered and therefore cannot enter this operation surface.
-    pub fn handle(self: *ApiHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
-        self.recordHandledRequest();
-        const uri_parts = splitTarget(req.uri);
-        var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(self.alloc);
-
-        if (!self.cfg.experimental and isA2aProtocolPath(uri_parts.path)) {
-            return try jsonErrorResponse(self.alloc, 404, "not found");
-        }
-
-        const route_requires_authentication = self.requiresAuthentication(uri_parts.path);
-        const should_authenticate_optional_ard_catalog =
-            !route_requires_authentication and
-            std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog) and
-            self.requestCarriesAuthentication(req);
-        if (route_requires_authentication or should_authenticate_optional_ard_catalog) {
-            authenticated_identity = self.authenticateRequest(.{
-                .authorization = req.authorization,
-                .trusted_principal = req.header(trusted_principal_header),
-            }) catch |err| switch (err) {
-                error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => {
-                    return try unauthorizedResponse(self.alloc);
-                },
-                else => return err,
-            };
-            const identity = authenticated_identity.?;
-
-            if (route_requires_authentication and requiresAdminPermission(uri_parts.path) and !permissionsAllow(identity.permissions, .@"*", "*", .admin)) {
-                return try textResponse(self.alloc, 403, "forbidden");
-            }
-            if (route_requires_authentication) {
-                const required_permission = requiredPermissionForRequest(self.alloc, req.method, uri_parts.path) catch |err| switch (err) {
-                    error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid path parameter"),
-                    else => return err,
-                };
-                if (required_permission) |required| {
-                    defer required.deinit(self.alloc);
-                    if (!permissionsAllow(identity.permissions, required.resource_type, required.resource, required.permission_type)) {
-                        return try textResponse(self.alloc, 403, "forbidden");
-                    }
-                }
-            }
-        }
-
-        if (self.cfg.ha_failover_safe_mutations_only) {
-            if (ha_mutation_inventory.classify(req.method, uri_parts.path)) |mutation| {
-                if (mutation.disposition == .reject or
-                    (mutation.disposition == .remote_apply and !self.cfg.ha_remote_apply_mutations_enabled))
-                {
-                    return try jsonResponseWithStatus(self.alloc, 503, .{
-                        .@"error" = "mutation is not continuously replicated while HA is active",
-                        .code = "ha_mutation_not_replicated",
-                        .surface = @tagName(mutation.surface),
-                    });
-                }
-            }
-        }
-
-        try self.resumeRestoreJobsOnce();
-        if (std.mem.eql(u8, uri_parts.path, "/restore/jobs")) {
-            if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
-            var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer query_arena_impl.deinit();
-            const options = parseRestoreJobListOptions(query_arena_impl.allocator(), uri_parts.query) catch
-                return try textResponse(self.alloc, 400, "invalid restore job list parameters");
-            var response = try self.handlePublicListRestoreJobs(authenticated_identity, options);
-            defer response.deinit(self.alloc);
-            return try legacyResponseFromContextualOperation(self.alloc, response);
-        }
-        if (restoreJobIdFromPath(uri_parts.path)) |job_id| {
-            if (authenticated_identity) |identity| {
-                if (!(try self.restoreJobAllowed(self.alloc, identity, job_id))) return try textResponse(self.alloc, 404, "not found");
-            }
-            return switch (req.method) {
-                .GET => blk: {
-                    var response = try self.handlePublicRestoreJob(job_id, false);
-                    defer response.deinit(self.alloc);
-                    break :blk try legacyResponseFromContextualOperation(self.alloc, response);
-                },
-                .DELETE => blk: {
-                    var response = try self.handlePublicRestoreJob(job_id, true);
-                    defer response.deinit(self.alloc);
-                    break :blk try legacyResponseFromContextualOperation(self.alloc, response);
-                },
-                else => try textResponse(self.alloc, 405, "method not allowed"),
-            };
-        }
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.status)) {
-            var public_status = try self.loadClusterStatus(self.alloc);
-            defer public_status.deinit(self.alloc);
-            return try jsonResponse(self.alloc, public_status);
-        }
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.cluster)) {
-            var topology_status = try self.loadClusterTopology(self.alloc);
-            defer topology_status.deinit(self.alloc);
-            return try jsonResponse(self.alloc, topology_status);
-        }
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.connections)) {
-            const connection_types = parseSimpleQueryParamDecodedAlloc(self.alloc, uri_parts.query, "types") catch return try textResponse(self.alloc, 400, "invalid types");
-            defer if (connection_types) |value| self.alloc.free(value);
-            const connection_include = parseSimpleQueryParamDecodedAlloc(self.alloc, uri_parts.query, "include") catch return try textResponse(self.alloc, 400, "invalid include");
-            defer if (connection_include) |value| self.alloc.free(value);
-            const connection_refresh = parseSimpleQueryParamDecodedAlloc(self.alloc, uri_parts.query, "refresh") catch return try textResponse(self.alloc, 400, "invalid refresh");
-            defer if (connection_refresh) |value| self.alloc.free(value);
-            const body = try self.listConnectionsJsonAlloc(
-                self.alloc,
-                connection_types,
-                connection_include,
-                connection_refresh,
-            );
-            return .{
-                .status = 200,
-                .content_type = try self.alloc.dupe(u8, "application/json"),
-                .body = body,
-            };
-        }
-        if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
-        if (try self.dispatchSecretRoutes(req, uri_parts)) |resp| return resp;
-        if (try self.dispatchTransactionRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
-        const public_table_resp = self.dispatchPublicTableRoutes(req, uri_parts, authenticated_identity) catch |err| {
-            if (err == error.InvalidPathParameter)
-                return try textResponse(self.alloc, 400, "invalid path parameter");
-            if (metadata_authority.isRetryableError(err)) {
-                if (publicTableRouteMutatesMetadata(req.method, uri_parts.path)) {
-                    return try metadataNotLeaderResponse(self.alloc);
-                }
-                return err;
-            }
-            return err;
-        };
-        if (public_table_resp) |resp| return resp;
-        return try textResponse(self.alloc, 404, "not found");
     }
 
     pub const HaRouteRequest = struct {
@@ -4255,430 +4100,11 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
-    fn recordHandledRequest(self: *ApiHttpServer) void {
+    pub fn recordHandledRequest(self: *ApiHttpServer) void {
         const prior = self.request_count.fetchAdd(1, .monotonic);
         if (prior == 0) {
             self.first_request_started_at_ns.store(platform_time.monotonicNs(), .monotonic);
         }
-    }
-
-    fn dispatchUserRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.users_me)) {
-            const identity = authenticated_identity orelse return try unauthorizedResponse(self.alloc);
-            var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena_impl.deinit();
-            const current_user = try makeCurrentUserResponse(arena_impl.allocator(), identity.username, identity.permissions, identity.metadata_json);
-            return try jsonResponse(self.alloc, current_user);
-        }
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.users)) {
-            const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-            const users = try manager.listUsers();
-            defer freeOwnedStrings(self.alloc, users);
-            const listed_users = try makeListedUsers(self.alloc, users);
-            defer self.alloc.free(listed_users);
-            return try jsonResponse(self.alloc, listed_users);
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchUserPath(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var create_req = parseCreateUserRequest(self.alloc, req.body, user_path.user_name) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid create user request");
-                };
-                defer create_req.deinit(self.alloc);
-                var created = manager.createUserWithMetadata(create_req.username, create_req.password, create_req.initial_policies, create_req.metadata_json) catch |err| switch (err) {
-                    error.UserExists => return try jsonErrorResponse(self.alloc, 409, "user already exists"),
-                    error.InvalidMetadata => return try jsonErrorResponse(self.alloc, 400, "invalid create user request"),
-                    else => return err,
-                };
-                defer created.deinit(self.alloc);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try userToOpenApi(arena_impl.allocator(), created);
-                return try jsonResponseWithStatus(self.alloc, 201, generated);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchUserPath(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var user = manager.getUser(user_path.user_name) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer user.deinit(self.alloc);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try userToOpenApi(arena_impl.allocator(), user);
-                return try jsonResponse(self.alloc, generated);
-            }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchUserPath(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                manager.deleteUser(user_path.user_name) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-        }
-        if (req.method == .PUT) {
-            if (routes.Routes.matchUserPassword(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const new_password = parsePasswordUpdateRequest(self.alloc, req.body) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid password update request");
-                };
-                defer self.alloc.free(new_password);
-                manager.updatePassword(user_path.user_name, new_password) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return try jsonResponse(self.alloc, .{ .message = "Password updated successfully" });
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchUserPermissions(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const permissions = manager.getPermissionsForUser(user_path.user_name) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer freePermissions(self.alloc, permissions);
-                const generated_permissions = try clonePermissionsToOpenApi(self.alloc, permissions);
-                defer self.alloc.free(generated_permissions);
-                return try jsonResponse(self.alloc, generated_permissions);
-            }
-            if (routes.Routes.matchUserRoles(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const roles = manager.getRolesForUser(user_path.user_name) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer freeOwnedStrings(self.alloc, roles);
-                return try jsonResponse(self.alloc, roles);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchUserPermissions(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var permission = parsePermissionBody(self.alloc, req.body) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid permission request");
-                };
-                defer permission.deinit(self.alloc);
-                manager.addPermissionToUser(user_path.user_name, permission) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    error.InvalidPermissionType, error.InvalidResourceType => return try jsonErrorResponse(self.alloc, 400, "invalid permission request"),
-                    else => return err,
-                };
-                return try jsonResponseWithStatus(self.alloc, 201, struct { message: []const u8 }{
-                    .message = "Permission added successfully",
-                });
-            }
-            if (routes.Routes.matchUserRoles(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const role = parseRoleAssignmentBody(self.alloc, req.body) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid role request");
-                };
-                defer self.alloc.free(role);
-                manager.addRoleToUser(user_path.user_name, role) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    error.InvalidRole => return try jsonErrorResponse(self.alloc, 400, "invalid role request"),
-                    else => return err,
-                };
-                return try jsonResponseWithStatus(self.alloc, 201, struct { message: []const u8 }{
-                    .message = "Role added successfully",
-                });
-            }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchUserPermissions(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer query_arena_impl.deinit();
-                const params = parseRemovePermissionFromUserParams(query_arena_impl.allocator(), uri_parts.query) catch |err| switch (err) {
-                    error.MissingResource => return try jsonErrorResponse(self.alloc, 400, "missing resource"),
-                    error.MissingResourceType => return try jsonErrorResponse(self.alloc, 400, "missing resourceType"),
-                    error.InvalidResourceType => return try jsonErrorResponse(self.alloc, 400, "invalid resourceType"),
-                    error.InvalidArgument => return try jsonErrorResponse(self.alloc, 400, "invalid query parameter"),
-                    else => return err,
-                };
-                manager.removePermissionFromUser(
-                    user_path.user_name,
-                    params.resource,
-                    usermgr.ResourceType.fromSlice(params.resource_type) catch return try jsonErrorResponse(self.alloc, 400, "invalid resourceType"),
-                ) catch |err| switch (err) {
-                    error.UserNotFound, error.RoleNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-            if (routes.Routes.matchUserRoles(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer query_arena_impl.deinit();
-                const params = parseRemoveRoleFromUserParams(query_arena_impl.allocator(), uri_parts.query) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "missing role");
-                };
-                manager.removeRoleFromUser(user_path.user_name, params.role) catch |err| switch (err) {
-                    error.UserNotFound, error.RoleNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchUserApiKeys(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const keys = manager.listApiKeys(user_path.user_name) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer freeApiKeys(self.alloc, keys);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const arena = arena_impl.allocator();
-                const generated = try arena.alloc(usermgr_openapi.ApiKey, keys.len);
-                for (keys, 0..) |api_key, i| {
-                    generated[i] = try apiKeyToOpenApi(arena, api_key);
-                }
-                return try jsonResponse(self.alloc, generated);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchUserApiKeys(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var create_req = parseCreateApiKeyRequest(self.alloc, req.body) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid api key request");
-                };
-                defer create_req.deinit(self.alloc);
-                var created = manager.createApiKey(
-                    user_path.user_name,
-                    create_req.name,
-                    create_req.permissions,
-                    create_req.row_filter,
-                    create_req.expires_at_ns,
-                ) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    error.PrivilegeEscalation => return try jsonErrorResponse(self.alloc, 403, "privilege escalation"),
-                    else => return err,
-                };
-                defer created.deinit(self.alloc);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try createdApiKeyToOpenApi(arena_impl.allocator(), created);
-                return try jsonResponseWithStatus(self.alloc, 201, generated);
-            }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchUserApiKey(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                manager.deleteApiKey(user_path.user_name, user_path.key_id) catch |err| switch (err) {
-                    error.ApiKeyNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-        }
-        if (req.method == .GET) {
-            if (std.mem.eql(u8, uri_parts.path, routes.Routes.auth_subjects)) {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const subjects = try manager.listAuthSubjects();
-                defer freeAuthSubjects(self.alloc, subjects);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                return try jsonResponse(self.alloc, try authSubjectsToResponse(arena_impl.allocator(), subjects));
-            }
-            if (routes.Routes.matchSubjectRowFilters(uri_parts.path)) |subject_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const row_filters = try manager.listSubjectRowFilters(subject_path.subject);
-                defer freeRowFilters(self.alloc, row_filters);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const arena = arena_impl.allocator();
-                const generated = try arena.alloc(usermgr_openapi.RowFilterEntry, row_filters.len);
-                for (row_filters, 0..) |entry, i| {
-                    generated[i] = try rowFilterEntryToOpenApi(arena, entry);
-                }
-                return try jsonResponse(self.alloc, generated);
-            }
-            if (routes.Routes.matchSubjectRowFilter(uri_parts.path)) |subject_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const filter_json = manager.getSubjectRowFilter(subject_path.subject, subject_path.table) catch |err| switch (err) {
-                    error.RowFilterNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer self.alloc.free(filter_json);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try rowFilterEntryToOpenApi(arena_impl.allocator(), .{
-                    .table = @constCast(subject_path.table),
-                    .filter = @constCast(filter_json),
-                });
-                return try jsonResponse(self.alloc, generated);
-            }
-            if (routes.Routes.matchUserRowFilters(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const row_filters = manager.listRowFilters(user_path.user_name) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer freeRowFilters(self.alloc, row_filters);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const arena = arena_impl.allocator();
-                const generated = try arena.alloc(usermgr_openapi.RowFilterEntry, row_filters.len);
-                for (row_filters, 0..) |entry, i| {
-                    generated[i] = try rowFilterEntryToOpenApi(arena, entry);
-                }
-                return try jsonResponse(self.alloc, generated);
-            }
-            if (routes.Routes.matchUserRowFilter(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const filter_json = manager.getRowFilter(user_path.user_name, user_path.table) catch |err| switch (err) {
-                    error.UserNotFound, error.RowFilterNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer self.alloc.free(filter_json);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try rowFilterEntryToOpenApi(arena_impl.allocator(), .{
-                    .table = @constCast(user_path.table),
-                    .filter = @constCast(filter_json),
-                });
-                return try jsonResponse(self.alloc, generated);
-            }
-        }
-        if (req.method == .PUT) {
-            if (routes.Routes.matchSubjectRowFilter(uri_parts.path)) |subject_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var parsed_filter = usermgr_openapi.server.parseSetSubjectRowFilterBody(self.alloc, req.body) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid row filter");
-                };
-                defer parsed_filter.deinit();
-                const normalized_filter = try std.json.Stringify.valueAlloc(self.alloc, parsed_filter.value, .{});
-                defer self.alloc.free(normalized_filter);
-                validateAuthRowFilterJson(self.alloc, normalized_filter) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid row filter");
-                };
-                manager.setSubjectRowFilter(subject_path.subject, subject_path.table, normalized_filter) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid row filter");
-                };
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try rowFilterEntryToOpenApi(arena_impl.allocator(), .{
-                    .table = @constCast(subject_path.table),
-                    .filter = @constCast(normalized_filter),
-                });
-                return try jsonResponse(self.alloc, generated);
-            }
-            if (routes.Routes.matchUserRowFilter(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var parsed_filter = usermgr_openapi.server.parseSetRowFilterBody(self.alloc, req.body) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid row filter");
-                };
-                defer parsed_filter.deinit();
-                const normalized_filter = try std.json.Stringify.valueAlloc(self.alloc, parsed_filter.value, .{});
-                defer self.alloc.free(normalized_filter);
-                validateAuthRowFilterJson(self.alloc, normalized_filter) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid row filter");
-                };
-                manager.setRowFilter(user_path.user_name, user_path.table, normalized_filter) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return try jsonErrorResponse(self.alloc, 400, "invalid row filter"),
-                };
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try rowFilterEntryToOpenApi(arena_impl.allocator(), .{
-                    .table = @constCast(user_path.table),
-                    .filter = @constCast(normalized_filter),
-                });
-                return try jsonResponse(self.alloc, generated);
-            }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchSubjectRowFilter(uri_parts.path)) |subject_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                manager.removeSubjectRowFilter(subject_path.subject, subject_path.table) catch |err| switch (err) {
-                    error.RowFilterNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-            if (routes.Routes.matchUserRowFilter(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                manager.removeRowFilter(user_path.user_name, user_path.table) catch |err| switch (err) {
-                    error.UserNotFound, error.RowFilterNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-        }
-        return null;
-    }
-
-    fn dispatchSecretRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.secrets)) {
-            const listed = if (self.cfg.secret_store) |secret_store|
-                try secret_store.list(self.alloc)
-            else
-                try common_secrets.listEnvironmentSecrets(self.alloc);
-            defer common_secrets.freeListedSecrets(self.alloc, listed);
-            const secret_list = try makeSecretList(self.alloc, listed);
-            defer self.alloc.free(secret_list.secrets);
-            return try jsonResponse(self.alloc, secret_list);
-        }
-        if (req.method == .PUT) {
-            if (routes.Routes.matchSecretPath(uri_parts.path)) |secret_path| {
-                const secret_store = self.cfg.secret_store orelse return try textResponse(self.alloc, 503, "secret management not available in multi-node mode");
-                var parsed = metadata_openapi.server.parsePutSecretBody(self.alloc, req.body) catch {
-                    return try textResponse(self.alloc, 400, "invalid secret request");
-                };
-                defer parsed.deinit();
-                var listed = secret_store.put(self.alloc, secret_path.key, parsed.value.value) catch |err| switch (err) {
-                    error.InvalidSecretKey => return try textResponse(self.alloc, 400, "invalid secret key"),
-                    else => return err,
-                };
-                defer listed.deinit(self.alloc);
-                return try jsonResponse(self.alloc, makeSecretEntry(listed));
-            }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchSecretPath(uri_parts.path)) |secret_path| {
-                const secret_store = self.cfg.secret_store orelse return try textResponse(self.alloc, 503, "secret management not available in multi-node mode");
-                if (!(try secret_store.delete(secret_path.key))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-        }
-        return null;
     }
 
     pub fn executeQueryBuilderAgent(
@@ -4770,742 +4196,6 @@ pub const ApiHttpServer = struct {
             try std.fmt.allocPrint(self.alloc, "{f}", .{std.json.fmt(response, .{})}),
             false,
         );
-    }
-
-    fn dispatchTransactionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        if (req.method == .GET) {
-            if (std.mem.eql(u8, uri_parts.path, routes.Routes.transactions)) {
-                const sessions = try self.txn_sessions.listStatusesForPrincipal(
-                    self.alloc,
-                    transactionPrincipal(authenticated_identity),
-                );
-                defer self.alloc.free(sessions);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSessionListResponse(arena_impl.allocator(), sessions);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.transactions_cleanup)) {
-            const now_ns = platform_time.realtimeNs();
-            const cutoff_ns = if (try parseUnsignedQueryParam(uri_parts.query, "cutoff_ns")) |explicit_cutoff|
-                explicit_cutoff
-            else if (self.cfg.session_ttl_ns) |ttl_ns|
-                now_ns -| ttl_ns
-            else
-                return try textResponse(self.alloc, 400, "missing cutoff");
-            const removed = try self.cleanupExpiredSessions(cutoff_ns);
-            return try jsonResponse(self.alloc, transactions_api.buildSessionCleanupResponse(removed, cutoff_ns));
-        }
-        if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.eval)) {
-            var parsed = metadata_openapi.server.parseEvaluateBody(self.alloc, req.body) catch {
-                return try jsonErrorResponse(self.alloc, 400, "invalid eval request");
-            };
-            defer parsed.deinit();
-            var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena_impl.deinit();
-            const response = retrieval_agent.buildEvalResponse(arena_impl.allocator(), parsed.value) catch |err| switch (err) {
-                error.InvalidEvalRequest => return try jsonErrorResponse(self.alloc, 400, "invalid eval request"),
-                else => return err,
-            };
-            return try jsonResponse(self.alloc, response);
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTransactionSession(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                var details = (self.txn_sessions.getDetails(self.alloc, txn_id) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                defer details.deinit(self.alloc);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSessionDetailsResponse(arena_impl.allocator(), details);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (std.mem.eql(u8, uri_parts.path, routes.Routes.transactions_begin)) {
-                const begin_req = transactions_api.parseBeginRequest(self.alloc, req.body) catch {
-                    return try textResponse(self.alloc, 400, "invalid transaction begin request");
-                };
-                const session = self.txn_sessions.beginForPrincipal(
-                    self.alloc,
-                    begin_req,
-                    self.localSessionNodeId(),
-                    transactionPrincipal(authenticated_identity),
-                ) catch |err| switch (err) {
-                    error.SessionLimitExceeded => return try textResponse(self.alloc, 429, "transaction session limit exceeded"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                };
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildBeginResponse(arena_impl.allocator(), session);
-                return try jsonResponseWithStatus(self.alloc, 201, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (std.mem.eql(u8, uri_parts.path, routes.Routes.transactions_commit)) {
-                const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
-                var commit_req = transactions_api.parseCommitRequest(self.alloc, req.body) catch |err| switch (err) {
-                    error.InvalidTransactionCommitRequest => {
-                        return try textResponse(self.alloc, 400, "invalid transaction commit request");
-                    },
-                    else => return err,
-                };
-                defer commit_req.deinit(self.alloc);
-                if (!(try self.transactionRequestAuthorized(authenticated_identity, commit_req))) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
-
-                const distributed_tables = try commit_req.distributedTables(self.alloc);
-                defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
-                self.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
-                    error.InvalidBatchRequest,
-                    error.InvalidArgument,
-                    error.InvalidGraphEdges,
-                    error.UnsupportedTransformOperation,
-                    => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
-                    else => return err,
-                };
-                if (try self.validateCommitReadSet(commit_req)) |conflict| {
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const response = try transactions_api.buildCommitResponse(
-                        arena_impl.allocator(),
-                        "aborted",
-                        conflict,
-                        null,
-                    );
-                    return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                }
-
-                const outcome = (source.commitTransaction(self.alloc, distributed_tables, commit_req.sync_level) catch |err| switch (err) {
-                    error.InvalidBatchRequest,
-                    error.InvalidArgument,
-                    error.InvalidGraphEdges,
-                    error.UnsupportedTransformOperation,
-                    => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
-                    error.TopologyChanged => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "aborted",
-                            transactions_api.topologyChangedConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.DecisionConflict => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "aborted",
-                            transactions_api.decisionConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.DocIdentityNamespaceMismatch => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "aborted",
-                            transactions_api.docIdentityUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.TxnNotFound, error.InvalidTxnRecord => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "aborted",
-                            transactions_api.tornStateConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.CommitVisibilityNotSatisfied => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "committed_visibility_pending",
-                            null,
-                            commit_req.tables,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 202, response);
-                    },
-                    error.CommitPropagationIncomplete => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "committed_recovery_pending",
-                            null,
-                            commit_req.tables,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 202, response);
-                    },
-                    error.CommitDecisionUnknown => return try textResponse(
-                        self.alloc,
-                        500,
-                        "transaction outcome is unknown; do not retry this stateless request because it may already have committed; use a transaction session for retryable commits",
-                    ),
-                    error.AbortDecisionNotDurable, error.TransactionBeginFailed => return try textResponse(
-                        self.alloc,
-                        503,
-                        "transaction coordinator is temporarily unavailable",
-                    ),
-                    error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
-                    error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-
-                switch (outcome) {
-                    .committed => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(arena_impl.allocator(), "committed", null, commit_req.tables);
-                        return try jsonResponseOmitNullOptionals(self.alloc, response);
-                    },
-                    .conflict => |conflict| {
-                        const enriched_conflict = try self.enrichCommitConflict(commit_req, conflict);
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "aborted",
-                            enriched_conflict,
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                }
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionRead(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                var read_req = transactions_api.parseStageReadPayload(self.alloc, req.body) catch {
-                    return try textResponse(self.alloc, 400, "invalid transaction read request");
-                };
-                defer read_req.deinit(self.alloc);
-                if (!transactionTablePermissionAllowed(authenticated_identity, read_req.table_name, .read)) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
-
-                var owned_snapshot: transactions_api.SessionReadSnapshot = (self.txn_sessions.getReadSnapshot(self.alloc, txn_id, read_req.table_name, read_req.key) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    else => return err,
-                }) orelse .{
-                    .table_name = try self.alloc.dupe(u8, read_req.table_name),
-                    .key = try self.alloc.dupe(u8, read_req.key),
-                    .version = 0,
-                    .document_json = null,
-                };
-                defer owned_snapshot.deinit(self.alloc);
-
-                if (owned_snapshot.version == 0 and self.table_reads != null) {
-                    const fetched = try self.lookupStageReadSnapshot(read_req.table_name, read_req.key);
-                    if (owned_snapshot.document_json) |document_json| self.alloc.free(document_json);
-                    self.alloc.free(owned_snapshot.table_name);
-                    self.alloc.free(owned_snapshot.key);
-                    owned_snapshot = .{
-                        .table_name = try self.alloc.dupe(u8, fetched.table_name),
-                        .key = try self.alloc.dupe(u8, fetched.key),
-                        .version = fetched.version,
-                        .document_json = if (fetched.document_json) |document_json| try self.alloc.dupe(u8, document_json) else null,
-                    };
-                    if (fetched.document_json) |document_json| self.alloc.free(document_json);
-                } else if (owned_snapshot.version == 0) {
-                    owned_snapshot.version = read_req.version;
-                }
-                if (!(try self.transactionReadSnapshotVisible(
-                    authenticated_identity,
-                    owned_snapshot.table_name,
-                    owned_snapshot.key,
-                    owned_snapshot.document_json,
-                ))) {
-                    if (owned_snapshot.document_json) |document_json| {
-                        self.alloc.free(document_json);
-                        owned_snapshot.document_json = null;
-                    }
-                    owned_snapshot.version = 0;
-                }
-                if (owned_snapshot.version != read_req.version) {
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const response = try transactions_api.buildSessionCommitResponse(
-                        arena_impl.allocator(),
-                        txn_id,
-                        "conflict",
-                        transactions_api.versionConflict(read_req.table_name, read_req.key, read_req.version, owned_snapshot.version),
-                        null,
-                    );
-                    return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                }
-
-                var stage_req = try transactions_api.ownedRequestFromStageReadRequest(self.alloc, read_req);
-                defer stage_req.deinit(self.alloc);
-
-                const session = (self.txn_sessions.stageRead(self.alloc, txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildStageReadResponse(arena_impl.allocator(), session.txn_id, owned_snapshot.stage());
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionWrite(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                var stage_req = transactions_api.parseStageWriteRequest(self.alloc, req.body) catch {
-                    return try textResponse(self.alloc, 400, "invalid transaction write request");
-                };
-                defer stage_req.deinit(self.alloc);
-                if (!(try self.transactionRequestAuthorized(authenticated_identity, stage_req))) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
-
-                const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildStageResponse(arena_impl.allocator(), session.txn_id);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionDelete(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                var stage_req = transactions_api.parseStageDeleteRequest(self.alloc, req.body) catch {
-                    return try textResponse(self.alloc, 400, "invalid transaction delete request");
-                };
-                defer stage_req.deinit(self.alloc);
-                if (!(try self.transactionRequestAuthorized(authenticated_identity, stage_req))) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
-
-                const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildStageResponse(arena_impl.allocator(), session.txn_id);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionSavepoints(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                const info = (self.txn_sessions.createSavepoint(self.alloc, txn_id) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
-                    error.SavepointLimitExceeded => return try textResponse(self.alloc, 409, "savepoint limit exceeded"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSavepointResponse(arena_impl.allocator(), info);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionRollback(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                const info = (self.txn_sessions.rollbackToSavepoint(self.alloc, txn_id, session_route.savepoint_id) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildRollbackResponse(arena_impl.allocator(), info);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionStage(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                var stage_req = transactions_api.parseCommitRequest(self.alloc, req.body) catch |err| switch (err) {
-                    error.InvalidTransactionCommitRequest => {
-                        return try textResponse(self.alloc, 400, "invalid transaction stage request");
-                    },
-                    else => return err,
-                };
-                defer stage_req.deinit(self.alloc);
-                if (!(try self.transactionRequestAuthorized(authenticated_identity, stage_req))) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
-
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildStageResponse(arena_impl.allocator(), session.txn_id);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionCommit(uri_parts.path)) |session_route| {
-                const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                const session = self.txn_sessions.getInfo(txn_id) orelse return try textResponse(self.alloc, 404, "not found");
-
-                var parsed_req: ?transactions_api.OwnedTransactionCommitRequest = null;
-                defer if (parsed_req) |*commit_req| commit_req.deinit(self.alloc);
-                if (!transactions_api.isEmptySessionCommitBody(req.body)) {
-                    parsed_req = transactions_api.parseCommitRequest(self.alloc, req.body) catch |err| switch (err) {
-                        error.InvalidTransactionCommitRequest => {
-                            return try textResponse(self.alloc, 400, "invalid transaction commit request");
-                        },
-                        else => return err,
-                    };
-                }
-                var commit_req = (self.txn_sessions.cloneCommitRequest(self.alloc, txn_id, if (parsed_req) |*value| value else null) catch |err| switch (err) {
-                    error.TransactionCommitRequestMismatch => {
-                        return try textResponse(self.alloc, 409, "transaction commit retry body does not match the sealed request");
-                    },
-                    error.SessionLeaseLost => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(
-                            arena_impl.allocator(),
-                            txn_id,
-                            "aborted",
-                            transactions_api.sessionLeaseLostConflict(if (parsed_req) |value| if (value.tables.len > 0) value.tables[0].table_name else "" else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    else => return err,
-                }) orelse {
-                    return try textResponse(self.alloc, 400, "transaction has no staged writes");
-                };
-                defer commit_req.deinit(self.alloc);
-                if (!(try self.transactionRequestAuthorized(authenticated_identity, commit_req))) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
-
-                if (try self.txn_sessions.getTerminalCommit(self.alloc, txn_id)) |terminal_value| {
-                    var terminal = terminal_value;
-                    defer terminal.deinit(self.alloc);
-                    var status = terminal.status;
-                    // A pending terminal state still requires commit replay;
-                    // acknowledging the coordinator here would release the
-                    // topology fence and strand the durable API response.
-                    if (status == .committed and !terminal.coordinator_acknowledged) {
-                        if (terminal.coordinator_group_id) |coordinator_group_id| {
-                            const coordinator_table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
-                            const acknowledged = source.acknowledgeTransactionCommit(
-                                self.alloc,
-                                txn_id,
-                                coordinator_group_id,
-                                coordinator_table_name,
-                            ) catch |err| blk: {
-                                std.log.warn("stable transaction coordinator acknowledgement retry deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                break :blk null;
-                            };
-                            if (acknowledged == null) {
-                                status = .committed_recovery_pending;
-                            } else if ((self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, txn_id) catch |err| blk: {
-                                std.log.warn("failed to persist stable transaction coordinator acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                break :blk null;
-                            }) == null) {
-                                // The replicated ACK is idempotent, but until
-                                // its receipt is durable the API handoff still
-                                // requires recovery and must not report 200.
-                                status = .committed_recovery_pending;
-                            }
-                        }
-                    }
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const response = try transactions_api.buildSessionCommitResponse(
-                        arena_impl.allocator(),
-                        txn_id,
-                        status.text(),
-                        null,
-                        commit_req.tables,
-                    );
-                    return try jsonResponseWithStatusOmitNullOptionals(
-                        self.alloc,
-                        if (status == .committed) 200 else 202,
-                        response,
-                    );
-                }
-
-                const distributed_tables = try commit_req.distributedTables(self.alloc);
-                defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
-                self.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
-                    error.InvalidBatchRequest,
-                    error.InvalidArgument,
-                    error.InvalidGraphEdges,
-                    error.UnsupportedTransformOperation,
-                    => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
-                    else => return err,
-                };
-                if (try self.validateCommitReadSet(commit_req)) |conflict| {
-                    _ = self.txn_sessions.remove(self.alloc, txn_id);
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const response = try transactions_api.buildSessionCommitResponse(
-                        arena_impl.allocator(),
-                        txn_id,
-                        "aborted",
-                        conflict,
-                        null,
-                    );
-                    return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                }
-
-                // This durable marker closes the crash window between the
-                // first successful 2PC decision and persistence of the API
-                // terminal response. Maintenance can safely replay the sealed
-                // request with the same transaction ID after this point.
-                _ = (self.txn_sessions.markCommitExecutionStarted(self.alloc, txn_id) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-
-                const outcome = (source.commitTransactionWithId(self.alloc, txn_id, session.begin_timestamp, distributed_tables, session.sync_level) catch |err| switch (err) {
-                    error.InvalidBatchRequest,
-                    error.InvalidArgument,
-                    error.InvalidGraphEdges,
-                    error.UnsupportedTransformOperation,
-                    => {
-                        // The participant has terminally aborted a transaction
-                        // that reached write validation; do not retain a local
-                        // session that can no longer be committed with its ID.
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        return try textResponse(self.alloc, 400, "invalid transaction commit request");
-                    },
-                    error.TopologyChanged => {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(
-                            arena_impl.allocator(),
-                            txn_id,
-                            "aborted",
-                            transactions_api.topologyChangedConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.DecisionConflict => {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(
-                            arena_impl.allocator(),
-                            txn_id,
-                            "aborted",
-                            transactions_api.decisionConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.DocIdentityNamespaceMismatch => {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(
-                            arena_impl.allocator(),
-                            txn_id,
-                            "aborted",
-                            transactions_api.docIdentityUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.UnsupportedOperation => {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        return try textResponse(self.alloc, 405, "method not allowed");
-                    },
-                    error.TableNotFound => {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        return try textResponse(self.alloc, 404, "not found");
-                    },
-                    error.UnknownGroup => {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(
-                            arena_impl.allocator(),
-                            txn_id,
-                            "aborted",
-                            transactions_api.participantUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.CommitVisibilityNotSatisfied => return try textResponse(
-                        self.alloc,
-                        503,
-                        "transaction committed, but the requested visibility barrier was not reached",
-                    ),
-                    error.CommitPropagationIncomplete => return try textResponse(
-                        self.alloc,
-                        503,
-                        "transaction committed; participant recovery is pending",
-                    ),
-                    error.CommitDecisionUnknown => return try textResponse(
-                        self.alloc,
-                        503,
-                        "transaction outcome is unknown; retry this transaction id",
-                    ),
-                    error.AbortDecisionNotDurable, error.TransactionBeginFailed => return try textResponse(
-                        self.alloc,
-                        503,
-                        "transaction coordinator is temporarily unavailable",
-                    ),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-
-                switch (outcome) {
-                    .committed => |committed| {
-                        var status: transactions_api.TerminalCommitStatus = if (committed.propagation_pending)
-                            .committed_recovery_pending
-                        else if (committed.visibility_pending)
-                            .committed_visibility_pending
-                        else
-                            .committed;
-                        _ = (self.txn_sessions.recordTerminalCommit(
-                            self.alloc,
-                            txn_id,
-                            status,
-                            committed.coordinator_group_id,
-                            committed.coordinator_table_name,
-                        ) catch |err| {
-                            std.log.err("failed to persist stable transaction terminal result txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                            return try textResponse(self.alloc, 503, "transaction committed; durable response handoff is pending");
-                        }) orelse return try textResponse(self.alloc, 503, "transaction committed; durable response handoff is pending");
-
-                        if (status == .committed) {
-                            if (committed.coordinator_group_id) |coordinator_group_id| {
-                                const coordinator_table_name = committed.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
-                                const acknowledged = source.acknowledgeTransactionCommit(
-                                    self.alloc,
-                                    txn_id,
-                                    coordinator_group_id,
-                                    coordinator_table_name,
-                                ) catch |err| blk: {
-                                    std.log.warn("stable transaction coordinator acknowledgement deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                    break :blk null;
-                                };
-                                if (acknowledged == null) {
-                                    status = .committed_recovery_pending;
-                                } else if ((self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, txn_id) catch |err| blk: {
-                                    std.log.warn("failed to persist stable transaction coordinator acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                    break :blk null;
-                                }) == null) {
-                                    status = .committed_recovery_pending;
-                                }
-                            }
-                        }
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(arena_impl.allocator(), txn_id, status.text(), null, commit_req.tables);
-                        return try jsonResponseWithStatusOmitNullOptionals(
-                            self.alloc,
-                            if (status == .committed) 200 else 202,
-                            response,
-                        );
-                    },
-                    .conflict => |conflict| {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        const enriched_conflict = try self.enrichCommitConflict(commit_req, conflict);
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(
-                            arena_impl.allocator(),
-                            txn_id,
-                            "aborted",
-                            enriched_conflict,
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                }
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionAbort(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                if (try self.txn_sessions.getTerminalCommit(self.alloc, txn_id)) |terminal_value| {
-                    var terminal = terminal_value;
-                    defer terminal.deinit(self.alloc);
-                    return try textResponse(self.alloc, 409, "transaction is already committed");
-                }
-                if (!self.txn_sessions.remove(self.alloc, txn_id)) return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildAbortResponse(arena_impl.allocator(), txn_id);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        return null;
     }
 
     fn internalQueryPlanningContext(self: *ApiHttpServer) ?internal_query_operations.QueryPlanningContext {
@@ -5906,688 +4596,6 @@ pub const ApiHttpServer = struct {
             .source = source,
         };
         return retrieval_agent.execute(self.alloc, query_runner.iface(), generation_runner.iface(), body);
-    }
-
-    fn dispatchPublicTableRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.backups)) {
-            var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer query_arena_impl.deinit();
-            const params = parseListBackupsParams(query_arena_impl.allocator(), uri_parts.query) catch return try textResponse(self.alloc, 400, "invalid backup list parameters");
-            return try self.handlePublicClusterBackupList(params.location, params.connection, .{
-                .limit = params.limit,
-                .cursor = params.cursor,
-            });
-        }
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.tables)) {
-            var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
-            defer self.source.freeAdminSnapshot(&snapshot);
-            var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer query_arena_impl.deinit();
-            const params = try parseListTablesParams(query_arena_impl.allocator(), uri_parts.query);
-            if (params.pattern != null) return try textResponse(self.alloc, 400, "unsupported table pattern");
-            const storage_statuses = try self.collectTableStorageStatuses(self.alloc, &snapshot, params.prefix);
-            defer if (storage_statuses) |items| self.alloc.free(items);
-            var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena_impl.deinit();
-            const response = try tables_api.buildTableListWithStorageStatuses(arena_impl.allocator(), &snapshot, params.prefix, storage_statuses);
-            return try jsonResponse(self.alloc, response);
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableIndexes(uri_parts.path)) |table_indexes| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_indexes.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicTableListIndexes(table_name);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_index.table_name);
-                defer self.alloc.free(table_name);
-                const index_name = try decodeRequestPathParamAlloc(self.alloc, table_index.index_name);
-                defer self.alloc.free(index_name);
-                if (runtimeSchemaDebugRequested(uri_parts.query)) {
-                    if (!self.runtimeSchemaDebugAllowed(authenticated_identity)) return try textResponse(self.alloc, 403, "forbidden");
-                    var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
-                    defer self.source.freeAdminSnapshot(&snapshot);
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const arena = arena_impl.allocator();
-                    const table = tables_api.findTableByName(&snapshot, table_name) orelse return try textResponse(self.alloc, 404, "not found");
-                    var local_statuses = self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot) catch return try textResponse(self.alloc, 500, "index lookup failed");
-                    defer if (local_statuses) |*status| status.deinit(self.alloc);
-                    const body = (indexes_api.encodeSingleIndex(
-                        arena,
-                        &snapshot,
-                        table_name,
-                        index_name,
-                        if (local_statuses) |*status| status else null,
-                    ) catch return try textResponse(self.alloc, 500, "index lookup failed")) orelse return try textResponse(self.alloc, 404, "not found");
-                    var value = parseOwnedJsonValueAlloc(arena, body) catch return try textResponse(self.alloc, 500, "index lookup failed");
-                    if (value != .object) return try textResponse(self.alloc, 500, "index lookup failed");
-                    const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
-                    defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
-                    try value.object.put(
-                        arena,
-                        try arena.dupe(u8, "debug"),
-                        try tables_api.buildTableIndexRuntimeSchemaDebugValueWithObserved(arena, table, index_name, observed_dynamic_capability_sets),
-                    );
-                    return try jsonResponse(self.alloc, value);
-                }
-                return try self.handlePublicTableGetIndex(table_name, index_name);
-            }
-        }
-        if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.backup)) {
-            return try self.handlePublicClusterBackup(req.body);
-        }
-        if (req.method == .POST) {
-            if (std.mem.eql(u8, uri_parts.path, routes.Routes.restore)) {
-                var response = try self.handlePublicClusterRestore(
-                    req.body,
-                    req.header("idempotency-key"),
-                    if (authenticated_identity) |identity| identity.username else null,
-                );
-                defer response.deinit(self.alloc);
-                return try legacyResponseFromContextualOperation(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableBackup(uri_parts.path)) |table_backup| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_backup.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicTableBackup(table_name, req.body);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableRestore(uri_parts.path)) |table_restore| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_restore.table_name);
-                defer self.alloc.free(table_name);
-                var response = try self.handlePublicTableRestore(
-                    table_name,
-                    req.body,
-                    req.header("idempotency-key"),
-                    if (authenticated_identity) |identity| identity.username else null,
-                );
-                defer response.deinit(self.alloc);
-                return try legacyResponseFromContextualOperation(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableArtifactRepair(uri_parts.path)) |repair_route| {
-                if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair requests use json body");
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_route.table_name);
-                defer self.alloc.free(table_name);
-                var response = try self.handlePublicListArtifactRepairIssues(table_name, req.body);
-                defer response.deinit(self.alloc);
-                return try legacyResponseFromPublicOperation(self.alloc, response);
-            }
-            if (routes.Routes.matchTableArtifactRepairRun(uri_parts.path)) |repair_route| {
-                if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair requests use json body");
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_route.table_name);
-                defer self.alloc.free(table_name);
-                var response = try self.handlePublicRunTableRepair(table_name, req.body);
-                defer response.deinit(self.alloc);
-                return try legacyResponseFromPublicOperation(self.alloc, response);
-            }
-            if (routes.Routes.matchTableRepairJobs(uri_parts.path)) |job_route| {
-                if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair job requests use json body");
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                var response = try self.handlePublicStartTableRepairJob(table_name, req.body);
-                defer response.deinit(self.alloc);
-                return try legacyResponseFromPublicOperation(self.alloc, response);
-            }
-            if (routes.Routes.matchTableRepairJobAdvance(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                var response = try self.handlePublicAdvanceTableRepairJob(table_name, job_route.job_id);
-                defer response.deinit(self.alloc);
-                return try legacyResponseFromPublicOperation(self.alloc, response);
-            }
-            if (routes.Routes.matchTableRepairJobCancel(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                var response = try self.handlePublicCancelTableRepairJob(table_name, job_route.job_id);
-                defer response.deinit(self.alloc);
-                return try legacyResponseFromPublicOperation(self.alloc, response);
-            }
-            if (routes.Routes.matchTableArtifactReprocessJobs(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                var response = try self.handlePublicStartDocumentArtifactReprocessJob(table_name, job_route.artifact_name, req.body);
-                defer response.deinit(self.alloc);
-                return try legacyResponseFromPublicOperation(self.alloc, response);
-            }
-            if (routes.Routes.matchTableArtifactReprocessJobAdvance(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                var response = try self.handlePublicAdvanceDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
-                defer response.deinit(self.alloc);
-                return try legacyResponseFromPublicOperation(self.alloc, response);
-            }
-            if (routes.Routes.matchTableArtifactReprocessJobCancel(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                var response = try self.handlePublicCancelDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
-                defer response.deinit(self.alloc);
-                return try legacyResponseFromPublicOperation(self.alloc, response);
-            }
-            if (routes.Routes.matchTableArtifactReprocess(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicReprocessDocumentArtifactRange(table_name, artifact_route.artifact_name, req.body);
-            }
-            if (routes.Routes.matchTableDocumentArtifactReprocess(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicReprocessDocumentArtifact(table_name, artifact_route.key, artifact_route.artifact_name, authenticated_identity);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_index.table_name);
-                defer self.alloc.free(table_name);
-                const index_name = try decodeRequestPathParamAlloc(self.alloc, table_index.index_name);
-                defer self.alloc.free(index_name);
-                return try self.handlePublicTableCreateIndex(table_name, index_name, req.body);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTablePath(uri_parts.path)) |table_path| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_path.table_name);
-                defer self.alloc.free(table_name);
-                var create_req = table_contract.parseCreateTableRequest(self.alloc, req.body) catch |err| {
-                    if (table_contract.classifyCreateTableRequestError(err) == .internal_failure) {
-                        std.log.err("create table request parsing failed: {} body_len={d}", .{ err, req.body.len });
-                        return err;
-                    }
-                    std.log.debug("create table request rejected: {} body_len={d}", .{ err, req.body.len });
-                    return try textResponse(self.alloc, 400, table_contract.createTableRequestErrorMessage(err, req.body));
-                };
-                defer create_req.deinit(self.alloc);
-                const normalized_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
-                    self.alloc,
-                    create_req.indexes_json orelse tables_api.default_indexes_json,
-                    .{
-                        .antfly_provider = self.antfly_provider,
-                        .io = self.inferenceIo(),
-                        .secret_store = self.cfg.secret_store,
-                        .remote_content = self.cfg.remote_content,
-                        .inference_api_url = self.configuredInferenceAPIURL(),
-                        .inference_api_key = self.cfg.inference_api_key,
-                    },
-                ) catch |err| switch (err) {
-                    error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
-                    error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
-                    error.EmbeddingProbeUnavailable => return try textResponse(self.alloc, 503, "table index validation probe unavailable"),
-                    else => return err,
-                };
-                if (create_req.indexes_json) |old_indexes_json| self.alloc.free(old_indexes_json);
-                create_req.indexes_json = normalized_indexes_json;
-                tables_api.validatePublicAlgebraicIndexesJson(self.alloc, create_req.indexes_json orelse tables_api.default_indexes_json) catch {
-                    return try textResponse(self.alloc, 400, "unsupported table index configuration");
-                };
-                std.log.info("public create table begin table={s}", .{table_name});
-                const metadata_create_start_ns = platform_time.monotonicNs();
-                var metadata_create_attempts: usize = 0;
-                while (true) {
-                    metadata_create_attempts += 1;
-                    self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
-                        error.TableAlreadyExists => return try textResponse(self.alloc, 409, "table already exists"),
-                        error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid table configuration"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.UnexpectedHttpStatus => {
-                            const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
-                            if (!self.metadata_mutation_retry_policy.shouldRetry(err, elapsed_ns, metadata_create_attempts)) {
-                                std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
-                                return err;
-                            }
-                            sleepNs(self.metadata_mutation_retry_policy.poll_ns);
-                            continue;
-                        },
-                        else => {
-                            if (metadata_authority.isRetryableError(err)) {
-                                const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
-                                if (self.metadata_mutation_retry_policy.shouldRetry(err, elapsed_ns, metadata_create_attempts)) {
-                                    sleepNs(self.metadata_mutation_retry_policy.poll_ns);
-                                    continue;
-                                }
-                                return error.NotLeader;
-                            }
-                            std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
-                            return err;
-                        },
-                    };
-                    break;
-                }
-                std.log.info("public create table metadata done table={s}", .{table_name});
-                const local_create_handled = if (self.table_writes) |table_writes_source| blk: {
-                    break :blk (table_writes_source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
-                        error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
-                        else => {
-                            std.log.err("public create table local create failed table={s} err={}", .{ table_name, err });
-                            return err;
-                        },
-                    }) != null;
-                } else false;
-                if (local_create_handled) {
-                    std.log.info("public create table wait projected presence table={s}", .{table_name});
-                    self.waitForProjectedTablePresence(table_name) catch |err| switch (err) {
-                        error.TableVisibilityTimeout => {
-                            std.log.err("public create table metadata visibility timed out table={s}", .{table_name});
-                            return try textResponse(self.alloc, 500, "table create did not converge");
-                        },
-                        else => return err,
-                    };
-                    // A local standalone create is the write-readiness barrier:
-                    // the owned DB has already been opened and initialized before
-                    // createTable returns. Distributed mode additionally requires
-                    // the projected Raft voter quorum and leader to be observable;
-                    // accepting only catalog presence there would acknowledge a
-                    // table before another node can safely route writes to it.
-                    if (!self.cfg.deployment_mode.isStandalone()) {
-                        self.waitForProjectedTableWriteQuorum(table_name) catch |err| switch (err) {
-                            error.TableVisibilityTimeout => {
-                                std.log.err("public create table write quorum timed out table={s}", .{table_name});
-                                return try textResponse(self.alloc, 500, "table create did not converge");
-                            },
-                            else => return err,
-                        };
-                    }
-                } else {
-                    const metadata_wait_handled = self.source.waitTableLifecycle(table_name, .present) catch |err| lifecycle: {
-                        break :lifecycle switch (err) {
-                            error.TableVisibilityTimeout => {
-                                self.waitForProjectedTableCreateReadiness(table_name) catch |fallback_err| switch (fallback_err) {
-                                    error.TableVisibilityTimeout => {
-                                        std.log.err("public create table metadata lifecycle timed out table={s}", .{table_name});
-                                        return try textResponse(self.alloc, 500, "table create did not converge");
-                                    },
-                                    else => return fallback_err,
-                                };
-                                break :lifecycle true;
-                            },
-                            error.NotLeader => return err,
-                            else => {
-                                std.log.err("public create table metadata lifecycle failed table={s} err={}", .{ table_name, err });
-                                return err;
-                            },
-                        };
-                    };
-                    if (!metadata_wait_handled) {
-                        std.log.info("public create table wait metadata visibility table={s}", .{table_name});
-                        self.waitForTableVisibility(table_name, .present) catch |err| switch (err) {
-                            error.TableVisibilityTimeout => {
-                                std.log.err("public create table metadata visibility timed out table={s}", .{table_name});
-                                return try textResponse(self.alloc, 500, "table create did not converge");
-                            },
-                            else => return err,
-                        };
-                    }
-                }
-                std.log.info("public create table visible table={s}", .{table_name});
-
-                var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
-                defer self.source.freeAdminSnapshot(&snapshot);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = (try tables_api.buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), &snapshot, table_name, null)) orelse {
-                    return try textResponse(self.alloc, 404, "not found");
-                };
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .PUT) {
-            if (routes.Routes.matchTableArtifactEnrichment(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicPutArtifactEnrichment(table_name, artifact_route.artifact_name, req.body);
-            }
-            if (routes.Routes.matchTableSchema(uri_parts.path)) |table_schema| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_schema.table_name);
-                defer self.alloc.free(table_name);
-                var invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, req.body);
-                const schema_json = table_contract.parseSchemaUpdateRequest(self.alloc, req.body) catch |err| {
-                    invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, req.body);
-                    return try textResponse(self.alloc, 400, invalid_schema_message);
-                };
-                defer self.alloc.free(schema_json);
-
-                const table_before = try self.loadOwnedTableRecord(self.alloc, table_name);
-                if (table_before == null) {
-                    _ = self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
-                        error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                        error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-                        error.TableGenerationChanged => return try textResponse(self.alloc, 409, "table mutation conflict; retry request"),
-                        error.TableTransitionActive => return try textResponse(self.alloc, 409, "table transition active"),
-                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => blk: {
-                            const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
-                            _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                                error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                                else => return write_err,
-                            } orelse return try textResponse(self.alloc, 404, "not found");
-                            break :blk null;
-                        },
-                        else => return err,
-                    };
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const value = try buildLocalSchemaUpdateStatus(arena_impl.allocator(), table_name, schema_json);
-                    return try jsonResponse(self.alloc, value);
-                }
-                defer metadata_table_manager.freeTable(self.alloc, table_before.?);
-
-                var local_schema_applied = false;
-                const committed_version = self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
-                    error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-                    error.TableGenerationChanged => return try textResponse(self.alloc, 409, "table mutation conflict; retry request"),
-                    error.TableTransitionActive => return try textResponse(self.alloc, 409, "table transition active"),
-                    error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                    error.UnsupportedOperation => blk: {
-                        const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
-                        _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                            else => return write_err,
-                        };
-                        local_schema_applied = true;
-                        break :blk null;
-                    },
-                    else => return err,
-                };
-                var expectation = try self.schemaProjectionExpectationAlloc(self.alloc, &table_before.?, schema_json, committed_version);
-                defer expectation.deinit(self.alloc);
-                self.waitForSchemaUpdateProjection(table_name, expectation, committed_version) catch |err| switch (err) {
-                    error.TableVisibilityTimeout => return try textResponse(self.alloc, 500, "schema update did not converge"),
-                    error.TableGenerationChanged => return try textResponse(self.alloc, 409, "schema update was superseded; retry request"),
-                    else => return err,
-                };
-                self.reconcileProjectedSchemaUpdate(self.alloc, table_name, schema_json, local_schema_applied) catch |write_err| switch (write_err) {
-                    error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                    else => return write_err,
-                };
-
-                const body = try self.encodeSchemaUpdateResponse(table_name, schema_json);
-                defer self.alloc.free(body);
-                return try jsonBodyResponseWithStatus(self.alloc, 200, body);
-            }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchTableArtifactEnrichment(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicDeleteArtifactEnrichment(table_name, artifact_route.artifact_name);
-            }
-            if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_index.table_name);
-                defer self.alloc.free(table_name);
-                const index_name = try decodeRequestPathParamAlloc(self.alloc, table_index.index_name);
-                defer self.alloc.free(index_name);
-                return try self.handlePublicTableDeleteIndex(table_name, index_name);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableLookup(uri_parts.path)) |lookup| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, lookup.table_name);
-                defer self.alloc.free(table_name);
-                const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
-                const decoded_key = try decodeRequestPathParamAlloc(self.alloc, lookup.key);
-                defer self.alloc.free(decoded_key);
-                var lookup_opts = try http_route_helpers.parseLookupOptions(self.alloc, uri_parts.query);
-                defer lookup_opts.deinit(self.alloc);
-                const consistency = parseLookupReadConsistency(uri_parts.query) catch {
-                    return try textResponse(self.alloc, 400, "invalid read consistency");
-                };
-
-                var result = (source.lookup(self.alloc, table_name, decoded_key, lookup_opts.opts, consistency) catch |err| switch (err) {
-                    error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
-                    error.HAReadWaitForApply,
-                    error.HAReadWaitForMetadata,
-                    error.ReadUnavailable,
-                    => return try textResponse(self.alloc, 503, "standby read unavailable"),
-                    error.PersistentDescriptorAdmissionExhausted,
-                    error.StorageReadTemporarilyUnavailable,
-                    => return try storageReadTemporarilyUnavailableResponse(self.alloc),
-                    else => {
-                        std.log.err("public table lookup failed table={s} key={s} err={}", .{ table_name, decoded_key, err });
-                        return try textResponse(self.alloc, 500, "lookup failed");
-                    },
-                }) orelse {
-                    return try textResponse(self.alloc, 404, "not found");
-                };
-                defer result.deinit(self.alloc);
-                const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
-                defer if (row_filter_json) |value| self.alloc.free(value);
-                if (row_filter_json) |value| {
-                    if (!(try self.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
-                        return try textResponse(self.alloc, 404, "not found");
-                    }
-                }
-                var version_buf: [20]u8 = undefined;
-                const version = try std.fmt.bufPrint(&version_buf, "{d}", .{result.version});
-                return try http_route_helpers.jsonWithHeadersResponse(self.alloc, 200, result.json, &.{
-                    .{
-                        .name = "X-Antfly-Version",
-                        .value = version,
-                    },
-                });
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableRepairJob(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                var response = try self.handlePublicTableRepairJob(table_name, job_route.job_id);
-                defer response.deinit(self.alloc);
-                return try legacyResponseFromPublicOperation(self.alloc, response);
-            }
-            if (routes.Routes.matchTableArtifactReprocessJob(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                var response = try self.handlePublicDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
-                defer response.deinit(self.alloc);
-                return try legacyResponseFromPublicOperation(self.alloc, response);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableDocumentArtifacts(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicDocumentArtifactManifests(table_name, artifact_route.key, uri_parts.query, authenticated_identity);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableDocumentArtifact(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicDocumentArtifactManifest(table_name, artifact_route.key, artifact_route.artifact_name, uri_parts.query, authenticated_identity);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableArtifacts(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicListArtifactEnrichments(table_name);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTablePath(uri_parts.path)) |table_path| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_path.table_name);
-                defer self.alloc.free(table_name);
-                if (runtimeSchemaDebugRequested(uri_parts.query) and !self.runtimeSchemaDebugAllowed(authenticated_identity)) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
-                var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
-                defer self.source.freeAdminSnapshot(&snapshot);
-                var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
-                const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &snapshot, &storage_status_buf);
-                if (runtimeSchemaDebugRequested(uri_parts.query)) {
-                    const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
-                    defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
-                    if (storage_statuses != null) {
-                        storage_status_buf[0].observed_dynamic_field_capability_sets = observed_dynamic_capability_sets;
-                    }
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const response =
-                        (try tables_api.buildSingleTableStatusWithRuntimeSchemaDebug(arena_impl.allocator(), &snapshot, table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
-                    return try jsonResponse(self.alloc, response);
-                }
-                const body = (try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
-                defer self.alloc.free(body);
-                return try jsonBodyResponseWithStatus(self.alloc, 200, body);
-            }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchTablePath(uri_parts.path)) |table_path| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_path.table_name);
-                defer self.alloc.free(table_name);
-                var local_drop_group_ids: ?[]u64 = null;
-                defer if (local_drop_group_ids) |group_ids| self.alloc.free(group_ids);
-                if (self.table_writes != null) {
-                    if (try self.source.adminSnapshot()) |snapshot_value| {
-                        var snapshot = snapshot_value;
-                        defer self.source.freeAdminSnapshot(&snapshot);
-                        local_drop_group_ids = try tableGroupIdsFromSnapshot(self.alloc, &snapshot, table_name);
-                    }
-                }
-                self.source.dropTable(self.alloc, table_name) catch |err| switch (err) {
-                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-                    error.TableTransitionActive => return try textResponse(self.alloc, 409, "table transition active"),
-                    error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                    error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
-                    error.NotLeader => return err,
-                    else => {
-                        std.log.err("public drop table metadata remove failed table={s} err={s}", .{
-                            table_name,
-                            @errorName(err),
-                        });
-                        return err;
-                    },
-                };
-                if (self.table_writes) |write_source| {
-                    const group_ids = local_drop_group_ids orelse &.{};
-                    _ = write_source.dropTable(self.alloc, table_name, group_ids) catch |err| switch (err) {
-                        error.TableNotFound => null,
-                        else => {
-                            std.log.err("public drop table local cleanup failed table={s} err={s}", .{
-                                table_name,
-                                @errorName(err),
-                            });
-                            return err;
-                        },
-                    };
-                }
-                self.waitForTableVisibility(table_name, .absent) catch |err| switch (err) {
-                    error.TableVisibilityTimeout => {
-                        std.log.err("public drop table metadata visibility timed out table={s}", .{table_name});
-                        return try textResponse(self.alloc, 500, "table delete did not converge");
-                    },
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableScan(uri_parts.path)) |scan| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, scan.table_name);
-                defer self.alloc.free(table_name);
-                const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
-                var scan_req = http_route_helpers.parseScanKeysRequest(self.alloc, req.body) catch |err| {
-                    if (try http_route_helpers.scanRequestErrorResponse(self.alloc, err)) |response| {
-                        return response;
-                    }
-                    return err;
-                };
-                defer scan_req.deinit(self.alloc);
-
-                var result = (source.scan(
-                    self.alloc,
-                    table_name,
-                    scan_req.from,
-                    scan_req.to,
-                    scan_req.opts,
-                    .read_index,
-                ) catch |err| switch (err) {
-                    error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
-                    error.HAReadWaitForApply,
-                    error.HAReadWaitForMetadata,
-                    error.ReadUnavailable,
-                    => return try textResponse(self.alloc, 503, "standby read unavailable"),
-                    error.PersistentDescriptorAdmissionExhausted,
-                    error.StorageReadTemporarilyUnavailable,
-                    => return try storageReadTemporarilyUnavailableResponse(self.alloc),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                defer result.deinit(self.alloc);
-                const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
-                defer if (row_filter_json) |value| self.alloc.free(value);
-                if (row_filter_json) |value| {
-                    const filtered = try self.filterScanResultByRowFilter(self.alloc, source, table_name, result.ndjson, value);
-                    defer self.alloc.free(filtered);
-                    return try http_route_helpers.ndjsonResponse(self.alloc, 200, filtered);
-                }
-                return try http_route_helpers.ndjsonResponse(self.alloc, 200, result.ndjson);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableQuery(uri_parts.path)) |query_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, query_route.table_name);
-                defer self.alloc.free(table_name);
-                var response = try self.handlePublicTableQueryWithContentTypeCancellation(table_name, req.body, req.content_type, authenticated_identity, req.cancellation);
-                defer response.deinit(self.alloc);
-                return try legacyResponseFromContextualOperation(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableBatch(uri_parts.path)) |batch_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, batch_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicTableBatch(table_name, req.body);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableMerge(uri_parts.path)) |merge_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, merge_route.table_name);
-                defer self.alloc.free(table_name);
-                const reads = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
-                const writes = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
-                if (!(try self.tableExists(table_name))) return try textResponse(self.alloc, 404, "not found");
-
-                var merge_req = linear_merge_api.parseRequest(self.alloc, req.body) catch |err| switch (err) {
-                    error.ValueTooLong => return try textResponse(self.alloc, 413, "value too large"),
-                    error.InvalidLinearMergeRequest => return try textResponse(self.alloc, 400, "invalid linear merge request"),
-                    else => return err,
-                };
-                defer merge_req.deinit(self.alloc);
-
-                self.validateTableWritesAgainstSchema(table_name, merge_req.writes) catch |err| switch (err) {
-                    error.InvalidBatchRequest => return try textResponse(self.alloc, 400, "invalid linear merge request"),
-                    else => return err,
-                };
-
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = linear_merge_api.executeResponse(
-                    arena_impl.allocator(),
-                    reads,
-                    writes,
-                    table_name,
-                    merge_req,
-                ) catch |err| switch (err) {
-                    error.InvalidLinearMergeRequest => return try textResponse(self.alloc, 400, "invalid linear merge request"),
-                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-                    error.InvalidBatchRequest => return try textResponse(self.alloc, 400, "invalid linear merge request"),
-                    else => return err,
-                };
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        return null;
     }
 
     pub fn localSessionNodeId(self: *ApiHttpServer) u64 {
@@ -8697,22 +6705,6 @@ pub const ApiHttpServer = struct {
         }) catch |err| {
             if (try self.tryAdoptSession(txn_id)) return null;
             return err;
-        };
-    }
-
-    fn publicTableRouteMutatesMetadata(method: http_common.Method, path: []const u8) bool {
-        return switch (method) {
-            .POST => std.mem.eql(u8, path, routes.Routes.backup) or
-                std.mem.eql(u8, path, routes.Routes.restore) or
-                routes.Routes.matchTableRestore(path) != null or
-                routes.Routes.matchTableIndex(path) != null or
-                routes.Routes.matchTablePath(path) != null,
-            .PUT => routes.Routes.matchTableSchema(path) != null or
-                routes.Routes.matchTableArtifactEnrichment(path) != null,
-            .DELETE => routes.Routes.matchTablePath(path) != null or
-                routes.Routes.matchTableIndex(path) != null or
-                routes.Routes.matchTableArtifactEnrichment(path) != null,
-            .GET => false,
         };
     }
 
@@ -14893,12 +12885,6 @@ pub fn requiresAdminPermission(path: []const u8) bool {
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
 }
 
-fn isA2aProtocolPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, routes.Routes.a2a) or
-        std.mem.eql(u8, path, routes.Routes.agent_card) or
-        std.mem.eql(u8, path, routes.Routes.agent_card_legacy);
-}
-
 fn isHaAdminPath(path: []const u8) bool {
     return std.mem.eql(u8, path, admin_routes.ha) or std.mem.startsWith(u8, path, admin_routes.ha ++ "/");
 }
@@ -15679,57 +13665,6 @@ fn publicOperationJsonResponse(
         .status = status,
         .body = try alloc.dupe(u8, body),
         .json = true,
-    };
-}
-
-/// Temporary adapter used only by the residual synthetic-request dispatcher.
-/// Production httpx routes consume `OwnedResponse` directly.
-fn legacyResponseFromPublicOperation(
-    alloc: std.mem.Allocator,
-    response: public_table_http.OwnedResponse,
-) !http_common.HttpResponse {
-    const content_type = try alloc.dupe(u8, if (response.json) "application/json" else "text/plain");
-    errdefer alloc.free(content_type);
-    const body = try alloc.dupe(u8, response.body);
-    errdefer alloc.free(body);
-    var headers: []http_common.Header = &.{};
-    if (response.retry_after_seconds) |seconds| {
-        headers = try alloc.alloc(http_common.Header, 1);
-        errdefer alloc.free(headers);
-        var value_buf: [10]u8 = undefined;
-        const value = try std.fmt.bufPrint(&value_buf, "{d}", .{seconds});
-        headers[0] = try ownedHeader(alloc, "Retry-After", value);
-        errdefer headers[0].deinit(alloc);
-    }
-    return .{
-        .status = response.status,
-        .content_type = content_type,
-        .headers = headers,
-        .body = body,
-    };
-}
-
-fn legacyResponseFromContextualOperation(
-    alloc: std.mem.Allocator,
-    response: contextual_operations.OwnedResponse,
-) !http_common.HttpResponse {
-    const content_type = try alloc.dupe(u8, response.content_type);
-    errdefer alloc.free(content_type);
-    const body = try alloc.dupe(u8, response.body);
-    errdefer alloc.free(body);
-    const headers = try alloc.alloc(http_common.Header, response.headers.len);
-    errdefer alloc.free(headers);
-    var initialized: usize = 0;
-    errdefer for (headers[0..initialized]) |*header| header.deinit(alloc);
-    for (response.headers, headers) |source, *target| {
-        target.* = try ownedHeader(alloc, source.name, source.value);
-        initialized += 1;
-    }
-    return .{
-        .status = response.status,
-        .content_type = content_type,
-        .headers = headers,
-        .body = body,
     };
 }
 
@@ -17849,6 +15784,13 @@ test "generated client query params decode for metadata parsers" {
     try std.testing.expectEqualStrings("table", permission.resource_type);
 }
 
+/// Send a compact test request through the production `httpx` router.
+/// Generated data API paths are canonicalized below `/db/v1`; root probes
+/// and contextual protocols retain their Kubernetes/protocol locations.
+fn executeHttpxTestRequest(server: *ApiHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
+    return test_runtime_support.executeOnce(std.testing.allocator, server, req);
+}
+
 test "api http server serves status" {
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -17872,7 +15814,7 @@ test "api http server serves status" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
-    var resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.status });
+    var resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.status });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
@@ -17881,7 +15823,7 @@ test "api http server serves status" {
     try std.testing.expectEqual(cluster.ClusterHealth.healthy, parsed.value.health);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"data\"") == null);
 
-    var cluster_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.cluster });
+    var cluster_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.cluster });
     defer cluster_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), cluster_resp.status);
     var parsed_cluster = try std.json.parseFromSlice(cluster.ClusterTopology, std.testing.allocator, cluster_resp.body, .{});
@@ -18933,7 +16875,7 @@ test "api http server serves extension catalog reads" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
 
-    var packages_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.extensions_v1_packages });
+    var packages_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.extensions_v1_packages });
     defer packages_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), packages_resp.status);
     var packages = try std.json.parseFromSlice([]extension_domain.PackageManifest, std.testing.allocator, packages_resp.body, .{ .ignore_unknown_fields = true });
@@ -18941,32 +16883,32 @@ test "api http server serves extension catalog reads" {
     try std.testing.expectEqual(@as(usize, 1), packages.value.len);
     try std.testing.expectEqualStrings("memoryaf", packages.value[0].name);
 
-    var package_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/packages/memoryaf/versions/1.0.0" });
+    var package_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/extensions/v1/packages/memoryaf/versions/1.0.0" });
     defer package_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), package_resp.status);
     var package = try std.json.parseFromSlice(extension_domain.PackageManifest, std.testing.allocator, package_resp.body, .{ .ignore_unknown_fields = true });
     defer package.deinit();
     try std.testing.expectEqualStrings("sha256:abc", package.value.digest);
 
-    var installed_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf" });
+    var installed_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf" });
     defer installed_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), installed_resp.status);
     var installed = try std.json.parseFromSlice(extension_domain.InstalledExtension, std.testing.allocator, installed_resp.body, .{ .ignore_unknown_fields = true });
     defer installed.deinit();
     try std.testing.expectEqualStrings("1.0.0", installed.value.package_version);
 
-    var objects_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf/objects" });
+    var objects_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf/objects" });
     defer objects_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), objects_resp.status);
     var objects = try std.json.parseFromSlice([]extension_domain.ExtensionMember, std.testing.allocator, objects_resp.body, .{ .ignore_unknown_fields = true });
     defer objects.deinit();
     try std.testing.expectEqual(@as(usize, 2), objects.value.len);
 
-    var missing_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/missing" });
+    var missing_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/extensions/v1/installed/missing" });
     defer missing_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), missing_resp.status);
 
-    var write_resp = try server.handle(.{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/update", .body = "{}" });
+    var write_resp = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/update", .body = "{}" });
     defer write_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 405), write_resp.status);
 }
@@ -19048,7 +16990,7 @@ test "api http server validates writes against extension data shape members" {
 
     const valid_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:c\":{\"body\":\"remember this\",\"kind\":\"note\"}}}");
     defer alloc.free(valid_body);
-    var valid_resp = try routed_server.handle(.{
+    var valid_resp = try executeHttpxTestRequest(&routed_server, .{
         .method = .POST,
         .uri = "/tables/memories/batch",
         .content_type = "application/json",
@@ -19059,7 +17001,7 @@ test "api http server validates writes against extension data shape members" {
 
     const invalid_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:d\":{\"body\":\"remember this\",\"unexpected\":\"owned by no shape\"}}}");
     defer alloc.free(invalid_body);
-    var invalid_resp = try routed_server.handle(.{
+    var invalid_resp = try executeHttpxTestRequest(&routed_server, .{
         .method = .POST,
         .uri = "/tables/memories/batch",
         .content_type = "application/json",
@@ -19111,7 +17053,7 @@ test "api http server dispatches extension lifecycle mutations" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
-    var install_resp = try server.handle(.{
+    var install_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/extensions/v1/installed/memoryaf",
         .content_type = "application/json",
@@ -19679,7 +17621,7 @@ test "api http server serves connections with partial provider failures" {
     );
     defer server.deinit();
 
-    var resp = try server.handle(.{ .method = .GET, .uri = "/connections?include=models" });
+    var resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/connections?include=models" });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
@@ -19718,7 +17660,7 @@ test "api http server serves connections with partial provider failures" {
     try std.testing.expect(saw_wiki);
 
     // The kind filter trims the response to the requested connection types.
-    var filtered = try server.handle(.{ .method = .GET, .uri = "/connections?types=external_io" });
+    var filtered = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/connections?types=external_io" });
     defer filtered.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), filtered.status);
     var parsed_filtered = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, filtered.body, .{});
@@ -19728,7 +17670,7 @@ test "api http server serves connections with partial provider failures" {
     try std.testing.expectEqualStrings("wiki", filtered_list[0].object.get("name").?.string);
 
     // The /db/v1 prefix variant resolves to the same route.
-    var prefixed = try server.handle(.{ .method = .GET, .uri = "/db/v1/connections" });
+    var prefixed = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/db/v1/connections" });
     defer prefixed.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), prefixed.status);
 }
@@ -19751,7 +17693,7 @@ test "api http server serves MCP and hides A2A by default" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
     defer server.deinit();
 
-    var mcp_resp = try executeProtocolRequestForTest(&server, .{
+    var mcp_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .content_type = "application/json",
@@ -19770,11 +17712,11 @@ test "api http server serves MCP and hides A2A by default" {
         },
         .{ .method = .GET, .uri = routes.Routes.agent_card },
         .{ .method = .GET, .uri = "/db/v1/.well-known/agent-card.json" },
-        .{ .method = .GET, .uri = routes.Routes.agent_card_legacy },
+        .{ .method = .GET, .uri = "/.well-known/agent.json" },
         .{ .method = .GET, .uri = "/db/v1/.well-known/agent.json" },
     };
     for (hidden_requests) |request| {
-        var response = try server.handle(request);
+        var response = try executeHttpxTestRequest(&server, request);
         defer response.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u16, 404), response.status);
     }
@@ -19804,7 +17746,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     );
     defer server.deinit();
 
-    var mcp_resp = try executeProtocolRequestForTest(&server, .{
+    var mcp_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .content_type = "application/json",
@@ -19813,15 +17755,13 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     defer mcp_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), mcp_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, mcp_resp.body, "\"protocolVersion\":\"2025-06-18\"") != null);
-    try std.testing.expectEqual(@as(usize, 2), mcp_resp.headers.len);
-    try std.testing.expectEqualStrings("Mcp-Session-Id", mcp_resp.headers[0].name);
-    try std.testing.expectEqualStrings("Mcp-Protocol-Version", mcp_resp.headers[1].name);
-    try std.testing.expectEqualStrings("2025-06-18", mcp_resp.headers[1].value);
+    const mcp_session_id = mcp_resp.header("Mcp-Session-Id") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("2025-06-18", mcp_resp.header("Mcp-Protocol-Version").?);
     const mcp_session_headers = [_]http_common.RequestHeader{
-        .{ .name = mcp.session_id_header, .value = mcp_resp.headers[0].value },
+        .{ .name = mcp.session_id_header, .value = mcp_session_id },
     };
 
-    var mcp_stream = try executeProtocolRequestForTest(&server, .{
+    var mcp_stream = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -19833,10 +17773,10 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     try std.testing.expect(std.mem.indexOf(u8, mcp_stream.body, "event: endpoint") != null);
 
     const mcp_resume_headers = [_]http_common.RequestHeader{
-        .{ .name = mcp.session_id_header, .value = mcp_resp.headers[0].value },
+        .{ .name = mcp.session_id_header, .value = mcp_session_id },
         .{ .name = mcp.last_event_id_header, .value = "9" },
     };
-    var mcp_resumed_stream = try executeProtocolRequestForTest(&server, .{
+    var mcp_resumed_stream = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_resume_headers,
@@ -19845,7 +17785,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     try std.testing.expectEqual(@as(u16, 200), mcp_resumed_stream.status);
     try std.testing.expect(std.mem.indexOf(u8, mcp_resumed_stream.body, "id: 10\n") != null);
 
-    var mcp_delete = try executeProtocolRequestForTest(&server, .{
+    var mcp_delete = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -19853,24 +17793,24 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     defer mcp_delete.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), mcp_delete.status);
 
-    var mcp_missing_session = try executeProtocolRequestForTest(&server, .{
+    var mcp_missing_session = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.mcp_v1,
     });
     defer mcp_missing_session.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), mcp_missing_session.status);
 
-    var card_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.agent_card });
+    var card_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.agent_card });
     defer card_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), card_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"id\":\"query-builder\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"id\":\"retrieval\"") != null);
 
-    var prefixed_card_resp = try server.handle(.{ .method = .GET, .uri = "/db/v1/.well-known/agent-card.json" });
+    var prefixed_card_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/db/v1/.well-known/agent-card.json" });
     defer prefixed_card_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), prefixed_card_resp.status);
+    try std.testing.expectEqual(@as(u16, 404), prefixed_card_resp.status);
 
-    var a2a_resp = try server.handle(.{
+    var a2a_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.a2a,
         .content_type = "application/json",
@@ -19880,16 +17820,16 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     try std.testing.expectEqual(@as(u16, 200), a2a_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, a2a_resp.body, "\"preferredTransport\":\"JSONRPC\"") != null);
 
-    var prefixed_a2a_resp = try server.handle(.{
+    var prefixed_a2a_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/db/v1/a2a",
         .content_type = "application/json",
         .body = "{\"jsonrpc\":\"2.0\",\"id\":\"prefixed-card\",\"method\":\"agent/getAuthenticatedExtendedCard\",\"params\":{}}",
     });
     defer prefixed_a2a_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), prefixed_a2a_resp.status);
+    try std.testing.expectEqual(@as(u16, 404), prefixed_a2a_resp.status);
 
-    var stream_resp = try server.handle(.{
+    var stream_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.a2a,
         .content_type = "application/json",
@@ -19901,7 +17841,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     try std.testing.expect(std.mem.indexOf(u8, stream_resp.body, "event: message") != null);
     try std.testing.expect(std.mem.indexOf(u8, stream_resp.body, "event: done") != null);
 
-    var task_resp = try server.handle(.{
+    var task_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.a2a,
         .content_type = "application/json",
@@ -19911,7 +17851,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     try std.testing.expectEqual(@as(u16, 200), task_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, task_resp.body, "\"id\":\"t1\"") != null);
 
-    var cancel_resp = try server.handle(.{
+    var cancel_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.a2a,
         .content_type = "application/json",
@@ -19943,7 +17883,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     }, source.iface(), null, null);
     defer server.deinit();
 
-    var public_catalog = try server.handle(.{
+    var public_catalog = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ai_catalog,
     });
@@ -19957,7 +17897,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/mcp-server+json\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
 
-    var tenant_catalog = try server.handle(.{
+    var tenant_catalog = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
     });
@@ -19983,7 +17923,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
         try std.testing.expect(has_url != has_data);
     }
 
-    var hidden_agents = try server.handle(.{
+    var hidden_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_agents,
     });
@@ -19991,7 +17931,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     try std.testing.expectEqual(@as(u16, 200), hidden_agents.status);
     try std.testing.expect(std.mem.indexOf(u8, hidden_agents.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
 
-    var hidden_search = try server.handle(.{
+    var hidden_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"text\":\"Antfly A2A Agent\"},\"federation\":\"none\"}",
@@ -20000,7 +17940,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     try std.testing.expectEqual(@as(u16, 200), hidden_search.status);
     try std.testing.expect(std.mem.indexOf(u8, hidden_search.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
 
-    var hidden_explore = try server.handle(.{
+    var hidden_explore = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_explore,
         .body = "{\"query\":{\"filter\":{\"type\":[\"application/a2a-agent-card+json\"]}},\"resultType\":{\"facets\":[{\"field\":\"type\"}]}}",
@@ -20015,7 +17955,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
         .ard_display_name = "Tenant Antfly",
     }, source.iface(), null, null);
     defer experimental_server.deinit();
-    var experimental_catalog = try experimental_server.handle(.{
+    var experimental_catalog = try executeHttpxTestRequest(&experimental_server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
     });
@@ -20023,7 +17963,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     try std.testing.expectEqual(@as(u16, 200), experimental_catalog.status);
     try std.testing.expect(std.mem.indexOf(u8, experimental_catalog.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
 
-    var experimental_agents = try experimental_server.handle(.{
+    var experimental_agents = try executeHttpxTestRequest(&experimental_server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_agents,
     });
@@ -20031,7 +17971,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     try std.testing.expectEqual(@as(u16, 200), experimental_agents.status);
     try std.testing.expect(std.mem.indexOf(u8, experimental_agents.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
 
-    var experimental_search = try experimental_server.handle(.{
+    var experimental_search = try executeHttpxTestRequest(&experimental_server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"text\":\"Antfly A2A Agent\",\"filter\":{\"type\":[\"application/a2a-agent-card+json\"]}},\"federation\":\"none\"}",
@@ -20040,7 +17980,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     try std.testing.expectEqual(@as(u16, 200), experimental_search.status);
     try std.testing.expect(std.mem.indexOf(u8, experimental_search.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
 
-    var experimental_explore = try experimental_server.handle(.{
+    var experimental_explore = try executeHttpxTestRequest(&experimental_server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_explore,
         .body = "{\"query\":{\"filter\":{\"type\":[\"application/a2a-agent-card+json\"]}},\"resultType\":{\"facets\":[{\"field\":\"type\"}]}}",
@@ -20093,14 +18033,14 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     );
     defer server.deinit();
 
-    var unauthorized = try server.handle(.{
+    var unauthorized = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
     });
     defer unauthorized.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
 
-    var unauthorized_well_known = try server.handle(.{
+    var unauthorized_well_known = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ai_catalog,
     });
@@ -20121,7 +18061,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
         .{ .name = trusted_principal_header, .value = token },
     };
 
-    var authorized = try server.handle(.{
+    var authorized = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
         .headers = &trusted_principal_headers,
@@ -20136,7 +18076,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Query Builder") != null);
     try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Schema Design") == null);
 
-    var authorized_well_known = try server.handle(.{
+    var authorized_well_known = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ai_catalog,
         .headers = &trusted_principal_headers,
@@ -20146,7 +18086,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expectEqual(@as(usize, 0), authorized_well_known.headers.len);
     try std.testing.expect(std.mem.indexOf(u8, authorized_well_known.body, "\"type\":\"application/mcp-server+json\"") != null);
 
-    var forbidden_spec = try server.handle(.{
+    var forbidden_spec = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/openapi/extensions.yaml",
         .headers = &trusted_principal_headers,
@@ -20154,7 +18094,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     defer forbidden_spec.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 403), forbidden_spec.status);
 
-    var forbidden_auth_spec = try server.handle(.{
+    var forbidden_auth_spec = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/openapi/auth.yaml",
         .headers = &trusted_principal_headers,
@@ -20162,7 +18102,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     defer forbidden_auth_spec.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 403), forbidden_auth_spec.status);
 
-    var hidden_admin_skill = try server.handle(.{
+    var hidden_admin_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/antfly-extension-management",
         .headers = &trusted_principal_headers,
@@ -20170,7 +18110,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     defer hidden_admin_skill.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), hidden_admin_skill.status);
 
-    var read_skill = try server.handle(.{
+    var read_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/antfly-retrieval",
         .headers = &trusted_principal_headers,
@@ -20181,7 +18121,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
 
     const admin_auth = try encodeBasicAuthorization(std.testing.allocator, "admin", "admin");
     defer std.testing.allocator.free(admin_auth);
-    var admin_catalog = try server.handle(.{
+    var admin_catalog = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
         .authorization = admin_auth,
@@ -20193,7 +18133,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Extension Management") != null);
     try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Schema Design") != null);
 
-    var admin_spec = try server.handle(.{
+    var admin_spec = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/openapi/extensions.yaml",
         .authorization = admin_auth,
@@ -20203,7 +18143,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expectEqualStrings("application/yaml", admin_spec.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, admin_spec.body, "title: Antfly Extensions API") != null);
 
-    var admin_auth_spec = try server.handle(.{
+    var admin_auth_spec = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/openapi/auth.yaml",
         .authorization = admin_auth,
@@ -20213,7 +18153,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expectEqualStrings("application/yaml", admin_auth_spec.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, admin_auth_spec.body, "title: User Management API") != null);
 
-    var admin_skill = try server.handle(.{
+    var admin_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/antfly-extension-management",
         .authorization = admin_auth,
@@ -20237,7 +18177,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     );
     defer public_catalog_server.deinit();
 
-    var public_well_known = try public_catalog_server.handle(.{
+    var public_well_known = try executeHttpxTestRequest(&public_catalog_server, .{
         .method = .GET,
         .uri = routes.Routes.ai_catalog,
     });
@@ -20250,7 +18190,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expect(std.mem.indexOf(u8, public_well_known.body, "\"type\":\"application/ai-registry+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, public_well_known.body, "\"type\":\"application/mcp-server+json\"") == null);
 
-    var public_flag_authenticated_well_known = try public_catalog_server.handle(.{
+    var public_flag_authenticated_well_known = try executeHttpxTestRequest(&public_catalog_server, .{
         .method = .GET,
         .uri = routes.Routes.ai_catalog,
         .headers = &trusted_principal_headers,
@@ -20279,7 +18219,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     var server = ApiHttpServer.init(std.testing.allocator, .{ .experimental = true }, source.iface(), null, null);
     defer server.deinit();
 
-    var catalog = try server.handle(.{
+    var catalog = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
     });
@@ -20291,7 +18231,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, catalog.body, "\"type\":\"application/ai-skill+md\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, catalog.body, "\"representativeQueries\"") != null);
 
-    var openapi = try server.handle(.{
+    var openapi = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_openapi,
     });
@@ -20317,28 +18257,28 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "MethodNotAllowed:") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "RegistryRoot") != null);
 
-    var openapi_wrong_method = try server.handle(.{
+    var openapi_wrong_method = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_openapi,
     });
     defer openapi_wrong_method.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 405), openapi_wrong_method.status);
 
-    var catalog_wrong_method = try server.handle(.{
+    var catalog_wrong_method = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_catalog,
     });
     defer catalog_wrong_method.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 405), catalog_wrong_method.status);
 
-    var well_known_wrong_method = try server.handle(.{
+    var well_known_wrong_method = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ai_catalog,
     });
     defer well_known_wrong_method.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 405), well_known_wrong_method.status);
 
-    var antfly_openapi = try server.handle(.{
+    var antfly_openapi = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/openapi/antfly.yaml",
     });
@@ -20347,7 +18287,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqualStrings("application/yaml", antfly_openapi.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, antfly_openapi.body, "title: Antfly Public API") != null);
 
-    var inference_openapi = try server.handle(.{
+    var inference_openapi = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/openapi/inference-config.yaml",
     });
@@ -20356,7 +18296,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqualStrings("application/yaml", inference_openapi.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, inference_openapi.body, "title: Antfly Inference Configuration Schema") != null);
 
-    var skill = try server.handle(.{
+    var skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/antfly-retrieval",
     });
@@ -20365,7 +18305,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqualStrings("text/markdown; charset=utf-8", skill.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, skill.body, "# Antfly Retrieval") != null);
 
-    var mcp_resource = try server.handle(.{
+    var mcp_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/default",
     });
@@ -20373,14 +18313,14 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqual(@as(u16, 200), mcp_resource.status);
     try std.testing.expect(std.mem.indexOf(u8, mcp_resource.body, "\"endpoint\":\"/mcp/v1\"") != null);
 
-    var skill_filtered_mcp_resource = try server.handle(.{
+    var skill_filtered_mcp_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/default?types=application/ai-skill+md",
     });
     defer skill_filtered_mcp_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), skill_filtered_mcp_resource.status);
 
-    var registry_root = try server.handle(.{
+    var registry_root = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1,
     });
@@ -20391,14 +18331,14 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
 
     var hosted_server = ApiHttpServer.init(std.testing.allocator, .{ .ard_base_url = "https://tenant.example.com/" }, source.iface(), null, null);
     defer hosted_server.deinit();
-    var hosted_mcp_resource = try hosted_server.handle(.{
+    var hosted_mcp_resource = try executeHttpxTestRequest(&hosted_server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/default",
     });
     defer hosted_mcp_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), hosted_mcp_resource.status);
     try std.testing.expect(std.mem.indexOf(u8, hosted_mcp_resource.body, "\"endpoint\":\"https://tenant.example.com/mcp/v1\"") != null);
-    var hosted_registry_root = try hosted_server.handle(.{
+    var hosted_registry_root = try executeHttpxTestRequest(&hosted_server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1,
     });
@@ -20409,7 +18349,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, hosted_registry_root.body, "\"explore\":\"https://tenant.example.com/ard/v1/explore\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, hosted_registry_root.body, "\"agents\":\"https://tenant.example.com/ard/v1/agents\"") != null);
 
-    var search = try server.handle(.{
+    var search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"text\":\"retrieval\",\"filter\":{\"type\":[\"application/ai-skill+md\"]}},\"federation\":\"none\"}",
@@ -20420,7 +18360,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/ai-skill+md\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/mcp-server+json\"") == null);
 
-    var filter_only_search = try server.handle(.{
+    var filter_only_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"filter\":{\"type\":[\"application/ai-skill+md\"]}}}",
@@ -20428,7 +18368,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     defer filter_only_search.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), filter_only_search.status);
 
-    var blank_text_search = try server.handle(.{
+    var blank_text_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"text\":\"   \",\"filter\":{\"type\":[\"application/ai-skill+md\"]}}}",
@@ -20436,7 +18376,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     defer blank_text_search.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), blank_text_search.status);
 
-    var profile_search = try server.handle(.{
+    var profile_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/ard/v1/search?profile=copilot",
         .body = "{\"query\":{\"text\":\"retrieval\",\"filter\":{\"type\":[\"application/ai-skill+md\"]}},\"federation\":\"none\"}",
@@ -20445,7 +18385,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqual(@as(u16, 200), profile_search.status);
     try std.testing.expect(std.mem.indexOf(u8, profile_search.body, "\"results\":[]") != null);
 
-    var federated_search = try server.handle(.{
+    var federated_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"text\":\"retrieval\"},\"federation\":\"referrals\"}",
@@ -20455,7 +18395,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, federated_search.body, "\"federation\":\"referrals\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, federated_search.body, "\"referrals\":[]") != null);
 
-    var invalid_federation = try server.handle(.{
+    var invalid_federation = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"text\":\"retrieval\"},\"federation\":\"recursive\"}",
@@ -20463,7 +18403,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     defer invalid_federation.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), invalid_federation.status);
 
-    var explore = try server.handle(.{
+    var explore = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_explore,
         .body = "{\"query\":{\"filter\":{\"capabilities\":[\"retrieval\"]}}}",
@@ -20475,7 +18415,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"buckets\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"value\":\"retrieval\"") != null);
 
-    var profile_explore = try server.handle(.{
+    var profile_explore = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/ard/v1/explore?profile=copilot",
         .body = "{\"query\":{\"filter\":{\"type\":[\"application/ai-skill+md\"]}},\"resultType\":{\"facets\":[{\"field\":\"type\"}]}}",
@@ -20484,7 +18424,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqual(@as(u16, 200), profile_explore.status);
     try std.testing.expect(std.mem.indexOf(u8, profile_explore.body, "\"value\":\"application/ai-skill+md\"") == null);
 
-    var agents = try server.handle(.{
+    var agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_agents,
     });
@@ -20494,7 +18434,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, agents.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, agents.body, "\"type\":\"application/mcp-server+json\"") != null);
 
-    var profile_agents = try server.handle(.{
+    var profile_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?profile=copilot",
     });
@@ -20503,7 +18443,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, profile_agents.body, "\"type\":\"application/mcp-server+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, profile_agents.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
 
-    var mcp_agents = try server.handle(.{
+    var mcp_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?include=mcp",
     });
@@ -20512,7 +18452,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, mcp_agents.body, "\"type\":\"application/mcp-server+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mcp_agents.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
 
-    var skill_agents = try server.handle(.{
+    var skill_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?types=application/ai-skill+md",
     });
@@ -20521,7 +18461,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, skill_agents.body, "\"agents\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, skill_agents.body, "\"count\":0") != null);
 
-    var paged_agents = try server.handle(.{
+    var paged_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?filter=%7B%22type%22%3A%5B%22application%2Fmcp-server%2Bjson%22%5D%7D&orderBy=displayName%20desc&pageSize=1",
     });
@@ -20532,7 +18472,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, paged_agents.body, "\"count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, paged_agents.body, "\"pageToken\":\"1\"") != null);
 
-    var next_agents_page = try server.handle(.{
+    var next_agents_page = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?filter=%7B%22type%22%3A%5B%22application%2Fmcp-server%2Bjson%22%5D%7D&orderBy=displayName%20desc&pageSize=1&pageToken=1",
     });
@@ -20541,7 +18481,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, next_agents_page.body, "\"count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, next_agents_page.body, "\"pageToken\"") == null);
 
-    var invalid_agents = try server.handle(.{
+    var invalid_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?orderBy=updatedAt",
     });
@@ -20601,7 +18541,7 @@ test "api http server lists extension-owned mcp tools" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
     defer server.deinit();
 
-    var init_resp = try executeProtocolRequestForTest(&server, .{
+    var init_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .content_type = "application/json",
@@ -20613,7 +18553,7 @@ test "api http server lists extension-owned mcp tools" {
     const mcp_session_headers = [_]http_common.RequestHeader{
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
     };
-    var tools_resp = try executeProtocolRequestForTest(&server, .{
+    var tools_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -20699,7 +18639,7 @@ test "api http server scopes mcp endpoint to one extension" {
     defer server.deinit();
 
     const scoped_uri = "/mcp/v1/extensions/memoryaf";
-    var init_resp = try executeProtocolRequestForTest(&server, .{
+    var init_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = scoped_uri,
         .content_type = "application/json",
@@ -20711,7 +18651,7 @@ test "api http server scopes mcp endpoint to one extension" {
     const mcp_session_headers = [_]http_common.RequestHeader{
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
     };
-    var tools_resp = try executeProtocolRequestForTest(&server, .{
+    var tools_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = scoped_uri,
         .headers = &mcp_session_headers,
@@ -20885,7 +18825,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     const trusted_principal_headers = [_]http_common.RequestHeader{
         .{ .name = trusted_principal_header, .value = token },
     };
-    var init_resp = try executeProtocolRequestForTest(&server, .{
+    var init_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &trusted_principal_headers,
@@ -20899,7 +18839,7 @@ test "api http server filters extension mcp tools by trusted principal table per
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
         .{ .name = trusted_principal_header, .value = token },
     };
-    var tools_resp = try executeProtocolRequestForTest(&server, .{
+    var tools_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -20915,7 +18855,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     // Discovery is not the authorization boundary: a read-only client may
     // retain an older write-tool schema and hand-craft tools/call. The current
     // request identity must still prevent the mutation from reaching a route.
-    var denied_builtin_write = try executeProtocolRequestForTest(&server, .{
+    var denied_builtin_write = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -20926,7 +18866,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqual(@as(u16, 200), denied_builtin_write.status);
     try std.testing.expect(std.mem.indexOf(u8, denied_builtin_write.body, "\"message\":\"unknown tool\"") != null);
 
-    var denied_extension_write = try executeProtocolRequestForTest(&server, .{
+    var denied_extension_write = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -20949,7 +18889,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     const write_headers = [_]http_common.RequestHeader{
         .{ .name = trusted_principal_header, .value = write_token },
     };
-    var write_init = try executeProtocolRequestForTest(&server, .{
+    var write_init = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &write_headers,
@@ -20961,7 +18901,7 @@ test "api http server filters extension mcp tools by trusted principal table per
         .{ .name = mcp.session_id_header, .value = write_init.headers[0].value },
         .{ .name = trusted_principal_header, .value = write_token },
     };
-    var denied_cross_table_write = try executeProtocolRequestForTest(&server, .{
+    var denied_cross_table_write = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &write_session_headers,
@@ -20973,7 +18913,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, denied_cross_table_write.body, "\"text\":\"permission denied\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, denied_cross_table_write.body, "\"isError\":true") != null);
 
-    var denied_unscoped_write = try executeProtocolRequestForTest(&server, .{
+    var denied_unscoped_write = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &write_session_headers,
@@ -20985,7 +18925,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, denied_unscoped_write.body, "\"text\":\"permission denied\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, denied_unscoped_write.body, "\"isError\":true") != null);
 
-    var ard_catalog_resp = try server.handle(.{
+    var ard_catalog_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
         .headers = &trusted_principal_headers,
@@ -21006,7 +18946,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/extensions/docsaf\"") != null);
 
-    var hidden_memory_skill = try server.handle(.{
+    var hidden_memory_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/extensions/memoryaf/memory",
         .headers = &trusted_principal_headers,
@@ -21014,7 +18954,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer hidden_memory_skill.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), hidden_memory_skill.status);
 
-    var ard_extension_mcp_resource = try server.handle(.{
+    var ard_extension_mcp_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/extensions/docsaf",
         .headers = &trusted_principal_headers,
@@ -21026,7 +18966,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"store_doc\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"search_memories\"") == null);
 
-    var ard_extension_agent_resource = try server.handle(.{
+    var ard_extension_agent_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/agents/extensions/docsaf/research",
         .headers = &trusted_principal_headers,
@@ -21037,7 +18977,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_extension_agent_resource.body, "\"profile\":\"copilot\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_extension_agent_resource.body, "\"streamHandler\":\"wasm:docsaf/research_stream\"") != null);
 
-    var mcp_filtered_extension_agent_resource = try server.handle(.{
+    var mcp_filtered_extension_agent_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/agents/extensions/docsaf/research?include=mcp",
         .headers = &trusted_principal_headers,
@@ -21045,7 +18985,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer mcp_filtered_extension_agent_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), mcp_filtered_extension_agent_resource.status);
 
-    var hidden_extension_agent_resource = try server.handle(.{
+    var hidden_extension_agent_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/agents/extensions/memoryaf/research",
         .headers = &trusted_principal_headers,
@@ -21053,7 +18993,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer hidden_extension_agent_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), hidden_extension_agent_resource.status);
 
-    var extension_agents = try server.handle(.{
+    var extension_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?include=agents",
         .headers = &trusted_principal_headers,
@@ -21064,7 +19004,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, extension_agents.body, "urn:ai:antfly.local:antfly:extension:docsaf:agent:research") != null);
     try std.testing.expect(std.mem.indexOf(u8, extension_agents.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") == null);
 
-    var extension_agent_run = try server.handle(.{
+    var extension_agent_run = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/agents/v1/extensions/docsaf/research/runs",
         .headers = &trusted_principal_headers,
@@ -21076,7 +19016,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, extension_agent_run.body, "\"status\":\"unsupported_runtime\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, extension_agent_run.body, "\"descriptor\":\"/ard/v1/resources/agents/extensions/docsaf/research\"") != null);
 
-    var extension_agent_events = try server.handle(.{
+    var extension_agent_events = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/agents/v1/extensions/docsaf/research/runs/run-1/events",
         .headers = &trusted_principal_headers,
@@ -21087,7 +19027,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, extension_agent_events.body, "event: error") != null);
     try std.testing.expect(std.mem.indexOf(u8, extension_agent_events.body, "\"runId\":\"run-1\"") != null);
 
-    var hidden_extension_agent_run = try server.handle(.{
+    var hidden_extension_agent_run = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/agents/v1/extensions/memoryaf/research/runs",
         .headers = &trusted_principal_headers,
@@ -21095,7 +19035,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer hidden_extension_agent_run.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), hidden_extension_agent_run.status);
 
-    var skill_filtered_extension_mcp_resource = try server.handle(.{
+    var skill_filtered_extension_mcp_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/extensions/docsaf?include=skills",
         .headers = &trusted_principal_headers,
@@ -21103,7 +19043,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer skill_filtered_extension_mcp_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), skill_filtered_extension_mcp_resource.status);
 
-    var hidden_extension_mcp_resource = try server.handle(.{
+    var hidden_extension_mcp_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/extensions/memoryaf",
         .headers = &trusted_principal_headers,
@@ -21111,7 +19051,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer hidden_extension_mcp_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), hidden_extension_mcp_resource.status);
 
-    var aggregate_mcp_resource = try server.handle(.{
+    var aggregate_mcp_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/default",
         .headers = &trusted_principal_headers,
@@ -21137,7 +19077,7 @@ test "api http server filters extension mcp tools by trusted principal table per
         .{ .name = trusted_principal_header, .value = memory_token },
     };
 
-    var memory_catalog_resp = try server.handle(.{
+    var memory_catalog_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
         .headers = &memory_headers,
@@ -21149,7 +19089,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "/ard/v1/skills/extensions/memoryaf/memory") != null);
     try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "/ard/v1/resources/agents/extensions/memoryaf/research") != null);
 
-    var memory_skill = try server.handle(.{
+    var memory_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/extensions/memoryaf/memory",
         .headers = &memory_headers,
@@ -21159,7 +19099,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqualStrings("text/markdown; charset=utf-8", memory_skill.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, memory_skill.body, "# Memoryaf") != null);
 
-    var profile_memory_skill = try server.handle(.{
+    var profile_memory_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/extensions/memoryaf/memory?profile=copilot",
         .headers = &memory_headers,
@@ -21168,7 +19108,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqual(@as(u16, 200), profile_memory_skill.status);
     try std.testing.expect(std.mem.indexOf(u8, profile_memory_skill.body, "# Memoryaf") != null);
 
-    var mcp_filtered_memory_skill = try server.handle(.{
+    var mcp_filtered_memory_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/extensions/memoryaf/memory?include=mcp",
         .headers = &memory_headers,
@@ -21176,7 +19116,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer mcp_filtered_memory_skill.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), mcp_filtered_memory_skill.status);
 
-    var wrong_type_memory_skill = try server.handle(.{
+    var wrong_type_memory_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/extensions/memoryaf/memory?types=application/mcp-server+json",
         .headers = &memory_headers,
@@ -21184,7 +19124,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer wrong_type_memory_skill.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), wrong_type_memory_skill.status);
 
-    var memory_skill_search = try server.handle(.{
+    var memory_skill_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .headers = &memory_headers,
@@ -21194,7 +19134,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqual(@as(u16, 200), memory_skill_search.status);
     try std.testing.expect(std.mem.indexOf(u8, memory_skill_search.body, "urn:ai:antfly.local:antfly:extension:memoryaf:skill:memory") != null);
 
-    var memory_agent_resource = try server.handle(.{
+    var memory_agent_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/agents/extensions/memoryaf/research",
         .headers = &memory_headers,
@@ -21203,7 +19143,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqual(@as(u16, 200), memory_agent_resource.status);
     try std.testing.expect(std.mem.indexOf(u8, memory_agent_resource.body, "\"runEndpoint\":\"/agents/v1/extensions/memoryaf/research/runs\"") != null);
 
-    var memory_agent_search = try server.handle(.{
+    var memory_agent_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .headers = &memory_headers,
@@ -21213,7 +19153,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqual(@as(u16, 200), memory_agent_search.status);
     try std.testing.expect(std.mem.indexOf(u8, memory_agent_search.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") != null);
 
-    var ard_filtered_catalog_resp = try server.handle(.{
+    var ard_filtered_catalog_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/catalog?types=application/mcp-server+json&profile=copilot",
         .headers = &trusted_principal_headers,
@@ -21226,7 +19166,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/extensions/docsaf\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"type\":\"application/antfly-extension-package+json\"") == null);
 
-    var copilot_profile_resource = try server.handle(.{
+    var copilot_profile_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/profiles/copilot",
         .headers = &trusted_principal_headers,
@@ -21239,7 +19179,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"store_doc\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"search_memories\"") == null);
 
-    var skill_filtered_profile_resource = try server.handle(.{
+    var skill_filtered_profile_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/profiles/copilot?types=application/ai-skill+md",
         .headers = &trusted_principal_headers,
@@ -21247,7 +19187,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer skill_filtered_profile_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), skill_filtered_profile_resource.status);
 
-    var profile_filtered_default_resource = try server.handle(.{
+    var profile_filtered_default_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/default?profile=copilot",
         .headers = &trusted_principal_headers,
@@ -21255,7 +19195,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer profile_filtered_default_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), profile_filtered_default_resource.status);
 
-    var profile_filtered_extension_resource = try server.handle(.{
+    var profile_filtered_extension_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/extensions/docsaf?profile=copilot",
         .headers = &trusted_principal_headers,
@@ -21276,7 +19216,7 @@ test "api http server filters extension mcp tools by trusted principal table per
         .{ .name = trusted_principal_header, .value = no_permission_token },
     };
 
-    var no_permission_profile_catalog = try server.handle(.{
+    var no_permission_profile_catalog = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/catalog?types=application/mcp-server+json&profile=copilot",
         .headers = &no_permission_headers,
@@ -21286,7 +19226,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, no_permission_profile_catalog.body, "Antfly Copilot MCP Profile") == null);
     try std.testing.expect(std.mem.indexOf(u8, no_permission_profile_catalog.body, "Antfly MCP Server") == null);
 
-    var no_permission_profile_resource = try server.handle(.{
+    var no_permission_profile_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/profiles/copilot",
         .headers = &no_permission_headers,
@@ -21294,7 +19234,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer no_permission_profile_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), no_permission_profile_resource.status);
 
-    var no_permission_aggregate_resource = try server.handle(.{
+    var no_permission_aggregate_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/default",
         .headers = &no_permission_headers,
@@ -21302,7 +19242,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer no_permission_aggregate_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), no_permission_aggregate_resource.status);
 
-    var ard_search_resp = try server.handle(.{
+    var ard_search_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .headers = &trusted_principal_headers,
@@ -21313,7 +19253,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_search_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:mcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_search_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:mcp") == null);
 
-    var ard_agent_search_resp = try server.handle(.{
+    var ard_agent_search_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .headers = &trusted_principal_headers,
@@ -21360,8 +19300,6 @@ test "api http server authenticates trusted principal" {
         null,
     );
     defer server.deinit();
-    try std.testing.expect(server.requiresAuthentication(routes.Routes.tables));
-
     var identity = try server.authenticateRequest(.{ .trusted_principal = token });
     defer identity.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("user:alice", identity.username);
@@ -21477,7 +19415,7 @@ test "api http server requires auth on public routes when enabled" {
         .user_manager = &auth.manager,
     }, source.iface(), null, null);
 
-    var unauthorized = try server.handle(.{ .method = .GET, .uri = routes.Routes.status });
+    var unauthorized = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.status });
     defer unauthorized.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
     try std.testing.expectEqualStrings("application/json", unauthorized.content_type.?);
@@ -21490,7 +19428,7 @@ test "api http server requires auth on public routes when enabled" {
 
     const admin_auth = try encodeBasicAuthorization(std.testing.allocator, "admin", "admin");
     defer std.testing.allocator.free(admin_auth);
-    var authorized = try server.handle(.{
+    var authorized = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.status,
         .authorization = admin_auth,
@@ -21616,7 +19554,7 @@ test "continuous HA rejects non-replicated public mutations before handlers" {
     var catalog_status: u16 = 0;
     var rejected: usize = 0;
     for (cases) |case| {
-        var response = try server.handle(.{ .method = case.method, .uri = case.uri, .body = case.body });
+        var response = try executeHttpxTestRequest(&server, .{ .method = case.method, .uri = case.uri, .body = case.body });
         defer response.deinit(std.testing.allocator);
         if (std.mem.eql(u8, case.surface, "auth_user")) auth_status = response.status;
         if (std.mem.eql(u8, case.surface, "table_catalog")) catalog_status = response.status;
@@ -21711,7 +19649,7 @@ test "continuous HA allows a configured RemoteApply batch write" {
     }, source.iface(), null, table_source.source());
     const body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:ha\":{\"title\":\"remote-apply\"}}}");
     defer alloc.free(body);
-    var response = try server.handle(.{
+    var response = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -21786,7 +19724,7 @@ test "api http server document scan requires table read permission" {
 
     const other_reader_auth = try encodeBasicAuthorization(alloc, "other-reader", "reader");
     defer alloc.free(other_reader_auth);
-    var forbidden = try server.handle(.{
+    var forbidden = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/secrets/documents",
         .authorization = other_reader_auth,
@@ -21799,7 +19737,7 @@ test "api http server document scan requires table read permission" {
 
     const secrets_reader_auth = try encodeBasicAuthorization(alloc, "secrets-reader", "reader");
     defer alloc.free(secrets_reader_auth);
-    var allowed = try server.handle(.{
+    var allowed = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/secrets/documents",
         .authorization = secrets_reader_auth,
@@ -21825,56 +19763,6 @@ fn executeHaRouteForTest(
         .content_type = if (body.len > 0) "application/json" else null,
         .body = body,
     })) orelse error.TestUnexpectedResult;
-}
-
-fn executeProtocolRequestForTest(server: *ApiHttpServer, request: http_common.HttpRequest) !http_common.HttpResponse {
-    var authenticated_identity: ?AuthenticatedIdentity = null;
-    defer if (authenticated_identity) |*identity| identity.deinit(server.alloc);
-    if (server.cfg.auth_enabled or server.cfg.trusted_principal_secret != null) {
-        authenticated_identity = server.authenticateRequest(.{
-            .authorization = request.authorization,
-            .trusted_principal = request.header(trusted_principal_header),
-        }) catch |err| switch (err) {
-            error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => return try unauthorizedResponse(server.alloc),
-            else => return err,
-        };
-    }
-    const uri = splitTarget(request.uri);
-    const mcp_request = protocol_adapters.McpRequest{
-        .method = switch (request.method) {
-            .GET => .get,
-            .POST => .post,
-            .PUT => .put,
-            .DELETE => .delete,
-        },
-        .endpoint_path = request.uri,
-        .authorization = request.authorization,
-        .trusted_principal = request.header(trusted_principal_header),
-        .session_id = request.header(mcp.session_id_header),
-        .last_event_id = request.header(mcp.last_event_id_header),
-        .body = request.body,
-    };
-    var response = if (routes.Routes.matchMcpExtension(uri.path)) |extension|
-        try protocol_adapters.executeExtensionMcpRequest(server, mcp_request, authenticated_identity, extension.name)
-    else
-        try protocol_adapters.executeMcpRequest(server, mcp_request, authenticated_identity);
-    defer response.deinit(server.alloc);
-    const headers = try server.alloc.alloc(http_common.Header, response.headers.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (headers[0..initialized]) |*header| header.deinit(server.alloc);
-        server.alloc.free(headers);
-    }
-    for (headers, response.headers) |*out, header| {
-        out.* = try ownedHeader(server.alloc, header.name, header.value);
-        initialized += 1;
-    }
-    return .{
-        .status = response.status,
-        .content_type = try server.alloc.dupe(u8, response.content_type),
-        .headers = headers,
-        .body = try server.alloc.dupe(u8, response.body),
-    };
 }
 
 test "typed HA route operation dispatches admin and internal executors" {
@@ -22159,7 +20047,7 @@ test "api http server serves secrets crud when backed by a local store" {
         .secret_store = &store,
     }, source.iface(), null, null);
 
-    var put_resp = try server.handle(.{
+    var put_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/secrets/openai.api_key",
         .body = "{\"value\":\"sk-test\"}",
@@ -22175,7 +20063,7 @@ test "api http server serves secrets crud when backed by a local store" {
     try std.testing.expect(put_entry.value.created_at != null);
     try std.testing.expect(put_entry.value.updated_at != null);
 
-    var list_resp = try server.handle(.{
+    var list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/secrets",
     });
@@ -22198,7 +20086,7 @@ test "api http server serves secrets crud when backed by a local store" {
         .data = "{\"secrets\":[{\"key\":\"gemini.api_key\",\"value\":\"externally-managed\",\"created_at_ns\":1,\"updated_at_ns\":2}]}",
     });
 
-    var external_list_resp = try server.handle(.{
+    var external_list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/secrets",
     });
@@ -22218,7 +20106,7 @@ test "api http server serves secrets crud when backed by a local store" {
     var restored = try store.put(alloc, "openai.api_key", "sk-test");
     defer restored.deinit(alloc);
 
-    var delete_resp = try server.handle(.{
+    var delete_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/secrets/openai.api_key",
     });
@@ -22272,7 +20160,7 @@ test "api http server status includes secret store reload health" {
         .data = "{not-json",
     });
 
-    var status_resp = try server.handle(.{
+    var status_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.status,
     });
@@ -22308,7 +20196,7 @@ test "api http server lists secrets status without a local secret store" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
-    var list_resp = try server.handle(.{
+    var list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.secrets,
     });
@@ -22381,7 +20269,7 @@ test "api http server forbids non-admin secret access when auth is enabled" {
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.secrets,
         .authorization = reader_auth,
@@ -22463,7 +20351,7 @@ test "api http server query builder requires table read permission when auth is 
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .authorization = reader_auth,
@@ -22565,7 +20453,7 @@ test "api http server restricts runtime schema debug to admins when auth is enab
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
-    var reader_resp = try server.handle(.{
+    var reader_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs?debug=runtime_schema",
         .authorization = reader_auth,
@@ -22577,7 +20465,7 @@ test "api http server restricts runtime schema debug to admins when auth is enab
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
-    var admin_resp = try server.handle(.{
+    var admin_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs?debug=runtime_schema",
         .authorization = admin_auth,
@@ -22650,7 +20538,7 @@ test "api http server serves user management routes when auth is enabled" {
         username: []const u8,
     };
 
-    var create_resp = try server.handle(.{
+    var create_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/auth/v1/users/alice",
         .authorization = admin_auth,
@@ -22664,7 +20552,7 @@ test "api http server serves user management routes when auth is enabled" {
     try std.testing.expectEqualStrings("alice", created_user.value.username);
     try std.testing.expectEqualStrings("acme", created_user.value.metadata.?.map.get("tenant_id").?.string);
 
-    var me_resp = try server.handle(.{
+    var me_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.users_me,
         .authorization = admin_auth,
@@ -22677,7 +20565,7 @@ test "api http server serves user management routes when auth is enabled" {
     defer me.deinit();
     try std.testing.expectEqualStrings("admin", me.value.username);
 
-    var users_resp = try server.handle(.{
+    var users_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.users,
         .authorization = admin_auth,
@@ -22690,7 +20578,7 @@ test "api http server serves user management routes when auth is enabled" {
     defer users.deinit();
     try std.testing.expectEqual(@as(usize, 2), users.value.len);
 
-    var permissions_resp = try server.handle(.{
+    var permissions_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/permissions",
         .authorization = admin_auth,
@@ -22704,7 +20592,7 @@ test "api http server serves user management routes when auth is enabled" {
     try std.testing.expectEqual(@as(usize, 1), permissions.value.len);
     try std.testing.expectEqualStrings("docs", permissions.value[0].resource);
 
-    var user_resp = try server.handle(.{
+    var user_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice",
         .authorization = admin_auth,
@@ -22716,7 +20604,7 @@ test "api http server serves user management routes when auth is enabled" {
     defer user.deinit();
     try std.testing.expectEqualStrings("alice", user.value.username);
 
-    var add_permission_resp = try server.handle(.{
+    var add_permission_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/auth/v1/users/alice/permissions",
         .authorization = admin_auth,
@@ -22730,7 +20618,7 @@ test "api http server serves user management routes when auth is enabled" {
     try std.testing.expect(add_permission.value.message != null);
     try std.testing.expect(add_permission.value.message.?.len > 0);
 
-    var add_role_resp = try server.handle(.{
+    var add_role_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/auth/v1/users/alice/roles",
         .authorization = admin_auth,
@@ -22740,7 +20628,7 @@ test "api http server serves user management routes when auth is enabled" {
     try std.testing.expectEqual(@as(u16, 201), add_role_resp.status);
     try std.testing.expectEqualStrings("application/json", add_role_resp.content_type.?);
 
-    var roles_resp = try server.handle(.{
+    var roles_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/roles",
         .authorization = admin_auth,
@@ -22753,7 +20641,7 @@ test "api http server serves user management routes when auth is enabled" {
     try std.testing.expectEqual(@as(usize, 1), roles.value.len);
     try std.testing.expectEqualStrings("role:tenant_reader", roles.value[0]);
 
-    var subjects_resp = try server.handle(.{
+    var subjects_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.auth_subjects,
         .authorization = admin_auth,
@@ -22765,7 +20653,7 @@ test "api http server serves user management routes when auth is enabled" {
     defer subjects.deinit();
     try std.testing.expect(subjects.value.len >= 2);
 
-    var delete_role_resp = try server.handle(.{
+    var delete_role_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/auth/v1/users/alice/roles?role=role:tenant_reader",
         .authorization = admin_auth,
@@ -22773,7 +20661,7 @@ test "api http server serves user management routes when auth is enabled" {
     defer delete_role_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), delete_role_resp.status);
 
-    var password_resp = try server.handle(.{
+    var password_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/auth/v1/users/alice/password",
         .authorization = admin_auth,
@@ -22791,7 +20679,7 @@ test "api http server serves user management routes when auth is enabled" {
     defer authed.deinit(alloc);
     try std.testing.expectEqualStrings("alice", authed.username);
 
-    var delete_resp = try server.handle(.{
+    var delete_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/auth/v1/users/alice",
         .authorization = admin_auth,
@@ -22853,7 +20741,7 @@ test "api http server serves api key and row filter routes" {
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
 
-    var api_key_resp = try server.handle(.{
+    var api_key_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/auth/v1/users/alice/api-keys",
         .authorization = admin_auth,
@@ -22868,7 +20756,7 @@ test "api http server serves api key and row filter routes" {
     try std.testing.expect(created.value.key_secret.len > 0);
     try std.testing.expect(created.value.encoded.len > 0);
 
-    var list_api_keys_resp = try server.handle(.{
+    var list_api_keys_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/api-keys",
         .authorization = admin_auth,
@@ -22886,7 +20774,7 @@ test "api http server serves api key and row filter routes" {
 
     const bearer_auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{created_encoded});
     defer alloc.free(bearer_auth);
-    var bearer_status = try server.handle(.{
+    var bearer_status = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.status,
         .authorization = bearer_auth,
@@ -22894,7 +20782,7 @@ test "api http server serves api key and row filter routes" {
     defer bearer_status.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), bearer_status.status);
 
-    var put_subject_row_filter_resp = try server.handle(.{
+    var put_subject_row_filter_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/auth/v1/subjects/role:tenant_reader/row-filters/docs",
         .authorization = admin_auth,
@@ -22904,7 +20792,7 @@ test "api http server serves api key and row filter routes" {
     try std.testing.expectEqual(@as(u16, 200), put_subject_row_filter_resp.status);
     try std.testing.expectEqualStrings("application/json", put_subject_row_filter_resp.content_type.?);
 
-    var subject_row_filters_resp = try server.handle(.{
+    var subject_row_filters_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/subjects/role:tenant_reader/row-filters",
         .authorization = admin_auth,
@@ -22917,7 +20805,7 @@ test "api http server serves api key and row filter routes" {
     try std.testing.expectEqual(@as(usize, 1), subject_row_filters.value.len);
     try std.testing.expectEqualStrings("docs", subject_row_filters.value[0].table);
 
-    var put_row_filter_resp = try server.handle(.{
+    var put_row_filter_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/auth/v1/users/alice/row-filters/docs",
         .authorization = admin_auth,
@@ -22930,7 +20818,7 @@ test "api http server serves api key and row filter routes" {
     defer created_row_filter.deinit();
     try std.testing.expectEqualStrings("docs", created_row_filter.value.table);
 
-    var row_filters_resp = try server.handle(.{
+    var row_filters_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/row-filters",
         .authorization = admin_auth,
@@ -22944,7 +20832,7 @@ test "api http server serves api key and row filter routes" {
     try std.testing.expectEqual(@as(usize, 1), row_filters.value.len);
     try std.testing.expectEqualStrings("docs", row_filters.value[0].table);
 
-    var single_row_filter_resp = try server.handle(.{
+    var single_row_filter_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/row-filters/docs",
         .authorization = admin_auth,
@@ -22956,7 +20844,7 @@ test "api http server serves api key and row filter routes" {
     defer single_row_filter.deinit();
     try std.testing.expectEqualStrings("docs", single_row_filter.value.table);
 
-    var delete_row_filter_resp = try server.handle(.{
+    var delete_row_filter_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/auth/v1/users/alice/row-filters/docs",
         .authorization = admin_auth,
@@ -22964,7 +20852,7 @@ test "api http server serves api key and row filter routes" {
     defer delete_row_filter_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), delete_row_filter_resp.status);
 
-    var delete_subject_row_filter_resp = try server.handle(.{
+    var delete_subject_row_filter_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/auth/v1/subjects/role:tenant_reader/row-filters/docs",
         .authorization = admin_auth,
@@ -22972,7 +20860,7 @@ test "api http server serves api key and row filter routes" {
     defer delete_subject_row_filter_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), delete_subject_row_filter_resp.status);
 
-    var delete_permission_resp = try server.handle(.{
+    var delete_permission_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/auth/v1/users/alice/permissions?resource=docs&resourceType=table",
         .authorization = admin_auth,
@@ -22980,7 +20868,7 @@ test "api http server serves api key and row filter routes" {
     defer delete_permission_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), delete_permission_resp.status);
 
-    var empty_permissions_resp = try server.handle(.{
+    var empty_permissions_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/permissions",
         .authorization = admin_auth,
@@ -22996,7 +20884,7 @@ test "api http server serves api key and row filter routes" {
 
     const delete_api_key_uri = try std.fmt.allocPrint(alloc, "/auth/v1/users/alice/api-keys/{s}", .{created_key_id});
     defer alloc.free(delete_api_key_uri);
-    var delete_api_key_resp = try server.handle(.{
+    var delete_api_key_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = delete_api_key_uri,
         .authorization = admin_auth,
@@ -23004,7 +20892,7 @@ test "api http server serves api key and row filter routes" {
     defer delete_api_key_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), delete_api_key_resp.status);
 
-    var empty_api_keys_resp = try server.handle(.{
+    var empty_api_keys_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/api-keys",
         .authorization = admin_auth,
@@ -23062,7 +20950,7 @@ test "api http server returns json user auth errors" {
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
 
-    var bad_delete_resp = try server.handle(.{
+    var bad_delete_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/auth/v1/users/alice/permissions?resource=docs&resource_type=table",
         .authorization = admin_auth,
@@ -23075,7 +20963,7 @@ test "api http server returns json user auth errors" {
     defer bad_delete_body.deinit();
     try std.testing.expectEqualStrings("missing resourceType", bad_delete_body.value.@"error");
 
-    var bad_row_filter_resp = try server.handle(.{
+    var bad_row_filter_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/auth/v1/users/alice/row-filters/docs",
         .authorization = admin_auth,
@@ -23112,7 +21000,7 @@ test "api http server rejects secret writes without a local secret store" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/secrets/openai.api_key",
         .body = "{\"value\":\"sk-test\"}",
@@ -23263,13 +21151,13 @@ test "api http server allows explicit stale table lookup consistency" {
     };
 
     var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), null);
-    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=stale" });
+    var resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=stale" });
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", resp.body);
 
-    var invalid = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=linearizable" });
+    var invalid = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=linearizable" });
     defer invalid.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid.status);
     try std.testing.expectEqualStrings("invalid read consistency", invalid.body);
@@ -23339,7 +21227,7 @@ test "api http server decodes percent-encoded lookup keys" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/docs%2Fgetting-started.md?fields=title" });
+    var resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs/documents/docs%2Fgetting-started.md?fields=title" });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     var parsed = try std.json.parseFromSlice(LookupResponse, std.testing.allocator, resp.body, .{});
@@ -23431,7 +21319,7 @@ test "api http server serves document lookup through mcp tool" {
         .{ .name = trusted_principal_header, .value = token },
     };
 
-    var init_resp = try executeProtocolRequestForTest(&server, .{
+    var init_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &trusted_principal_headers,
@@ -23445,7 +21333,7 @@ test "api http server serves document lookup through mcp tool" {
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
         .{ .name = trusted_principal_header, .value = token },
     };
-    var tools_resp = try executeProtocolRequestForTest(&server, .{
+    var tools_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23457,7 +21345,7 @@ test "api http server serves document lookup through mcp tool" {
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"get_document\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"lookup\"") == null);
 
-    var call_resp = try executeProtocolRequestForTest(&server, .{
+    var call_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23535,7 +21423,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
     defer server.deinit();
 
-    var init_resp = try executeProtocolRequestForTest(&server, .{
+    var init_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .content_type = "application/json",
@@ -23547,7 +21435,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     const mcp_session_headers = [_]http_common.RequestHeader{
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
     };
-    var tools_resp = try executeProtocolRequestForTest(&server, .{
+    var tools_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23569,7 +21457,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"inclusiveFrom\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"boolean\"") != null);
 
-    var describe_table_resp = try executeProtocolRequestForTest(&server, .{
+    var describe_table_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23581,7 +21469,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, describe_table_resp.body, "\"name\":\"docs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, describe_table_resp.body, "\"full_text_index_v0\"") != null);
 
-    var describe_indexes_resp = try executeProtocolRequestForTest(&server, .{
+    var describe_indexes_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23593,7 +21481,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, describe_indexes_resp.body, "\"full_text_index_v0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, describe_indexes_resp.body, "\"structuredContent\":{\"indexes\":[") != null);
 
-    var list_indexes_resp = try executeProtocolRequestForTest(&server, .{
+    var list_indexes_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23605,7 +21493,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, list_indexes_resp.body, "\"full_text_index_v0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, list_indexes_resp.body, "\"structuredContent\":{\"indexes\":[") != null);
 
-    var sample_documents_resp = try executeProtocolRequestForTest(&server, .{
+    var sample_documents_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23617,7 +21505,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"doc:a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"hello\"") != null);
 
-    var sample_documents_zero_limit_resp = try executeProtocolRequestForTest(&server, .{
+    var sample_documents_zero_limit_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23629,7 +21517,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_zero_limit_resp.body, "\"isError\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_zero_limit_resp.body, "limit must be greater than 0") != null);
 
-    var sample_documents_large_limit_resp = try executeProtocolRequestForTest(&server, .{
+    var sample_documents_large_limit_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23641,7 +21529,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_large_limit_resp.body, "\"isError\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_large_limit_resp.body, "limit exceeds maximum sample size") != null);
 
-    var describe_capabilities_resp = try executeProtocolRequestForTest(&server, .{
+    var describe_capabilities_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23654,7 +21542,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "query-builder") != null);
     try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "\"raw_query_request\":true") != null);
 
-    var wrong_field_resp = try executeProtocolRequestForTest(&server, .{
+    var wrong_field_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23665,7 +21553,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expectEqual(@as(u16, 200), wrong_field_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, wrong_field_resp.body, "\"doc:a\"") == null);
 
-    var query_resp = try executeProtocolRequestForTest(&server, .{
+    var query_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23676,7 +21564,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expectEqual(@as(u16, 200), query_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, query_resp.body, "\"doc:a\"") != null);
 
-    var query_object_resp = try executeProtocolRequestForTest(&server, .{
+    var query_object_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23687,7 +21575,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expectEqual(@as(u16, 200), query_object_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, query_object_resp.body, "\"doc:a\"") != null);
 
-    var query_rest_alias_resp = try executeProtocolRequestForTest(&server, .{
+    var query_rest_alias_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23698,7 +21586,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expectEqual(@as(u16, 200), query_rest_alias_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, query_rest_alias_resp.body, "\"doc:a\"") != null);
 
-    var raw_query_request_resp = try executeProtocolRequestForTest(&server, .{
+    var raw_query_request_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23709,7 +21597,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expectEqual(@as(u16, 200), raw_query_request_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, raw_query_request_resp.body, "\"doc:a\"") != null);
 
-    var mixed_query_request_resp = try executeProtocolRequestForTest(&server, .{
+    var mixed_query_request_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23721,7 +21609,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, mixed_query_request_resp.body, "\"isError\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, mixed_query_request_resp.body, "queryRequest cannot be combined") != null);
 
-    var raw_query_request_table_resp = try executeProtocolRequestForTest(&server, .{
+    var raw_query_request_table_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23733,7 +21621,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, raw_query_request_table_resp.body, "\"isError\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw_query_request_table_resp.body, "queryRequest.table is not allowed") != null);
 
-    var describe_query_request_resp = try executeProtocolRequestForTest(&server, .{
+    var describe_query_request_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23791,7 +21679,7 @@ test "api http server serves table scan as ndjson" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/documents",
         .content_type = "application/json",
@@ -23806,7 +21694,7 @@ test "api http server serves table scan as ndjson" {
     try std.testing.expectEqualStrings("doc:a", parsed.value._id);
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 
-    var empty_body_resp = try server.handle(.{
+    var empty_body_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/documents",
         .content_type = null,
@@ -23816,7 +21704,7 @@ test "api http server serves table scan as ndjson" {
     try std.testing.expectEqual(@as(u16, 200), empty_body_resp.status);
     try std.testing.expectEqualStrings("application/x-ndjson", empty_body_resp.content_type.?);
 
-    var invalid_resp = try server.handle(.{
+    var invalid_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/documents",
         .content_type = "application/json",
@@ -23826,7 +21714,7 @@ test "api http server serves table scan as ndjson" {
     try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
     try std.testing.expectEqualStrings("invalid scan request", invalid_resp.body);
 
-    var unsupported_resp = try server.handle(.{
+    var unsupported_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/documents",
         .content_type = "application/json",
@@ -23876,7 +21764,7 @@ test "api http server serves table query response envelope" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
     const query_body = try test_contract_helpers.encodeMatchQueryRequest(std.testing.allocator, "body", "hello", &.{}, 5);
     defer std.testing.allocator.free(query_body);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/query",
         .content_type = "application/json",
@@ -23890,7 +21778,7 @@ test "api http server serves table query response envelope" {
     try std.testing.expectEqual(@as(usize, 1), parsed.value.responses.?.len);
     try std.testing.expectEqualStrings("doc:a", parsed.value.responses.?[0].hits.?.hits.?[0]._id);
 
-    var internal_field_resp = try server.handle(.{
+    var internal_field_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/query",
         .content_type = "application/json",
@@ -23980,7 +21868,7 @@ test "api http server executes public Query filter roots and compositions" {
             .{filter},
         );
         defer alloc.free(body);
-        var resp = try server.handle(.{
+        var resp = try executeHttpxTestRequest(&server, .{
             .method = .POST,
             .uri = "/tables/files/query",
             .content_type = "application/json",
@@ -24006,7 +21894,7 @@ test "api http server executes public Query filter roots and compositions" {
         );
     }
 
-    var exclusion_resp = try server.handle(.{
+    var exclusion_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/files/query",
         .content_type = "application/json",
@@ -24026,7 +21914,7 @@ test "api http server executes public Query filter roots and compositions" {
         exclusion_parsed.value.responses.?[0].hits.?.hits.?.len,
     );
 
-    var unsupported_resp = try server.handle(.{
+    var unsupported_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/files/query",
         .content_type = "application/json",
@@ -24040,7 +21928,7 @@ test "api http server executes public Query filter roots and compositions" {
         "\"offending_node\":\"query_string\"",
     ) != null);
 
-    var invalid_resp = try server.handle(.{
+    var invalid_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/files/query",
         .content_type = "application/json",
@@ -24095,7 +21983,7 @@ test "api http server serves table query with SearchAF-shaped terms aggregations
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/files/query",
         .content_type = "application/json",
@@ -24171,7 +22059,7 @@ test "api http server serves retrieval agent response envelope" {
     const retrieval_body =
         \\{"query":"find hello","stream":false,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
     ;
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/agents/retrieval",
         .content_type = "application/json",
@@ -24189,7 +22077,7 @@ test "api http server serves retrieval agent response envelope" {
     const internal_query_body =
         \\{"query":"find hello","stream":false,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"native_doc_id_constraints":{"include_doc_ids":["doc:a"]},"limit":5}]}
     ;
-    var internal_resp = try server.handle(.{
+    var internal_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/agents/retrieval",
         .content_type = "application/json",
@@ -24249,7 +22137,7 @@ test "api http server maps retrieval agent doc identity mismatch to unavailable"
     const retrieval_body =
         \\{"query":"find hello","stream":false,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
     ;
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/agents/retrieval",
         .content_type = "application/json",
@@ -24300,7 +22188,7 @@ test "api http server serves retrieval agent event stream" {
     const retrieval_body =
         \\{"query":"find hello","stream":true,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
     ;
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/agents/retrieval",
         .content_type = "application/json",
@@ -24339,7 +22227,7 @@ test "api http server serves retrieval agent event stream" {
     try std.testing.expect(saw_hit);
     try std.testing.expect(saw_done);
 
-    var a2a_resp = try server.handle(.{
+    var a2a_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.a2a,
         .content_type = "application/json",
@@ -24374,7 +22262,7 @@ test "api http server serves eval response envelope" {
     const eval_body =
         \\{"evaluators":["precision","recall","relevance","faithfulness"],"query":"How does raft consensus work?","output":"Raft uses leader election and replicated logs. [doc:1]","context":[{"title":"Raft","body":"Raft uses leader election and replicated logs."},{"title":"Other","body":"Unrelated content."}],"retrieved_ids":["doc:1","doc:2"],"ground_truth":{"relevant_ids":["doc:1"],"expectations":"leader election replicated logs"}}
     ;
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.eval,
         .body = eval_body,
@@ -24441,7 +22329,7 @@ test "api http server serves query builder response envelope" {
     const query_builder_body =
         \\{"table":"docs","intent":"find published raft articles","mode":"auto","output":"query_request","constraints":{"limit":7},"max_internal_iterations":3,"max_user_clarifications":2}
     ;
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = query_builder_body,
@@ -24513,7 +22401,7 @@ test "api http server query builder infers semantic indexes from table metadata"
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs\",\"intent\":\"find raft architecture\",\"mode\":\"semantic\"}",
@@ -24530,7 +22418,7 @@ test "api http server query builder infers semantic indexes from table metadata"
     try std.testing.expectEqual(@as(usize, 1), parsed.value.query_request.?.indexes.?.len);
     try std.testing.expect(parsed.value.query_request.?.full_text_search == null);
 
-    var invalid_resp = try server.handle(.{
+    var invalid_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs\",\"intent\":\"find raft architecture\",\"mode\":\"semantic\",\"constraints\":{\"prefer_indexes\":[\"missing_idx\"],\"require_executable\":true}}",
@@ -24640,7 +22528,7 @@ test "api http server query builder maps doc identity mismatch to unavailable" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), FakeReads.source(), null);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs\",\"intent\":\"find raft architecture\",\"mode\":\"full_text\",\"output\":\"query_request\"}",
@@ -24785,7 +22673,7 @@ test "api http server query builder handles tree graph indexes" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
-    var inferred_resp = try server.handle(.{
+    var inferred_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs_single\",\"intent\":\"find raft architecture\",\"mode\":\"tree\"}",
@@ -24798,7 +22686,7 @@ test "api http server query builder handles tree graph indexes" {
     try std.testing.expect(inferred.value.retrieval_query_request != null);
     try std.testing.expectEqualStrings("doc_hierarchy", inferred.value.retrieval_query_request.?.tree_search.?.index);
 
-    var graph_inferred_resp = try server.handle(.{
+    var graph_inferred_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs_single\",\"intent\":\"find related raft architecture\",\"mode\":\"graph\"}",
@@ -24812,7 +22700,7 @@ test "api http server query builder handles tree graph indexes" {
     try std.testing.expectEqualStrings("doc_hierarchy", graph_query.index_name);
     try std.testing.expectEqualStrings("$full_text_results", graph_query.start_nodes.?.result_ref.?);
 
-    var question_resp = try server.handle(.{
+    var question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs_multi\",\"intent\":\"find raft architecture\",\"mode\":\"tree\",\"interactive\":true,\"max_user_clarifications\":1}",
@@ -24824,7 +22712,7 @@ test "api http server query builder handles tree graph indexes" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.clarification_required, question.value.status.?);
     try std.testing.expectEqualStrings("select_tree_index", question.value.questions.?[0].id);
 
-    var answer_resp = try server.handle(.{
+    var answer_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs_multi\",\"intent\":\"find raft architecture\",\"mode\":\"tree\",\"interactive\":true,\"max_user_clarifications\":1,\"decisions\":[{\"question_id\":\"select_tree_index\",\"answer\":\"topic_graph\"}]}",
@@ -24836,7 +22724,7 @@ test "api http server query builder handles tree graph indexes" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, answer.value.status.?);
     try std.testing.expectEqualStrings("topic_graph", answer.value.retrieval_query_request.?.tree_search.?.index);
 
-    var graph_question_resp = try server.handle(.{
+    var graph_question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs_multi\",\"intent\":\"find related raft architecture\",\"mode\":\"graph\",\"interactive\":true,\"max_user_clarifications\":1}",
@@ -24848,7 +22736,7 @@ test "api http server query builder handles tree graph indexes" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.clarification_required, graph_question.value.status.?);
     try std.testing.expectEqualStrings("select_graph_index", graph_question.value.questions.?[0].id);
 
-    var graph_answer_resp = try server.handle(.{
+    var graph_answer_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs_multi\",\"intent\":\"find related raft architecture\",\"mode\":\"graph\",\"interactive\":true,\"max_user_clarifications\":1,\"decisions\":[{\"question_id\":\"select_graph_index\",\"answer\":\"topic_graph\"}]}",
@@ -24904,7 +22792,7 @@ test "api http server query builder replays clarification decisions" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
-    var table_question_resp = try server.handle(.{
+    var table_question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"find raft architecture\",\"schema_fields\":[\"body\",\"status\"],\"interactive\":true,\"max_user_clarifications\":1,\"constraints\":{\"require_executable\":true}}",
@@ -24916,7 +22804,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.clarification_required, table_question.value.status.?);
     try std.testing.expectEqualStrings("select_query_table", table_question.value.questions.?[0].id);
 
-    var table_answer_resp = try server.handle(.{
+    var table_answer_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"find raft architecture\",\"schema_fields\":[\"body\",\"status\"],\"interactive\":true,\"max_user_clarifications\":1,\"constraints\":{\"require_executable\":true},\"decisions\":[{\"question_id\":\"select_query_table\",\"answer\":\"docs\"}]}",
@@ -24929,7 +22817,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expect(table_answer.value.questions == null);
     try std.testing.expectEqualStrings("docs", table_answer.value.query_request.?.table.?);
 
-    var field_question_resp = try server.handle(.{
+    var field_question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"find raft architecture\",\"schema_fields\":[\"title\",\"body\",\"status\"],\"mode\":\"full_text\",\"interactive\":true,\"max_user_clarifications\":1}",
@@ -24941,7 +22829,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.clarification_required, field_question.value.status.?);
     try std.testing.expectEqualStrings("select_text_field", field_question.value.questions.?[0].id);
 
-    var field_answer_resp = try server.handle(.{
+    var field_answer_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"find raft architecture\",\"schema_fields\":[\"title\",\"body\",\"status\"],\"mode\":\"full_text\",\"interactive\":true,\"max_user_clarifications\":1,\"decisions\":[{\"question_id\":\"select_text_field\",\"answer\":\"title\"}]}",
@@ -24953,7 +22841,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, field_answer.value.status.?);
     try std.testing.expectEqualStrings("title", field_answer.value.query_request.?.full_text_search.?.object.get("field").?.string);
 
-    var semantic_question_resp = try server.handle(.{
+    var semantic_question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"find raft architecture\",\"schema_fields\":[\"body\",\"status\"],\"mode\":\"semantic\",\"interactive\":true,\"max_user_clarifications\":1}",
@@ -24965,7 +22853,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.clarification_required, semantic_question.value.status.?);
     try std.testing.expectEqualStrings("select_semantic_index", semantic_question.value.questions.?[0].id);
 
-    var semantic_answer_resp = try server.handle(.{
+    var semantic_answer_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"find raft architecture\",\"schema_fields\":[\"body\",\"status\"],\"mode\":\"semantic\",\"interactive\":true,\"max_user_clarifications\":1,\"decisions\":[{\"question_id\":\"select_semantic_index\",\"answer\":\"body_embedding\"}]}",
@@ -24978,7 +22866,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expectEqualStrings("semantic", semantic_answer.value.specialist.?);
     try std.testing.expectEqualStrings("body_embedding", semantic_answer.value.query_request.?.indexes.?[0]);
 
-    var strategy_question_resp = try server.handle(.{
+    var strategy_question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs\",\"intent\":\"find raft architecture\",\"mode\":\"auto\",\"interactive\":true,\"max_user_clarifications\":1}",
@@ -24990,7 +22878,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.clarification_required, strategy_question.value.status.?);
     try std.testing.expectEqualStrings("select_query_strategy", strategy_question.value.questions.?[0].id);
 
-    var strategy_answer_resp = try server.handle(.{
+    var strategy_answer_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs\",\"intent\":\"find raft architecture\",\"mode\":\"auto\",\"interactive\":true,\"max_user_clarifications\":1,\"decisions\":[{\"question_id\":\"select_query_strategy\",\"answer\":\"full_text\"}]}",
@@ -25026,7 +22914,7 @@ test "api http server returns json eval and query builder validation errors" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
-    var eval_resp = try server.handle(.{
+    var eval_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.eval,
         .body = "{}",
@@ -25039,7 +22927,7 @@ test "api http server returns json eval and query builder validation errors" {
     defer eval_body.deinit();
     try std.testing.expectEqualStrings("invalid eval request", eval_body.value.@"error");
 
-    var query_builder_resp = try server.handle(.{
+    var query_builder_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"\"}",
@@ -25092,7 +22980,7 @@ test "api http server returns json not found for missing query builder table" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"missing\",\"intent\":\"find docs\"}",
@@ -25181,7 +23069,7 @@ test "api http server routes table query through read schema full text index" {
     const query_body = try test_contract_helpers.encodeMatchQueryRequest(std.testing.allocator, "body", "hello", &.{}, 5);
     defer std.testing.allocator.free(query_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/query",
         .content_type = "application/json",
@@ -25232,7 +23120,7 @@ test "api http server serves table batch writes" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"deletes\":[\"doc:gone\"]}");
     defer std.testing.allocator.free(batch_body);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -25268,7 +23156,7 @@ test "api http server serves table batch writes" {
         );
     }
     try compact_writer.writeAll("},\"sync_level\":\"write\"}");
-    var compact_resp = try server.handle(.{
+    var compact_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -25367,7 +23255,7 @@ test "api http server routes table batches through the batch commit hook" {
     );
     defer std.testing.allocator.free(batch_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -25427,7 +23315,7 @@ test "api http server serves table batch transforms" {
         "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"version\":1}}}",
     );
     defer std.testing.allocator.free(insert_body);
-    var insert_resp = try server.handle(.{
+    var insert_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -25445,7 +23333,7 @@ test "api http server serves table batch transforms" {
         "{\"transforms\":[{\"key\":\"doc:a\",\"operations\":[{\"op\":\"$set\",\"path\":\"status\",\"value\":\"updated\"},{\"op\":\"$max\",\"path\":\"version\",\"value\":3}]}]}",
     );
     defer std.testing.allocator.free(transform_body);
-    var transform_resp = try server.handle(.{
+    var transform_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -25508,7 +23396,7 @@ test "api http graph push preserves projected edges across restart" {
             \\{"inserts":{"a":{"title":"A","_edges":{"graph":{"FRIEND":[{"target":"b","weight":2,"metadata":{"since":2024}}]}}},"b":{"title":"B"},"c":{"title":"C"}},"sync_level":"full_index"}
         );
         defer alloc.free(insert_body);
-        var insert_resp = try server.handle(.{
+        var insert_resp = try executeHttpxTestRequest(&server, .{
             .method = .POST,
             .uri = "/tables/docs/batch",
             .content_type = "application/json",
@@ -25521,7 +23409,7 @@ test "api http graph push preserves projected edges across restart" {
             \\{"transforms":[{"key":"a","operations":[{"op":"$push","path":"$._edges.graph.FRIEND","value":{"target":"c","weight":3}}]}],"sync_level":"full_index"}
         );
         defer alloc.free(transform_body);
-        var transform_resp = try server.handle(.{
+        var transform_resp = try executeHttpxTestRequest(&server, .{
             .method = .POST,
             .uri = "/tables/docs/batch",
             .content_type = "application/json",
@@ -25543,7 +23431,7 @@ test "api http graph push preserves projected edges across restart" {
         for (invalid_transforms) |invalid_body_json| {
             const invalid_body = try test_contract_helpers.normalizeBatchRequest(alloc, invalid_body_json);
             defer alloc.free(invalid_body);
-            var invalid_resp = try server.handle(.{
+            var invalid_resp = try executeHttpxTestRequest(&server, .{
                 .method = .POST,
                 .uri = "/tables/docs/batch",
                 .content_type = "application/json",
@@ -25564,7 +23452,7 @@ test "api http graph push preserves projected edges across restart" {
             "full_index",
         );
         defer alloc.free(invalid_txn_body);
-        var invalid_txn_resp = try server.handle(.{
+        var invalid_txn_resp = try executeHttpxTestRequest(&server, .{
             .method = .POST,
             .uri = routes.Routes.transactions_commit,
             .content_type = "application/json",
@@ -25626,7 +23514,7 @@ test "api http server updates local table schema through bound write source" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
 
-    var managed_version_resp = try server.handle(.{
+    var managed_version_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/tables/docs/schema",
         .content_type = "application/json",
@@ -25637,7 +23525,7 @@ test "api http server updates local table schema through bound write source" {
     try std.testing.expectEqualStrings("schema.version is managed by Antfly; omit it", managed_version_resp.body);
 
     const schema_body = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}}}}}}";
-    var update_resp = try server.handle(.{
+    var update_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/tables/docs/schema",
         .content_type = "application/json",
@@ -25656,7 +23544,7 @@ test "api http server updates local table schema through bound write source" {
 
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"unexpected\"}}}");
     defer std.testing.allocator.free(batch_body);
-    var batch_resp = try server.handle(.{
+    var batch_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -25715,7 +23603,7 @@ test "api http server serves public transaction commit route" {
     );
     defer std.testing.allocator.free(commit_body);
 
-    var commit_resp = try server.handle(.{
+    var commit_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -25747,7 +23635,7 @@ test "api http server serves public transaction commit route" {
     );
     defer std.testing.allocator.free(stale_body);
 
-    var stale_resp = try server.handle(.{
+    var stale_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -25863,7 +23751,7 @@ test "api http server surfaces structured participant diagnostics for unavailabl
     );
     defer alloc.free(commit_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -25971,7 +23859,7 @@ test "api http server surfaces structured decision conflicts for transaction com
     );
     defer alloc.free(commit_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -26077,7 +23965,7 @@ test "api http server surfaces structured doc identity conflicts for transaction
     );
     defer alloc.free(commit_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -26185,7 +24073,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
     );
     defer alloc.free(commit_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -26290,7 +24178,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
     );
     defer alloc.free(commit_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -26348,7 +24236,7 @@ test "api http server serves long-lived public transaction session routes" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), read_source.source(), table_source.source());
     defer server.deinit();
 
-    var begin_resp = try server.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -26407,7 +24295,7 @@ test "api http server serves long-lived public transaction session routes" {
     });
     defer std.testing.allocator.free(delete_stage_uri_committed);
 
-    var read_stage_resp = try server.handle(.{
+    var read_stage_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = read_stage_uri,
         .content_type = "application/json",
@@ -26422,7 +24310,7 @@ test "api http server serves long-lived public transaction session routes" {
     try std.testing.expectEqualStrings("7", parsed_read_stage.value.snapshot.version);
     try std.testing.expectEqualStrings("alpha", parsed_read_stage.value.snapshot.document.object.get("title").?.string);
 
-    var write_stage_resp = try server.handle(.{
+    var write_stage_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = write_stage_uri,
         .content_type = "application/json",
@@ -26435,7 +24323,7 @@ test "api http server serves long-lived public transaction session routes" {
     defer parsed_write_stage.deinit();
     try std.testing.expectEqualStrings("staged", parsed_write_stage.value.status);
 
-    var savepoint_resp = try server.handle(.{
+    var savepoint_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = savepoint_uri,
         .body = "",
@@ -26447,7 +24335,7 @@ test "api http server serves long-lived public transaction session routes" {
     defer parsed_savepoint.deinit();
     const savepoint_id = parsed_savepoint.value.savepoint_id;
 
-    var delete_after_savepoint_resp = try server.handle(.{
+    var delete_after_savepoint_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = delete_stage_uri_committed,
         .content_type = "application/json",
@@ -26468,7 +24356,7 @@ test "api http server serves long-lived public transaction session routes" {
         routes.Routes.transactions_rollback_suffix,
     });
     defer std.testing.allocator.free(rollback_uri);
-    var rollback_resp = try server.handle(.{
+    var rollback_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = rollback_uri,
         .body = "",
@@ -26480,7 +24368,7 @@ test "api http server serves long-lived public transaction session routes" {
     defer parsed_rollback.deinit();
     try std.testing.expectEqualStrings("rolled_back", parsed_rollback.value.status);
 
-    var commit_resp = try server.handle(.{
+    var commit_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = commit_uri,
         .content_type = "application/json",
@@ -26494,7 +24382,7 @@ test "api http server serves long-lived public transaction session routes" {
     try std.testing.expectEqualStrings("committed", parsed_commit.value.status);
     try std.testing.expect(parsed_commit.value.tables != null);
 
-    var commit_again = try server.handle(.{
+    var commit_again = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = commit_uri,
         .content_type = "application/json",
@@ -26506,7 +24394,7 @@ test "api http server serves long-lived public transaction session routes" {
     defer parsed_commit_again.deinit();
     try std.testing.expectEqualStrings("committed", parsed_commit_again.value.status);
 
-    var abort_begin = try server.handle(.{
+    var abort_begin = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -26529,7 +24417,7 @@ test "api http server serves long-lived public transaction session routes" {
         routes.Routes.transactions_delete_suffix,
     });
     defer std.testing.allocator.free(delete_stage_uri);
-    var delete_stage_resp = try server.handle(.{
+    var delete_stage_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = delete_stage_uri,
         .content_type = "application/json",
@@ -26547,7 +24435,7 @@ test "api http server serves long-lived public transaction session routes" {
         routes.Routes.transactions_abort_suffix,
     });
     defer std.testing.allocator.free(abort_uri);
-    var abort_resp = try server.handle(.{
+    var abort_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = abort_uri,
         .body = "",
@@ -26627,7 +24515,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
         .{ .name = trusted_principal_header, .value = bob_token },
     };
 
-    var begin_resp = try server.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .headers = &alice_headers,
@@ -26644,7 +24532,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
         parsed_begin.value.transaction_id,
     });
     defer alloc.free(session_uri);
-    var cross_principal = try server.handle(.{
+    var cross_principal = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = session_uri,
         .headers = &bob_headers,
@@ -26657,7 +24545,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
         routes.Routes.transactions_write_suffix,
     });
     defer alloc.free(write_uri);
-    var denied_write = try server.handle(.{
+    var denied_write = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = write_uri,
         .headers = &alice_headers,
@@ -26672,7 +24560,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
         routes.Routes.transactions_read_suffix,
     });
     defer alloc.free(read_uri);
-    var hidden_read = try server.handle(.{
+    var hidden_read = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = read_uri,
         .headers = &alice_headers,
@@ -26686,7 +24574,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
     try std.testing.expectEqualStrings("0", parsed_hidden.value.snapshot.version);
     try std.testing.expect(parsed_hidden.value.snapshot.document == .null);
 
-    var denied_table_read = try server.handle(.{
+    var denied_table_read = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = read_uri,
         .headers = &alice_headers,
@@ -26696,7 +24584,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
     defer denied_table_read.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), denied_table_read.status);
 
-    var alice_list = try server.handle(.{
+    var alice_list = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.transactions,
         .headers = &alice_headers,
@@ -26706,7 +24594,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
     defer parsed_alice_list.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_alice_list.value.session_count);
 
-    var bob_list = try server.handle(.{
+    var bob_list = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.transactions,
         .headers = &bob_headers,
@@ -26716,7 +24604,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
     defer parsed_bob_list.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed_bob_list.value.session_count);
 
-    var denied_cleanup = try server.handle(.{
+    var denied_cleanup = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_cleanup,
         .headers = &alice_headers,
@@ -26745,7 +24633,7 @@ test "api http server serves transaction session cleanup route" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
     defer server.deinit();
 
-    var begin_resp = try server.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -26754,7 +24642,7 @@ test "api http server serves transaction session cleanup route" {
     defer begin_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), begin_resp.status);
 
-    var cleanup_resp = try server.handle(.{
+    var cleanup_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/transactions/cleanup?cutoff_ns=18446744073709551615",
         .content_type = "application/json",
@@ -26767,7 +24655,7 @@ test "api http server serves transaction session cleanup route" {
     defer parsed_cleanup.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_cleanup.value.removed);
 
-    var list_resp = try server.handle(.{
+    var list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.transactions,
         .content_type = null,
@@ -26824,7 +24712,7 @@ test "api http server reloads durable transaction sessions after restart" {
     var server1 = try ApiHttpServer.initWithConfig(std.testing.allocator, .{ .session_store_path = session_path }, source.iface(), null, table_source.source());
     defer server1.deinit();
 
-    var begin_resp = try server1.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&server1, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -26841,7 +24729,7 @@ test "api http server reloads durable transaction sessions after restart" {
         routes.Routes.transactions_write_suffix,
     });
     defer std.testing.allocator.free(stage_uri);
-    var stage_resp = try server1.handle(.{
+    var stage_resp = try executeHttpxTestRequest(&server1, .{
         .method = .POST,
         .uri = stage_uri,
         .content_type = "application/json",
@@ -26862,7 +24750,7 @@ test "api http server reloads durable transaction sessions after restart" {
         routes.Routes.transactions_commit_suffix,
     });
     defer std.testing.allocator.free(commit_uri);
-    var commit_resp = try server2.handle(.{
+    var commit_resp = try executeHttpxTestRequest(&server2, .{
         .method = .POST,
         .uri = commit_uri,
         .content_type = "application/json",
@@ -26957,7 +24845,7 @@ test "api http server retries stable terminal commits without replaying writes" 
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
     defer server.deinit();
-    var begin = try server.handle(.{
+    var begin = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -26982,7 +24870,7 @@ test "api http server retries stable terminal commits without replaying writes" 
     );
     defer alloc.free(body);
 
-    var first = try server.handle(.{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
+    var first = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 202), first.status);
     var parsed_first = try std.json.parseFromSlice(transactions_api.SessionCommitResponse, alloc, first.body, .{});
@@ -26998,7 +24886,7 @@ test "api http server retries stable terminal commits without replaying writes" 
     try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
     try std.testing.expectEqual(@as(usize, 1), writes.acknowledge_calls);
     try server.runSessionMaintenanceOnce();
-    var retry = try server.handle(.{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
+    var retry = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
     defer retry.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), retry.status);
     try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
@@ -27010,7 +24898,7 @@ test "api http server retries stable terminal commits without replaying writes" 
         routes.Routes.transactions_abort_suffix,
     });
     defer alloc.free(abort_uri);
-    var abort = try server.handle(.{ .method = .POST, .uri = abort_uri, .content_type = "application/json", .body = "" });
+    var abort = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = abort_uri, .content_type = "application/json", .body = "" });
     defer abort.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), abort.status);
 }
@@ -27082,7 +24970,7 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
     defer server.deinit();
     writes.durable = server.opened_session_store.?.durableStore();
 
-    var begin = try server.handle(.{ .method = .POST, .uri = routes.Routes.transactions_begin, .content_type = "application/json", .body = "{}" });
+    var begin = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = routes.Routes.transactions_begin, .content_type = "application/json", .body = "{}" });
     defer begin.deinit(alloc);
     var parsed_begin = try std.json.parseFromSlice(transactions_api.BeginResponse, alloc, begin.body, .{});
     defer parsed_begin.deinit();
@@ -27102,7 +24990,7 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
     );
     defer alloc.free(body);
 
-    var first = try server.handle(.{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
+    var first = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 503), first.status);
     try std.testing.expectEqual(@as(usize, 1), writes.commit_calls);
@@ -27113,7 +25001,7 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
     try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
     try std.testing.expectEqual(@as(usize, 1), writes.acknowledge_calls);
 
-    var retry = try server.handle(.{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
+    var retry = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
     defer retry.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), retry.status);
     try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
@@ -27169,7 +25057,7 @@ test "api http server enforces configured savepoint limits and exposes remaining
     );
     defer server.deinit();
 
-    var begin_resp = try server.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -27182,7 +25070,7 @@ test "api http server enforces configured savepoint limits and exposes remaining
 
     const info_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ routes.Routes.transactions_prefix, txn_id_hex });
     defer alloc.free(info_uri);
-    var info_before = try server.handle(.{
+    var info_before = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = info_uri,
     });
@@ -27198,7 +25086,7 @@ test "api http server enforces configured savepoint limits and exposes remaining
         routes.Routes.transactions_savepoints_suffix,
     });
     defer alloc.free(savepoint_uri);
-    var savepoint_resp = try server.handle(.{
+    var savepoint_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = savepoint_uri,
         .body = "",
@@ -27206,7 +25094,7 @@ test "api http server enforces configured savepoint limits and exposes remaining
     defer savepoint_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), savepoint_resp.status);
 
-    var info_after = try server.handle(.{
+    var info_after = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = info_uri,
     });
@@ -27216,7 +25104,7 @@ test "api http server enforces configured savepoint limits and exposes remaining
     try std.testing.expectEqual(@as(?usize, 1), parsed_info_after.value.savepoint_limit);
     try std.testing.expectEqual(@as(?usize, 0), parsed_info_after.value.remaining_savepoints);
 
-    var savepoint_again = try server.handle(.{
+    var savepoint_again = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = savepoint_uri,
         .body = "",
@@ -27241,9 +25129,9 @@ test "api http server enforces session adoption timeout when configured" {
     var durable = transactions_api.DurableSessionStore.init(alloc, &session_store);
     const lease_store = transactions_api.SessionLeaseStore.init(alloc, &session_store);
 
-    var registry = transactions_api.SessionRegistry.initWithLeaseTtl(alloc, &durable, lease_store, std.time.ns_per_s);
-    defer registry.deinit();
-    const session = try registry.begin(.{ .sync_level = .write }, 7);
+    var registry = transactions_api.SessionRegistry.initWithLeaseTtl(&durable, lease_store, std.time.ns_per_s);
+    defer registry.deinit(alloc);
+    const session = try registry.begin(alloc, .{ .sync_level = .write }, 7);
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -27389,7 +25277,7 @@ test "api http server keeps session maintenance off public request paths" {
     );
     defer owner.deinit();
 
-    var begin_resp = try owner.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&owner, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -27404,7 +25292,7 @@ test "api http server keeps session maintenance off public request paths" {
     owner.last_session_lease_renew_ns.store(0, .release);
     const info_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ routes.Routes.transactions_prefix, txn_id_hex });
     defer alloc.free(info_uri);
-    var info_resp = try owner.handle(.{
+    var info_resp = try executeHttpxTestRequest(&owner, .{
         .method = .GET,
         .uri = info_uri,
     });
@@ -27483,7 +25371,7 @@ test "api http server can renew owned session leases via explicit maintenance ho
     );
     defer owner.deinit();
 
-    var begin_resp = try owner.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&owner, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -27500,7 +25388,7 @@ test "api http server can renew owned session leases via explicit maintenance ho
 
     const info_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ routes.Routes.transactions_prefix, txn_id_hex });
     defer alloc.free(info_uri);
-    var info_resp = try owner.handle(.{
+    var info_resp = try executeHttpxTestRequest(&owner, .{
         .method = .GET,
         .uri = info_uri,
     });
@@ -27594,7 +25482,7 @@ test "api http server keeps session maintenance off internal request paths" {
     );
     defer owner.deinit();
 
-    var begin_resp = try owner.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&owner, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -27605,7 +25493,7 @@ test "api http server keeps session maintenance off internal request paths" {
     defer parsed_begin.deinit();
     _ = try distributed_txn.parseTxnIdHex(parsed_begin.value.transaction_id);
     owner.last_session_lease_renew_ns.store(0, .release);
-    var internal_resp = try owner.handle(.{
+    var internal_resp = try executeHttpxTestRequest(&owner, .{
         .method = .GET,
         .uri = "/internal/v1/groups/7/db/median-key",
         .body = "",
@@ -27709,7 +25597,7 @@ test "legacy api dispatcher no longer handles internal group lookups" {
         .uri = "/internal/v1/groups/7/tables/docs/documents/doc:a?fields=title",
     };
 
-    var response = try server.handle(req);
+    var response = try executeHttpxTestRequest(&server, req);
     defer response.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 404), response.status);
@@ -27810,7 +25698,7 @@ test "api http server preserves public query availability errors" {
 
         try std.testing.expectEqual(case.status, resp.status);
         try std.testing.expectEqualStrings(case.body, resp.body);
-        try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", resp.content_type.?);
+        try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", resp.content_type);
         try std.testing.expectEqual(
             case.query_error == error.StorageReadTemporarilyUnavailable,
             resp.headers.len == 1 and std.ascii.eqlIgnoreCase(resp.headers[0].name, "Retry-After"),
@@ -27822,7 +25710,7 @@ test "api http server preserves public query availability errors" {
         defer multi_resp.deinit(alloc);
         try std.testing.expectEqual(case.status, multi_resp.status);
         try std.testing.expectEqualStrings(case.body, multi_resp.body);
-        try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", multi_resp.content_type.?);
+        try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", multi_resp.content_type);
     }
 }
 
@@ -27987,7 +25875,7 @@ test "api http server serves internal group transaction routes" {
         .participants = &.{"group:7"},
     });
     defer std.testing.allocator.free(begin_body);
-    var begin_resp = try server.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-begin",
         .content_type = "application/json",
@@ -28003,7 +25891,7 @@ test "api http server serves internal group transaction routes" {
         },
     });
     defer std.testing.allocator.free(prepare_body);
-    var prepare_resp = try server.handle(.{
+    var prepare_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-prepare",
         .content_type = "application/json",
@@ -28014,7 +25902,7 @@ test "api http server serves internal group transaction routes" {
 
     const status_body = try distributed_txn.encodeTxnStatusRequest(std.testing.allocator, txn_id);
     defer std.testing.allocator.free(status_body);
-    var pending_resp = try server.handle(.{
+    var pending_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-status",
         .content_type = "application/json",
@@ -28031,7 +25919,7 @@ test "api http server serves internal group transaction routes" {
         .commit_version = 10_001,
     });
     defer std.testing.allocator.free(resolve_body);
-    var resolve_resp = try server.handle(.{
+    var resolve_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-resolve",
         .content_type = "application/json",
@@ -28040,7 +25928,7 @@ test "api http server serves internal group transaction routes" {
     defer resolve_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resolve_resp.status);
 
-    var committed_resp = try server.handle(.{
+    var committed_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-status",
         .content_type = "application/json",
@@ -28100,7 +25988,7 @@ test "api http server serves table metadata list and detail" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
 
-    var list_resp = try server.handle(.{ .method = .GET, .uri = "/tables?prefix=do" });
+    var list_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables?prefix=do" });
     defer list_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), list_resp.status);
     try std.testing.expectEqualStrings("application/json", list_resp.content_type.?);
@@ -28109,7 +25997,7 @@ test "api http server serves table metadata list and detail" {
     try std.testing.expectEqual(@as(usize, 1), parsed_list.value.len);
     try std.testing.expectEqualStrings("docs", parsed_list.value[0].name);
 
-    var detail_resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs" });
+    var detail_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs" });
     defer detail_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), detail_resp.status);
     try std.testing.expectEqualStrings("application/json", detail_resp.content_type.?);
@@ -28221,7 +26109,7 @@ test "api http server serves runtime schema debug on table and index detail" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
 
-    var table_resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs?debug=runtime_schema" });
+    var table_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs?debug=runtime_schema" });
     defer table_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), table_resp.status);
     try std.testing.expectEqualStrings("application/json", table_resp.content_type.?);
@@ -28250,7 +26138,7 @@ test "api http server serves runtime schema debug on table and index detail" {
     try std.testing.expect(parsed_table.value.debug.runtime_schemas[0].runtime_schema != null);
     try std.testing.expect(Helpers.hasAnalyzer(parsed_table.value.debug.runtime_schemas[0].runtime_schema.?, "french"));
 
-    var index_resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/indexes/full_text_index_v0?debug=runtime_schema" });
+    var index_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs/indexes/full_text_index_v0?debug=runtime_schema" });
     defer index_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), index_resp.status);
     try std.testing.expectEqualStrings("application/json", index_resp.content_type.?);
@@ -28335,7 +26223,7 @@ test "api http server serves table index metadata routes" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
 
-    var list_resp = try server.handle(.{
+    var list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes",
     });
@@ -28351,7 +26239,7 @@ test "api http server serves table index metadata routes" {
     try std.testing.expectEqualStrings("embed_idx", parsed_list.value.array.items[1].object.get("config").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("alg", parsed_list.value.array.items[2].object.get("config").?.object.get("name").?.string);
 
-    var detail_resp = try server.handle(.{
+    var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/embed_idx",
     });
@@ -28365,7 +26253,7 @@ test "api http server serves table index metadata routes" {
     try std.testing.expectEqualStrings("embed_idx", parsed_detail.value.object.get("config").?.object.get("name").?.string);
     try std.testing.expectEqual(@as(usize, 2), source.cached_snapshot_calls);
 
-    var artifacts_resp = try server.handle(.{
+    var artifacts_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/artifacts",
     });
@@ -28386,7 +26274,7 @@ test "api http server serves table index metadata routes" {
     try std.testing.expectEqualStrings("body_chunks_v1", artifacts[1].object.get("source_artifact_name").?.string);
     try std.testing.expectEqual(@as(usize, 3), source.cached_snapshot_calls);
 
-    var encoded_table_artifacts_resp = try server.handle(.{
+    var encoded_table_artifacts_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs%20table/artifacts",
     });
@@ -28402,7 +26290,7 @@ test "api http server serves table index metadata routes" {
 
     try std.testing.expectEqual(@as(usize, 0), source.admin_snapshot_calls);
 
-    var algebraic_detail_resp = try server.handle(.{
+    var algebraic_detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/alg",
     });
@@ -28417,7 +26305,7 @@ test "api http server serves table index metadata routes" {
     try std.testing.expectEqualStrings("algebraic", parsed_algebraic_detail.value.object.get("config").?.object.get("type").?.string);
     try std.testing.expect(parsed_algebraic_detail.value.object.get("status") != null);
 
-    var algebraic_child_resp = try server.handle(.{
+    var algebraic_child_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/alg/algebraic",
     });
@@ -28477,7 +26365,7 @@ test "api http server index status is cache only" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
 
-    var detail_resp = try server.handle(.{
+    var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/embed_idx",
     });
@@ -28552,7 +26440,7 @@ test "api http server reports table storage empty from read visibility" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), read_source.source(), null);
 
-    var empty_resp = try server.handle(.{
+    var empty_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs",
     });
@@ -28568,7 +26456,7 @@ test "api http server reports table storage empty from read visibility" {
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
     });
 
-    var non_empty_resp = try server.handle(.{
+    var non_empty_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs",
     });
@@ -28580,7 +26468,7 @@ test "api http server reports table storage empty from read visibility" {
     try std.testing.expectEqual(@as(?i64, null), parsed_non_empty.value.storage_status.disk_usage);
     try std.testing.expectEqual(@as(?bool, false), parsed_non_empty.value.storage_status.empty);
 
-    var list_resp = try server.handle(.{
+    var list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables",
     });
@@ -28693,7 +26581,7 @@ test "api http server table status uses runtime stats without probing storage" {
     var reads = FakeReads{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs",
     });
@@ -28920,7 +26808,7 @@ test "api http server serves local index runtime backfill status" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), read_source.source(), null);
 
-    var detail_resp = try server.handle(.{
+    var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/search_idx",
     });
@@ -29056,7 +26944,7 @@ test "api http server create index waits for exact target config projection" {
 
     const create_index_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "embed_idx");
     defer alloc.free(create_index_body);
-    var create_index_resp = try server.handle(.{
+    var create_index_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/embed_idx",
         .content_type = "application/json",
@@ -29068,7 +26956,7 @@ test "api http server create index waits for exact target config projection" {
     var first_lookup = (try indexes_api.lookupSingleIndexConfig(alloc, source.indexes_json, "embed_idx")).?;
     defer first_lookup.deinit();
     const first_incarnation = coverage_policy.incarnation(first_lookup.config) orelse return error.TestUnexpectedResult;
-    var retry_resp = try server.handle(.{
+    var retry_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/embed_idx",
         .content_type = "application/json",
@@ -29198,7 +27086,7 @@ test "api http server create index expands schema-derived algebraic config" {
     const create_index_body =
         \\{"name":"sales_rollup","type":"algebraic","derive_from_schema":true}
     ;
-    var create_index_resp = try server.handle(.{
+    var create_index_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/sales_rollup",
         .content_type = "application/json",
@@ -29283,7 +27171,7 @@ test "api http server rejects public algebraic materialization config" {
         null,
     );
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/manual_alg",
         .content_type = "application/json",
@@ -29437,7 +27325,7 @@ test "api http server serves provisioned index runtime backfill status across sh
     var read_source = table_reads.ProvisionedTableReadSource.init(path, FakeCatalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
     var server = ApiHttpServer.init(std.testing.allocator, .{}, FakeSource.iface(), read_source.source(), null);
 
-    var detail_resp = try server.handle(.{
+    var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/search_idx",
     });
@@ -29630,7 +27518,7 @@ test "api http server serves table create and drop" {
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "docs table");
     defer std.testing.allocator.free(create_body);
-    var create_resp = try server.handle(.{
+    var create_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -29646,7 +27534,7 @@ test "api http server serves table create and drop" {
     try std.testing.expectEqualStrings("docs", parsed_create.value.name);
     try std.testing.expectEqualStrings("docs table", parsed_create.value.description.?);
 
-    var duplicate_create_resp = try server.handle(.{
+    var duplicate_create_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -29657,7 +27545,7 @@ test "api http server serves table create and drop" {
     try std.testing.expectEqualStrings("text/plain", duplicate_create_resp.content_type.?);
     try std.testing.expectEqualStrings("table already exists", duplicate_create_resp.body);
 
-    var drop_resp = try server.handle(.{
+    var drop_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/tables/docs",
     });
@@ -29666,7 +27554,7 @@ test "api http server serves table create and drop" {
 
     const update_schema_body = try test_contract_helpers.encodeSchemaUpdateRequest(std.testing.allocator);
     defer std.testing.allocator.free(update_schema_body);
-    var update_resp = try server.handle(.{
+    var update_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/tables/docs/schema",
         .content_type = "application/json",
@@ -29684,7 +27572,7 @@ test "api http server serves table create and drop" {
 
     const create_index_body = try test_contract_helpers.encodeCreateIndexRequest(std.testing.allocator, "embed_idx");
     defer std.testing.allocator.free(create_index_body);
-    var create_index_resp = try server.handle(.{
+    var create_index_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/embed_idx",
         .content_type = "application/json",
@@ -29696,7 +27584,7 @@ test "api http server serves table create and drop" {
     try std.testing.expectEqualStrings("{}", create_index_resp.body);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"embed_idx\"") != null);
 
-    var detail_resp = try server.handle(.{
+    var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/embed_idx",
     });
@@ -29713,7 +27601,7 @@ test "api http server serves table create and drop" {
     defer parsed_index.deinit();
     try std.testing.expectEqualStrings("embed_idx", parsed_index.value.config.name);
 
-    var drop_index_resp = try server.handle(.{
+    var drop_index_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/tables/docs/indexes/embed_idx",
     });
@@ -29886,7 +27774,7 @@ test "api http server create table with local writes waits for projected presenc
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(alloc, "docs table");
     defer alloc.free(create_body);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -30059,7 +27947,7 @@ test "api http server rejects unsupported table index before metadata publicatio
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -30097,7 +27985,7 @@ test "api http server rejects caller-managed schema version before metadata publ
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -30539,7 +28427,7 @@ test "api index status uses read runtime status without consulting write source"
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/vec",
     });
@@ -30703,7 +28591,7 @@ test "api index status asks write source when read runtime status is absent" {
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/vec",
     });
@@ -30868,7 +28756,7 @@ test "api index status uses propagated remote store runtime status" {
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/vec",
     });
@@ -31300,7 +29188,7 @@ test "api index status ignores propagated runtime status from removed owner" {
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/vec",
     });
@@ -31440,7 +29328,7 @@ test "api index status reports missing remote shard as not ready" {
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/vec",
     });
@@ -31555,7 +29443,7 @@ test "api http server drop table waits for metadata lifecycle absence" {
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/tables/docs",
     });
@@ -31668,7 +29556,7 @@ test "api http server get missing index returns 404 without runtime status looku
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/vec",
     });
@@ -31766,7 +29654,7 @@ test "api http server serves table metadata routes against real metadata service
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "docs table");
     defer std.testing.allocator.free(create_body);
-    var create_resp = try server.handle(.{
+    var create_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -31785,7 +29673,7 @@ test "api http server serves table metadata routes against real metadata service
     var rounds: usize = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
-    var detail_resp = try server.handle(.{
+    var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs",
     });
@@ -31798,7 +29686,7 @@ test "api http server serves table metadata routes against real metadata service
     try std.testing.expectEqualStrings("docs table", parsed_detail.value.description.?);
     try std.testing.expect(parsed_detail.value.indexes.map.count() > 0);
 
-    var indexes_resp = try server.handle(.{
+    var indexes_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes",
     });
@@ -31812,7 +29700,7 @@ test "api http server serves table metadata routes against real metadata service
     try std.testing.expectEqual(@as(usize, 1), parsed_indexes.value.array.items.len);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed_indexes.value.array.items[0].object.get("config").?.object.get("name").?.string);
 
-    var index_resp = try server.handle(.{
+    var index_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/full_text_index_v0",
     });
@@ -31827,7 +29715,7 @@ test "api http server serves table metadata routes against real metadata service
 
     const update_schema_body = try test_contract_helpers.encodeSchemaUpdateRequest(std.testing.allocator);
     defer std.testing.allocator.free(update_schema_body);
-    var update_resp = try server.handle(.{
+    var update_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/tables/docs/schema",
         .content_type = "application/json",
@@ -31846,7 +29734,7 @@ test "api http server serves table metadata routes against real metadata service
     rounds = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
-    var updated_detail = try server.handle(.{
+    var updated_detail = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs",
     });
@@ -31861,7 +29749,7 @@ test "api http server serves table metadata routes against real metadata service
 
     const valid_batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"inserts\":{\"doc:ok\":{\"title\":\"alpha\",\"status\":\"published\"}}}");
     defer std.testing.allocator.free(valid_batch_body);
-    var valid_batch_resp = try server.handle(.{
+    var valid_batch_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -31872,7 +29760,7 @@ test "api http server serves table metadata routes against real metadata service
 
     const invalid_batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"inserts\":{\"doc:bad\":{\"title\":\"alpha\",\"body\":\"unexpected\"}}}");
     defer std.testing.allocator.free(invalid_batch_body);
-    var invalid_batch_resp = try server.handle(.{
+    var invalid_batch_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -31985,7 +29873,7 @@ test "api http server create table with replication sources returns encoded tabl
         \\  ]
         \\}
     ;
-    var create_resp = try server.handle(.{
+    var create_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -32083,7 +29971,7 @@ test "api http server lists cluster backups through public route" {
     const uri = try std.fmt.allocPrint(alloc, "/backups?location={s}&connection=test-backups", .{location_uri});
     defer alloc.free(uri);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = uri,
     });
@@ -32155,7 +30043,7 @@ test "api http server returns retryable not leader when local reconcile lease is
     const create_body = try test_contract_helpers.encodeCreateTableRequest(alloc, "docs table");
     defer alloc.free(create_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -32200,7 +30088,7 @@ test "api http server returns retryable not leader when metadata proposal is dro
     const create_body = try test_contract_helpers.encodeCreateTableRequest(alloc, "docs table");
     defer alloc.free(create_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -32272,7 +30160,7 @@ test "api http server returns retryable not leader through public table adapter 
     const create_index_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "body");
     defer alloc.free(create_index_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/body",
         .content_type = "application/json",
@@ -32315,7 +30203,7 @@ test "api http server returns retryable not leader when cluster backup read barr
     defer node_config.deinit();
     var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config }, source.iface(), null, null);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/backup",
         .content_type = "application/json",
@@ -32476,7 +30364,7 @@ test "api http server cluster backup succeeds after load balanced metadata timeo
     );
     defer alloc.free(backup_body);
 
-    var retry_response = try timed_out_server.handle(.{
+    var retry_response = try executeHttpxTestRequest(&timed_out_server, .{
         .method = .POST,
         .uri = "/backup",
         .content_type = "application/json",
@@ -32485,7 +30373,7 @@ test "api http server cluster backup succeeds after load balanced metadata timeo
     defer retry_response.deinit(alloc);
     try expectPublicMetadataNotLeaderResponse(retry_response);
 
-    var success_response = try recovered_server.handle(.{
+    var success_response = try executeHttpxTestRequest(&recovered_server, .{
         .method = .POST,
         .uri = "/backup",
         .content_type = "application/json",
@@ -32589,7 +30477,7 @@ test "api http server does not advertise a retry after cluster backup side effec
         .{location_uri},
     );
     defer alloc.free(body);
-    var response = try server.handle(.{
+    var response = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/backup",
         .content_type = "application/json",
@@ -32966,7 +30854,7 @@ test "api http server backs up and restores a table through public routes" {
 
     const backup_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"file://{s}\",\"connection\":\"test-backups\"}}", .{backup_root_abs});
     defer alloc.free(backup_body);
-    var backup_resp = try server.handle(.{
+    var backup_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/backup",
         .content_type = "application/json",
@@ -32990,7 +30878,7 @@ test "api http server backs up and restores a table through public routes" {
 
     const restore_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"file://{s}\",\"connection\":\"test-backups\"}}", .{backup_root_abs});
     defer alloc.free(restore_body);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/restore",
         .content_type = "application/json",
@@ -33227,7 +31115,7 @@ test "api http server durability-pending restore preserves committed metadata" {
     const restore_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"{s}\",\"connection\":\"test-backups\"}}", .{location_uri});
     defer alloc.free(restore_body);
     {
-        var unsupported_resp = try server.handle(.{
+        var unsupported_resp = try executeHttpxTestRequest(&server, .{
             .method = .POST,
             .uri = "/tables/docs/restore",
             .content_type = "application/json",
@@ -33249,7 +31137,7 @@ test "api http server durability-pending restore preserves committed metadata" {
     defer alloc.free(invalid_manifest_path);
     try std.Io.Dir.cwd().deleteFile(std.testing.io, invalid_manifest_path);
     try writeTestRestoreManifestAndArtifact(alloc, backup_root_abs, &manifest);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/restore",
         .content_type = "application/json",
@@ -33594,7 +31482,7 @@ test "api http server cluster overwrite restores from read-only repository witho
         .{location_uri},
     );
     defer alloc.free(restore_body);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/restore",
         .content_type = "application/json",
@@ -33752,7 +31640,7 @@ test "api http server cluster restore rejects missing extension package digest" 
         .{location_uri},
     );
     defer alloc.free(restore_body);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/restore",
         .content_type = "application/json",
@@ -33970,7 +31858,7 @@ test "api http server cluster restore rehydrates extension metadata" {
         .{location_uri},
     );
     defer alloc.free(restore_body);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/restore",
         .body = restore_body,
@@ -34110,7 +31998,7 @@ test "api http server prefers metadata-owned restore over inline write-source re
         .{location_uri},
     );
     defer alloc.free(restore_body);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/restore",
         .content_type = "application/json",
@@ -34186,7 +32074,7 @@ test "api http server retries stale metadata table-exists restore race" {
         .{location_uri},
     );
     defer alloc.free(restore_body);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/restore",
         .content_type = "application/json",

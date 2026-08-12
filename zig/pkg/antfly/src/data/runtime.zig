@@ -20,6 +20,14 @@ const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const runtime_status = @import("../api/runtime_status.zig");
+const api_http_test_runtime = if (@import("builtin").is_test) @import("../api/http_test_runtime.zig") else struct {};
+
+fn executeApiHttpxTestRequest(
+    api: *antfly.public_api.http_server.ApiHttpServer,
+    req: antfly.raft.transport.http_common.HttpRequest,
+) !antfly.raft.transport.http_common.HttpResponse {
+    return api_http_test_runtime.executeOnce(std.testing.allocator, api, req);
+}
 
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
@@ -23354,7 +23362,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
     try server.initApiServer();
 
-    var status_resp = try server.http_server.?.handle(.{ .method = .GET, .uri = antfly.public_api.http_routes.Routes.status });
+    var status_resp = try executeApiHttpxTestRequest(&server.http_server.?, .{ .method = .GET, .uri = antfly.public_api.http_routes.Routes.status });
     defer status_resp.deinit(server.http_server.?.alloc);
 
     const items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
@@ -24108,25 +24116,24 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expect(server.ha_internal_server != null);
     try std.testing.expect(server.haOwnerJobCanRun(.compaction_publish));
 
-    var admin_unauthorized = try server.http_server.?.handle(.{
+    var admin_unauthorized = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.admin.routes.ha_primary_status,
     });
     defer admin_unauthorized.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 401), admin_unauthorized.status);
 
-    var admin_resp = try server.http_server.?.handle(.{
+    var admin_resp = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.admin.routes.ha_primary_status,
         .authorization = "Bearer runtime-secret-token",
     });
     defer admin_resp.deinit(server.http_server.?.alloc);
-    try std.testing.expect(admin_resp.owner_allocator != null);
     try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, admin_resp.body, "\"current_lsn\"") != null);
 
     const capture_body = "{\"slot_name\":\"standby-capture\",\"generation\":\"seed-standby-capture-3\",\"topology_id\":\"topology-a\",\"topology_generation\":7,\"node_id\":\"standby-a\",\"target_pvc_name\":\"standby-a-data\",\"target_pvc_uid\":\"pvc-uid-7\"}";
-    var capture_resp = try server.http_server.?.handle(.{
+    var capture_resp = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .POST,
         .uri = antfly.admin.routes.ha_base_backups_capture,
         .authorization = "Bearer runtime-secret-token",
@@ -24260,7 +24267,7 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expect(!captured_slot.active);
     try std.testing.expect(!captured_slot.reseed_required);
 
-    var capture_retry = try server.http_server.?.handle(.{
+    var capture_retry = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .POST,
         .uri = antfly.admin.routes.ha_base_backups_capture,
         .authorization = "Bearer runtime-secret-token",
@@ -24535,7 +24542,7 @@ test "data server wires configured HA executors into API server" {
         capture_binding,
     ));
 
-    var internal_resp = try server.http_server.?.handle(.{
+    var internal_resp = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.internal.routes.ha_replication_identify,
         .authorization = "Bearer runtime-secret-token",
@@ -25220,7 +25227,7 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
     }
     try source_gate.check();
 
-    var fence_response = try server.http_server.?.handle(.{
+    var fence_response = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .POST,
         .uri = antfly.admin.routes.ha_fence,
         .authorization = "Bearer runtime-secret-token",
@@ -25592,7 +25599,7 @@ test "data server pulls and applies HA standby replication through internal HTTP
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
 
-    var admin_status = try server.http_server.?.handle(.{
+    var admin_status = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.admin.routes.ha_standby_status,
         .authorization = "Bearer runtime-secret-token",
@@ -25945,7 +25952,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     try std.testing.expectError(error.HAReadRequiresPrimary, public_read_gate_before.check(.stale));
     try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate_before.check());
 
-    var before = try server.http_server.?.handle(.{
+    var before = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.internal.routes.ha_replication_identify,
         .authorization = "Bearer runtime-secret-token",
@@ -25970,7 +25977,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     try public_read_gate_before.check(.stale);
     try public_write_gate_before.check();
 
-    var write_check = try server.http_server.?.handle(.{
+    var write_check = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .POST,
         .uri = antfly.admin.routes.ha_write_check,
         .authorization = "Bearer runtime-secret-token",
@@ -25983,7 +25990,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     try std.testing.expect(std.mem.indexOf(u8, write_check.body, "\"action\":\"open_promoted_primary\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_check.body, "\"promotion_handoff\"") != null);
 
-    var owner_job_check = try server.http_server.?.handle(.{
+    var owner_job_check = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .POST,
         .uri = antfly.admin.routes.ha_owner_job_check,
         .authorization = "Bearer runtime-secret-token",
@@ -25995,7 +26002,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     try std.testing.expect(std.mem.indexOf(u8, owner_job_check.body, "\"role\":\"promoted_standby\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, owner_job_check.body, "\"action\":\"open_promoted_primary\"") != null);
 
-    var internal_resp = try server.http_server.?.handle(.{
+    var internal_resp = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.internal.routes.ha_replication_identify,
         .authorization = "Bearer runtime-secret-token",
@@ -26526,7 +26533,7 @@ test "data runtime records and backs off HA standby replication round failures" 
     try std.testing.expect(!server.haStandbyReplicationRetryDue(next_attempt_ns - 1));
     try std.testing.expect(server.haStandbyReplicationRetryDue(next_attempt_ns));
 
-    var admin_status = try server.http_server.?.handle(.{
+    var admin_status = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.admin.routes.ha_standby_status,
         .authorization = "Bearer runtime-secret-token",
@@ -26692,7 +26699,7 @@ test "data runtime records HA standby apply failures without stopping run round"
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
 
-    var admin_status = try server.http_server.?.handle(.{
+    var admin_status = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.admin.routes.ha_standby_status,
         .authorization = "Bearer runtime-secret-token",
