@@ -177,6 +177,12 @@ that end state:
   contextual result. Metadata-leader retry policy and headers remain at the
   transport edge; the application operation no longer receives a synthetic
   request, returns a legacy response, or enters `ApiHttpServer.handle()`.
+- HA administration and internal replication paths now use a dedicated
+  registrar and typed method/target/body ingress instead of the global
+  contextual fallback. This removes the last listener route that could enter
+  `ApiHttpServer.handle()`; the runtime-provided HA executors still use the
+  temporary request/response compatibility contract and remain an explicit
+  operation-extraction boundary.
 - Canonical and legacy-location A2A agent-card reads now use a direct `httpx`
   handler over an owned JSON builder. Card generation no longer constructs a
   request or response compatibility object, and both locations share the same

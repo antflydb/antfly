@@ -260,8 +260,6 @@ pub const AntflyApiHandler = struct {
             try self.registerProbes(server);
         }
 
-        const handler = httpx.Handler.bind(self, contextualRoute);
-
         const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*" };
         const mcp_handler = httpx.Handler.bind(self, mcpRoute);
         inline for (mcp_paths) |path| {
@@ -302,11 +300,12 @@ pub const AntflyApiHandler = struct {
         try server.put(routes.agents_v1_extensions_prefix ++ "*", extension_agent_handler);
 
         const ha_admin_paths = [_][]const u8{ admin_routes.ha, admin_routes.ha ++ "/*" };
+        const ha_handler = httpx.Handler.bind(self, haRoute);
         inline for (ha_admin_paths) |path| {
-            try server.get(path, handler);
-            try server.post(path, handler);
-            try server.put(path, handler);
-            try server.delete(path, handler);
+            try server.get(path, ha_handler);
+            try server.post(path, ha_handler);
+            try server.put(path, ha_handler);
+            try server.delete(path, ha_handler);
         }
         try server.post(admin_routes.maintenance_check, httpx.Handler.bind(self, checkStorage));
         try server.post(admin_routes.maintenance_compact, httpx.Handler.bind(self, compactStorage));
@@ -316,10 +315,10 @@ pub const AntflyApiHandler = struct {
 
         const ha_internal_paths = [_][]const u8{ internal_routes.ha, internal_routes.ha ++ "/*" };
         inline for (ha_internal_paths) |path| {
-            try server.get(path, handler);
-            try server.post(path, handler);
-            try server.put(path, handler);
-            try server.delete(path, handler);
+            try server.get(path, ha_handler);
+            try server.post(path, ha_handler);
+            try server.put(path, ha_handler);
+            try server.delete(path, ha_handler);
         }
 
         const group_prefix = routes.internal_groups_prefix ++ ":group_id";
@@ -585,16 +584,22 @@ pub const AntflyApiHandler = struct {
         };
     }
 
-    fn contextualRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
-        var request = operationRequestFromContext(ctx, null) catch |err| switch (err) {
-            error.UnsupportedMethod => {
-                _ = ctx.status(405);
-                return ctx.text("method not allowed");
-            },
-            else => return err,
+    fn haRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const method: contextual_operations.Method = switch (ctx.request.method) {
+            .GET => .get,
+            .POST => .post,
+            .PUT => .put,
+            .DELETE => .delete,
+            else => return textResponse(ctx, 405, "method not allowed"),
         };
-        defer request.deinit();
-        var response = try self.api_server.handle(request.value);
+        const body = (try ctx.body()) orelse "";
+        var response = (try self.api_server.executeHaRoute(.{
+            .method = method,
+            .target = ctx.request.uri.raw,
+            .authorization = ctx.header("authorization"),
+            .content_type = ctx.header("content-type"),
+            .body = body,
+        })) orelse return textResponse(ctx, 404, "not found");
         const response_alloc = response.owner_allocator orelse self.api_server.alloc;
         return respondWithAllocator(ctx, &response, response_alloc);
     }
