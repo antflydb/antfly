@@ -6020,44 +6020,60 @@ pub const ApiHttpServer = struct {
                 if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair requests use json body");
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicListArtifactRepairIssues(table_name, req.body);
+                var response = try self.handlePublicListArtifactRepairIssues(table_name, req.body);
+                defer response.deinit(self.alloc);
+                return try legacyResponseFromPublicOperation(self.alloc, response);
             }
             if (routes.Routes.matchTableArtifactRepairRun(uri_parts.path)) |repair_route| {
                 if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair requests use json body");
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicRunTableRepair(table_name, req.body);
+                var response = try self.handlePublicRunTableRepair(table_name, req.body);
+                defer response.deinit(self.alloc);
+                return try legacyResponseFromPublicOperation(self.alloc, response);
             }
             if (routes.Routes.matchTableRepairJobs(uri_parts.path)) |job_route| {
                 if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair job requests use json body");
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicStartTableRepairJob(table_name, req.body);
+                var response = try self.handlePublicStartTableRepairJob(table_name, req.body);
+                defer response.deinit(self.alloc);
+                return try legacyResponseFromPublicOperation(self.alloc, response);
             }
             if (routes.Routes.matchTableRepairJobAdvance(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicAdvanceTableRepairJob(table_name, job_route.job_id);
+                var response = try self.handlePublicAdvanceTableRepairJob(table_name, job_route.job_id);
+                defer response.deinit(self.alloc);
+                return try legacyResponseFromPublicOperation(self.alloc, response);
             }
             if (routes.Routes.matchTableRepairJobCancel(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicCancelTableRepairJob(table_name, job_route.job_id);
+                var response = try self.handlePublicCancelTableRepairJob(table_name, job_route.job_id);
+                defer response.deinit(self.alloc);
+                return try legacyResponseFromPublicOperation(self.alloc, response);
             }
             if (routes.Routes.matchTableArtifactReprocessJobs(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicStartDocumentArtifactReprocessJob(table_name, job_route.artifact_name, req.body);
+                var response = try self.handlePublicStartDocumentArtifactReprocessJob(table_name, job_route.artifact_name, req.body);
+                defer response.deinit(self.alloc);
+                return try legacyResponseFromPublicOperation(self.alloc, response);
             }
             if (routes.Routes.matchTableArtifactReprocessJobAdvance(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicAdvanceDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
+                var response = try self.handlePublicAdvanceDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
+                defer response.deinit(self.alloc);
+                return try legacyResponseFromPublicOperation(self.alloc, response);
             }
             if (routes.Routes.matchTableArtifactReprocessJobCancel(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicCancelDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
+                var response = try self.handlePublicCancelDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
+                defer response.deinit(self.alloc);
+                return try legacyResponseFromPublicOperation(self.alloc, response);
             }
             if (routes.Routes.matchTableArtifactReprocess(uri_parts.path)) |artifact_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
@@ -6365,12 +6381,16 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTableRepairJob(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicTableRepairJob(table_name, job_route.job_id);
+                var response = try self.handlePublicTableRepairJob(table_name, job_route.job_id);
+                defer response.deinit(self.alloc);
+                return try legacyResponseFromPublicOperation(self.alloc, response);
             }
             if (routes.Routes.matchTableArtifactReprocessJob(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
+                var response = try self.handlePublicDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
+                defer response.deinit(self.alloc);
+                return try legacyResponseFromPublicOperation(self.alloc, response);
             }
         }
         if (req.method == .GET) {
@@ -11909,15 +11929,15 @@ pub const ApiHttpServer = struct {
         limit: ?u32 = null,
     };
 
-    pub fn handlePublicListArtifactRepairIssues(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        const source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
+    pub fn handlePublicListArtifactRepairIssues(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
+        const source = self.table_writes orelse return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         var parsed = std.json.parseFromSlice(PublicRepairListRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 400, "invalid repair list request");
+            return try publicOperationTextResponse(self.alloc, 400, "invalid repair list request");
         };
         defer parsed.deinit();
-        const target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try textResponse(self.alloc, 400, "invalid repair target");
+        const target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try publicOperationTextResponse(self.alloc, 400, "invalid repair target");
         const raw_limit: u32 = parsed.value.limit orelse 50;
-        if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
+        if (raw_limit == 0) return try publicOperationTextResponse(self.alloc, 400, "invalid limit");
         const limit: u32 = @min(raw_limit, 500);
         var result = (source.listArtifactRepairIssues(self.alloc, table_name, .{
             .target = target,
@@ -11926,12 +11946,12 @@ pub const ApiHttpServer = struct {
             .limit = limit,
             .cursor = parsed.value.cursor,
         }) catch |err| switch (err) {
-            error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid cursor"),
+            error.InvalidArgument => return try publicOperationTextResponse(self.alloc, 400, "invalid cursor"),
             else => {
                 std.log.err("artifact repair issue list failed table={s} err={}", .{ table_name, err });
-                return try textResponse(self.alloc, 500, "artifact repair issue list failed");
+                return try publicOperationTextResponse(self.alloc, 500, "artifact repair issue list failed");
             },
-        }) orelse return try textResponse(self.alloc, 404, "not found");
+        }) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
 
         const response_body = try std.json.Stringify.valueAlloc(self.alloc, .{
@@ -11944,8 +11964,7 @@ pub const ApiHttpServer = struct {
             .next_cursor = result.next_cursor,
             .issues = result.issues,
         }, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(response_body);
-        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+        return .{ .status = 200, .body = response_body, .json = true };
     }
 
     const PublicRepairRunRequest = struct {
@@ -11959,23 +11978,23 @@ pub const ApiHttpServer = struct {
         repair_id: ?[]const u8 = null,
     };
 
-    pub fn handlePublicRunTableRepair(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        const source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
+    pub fn handlePublicRunTableRepair(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
+        const source = self.table_writes orelse return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         var parsed = std.json.parseFromSlice(PublicRepairRunRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 400, "invalid repair request");
+            return try publicOperationTextResponse(self.alloc, 400, "invalid repair request");
         };
         defer parsed.deinit();
-        const body_target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try textResponse(self.alloc, 400, "invalid repair target");
+        const body_target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try publicOperationTextResponse(self.alloc, 400, "invalid repair target");
         const target = body_target;
         const raw_limit = parsed.value.limit orelse 100;
-        if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
+        if (raw_limit == 0) return try publicOperationTextResponse(self.alloc, 400, "invalid limit");
         const limit: u32 = @min(raw_limit, 1000);
         const control = if (parsed.value.control) |raw|
-            std.meta.stringToEnum(db_mod.types.IndexRepairControl, raw) orelse return try textResponse(self.alloc, 400, "invalid repair control")
+            std.meta.stringToEnum(db_mod.types.IndexRepairControl, raw) orelse return try publicOperationTextResponse(self.alloc, 400, "invalid repair control")
         else
             null;
         const repair_id = if (parsed.value.repair_id) |raw|
-            std.fmt.parseInt(u128, raw, 10) catch return try textResponse(self.alloc, 400, "invalid repair id")
+            std.fmt.parseInt(u128, raw, 10) catch return try publicOperationTextResponse(self.alloc, 400, "invalid repair id")
         else
             null;
         var result = (source.repairArtifactIssues(self.alloc, table_name, .{
@@ -11988,13 +12007,13 @@ pub const ApiHttpServer = struct {
             .control = control,
             .repair_id = repair_id,
         }) catch |err| switch (err) {
-            error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid repair request"),
-            error.StaleIndexRepairControl => return try textResponse(self.alloc, 409, "repair changed; refresh and retry"),
+            error.InvalidArgument => return try publicOperationTextResponse(self.alloc, 400, "invalid repair request"),
+            error.StaleIndexRepairControl => return try publicOperationTextResponse(self.alloc, 409, "repair changed; refresh and retry"),
             else => {
                 std.log.err("table repair failed table={s} err={}", .{ table_name, err });
-                return try textResponse(self.alloc, 500, "table repair failed");
+                return try publicOperationTextResponse(self.alloc, 500, "table repair failed");
             },
-        }) orelse return try textResponse(self.alloc, 404, "not found");
+        }) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
         const response_body = try std.json.Stringify.valueAlloc(self.alloc, .{
             .table = table_name,
@@ -12002,18 +12021,17 @@ pub const ApiHttpServer = struct {
             .limit = limit,
             .result = result,
         }, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(response_body);
-        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+        return .{ .status = 200, .body = response_body, .json = true };
     }
 
-    pub fn handlePublicStartTableRepairJob(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        if (self.table_writes == null) return try textResponse(self.alloc, 405, "method not allowed");
+    pub fn handlePublicStartTableRepairJob(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
+        if (self.table_writes == null) return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         var parsed = std.json.parseFromSlice(repair_jobs.StartRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 400, "invalid repair job request");
+            return try publicOperationTextResponse(self.alloc, 400, "invalid repair job request");
         };
         defer parsed.deinit();
-        if (std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) == null) return try textResponse(self.alloc, 400, "invalid repair target");
-        if (parsed.value.limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
+        if (std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) == null) return try publicOperationTextResponse(self.alloc, 400, "invalid repair target");
+        if (parsed.value.limit == 0) return try publicOperationTextResponse(self.alloc, 400, "invalid limit");
 
         const encoded = try self.repair_job_store.startJob(self.alloc, table_name, .{
             .target = parsed.value.target,
@@ -12027,51 +12045,51 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(encoded);
         if (parsed.value.advance) {
             var parsed_state = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-                return try textResponse(self.alloc, 500, "repair job failed");
+                return try publicOperationTextResponse(self.alloc, 500, "repair job failed");
             };
             defer parsed_state.deinit();
             return try self.advanceTableRepairJobState(table_name, parsed_state.value);
         }
-        return try jsonBodyResponseWithStatus(self.alloc, 202, encoded);
+        return try publicOperationJsonResponse(self.alloc, 202, encoded);
     }
 
-    pub fn handlePublicTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
-        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+    pub fn handlePublicTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !public_table_http.OwnedResponse {
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try publicOperationTextResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "repair job failed");
+            return try publicOperationTextResponse(self.alloc, 500, "repair job failed");
         };
         defer parsed.deinit();
-        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try textResponse(self.alloc, 404, "not found");
-        return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try publicOperationTextResponse(self.alloc, 404, "not found");
+        return try publicOperationJsonResponse(self.alloc, 200, encoded);
     }
 
-    pub fn handlePublicAdvanceTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
-        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+    pub fn handlePublicAdvanceTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !public_table_http.OwnedResponse {
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try publicOperationTextResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "repair job failed");
+            return try publicOperationTextResponse(self.alloc, 500, "repair job failed");
         };
         defer parsed.deinit();
-        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try textResponse(self.alloc, 404, "not found");
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try publicOperationTextResponse(self.alloc, 404, "not found");
         return try self.advanceTableRepairJobState(table_name, parsed.value);
     }
 
-    pub fn handlePublicCancelTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
-        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+    pub fn handlePublicCancelTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !public_table_http.OwnedResponse {
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try publicOperationTextResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "repair job failed");
+            return try publicOperationTextResponse(self.alloc, 500, "repair job failed");
         };
         defer parsed.deinit();
-        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try textResponse(self.alloc, 404, "not found");
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try publicOperationTextResponse(self.alloc, 404, "not found");
         const cancelled = try self.repair_job_store.requestCancel(self.alloc, parsed.value);
         defer self.alloc.free(cancelled);
         var parsed_cancelled = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, cancelled, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "invalid repair job state");
+            return try publicOperationTextResponse(self.alloc, 500, "invalid repair job state");
         };
         defer parsed_cancelled.deinit();
         if (repair_jobs.requiresDurableCancel(parsed_cancelled.value) and
@@ -12079,25 +12097,25 @@ pub const ApiHttpServer = struct {
         {
             return try self.advanceTableRepairJobState(table_name, parsed_cancelled.value);
         }
-        return try jsonBodyResponseWithStatus(self.alloc, if (repair_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
+        return try publicOperationJsonResponse(self.alloc, if (repair_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
     }
 
-    fn advanceTableRepairJobState(self: *ApiHttpServer, table_name: []const u8, state: repair_jobs.JobState) !http_common.HttpResponse {
+    fn advanceTableRepairJobState(self: *ApiHttpServer, table_name: []const u8, state: repair_jobs.JobState) !public_table_http.OwnedResponse {
         if (repair_jobs.isTerminalPhase(state.phase)) {
             const encoded = try repair_jobs.encodeState(self.alloc, state);
             defer self.alloc.free(encoded);
-            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+            return try publicOperationJsonResponse(self.alloc, 200, encoded);
         }
 
         const begin = try self.repair_job_store.beginAdvance(self.alloc, state);
         defer self.alloc.free(begin.encoded);
         var parsed_running = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "invalid repair job state");
+            return try publicOperationTextResponse(self.alloc, 500, "invalid repair job state");
         };
         defer parsed_running.deinit();
         const running_state = parsed_running.value;
         if (!begin.started) {
-            return try jsonBodyResponseWithStatus(self.alloc, if (repair_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
+            return try publicOperationJsonResponse(self.alloc, if (repair_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
         }
 
         const updated = if (try self.submitTableRepairJobPass(table_name, begin.encoded, running_state.job_id)) |submitted|
@@ -12106,10 +12124,10 @@ pub const ApiHttpServer = struct {
             try self.runTableRepairJobPass(table_name, running_state);
         defer self.alloc.free(updated);
         var parsed_updated = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, updated, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "invalid repair job state");
+            return try publicOperationTextResponse(self.alloc, 500, "invalid repair job state");
         };
         defer parsed_updated.deinit();
-        return try jsonBodyResponseWithStatus(self.alloc, if (repair_jobs.isTerminalPhase(parsed_updated.value.phase)) 200 else 202, updated);
+        return try publicOperationJsonResponse(self.alloc, if (repair_jobs.isTerminalPhase(parsed_updated.value.phase)) 200 else 202, updated);
     }
 
     const TableRepairJobPassWork = struct {
@@ -12384,12 +12402,12 @@ pub const ApiHttpServer = struct {
         return try self.repair_job_store.recordPass(self.alloc, running_state, result);
     }
 
-    pub fn handlePublicStartDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        if (self.table_writes == null) return try textResponse(self.alloc, 405, "method not allowed");
+    pub fn handlePublicStartDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
+        if (self.table_writes == null) return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
         var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.StartRequest, self.alloc, if (body.len > 0) body else "{}", .{}) catch {
-            return try textResponse(self.alloc, 400, "invalid request");
+            return try publicOperationTextResponse(self.alloc, 400, "invalid request");
         };
         defer parsed.deinit();
 
@@ -12397,93 +12415,93 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(encoded);
         if (parsed.value.advance) {
             var parsed_state = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-                return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+                return try publicOperationTextResponse(self.alloc, 500, "artifact reprocess job failed");
             };
             defer parsed_state.deinit();
             return try self.advanceDocumentArtifactReprocessJobState(table_name, artifact_name, parsed_state.value);
         }
-        return try jsonBodyResponseWithStatus(self.alloc, 202, encoded);
+        return try publicOperationJsonResponse(self.alloc, 202, encoded);
     }
 
-    pub fn handlePublicDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+    pub fn handlePublicDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !public_table_http.OwnedResponse {
         const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
-        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try publicOperationTextResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+            return try publicOperationTextResponse(self.alloc, 500, "artifact reprocess job failed");
         };
         defer parsed.deinit();
         if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
-            return try textResponse(self.alloc, 404, "not found");
+            return try publicOperationTextResponse(self.alloc, 404, "not found");
         }
-        return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+        return try publicOperationJsonResponse(self.alloc, 200, encoded);
     }
 
-    pub fn handlePublicAdvanceDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+    pub fn handlePublicAdvanceDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !public_table_http.OwnedResponse {
         const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
-        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try publicOperationTextResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+            return try publicOperationTextResponse(self.alloc, 500, "artifact reprocess job failed");
         };
         defer parsed.deinit();
         if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
-            return try textResponse(self.alloc, 404, "not found");
+            return try publicOperationTextResponse(self.alloc, 404, "not found");
         }
         return try self.advanceDocumentArtifactReprocessJobState(table_name, artifact_name, parsed.value);
     }
 
-    pub fn handlePublicCancelDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+    pub fn handlePublicCancelDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !public_table_http.OwnedResponse {
         const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
-        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try publicOperationTextResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+            return try publicOperationTextResponse(self.alloc, 500, "artifact reprocess job failed");
         };
         defer parsed.deinit();
         if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
-            return try textResponse(self.alloc, 404, "not found");
+            return try publicOperationTextResponse(self.alloc, 404, "not found");
         }
         if (artifact_reprocess_jobs.isTerminalPhase(parsed.value.phase)) {
-            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+            return try publicOperationJsonResponse(self.alloc, 200, encoded);
         }
         const cancelled = try self.artifact_reprocess_job_store.requestCancel(self.alloc, parsed.value);
         defer self.alloc.free(cancelled);
         var parsed_cancelled = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, cancelled, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "invalid artifact reprocess job state");
+            return try publicOperationTextResponse(self.alloc, 500, "invalid artifact reprocess job state");
         };
         defer parsed_cancelled.deinit();
-        return try jsonBodyResponseWithStatus(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
+        return try publicOperationJsonResponse(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
     }
 
-    fn advanceDocumentArtifactReprocessJobState(self: *ApiHttpServer, table_name: []const u8, artifact_name: []const u8, state: artifact_reprocess_jobs.JobState) !http_common.HttpResponse {
+    fn advanceDocumentArtifactReprocessJobState(self: *ApiHttpServer, table_name: []const u8, artifact_name: []const u8, state: artifact_reprocess_jobs.JobState) !public_table_http.OwnedResponse {
         if (artifact_reprocess_jobs.isTerminalPhase(state.phase)) {
             const encoded = try artifact_reprocess_jobs.encodeState(self.alloc, state);
             defer self.alloc.free(encoded);
-            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+            return try publicOperationJsonResponse(self.alloc, 200, encoded);
         }
 
         const begin = try self.artifact_reprocess_job_store.beginAdvance(self.alloc, state);
         defer self.alloc.free(begin.encoded);
         var parsed_running = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "invalid job state");
+            return try publicOperationTextResponse(self.alloc, 500, "invalid job state");
         };
         defer parsed_running.deinit();
         const running_state = parsed_running.value;
         if (!begin.started) {
-            return try jsonBodyResponseWithStatus(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
+            return try publicOperationJsonResponse(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
         }
 
         const source = self.table_writes orelse {
             const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
             defer self.alloc.free(failed);
-            return try textResponse(self.alloc, 405, "method not allowed");
+            return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         };
 
         const shard_resumes = try self.alloc.alloc(db_mod.types.DocumentArtifactReprocessShardResume, running_state.shard_cursors.len);
@@ -12505,35 +12523,35 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => {
                 const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
-                return try textResponse(self.alloc, 503, "doc identity unavailable");
+                return try publicOperationTextResponse(self.alloc, 503, "doc identity unavailable");
             },
             error.InvalidArgument => {
                 const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
-                return try textResponse(self.alloc, 400, "invalid request");
+                return try publicOperationTextResponse(self.alloc, 400, "invalid request");
             },
             error.NotFound => {
                 const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
-                return try textResponse(self.alloc, 404, "not found");
+                return try publicOperationTextResponse(self.alloc, 404, "not found");
             },
             else => {
                 const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
                 std.log.err("public document artifact reprocess job failed table={s} artifact={s} job_id={d} err={}", .{ table_name, artifact_name, running_state.job_id, err });
-                return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+                return try publicOperationTextResponse(self.alloc, 500, "artifact reprocess job failed");
             },
         };
         if (result == null) {
             const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
             defer self.alloc.free(failed);
-            return try textResponse(self.alloc, 405, "method not allowed");
+            return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         }
         var pass = result.?;
         defer pass.deinit(self.alloc);
         const updated = try self.artifact_reprocess_job_store.recordPass(self.alloc, running_state, pass);
         defer self.alloc.free(updated);
-        return try jsonBodyResponseWithStatus(self.alloc, 202, updated);
+        return try publicOperationJsonResponse(self.alloc, 202, updated);
     }
 
     pub fn handlePublicTableBackup(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -15605,6 +15623,56 @@ fn jsonBodyResponseWithStatus(
         .status = status,
         .content_type = try alloc.dupe(u8, "application/json"),
         .body = try alloc.dupe(u8, body),
+    };
+}
+
+fn publicOperationTextResponse(
+    alloc: std.mem.Allocator,
+    status: u16,
+    body: []const u8,
+) !public_table_http.OwnedResponse {
+    return .{
+        .status = status,
+        .body = try alloc.dupe(u8, body),
+    };
+}
+
+fn publicOperationJsonResponse(
+    alloc: std.mem.Allocator,
+    status: u16,
+    body: []const u8,
+) !public_table_http.OwnedResponse {
+    return .{
+        .status = status,
+        .body = try alloc.dupe(u8, body),
+        .json = true,
+    };
+}
+
+/// Temporary adapter used only by the residual synthetic-request dispatcher.
+/// Production httpx routes consume `OwnedResponse` directly.
+fn legacyResponseFromPublicOperation(
+    alloc: std.mem.Allocator,
+    response: public_table_http.OwnedResponse,
+) !http_common.HttpResponse {
+    const content_type = try alloc.dupe(u8, if (response.json) "application/json" else "text/plain");
+    errdefer alloc.free(content_type);
+    const body = try alloc.dupe(u8, response.body);
+    errdefer alloc.free(body);
+    var headers: []http_common.Header = &.{};
+    if (response.retry_after_seconds) |seconds| {
+        headers = try alloc.alloc(http_common.Header, 1);
+        errdefer alloc.free(headers);
+        var value_buf: [10]u8 = undefined;
+        const value = try std.fmt.bufPrint(&value_buf, "{d}", .{seconds});
+        headers[0] = try ownedHeader(alloc, "Retry-After", value);
+        errdefer headers[0].deinit(alloc);
+    }
+    return .{
+        .status = response.status,
+        .content_type = content_type,
+        .headers = headers,
+        .body = body,
     };
 }
 

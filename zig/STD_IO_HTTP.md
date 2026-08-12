@@ -218,19 +218,25 @@ that end state:
   operation arms still delegate to legacy response-returning application
   helpers; extracting those final operation results is the remaining MCP
   boundary, rather than retaining an HTTP fallback.
-- Remaining non-generated route families share one explicitly temporary
-  request/response compatibility module, preventing per-runtime wire glue from
-  diverging while each family is extracted. Data and metadata register those
-  families from one explicit compatibility manifest; neither public listener
-  has a global catch-all, so generated namespaces and unknown paths retain
-  native `httpx` 404 behavior.
+- Public table-repair and document-artifact reprocess job handlers now return
+  owned typed responses directly to their concrete `httpx` routes. The
+  residual synthetic public dispatcher has a temporary one-way adapter for
+  its test and compatibility callers; production ingress does not allocate a
+  legacy `HttpResponse` for these route families.
+- The former shared non-generated compatibility manifest and listener
+  catch-alls are gone. Metadata has no manual dispatcher, and data and
+  standalone register generated and contextual families explicitly. Unknown
+  paths therefore retain native `httpx` 404 behavior. The remaining legacy
+  surface is inside the public application helpers and the synthetic
+  `ApiHttpServer.handle()` adapter, not in runtime route registration.
 
-The remaining application migration is intentionally explicit: non-OpenAPI
-admin/internal route families still use compatibility adapters, and public API
-handlers still delegate substantial business behavior to `ApiHttpServer`.
-Those adapters are deletion scaffolding, not a second supported transport.
-Completion requires extracting the typed kernel operations and contextual
-registrars described below, then deleting the compatibility paths.
+The remaining application migration is intentionally explicit: generated
+public API handlers still delegate substantial business behavior to
+`ApiHttpServer`, and its synthetic dispatcher remains for legacy tests and
+in-process fixtures. That adapter is deletion scaffolding, not a second
+supported transport. Completion requires extracting the remaining typed
+kernel operations, migrating those fixtures to direct operations or real
+`httpx` test listeners, and then deleting the compatibility path.
 
 ## Goals
 

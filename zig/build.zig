@@ -4643,7 +4643,6 @@ pub fn build(b: *std.Build) void {
         "api http server surfaces structured torn-state conflicts when txn record is corrupted",
         "api http server serves transaction session cleanup route",
         "api http server serves table metadata list and detail",
-        "api http server exposes storage status and asynchronous maintenance jobs",
         "api http server serves runtime schema debug on table and index detail",
         "api http server serves table index metadata routes",
         "api runtime status upsert keeps one authoritative observation per group",

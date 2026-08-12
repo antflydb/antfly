@@ -412,7 +412,11 @@ pub const AntflyApiHandler = struct {
     }
 
     fn respondOwnedApiResponse(ctx: *httpx.Context, resp: anytype) !httpx.Response {
-        defer resp.deinit(ctx.allocator);
+        return respondOwnedApiResponseWithAllocator(ctx, resp, ctx.allocator);
+    }
+
+    fn respondOwnedApiResponseWithAllocator(ctx: *httpx.Context, resp: anytype, alloc: std.mem.Allocator) !httpx.Response {
+        defer resp.deinit(alloc);
         const Response = @TypeOf(resp.*);
         _ = ctx.status(resp.status);
         const is_json = if (@hasField(Response, "json")) resp.json else resp.status >= 200 and resp.status < 300;
@@ -4091,8 +4095,8 @@ pub const AntflyApiHandler = struct {
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageReadTemporarilyUnavailable,
             => {
-                var response = try http_server_mod.storageReadTemporarilyUnavailableResponse(self.api_server.alloc);
-                return respondWithAllocator(ctx, &response, self.api_server.alloc);
+                var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
+                return respondOwnedApiResponse(ctx, &response);
             },
             else => return err,
         }) orelse {
@@ -4153,8 +4157,8 @@ pub const AntflyApiHandler = struct {
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageReadTemporarilyUnavailable,
             => {
-                var response = try http_server_mod.storageReadTemporarilyUnavailableResponse(self.api_server.alloc);
-                return respondWithAllocator(ctx, &response, self.api_server.alloc);
+                var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
+                return respondOwnedApiResponse(ctx, &response);
             },
             else => return err,
         }) orelse {
@@ -4258,7 +4262,7 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
         var response = try self.api_server.handlePublicListArtifactRepairIssues(decoded_table_name, body_data);
-        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+        return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
     pub fn listArtifactRepairIssues(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -4276,7 +4280,7 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
         var response = try self.api_server.handlePublicRunTableRepair(decoded_table_name, body_data);
-        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+        return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
     pub fn startTableRepairJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -4290,7 +4294,7 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
         var response = try self.api_server.handlePublicStartTableRepairJob(decoded_table_name, body_data);
-        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+        return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
     pub fn getTableRepairJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
@@ -4300,7 +4304,7 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         var response = try self.api_server.handlePublicTableRepairJob(decoded_table_name, job_id);
-        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+        return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
     pub fn advanceTableRepairJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
@@ -4310,7 +4314,7 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         var response = try self.api_server.handlePublicAdvanceTableRepairJob(decoded_table_name, job_id);
-        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+        return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
     pub fn cancelTableRepairJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
@@ -4320,7 +4324,7 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         var response = try self.api_server.handlePublicCancelTableRepairJob(decoded_table_name, job_id);
-        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+        return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
     pub fn reprocessDocumentArtifact(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response {
@@ -4364,7 +4368,7 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
         var response = try self.api_server.handlePublicStartDocumentArtifactReprocessJob(decoded_table_name, artifact_name, body_data);
-        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+        return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
     pub fn getDocumentArtifactReprocessJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response {
@@ -4374,7 +4378,7 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         var response = try self.api_server.handlePublicDocumentArtifactReprocessJob(decoded_table_name, artifact_name, job_id);
-        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+        return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
     pub fn advanceDocumentArtifactReprocessJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response {
@@ -4384,7 +4388,7 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         var response = try self.api_server.handlePublicAdvanceDocumentArtifactReprocessJob(decoded_table_name, artifact_name, job_id);
-        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+        return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
     pub fn cancelDocumentArtifactReprocessJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response {
@@ -4394,7 +4398,7 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         var response = try self.api_server.handlePublicCancelDocumentArtifactReprocessJob(decoded_table_name, artifact_name, job_id);
-        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+        return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
     pub fn listIndexes(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
