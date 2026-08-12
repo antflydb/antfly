@@ -2184,6 +2184,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ai/v1/classify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Classify text against candidate labels
+         * @description Classifies one or more texts with either a zero-shot NLI classifier or
+         *     a classification-capable extractor model. Candidate labels are supplied
+         *     per request, and `multi_label` controls whether their scores are
+         *     independent or normalized across labels.
+         */
+        post: operations["classifyText"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ai/v1/read": {
         parameters: {
             query?: never;
@@ -11556,6 +11579,77 @@ export interface components {
             /** @description Rewritten texts for this input, one per beam. */
             texts: string[];
         };
+        InferenceClassifyRequest: {
+            /**
+             * @description Name of classifier model from models_dir/classifiers/
+             * @example MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
+             */
+            model: string;
+            /**
+             * @description Texts to classify
+             * @example [
+             *       "I love this product!",
+             *       "The service was terrible."
+             *     ]
+             */
+            texts: string[];
+            /**
+             * @description Candidate labels for zero-shot classification.
+             *     The model will predict which label(s) best describe each text.
+             * @example [
+             *       "positive",
+             *       "negative",
+             *       "neutral"
+             *     ]
+             */
+            labels: string[];
+            /**
+             * @description Custom hypothesis template for NLI-based classification.
+             *     Use "{}" as placeholder for the label.
+             *     Default: "This example is {}."
+             * @example This text expresses a {} sentiment.
+             */
+            hypothesis_template?: string;
+            /**
+             * @description If true, allows multiple labels per text (independent scoring).
+             *     If false (default), scores are normalized across labels.
+             * @default false
+             */
+            multi_label?: boolean;
+        };
+        InferenceClassifyResult: {
+            /**
+             * @description The predicted class/category
+             * @example positive
+             */
+            label: string;
+            /**
+             * Format: float
+             * @description Confidence score (0.0 to 1.0)
+             * @example 0.95
+             */
+            score: number;
+        };
+        InferenceClassifyResponse: {
+            /**
+             * @description Object type, always "list"
+             * @enum {string}
+             */
+            object: "list";
+            /** @description Classification result objects, one per input text. */
+            data: components["schemas"]["InferenceClassifyObject"][];
+            /** @description Name of model used for classification */
+            model: string;
+            usage: components["schemas"]["InferenceGenerateUsage"];
+        };
+        InferenceClassifyObject: {
+            /** @enum {string} */
+            object: "classification";
+            /** @description Original input text index. */
+            index: number;
+            /** @description Classification results for this input text. */
+            classifications: components["schemas"]["InferenceClassifyResult"][];
+        };
         InferenceReadRequest: {
             /**
              * @description Name of reader model from models_dir/readers/
@@ -17001,6 +17095,68 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceRewriteResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    classifyText: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceClassifyRequest"];
+            };
+        };
+        responses: {
+            /** @description Text classified successfully */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceClassifyResponse"];
                 };
             };
             /** @description Invalid request */

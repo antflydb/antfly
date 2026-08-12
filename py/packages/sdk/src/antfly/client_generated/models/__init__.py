@@ -309,6 +309,12 @@ from .inference_chunk_object_object import InferenceChunkObjectObject
 from .inference_chunk_request import InferenceChunkRequest
 from .inference_chunk_response import InferenceChunkResponse
 from .inference_chunk_response_object import InferenceChunkResponseObject
+from .inference_classify_object import InferenceClassifyObject
+from .inference_classify_object_object import InferenceClassifyObjectObject
+from .inference_classify_request import InferenceClassifyRequest
+from .inference_classify_response import InferenceClassifyResponse
+from .inference_classify_response_object import InferenceClassifyResponseObject
+from .inference_classify_result import InferenceClassifyResult
 from .inference_config import InferenceConfig
 from .inference_config_model_strategies import InferenceConfigModelStrategies
 from .inference_config_model_strategies_additional_property import InferenceConfigModelStrategiesAdditionalProperty
@@ -1030,6 +1036,12 @@ __all__ = (
     "InferenceChunkRequest",
     "InferenceChunkResponse",
     "InferenceChunkResponseObject",
+    "InferenceClassifyObject",
+    "InferenceClassifyObjectObject",
+    "InferenceClassifyRequest",
+    "InferenceClassifyResponse",
+    "InferenceClassifyResponseObject",
+    "InferenceClassifyResult",
     "InferenceConfig",
     "InferenceConfigModelStrategies",
     "InferenceConfigModelStrategiesAdditionalProperty",
