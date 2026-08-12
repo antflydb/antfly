@@ -70,6 +70,8 @@ const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseJsonObjectAlloc = json_helpers.parseJsonObjectAlloc;
 const parseJsonPathValueAlloc = json_helpers.parseJsonPathValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
+const common_config = @import("../../common/config.zig");
+const RequestAdmission = @import("../../common/request_admission.zig").RequestAdmission;
 
 pub const HttpRequest = http_types.HttpRequest;
 pub const HttpResponse = http_types.HttpResponse;
@@ -182,6 +184,8 @@ pub const HttpHandler = struct {
     published_search_sources: search_sources.PublishedSearchSources = .{},
     runtime_status: *const api_types.RuntimeStatusResult,
     runtime_metrics: ?*runtime_manager.ManagedRuntime = null,
+    query_admission: RequestAdmission = RequestAdmission.init(common_config.default_query_max_concurrent_requests),
+    write_admission: RequestAdmission = RequestAdmission.init(common_config.default_write_max_concurrent_requests),
 
     pub fn init(
         alloc: Allocator,
@@ -205,6 +209,40 @@ pub const HttpHandler = struct {
 
     pub fn handle(self: *HttpHandler, req: HttpRequest) !HttpResponse {
         const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
+        const admission: ?*RequestAdmission = switch (route) {
+            .query,
+            .table_query,
+            .table_query_request,
+            .table_query_published,
+            .table_query_latest,
+            .query_search,
+            .table_query_search,
+            .table_query_graph_neighbors,
+            .table_query_graph_traverse,
+            .table_query_graph_shortest_path,
+            .query_graph_neighbors,
+            .query_graph_traverse,
+            .query_graph_shortest_path,
+            .query_head,
+            .query_latest,
+            .query_version,
+            .query_version_graph_neighbors,
+            .query_version_graph_traverse,
+            .query_version_graph_shortest_path,
+            .query_head_artifact,
+            .query_version_artifact,
+            => &self.query_admission,
+            .ingest_batch, .ingest_table_batch, .table_batch => &self.write_admission,
+            else => null,
+        };
+        if (admission) |gate| {
+            if (!gate.tryAcquire()) {
+                var response = try textResponse(self.alloc, 429, if (gate == &self.query_admission) "query capacity exhausted" else "write capacity exhausted");
+                response.retry_after_seconds = 1;
+                return response;
+            }
+        }
+        defer if (admission) |gate| gate.release();
 
         return switch (route) {
             .health => try self.handleHealth(),
@@ -264,6 +302,11 @@ pub const HttpHandler = struct {
             .query_head_artifact => |value| try self.handleQueryHeadArtifact(value.namespace, value.artifact_index),
             .query_version_artifact => |value| try self.handleQueryVersionArtifact(value.namespace, value.version.?, value.artifact_index),
         };
+    }
+
+    pub fn configureAdmission(self: *HttpHandler, query_capacity: usize, write_capacity: usize) void {
+        self.query_admission = RequestAdmission.init(query_capacity);
+        self.write_admission = RequestAdmission.init(write_capacity);
     }
 
     pub fn setRuntimeMetrics(self: *HttpHandler, runtime: *runtime_manager.ManagedRuntime) void {
@@ -6250,7 +6293,7 @@ fn textResponse(alloc: Allocator, status: u16, body: []const u8) !HttpResponse {
     };
 }
 
-test "http handler serves internal namespace lifecycle and query head" {
+test "serverless http handler serves internal namespace lifecycle, admission, and query head" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -6388,6 +6431,27 @@ test "http handler serves internal namespace lifecycle and query head" {
     try std.testing.expectEqual(@as(u64, 123), parsed_create.value.created_at_ns);
     try std.testing.expectEqual(@as(u64, 4), parsed_create.value.policy.keep_latest_versions);
     try std.testing.expectEqual(shared_vector.DistanceMetric.inner_product, parsed_create.value.policy.vector_distance_metric);
+
+    handler.configureAdmission(1, 1);
+    try std.testing.expect(handler.query_admission.tryAcquire());
+    try std.testing.expect(handler.write_admission.tryAcquire());
+    var saturated_query = try handler.handle(.{
+        .method = .get,
+        .path = "/internal/v1/namespaces/docs/query/head",
+    });
+    defer saturated_query.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), saturated_query.status);
+    try std.testing.expectEqual(@as(?u32, 1), saturated_query.retry_after_seconds);
+    var saturated_write = try handler.handle(.{
+        .method = .put,
+        .path = "/internal/v1/namespaces/docs/ingest-batch",
+        .body = "{}",
+    });
+    defer saturated_write.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), saturated_write.status);
+    try std.testing.expectEqual(@as(?u32, 1), saturated_write.retry_after_seconds);
+    handler.query_admission.release();
+    handler.write_admission.release();
 
     var list = try handler.handle(.{
         .method = .get,

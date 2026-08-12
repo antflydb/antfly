@@ -599,11 +599,16 @@ pub const RestoreExecutionGuard = struct {
     is_current: *const fn (ptr: *anyopaque, leadership_term: u64) bool,
 };
 
+/// Shared by every public protocol adapter for foreground workload admission.
+pub const RequestAdmission = @import("../common/request_admission.zig").RequestAdmission;
+
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     experimental: bool = false,
-    /// Node-local query/search admission capacity. Zero disables the limit.
-    max_concurrent_requests: u32 = common_config.default_max_concurrent_requests,
+    /// Node-local public database-query admission capacity. Zero disables it.
+    query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
+    /// Node-local foreground data-mutation admission capacity. Zero disables it.
+    write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     ard_base_url: ?[]const u8 = null,
     ard_publisher_domain: []const u8 = "antfly.local",
     ard_display_name: []const u8 = "Antfly",
@@ -1696,6 +1701,8 @@ pub const ApiHttpServer = struct {
     alloc: std.mem.Allocator,
     owner_alloc: std.mem.Allocator,
     cfg: ApiHttpServerConfig,
+    query_admission: RequestAdmission,
+    write_admission: RequestAdmission,
     source: StatusSource,
     metadata_mutation_retry_policy: MetadataMutationRetryPolicy = .{},
     table_reads: ?table_reads.TableReadSource = null,
@@ -1857,6 +1864,8 @@ pub const ApiHttpServer = struct {
             .alloc = request_alloc,
             .owner_alloc = owner_alloc,
             .cfg = cfg,
+            .query_admission = RequestAdmission.init(cfg.query_max_concurrent_requests),
+            .write_admission = RequestAdmission.init(cfg.write_max_concurrent_requests),
             .source = source,
             .table_reads = table_read_source,
             .table_writes = table_write_source,
@@ -1950,6 +1959,38 @@ pub const ApiHttpServer = struct {
             .query_embedding_cache = self.query_embedding_cache.stats(self.inferenceCacheBudget()),
             .inference_cache_budget = self.inferenceCacheBudget().stats(),
         };
+    }
+
+    pub fn queryAdmissionStats(self: *const ApiHttpServer) RequestAdmission.Stats {
+        return self.query_admission.stats();
+    }
+
+    pub fn tryAcquireQuery(self: *ApiHttpServer) bool {
+        return self.query_admission.tryAcquire();
+    }
+
+    pub fn releaseQuery(self: *ApiHttpServer) void {
+        self.query_admission.release();
+    }
+
+    pub fn queryOverloadedResponse(self: *ApiHttpServer) !http_common.HttpResponse {
+        return try retryableTextResponse(self.alloc, 429, "query capacity exhausted");
+    }
+
+    pub fn writeAdmissionStats(self: *const ApiHttpServer) RequestAdmission.Stats {
+        return self.write_admission.stats();
+    }
+
+    pub fn tryAcquireWrite(self: *ApiHttpServer) bool {
+        return self.write_admission.tryAcquire();
+    }
+
+    pub fn releaseWrite(self: *ApiHttpServer) void {
+        self.write_admission.release();
+    }
+
+    pub fn writeOverloadedResponse(self: *ApiHttpServer) !http_common.HttpResponse {
+        return try retryableTextResponse(self.alloc, 429, "write capacity exhausted");
     }
 
     pub fn setHAInternalExecutor(self: *ApiHttpServer, executor_value: ?http_common.RequestExecutor) void {
@@ -4996,6 +5037,8 @@ pub const ApiHttpServer = struct {
         if (req.method == .POST) {
             if (std.mem.eql(u8, uri_parts.path, routes.Routes.transactions_commit)) {
                 const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
+                if (!self.tryAcquireWrite()) return try self.writeOverloadedResponse();
+                defer self.releaseWrite();
                 var commit_req = transactions_api.parseCommitRequest(self.alloc, req.body) catch |err| switch (err) {
                     error.InvalidTransactionCommitRequest => {
                         return try textResponse(self.alloc, 400, "invalid transaction commit request");
@@ -5350,6 +5393,8 @@ pub const ApiHttpServer = struct {
                 if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
                     return try textResponse(self.alloc, 404, "not found");
                 }
+                if (!self.tryAcquireWrite()) return try self.writeOverloadedResponse();
+                defer self.releaseWrite();
                 const session = self.txn_sessions.getInfo(txn_id) orelse return try textResponse(self.alloc, 404, "not found");
 
                 var parsed_req: ?transactions_api.OwnedTransactionCommitRequest = null;
@@ -5729,6 +5774,11 @@ pub const ApiHttpServer = struct {
             try queue.status(alloc, task_id, context_id, "failed", "not found");
             return;
         };
+        if (!self.tryAcquireQuery()) {
+            try queue.status(alloc, task_id, context_id, "failed", "query capacity exhausted");
+            return;
+        }
+        defer self.releaseQuery();
 
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
@@ -5956,6 +6006,8 @@ pub const ApiHttpServer = struct {
     fn executeInternalRetrievalRoute(ptr: *anyopaque, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         if (req.method != .POST or !std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return null;
+        if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
+        defer self.releaseQuery();
 
         const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
 
@@ -6727,6 +6779,8 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTableMerge(uri_parts.path)) |merge_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, merge_route.table_name);
                 defer self.alloc.free(table_name);
+                if (!self.tryAcquireWrite()) return try self.writeOverloadedResponse();
+                defer self.releaseWrite();
                 const reads = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
                 const writes = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
                 if (!(try self.tableExists(table_name))) return try textResponse(self.alloc, 404, "not found");
@@ -11391,6 +11445,8 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicTableBatch(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        if (!self.tryAcquireWrite()) return try self.writeOverloadedResponse();
+        defer self.releaseWrite();
         var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi());
         defer resp.deinit(self.alloc);
         var response = switch (resp.status) {
@@ -11437,6 +11493,22 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !http_common.HttpResponse {
+        if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
+        defer self.releaseQuery();
+        return try self.handleAdmittedPublicTableQueryWithContentTypeCancellation(table_name, body, content_type, authenticated_identity, cancellation);
+    }
+
+    /// Executes a public table query while the caller holds this server's
+    /// query-admission permit. Protocol adapters use this to preserve their
+    /// transport-specific overload response without double acquisition.
+    pub fn handleAdmittedPublicTableQueryWithContentTypeCancellation(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        content_type: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !http_common.HttpResponse {
         if (isNdjsonContentType(content_type)) {
             return try self.handlePublicTableMultiQueryWithCancellation(table_name, body, authenticated_identity, cancellation);
         }
@@ -11451,6 +11523,17 @@ pub const ApiHttpServer = struct {
     /// Keep the cancellation-aware variant public so alternate listeners do
     /// not silently lose the public query cancellation contract.
     pub fn handlePublicGlobalMultiQueryWithCancellation(
+        self: *ApiHttpServer,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !http_common.HttpResponse {
+        if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
+        defer self.releaseQuery();
+        return try self.handleAdmittedPublicGlobalMultiQueryWithCancellation(body, authenticated_identity, cancellation);
+    }
+
+    pub fn handleAdmittedPublicGlobalMultiQueryWithCancellation(
         self: *ApiHttpServer,
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
@@ -11535,7 +11618,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, null);
+        return try self.handlePublicTableQueryWithContentTypeCancellation(table_name, body, null, authenticated_identity, null);
     }
 
     fn handlePublicTableQueryWithCancellation(
@@ -27654,6 +27737,86 @@ test "api http server preserves public query availability errors" {
         try std.testing.expectEqualStrings(case.body, multi_resp.body);
         try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", multi_resp.content_type.?);
     }
+}
+
+test "shared query admission covers direct and MCP-style API dispatch" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var server = ApiHttpServer.init(
+        alloc,
+        .{ .query_max_concurrent_requests = 1 },
+        FakeSource.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+    try std.testing.expect(server.tryAcquireQuery());
+    defer server.releaseQuery();
+
+    // MCP's query tool forwards through this same ApiHttpServer.handle path.
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/query",
+        .content_type = "application/json",
+        .body = "{\"limit\":1}",
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 429), response.status);
+    try std.testing.expectEqualStrings("query capacity exhausted", response.body);
+    try std.testing.expectEqual(@as(usize, 1), response.headers.len);
+    try std.testing.expectEqualStrings("Retry-After", response.headers[0].name);
+    try std.testing.expectEqualStrings("1", response.headers[0].value);
+    try std.testing.expectEqual(@as(u64, 1), server.queryAdmissionStats().rejected_total);
+}
+
+test "shared write admission rejects mutations while control routes remain available" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var server = ApiHttpServer.init(
+        alloc,
+        .{ .write_max_concurrent_requests = 1 },
+        FakeSource.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+    try std.testing.expect(server.tryAcquireWrite());
+    defer server.releaseWrite();
+
+    var rejected = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}}}",
+    });
+    defer rejected.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), rejected.status);
+    try std.testing.expectEqualStrings("write capacity exhausted", rejected.body);
+    try std.testing.expectEqualStrings("1", rejected.header("Retry-After").?);
+
+    var status = try server.handle(.{ .method = .GET, .uri = "/status" });
+    defer status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), status.status);
+    try std.testing.expectEqual(@as(u64, 1), server.writeAdmissionStats().rejected_total);
 }
 
 test "api http server maps cancelled NDJSON multi-query to client closed response" {

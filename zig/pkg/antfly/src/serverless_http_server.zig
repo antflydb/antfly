@@ -74,12 +74,28 @@ pub const ServerlessHttpServer = struct {
         });
         defer resp.deinit(self.alloc);
 
-        return .{
+        var response = http_common.HttpResponse{
             .status = resp.status,
             .owner_allocator = self.alloc,
             .content_type = try self.alloc.dupe(u8, resp.content_type),
             .body = try self.alloc.dupe(u8, resp.body),
         };
+        errdefer response.deinit(self.alloc);
+        if (resp.retry_after_seconds) |seconds| {
+            const value = try std.fmt.allocPrint(self.alloc, "{d}", .{seconds});
+            defer self.alloc.free(value);
+            const name_owned = try self.alloc.dupe(u8, "Retry-After");
+            errdefer self.alloc.free(name_owned);
+            const value_owned = try self.alloc.dupe(u8, value);
+            errdefer self.alloc.free(value_owned);
+            const headers = try self.alloc.alloc(http_common.Header, 1);
+            headers[0] = .{
+                .name = name_owned,
+                .value = value_owned,
+            };
+            response.headers = headers;
+        }
+        return response;
     }
 
     fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {

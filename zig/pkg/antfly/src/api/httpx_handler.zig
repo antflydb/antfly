@@ -21,7 +21,6 @@
 /// the respond() helper for methods that return http_common.HttpResponse.
 const std = @import("std");
 const httpx = @import("httpx");
-const common_config = @import("../common/config.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const PeerObserver = @import("../common/http/peer_disconnect_observer.zig").Observer;
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -89,66 +88,15 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
 }
 
-/// Bounded admission for expensive public query execution.  This lives at the
-/// httpx adapter boundary so status, auth, and other control routes retain a
-/// path even when query workers are saturated.
-pub const QueryAdmission = struct {
-    /// Match the provisioned public listener's expensive-request budget so
-    /// standalone and clustered deployments shed load at the same point.
-    capacity: usize = common_config.default_max_concurrent_requests,
-    in_flight: std.atomic.Value(usize) = .init(0),
-    rejected_total: std.atomic.Value(u64) = .init(0),
-    peak_in_flight: std.atomic.Value(usize) = .init(0),
-
-    pub fn init(capacity: usize) QueryAdmission {
-        return .{ .capacity = capacity };
-    }
-
-    pub fn tryAcquire(self: *QueryAdmission) bool {
-        var observed = self.in_flight.load(.acquire);
-        while (self.capacity == 0 or observed < self.capacity) {
-            if (self.in_flight.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire) == null) {
-                const admitted = observed + 1;
-                var peak = self.peak_in_flight.load(.acquire);
-                while (peak < admitted) {
-                    if (self.peak_in_flight.cmpxchgWeak(peak, admitted, .acq_rel, .acquire) == null) break;
-                    peak = self.peak_in_flight.load(.acquire);
-                }
-                return true;
-            }
-            observed = self.in_flight.load(.acquire);
-        }
-        _ = self.rejected_total.fetchAdd(1, .monotonic);
-        return false;
-    }
-
-    pub fn release(self: *QueryAdmission) void {
-        _ = self.in_flight.fetchSub(1, .acq_rel);
-    }
-
-    pub const Stats = struct {
-        capacity: usize,
-        in_flight: usize,
-        peak_in_flight: usize,
-        rejected_total: u64,
-    };
-
-    pub fn stats(self: *const QueryAdmission) Stats {
-        return .{
-            .capacity = self.capacity,
-            .in_flight = self.in_flight.load(.acquire),
-            .peak_in_flight = self.peak_in_flight.load(.acquire),
-            .rejected_total = self.rejected_total.load(.acquire),
-        };
-    }
-};
+pub const RequestAdmission = http_server_mod.RequestAdmission;
+const default_query_body_admission_capacity: usize = 32;
+const default_query_peer_observer_capacity: usize = 256;
 
 pub const AntflyApiHandler = struct {
     api_server: *ApiHttpServer,
-    query_admission: QueryAdmission = .{},
     /// Separate phase admission for H2 query bodies. Slow uploads must not
     /// consume execution permits, but still need a global waiter bound.
-    query_body_admission: QueryAdmission = .{},
+    query_body_admission: RequestAdmission = RequestAdmission.init(default_query_body_admission_capacity),
     peer_observer: ?PeerObserver = null,
     cancellation_watcher_start_failures_total: std.atomic.Value(u64) = .init(0),
     peer_disconnect_cancellations_total: std.atomic.Value(u64) = .init(0),
@@ -175,7 +123,10 @@ pub const AntflyApiHandler = struct {
     /// this runtime is unavailable.
     pub fn initRuntime(self: *AntflyApiHandler, alloc: std.mem.Allocator) !void {
         if (self.peer_observer != null) return error.AlreadyStarted;
-        self.peer_observer = PeerObserver.init(alloc, self.query_admission.capacity);
+        // Socket observation is a transport safeguard. Keep its bounded pool
+        // independent from query admission, including when query capacity is
+        // explicitly unlimited (zero).
+        self.peer_observer = PeerObserver.init(alloc, default_query_peer_observer_capacity);
         self.peer_observer.?.start() catch |err| {
             self.peer_observer.?.deinit();
             self.peer_observer = null;
@@ -454,6 +405,12 @@ pub const AntflyApiHandler = struct {
         // they do not retain connection-admission permits.
         if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
         return textResponse(ctx, 429, "query capacity exhausted");
+    }
+
+    fn writeOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
+        return textResponse(ctx, 429, "write capacity exhausted");
     }
 
     fn queryBodyOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
@@ -738,6 +695,8 @@ pub const AntflyApiHandler = struct {
         response_mode: CommitResponseMode,
     ) !httpx.Response {
         const alloc = ctx.allocator;
+        if (!self.api_server.tryAcquireWrite()) return writeOverloadedResponse(ctx);
+        defer self.api_server.releaseWrite();
         const source = self.api_server.table_writes orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -1387,6 +1346,8 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
+        if (!self.api_server.tryAcquireWrite()) return writeOverloadedResponse(ctx);
+        defer self.api_server.releaseWrite();
         const alloc = self.api_server.alloc;
         const session = self.api_server.txn_sessions.getInfo(txn_id) orelse {
             _ = ctx.status(404);
@@ -1825,15 +1786,15 @@ pub const AntflyApiHandler = struct {
         };
         // Body admission is released before expensive execution starts so
         // slow ingress and query compute cannot starve one another.
-        if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
-        defer self.query_admission.release();
+        if (!self.api_server.tryAcquireQuery()) return queryOverloadedResponse(ctx);
+        defer self.api_server.releaseQuery();
         var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
         var peer_registration: PeerObserver.Registration = .{};
         self.startPeerCancellationWatcher(ctx, &cancellation, &peer_registration) catch
             return queryCancellationUnavailableResponse(ctx);
         defer peer_registration.deinit();
         if (isNdjsonContentType(ctx.header("content-type"))) {
-            var resp = try self.api_server.handlePublicGlobalMultiQueryWithCancellation(
+            var resp = try self.api_server.handleAdmittedPublicGlobalMultiQueryWithCancellation(
                 body_data,
                 authenticated_identity,
                 &cancellation,
@@ -1845,7 +1806,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid query request");
         };
         defer parsed_table.deinit();
-        var resp = try self.api_server.handlePublicTableQueryWithContentTypeCancellation(
+        var resp = try self.api_server.handleAdmittedPublicTableQueryWithContentTypeCancellation(
             parsed_table.table_name,
             body_data,
             ctx.header("content-type"),
@@ -1990,6 +1951,8 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid retrieval agent request");
         };
+        if (!self.api_server.tryAcquireQuery()) return queryOverloadedResponse(ctx);
+        defer self.api_server.releaseQuery();
 
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
@@ -2437,14 +2400,14 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("missing body");
             };
         };
-        if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
-        defer self.query_admission.release();
+        if (!self.api_server.tryAcquireQuery()) return queryOverloadedResponse(ctx);
+        defer self.api_server.releaseQuery();
         var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
         var peer_registration: PeerObserver.Registration = .{};
         self.startPeerCancellationWatcher(ctx, &cancellation, &peer_registration) catch
             return queryCancellationUnavailableResponse(ctx);
         defer peer_registration.deinit();
-        var resp = try self.api_server.handlePublicTableQueryWithContentTypeCancellation(
+        var resp = try self.api_server.handleAdmittedPublicTableQueryWithContentTypeCancellation(
             decoded_table_name,
             body_data,
             ctx.header("content-type"),
@@ -2464,6 +2427,8 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
+        if (!self.api_server.tryAcquireWrite()) return writeOverloadedResponse(ctx);
+        defer self.api_server.releaseWrite();
         return try handleTableBatchOffEventLoop(ctx, self.api_server.cfg.backend_runtime, decoded_table_name, body_data, self.api_server.tableApi());
     }
 
@@ -2490,6 +2455,8 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid linear merge request");
         };
+        if (!self.api_server.tryAcquireWrite()) return writeOverloadedResponse(ctx);
+        defer self.api_server.releaseWrite();
         var merge_req = linear_merge_api.parseRequest(alloc, body_data) catch |err| switch (err) {
             error.InvalidLinearMergeRequest => {
                 _ = ctx.status(400);
@@ -3791,14 +3758,14 @@ const HttpxE2eServer = struct {
         query_capacity: usize,
         max_connections: u32,
     ) !void {
+        api_server.query_admission = RequestAdmission.init(query_capacity);
         self.* = .{
             .allocator = allocator,
             .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{}),
             .server = undefined,
             .handler = .{
                 .api_server = api_server,
-                .query_admission = QueryAdmission.init(query_capacity),
-                .query_body_admission = QueryAdmission.init(query_capacity),
+                .query_body_admission = RequestAdmission.init(query_capacity),
             },
             .thread = null,
         };
@@ -4447,15 +4414,14 @@ test "httpx owned response preserves retryable JSON metadata" {
 test "httpx query admission rejects saturated queries without blocking control routes" {
     const alloc = std.testing.allocator;
     var source = AuthStatusSource{};
-    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var api_server = ApiHttpServer.init(alloc, .{ .query_max_concurrent_requests = 1 }, source.iface(), null, null);
     var handler = AntflyApiHandler{
         .api_server = &api_server,
-        .query_admission = QueryAdmission.init(1),
-        .query_body_admission = QueryAdmission.init(1),
+        .query_body_admission = RequestAdmission.init(1),
     };
 
-    try std.testing.expect(handler.query_admission.tryAcquire());
-    defer handler.query_admission.release();
+    try std.testing.expect(api_server.tryAcquireQuery());
+    defer api_server.releaseQuery();
 
     var query_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
     defer query_request.deinit();
@@ -4467,7 +4433,7 @@ test "httpx query admission rejects saturated queries without blocking control r
     try std.testing.expectEqual(@as(u16, 429), rejected.status.code);
     try std.testing.expectEqualStrings("1", rejected.headers.get("Retry-After").?);
     try std.testing.expect(rejected.headers.get("Connection") == null);
-    const admission_stats = handler.query_admission.stats();
+    const admission_stats = api_server.queryAdmissionStats();
     try std.testing.expectEqual(@as(usize, 1), admission_stats.in_flight);
     try std.testing.expectEqual(@as(usize, 1), admission_stats.peak_in_flight);
     try std.testing.expectEqual(@as(u64, 1), admission_stats.rejected_total);
@@ -4498,7 +4464,7 @@ test "httpx query admission rejects saturated queries without blocking control r
     defer h2_rejected.deinit();
     try std.testing.expectEqual(@as(u16, 429), h2_rejected.status.code);
     try std.testing.expectEqualStrings("query body capacity exhausted", h2_rejected.body orelse "");
-    try std.testing.expectEqual(@as(usize, 1), handler.query_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 1), api_server.queryAdmissionStats().in_flight);
     try std.testing.expectEqual(@as(usize, 1), handler.query_body_admission.stats().in_flight);
     try std.testing.expectEqual(@as(u64, 1), handler.query_body_admission.stats().rejected_total);
 
@@ -4512,7 +4478,7 @@ test "httpx query admission rejects saturated queries without blocking control r
 }
 
 test "httpx query admission releases a cancelled query slot" {
-    var admission = QueryAdmission.init(1);
+    var admission = RequestAdmission.init(1);
     try std.testing.expect(admission.tryAcquire());
     var cancellation = http_common.RequestCancellation{};
     cancellation.cancel();
@@ -4522,8 +4488,32 @@ test "httpx query admission releases a cancelled query slot" {
     admission.release();
 }
 
+test "httpx write admission rejects saturated table mutations" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{ .write_max_concurrent_requests = 1 }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+
+    try std.testing.expect(api_server.tryAcquireWrite());
+    defer api_server.releaseWrite();
+
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/batch");
+    defer request.deinit();
+    request.body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}}}";
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var rejected = try handler.batchWrite(&ctx, "docs");
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 429), rejected.status.code);
+    try std.testing.expectEqualStrings("1", rejected.headers.get("Retry-After").?);
+    try std.testing.expectEqualStrings("write capacity exhausted", rejected.body orelse "");
+    try std.testing.expectEqual(@as(u64, 1), api_server.writeAdmissionStats().rejected_total);
+}
+
 test "httpx query admission treats zero capacity as unlimited" {
-    var admission = QueryAdmission.init(0);
+    var admission = RequestAdmission.init(0);
     for (0..64) |_| try std.testing.expect(admission.tryAcquire());
     try std.testing.expectEqual(@as(usize, 64), admission.stats().in_flight);
     for (0..64) |_| admission.release();
@@ -4659,12 +4649,12 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
     }
 
     for (0..10_000) |_| {
-        const admission = e2e_server.handler.query_admission.stats();
+        const admission = api_server.queryAdmissionStats();
         if (admission.in_flight == 8 and admission.rejected_total == 120) break;
         var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
         _ = std.posix.system.nanosleep(&delay, &delay);
     }
-    const saturated = e2e_server.handler.query_admission.stats();
+    const saturated = api_server.queryAdmissionStats();
     try std.testing.expectEqual(@as(usize, 8), saturated.in_flight);
     try std.testing.expectEqual(@as(u64, 120), saturated.rejected_total);
     try std.testing.expectEqual(@as(u32, 8), reads.started.load(.acquire));
@@ -4692,13 +4682,13 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
         slot.* = null;
     }
     for (0..10_000) |_| {
-        const admission = e2e_server.handler.query_admission.stats();
+        const admission = api_server.queryAdmissionStats();
         const runtime = e2e_server.handler.runtimeStats();
         if (admission.in_flight == 0 and runtime.active_peer_observers == 0 and reads.cancelled.load(.acquire) == 8) break;
         var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
         _ = std.posix.system.nanosleep(&delay, &delay);
     }
-    try std.testing.expectEqual(@as(usize, 0), e2e_server.handler.query_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
     try std.testing.expectEqual(@as(usize, 0), e2e_server.handler.runtimeStats().active_peer_observers);
     try std.testing.expectEqual(@as(u32, 8), reads.cancelled.load(.acquire));
 

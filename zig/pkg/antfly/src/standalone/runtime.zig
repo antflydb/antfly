@@ -616,10 +616,6 @@ const StandaloneHealthSource = struct {
         try data_health.metricsWriter().writeMetrics(writer);
 
         const handler = antfly.public_api.kernel_bridge.handlerStats(self.handler);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_capacity", "gauge", "Maximum concurrent expensive public queries", handler.query_capacity);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_in_flight", "gauge", "Currently executing expensive public queries", handler.query_in_flight);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_peak_in_flight", "gauge", "Peak concurrent expensive public queries since process start", handler.query_peak_in_flight);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public queries rejected by admission control", handler.query_rejected_total);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", handler.query_body_capacity);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", handler.query_body_in_flight);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", handler.query_body_peak_in_flight);
@@ -2128,7 +2124,8 @@ pub fn runFromIterator(
             .ha_remote_apply_mutations_enabled = haRemoteApplyMutationsEnabled(ha_sync_policy.policy),
             .auth_enabled = auth_enabled,
             .experimental = cli.experimental,
-            .max_concurrent_requests = if (loaded_config) |*cfg| cfg.runtime.max_concurrent_requests else antfly.common.config.default_max_concurrent_requests,
+            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
@@ -2505,11 +2502,7 @@ fn serveUnifiedInner(
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
 ) !void {
-    var server = httpx.Server.initWithConfig(
-        alloc,
-        io,
-        publicHttpServerConfig(bind_host, bind_port, api_server.cfg.max_concurrent_requests),
-    );
+    var server = httpx.Server.initWithConfig(alloc, io, publicHttpServerConfig(bind_host, bind_port));
     defer server.deinit();
     lifecycle.attach(&server);
     defer lifecycle.detach(&server);
@@ -2578,6 +2571,7 @@ fn serveUnifiedInner(
 }
 
 const public_http_connection_ceiling: u32 = 256;
+const public_http_body_admission_limit: u32 = 32;
 
 fn publicHttpConnectionLimitForFdSoftLimit(fd_soft_limit: u64) u32 {
     // Public inbound sockets may use at most one quarter of the process FD
@@ -2594,7 +2588,7 @@ fn configuredPublicHttpConnectionLimit() u32 {
     return publicHttpConnectionLimitForFdSoftLimit(@intCast(limit.cur));
 }
 
-fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16, max_concurrent_requests: u32) httpx.ServerConfig {
+fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerConfig {
     return .{
         .host = bind_host,
         .port = bind_port,
@@ -2603,10 +2597,9 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16, max_concurrent_
         // Four maximum-sized public requests may complete while excess uploads
         // are shed before allocator pressure becomes systemic.
         .request_body_buffer_budget_bytes = 256 * 1024 * 1024,
-        // Apply query execution's bound while H1
-        // bodies are still streaming so the remaining public connections can
-        // service health, control, and recovery traffic.
-        .max_h1_inflight_bodies = max_concurrent_requests,
+        // This is a transport safeguard for every H1 request body. Keep it
+        // independent from admission.query.max_concurrent_requests.
+        .max_h1_inflight_bodies = public_http_body_admission_limit,
         .request_timeout_ms = 300_000,
         // Keep a large process-wide FD reserve for storage, Raft, outbound
         // clients, and diagnostics. This prevents the historical 1,000-socket
@@ -6697,22 +6690,19 @@ test "standalone runtime defaults public listener to antfarm port" {
 }
 
 test "standalone public HTTP server is restart-safe and uses public API request body limit" {
-    const cfg = publicHttpServerConfig("127.0.0.1", 8080, antfly.common.config.default_max_concurrent_requests);
+    const cfg = publicHttpServerConfig("127.0.0.1", 8080);
     try std.testing.expect(cfg.reuse_address);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
     try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), cfg.request_body_buffer_budget_bytes);
     try std.testing.expect(cfg.max_connections >= 1);
     try std.testing.expect(cfg.max_connections <= public_http_connection_ceiling);
-    try std.testing.expectEqual(antfly.common.config.default_max_concurrent_requests, cfg.max_h1_inflight_bodies);
+    try std.testing.expectEqual(public_http_body_admission_limit, cfg.max_h1_inflight_bodies);
     try std.testing.expectEqual(@as(u32, 5), cfg.accept_error_backoff_initial_ms);
     try std.testing.expectEqual(@as(u32, 1_000), cfg.accept_error_backoff_max_ms);
     try std.testing.expectEqual(@as(u32, 256), publicHttpConnectionLimitForFdSoftLimit(1024));
     try std.testing.expectEqual(@as(u32, 128), publicHttpConnectionLimitForFdSoftLimit(512));
     try std.testing.expectEqual(@as(u32, 32), publicHttpConnectionLimitForFdSoftLimit(128));
     try std.testing.expectEqual(@as(u32, 1), publicHttpConnectionLimitForFdSoftLimit(3));
-
-    const configured = publicHttpServerConfig("127.0.0.1", 8080, 7);
-    try std.testing.expectEqual(@as(u32, 7), configured.max_h1_inflight_bodies);
 }
 
 test "standalone rejects configured server TLS instead of serving plaintext" {

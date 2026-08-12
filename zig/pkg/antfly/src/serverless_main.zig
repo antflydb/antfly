@@ -163,12 +163,14 @@ pub fn runFromIterator(
         .prune_enabled = cli.prune_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_PRUNE_ENABLED", true),
         .enrichment_enabled = cli.enrichment_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_ENRICHMENT_ENABLED", true),
         .remote_content = if (remote_content) |*cfg| cfg else null,
+        .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+        .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
     };
     const listener_enabled = forced_listener orelse listenerEnabledForRole(bootstrap.role);
     const max_concurrent_requests = if (loaded_config) |*cfg|
-        cfg.runtime.max_concurrent_requests
+        cfg.admission.query.max_concurrent_requests
     else
-        antfly.common.config.default_max_concurrent_requests;
+        antfly.common.config.default_query_max_concurrent_requests;
     const listener = if (listener_enabled)
         try serverless_serverConfigFromEnv(init.environ_map, cli, max_concurrent_requests)
     else
@@ -808,10 +810,10 @@ test "serverless main listener config defaults request limit to public API limit
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
 
-    const cfg = try serverless_serverConfigFromEnv(&env_map, .{}, antfly.common.config.default_max_concurrent_requests);
+    const cfg = try serverless_serverConfigFromEnv(&env_map, .{}, antfly.common.config.default_query_max_concurrent_requests);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
     try std.testing.expect(cfg.serve_in_connection_threads);
-    try std.testing.expectEqual(antfly.common.config.default_max_concurrent_requests, cfg.max_active_requests);
+    try std.testing.expectEqual(antfly.common.config.default_query_max_concurrent_requests, cfg.max_active_requests);
     try std.testing.expectEqual(serverless_default_max_connection_threads, cfg.max_connection_threads);
 
     const configured = try serverless_serverConfigFromEnv(&env_map, .{}, 7);
@@ -824,14 +826,14 @@ test "serverless main listener config allows env and cli listener limit override
     try env_map.put("ANTFLY_SERVERLESS_MAX_REQUEST_BYTES", "4194304");
     try env_map.put("ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS", "7");
 
-    const env_cfg = try serverless_serverConfigFromEnv(&env_map, .{}, antfly.common.config.default_max_concurrent_requests);
+    const env_cfg = try serverless_serverConfigFromEnv(&env_map, .{}, antfly.common.config.default_query_max_concurrent_requests);
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), env_cfg.max_request_bytes);
     try std.testing.expectEqual(@as(u32, 7), env_cfg.max_connection_threads);
 
     const cli_cfg = try serverless_serverConfigFromEnv(&env_map, .{
         .max_request_bytes = 8 * 1024 * 1024,
         .max_connection_threads = 11,
-    }, antfly.common.config.default_max_concurrent_requests);
+    }, antfly.common.config.default_query_max_concurrent_requests);
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), cli_cfg.max_request_bytes);
     try std.testing.expectEqual(@as(u32, 11), cli_cfg.max_connection_threads);
 }
@@ -840,7 +842,7 @@ test "serverless main rejects malformed explicit environment values" {
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
     try env_map.put("ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS", "many");
-    try std.testing.expectError(error.InvalidEnvironmentValue, serverless_serverConfigFromEnv(&env_map, .{}, antfly.common.config.default_max_concurrent_requests));
+    try std.testing.expectError(error.InvalidEnvironmentValue, serverless_serverConfigFromEnv(&env_map, .{}, antfly.common.config.default_query_max_concurrent_requests));
 
     _ = env_map.remove("ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS");
     try env_map.put("ANTFLY_SERVERLESS_PRUNE_ENABLED", "sometimes");

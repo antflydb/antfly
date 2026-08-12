@@ -3,6 +3,7 @@
 
 pub const types = @import("types.zig");
 
+pub const AdmissionConfig = types.AdmissionConfig;
 pub const AwsCredentialConfig = types.AwsCredentialConfig;
 pub const CdcConnectionConfig = types.CdcConnectionConfig;
 pub const CdcConnectionVariant = types.CdcConnectionVariant;
@@ -25,7 +26,7 @@ pub const NamedChainLink = types.NamedChainLink;
 pub const ObjectStorageConfig = types.ObjectStorageConfig;
 pub const ObjectStorageLanes = types.ObjectStorageLanes;
 pub const ObjectStorageLocation = types.ObjectStorageLocation;
-pub const RuntimeConfig = types.RuntimeConfig;
+pub const QueryAdmissionConfig = types.QueryAdmissionConfig;
 pub const S3ExternalIoConfig = types.S3ExternalIoConfig;
 pub const StorageConfig = types.StorageConfig;
 pub const StorageEngine = types.StorageEngine;
@@ -33,3 +34,4 @@ pub const TLSInfo = types.TLSInfo;
 pub const TransactionSessionConfig = types.TransactionSessionConfig;
 pub const WebSearchConnectionConfig = types.WebSearchConnectionConfig;
 pub const WebSearchConnectionVariant = types.WebSearchConnectionVariant;
+pub const WriteAdmissionConfig = types.WriteAdmissionConfig;

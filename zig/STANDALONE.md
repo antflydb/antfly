@@ -69,9 +69,11 @@ need this migration.
 
 Serving admission and backend execution are separate concerns:
 
-- `runtime.max_concurrent_requests` bounds node-local database data-plane work.
-  Query and search routes consume the budget; operational and control-plane
-  routes remain available during overload.
+- `admission.query.max_concurrent_requests` bounds node-local query, search,
+  and retrieval execution across REST, MCP, A2A, and direct API-kernel calls.
+- `admission.write.max_concurrent_requests` independently bounds foreground
+  table mutations, linear merges, and transaction commits. Administrative and
+  control-plane routes remain available when either foreground class saturates.
 - `inference.max_concurrent_requests` is an independent weighted budget shared
   by every embedded inference execution surface, including direct providers and
   the public inference and traditional-ML prediction routes.
@@ -82,7 +84,7 @@ Serving admission and backend execution are separate concerns:
   lanes. It does not classify public routes or return protocol-specific overload
   responses; runtime/API adapters acquire admission before submitting work.
 
-Both request limits reject immediately when exhausted. A value of zero disables
+All request limits reject immediately when exhausted. A value of zero disables
 the corresponding admission budget for trusted environments, while underlying
 transport and memory safeguards remain in force.
 

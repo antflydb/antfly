@@ -27,6 +27,7 @@ pub const HttpResponse = struct {
     status: u16,
     content_type: []u8,
     body: []u8,
+    retry_after_seconds: ?u32 = null,
 
     pub fn deinit(self: *HttpResponse, alloc: Allocator) void {
         alloc.free(self.content_type);

@@ -24,8 +24,8 @@ components:
           description: "Port for the health/metrics server. Defaults to 4200."
           default: 4200
           example: 4200
-        runtime:
-          $ref: "#/components/schemas/RuntimeConfig"
+        admission:
+          $ref: "#/components/schemas/AdmissionConfig"
         storage:
           $ref: "#/components/schemas/StorageConfig"
         transaction_sessions:
@@ -778,9 +778,19 @@ components:
         publication_name:
           type: string
           description: Provider publication or stream grouping name when applicable.
-    RuntimeConfig:
+    AdmissionConfig:
       type: object
-      description: Node-local serving-runtime admission settings.
+      additionalProperties: false
+      description: Node-local foreground database request admission settings.
+      properties:
+        query:
+          $ref: "#/components/schemas/QueryAdmissionConfig"
+        write:
+          $ref: "#/components/schemas/WriteAdmissionConfig"
+
+    QueryAdmissionConfig:
+      type: object
+      additionalProperties: false
       properties:
         max_concurrent_requests:
           type: integer
@@ -788,15 +798,43 @@ components:
           maximum: 4294967295
           default: 32
           example: 32
+          x-go-type-skip-optional-pointer: false
           description: |
-            Maximum concurrent data-plane request admission units for each
-            serving runtime in this process. Query and search requests currently
-            consume one unit. Operational and control-plane routes remain outside this
-            budget so they stay reachable during overload. Excess work is
-            rejected immediately with a retryable overload response rather
-            than retained in an in-process queue. Set to 0 to disable this
-            admission limit. This setting is separate from transport connection
-            limits and from inference.max_concurrent_requests.
+            Maximum concurrent query, search, and retrieval requests in this
+            process. The default is 32. The budget is shared by REST, MCP,
+            retrieval-agent, A2A, and direct API-kernel execution. Full-text,
+            vector, hybrid, graph, aggregation, and federated searches consume
+            it. Point lookups and operational/control-plane reads remain outside
+            it. Excess HTTP work is rejected immediately with HTTP 429 and
+            Retry-After: 1; asynchronous protocols use their native failure
+            response. Excess work is not queued. Set to 0 to disable query
+            admission. This budget is independent of transport safeguards,
+            write admission, and inference.max_concurrent_requests.
+
+    WriteAdmissionConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        max_concurrent_requests:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 16
+          example: 16
+          x-go-type-skip-optional-pointer: false
+          description: |
+            Maximum concurrent foreground data mutations in this process. The
+            default is 16. Table batch writes, cross-table batches, linear merges,
+            and transaction commits consume this budget. Schema, index, backup,
+            restore, repair, and other administrative operations use dedicated
+            control or background-maintenance paths. Set to 0 to disable write
+            admission.
+
+            Excess HTTP work in either foreground class is rejected immediately
+            with HTTP 429 and Retry-After: 1; asynchronous protocols use their
+            native failure response. Excess work is not queued. Both budgets are
+            independent of transport safeguards and
+            inference.max_concurrent_requests.
 
     MetadataInfo:
       type: object

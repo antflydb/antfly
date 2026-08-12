@@ -160,6 +160,18 @@ pub fn requestStats(context: *const CallContext) callconv(.c) abi.Status {
     return .ok;
 }
 
+pub fn queryAdmissionStats(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, server_mod.RequestAdmission.Stats, context)) |failure| return failure;
+    output(server_mod.RequestAdmission.Stats, context).* = serverState(context).server.queryAdmissionStats();
+    return .ok;
+}
+
+pub fn writeAdmissionStats(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, server_mod.RequestAdmission.Stats, context)) |failure| return failure;
+    output(server_mod.RequestAdmission.Stats, context).* = serverState(context).server.writeAdmissionStats();
+    return .ok;
+}
+
 pub fn setProvider(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(?managed_embedder.AntflyProvider, void, context)) |failure| return failure;
     serverState(context).server.antfly_provider = input(?managed_embedder.AntflyProvider, context).*;
@@ -267,11 +279,7 @@ pub fn handlerCreate(context: *const HandlerCreateContext) callconv(.c) abi.Stat
     const state = api_state.owner_alloc.create(HandlerState) catch |err| return fail(err);
     state.* = .{
         .alloc = api_state.owner_alloc,
-        .handler = .{
-            .api_server = &api_state.server,
-            .query_admission = handler_mod.QueryAdmission.init(api_state.server.cfg.max_concurrent_requests),
-            .query_body_admission = handler_mod.QueryAdmission.init(api_state.server.cfg.max_concurrent_requests),
-        },
+        .handler = .{ .api_server = &api_state.server },
     };
     context.out_handle.* = state;
     return .ok;
@@ -293,7 +301,8 @@ pub fn handlerInit(context: *const CallContext) callconv(.c) abi.Status {
 pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, abi.HandlerStats, context)) |failure| return failure;
     const handler = &handlerState(context).handler;
-    const query = handler.query_admission.stats();
+    const query = handler.api_server.queryAdmissionStats();
+    const write = handler.api_server.writeAdmissionStats();
     const query_body = handler.query_body_admission.stats();
     const runtime = handler.runtimeStats();
     output(abi.HandlerStats, context).* = .{
@@ -301,6 +310,10 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
         .query_in_flight = query.in_flight,
         .query_peak_in_flight = query.peak_in_flight,
         .query_rejected_total = query.rejected_total,
+        .write_capacity = write.capacity,
+        .write_in_flight = write.in_flight,
+        .write_peak_in_flight = write.peak_in_flight,
+        .write_rejected_total = write.rejected_total,
         .query_body_capacity = query_body.capacity,
         .query_body_in_flight = query_body.in_flight,
         .query_body_peak_in_flight = query_body.peak_in_flight,

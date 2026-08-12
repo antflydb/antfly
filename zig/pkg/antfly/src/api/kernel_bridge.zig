@@ -42,6 +42,8 @@ const BoundaryAllocator = struct {
 extern fn antfly_api_kernel_create(context: *const CreateContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_destroy(handle: *anyopaque) callconv(.c) void;
 extern fn antfly_api_kernel_request_stats(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_query_admission_stats(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_write_admission_stats(context: *const CallContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_set_provider(context: *const CallContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_set_ha_executor(context: *const CallContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_executor(context: *const CallContext) callconv(.c) abi.Status;
@@ -81,6 +83,8 @@ const OpaqueApiHttpServer = struct {
     cfg: server_mod.ApiHttpServerConfig,
 
     pub const RequestStats = server_mod.ApiHttpServer.RequestStats;
+    pub const QueryAdmissionStats = server_mod.RequestAdmission.Stats;
+    pub const WriteAdmissionStats = server_mod.RequestAdmission.Stats;
 
     pub fn initWithConfig(
         owner_alloc: std.mem.Allocator,
@@ -114,6 +118,18 @@ const OpaqueApiHttpServer = struct {
     pub fn requestStats(self: *OpaqueApiHttpServer) RequestStats {
         var out: RequestStats = undefined;
         callInfallible(void, RequestStats, antfly_api_kernel_request_stats, self.opaque_handle, null, &out);
+        return out;
+    }
+
+    pub fn queryAdmissionStats(self: *const OpaqueApiHttpServer) QueryAdmissionStats {
+        var out: QueryAdmissionStats = undefined;
+        callInfallible(void, QueryAdmissionStats, antfly_api_kernel_query_admission_stats, self.opaque_handle, null, &out);
+        return out;
+    }
+
+    pub fn writeAdmissionStats(self: *const OpaqueApiHttpServer) WriteAdmissionStats {
+        var out: WriteAdmissionStats = undefined;
+        callInfallible(void, WriteAdmissionStats, antfly_api_kernel_write_admission_stats, self.opaque_handle, null, &out);
         return out;
     }
 
@@ -306,11 +322,7 @@ const OpaqueHttpxHandler = struct {
 };
 
 pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
-    if (comptime direct_codegen) return .{
-        .api_server = server,
-        .query_admission = handler_mod.QueryAdmission.init(server.cfg.max_concurrent_requests),
-        .query_body_admission = handler_mod.QueryAdmission.init(server.cfg.max_concurrent_requests),
-    };
+    if (comptime direct_codegen) return .{ .api_server = server };
     var handle: ?*anyopaque = null;
     const status = antfly_api_kernel_handler_create(&.{
         .abi_version = abi.abi_version,
@@ -323,7 +335,8 @@ pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
 
 pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
     if (comptime direct_codegen) {
-        const query = handler.query_admission.stats();
+        const query = handler.api_server.queryAdmissionStats();
+        const write = handler.api_server.writeAdmissionStats();
         const query_body = handler.query_body_admission.stats();
         const runtime = handler.runtimeStats();
         return .{
@@ -331,6 +344,10 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
             .query_in_flight = query.in_flight,
             .query_peak_in_flight = query.peak_in_flight,
             .query_rejected_total = query.rejected_total,
+            .write_capacity = write.capacity,
+            .write_in_flight = write.in_flight,
+            .write_peak_in_flight = write.peak_in_flight,
+            .write_rejected_total = write.rejected_total,
             .query_body_capacity = query_body.capacity,
             .query_body_in_flight = query_body.in_flight,
             .query_body_peak_in_flight = query_body.peak_in_flight,

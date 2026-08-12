@@ -282,6 +282,8 @@ comptime {
             exportInternal(&api_kernel_exports.create, "antfly_api_kernel_create");
             exportInternal(&api_kernel_exports.destroy, "antfly_api_kernel_destroy");
             exportInternal(&api_kernel_exports.requestStats, "antfly_api_kernel_request_stats");
+            exportInternal(&api_kernel_exports.queryAdmissionStats, "antfly_api_kernel_query_admission_stats");
+            exportInternal(&api_kernel_exports.writeAdmissionStats, "antfly_api_kernel_write_admission_stats");
             exportInternal(&api_kernel_exports.setProvider, "antfly_api_kernel_set_provider");
             exportInternal(&api_kernel_exports.setHAExecutor, "antfly_api_kernel_set_ha_executor");
             exportInternal(&api_kernel_exports.executor, "antfly_api_kernel_executor");

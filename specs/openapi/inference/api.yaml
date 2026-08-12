@@ -3154,6 +3154,7 @@ components:
           deprecated: true
         max_concurrent_requests:
           type: integer
+          x-go-type-skip-optional-pointer: false
           description: |
             Maximum concurrent weighted inference admission units in the Zig runtime.
             Request body size, generation workload, and image byte/count reservations

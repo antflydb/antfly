@@ -37,6 +37,7 @@ const foreign_mod = @import("../../foreign/mod.zig");
 const scraping = @import("antfly_scraping");
 const object_store_support = @import("../object_store_support.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const common_config = @import("../../common/config.zig");
 
 pub const BootstrapConfig = struct {
     pub const S3Options = object_store_support.S3Options;
@@ -63,6 +64,8 @@ pub const BootstrapConfig = struct {
     enrichment_enabled: bool = true,
     foreign_registry: ?*const foreign_mod.Registry = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
+    write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
 };
 
 pub const RuntimeStatus = api_mod.RuntimeStatusResult;
@@ -410,6 +413,7 @@ pub const OwnedStack = struct {
         self.sparse_query_index_name = try alloc.dupe(u8, cfg.sparse_embedding_index_name);
         self.runtime.setEnricher(enricher);
         self.handler = api_mod.HttpHandler.init(alloc, &self.api, &self.catalog, &self.manifests, &self.progress, &self.query, &self.status);
+        self.handler.configureAdmission(cfg.query_max_concurrent_requests, cfg.write_max_concurrent_requests);
         self.handler.setRemoteContent(cfg.remote_content);
         if (self.query_cache) |*query_cache| self.handler.setQueryCache(query_cache);
         self.handler.setPublishedSearchSources(search_sources.publishedSearchSourcesForNames(

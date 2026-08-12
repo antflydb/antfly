@@ -318,7 +318,7 @@ const public_api_max_connection_threads: u32 = 64;
 // Leave half of the public connection slots available to parse, reject, and
 // drain overload traffic. Health has its own listener; this bound prevents
 // expensive public queries from consuming every worker under client timeouts.
-const public_api_max_active_requests: u32 = antfly.common.config.default_max_concurrent_requests;
+const public_api_max_active_requests: u32 = antfly.common.config.default_query_max_concurrent_requests;
 
 const DataRaftBatchRoute = struct {
     allow_remote_forward: bool = true,
@@ -1077,10 +1077,29 @@ pub const HealthSource = struct {
             http_server.requestStats()
         else
             antfly.public_api.ApiHttpServer.RequestStats{};
+        const query_stats = if (self.data_server.http_server) |*http_server|
+            http_server.queryAdmissionStats()
+        else
+            antfly.public_api.http_server.RequestAdmission.Stats{
+                .capacity = self.data_server.api_server_cfg.query_max_concurrent_requests,
+                .in_flight = 0,
+                .peak_in_flight = 0,
+                .rejected_total = 0,
+            };
+        const write_stats = if (self.data_server.http_server) |*http_server|
+            http_server.writeAdmissionStats()
+        else
+            antfly.public_api.http_server.RequestAdmission.Stats{
+                .capacity = self.data_server.api_server_cfg.write_max_concurrent_requests,
+                .in_flight = 0,
+                .peak_in_flight = 0,
+                .rejected_total = 0,
+            };
         const listener_stats = if (self.data_server.listener) |*listener|
             listener.runtimeStats()
         else
             null;
+        const query_rejected_total = query_stats.rejected_total +| if (listener_stats) |http| http.rejected_requests_total else 0;
         try antfly.common.health_server.appendPromMetric(
             writer,
             "antfly_data_server_up",
@@ -1093,14 +1112,18 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_candidates", "gauge", "Raft groups currently queued for snapshot compaction", raft_metrics.runtime_snapshot_compaction_candidates);
         try health_metrics.appendPromMetric(writer, "antfly_data_api_requests_total", "counter", "Requests handled by the local API server process", api_request_stats.request_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_api_first_request_elapsed_ms", "gauge", "Milliseconds from API server initialization until the first handled request", api_request_stats.first_request_elapsed_ms);
+        try health_metrics.appendPromMetric(writer, "antfly_query_capacity", "gauge", "Maximum concurrent public database queries", query_stats.capacity);
+        try health_metrics.appendPromMetric(writer, "antfly_query_in_flight", "gauge", "Currently executing public database queries", query_stats.in_flight);
+        try health_metrics.appendPromMetric(writer, "antfly_query_peak_in_flight", "gauge", "Peak concurrent public database queries since process start", query_stats.peak_in_flight);
+        try health_metrics.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public database queries rejected by admission control", query_rejected_total);
+        try health_metrics.appendPromMetric(writer, "antfly_write_capacity", "gauge", "Maximum concurrent foreground data mutations", write_stats.capacity);
+        try health_metrics.appendPromMetric(writer, "antfly_write_in_flight", "gauge", "Currently executing foreground data mutations", write_stats.in_flight);
+        try health_metrics.appendPromMetric(writer, "antfly_write_peak_in_flight", "gauge", "Peak concurrent foreground data mutations since process start", write_stats.peak_in_flight);
+        try health_metrics.appendPromMetric(writer, "antfly_write_rejected_total", "counter", "Foreground data mutations rejected by admission control", write_stats.rejected_total);
         if (listener_stats) |http| {
             try health_metrics.appendPromMetric(writer, "antfly_http_connection_thread_limit", "gauge", "Maximum public HTTP connection handoff threads", http.max_connection_threads);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_connection_threads", "gauge", "Currently active public HTTP connection handoff threads", http.active_connection_threads);
             try health_metrics.appendPromMetric(writer, "antfly_http_peak_connection_threads", "gauge", "Peak public HTTP connection handoff threads since process start", http.peak_connection_threads);
-            try health_metrics.appendPromMetric(writer, "antfly_query_capacity", "gauge", "Maximum concurrent expensive public queries", http.max_active_requests);
-            try health_metrics.appendPromMetric(writer, "antfly_query_in_flight", "gauge", "Currently executing expensive public queries", http.active_requests);
-            try health_metrics.appendPromMetric(writer, "antfly_query_peak_in_flight", "gauge", "Peak concurrent expensive public queries since process start", http.peak_active_requests);
-            try health_metrics.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public queries rejected by admission control", http.rejected_requests_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests cancelled because peer observation could not be scheduled", http.cancellation_watcher_start_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_deadline_observer_failures_total", "counter", "Public requests closed because deadline observation could not be scheduled", http.deadline_observer_failures_total);
@@ -4254,7 +4277,7 @@ pub const DataServer = struct {
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
-            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.max_concurrent_requests),
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.query_max_concurrent_requests),
         };
     }
 
@@ -4291,7 +4314,7 @@ pub const DataServer = struct {
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
-            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.max_concurrent_requests),
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.query_max_concurrent_requests),
         };
     }
 
@@ -4328,7 +4351,7 @@ pub const DataServer = struct {
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
-            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.max_concurrent_requests),
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.query_max_concurrent_requests),
         };
     }
 
@@ -12993,7 +13016,7 @@ pub const DataServer = struct {
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
-            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.max_concurrent_requests),
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.query_max_concurrent_requests),
         };
         owned_backend_runtime = null;
         return server;
@@ -15925,7 +15948,8 @@ pub fn runFromIterator(
         .api_server_cfg = .{
             .auth_enabled = effective_auth_enabled,
             .experimental = cli.experimental,
-            .max_concurrent_requests = if (loaded_config) |*cfg| cfg.runtime.max_concurrent_requests else antfly.common.config.default_max_concurrent_requests,
+            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
             .ard_base_url = cli.ard_base_url,
@@ -23312,6 +23336,10 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_indexes 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_api_requests_total 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_api_first_request_elapsed_ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_capacity 32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_in_flight 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_write_capacity 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_write_in_flight 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_hits_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_coalesced_waiters_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_uncached_computations_total 0") != null);
