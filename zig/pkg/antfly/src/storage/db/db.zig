@@ -8570,7 +8570,11 @@ pub const DB = struct {
 
         const key = try self.repairIssueKeyForIssueAlloc(alloc, issue);
         defer alloc.free(key);
-        const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return false;
+        // Successful replay can retire this exact diagnosis at its publication
+        // boundary before the request that initiated replay reaches completion.
+        // Absence is therefore an idempotent success; a present, newer revision
+        // remains a conflict and must not be cleared below.
+        const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return true;
         var current = existing;
         defer current.deinit(alloc);
         if (!revision.matches(current)) return false;
@@ -8622,7 +8626,11 @@ pub const DB = struct {
 
         const key = try self.repairIssueKeyForIssueAlloc(alloc, issue);
         defer alloc.free(key);
-        const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return .stale;
+        // Publication owns the authoritative resolution boundary and may have
+        // already removed this exact issue while the initiating repair request
+        // was replaying it. Treat absence as idempotent completion, but retain
+        // the revision and completion-epoch fences for every present record.
+        const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return .completed;
         var current = existing;
         defer current.deinit(alloc);
         if (!revision.matches(current)) return .stale;
@@ -52326,6 +52334,22 @@ test "db repair completion cannot clear debt behind terminal coverage" {
     const remaining = try db.listArtifactRepairIssues(alloc, .embedding, "semantic", 1);
     defer types.freeArtifactRepairIssues(alloc, remaining);
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
+
+    // The replay publication path owns ledger retirement. A request resuming
+    // after that boundary must observe idempotent success rather than report
+    // the repair it initiated as unresolved.
+    try std.testing.expectEqual(
+        DB.ArtifactRepairCompletionDisposition.completed,
+        try db.completeArtifactRepairIssueIfCurrent(
+            alloc,
+            pending[0],
+            revision,
+            completion_key,
+            completion.epoch,
+            false,
+        ),
+    );
+    try std.testing.expect(try db.clearArtifactRepairIssueIfCurrent(alloc, pending[0], revision));
 }
 
 test "db successful embedding publication retires covered provider failure debt" {

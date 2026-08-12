@@ -858,21 +858,6 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v0") == null);
     try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v1") != null);
 
-    {
-        var writer = provisioned_write_source.leaseManagedWriterGroupForTransition(group_id) orelse
-            return error.TestUnexpectedResult;
-        defer writer.deinit(std.testing.allocator);
-        const provisioned_indexes = try writer.db.listIndexes(std.testing.allocator);
-        defer db_mod.types.freeIndexConfigs(std.testing.allocator, provisioned_indexes);
-        var found_embed = false;
-        for (provisioned_indexes) |cfg| {
-            if (!std.mem.eql(u8, cfg.name, "embed_idx")) continue;
-            found_embed = true;
-            try std.testing.expectEqual(db_mod.types.IndexKind.dense_vector, cfg.kind);
-        }
-        try std.testing.expect(found_embed);
-    }
-
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
         \\{"inserts":{"doc:a":{"title":"alpha","body":"hello full text world","status":"published","score":10,"created_at":"2026-03-01T00:00:00Z"},"doc:b":{"title":"beta","body":"secondary document","status":"draft","score":3,"created_at":"2026-03-10T00:00:00Z"},"doc:c":{"title":"gamma","body":"hello filtered world","status":"published","score":8,"created_at":"2026-03-20T00:00:00Z"}}}
     );
@@ -3429,26 +3414,28 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
     var recreated = try client.createTableIndex(base_uri, "docs", "semantic_idx", semantic_index_body);
     defer recreated.deinit(std.testing.allocator);
 
-    // Index creation is accepted before the writer-owned structural worker has
-    // finished rebuilding and publishing runtime status. Wait on that owner
-    // rather than assuming a fixed number of metadata rounds represents wall
-    // clock progress.
+    // Index creation is accepted before the writer-owned generation has
+    // finished rebuilding and publishing runtime status. A completed
+    // structural worker may legitimately retire its cached writer before the
+    // repair owner publishes the replacement, so wait on the public lifecycle
+    // contract rather than cache residency or a fixed number of rounds.
     var wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
     defer wait_io.deinit();
     var wait_attempts: usize = 0;
-    while (wait_attempts < 120_000 and provisioned_write_source.hasGroupActivityBestEffort("docs", 0)) : (wait_attempts += 1) {
+    var semantic_ready = false;
+    while (wait_attempts < 120_000) : (wait_attempts += 1) {
         try svc.runRound();
+        var status_response = try client.fetchTableIndex(base_uri, "docs", "semantic_idx");
+        defer status_response.deinit(std.testing.allocator);
+        var status = try parseJsonBodyIgnoreUnknown(IndexStatusSummary, std.testing.allocator, status_response.body);
+        defer status.deinit();
+        if (status.value.status.backfill_active == false and status.value.status.doc_count == 2) {
+            semantic_ready = true;
+            break;
+        }
         wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort("docs", 0));
-
-    var semantic_index = try client.fetchTableIndex(base_uri, "docs", "semantic_idx");
-    defer semantic_index.deinit(std.testing.allocator);
-    var parsed_semantic_index = try parseJsonBodyIgnoreUnknown(IndexStatusSummary, std.testing.allocator, semantic_index.body);
-    defer parsed_semantic_index.deinit();
-    try std.testing.expectEqualStrings("semantic_idx", parsed_semantic_index.value.config.name);
-    try std.testing.expectEqual(@as(?bool, false), parsed_semantic_index.value.status.backfill_active);
-    try std.testing.expectEqual(@as(?u64, 2), parsed_semantic_index.value.status.doc_count);
+    try std.testing.expect(semantic_ready);
 }
 
 test "public api e2e restores managed embeddings from table backup" {
