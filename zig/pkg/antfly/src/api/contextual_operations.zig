@@ -14,6 +14,28 @@ pub const Method = enum {
     delete,
 };
 
+pub const McpApplicationOperation = union(enum) {
+    list_tables,
+    create_table: TableBody,
+    drop_table: Table,
+    describe_table: Table,
+    list_indexes: Table,
+    create_index: TableIndexBody,
+    drop_index: TableIndex,
+    get_document: DocumentRead,
+    sample_documents: TableBody,
+    query: TableBody,
+    backup: TableBody,
+    restore: TableBody,
+    batch: TableBody,
+
+    pub const Table = struct { table_name: []const u8 };
+    pub const TableBody = struct { table_name: []const u8, body: []const u8 };
+    pub const TableIndex = struct { table_name: []const u8, index_name: []const u8 };
+    pub const TableIndexBody = struct { table_name: []const u8, index_name: []const u8, body: []const u8 };
+    pub const DocumentRead = struct { table_name: []const u8, key: []const u8, fields: ?[]const u8 = null };
+};
+
 pub const Header = struct {
     name: []u8,
     value: []u8,

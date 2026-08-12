@@ -209,8 +209,12 @@ that end state:
   `httpx` registrar with typed method/body/session inputs. The owned contextual
   result carries cloned MCP session/protocol headers, so ingress no longer
   constructs a legacy request or response and the protocol dispatcher has
-  been deleted. MCP tool implementations that still synthesize REST calls are
-  the next, separate operation-extraction boundary.
+  been deleted. Built-in MCP tools now submit an explicit
+  `McpApplicationOperation` union with the authenticated identity instead of
+  manufacturing REST requests and calling the public dispatcher. Several
+  operation arms still delegate to legacy response-returning application
+  helpers; extracting those final operation results is the remaining MCP
+  boundary, rather than retaining an HTTP fallback.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

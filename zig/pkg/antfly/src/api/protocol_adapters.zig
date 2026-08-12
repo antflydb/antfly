@@ -22,7 +22,6 @@ const usermgr = @import("../usermgr/mod.zig");
 const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
 
-const trusted_principal_header = "X-Antfly-Trusted-Principal";
 const max_mcp_sample_documents_limit: i64 = 100;
 
 const McpToolKind = enum {
@@ -336,8 +335,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
     const Server = @TypeOf(server_ptr);
     const ToolContext = struct {
         server: Server,
-        authorization: ?[]const u8,
-        trusted_principal: ?[]const u8,
+        authenticated_identity: @TypeOf(authenticated_identity),
         permissions: ?[]const usermgr.Permission,
         spec: McpToolSpec,
 
@@ -352,9 +350,9 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             }
             return switch (ctx.spec.kind) {
                 .create_table => try ctx.createTable(alloc, args),
-                .drop_table => try ctx.tableRoute(alloc, args, .DELETE, "tableName", null, ""),
-                .list_tables => try ctx.simpleRoute(alloc, .GET, routes.Routes.tables, ""),
-                .describe_table => try ctx.tableRoute(alloc, args, .GET, "tableName", null, ""),
+                .drop_table => try ctx.tableOperation(alloc, args, "tableName", .drop_table),
+                .list_tables => try ctx.executeOperation(alloc, .list_tables),
+                .describe_table => try ctx.tableOperation(alloc, args, "tableName", .describe_table),
                 .create_index => try ctx.createIndex(alloc, args),
                 .drop_index => try ctx.indexRoute(alloc, args, .DELETE, ""),
                 .list_indexes => try ctx.listIndexes(alloc, args),
@@ -385,8 +383,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
                 if (key.len != 0) try body.put(alloc, "key", .{ .string = key });
             }
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ routes.Routes.tables, table_name });
-            return try ctx.simpleRoute(alloc, .POST, uri, body_json);
+            return try ctx.executeOperation(alloc, .{ .create_table = .{ .table_name = table_name, .body = body_json } });
         }
 
         fn createIndex(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
@@ -404,14 +401,16 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             if (jsonStringArg(args, "summarizer")) |summarizer_json| {
                 if (summarizer_json.len != 0) try body.put(alloc, "summarizer", std.json.parseFromSliceLeaky(std.json.Value, alloc, summarizer_json, .{}) catch return mcpError(alloc, "invalid summarizer JSON"));
             }
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes/{s}", .{ routes.Routes.tables, table_name, index_name });
-            return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
+            return try ctx.executeOperation(alloc, .{ .create_index = .{
+                .table_name = table_name,
+                .index_name = index_name,
+                .body = try stringifyJsonValue(alloc, .{ .object = body }),
+            } });
         }
 
         fn listIndexes(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes", .{ routes.Routes.tables, table_name });
-            var result = try ctx.simpleRoute(alloc, .GET, uri, "");
+            var result = try ctx.executeOperation(alloc, .{ .list_indexes = .{ .table_name = table_name } });
             if (result.structured) |structured| {
                 if (structured == .array) {
                     var wrapped = std.json.ObjectMap.empty;
@@ -425,28 +424,23 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         fn getDocument(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             const key = jsonStringArg(args, "key") orelse return mcpError(alloc, "missing key");
-
-            var uri = std.ArrayListUnmanaged(u8).empty;
-            errdefer uri.deinit(alloc);
-            try uri.appendSlice(alloc, routes.Routes.tables);
-            try uri.append(alloc, '/');
-            try uri.appendSlice(alloc, table_name);
-            try uri.appendSlice(alloc, routes.Routes.documents_marker);
-            try appendUriPathSegment(alloc, &uri, key);
-
+            var fields_csv = std.ArrayListUnmanaged(u8).empty;
+            defer fields_csv.deinit(alloc);
             if (jsonValueArg(args, "fields")) |fields| {
                 if (fields != .array) return mcpError(alloc, "fields must be an array");
                 if (fields.array.items.len > 0) {
-                    try uri.appendSlice(alloc, "?fields=");
                     for (fields.array.items, 0..) |field, i| {
                         if (field != .string) return mcpError(alloc, "fields must contain strings");
-                        if (i != 0) try uri.append(alloc, ',');
-                        try uri.appendSlice(alloc, field.string);
+                        if (i != 0) try fields_csv.append(alloc, ',');
+                        try fields_csv.appendSlice(alloc, field.string);
                     }
                 }
             }
-
-            return try ctx.simpleRoute(alloc, .GET, try uri.toOwnedSlice(alloc), "");
+            return try ctx.executeOperation(alloc, .{ .get_document = .{
+                .table_name = table_name,
+                .key = key,
+                .fields = if (fields_csv.items.len > 0) fields_csv.items else null,
+            } });
         }
 
         fn sampleDocuments(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
@@ -460,15 +454,18 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             if (jsonStringArg(args, "to")) |to| if (to.len != 0) try body.put(alloc, "to", .{ .string = to });
             if (jsonBoolArg(args, "inclusiveFrom")) |inclusive| try body.put(alloc, "inclusive_from", .{ .bool = inclusive });
             if (jsonValueArg(args, "fields")) |fields| try body.put(alloc, "fields", fields);
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ routes.Routes.tables, table_name, routes.Routes.documents_suffix });
-            return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
+            return try ctx.executeOperation(alloc, .{ .sample_documents = .{
+                .table_name = table_name,
+                .body = try stringifyJsonValue(alloc, .{ .object = body }),
+            } });
         }
 
         fn indexRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, body: []const u8) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes/{s}", .{ routes.Routes.tables, table_name, index_name });
-            return try ctx.simpleRoute(alloc, method, uri, body);
+            _ = body;
+            if (method != .DELETE) return error.UnsupportedMethod;
+            return try ctx.executeOperation(alloc, .{ .drop_index = .{ .table_name = table_name, .index_name = index_name } });
         }
 
         fn query(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
@@ -478,8 +475,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
                 if (hasNonRawQueryArg(args)) return mcpError(alloc, "queryRequest cannot be combined with shorthand query arguments");
                 if (query_request.object.get("table") != null) return mcpError(alloc, "queryRequest.table is not allowed; use tableName");
 
-                const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/query", .{ routes.Routes.tables, table_name });
-                return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, query_request));
+                return try ctx.executeOperation(alloc, .{ .query = .{
+                    .table_name = table_name,
+                    .body = try stringifyJsonValue(alloc, query_request),
+                } });
             }
 
             var body = std.json.ObjectMap.empty;
@@ -490,8 +489,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             if (jsonValueArg(args, "indexes")) |indexes| try body.put(alloc, "indexes", indexes);
             if (jsonStringArg(args, "filterPrefix")) |prefix| if (prefix.len != 0) try body.put(alloc, "filter_prefix", .{ .string = prefix });
             try body.put(alloc, "limit", .{ .integer = jsonIntArg(args, "limit") orelse 10 });
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/query", .{ routes.Routes.tables, table_name });
-            return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
+            return try ctx.executeOperation(alloc, .{ .query = .{
+                .table_name = table_name,
+                .body = try stringifyJsonValue(alloc, .{ .object = body }),
+            } });
         }
 
         fn describeQueryRequest(_: *@This(), alloc: std.mem.Allocator) !mcp.CallToolResult {
@@ -517,8 +518,11 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "backup_id", .{ .string = backup_id });
             try body.put(alloc, "location", .{ .string = location });
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ routes.Routes.tables, table_name, operation });
-            return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
+            const body_json = try stringifyJsonValue(alloc, .{ .object = body });
+            return if (std.mem.eql(u8, operation, "backup"))
+                try ctx.executeOperation(alloc, .{ .backup = .{ .table_name = table_name, .body = body_json } })
+            else
+                try ctx.executeOperation(alloc, .{ .restore = .{ .table_name = table_name, .body = body_json } });
         }
 
         fn batch(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
@@ -526,34 +530,26 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             var body = std.json.ObjectMap.empty;
             if (jsonValueArg(args, "writes")) |writes| try body.put(alloc, "inserts", writes);
             if (jsonValueArg(args, "deletes")) |deletes| try body.put(alloc, "deletes", deletes);
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/batch", .{ routes.Routes.tables, table_name });
-            return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
+            return try ctx.executeOperation(alloc, .{ .batch = .{
+                .table_name = table_name,
+                .body = try stringifyJsonValue(alloc, .{ .object = body }),
+            } });
         }
 
-        fn tableRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, table_arg: []const u8, suffix: ?[]const u8, body: []const u8) !mcp.CallToolResult {
+        const TableOperationKind = enum { drop_table, describe_table };
+
+        fn tableOperation(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, table_arg: []const u8, kind: TableOperationKind) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, table_arg) orelse return mcpError(alloc, "missing tableName");
-            const uri = if (suffix) |route_suffix|
-                try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ routes.Routes.tables, table_name, route_suffix })
-            else
-                try std.fmt.allocPrint(alloc, "{s}/{s}", .{ routes.Routes.tables, table_name });
-            return try ctx.simpleRoute(alloc, method, uri, body);
+            return switch (kind) {
+                .drop_table => try ctx.executeOperation(alloc, .{ .drop_table = .{ .table_name = table_name } }),
+                .describe_table => try ctx.executeOperation(alloc, .{ .describe_table = .{ .table_name = table_name } }),
+            };
         }
 
-        fn simpleRoute(ctx: *@This(), alloc: std.mem.Allocator, method: http_common.Method, uri: []const u8, body: []const u8) !mcp.CallToolResult {
-            const headers: []const http_common.RequestHeader = if (ctx.trusted_principal) |trusted_principal|
-                &[_]http_common.RequestHeader{.{ .name = trusted_principal_header, .value = trusted_principal }}
-            else
-                &.{};
-            var resp = try ctx.server.handle(.{
-                .method = method,
-                .uri = uri,
-                .headers = headers,
-                .authorization = ctx.authorization,
-                .content_type = if (body.len == 0) null else "application/json",
-                .body = body,
-            });
+        fn executeOperation(ctx: *@This(), alloc: std.mem.Allocator, operation: contextual_operations.McpApplicationOperation) !mcp.CallToolResult {
+            var resp = try ctx.server.executeMcpApplicationOperation(operation, ctx.authenticated_identity);
             defer resp.deinit(ctx.server.alloc);
-            return try mcpResultFromHttpResponse(alloc, resp);
+            return try mcpResultFromOwnedResponse(alloc, resp);
         }
     };
     const ExtensionToolContext = struct {
@@ -582,8 +578,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
     for (&contexts, mcp_tool_specs) |*ctx, spec| {
         ctx.* = .{
             .server = server_ptr,
-            .authorization = request.authorization,
-            .trusted_principal = request.trusted_principal,
+            .authenticated_identity = authenticated_identity,
             .permissions = if (authenticated_identity) |identity| identity.permissions else null,
             .spec = spec,
         };
@@ -1765,26 +1760,6 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(alloc, encoded);
 }
 
-fn appendUriPathSegment(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
-    const hex = "0123456789ABCDEF";
-    for (text) |ch| {
-        if (isUriUnreserved(ch)) {
-            try out.append(alloc, ch);
-        } else {
-            try out.append(alloc, '%');
-            try out.append(alloc, hex[ch >> 4]);
-            try out.append(alloc, hex[ch & 0x0f]);
-        }
-    }
-}
-
-fn isUriUnreserved(ch: u8) bool {
-    return (ch >= 'A' and ch <= 'Z') or
-        (ch >= 'a' and ch <= 'z') or
-        (ch >= '0' and ch <= '9') or
-        ch == '-' or ch == '.' or ch == '_' or ch == '~';
-}
-
 fn mcpError(alloc: std.mem.Allocator, text: []const u8) !mcp.CallToolResult {
     return .{
         .is_error = true,
@@ -1792,7 +1767,7 @@ fn mcpError(alloc: std.mem.Allocator, text: []const u8) !mcp.CallToolResult {
     };
 }
 
-fn mcpResultFromHttpResponse(alloc: std.mem.Allocator, resp: http_common.HttpResponse) !mcp.CallToolResult {
+fn mcpResultFromOwnedResponse(alloc: std.mem.Allocator, resp: contextual_operations.OwnedResponse) !mcp.CallToolResult {
     if (resp.status < 200 or resp.status >= 300) {
         return .{
             .is_error = true,
@@ -1800,10 +1775,8 @@ fn mcpResultFromHttpResponse(alloc: std.mem.Allocator, resp: http_common.HttpRes
         };
     }
     var structured: ?std.json.Value = null;
-    if (resp.content_type) |content_type| {
-        if (std.mem.indexOf(u8, content_type, "json") != null and resp.body.len != 0) {
-            structured = std.json.parseFromSliceLeaky(std.json.Value, alloc, resp.body, .{}) catch null;
-        }
+    if (std.mem.indexOf(u8, resp.content_type, "json") != null and resp.body.len != 0) {
+        structured = std.json.parseFromSliceLeaky(std.json.Value, alloc, resp.body, .{}) catch null;
     }
     return .{
         .text = try alloc.dupe(u8, if (resp.body.len == 0) "ok" else resp.body),

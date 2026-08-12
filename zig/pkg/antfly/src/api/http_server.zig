@@ -11281,6 +11281,231 @@ pub const ApiHttpServer = struct {
         return try result_alloc.dupe(u8, response_body);
     }
 
+    pub fn executeMcpApplicationOperation(
+        self: *ApiHttpServer,
+        operation: contextual_operations.McpApplicationOperation,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        switch (operation) {
+            .list_tables => {
+                var snapshot = (try self.source.adminSnapshot()) orelse
+                    return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+                defer self.source.freeAdminSnapshot(&snapshot);
+                const storage_statuses = try self.collectTableStorageStatuses(self.alloc, &snapshot, null);
+                defer if (storage_statuses) |items| self.alloc.free(items);
+                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena_impl.deinit();
+                return try contextualJsonResponse(
+                    self.alloc,
+                    200,
+                    try tables_api.buildTableListWithStorageStatuses(arena_impl.allocator(), &snapshot, null, storage_statuses),
+                );
+            },
+            .create_table => |request| return try self.executeMcpCreateTable(request.table_name, request.body),
+            .drop_table => |request| return try self.executeMcpDropTable(request.table_name),
+            .describe_table => |request| {
+                const body = (try self.maybeEncodeTableStatus(request.table_name)) orelse
+                    return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+                return contextual_operations.json(body, false);
+            },
+            .list_indexes => |request| {
+                var response = try self.handlePublicTableListIndexes(request.table_name);
+                defer response.deinit(self.alloc);
+                return try contextualResponseFromLegacy(self.alloc, response);
+            },
+            .create_index => |request| {
+                var response = try self.handlePublicTableCreateIndex(request.table_name, request.index_name, request.body);
+                defer response.deinit(self.alloc);
+                return try contextualResponseFromLegacy(self.alloc, response);
+            },
+            .drop_index => |request| {
+                var response = try self.handlePublicTableDeleteIndex(request.table_name, request.index_name);
+                defer response.deinit(self.alloc);
+                return try contextualResponseFromLegacy(self.alloc, response);
+            },
+            .get_document => |request| return try self.executeMcpGetDocument(request, authenticated_identity),
+            .sample_documents => |request| return try self.executeMcpSampleDocuments(request, authenticated_identity),
+            .query => |request| {
+                var response = try self.handlePublicTableQuery(request.table_name, request.body, authenticated_identity);
+                defer response.deinit(self.alloc);
+                return try contextualResponseFromLegacy(self.alloc, response);
+            },
+            .backup => |request| {
+                var response = try self.handlePublicTableBackup(request.table_name, request.body);
+                defer response.deinit(self.alloc);
+                return try contextualResponseFromLegacy(self.alloc, response);
+            },
+            .restore => |request| {
+                var response = try self.handlePublicTableRestore(
+                    request.table_name,
+                    request.body,
+                    null,
+                    if (authenticated_identity) |identity| identity.username else null,
+                );
+                defer response.deinit(self.alloc);
+                return try contextualResponseFromLegacy(self.alloc, response);
+            },
+            .batch => |request| {
+                var response = try self.handlePublicTableBatch(request.table_name, request.body);
+                defer response.deinit(self.alloc);
+                return try contextualResponseFromLegacy(self.alloc, response);
+            },
+        }
+    }
+
+    fn executeMcpCreateTable(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !contextual_operations.OwnedResponse {
+        var request = table_contract.parseCreateTableRequest(self.alloc, body) catch |err|
+            return try contextual_operations.textAlloc(self.alloc, 400, table_contract.createTableRequestErrorMessage(err, body));
+        defer request.deinit(self.alloc);
+        const normalized_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+            self.alloc,
+            request.indexes_json orelse tables_api.default_indexes_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| return switch (err) {
+            error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
+            error.EmbeddingProbeUnavailable => try contextual_operations.textAlloc(self.alloc, 503, "table index validation probe unavailable"),
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
+            else => return err,
+        };
+        if (request.indexes_json) |old| self.alloc.free(old);
+        request.indexes_json = normalized_indexes_json;
+        tables_api.validatePublicAlgebraicIndexesJson(self.alloc, request.indexes_json orelse tables_api.default_indexes_json) catch
+            return try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration");
+
+        self.source.createTable(self.alloc, table_name, request) catch |err| return switch (err) {
+            error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
+            error.InvalidCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
+            error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
+            else => return err,
+        };
+        const local_handled = if (self.table_writes) |writes|
+            (try writes.createTable(self.alloc, table_name, request)) != null
+        else
+            false;
+        if (local_handled) {
+            self.waitForProjectedTablePresence(table_name) catch |err| switch (err) {
+                error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
+                else => return err,
+            };
+            if (!self.cfg.deployment_mode.isStandalone()) {
+                self.waitForProjectedTableWriteQuorum(table_name) catch |err| switch (err) {
+                    error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
+                    else => return err,
+                };
+            }
+        } else {
+            const metadata_wait_handled = self.source.waitTableLifecycle(table_name, .present) catch |err| lifecycle: {
+                break :lifecycle switch (err) {
+                    error.TableVisibilityTimeout => {
+                        self.waitForProjectedTableCreateReadiness(table_name) catch |fallback_err| switch (fallback_err) {
+                            error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
+                            else => return fallback_err,
+                        };
+                        break :lifecycle true;
+                    },
+                    error.NotLeader => return err,
+                    else => return err,
+                };
+            };
+            if (!metadata_wait_handled) {
+                self.waitForTableVisibility(table_name, .present) catch |err| switch (err) {
+                    error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
+                    else => return err,
+                };
+            }
+        }
+        const response_body = (try self.maybeEncodeTableStatus(table_name)) orelse
+            return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+        return contextual_operations.json(response_body, false);
+    }
+
+    fn executeMcpDropTable(self: *ApiHttpServer, table_name: []const u8) !contextual_operations.OwnedResponse {
+        var group_ids: ?[]u64 = null;
+        defer if (group_ids) |values| self.alloc.free(values);
+        if (self.table_writes != null) {
+            if (try self.source.adminSnapshot()) |snapshot_value| {
+                var snapshot = snapshot_value;
+                defer self.source.freeAdminSnapshot(&snapshot);
+                group_ids = try tableGroupIdsFromSnapshot(self.alloc, &snapshot, table_name);
+            }
+        }
+        self.source.dropTable(self.alloc, table_name) catch |err| return switch (err) {
+            error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
+            error.TableTransitionActive => try contextual_operations.textAlloc(self.alloc, 409, "table transition active"),
+            error.ExtensionOwnedObject, error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
+            else => return err,
+        };
+        if (self.table_writes) |writes| {
+            _ = writes.dropTable(self.alloc, table_name, group_ids orelse &.{}) catch |err| switch (err) {
+                error.TableNotFound => null,
+                else => return err,
+            };
+        }
+        self.waitForTableVisibility(table_name, .absent) catch |err| switch (err) {
+            error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table delete did not converge"),
+            else => return err,
+        };
+        return try contextual_operations.textAlloc(self.alloc, 204, "");
+    }
+
+    fn executeMcpGetDocument(
+        self: *ApiHttpServer,
+        request: contextual_operations.McpApplicationOperation.DocumentRead,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+        const query = if (request.fields) |fields| try std.fmt.allocPrint(self.alloc, "fields={s}", .{fields}) else try self.alloc.dupe(u8, "");
+        defer self.alloc.free(query);
+        var lookup_options = try http_route_helpers.parseLookupOptions(self.alloc, query);
+        defer lookup_options.deinit(self.alloc);
+        var result = (source.lookup(self.alloc, request.table_name, request.key, lookup_options.opts, .read_index) catch |err| switch (err) {
+            error.TableNotFound => return try contextual_operations.textAlloc(self.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, request.table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        if (row_filter_json) |value| {
+            if (!(try self.docJsonMatchesRowFilter(request.key, result.json, value)))
+                return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+        }
+        return contextual_operations.json(try self.alloc.dupe(u8, result.json), false);
+    }
+
+    fn executeMcpSampleDocuments(
+        self: *ApiHttpServer,
+        request: contextual_operations.McpApplicationOperation.TableBody,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+        var scan_request = http_route_helpers.parseScanKeysRequest(self.alloc, request.body) catch
+            return try contextual_operations.textAlloc(self.alloc, 400, "invalid scan request");
+        defer scan_request.deinit(self.alloc);
+        var result = (try source.scan(
+            self.alloc,
+            request.table_name,
+            scan_request.from,
+            scan_request.to,
+            scan_request.opts,
+            .read_index,
+        )) orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, request.table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        const body = if (row_filter_json) |value|
+            try self.filterScanResultByRowFilter(self.alloc, source, request.table_name, result.ndjson, value)
+        else
+            try self.alloc.dupe(u8, result.ndjson);
+        return contextual_operations.bytes("application/x-ndjson", body);
+    }
+
     pub fn handlePublicTableQueryWithContentType(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -14004,6 +14229,26 @@ fn contextualJsonResponse(alloc: std.mem.Allocator, status: u16, value: anytype)
 
 fn contextualJsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8) !contextual_operations.OwnedResponse {
     return try contextualJsonResponse(alloc, status, .{ .@"error" = message });
+}
+
+fn contextualResponseFromLegacy(alloc: std.mem.Allocator, response: http_common.HttpResponse) !contextual_operations.OwnedResponse {
+    const content_type = response.content_type orelse if (response.status >= 200 and response.status < 300)
+        "application/json"
+    else
+        "text/plain";
+    const stable_content_type = if (std.mem.indexOf(u8, content_type, "json") != null)
+        "application/json"
+    else if (std.mem.indexOf(u8, content_type, "ndjson") != null)
+        "application/x-ndjson"
+    else if (std.mem.indexOf(u8, content_type, "event-stream") != null)
+        "text/event-stream"
+    else
+        "text/plain";
+    return .{
+        .status = response.status,
+        .content_type = stable_content_type,
+        .body = try alloc.dupe(u8, response.body),
+    };
 }
 
 fn contextualRetryableTextResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !contextual_operations.OwnedResponse {
@@ -19372,7 +19617,7 @@ test "api http server serves MCP and hides A2A by default" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
     defer server.deinit();
 
-    var mcp_resp = try server.handle(.{
+    var mcp_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .content_type = "application/json",
@@ -19425,7 +19670,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     );
     defer server.deinit();
 
-    var mcp_resp = try server.handle(.{
+    var mcp_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .content_type = "application/json",
@@ -19442,7 +19687,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
         .{ .name = mcp.session_id_header, .value = mcp_resp.headers[0].value },
     };
 
-    var mcp_stream = try server.handle(.{
+    var mcp_stream = try executeProtocolRequestForTest(&server, .{
         .method = .GET,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -19457,7 +19702,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
         .{ .name = mcp.session_id_header, .value = mcp_resp.headers[0].value },
         .{ .name = mcp.last_event_id_header, .value = "9" },
     };
-    var mcp_resumed_stream = try server.handle(.{
+    var mcp_resumed_stream = try executeProtocolRequestForTest(&server, .{
         .method = .GET,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_resume_headers,
@@ -19466,7 +19711,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     try std.testing.expectEqual(@as(u16, 200), mcp_resumed_stream.status);
     try std.testing.expect(std.mem.indexOf(u8, mcp_resumed_stream.body, "id: 10\n") != null);
 
-    var mcp_delete = try server.handle(.{
+    var mcp_delete = try executeProtocolRequestForTest(&server, .{
         .method = .DELETE,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -19474,7 +19719,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     defer mcp_delete.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), mcp_delete.status);
 
-    var mcp_missing_session = try server.handle(.{
+    var mcp_missing_session = try executeProtocolRequestForTest(&server, .{
         .method = .GET,
         .uri = routes.Routes.mcp_v1,
     });
@@ -20222,7 +20467,7 @@ test "api http server lists extension-owned mcp tools" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
     defer server.deinit();
 
-    var init_resp = try server.handle(.{
+    var init_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .content_type = "application/json",
@@ -20234,7 +20479,7 @@ test "api http server lists extension-owned mcp tools" {
     const mcp_session_headers = [_]http_common.RequestHeader{
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
     };
-    var tools_resp = try server.handle(.{
+    var tools_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -20320,7 +20565,7 @@ test "api http server scopes mcp endpoint to one extension" {
     defer server.deinit();
 
     const scoped_uri = "/mcp/v1/extensions/memoryaf";
-    var init_resp = try server.handle(.{
+    var init_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = scoped_uri,
         .content_type = "application/json",
@@ -20332,7 +20577,7 @@ test "api http server scopes mcp endpoint to one extension" {
     const mcp_session_headers = [_]http_common.RequestHeader{
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
     };
-    var tools_resp = try server.handle(.{
+    var tools_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = scoped_uri,
         .headers = &mcp_session_headers,
@@ -20506,7 +20751,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     const trusted_principal_headers = [_]http_common.RequestHeader{
         .{ .name = trusted_principal_header, .value = token },
     };
-    var init_resp = try server.handle(.{
+    var init_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &trusted_principal_headers,
@@ -20520,7 +20765,7 @@ test "api http server filters extension mcp tools by trusted principal table per
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
         .{ .name = trusted_principal_header, .value = token },
     };
-    var tools_resp = try server.handle(.{
+    var tools_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -20536,7 +20781,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     // Discovery is not the authorization boundary: a read-only client may
     // retain an older write-tool schema and hand-craft tools/call. The current
     // request identity must still prevent the mutation from reaching a route.
-    var denied_builtin_write = try server.handle(.{
+    var denied_builtin_write = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -20547,7 +20792,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqual(@as(u16, 200), denied_builtin_write.status);
     try std.testing.expect(std.mem.indexOf(u8, denied_builtin_write.body, "\"message\":\"unknown tool\"") != null);
 
-    var denied_extension_write = try server.handle(.{
+    var denied_extension_write = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -20570,7 +20815,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     const write_headers = [_]http_common.RequestHeader{
         .{ .name = trusted_principal_header, .value = write_token },
     };
-    var write_init = try server.handle(.{
+    var write_init = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &write_headers,
@@ -20582,7 +20827,7 @@ test "api http server filters extension mcp tools by trusted principal table per
         .{ .name = mcp.session_id_header, .value = write_init.headers[0].value },
         .{ .name = trusted_principal_header, .value = write_token },
     };
-    var denied_cross_table_write = try server.handle(.{
+    var denied_cross_table_write = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &write_session_headers,
@@ -20594,7 +20839,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, denied_cross_table_write.body, "\"text\":\"permission denied\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, denied_cross_table_write.body, "\"isError\":true") != null);
 
-    var denied_unscoped_write = try server.handle(.{
+    var denied_unscoped_write = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &write_session_headers,
@@ -21446,6 +21691,56 @@ fn executeHaRouteForTest(
         .content_type = if (body.len > 0) "application/json" else null,
         .body = body,
     })) orelse error.TestUnexpectedResult;
+}
+
+fn executeProtocolRequestForTest(server: *ApiHttpServer, request: http_common.HttpRequest) !http_common.HttpResponse {
+    var authenticated_identity: ?AuthenticatedIdentity = null;
+    defer if (authenticated_identity) |*identity| identity.deinit(server.alloc);
+    if (server.cfg.auth_enabled or server.cfg.trusted_principal_secret != null) {
+        authenticated_identity = server.authenticateRequest(.{
+            .authorization = request.authorization,
+            .trusted_principal = request.header(trusted_principal_header),
+        }) catch |err| switch (err) {
+            error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => return try unauthorizedResponse(server.alloc),
+            else => return err,
+        };
+    }
+    const uri = splitTarget(request.uri);
+    const mcp_request = protocol_adapters.McpRequest{
+        .method = switch (request.method) {
+            .GET => .get,
+            .POST => .post,
+            .PUT => .put,
+            .DELETE => .delete,
+        },
+        .endpoint_path = request.uri,
+        .authorization = request.authorization,
+        .trusted_principal = request.header(trusted_principal_header),
+        .session_id = request.header(mcp.session_id_header),
+        .last_event_id = request.header(mcp.last_event_id_header),
+        .body = request.body,
+    };
+    var response = if (routes.Routes.matchMcpExtension(uri.path)) |extension|
+        try protocol_adapters.executeExtensionMcpRequest(server, mcp_request, authenticated_identity, extension.name)
+    else
+        try protocol_adapters.executeMcpRequest(server, mcp_request, authenticated_identity);
+    defer response.deinit(server.alloc);
+    const headers = try server.alloc.alloc(http_common.Header, response.headers.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (headers[0..initialized]) |*header| header.deinit(server.alloc);
+        server.alloc.free(headers);
+    }
+    for (headers, response.headers) |*out, header| {
+        out.* = try ownedHeader(server.alloc, header.name, header.value);
+        initialized += 1;
+    }
+    return .{
+        .status = response.status,
+        .content_type = try server.alloc.dupe(u8, response.content_type),
+        .headers = headers,
+        .body = try server.alloc.dupe(u8, response.body),
+    };
 }
 
 test "typed HA route operation dispatches admin and internal executors" {
@@ -22993,7 +23288,7 @@ test "api http server serves document lookup through mcp tool" {
         .{ .name = trusted_principal_header, .value = token },
     };
 
-    var init_resp = try server.handle(.{
+    var init_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &trusted_principal_headers,
@@ -23007,7 +23302,7 @@ test "api http server serves document lookup through mcp tool" {
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
         .{ .name = trusted_principal_header, .value = token },
     };
-    var tools_resp = try server.handle(.{
+    var tools_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23019,7 +23314,7 @@ test "api http server serves document lookup through mcp tool" {
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"get_document\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"lookup\"") == null);
 
-    var call_resp = try server.handle(.{
+    var call_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23097,7 +23392,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
     defer server.deinit();
 
-    var init_resp = try server.handle(.{
+    var init_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .content_type = "application/json",
@@ -23109,7 +23404,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     const mcp_session_headers = [_]http_common.RequestHeader{
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
     };
-    var tools_resp = try server.handle(.{
+    var tools_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23131,7 +23426,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"inclusiveFrom\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"boolean\"") != null);
 
-    var describe_table_resp = try server.handle(.{
+    var describe_table_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23143,7 +23438,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, describe_table_resp.body, "\"name\":\"docs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, describe_table_resp.body, "\"full_text_index_v0\"") != null);
 
-    var describe_indexes_resp = try server.handle(.{
+    var describe_indexes_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23155,7 +23450,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, describe_indexes_resp.body, "\"full_text_index_v0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, describe_indexes_resp.body, "\"structuredContent\":{\"indexes\":[") != null);
 
-    var list_indexes_resp = try server.handle(.{
+    var list_indexes_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23167,7 +23462,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, list_indexes_resp.body, "\"full_text_index_v0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, list_indexes_resp.body, "\"structuredContent\":{\"indexes\":[") != null);
 
-    var sample_documents_resp = try server.handle(.{
+    var sample_documents_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23179,7 +23474,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"doc:a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"hello\"") != null);
 
-    var sample_documents_zero_limit_resp = try server.handle(.{
+    var sample_documents_zero_limit_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23191,7 +23486,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_zero_limit_resp.body, "\"isError\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_zero_limit_resp.body, "limit must be greater than 0") != null);
 
-    var sample_documents_large_limit_resp = try server.handle(.{
+    var sample_documents_large_limit_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23203,7 +23498,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_large_limit_resp.body, "\"isError\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, sample_documents_large_limit_resp.body, "limit exceeds maximum sample size") != null);
 
-    var describe_capabilities_resp = try server.handle(.{
+    var describe_capabilities_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23216,7 +23511,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "query-builder") != null);
     try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "\"raw_query_request\":true") != null);
 
-    var wrong_field_resp = try server.handle(.{
+    var wrong_field_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23227,7 +23522,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expectEqual(@as(u16, 200), wrong_field_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, wrong_field_resp.body, "\"doc:a\"") == null);
 
-    var query_resp = try server.handle(.{
+    var query_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23238,7 +23533,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expectEqual(@as(u16, 200), query_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, query_resp.body, "\"doc:a\"") != null);
 
-    var query_object_resp = try server.handle(.{
+    var query_object_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23249,7 +23544,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expectEqual(@as(u16, 200), query_object_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, query_object_resp.body, "\"doc:a\"") != null);
 
-    var query_rest_alias_resp = try server.handle(.{
+    var query_rest_alias_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23260,7 +23555,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expectEqual(@as(u16, 200), query_rest_alias_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, query_rest_alias_resp.body, "\"doc:a\"") != null);
 
-    var raw_query_request_resp = try server.handle(.{
+    var raw_query_request_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23271,7 +23566,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expectEqual(@as(u16, 200), raw_query_request_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, raw_query_request_resp.body, "\"doc:a\"") != null);
 
-    var mixed_query_request_resp = try server.handle(.{
+    var mixed_query_request_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23283,7 +23578,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, mixed_query_request_resp.body, "\"isError\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, mixed_query_request_resp.body, "queryRequest cannot be combined") != null);
 
-    var raw_query_request_table_resp = try server.handle(.{
+    var raw_query_request_table_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23295,7 +23590,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, raw_query_request_table_resp.body, "\"isError\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw_query_request_table_resp.body, "queryRequest.table is not allowed") != null);
 
-    var describe_query_request_resp = try server.handle(.{
+    var describe_query_request_resp = try executeProtocolRequestForTest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
