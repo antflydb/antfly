@@ -66,6 +66,11 @@ that end state:
   tests cover cancellation, while the real `httpx` client/server round trip
   covers the canonical wire contract without restoring a compatibility
   dispatcher.
+- Metadata table restore, split, merge, and replication-source exact-cutover
+  reseed now use the same operation layer and concrete `httpx` routes. The
+  metadata router no longer registers any contextual catch-all; the residual
+  request executor exists only for simulation callers that still need to move
+  to typed operations or real `httpx` transport before it can be deleted.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

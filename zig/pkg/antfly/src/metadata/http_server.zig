@@ -42,19 +42,8 @@ const service = @import("service.zig");
 
 pub const MetadataHttpServerConfig = struct {};
 
-pub const SplitRequest = struct {
-    split_key: []const u8,
-    source_group_id: ?u64 = null,
-    destination_group_id: ?u64 = null,
-    transition_id: ?u64 = null,
-};
-
-pub const MergeRequest = struct {
-    donor_group_id: u64,
-    receiver_group_id: u64,
-    transition_id: ?u64 = null,
-    allow_doc_identity_reassignment: bool = false,
-};
+pub const SplitRequest = table_operations.SplitRequest;
+pub const MergeRequest = table_operations.MergeRequest;
 
 pub const NodeShutdownRequest = struct {
     type: []const u8 = "remove",
@@ -75,16 +64,7 @@ pub const ReplaceTableDefinitionRequest = struct {
     definition: metadata_table_manager.TableRecord,
 };
 
-pub const ReseedExactCutoverResult = struct {
-    slot_name: []u8,
-    publication_name: []u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.slot_name);
-        alloc.free(self.publication_name);
-        self.* = undefined;
-    }
-};
+pub const ReseedExactCutoverResult = table_operations.ReseedExactCutoverResult;
 
 pub const AdminSource = struct {
     ptr: *anyopaque,
@@ -1109,7 +1089,6 @@ pub const MetadataHttpServer = struct {
     /// routes. Unknown paths are rejected by httpx and never enter the
     /// metadata operation layer.
     pub fn registerRoutes(self: *MetadataHttpServer, server: *httpx.Server) !void {
-        const handler = httpx.Handler.bind(self, contextualRoute);
         try server.get(routes.Routes.health, httpx.Handler.bind(self, metadataHealth));
         try server.get(routes.Routes.head, httpx.Handler.bind(self, metadataHead));
         try server.get(routes.Routes.status, httpx.Handler.bind(self, metadataStatus));
@@ -1155,10 +1134,10 @@ pub const MetadataHttpServer = struct {
         const enrichment_path = table_path ++ routes.Routes.internal_table_enrichments_infix ++ ":enrichment_name";
         try server.put(enrichment_path, httpx.Handler.bind(self, metadataPutTableEnrichment));
         try server.delete(enrichment_path, httpx.Handler.bind(self, metadataDeleteTableEnrichment));
-        try server.post(table_path ++ routes.Routes.internal_table_restore_suffix, handler);
-        try server.post(table_path ++ routes.Routes.internal_table_replication_sources_infix ++ ":source_ordinal" ++ routes.Routes.internal_table_reseed_exact_cutover_suffix, handler);
-        try server.post(table_path ++ routes.Routes.internal_split_suffix, handler);
-        try server.post(table_path ++ routes.Routes.internal_merge_suffix, handler);
+        try server.post(table_path ++ routes.Routes.internal_table_restore_suffix, httpx.Handler.bind(self, metadataRestoreTable));
+        try server.post(table_path ++ routes.Routes.internal_table_replication_sources_infix ++ ":source_ordinal" ++ routes.Routes.internal_table_reseed_exact_cutover_suffix, httpx.Handler.bind(self, metadataReseedReplicationSourceExactCutover));
+        try server.post(table_path ++ routes.Routes.internal_split_suffix, httpx.Handler.bind(self, metadataRequestTableSplit));
+        try server.post(table_path ++ routes.Routes.internal_merge_suffix, httpx.Handler.bind(self, metadataRequestTableMerge));
     }
 
     fn requestContext(ctx: *httpx.Context) operation.RequestContext {
@@ -1668,12 +1647,18 @@ pub const MetadataHttpServer = struct {
         return .{ .source = .{ .ptr = self, .vtable = &.{
             .create_table = createTableOperation,
             .replace_definition = replaceTableDefinitionOperation,
+            .restore_table = restoreTableOperation,
             .drop_table = dropTableOperation,
             .update_schema = updateTableSchemaOperation,
             .create_index = createTableIndexOperation,
             .drop_index = dropTableIndexOperation,
             .put_enrichment = putTableEnrichmentOperation,
             .delete_enrichment = deleteTableEnrichmentOperation,
+            .validate_split = validateTableSplitOperation,
+            .request_split = requestTableSplitOperation,
+            .validate_merge = validateTableMergeOperation,
+            .request_merge = requestTableMergeOperation,
+            .reseed_exact_cutover = reseedTableExactCutoverOperation,
         } } };
     }
 
@@ -1685,6 +1670,11 @@ pub const MetadataHttpServer = struct {
     fn replaceTableDefinitionOperation(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.source.replaceTableDefinition(expected, replacement);
+    }
+
+    fn restoreTableOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, request: table_operations.RestoreRequest) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.restoreTable(alloc, table_name, request.location, request.connection, request.artifact_backup_id, &request.manifest);
     }
 
     fn dropTableOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
@@ -1715,6 +1705,31 @@ pub const MetadataHttpServer = struct {
     fn deleteTableEnrichmentOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.source.deleteArtifactEnrichment(alloc, table_name, enrichment_name);
+    }
+
+    fn validateTableSplitOperation(ptr: *anyopaque, table_name: []const u8, request: SplitRequest) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return validateSplitRequestDocIdentity(self.source, table_name, request);
+    }
+
+    fn requestTableSplitOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, request: SplitRequest) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.requestSplit(alloc, table_name, request);
+    }
+
+    fn validateTableMergeOperation(ptr: *anyopaque, table_name: []const u8, request: MergeRequest) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return validateMergeRequestDocIdentity(self.source, table_name, request);
+    }
+
+    fn requestTableMergeOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, request: MergeRequest) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.requestMerge(alloc, table_name, request);
+    }
+
+    fn reseedTableExactCutoverOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) !ReseedExactCutoverResult {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.reseedReplicationSourceExactCutover(alloc, table_name, source_ordinal);
     }
 
     fn requiredParam(ctx: *httpx.Context, name: []const u8) ![]const u8 {
@@ -1864,6 +1879,75 @@ pub const MetadataHttpServer = struct {
         };
     }
 
+    fn metadataRestoreTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        var parsed = std.json.parseFromSlice(table_operations.RestoreRequest, ctx.allocator, (try ctx.body()) orelse "", .{ .allocate = .alloc_always }) catch
+            return ctx.status(400).text("invalid restore request");
+        defer parsed.deinit();
+        self.tableOperations().restore(ctx.allocator, requestContext(ctx), table_name, parsed.value) catch |err| {
+            if (backups_api.backupLocationErrorMessage(err)) |msg| return ctx.status(400).text(msg);
+            return switch (err) {
+                error.TableAlreadyExists => ctx.status(409).text("table already exists"),
+                error.InvalidBackupRequest, error.UnsupportedBackupFormat, error.UnsupportedBackupMigrationState => ctx.status(400).text("invalid restore request"),
+                error.BackupIntegrityMissing,
+                error.BackupArtifactIntegrityMismatch,
+                error.BackupArtifactMissing,
+                error.BackupArtifactFormatMismatch,
+                => ctx.status(400).text(backups_api.integrity_failure_message),
+                error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
+                else => metadataReadError(ctx, err),
+            };
+        };
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataRequestTableSplit(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        const split_request = parseSplitRequest(ctx.allocator, (try ctx.body()) orelse "") catch
+            return ctx.status(400).text("invalid split request");
+        defer ctx.allocator.free(split_request.split_key);
+        self.tableOperations().requestSplit(ctx.allocator, requestContext(ctx), table_name, split_request) catch |err| return switch (err) {
+            error.TableNotFound, error.RangeNotFound => ctx.status(404).text("not found"),
+            error.DocIdentityNamespaceMismatch => ctx.status(409).text("doc identity namespace mismatch"),
+            error.SplitInProgress, error.ConflictingSplitTransition => ctx.status(409).text("split already in progress"),
+            error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
+            error.Canceled, error.DeadlineExceeded => metadataReadError(ctx, err),
+            else => ctx.status(400).text("invalid split request"),
+        };
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataRequestTableMerge(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        const merge_request = parseMergeRequest(ctx.allocator, (try ctx.body()) orelse "") catch
+            return ctx.status(400).text("invalid merge request");
+        self.tableOperations().requestMerge(ctx.allocator, requestContext(ctx), table_name, merge_request) catch |err| return switch (err) {
+            error.TableNotFound, error.RangeNotFound => ctx.status(404).text("not found"),
+            error.DocIdentityNamespaceMismatch => ctx.status(409).text("doc identity namespace mismatch"),
+            error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
+            error.Canceled, error.DeadlineExceeded => metadataReadError(ctx, err),
+            else => ctx.status(400).text("invalid merge request"),
+        };
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataReseedReplicationSourceExactCutover(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        const raw_source_ordinal = requiredParam(ctx, "source_ordinal") catch return ctx.status(400).text("invalid replication source");
+        const source_ordinal = std.fmt.parseInt(u32, raw_source_ordinal, 10) catch return ctx.status(400).text("invalid replication source");
+        var result = self.tableOperations().reseedExactCutover(ctx.allocator, requestContext(ctx), table_name, source_ordinal) catch |err| return switch (err) {
+            error.TableNotFound, error.UnknownReplicationSource => ctx.status(404).text("not found"),
+            error.InvalidReplicationSourceConfig, error.UnsupportedReplicationSource => ctx.status(400).text("invalid replication source"),
+            error.TableGenerationChanged => ctx.status(409).text("table generation changed"),
+            error.TableTransitionActive => ctx.status(409).text("table transition active"),
+            error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
+            else => metadataReadError(ctx, err),
+        };
+        defer result.deinit(ctx.allocator);
+        _ = ctx.status(202);
+        return self.trackedJson(ctx, result);
+    }
+
     fn contextualRoute(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const method: http_common.Method = switch (ctx.request.method) {
             .GET => .GET,
@@ -1995,13 +2079,7 @@ pub const MetadataHttpServer = struct {
     }
 };
 
-const InternalTableRestoreRequest = struct {
-    backup_id: []const u8,
-    artifact_backup_id: []const u8,
-    location: []const u8,
-    connection: []const u8,
-    manifest: backups_api.TableBackupManifest,
-};
+const InternalTableRestoreRequest = table_operations.RestoreRequest;
 
 /// The ingress data node validates and content-binds the manifest using the
 /// named connection. Metadata persists that authority identifier and exact
@@ -4288,32 +4366,18 @@ test "metadata http server accepts internal reallocate and split merge routes" {
         "test-backups",
     );
     defer std.testing.allocator.free(restore_body);
-    var restore = try server.handle(.{
-        .method = .POST,
-        .uri = "/internal/v1/tables/docs/restore",
-        .body = restore_body,
-        .content_type = "application/json",
-    });
-    defer restore.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), restore.status);
+    const table_params = [_]httpx.RouteParam{.{ .name = "table_name", .value = "docs" }};
+    var restore = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/docs/restore", &table_params, restore_body, MetadataHttpServer.metadataRestoreTable);
+    defer restore.deinit();
+    try std.testing.expectEqual(@as(u16, 202), restore.status.code);
 
-    var split = try server.handle(.{
-        .method = .POST,
-        .uri = "/internal/v1/tables/docs/split",
-        .body = "{\"split_key\":\"doc:m\"}",
-        .content_type = "application/json",
-    });
-    defer split.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), split.status);
+    var split = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/docs/split", &table_params, "{\"split_key\":\"doc:m\"}", MetadataHttpServer.metadataRequestTableSplit);
+    defer split.deinit();
+    try std.testing.expectEqual(@as(u16, 202), split.status.code);
 
-    var merge = try server.handle(.{
-        .method = .POST,
-        .uri = "/internal/v1/tables/docs/merge",
-        .body = "{\"donor_group_id\":10,\"receiver_group_id\":9,\"allow_doc_identity_reassignment\":true}",
-        .content_type = "application/json",
-    });
-    defer merge.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), merge.status);
+    var merge = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/docs/merge", &table_params, "{\"donor_group_id\":10,\"receiver_group_id\":9,\"allow_doc_identity_reassignment\":true}", MetadataHttpServer.metadataRequestTableMerge);
+    defer merge.deinit();
+    try std.testing.expectEqual(@as(u16, 202), merge.status.code);
 
     try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
     try std.testing.expectEqual(@as(usize, 1), source.node_count);
@@ -4402,26 +4466,17 @@ test "metadata http server rejects split and merge during active doc identity re
 
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    const table_params = [_]httpx.RouteParam{.{ .name = "table_name", .value = "docs" }};
 
-    var split = try server.handle(.{
-        .method = .POST,
-        .uri = "/internal/v1/tables/docs/split",
-        .body = "{\"split_key\":\"doc:m\"}",
-        .content_type = "application/json",
-    });
-    defer split.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 409), split.status);
-    try std.testing.expectEqualStrings("doc identity namespace mismatch", split.body);
+    var split = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/docs/split", &table_params, "{\"split_key\":\"doc:m\"}", MetadataHttpServer.metadataRequestTableSplit);
+    defer split.deinit();
+    try std.testing.expectEqual(@as(u16, 409), split.status.code);
+    try std.testing.expectEqualStrings("doc identity namespace mismatch", split.body.?);
 
-    var merge = try server.handle(.{
-        .method = .POST,
-        .uri = "/internal/v1/tables/docs/merge",
-        .body = "{\"donor_group_id\":10,\"receiver_group_id\":9,\"allow_doc_identity_reassignment\":true}",
-        .content_type = "application/json",
-    });
-    defer merge.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 409), merge.status);
-    try std.testing.expectEqualStrings("doc identity namespace mismatch", merge.body);
+    var merge = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/docs/merge", &table_params, "{\"donor_group_id\":10,\"receiver_group_id\":9,\"allow_doc_identity_reassignment\":true}", MetadataHttpServer.metadataRequestTableMerge);
+    defer merge.deinit();
+    try std.testing.expectEqual(@as(u16, 409), merge.status.code);
+    try std.testing.expectEqualStrings("doc identity namespace mismatch", merge.body.?);
 
     try std.testing.expectEqual(@as(usize, 0), source.split_count);
     try std.testing.expectEqual(@as(usize, 0), source.merge_count);
@@ -4512,26 +4567,17 @@ test "metadata http server maps source split merge doc identity conflicts" {
 
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    const table_params = [_]httpx.RouteParam{.{ .name = "table_name", .value = "docs" }};
 
-    var split = try server.handle(.{
-        .method = .POST,
-        .uri = "/internal/v1/tables/docs/split",
-        .body = "{\"split_key\":\"doc:m\"}",
-        .content_type = "application/json",
-    });
-    defer split.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 409), split.status);
-    try std.testing.expectEqualStrings("doc identity namespace mismatch", split.body);
+    var split = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/docs/split", &table_params, "{\"split_key\":\"doc:m\"}", MetadataHttpServer.metadataRequestTableSplit);
+    defer split.deinit();
+    try std.testing.expectEqual(@as(u16, 409), split.status.code);
+    try std.testing.expectEqualStrings("doc identity namespace mismatch", split.body.?);
 
-    var merge = try server.handle(.{
-        .method = .POST,
-        .uri = "/internal/v1/tables/docs/merge",
-        .body = "{\"donor_group_id\":10,\"receiver_group_id\":9}",
-        .content_type = "application/json",
-    });
-    defer merge.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 409), merge.status);
-    try std.testing.expectEqualStrings("doc identity namespace mismatch", merge.body);
+    var merge = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/docs/merge", &table_params, "{\"donor_group_id\":10,\"receiver_group_id\":9}", MetadataHttpServer.metadataRequestTableMerge);
+    defer merge.deinit();
+    try std.testing.expectEqual(@as(u16, 409), merge.status.code);
+    try std.testing.expectEqualStrings("doc identity namespace mismatch", merge.body.?);
 
     try std.testing.expectEqual(@as(usize, 1), source.split_count);
     try std.testing.expectEqual(@as(usize, 1), source.merge_count);
@@ -4765,18 +4811,14 @@ test "metadata http server returns 400 for invalid internal restore backup locat
         "test-backups",
     );
     defer std.testing.allocator.free(restore_body);
-    var restore = try server.handle(.{
-        .method = .POST,
-        .uri = "/internal/v1/tables/docs/restore",
-        .body = restore_body,
-        .content_type = "application/json",
-    });
-    defer restore.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 400), restore.status);
-    try std.testing.expectEqualStrings("text/plain", restore.content_type.?);
+    const table_params = [_]httpx.RouteParam{.{ .name = "table_name", .value = "docs" }};
+    var restore = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/docs/restore", &table_params, restore_body, MetadataHttpServer.metadataRestoreTable);
+    defer restore.deinit();
+    try std.testing.expectEqual(@as(u16, 400), restore.status.code);
+    try std.testing.expect(std.mem.startsWith(u8, restore.headers.get("content-type").?, "text/plain"));
     try std.testing.expectEqualStrings(
         "missing S3-compatible endpoint; set AWS_ENDPOINT_URL for s3:// backups",
-        restore.body,
+        restore.body.?,
     );
 }
 
@@ -4835,16 +4877,17 @@ test "metadata http server accepts reseed exact cutover route" {
 
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
-    var resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/internal/v1/tables/docs/replication-sources/1/reseed-exact-cutover",
-    });
-    defer resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), resp.status);
+    const reseed_params = [_]httpx.RouteParam{
+        .{ .name = "table_name", .value = "docs" },
+        .{ .name = "source_ordinal", .value = "1" },
+    };
+    var resp = try server.executeTypedHandlerForTest(.POST, "/internal/v1/tables/docs/replication-sources/1/reseed-exact-cutover", &reseed_params, MetadataHttpServer.metadataReseedReplicationSourceExactCutover);
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), resp.status.code);
     try std.testing.expectEqualStrings("docs", source.reseed_table_name.?);
     try std.testing.expectEqual(@as(u32, 1), source.reseed_source_ordinal.?);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"slot_name\":\"fresh_slot\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"publication_name\":\"fresh_pub\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body.?, "\"slot_name\":\"fresh_slot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body.?, "\"publication_name\":\"fresh_pub\"") != null);
 }
 
 test "metadata http server returns retryable authority response when reconcile lease is not held" {
