@@ -4835,6 +4835,7 @@ pub fn build(b: *std.Build) void {
     const lib_api_auth_default_filters = [_][]const u8{
         "api http server requires auth on public routes when enabled",
         "continuous HA rejects non-replicated public mutations before handlers",
+        "HA mutation middleware fails closed for unregistered HTTP methods",
         "continuous HA freezes pre-existing restore workers and resumption",
         "continuous HA allows a configured RemoteApply batch write",
         "api http server document scan requires table read permission",

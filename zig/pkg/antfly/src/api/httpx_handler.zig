@@ -160,9 +160,8 @@ pub const AntflyApiHandler = struct {
     /// `/db/v1` routes and root contextual routes share one inventory.
     fn enforceHaMutationPolicy(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         if (!self.api_server.cfg.ha_failover_safe_mutations_only) return next.call(ctx);
-        const method = requestMethod(ctx) orelse return next.call(ctx);
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
-        const mutation = ha_mutation_inventory.classify(method, path) orelse return next.call(ctx);
+        const mutation = classifyHaMutation(ctx.request.method, path) orelse return next.call(ctx);
         if (mutation.disposition != .reject and
             (mutation.disposition != .remote_apply or self.api_server.cfg.ha_remote_apply_mutations_enabled))
         {
@@ -175,6 +174,24 @@ pub const AntflyApiHandler = struct {
             .code = "ha_mutation_not_replicated",
             .surface = @tagName(mutation.surface),
         });
+    }
+
+    fn classifyHaMutation(method: httpx.Method, path: []const u8) ?ha_mutation_inventory.Classification {
+        const inventory_method: http_common.Method = switch (method) {
+            .GET, .HEAD, .OPTIONS => return null,
+            .POST => .POST,
+            .PUT => .PUT,
+            .DELETE => .DELETE,
+            // The inventory's deliberately small method type makes every new
+            // mutation verb opt in. Do not let a future PATCH or custom route
+            // bypass continuous-HA durability policy merely because the
+            // application-method adapter has not learned that verb yet.
+            else => return .{
+                .surface = .unclassified_non_get,
+                .disposition = .reject,
+            },
+        };
+        return ha_mutation_inventory.classify(inventory_method, path);
     }
 
     fn metadataNotLeaderResponse(ctx: *httpx.Context) !httpx.Response {
@@ -5425,6 +5442,16 @@ test "typed internal HTTP errors preserve doc identity conflict semantics" {
     try std.testing.expectEqual(@as(u16, 409), spec.status);
     try std.testing.expectEqualStrings("doc identity namespace mismatch", spec.message);
     try std.testing.expect(AntflyApiHandler.sharedInternalHttpErrorSpec(error.NotFound) == null);
+}
+
+test "HA mutation middleware fails closed for unregistered HTTP methods" {
+    try std.testing.expect(AntflyApiHandler.classifyHaMutation(.GET, "/tables/docs") == null);
+    try std.testing.expect(AntflyApiHandler.classifyHaMutation(.HEAD, "/tables/docs") == null);
+    try std.testing.expect(AntflyApiHandler.classifyHaMutation(.OPTIONS, "/tables/docs") == null);
+
+    const patch = AntflyApiHandler.classifyHaMutation(.PATCH, "/tables/docs").?;
+    try std.testing.expectEqual(ha_mutation_inventory.Surface.unclassified_non_get, patch.surface);
+    try std.testing.expectEqual(ha_mutation_inventory.Disposition.reject, patch.disposition);
 }
 
 test "httpx multi batch route uses the batch commit hook and public response contract" {
