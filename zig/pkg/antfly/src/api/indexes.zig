@@ -387,7 +387,7 @@ pub fn sortArtifactEnrichmentsByDependency(configs: []db_mod.types.EnrichmentCon
     std.mem.sort(db_mod.types.EnrichmentConfig, configs, {}, artifactEnrichmentLessThan);
 }
 
-fn collectArtifactEnrichmentsFromValue(
+pub fn collectArtifactEnrichmentsFromValue(
     alloc: std.mem.Allocator,
     value: std.json.Value,
     out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
@@ -688,7 +688,7 @@ fn isReservedIndexMetadataEntry(name: []const u8) bool {
     return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
 }
 
-fn expectedTableGroupIds(
+pub fn expectedTableGroupIds(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
     table_id: u64,

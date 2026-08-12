@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const platform_sync = @import("antfly_platform").sync;
 const adaptive_mod = @import("adaptive.zig");
 const algebra = @import("algebra.zig");
 const cylinder = @import("cylinder.zig");
@@ -28,6 +29,7 @@ const tensor_mod = @import("tensor.zig");
 const token = @import("token.zig");
 const value_mod = @import("value.zig");
 const symbol = @import("symbol.zig");
+const backend_erased = @import("../../backend_erased.zig");
 const backend_types = @import("../../backend_types.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
@@ -43,6 +45,38 @@ const geo_mod = @import("../../../search/geo.zig");
 const wildcard_mod = @import("../../../search/wildcard.zig");
 
 const namespace_prefix = "\x00\x00__algebraic__:";
+
+/// Prefix for the original algebraic fact-key family. Generation cleanup
+/// deliberately stops before the format version.
+pub fn storagePrefixAlloc(alloc: Allocator, storage_namespace: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, namespace_prefix);
+    try token.appendComponent(&out, alloc, storage_namespace);
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn tupleStoragePrefixAlloc(alloc: Allocator, storage_namespace: []const u8) ![]u8 {
+    return try token.canonicalTupleAlloc(alloc, &.{ "\x00\x00__algebraic__", storage_namespace });
+}
+
+pub fn dictionaryStoragePrefixAlloc(alloc: Allocator, storage_namespace: []const u8) ![]u8 {
+    return try token.canonicalTupleAlloc(alloc, &.{ "dictionary:v1", storage_namespace });
+}
+
+pub fn dictionaryRegistryPrefixAlloc(alloc: Allocator, storage_namespace: []const u8) ![]u8 {
+    return try token.canonicalTupleAlloc(alloc, &.{ "dictionary_registry:v1", storage_namespace });
+}
+
+pub fn storageBytesKeyAlloc(alloc: Allocator, storage_namespace: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    const prefix = try storagePrefixAlloc(alloc, storage_namespace);
+    defer alloc.free(prefix);
+    try out.appendSlice(alloc, prefix);
+    try token.appendComponent(&out, alloc, "storage-bytes:v1");
+    return try out.toOwnedSlice(alloc);
+}
 pub const path_fact_exists_constraint_value = "pathfact-exists:v1";
 const path_fact_any_constraint_tag = "pathfact-any:v1";
 const path_fact_prefix_constraint_tag = "pathfact-prefix:v1";
@@ -2609,7 +2643,12 @@ const JoinScanBounds = struct {
 
 pub const Index = struct {
     alloc: Allocator,
+    /// Public catalog identity used by planners and request access paths.
     name: []u8,
+    /// Physical primary-store namespace for this generation. Manager-owned
+    /// indexes use an explicit canonical or repair-generation namespace,
+    /// selected by the active-root pointer.
+    storage_namespace: []u8,
     parsed: std.json.Parsed(Config),
     parse_error_count: u64 = 0,
     last_error_doc_key: ?[]u8 = null,
@@ -2662,16 +2701,220 @@ pub const Index = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     append_only_accumulator_resource_bytes: u64 = 0,
     maintenance_accumulator_resource_bytes: u64 = 0,
+    /// Serializes the read-modify-write storage counter with every mutation
+    /// transaction owned by this physical generation. Runtime LSM write
+    /// transactions may overlap even though their commits are serialized, so
+    /// the lock must be acquired before opening the underlying transaction.
+    storage_accounting_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn open(alloc: Allocator, name: []const u8, config_json: []const u8) !Index {
+        return try openWithStorageNamespace(alloc, name, name, config_json);
+    }
+
+    pub fn openWithStorageNamespace(
+        alloc: Allocator,
+        name: []const u8,
+        storage_namespace: []const u8,
+        config_json: []const u8,
+    ) !Index {
         var parsed = try std.json.parseFromSlice(Config, alloc, config_json, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
         try validateConfig(parsed.value);
+        const owned_name = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned_name);
+        const owned_storage_namespace = try alloc.dupe(u8, storage_namespace);
+        errdefer alloc.free(owned_storage_namespace);
         return .{
             .alloc = alloc,
-            .name = try alloc.dupe(u8, name),
+            .name = owned_name,
+            .storage_namespace = owned_storage_namespace,
             .parsed = parsed,
         };
+    }
+
+    pub fn storageNamespace(self: *const Index) []const u8 {
+        return self.storage_namespace;
+    }
+
+    pub fn storageBytes(self: *const Index, store: *docstore_mod.DocStore) !u64 {
+        const key = try storageBytesKeyAlloc(self.alloc, self.storage_namespace);
+        defer self.alloc.free(key);
+        const raw = store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        if (raw.len != @sizeOf(u64)) return error.InvalidAlgebraicStorageByteCounter;
+        return std.mem.readInt(u64, raw[0..@sizeOf(u64)], .little);
+    }
+
+    fn StorageAccountingTxn(comptime Inner: type) type {
+        return struct {
+            const CachedValueLength = struct {
+                value_len: ?u64,
+            };
+
+            index: *Index,
+            inner: Inner,
+            prefixes: [4][]u8,
+            counter_key: []u8,
+            bytes: u64,
+            dirty: bool = false,
+            prior_value_lengths: std.StringHashMapUnmanaged(CachedValueLength) = .empty,
+
+            fn init(index: *Index, inner: Inner) !@This() {
+                const fact_prefix = try storagePrefixAlloc(index.alloc, index.storage_namespace);
+                errdefer index.alloc.free(fact_prefix);
+                const tuple_prefix = try tupleStoragePrefixAlloc(index.alloc, index.storage_namespace);
+                errdefer index.alloc.free(tuple_prefix);
+                const dictionary_prefix = try dictionaryStoragePrefixAlloc(index.alloc, index.storage_namespace);
+                errdefer index.alloc.free(dictionary_prefix);
+                const registry_prefix = try dictionaryRegistryPrefixAlloc(index.alloc, index.storage_namespace);
+                errdefer index.alloc.free(registry_prefix);
+                const counter_key = try storageBytesKeyAlloc(index.alloc, index.storage_namespace);
+                errdefer index.alloc.free(counter_key);
+                const raw = inner.get(counter_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (raw) |value| if (value.len != @sizeOf(u64))
+                    return error.InvalidAlgebraicStorageByteCounter;
+                return .{
+                    .index = index,
+                    .inner = inner,
+                    .prefixes = .{ fact_prefix, tuple_prefix, dictionary_prefix, registry_prefix },
+                    .counter_key = counter_key,
+                    .bytes = if (raw) |value| std.mem.readInt(u64, value[0..@sizeOf(u64)], .little) else 0,
+                };
+            }
+
+            fn deinit(self: *@This()) void {
+                var cached_keys = self.prior_value_lengths.keyIterator();
+                while (cached_keys.next()) |key| self.index.alloc.free(key.*);
+                self.prior_value_lengths.deinit(self.index.alloc);
+                for (self.prefixes) |prefix| self.index.alloc.free(prefix);
+                self.index.alloc.free(self.counter_key);
+                self.* = undefined;
+            }
+
+            fn rememberValueLength(self: *@This(), key: []const u8, value_len: ?u64) !void {
+                if (self.prior_value_lengths.getPtr(key)) |cached| {
+                    cached.value_len = value_len;
+                    return;
+                }
+                const owned_key = try self.index.alloc.dupe(u8, key);
+                errdefer self.index.alloc.free(owned_key);
+                try self.prior_value_lengths.put(self.index.alloc, owned_key, .{ .value_len = value_len });
+            }
+
+            fn valueLength(self: *@This(), key: []const u8) !?u64 {
+                if (self.prior_value_lengths.get(key)) |cached| return cached.value_len;
+                const old = self.inner.get(key) catch |err| switch (err) {
+                    error.NotFound => {
+                        try self.rememberValueLength(key, null);
+                        return null;
+                    },
+                    else => return err,
+                };
+                const value_len: u64 = @intCast(old.len);
+                try self.rememberValueLength(key, value_len);
+                return value_len;
+            }
+
+            fn counts(self: *const @This(), key: []const u8) bool {
+                if (std.mem.eql(u8, key, self.counter_key)) return false;
+                for (self.prefixes) |prefix| {
+                    if (std.mem.startsWith(u8, key, prefix)) return true;
+                }
+                return false;
+            }
+
+            fn entryBytes(key: []const u8, value: []const u8) u64 {
+                return @as(u64, @intCast(key.len)) +| @as(u64, @intCast(value.len));
+            }
+
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                const value = self.inner.get(key) catch |err| switch (err) {
+                    error.NotFound => {
+                        if (self.counts(key)) try self.rememberValueLength(key, null);
+                        return err;
+                    },
+                    else => return err,
+                };
+                if (self.counts(key)) try self.rememberValueLength(key, @intCast(value.len));
+                return value;
+            }
+
+            pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+                try self.inner.getManySorted(keys, values);
+                for (keys, values) |key, value| {
+                    if (!self.counts(key)) continue;
+                    try self.rememberValueLength(key, if (value) |bytes| @intCast(bytes.len) else null);
+                }
+            }
+
+            pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                const old_value_len = if (self.counts(key)) try self.valueLength(key) else null;
+                const old_bytes = if (old_value_len) |len| @as(u64, @intCast(key.len)) +| len else 0;
+                try self.inner.put(key, value);
+                if (!self.counts(key)) return;
+                self.bytes -|= old_bytes;
+                self.bytes +|= entryBytes(key, value);
+                self.dirty = true;
+                try self.rememberValueLength(key, @intCast(value.len));
+            }
+
+            pub fn appendPut(self: *@This(), key: []const u8, value: []const u8) !void {
+                try self.inner.appendPut(key, value);
+                if (!self.counts(key)) return;
+                self.bytes +|= entryBytes(key, value);
+                self.dirty = true;
+                try self.rememberValueLength(key, @intCast(value.len));
+            }
+
+            pub fn delete(self: *@This(), key: []const u8) !void {
+                const old_value_len = if (self.counts(key)) try self.valueLength(key) else null;
+                const old_bytes = if (old_value_len) |len| @as(u64, @intCast(key.len)) +| len else 0;
+                try self.inner.delete(key);
+                if (old_bytes != 0) {
+                    self.bytes -|= old_bytes;
+                    self.dirty = true;
+                }
+                if (self.counts(key)) try self.rememberValueLength(key, null);
+            }
+
+            pub fn openCursor(self: *@This()) !backend_erased.Cursor {
+                return try self.inner.openCursor();
+            }
+
+            fn finish(self: *@This()) !void {
+                if (!self.dirty) return;
+                var encoded: [@sizeOf(u64)]u8 = undefined;
+                std.mem.writeInt(u64, &encoded, self.bytes, .little);
+                try self.inner.put(self.counter_key, &encoded);
+            }
+        };
+    }
+
+    const StorageAccountingScope = struct {
+        index: *Index,
+
+        fn deinit(self: *@This()) void {
+            self.index.storage_accounting_mutex.unlock();
+            self.* = undefined;
+        }
+
+        fn txn(self: *@This(), inner: anytype) !StorageAccountingTxn(@TypeOf(inner)) {
+            return try StorageAccountingTxn(@TypeOf(inner)).init(self.index, inner);
+        }
+    };
+
+    /// Acquires generation-wide accounting ownership before callers open their
+    /// backend transaction. Keeping transaction construction on this scope
+    /// makes the required ordering explicit at every mutation site.
+    fn storageAccountingScope(self: *Index) StorageAccountingScope {
+        platform_sync.lockYielding(&self.storage_accounting_mutex);
+        return .{ .index = self };
     }
 
     pub fn attachResourceManager(self: *Index, manager: *resource_manager_mod.ResourceManager) void {
@@ -2682,6 +2925,7 @@ pub const Index = struct {
         self.clearAccumulatorResourceUsage(&self.append_only_accumulator_resource_bytes);
         self.clearAccumulatorResourceUsage(&self.maintenance_accumulator_resource_bytes);
         self.alloc.free(self.name);
+        self.alloc.free(self.storage_namespace);
         if (self.last_error_doc_key) |value| self.alloc.free(value);
         if (self.last_error_reason) |value| self.alloc.free(value);
         if (self.planner_last_fallback_reason) |value| self.alloc.free(value);
@@ -2727,9 +2971,14 @@ pub const Index = struct {
         }
         errdefer self.abortBulkIngestSession();
         if (self.bulk_dirty_path_promotion_dictionaries.count() > 0) {
+            var storage_accounting = self.storageAccountingScope();
+            defer storage_accounting.deinit();
             var txn = try store.beginWriteTxn();
             errdefer txn.abort();
-            try self.flushBulkSessionPathPromotionDictionariesTxn(&txn);
+            var accounting = try storage_accounting.txn(&txn);
+            defer accounting.deinit();
+            try self.flushBulkSessionPathPromotionDictionariesTxn(&accounting);
+            try accounting.finish();
             try txn.commit();
         }
         self.clearBulkDirtyPathPromotionDictionaries();
@@ -2756,17 +3005,26 @@ pub const Index = struct {
         }
 
         if (options.batch_options.mode == .bulk_ingest) {
+            var storage_accounting = self.storageAccountingScope();
+            defer storage_accounting.deinit();
             var write_batch = try store.beginWriteBatchWithOptions(options.batch_options);
             errdefer write_batch.abort();
-            const txn = write_batch.asTxn();
-            try self.applyBatchMutationsWithTxn(txn, batch, options);
+            var accounting = try storage_accounting.txn(write_batch.asTxn());
+            defer accounting.deinit();
+            try self.applyBatchMutationsWithTxn(&accounting, batch, options);
+            try accounting.finish();
             try write_batch.commit();
             return;
         }
 
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        try self.applyBatchMutationsWithTxn(&txn, batch, options);
+        var accounting = try storage_accounting.txn(&txn);
+        defer accounting.deinit();
+        try self.applyBatchMutationsWithTxn(&accounting, batch, options);
+        try accounting.finish();
         try txn.commit();
     }
 
@@ -2936,9 +3194,13 @@ pub const Index = struct {
         batch: derived_types.DerivedBatch,
         options: ApplyOptions,
     ) !void {
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var write_batch = try store.beginWriteBatchWithOptions(options.batch_options);
         errdefer write_batch.abort();
-        const txn = write_batch.asTxn();
+        var accounting = try storage_accounting.txn(write_batch.asTxn());
+        defer accounting.deinit();
+        const txn = &accounting;
         var accumulator = AppendOnlyAccumulator{};
         defer {
             self.clearAccumulatorResourceUsage(&self.append_only_accumulator_resource_bytes);
@@ -2972,6 +3234,7 @@ pub const Index = struct {
             try self.flushBatchMaintenanceContextTxn(txn, ctx);
         }
 
+        try accounting.finish();
         try write_batch.commit();
     }
 
@@ -3028,7 +3291,7 @@ pub const Index = struct {
     ) !?[]u8 {
         var txn = try store.beginReadTxn();
         defer txn.abort();
-        const key = try tensor_mod.keyAlloc(self.alloc, self.name, .{
+        const key = try tensor_mod.keyAlloc(self.alloc, self.storage_namespace, .{
             .materialization = materialization_id,
             .axes_canonical = axes_canonical,
             .bucket = bucket,
@@ -3055,11 +3318,15 @@ pub const Index = struct {
     ) !void {
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try storage_accounting.txn(&raw_txn);
+        defer txn.deinit();
         const axis_id = try self.ensureSymbol(&txn, axes_canonical);
         self.alloc.free(axis_id);
-        const key = try tensor_mod.expressionKeyAlloc(self.alloc, self.name, .{
+        const key = try tensor_mod.expressionKeyAlloc(self.alloc, self.storage_namespace, .{
             .expr_id = expr_id,
             .axes_canonical = axes_canonical,
             .bucket = bucket,
@@ -3074,12 +3341,14 @@ pub const Index = struct {
                 error.NotFound => {},
                 else => return err,
             };
-            try txn.commit();
+            try txn.finish();
+            try raw_txn.commit();
             return;
         };
         defer self.alloc.free(encoded);
         try txn.put(key, encoded);
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
     }
 
     pub fn materializedExpressionRawValueAlloc(
@@ -3094,7 +3363,7 @@ pub const Index = struct {
         defer self.alloc.free(expr_id);
         var txn = try store.beginReadTxn();
         defer txn.abort();
-        const key = try tensor_mod.expressionKeyAlloc(self.alloc, self.name, .{
+        const key = try tensor_mod.expressionKeyAlloc(self.alloc, self.storage_namespace, .{
             .expr_id = expr_id,
             .axes_canonical = axes_canonical,
             .bucket = bucket,
@@ -3228,11 +3497,15 @@ pub const Index = struct {
     ) !usize {
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.name, expr_id);
+        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.storage_namespace, expr_id);
         defer self.alloc.free(prefix);
 
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try storage_accounting.txn(&raw_txn);
+        defer txn.deinit();
 
         var keys = std.ArrayListUnmanaged([]u8).empty;
         defer {
@@ -3270,7 +3543,7 @@ pub const Index = struct {
             } else .{ .bucket = @as(?[]const u8, null), .axes = entry.group_key };
             const axis_id = try self.ensureSymbol(&txn, expression_coordinate.axes);
             self.alloc.free(axis_id);
-            const key = try tensor_mod.expressionKeyAlloc(self.alloc, self.name, .{
+            const key = try tensor_mod.expressionKeyAlloc(self.alloc, self.storage_namespace, .{
                 .expr_id = expr_id,
                 .axes_canonical = expression_coordinate.axes,
                 .bucket = expression_coordinate.bucket,
@@ -3286,7 +3559,8 @@ pub const Index = struct {
             written += 1;
         }
 
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         return written;
     }
 
@@ -6385,7 +6659,7 @@ pub const Index = struct {
         if (!(try self.pathProfileHasKind(store, path, .string))) return .none;
         if (try self.readyPathPromotionMaterializationIdAlloc(store, path, .string)) |materialization_id| {
             defer self.alloc.free(materialization_id);
-            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, .string, "json-scalar-v1", "kind-qualified");
+            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, path, .string, "json-scalar-v1", "kind-qualified");
             return try self.resolvedDocSetForPathDictionaryLabelScanAlloc(store, identity, .{ .ip_range = query });
         }
         return try self.resolvedDocSetForPathLookupStringScanAlloc(store, path, .{ .ip_range = query });
@@ -7809,7 +8083,7 @@ pub const Index = struct {
         kind: pathfact_mod.Kind,
         scalar: []const u8,
     ) !?[][]u8 {
-        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, kind, "json-scalar-v1", "kind-qualified");
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, path, kind, "json-scalar-v1", "kind-qualified");
         if (!(try self.dictionaryRegistryReadyForLayout(store, identity, .lexicon_postings_rows))) return null;
         if (try self.pathDictionaryFstBytesAlloc(store, identity)) |fst_bytes| {
             defer self.alloc.free(fst_bytes);
@@ -7836,7 +8110,7 @@ pub const Index = struct {
         kind: pathfact_mod.Kind,
         scalar: []const u8,
     ) !?doc_set.ResolvedDocSet {
-        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, kind, "json-scalar-v1", "kind-qualified");
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, path, kind, "json-scalar-v1", "kind-qualified");
         if (!(try self.dictionaryRegistryReadyForLayout(store, identity, .lexicon_postings_rows))) return null;
         if (try self.pathDictionaryFstBytesAlloc(store, identity)) |fst_bytes| {
             defer self.alloc.free(fst_bytes);
@@ -7881,7 +8155,7 @@ pub const Index = struct {
             const promoted_path = spec.path_promotion_path orelse continue;
             if (!std.mem.eql(u8, promoted_path, path)) continue;
             const promoted_kind = spec.path_promotion_kind orelse continue;
-            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, promoted_kind, "json-scalar-v1", "kind-qualified");
+            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, path, promoted_kind, "json-scalar-v1", "kind-qualified");
             const item_ids = (try self.docIdsForPathDictionaryAllPostingsAlloc(store, identity)) orelse continue;
             defer self.freeDocIds(item_ids);
             saw_dictionary = true;
@@ -7917,7 +8191,7 @@ pub const Index = struct {
             const promoted_path = spec.path_promotion_path orelse continue;
             if (!std.mem.eql(u8, promoted_path, path)) continue;
             const promoted_kind = spec.path_promotion_kind orelse continue;
-            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, promoted_kind, "json-scalar-v1", "kind-qualified");
+            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, path, promoted_kind, "json-scalar-v1", "kind-qualified");
             var item_set = (try self.resolvedDocSetForPathDictionaryAllPostingsAlloc(store, identity)) orelse return null;
             defer item_set.deinit(self.alloc);
             saw_dictionary = true;
@@ -7933,7 +8207,7 @@ pub const Index = struct {
         path: []const u8,
         scan: PathDictionaryStringScan,
     ) !?[][]u8 {
-        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, .string, "json-scalar-v1", "kind-qualified");
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, path, .string, "json-scalar-v1", "kind-qualified");
         return try self.docIdsForPathDictionaryLabelScanAlloc(store, identity, scan);
     }
 
@@ -7943,7 +8217,7 @@ pub const Index = struct {
         spec: PathRangePredicate,
         kind: pathfact_mod.Kind,
     ) !?[][]u8 {
-        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, spec.path, kind, "json-scalar-v1", "kind-qualified");
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, spec.path, kind, "json-scalar-v1", "kind-qualified");
         if (!(try self.dictionaryRegistryReadyForLayout(store, identity, .lexicon_postings_rows))) return null;
         if (try self.pathDictionaryFstBytesAlloc(store, identity)) |fst_bytes| {
             defer self.alloc.free(fst_bytes);
@@ -8005,7 +8279,7 @@ pub const Index = struct {
         spec: PathRangePredicate,
         kind: pathfact_mod.Kind,
     ) !?doc_set.ResolvedDocSet {
-        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, spec.path, kind, "json-scalar-v1", "kind-qualified");
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, spec.path, kind, "json-scalar-v1", "kind-qualified");
         if (!(try self.dictionaryRegistryReadyForLayout(store, identity, .lexicon_postings_rows))) return null;
         if (try self.pathDictionaryFstBytesAlloc(store, identity)) |fst_bytes| {
             defer self.alloc.free(fst_bytes);
@@ -8617,7 +8891,7 @@ pub const Index = struct {
         if (!(try self.pathProfileHasKind(store, path, .string))) return .none;
         if (try self.readyPathPromotionMaterializationIdAlloc(store, path, .string)) |materialization_id| {
             defer self.alloc.free(materialization_id);
-            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, .string, "json-scalar-v1", "kind-qualified");
+            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, path, .string, "json-scalar-v1", "kind-qualified");
             return try self.resolvedDocSetForPathDictionaryLabelScanAlloc(store, identity, scan);
         }
         return try self.resolvedDocSetForPathLookupStringScanAlloc(store, path, scan);
@@ -9022,9 +9296,9 @@ pub const Index = struct {
             const materialization_id = try adaptive_mod.materializationIdAlloc(self.alloc, token_recommendation);
             defer self.alloc.free(materialization_id);
             const lifecycle: adaptive_mod.Lifecycle = .recommended;
-            const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.name, token_recommendation);
+            const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.storage_namespace, token_recommendation);
             defer self.alloc.free(state_key);
-            const candidate_key = try adaptive_mod.candidateKeyAlloc(self.alloc, self.name, token_recommendation);
+            const candidate_key = try adaptive_mod.candidateKeyAlloc(self.alloc, self.storage_namespace, token_recommendation);
             defer self.alloc.free(candidate_key);
             const cost = AdaptiveCostInputs{
                 .doc_rows = recommendation.doc_count,
@@ -9053,8 +9327,12 @@ pub const Index = struct {
             else
                 "schemaless_typed_path_recommended";
             const decision = if (should_start_backfill) "schemaless_path_backfill_started" else base_decision;
-            var txn = try store.beginWriteTxn();
-            errdefer txn.abort();
+            var storage_accounting = self.storageAccountingScope();
+            defer storage_accounting.deinit();
+            var raw_txn = try store.beginWriteTxn();
+            errdefer raw_txn.abort();
+            var txn = try storage_accounting.txn(&raw_txn);
+            defer txn.deinit();
             try self.persistPathProfileHistoryTxn(&txn, recommendation);
             const prior_state_payload = txn.get(state_key) catch |err| switch (err) {
                 error.NotFound => null,
@@ -9092,7 +9370,7 @@ pub const Index = struct {
                 generation,
             );
             defer self.alloc.free(candidate_payload);
-            const history_key = try adaptiveDecisionHistoryKeyAlloc(self.alloc, self.name, token_recommendation, generation);
+            const history_key = try adaptiveDecisionHistoryKeyAlloc(self.alloc, self.storage_namespace, token_recommendation, generation);
             defer self.alloc.free(history_key);
             const history_payload = try self.encodePersistedAdaptiveDecisionAlloc(token_recommendation, materialization_id, effective_lifecycle, previous_decision, decision, recommendation.doc_count, estimated_scan_rows_saved, estimated_write_cost, score, score - previous_score, 0, generation);
             defer self.alloc.free(history_payload);
@@ -9103,13 +9381,14 @@ pub const Index = struct {
             try txn.put(candidate_key, candidate_payload);
             try txn.put(history_key, history_payload);
             if (should_start_backfill and should_write_state) {
-                const progress_key = try adaptive_mod.progressKeyAlloc(self.alloc, self.name, token_recommendation);
+                const progress_key = try adaptive_mod.progressKeyAlloc(self.alloc, self.storage_namespace, token_recommendation);
                 defer self.alloc.free(progress_key);
                 const progress_payload = try self.encodePersistedAdaptiveProgressAlloc(token_recommendation, materialization_id, .backfilling, 0, 0, 0, 0, "");
                 defer self.alloc.free(progress_payload);
                 try txn.put(progress_key, progress_payload);
             }
-            try txn.commit();
+            try txn.finish();
+            try raw_txn.commit();
         }
         return changed;
     }
@@ -9925,7 +10204,7 @@ pub const Index = struct {
     ) ![]FoldEntry {
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.name, expr_id);
+        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.storage_namespace, expr_id);
         defer self.alloc.free(prefix);
 
         var out = std.ArrayListUnmanaged(FoldEntry).empty;
@@ -11027,7 +11306,7 @@ pub const Index = struct {
         const expr = materializationExpression(mat, law_id);
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        const key = try tensor_mod.expressionKeyAlloc(self.alloc, self.name, .{
+        const key = try tensor_mod.expressionKeyAlloc(self.alloc, self.storage_namespace, .{
             .expr_id = expr_id,
             .axes_canonical = axes_canonical,
             .bucket = bucket,
@@ -11055,7 +11334,7 @@ pub const Index = struct {
             const mat_idx = self.materializationIndex(name) orelse return null;
             if (!sameLayoutShape(first_mat, self.config().materializations[mat_idx])) return null;
         }
-        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.name, first_expr_id);
+        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.storage_namespace, first_expr_id);
         defer self.alloc.free(prefix);
 
         var out = std.ArrayListUnmanaged(MaterializedExpressionRowEntry).empty;
@@ -11154,7 +11433,7 @@ pub const Index = struct {
         const expr = materializationExpression(mat, law_id);
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.name, expr_id);
+        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.storage_namespace, expr_id);
         defer self.alloc.free(prefix);
 
         var count: usize = 0;
@@ -11174,7 +11453,7 @@ pub const Index = struct {
         const law_id = law_mod.fromOp(spec.op);
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.name, expr_id);
+        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.storage_namespace, expr_id);
         defer self.alloc.free(prefix);
         var txn = try store.beginReadTxn();
         defer txn.abort();
@@ -11264,7 +11543,7 @@ pub const Index = struct {
         const law_id = law_mod.fromOp(spec.op);
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.name, expr_id);
+        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.storage_namespace, expr_id);
         defer self.alloc.free(prefix);
         var out = std.ArrayListUnmanaged(FoldEntry).empty;
         errdefer {
@@ -11322,7 +11601,7 @@ pub const Index = struct {
         txn: anytype,
         recommendation: []const u8,
     ) !?PersistedAdaptiveProgress {
-        const key = try adaptive_mod.progressKeyAlloc(self.alloc, self.name, recommendation);
+        const key = try adaptive_mod.progressKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(key);
         const payload = txn.get(key) catch |err| switch (err) {
             error.NotFound => return null,
@@ -11336,7 +11615,7 @@ pub const Index = struct {
         txn: anytype,
         recommendation: []const u8,
     ) !bool {
-        const key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.name, recommendation);
+        const key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(key);
         const payload = txn.get(key) catch |err| switch (err) {
             error.NotFound => return false,
@@ -11494,7 +11773,7 @@ pub const Index = struct {
 
     pub fn loadPersistedObservations(self: *Index, store: *docstore_mod.DocStore) !void {
         self.clearObservedQueryState();
-        const prefix = try adaptiveObservationPrefixAlloc(self.alloc, self.name);
+        const prefix = try adaptiveObservationPrefixAlloc(self.alloc, self.storage_namespace);
         defer self.alloc.free(prefix);
         var txn = try store.beginReadTxn();
         defer txn.abort();
@@ -11510,7 +11789,7 @@ pub const Index = struct {
     }
 
     pub fn scanPersistedQueryObservations(self: *Index, store: *docstore_mod.DocStore) ![]PersistedQueryObservation {
-        const prefix = try adaptiveObservationPrefixAlloc(self.alloc, self.name);
+        const prefix = try adaptiveObservationPrefixAlloc(self.alloc, self.storage_namespace);
         defer self.alloc.free(prefix);
         var out = std.ArrayListUnmanaged(PersistedQueryObservation).empty;
         errdefer {
@@ -11532,7 +11811,7 @@ pub const Index = struct {
     }
 
     pub fn scanPersistedMaterializationStates(self: *Index, store: *docstore_mod.DocStore) ![]PersistedMaterializationState {
-        const prefix = try adaptiveMaterializationStatePrefixAlloc(self.alloc, self.name);
+        const prefix = try adaptiveMaterializationStatePrefixAlloc(self.alloc, self.storage_namespace);
         defer self.alloc.free(prefix);
         var out = std.ArrayListUnmanaged(PersistedMaterializationState).empty;
         errdefer {
@@ -11554,7 +11833,7 @@ pub const Index = struct {
     }
 
     pub fn scanPersistedAdaptiveCandidates(self: *Index, store: *docstore_mod.DocStore) ![]PersistedAdaptiveCandidate {
-        const prefix = try adaptiveCandidatePrefixAlloc(self.alloc, self.name);
+        const prefix = try adaptiveCandidatePrefixAlloc(self.alloc, self.storage_namespace);
         defer self.alloc.free(prefix);
         var out = std.ArrayListUnmanaged(PersistedAdaptiveCandidate).empty;
         errdefer {
@@ -11576,7 +11855,7 @@ pub const Index = struct {
     }
 
     pub fn scanPersistedAdaptiveDecisions(self: *Index, store: *docstore_mod.DocStore, limit: usize) ![]PersistedAdaptiveDecision {
-        const prefix = try adaptiveDecisionHistoryPrefixAlloc(self.alloc, self.name);
+        const prefix = try adaptiveDecisionHistoryPrefixAlloc(self.alloc, self.storage_namespace);
         defer self.alloc.free(prefix);
         var out = std.ArrayListUnmanaged(PersistedAdaptiveDecision).empty;
         errdefer {
@@ -11602,7 +11881,7 @@ pub const Index = struct {
     }
 
     pub fn scanPersistedAdaptiveProgress(self: *Index, store: *docstore_mod.DocStore) ![]PersistedAdaptiveProgress {
-        const prefix = try adaptiveProgressPrefixAlloc(self.alloc, self.name);
+        const prefix = try adaptiveProgressPrefixAlloc(self.alloc, self.storage_namespace);
         defer self.alloc.free(prefix);
         var out = std.ArrayListUnmanaged(PersistedAdaptiveProgress).empty;
         errdefer {
@@ -11624,7 +11903,7 @@ pub const Index = struct {
     }
 
     fn scanPersistedAdaptiveProgressTxn(self: *Index, txn: anytype) ![]PersistedAdaptiveProgress {
-        const prefix = try adaptiveProgressPrefixAlloc(self.alloc, self.name);
+        const prefix = try adaptiveProgressPrefixAlloc(self.alloc, self.storage_namespace);
         defer self.alloc.free(prefix);
         var out = std.ArrayListUnmanaged(PersistedAdaptiveProgress).empty;
         errdefer {
@@ -11855,7 +12134,7 @@ pub const Index = struct {
         recommendation: []const u8,
         lifecycle: adaptive_mod.Lifecycle,
     ) !void {
-        const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.name, recommendation);
+        const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(state_key);
 
         var existing_state: PersistedMaterializationState = undefined;
@@ -11874,7 +12153,7 @@ pub const Index = struct {
             errdefer existing_state.deinit(self.alloc);
             if (!adaptive_mod.validLifecycleTransition(existing_state.lifecycle, lifecycle)) return error.InvalidAlgebraicLifecycleTransition;
 
-            const prefix = try adaptiveObservationPrefixAlloc(self.alloc, self.name);
+            const prefix = try adaptiveObservationPrefixAlloc(self.alloc, self.storage_namespace);
             defer self.alloc.free(prefix);
             var cursor = try txn.openCursor();
             defer cursor.close();
@@ -11902,8 +12181,12 @@ pub const Index = struct {
             updates.deinit(self.alloc);
         }
 
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try storage_accounting.txn(&raw_txn);
+        defer txn.deinit();
         const state = try self.encodePersistedMaterializationStateAlloc(recommendation, lifecycle, existing_state.observation_count);
         defer self.alloc.free(state);
         try txn.put(state_key, state);
@@ -11919,7 +12202,8 @@ pub const Index = struct {
             defer self.alloc.free(encoded);
             try txn.put(update.key, encoded);
         }
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         self.invalidateAdaptiveReadySpecCache();
     }
 
@@ -11956,11 +12240,15 @@ pub const Index = struct {
         defer self.alloc.free(shape);
         const recommendation = try adaptive_mod.recommendationAlloc(self.alloc, query);
         defer self.alloc.free(recommendation);
-        const key = try adaptive_mod.observationKeyAlloc(self.alloc, self.name, shape);
+        const key = try adaptive_mod.observationKeyAlloc(self.alloc, self.storage_namespace, shape);
         defer self.alloc.free(key);
 
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try storage_accounting.txn(&raw_txn);
+        defer txn.deinit();
         const existing = txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -11975,13 +12263,14 @@ pub const Index = struct {
         defer self.alloc.free(encoded);
         try txn.put(key, encoded);
         if (lifecycle == .recommended or lifecycle == .backfilling or lifecycle == .ready) {
-            const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.name, recommendation);
+            const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
             defer self.alloc.free(state_key);
             const state = try self.encodePersistedMaterializationStateAlloc(recommendation, lifecycle, next_count);
             defer self.alloc.free(state);
             try txn.put(state_key, state);
         }
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         self.invalidateAdaptiveReadySpecCache();
     }
 
@@ -11993,15 +12282,19 @@ pub const Index = struct {
         lifecycle: adaptive_mod.Lifecycle,
     ) !void {
         const recommendation = observation.recommendation orelse return;
-        const key = try adaptive_mod.observationKeyAlloc(self.alloc, self.name, observation.shape);
+        const key = try adaptive_mod.observationKeyAlloc(self.alloc, self.storage_namespace, observation.shape);
         defer self.alloc.free(key);
         const encoded = try self.encodePersistedObservationAlloc(observation.shape, count, observation.reason, recommendation, lifecycle);
         defer self.alloc.free(encoded);
 
-        const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.name, recommendation);
+        const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(state_key);
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try storage_accounting.txn(&raw_txn);
+        defer txn.deinit();
         try txn.put(key, encoded);
         if (txn.get(state_key)) |existing| {
             var state = self.decodePersistedMaterializationState(existing) catch null;
@@ -12015,7 +12308,8 @@ pub const Index = struct {
             error.NotFound => {},
             else => return err,
         }
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
     }
 
     fn adaptiveCostInputs(
@@ -12044,7 +12338,7 @@ pub const Index = struct {
             const law_id = law_mod.fromOp(spec.op);
             const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
             defer self.alloc.free(expr_id);
-            const expression_cost = try self.countRowsAndBytesWithPrefix(store, try tensor_mod.expressionPrefixAlloc(self.alloc, self.name, expr_id));
+            const expression_cost = try self.countRowsAndBytesWithPrefix(store, try tensor_mod.expressionPrefixAlloc(self.alloc, self.storage_namespace, expr_id));
             tensor_rows = saturatedAdd(tensor_rows, expression_cost.rows);
             storage_bytes = saturatedAdd(storage_bytes, expression_cost.bytes);
         }
@@ -12055,7 +12349,7 @@ pub const Index = struct {
             storage_bytes = saturatedAdd(storage_bytes, promoted_lookup_cost.bytes);
 
             if (spec.path_promotion_kind) |kind| {
-                const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, kind, "json-scalar-v1", "kind-qualified");
+                const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, path, kind, "json-scalar-v1", "kind-qualified");
                 if (try self.dictionaryRegistryOwnedByMaterialization(store, identity, materialization_id)) {
                     const lexicon_cost = try self.countRowsAndBytesWithPrefix(store, try self.pathDictionaryLexiconPrefixAlloc(identity));
                     const postings_cost = try self.countRowsAndBytesWithPrefix(store, try self.pathDictionaryPostingsDictionaryPrefixAlloc(identity));
@@ -12166,10 +12460,14 @@ pub const Index = struct {
         decision: []const u8,
         idle_miss_count: u64,
     ) !void {
-        const key = try adaptive_mod.candidateKeyAlloc(self.alloc, self.name, recommendation);
+        const key = try adaptive_mod.candidateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(key);
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try storage_accounting.txn(&raw_txn);
+        defer txn.deinit();
         var prior_candidate: ?PersistedAdaptiveCandidate = null;
         const prior_payload = txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
@@ -12182,13 +12480,14 @@ pub const Index = struct {
         const previous_score = if (prior_candidate) |candidate| candidate.score else 0;
         const payload = try self.encodePersistedAdaptiveCandidateAlloc(recommendation, materialization_id, lifecycle, observation_count, estimated_scan_rows_saved, estimated_write_cost, cost, score, decision, idle_miss_count, generation);
         defer self.alloc.free(payload);
-        const history_key = try adaptiveDecisionHistoryKeyAlloc(self.alloc, self.name, recommendation, generation);
+        const history_key = try adaptiveDecisionHistoryKeyAlloc(self.alloc, self.storage_namespace, recommendation, generation);
         defer self.alloc.free(history_key);
         const history_payload = try self.encodePersistedAdaptiveDecisionAlloc(recommendation, materialization_id, lifecycle, previous_decision, decision, observation_count, estimated_scan_rows_saved, estimated_write_cost, score, score - previous_score, idle_miss_count, generation);
         defer self.alloc.free(history_payload);
         try txn.put(key, payload);
         try txn.put(history_key, history_payload);
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
     }
 
     fn persistAdaptiveProgress(
@@ -12203,14 +12502,19 @@ pub const Index = struct {
         target_rows: u64,
         cursor_key: []const u8,
     ) !void {
-        const key = try adaptive_mod.progressKeyAlloc(self.alloc, self.name, recommendation);
+        const key = try adaptive_mod.progressKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(key);
         const payload = try self.encodePersistedAdaptiveProgressAlloc(recommendation, materialization_id, lifecycle, target_sequence, applied_sequence, rows_processed, target_rows, cursor_key);
         defer self.alloc.free(payload);
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try storage_accounting.txn(&raw_txn);
+        defer txn.deinit();
         try txn.put(key, payload);
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         self.invalidateAdaptiveReadySpecCache();
     }
 
@@ -12226,7 +12530,7 @@ pub const Index = struct {
         target_rows: u64,
         cursor_key: []const u8,
     ) !void {
-        const key = try adaptive_mod.progressKeyAlloc(self.alloc, self.name, recommendation);
+        const key = try adaptive_mod.progressKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(key);
         const payload = try self.encodePersistedAdaptiveProgressAlloc(recommendation, materialization_id, lifecycle, target_sequence, applied_sequence, rows_processed, target_rows, cursor_key);
         defer self.alloc.free(payload);
@@ -12240,7 +12544,7 @@ pub const Index = struct {
         recommendation: []const u8,
         materialization_id: []const u8,
     ) !void {
-        const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.name, recommendation);
+        const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(state_key);
         const existing_state = txn.get(state_key) catch |err| switch (err) {
             error.NotFound => null,
@@ -12255,7 +12559,7 @@ pub const Index = struct {
         defer self.alloc.free(state_payload);
         try txn.put(state_key, state_payload);
 
-        const progress_key = try adaptive_mod.progressKeyAlloc(self.alloc, self.name, recommendation);
+        const progress_key = try adaptive_mod.progressKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(progress_key);
         const existing_progress = txn.get(progress_key) catch |err| switch (err) {
             error.NotFound => null,
@@ -12289,10 +12593,15 @@ pub const Index = struct {
         for (progress_rows) |progress| {
             if (self.adaptiveProgressMatchesCurrentConfig(progress)) continue;
             if (progress.lifecycle == .rebuild_required) continue;
-            var txn = try store.beginWriteTxn();
-            errdefer txn.abort();
+            var storage_accounting = self.storageAccountingScope();
+            defer storage_accounting.deinit();
+            var raw_txn = try store.beginWriteTxn();
+            errdefer raw_txn.abort();
+            var txn = try storage_accounting.txn(&raw_txn);
+            defer txn.deinit();
             try self.markAdaptiveMaterializationRebuildRequiredTxn(&txn, progress);
-            try txn.commit();
+            try txn.finish();
+            try raw_txn.commit();
             changed += 1;
         }
         return changed;
@@ -12303,7 +12612,7 @@ pub const Index = struct {
         txn: anytype,
         progress: PersistedAdaptiveProgress,
     ) !void {
-        const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.name, progress.recommendation);
+        const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.storage_namespace, progress.recommendation);
         defer self.alloc.free(state_key);
         const existing_state = txn.get(state_key) catch |err| switch (err) {
             error.NotFound => null,
@@ -12364,7 +12673,7 @@ pub const Index = struct {
     }
 
     fn persistedMaterializationStateReadyTxn(self: *Index, txn: anytype, recommendation: []const u8) !bool {
-        const key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.name, recommendation);
+        const key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(key);
         const payload = txn.get(key) catch |err| switch (err) {
             error.NotFound => return false,
@@ -12678,8 +12987,12 @@ pub const Index = struct {
         const processed: u64 = @intCast(payloads.items.len);
         const total_processed = progress.rows_processed + processed;
 
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try storage_accounting.txn(&raw_txn);
+        defer txn.deinit();
         for (payloads.items) |item| {
             var facts = fact_mod.decodeListAlloc(self.alloc, item.payload) catch |err| switch (err) {
                 error.InvalidAlgebraicFact => continue,
@@ -12705,7 +13018,8 @@ pub const Index = struct {
             target_rows,
             cursor_key,
         );
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         if (reached_end and next_cursor_key.len > 0) {
             self.alloc.free(next_cursor_key);
             next_cursor_key = &.{};
@@ -12828,8 +13142,12 @@ pub const Index = struct {
 
         const processed: u64 = @intCast(items.items.len);
         const total_processed = progress.rows_processed + processed;
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try storage_accounting.txn(&raw_txn);
+        defer txn.deinit();
         const owns_dictionary = try self.putPathPromotionDictionaryRegistryTxn(&txn, spec, if (reached_end) "ready" else "building");
         for (items.items) |item| {
             const item_kind = std.meta.stringToEnum(pathfact_mod.Kind, item.kind) orelse continue;
@@ -12839,7 +13157,7 @@ pub const Index = struct {
             self.alloc.free(axes_id);
             const delta = try algebra.encodeI64Alloc(self.alloc, 1);
             defer self.alloc.free(delta);
-            const key = try tensor_mod.keyAlloc(self.alloc, self.name, .{
+            const key = try tensor_mod.keyAlloc(self.alloc, self.storage_namespace, .{
                 .materialization = spec.name,
                 .axes_canonical = axes_canonical,
                 .bucket = null,
@@ -12862,7 +13180,7 @@ pub const Index = struct {
             defer self.alloc.free(promoted_key);
             try txn.put(promoted_key, "");
             if (owns_dictionary) {
-                const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, item_kind, "json-scalar-v1", "kind-qualified");
+                const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, path, item_kind, "json-scalar-v1", "kind-qualified");
                 const lexicon_key = try self.pathDictionaryLexiconKeyAlloc(identity, item.value);
                 defer self.alloc.free(lexicon_key);
                 try txn.put(lexicon_key, "");
@@ -12890,7 +13208,8 @@ pub const Index = struct {
             target_rows,
             cursor_key,
         );
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         if (reached_end and next_cursor_key.len > 0) {
             self.alloc.free(next_cursor_key);
             next_cursor_key = &.{};
@@ -12915,7 +13234,7 @@ pub const Index = struct {
     ) !bool {
         const path = spec.path_promotion_path orelse return false;
         const kind = spec.path_promotion_kind orelse return false;
-        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, kind, "json-scalar-v1", "kind-qualified");
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, path, kind, "json-scalar-v1", "kind-qualified");
         switch (try lexical_mod.claimRegistryOwnerTxn(self.alloc, txn, identity, spec.name, .lexicon_postings_rows, state)) {
             .claimed => {
                 self.dictionary_registry_claimed_count += 1;
@@ -13004,8 +13323,12 @@ pub const Index = struct {
         const processed: u64 = @intCast(payloads.items.len);
         const total_processed = progress.rows_processed + processed;
 
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try storage_accounting.txn(&raw_txn);
+        defer txn.deinit();
         for (payloads.items) |item| {
             var changed_fact = ProjectedFact.decode(self.alloc, item.payload) catch |err| switch (err) {
                 error.InvalidAlgebraicFact => continue,
@@ -13031,7 +13354,8 @@ pub const Index = struct {
             target_rows,
             cursor_key,
         );
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         if (reached_end and next_cursor_key.len > 0) {
             self.alloc.free(next_cursor_key);
             next_cursor_key = &.{};
@@ -13086,7 +13410,7 @@ pub const Index = struct {
                     const law_id = law_mod.fromOp(owned_spec.op);
                     const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
                     defer self.alloc.free(expr_id);
-                    const expr_prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.name, expr_id);
+                    const expr_prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.storage_namespace, expr_id);
                     defer self.alloc.free(expr_prefix);
                     entry_opt = try cursor.seekAtOrAfter(expr_prefix);
                     while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
@@ -13097,13 +13421,17 @@ pub const Index = struct {
             } else |_| {}
         }
 
-        const progress_key = try adaptive_mod.progressKeyAlloc(self.alloc, self.name, recommendation);
+        const progress_key = try adaptive_mod.progressKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(progress_key);
-        const candidate_key = try adaptive_mod.candidateKeyAlloc(self.alloc, self.name, recommendation);
+        const candidate_key = try adaptive_mod.candidateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(candidate_key);
 
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try storage_accounting.txn(&raw_txn);
+        defer txn.deinit();
         for (keys.items) |key| txn.delete(key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
@@ -13117,7 +13445,8 @@ pub const Index = struct {
             else => return err,
         };
         try self.deleteAdaptiveDictionaryIfOwnedTxn(&txn, recommendation, materialization_id);
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
     }
 
     fn deleteAdaptiveDictionaryIfOwnedTxn(
@@ -13130,7 +13459,7 @@ pub const Index = struct {
         defer spec.deinit(self.alloc);
         const path = spec.path_promotion_path orelse return;
         const kind = spec.path_promotion_kind orelse return;
-        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, kind, "json-scalar-v1", "kind-qualified");
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, path, kind, "json-scalar-v1", "kind-qualified");
         const registry_key = try identity.registryKeyAlloc(self.alloc);
         defer self.alloc.free(registry_key);
         const payload = txn.get(registry_key) catch |err| switch (err) {
@@ -13218,7 +13547,7 @@ pub const Index = struct {
         const law_id = law_mod.fromOp(spec.op);
         const delta = try self.adaptiveTensorDeltaAlloc(spec.op, measure_value, sign);
         defer self.alloc.free(delta);
-        const key = try tensor_mod.keyAlloc(self.alloc, self.name, .{
+        const key = try tensor_mod.keyAlloc(self.alloc, self.storage_namespace, .{
             .materialization = spec.name,
             .axes_canonical = axes_canonical,
             .bucket = bucket_start,
@@ -13382,7 +13711,7 @@ pub const Index = struct {
         const law_id = law_mod.fromOp(spec.op);
         const delta = try self.adaptiveTensorDeltaAlloc(spec.op, measure_value, sign);
         defer self.alloc.free(delta);
-        const key = try tensor_mod.keyAlloc(self.alloc, self.name, .{
+        const key = try tensor_mod.keyAlloc(self.alloc, self.storage_namespace, .{
             .materialization = spec.name,
             .axes_canonical = axes_canonical,
             .bucket = null,
@@ -13477,7 +13806,7 @@ pub const Index = struct {
         const axes_id = try self.ensureSymbolAppendOnly(txn, axes_canonical);
         defer self.alloc.free(axes_id);
 
-        const tensor_key = try tensor_mod.keyAlloc(self.alloc, self.name, .{
+        const tensor_key = try tensor_mod.keyAlloc(self.alloc, self.storage_namespace, .{
             .materialization = spec.name,
             .axes_canonical = axes_canonical,
             .bucket = bucket,
@@ -13488,7 +13817,7 @@ pub const Index = struct {
         const expr = adaptiveMaterializedExpression(spec) orelse return;
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        const expr_key = try tensor_mod.expressionKeyAlloc(self.alloc, self.name, .{
+        const expr_key = try tensor_mod.expressionKeyAlloc(self.alloc, self.storage_namespace, .{
             .expr_id = expr_id,
             .axes_canonical = axes_canonical,
             .bucket = bucket,
@@ -13510,7 +13839,7 @@ pub const Index = struct {
         const axes_id = try self.ensureSymbol(txn, axes_canonical);
         defer self.alloc.free(axes_id);
 
-        const tensor_key = try tensor_mod.keyAlloc(self.alloc, self.name, .{
+        const tensor_key = try tensor_mod.keyAlloc(self.alloc, self.storage_namespace, .{
             .materialization = spec.name,
             .axes_canonical = axes_canonical,
             .bucket = bucket,
@@ -13521,7 +13850,7 @@ pub const Index = struct {
         const expr = adaptiveMaterializedExpression(spec) orelse return;
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        const expr_key = try tensor_mod.expressionKeyAlloc(self.alloc, self.name, .{
+        const expr_key = try tensor_mod.expressionKeyAlloc(self.alloc, self.storage_namespace, .{
             .expr_id = expr_id,
             .axes_canonical = axes_canonical,
             .bucket = bucket,
@@ -13542,7 +13871,7 @@ pub const Index = struct {
         const expr = adaptiveMaterializedExpression(spec) orelse return;
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        const expr_key = try tensor_mod.expressionKeyAlloc(self.alloc, self.name, .{
+        const expr_key = try tensor_mod.expressionKeyAlloc(self.alloc, self.storage_namespace, .{
             .expr_id = expr_id,
             .axes_canonical = axes_canonical,
             .bucket = bucket,
@@ -13791,8 +14120,9 @@ pub const Index = struct {
     fn keyAlloc(self: *Index, parts: []const []const u8) ![]u8 {
         var out = std.ArrayListUnmanaged(u8).empty;
         errdefer out.deinit(self.alloc);
-        try out.appendSlice(self.alloc, namespace_prefix);
-        try token.appendComponent(&out, self.alloc, self.name);
+        const prefix = try storagePrefixAlloc(self.alloc, self.storage_namespace);
+        defer self.alloc.free(prefix);
+        try out.appendSlice(self.alloc, prefix);
         try token.appendComponent(&out, self.alloc, "v4");
         for (parts) |part| try token.appendComponent(&out, self.alloc, part);
         return try out.toOwnedSlice(self.alloc);
@@ -14007,7 +14337,7 @@ pub const Index = struct {
     }
 
     fn adaptiveTensorPrefixAlloc(self: *Index, materialization_id: []const u8) ![]u8 {
-        return try token.canonicalTupleAlloc(self.alloc, &.{ "\x00\x00__algebraic__", self.name, tensor_mod.namespace_version, "tensor", materialization_id });
+        return try token.canonicalTupleAlloc(self.alloc, &.{ "\x00\x00__algebraic__", self.storage_namespace, tensor_mod.namespace_version, "tensor", materialization_id });
     }
 
     fn docJoinFactRefKeyAlloc(self: *Index, doc_key: []const u8, join_cfg: JoinConfig, side: join_mod.Side, fact_key: []const u8) ![]u8 {
@@ -14266,7 +14596,7 @@ pub const Index = struct {
         const expr = materializationExpression(mat, law_id);
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        const expr_key = try tensor_mod.expressionKeyAlloc(self.alloc, self.name, .{
+        const expr_key = try tensor_mod.expressionKeyAlloc(self.alloc, self.storage_namespace, .{
             .expr_id = expr_id,
             .axes_canonical = group_key,
             .bucket = bucket_start,
@@ -14301,7 +14631,7 @@ pub const Index = struct {
         const expr = materializationExpression(mat, law_id);
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        const expr_key = try tensor_mod.expressionKeyAlloc(self.alloc, self.name, .{
+        const expr_key = try tensor_mod.expressionKeyAlloc(self.alloc, self.storage_namespace, .{
             .expr_id = expr_id,
             .axes_canonical = group_key,
             .bucket = bucket_start,
@@ -14340,7 +14670,7 @@ pub const Index = struct {
         const expr = materializationExpression(mat, law_id);
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        const expr_key = try tensor_mod.expressionKeyAlloc(self.alloc, self.name, .{
+        const expr_key = try tensor_mod.expressionKeyAlloc(self.alloc, self.storage_namespace, .{
             .expr_id = expr_id,
             .axes_canonical = group_key,
             .bucket = bucket_start,
@@ -15274,7 +15604,7 @@ pub const Index = struct {
     ) !void {
         const axes_id = try self.ensureSymbol(txn, axes_canonical);
         self.alloc.free(axes_id);
-        const key = try tensor_mod.keyAlloc(self.alloc, self.name, .{
+        const key = try tensor_mod.keyAlloc(self.alloc, self.storage_namespace, .{
             .materialization = spec.name,
             .axes_canonical = axes_canonical,
             .bucket = null,
@@ -15310,7 +15640,7 @@ pub const Index = struct {
         defer self.alloc.free(promoted_key);
         try txn.put(promoted_key, "");
         if (owns_dictionary) {
-            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, fact.path, fact.kind, "json-scalar-v1", "kind-qualified");
+            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, fact.path, fact.kind, "json-scalar-v1", "kind-qualified");
             const lexicon_key = try self.pathDictionaryLexiconKeyAlloc(identity, fact.value);
             defer self.alloc.free(lexicon_key);
             try txn.put(lexicon_key, "");
@@ -15338,7 +15668,7 @@ pub const Index = struct {
             else => return err,
         };
         if (owns_dictionary) {
-            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, fact.path, fact.kind, "json-scalar-v1", "kind-qualified");
+            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, fact.path, fact.kind, "json-scalar-v1", "kind-qualified");
             const posting_key = try self.pathDictionaryPostingsKeyAlloc(identity, fact.value, doc_key);
             defer self.alloc.free(posting_key);
             txn.delete(posting_key) catch |err| switch (err) {
@@ -15410,7 +15740,7 @@ pub const Index = struct {
         self.path_dictionary_fst_rebuild_count += 1;
         const path = spec.path_promotion_path orelse return;
         const kind = spec.path_promotion_kind orelse return;
-        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, kind, "json-scalar-v1", "kind-qualified");
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, path, kind, "json-scalar-v1", "kind-qualified");
         const lexicon_prefix = try self.pathDictionaryLexiconPrefixAlloc(identity);
         defer self.alloc.free(lexicon_prefix);
         const fst_key = try self.pathDictionaryFstKeyAlloc(identity);
@@ -15449,7 +15779,7 @@ pub const Index = struct {
     ) !bool {
         const path = spec.path_promotion_path orelse return false;
         const kind = spec.path_promotion_kind orelse return false;
-        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, kind, "json-scalar-v1", "kind-qualified");
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.storage_namespace, path, kind, "json-scalar-v1", "kind-qualified");
         const registry_key = try identity.registryKeyAlloc(self.alloc);
         defer self.alloc.free(registry_key);
         const payload = txn.get(registry_key) catch |err| switch (err) {
@@ -17300,6 +17630,176 @@ fn rangeFieldAcceptsKind(field_type: []const u8, kind: RangeKind) bool {
 
 fn wildcardMatch(pattern: []const u8, text: []const u8) bool {
     return wildcard_mod.match(pattern, text);
+}
+
+fn measuredStorageBytesForTest(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    storage_namespace: []const u8,
+) !u64 {
+    const fact_prefix = try storagePrefixAlloc(alloc, storage_namespace);
+    defer alloc.free(fact_prefix);
+    const tuple_prefix = try tupleStoragePrefixAlloc(alloc, storage_namespace);
+    defer alloc.free(tuple_prefix);
+    const dictionary_prefix = try dictionaryStoragePrefixAlloc(alloc, storage_namespace);
+    defer alloc.free(dictionary_prefix);
+    const registry_prefix = try dictionaryRegistryPrefixAlloc(alloc, storage_namespace);
+    defer alloc.free(registry_prefix);
+    const counter_key = try storageBytesKeyAlloc(alloc, storage_namespace);
+    defer alloc.free(counter_key);
+
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var total: u64 = 0;
+    for ([_][]const u8{ fact_prefix, tuple_prefix, dictionary_prefix, registry_prefix }) |prefix| {
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (std.mem.eql(u8, entry.key, counter_key)) continue;
+            total = total +| @as(u64, @intCast(entry.key.len)) +| @as(u64, @intCast(entry.value.len));
+        }
+    }
+    return total;
+}
+
+fn accountedPutForTest(
+    index: *Index,
+    store: *docstore_mod.DocStore,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    var storage_accounting = index.storageAccountingScope();
+    defer storage_accounting.deinit();
+    var raw_txn = try store.beginWriteTxn();
+    errdefer raw_txn.abort();
+    var txn = try storage_accounting.txn(&raw_txn);
+    defer txn.deinit();
+    try txn.put(key, value);
+    try txn.finish();
+    try raw_txn.commit();
+}
+
+test "algebraic storage accounting reuses transaction reads for updates" {
+    const alloc = std.testing.allocator;
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "materializations": []
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg_accounting_cache", cfg);
+    defer idx.close();
+    const data_key = try idx.keyAlloc(&.{"cache-test"});
+    defer alloc.free(data_key);
+
+    const CountingTxn = struct {
+        data_key: []const u8,
+        get_count: usize = 0,
+
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            self.get_count += 1;
+            if (std.mem.eql(u8, key, self.data_key)) return "old";
+            return error.NotFound;
+        }
+
+        pub fn put(_: *@This(), _: []const u8, _: []const u8) !void {}
+    };
+    var inner = CountingTxn{ .data_key = data_key };
+    var accounting = try Index.StorageAccountingTxn(*CountingTxn).init(&idx, &inner);
+    defer accounting.deinit();
+
+    _ = try accounting.get(data_key);
+    try accounting.put(data_key, "replacement");
+    try std.testing.expectEqual(@as(usize, 2), inner.get_count);
+}
+
+test "algebraic storage accounting serializes concurrent generation writes" {
+    const alloc = std.heap.smp_allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "materializations": []
+        \\}
+    ;
+    var idx = try Index.openWithStorageNamespace(alloc, "alg_accounting", "alg_accounting::generation", cfg);
+    defer idx.close();
+
+    const worker_count = 8;
+    const writes_per_worker = 8;
+    const Worker = struct {
+        index: *Index,
+        store: *docstore_mod.DocStore,
+        start: *std.atomic.Value(bool),
+        worker_id: usize,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            for (0..8) |write_id| {
+                const component = std.fmt.allocPrint(self.index.alloc, "concurrent-{d}-{d}", .{ self.worker_id, write_id }) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                defer self.index.alloc.free(component);
+                const key = self.index.keyAlloc(&.{component}) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                defer self.index.alloc.free(key);
+                accountedPutForTest(self.index, self.store, key, "value") catch |err| {
+                    self.failure = err;
+                    return;
+                };
+            }
+        }
+    };
+
+    var start = std.atomic.Value(bool).init(false);
+    var workers: [worker_count]Worker = undefined;
+    var threads: [worker_count]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer {
+        start.store(true, .release);
+        for (threads[0..spawned]) |thread| thread.join();
+    }
+    for (&workers, 0..) |*worker, worker_id| {
+        worker.* = .{
+            .index = &idx,
+            .store = &store,
+            .start = &start,
+            .worker_id = worker_id,
+        };
+        threads[worker_id] = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        spawned += 1;
+    }
+    start.store(true, .release);
+    for (threads) |thread| thread.join();
+    spawned = 0;
+    for (workers) |worker| if (worker.failure) |err| return err;
+
+    var expected: u64 = 0;
+    for (0..worker_count) |worker_id| {
+        for (0..writes_per_worker) |write_id| {
+            const component = try std.fmt.allocPrint(alloc, "concurrent-{d}-{d}", .{ worker_id, write_id });
+            defer alloc.free(component);
+            const key = try idx.keyAlloc(&.{component});
+            defer alloc.free(key);
+            expected += @intCast(key.len + "value".len);
+        }
+    }
+    const measured = try measuredStorageBytesForTest(alloc, &store, idx.storageNamespace());
+    try std.testing.expectEqual(expected, measured);
+    try std.testing.expectEqual(measured, try idx.storageBytes(&store));
 }
 
 test "algebraic wildcard helpers preserve escaped literals" {
@@ -20098,6 +20598,10 @@ test "algebraic index materialized expression rows use tensor law mutation" {
     const raw = (try idx.materializedExpressionRawValueAlloc(&store, expr, axes, "2026-05-15", .sum)).?;
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("4", raw);
+    try std.testing.expectEqual(
+        try measuredStorageBytesForTest(alloc, &store, idx.storageNamespace()),
+        try idx.storageBytes(&store),
+    );
 
     var count_expr = expr;
     count_expr.law_id = .count;

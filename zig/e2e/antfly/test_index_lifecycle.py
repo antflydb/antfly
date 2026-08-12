@@ -173,6 +173,30 @@ def _ready_index(stateful_api, table_name: str, index_name: str, *, expected_doc
     return stats
 
 
+def _ready_algebraic_index(stateful_api, table_name: str, index_name: str) -> dict | None:
+    try:
+        index_info = stateful_api.get_index(table_name, index_name)
+    except Exception:
+        return None
+    return ready_index_status(index_info, require_query_fresh=True)
+
+
+def _algebraic_aggregations(stateful_api, table_name: str) -> dict:
+    result = stateful_api.query_table(
+        table_name,
+        {
+            "limit": 1,
+            "aggregations": {
+                "amount_sum": {"type": "sum", "field": "amount"},
+                "category_terms": {"type": "terms", "field": "category", "size": 10},
+            },
+        },
+    )
+    responses = result.get("responses", [result])
+    assert responses
+    return responses[0].get("aggregations", {})
+
+
 def test_ready_index_status_requires_current_coverage_observation():
     ready_status = {
         "status": {
@@ -320,6 +344,93 @@ def test_stateful_table_accepts_public_full_text_create_index(stateful_api):
     assert detail["config"]["type"] == "full_text"
 
 
+def test_stateful_managed_algebraic_generation_rebuild_catches_up_and_reopens(stateful_api):
+    table_name = f"managed_algebraic_generation_{time.time_ns()}"
+    index_name = "analytics_idx"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert _table_name(created) == table_name
+    stateful_api.update_schema(
+        table_name,
+        {
+            "default_type": "doc",
+            "document_schemas": {
+                "doc": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "category": {"type": "keyword"},
+                            "amount": {"type": "number"},
+                        },
+                    }
+                }
+            },
+        },
+    )
+    initial = stateful_api.batch_write(
+        table_name,
+        inserts={
+            "doc:a": {"category": "tools", "amount": 3},
+            "doc:b": {"category": "books", "amount": 5},
+        },
+        sync_level="write",
+    )
+    assert initial["inserted"] == 2
+
+    assert (
+        stateful_api.create_index(
+            table_name,
+            index_name,
+            {
+                "name": index_name,
+                "type": "algebraic",
+                "derive_from_schema": True,
+            },
+        )
+        == {}
+    )
+    # This write lands after admission while the snapshot generation may still
+    # be building. Durable replay must carry it into the activated generation.
+    concurrent = stateful_api.batch_write(
+        table_name,
+        inserts={"doc:c": {"category": "tools", "amount": 7}},
+        sync_level="write",
+    )
+    assert concurrent["inserted"] == 1
+
+    ready = wait_until(
+        lambda: _ready_algebraic_index(stateful_api, table_name, index_name),
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert ready is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name),
+        indent=2,
+        sort_keys=True,
+    )
+    aggregations = _algebraic_aggregations(stateful_api, table_name)
+    assert aggregations["amount_sum"]["value"] == 15
+    assert {
+        bucket["key"]: bucket["doc_count"]
+        for bucket in aggregations["category_terms"]["buckets"]
+    } == {"books": 1, "tools": 2}
+
+    assert stateful_api.supports_restart
+    stateful_api.restart_server()
+    reopened = wait_until(
+        lambda: _ready_algebraic_index(stateful_api, table_name, index_name),
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert reopened is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name),
+        indent=2,
+        sort_keys=True,
+    )
+    reopened_aggregations = _algebraic_aggregations(stateful_api, table_name)
+    assert reopened_aggregations == aggregations
+
+
 def test_stateful_table_registers_public_artifact_enrichment_for_default_full_text(stateful_api):
     table_name = f"artifact_enrichment_{time.time_ns()}"
 
@@ -434,7 +545,7 @@ def test_stateful_table_registers_public_artifact_enrichment_for_default_full_te
     assert stateful_api.delete(f"/tables/{table_name}/artifacts/document_units_v1/enrichment") == {}
 
 
-def test_stateful_table_accepts_document_full_text_create_index_with_inline_enrichments(stateful_api):
+def test_stateful_table_cleans_document_full_text_inline_enrichments_on_index_delete(stateful_api):
     table_name = f"document_full_text_inline_{time.time_ns()}"
 
     created = stateful_api.create_table(table_name, num_shards=1)
@@ -474,6 +585,24 @@ def test_stateful_table_accepts_document_full_text_create_index_with_inline_enri
     detail = json.dumps(index, sort_keys=True)
     assert "document_units_v1" in detail
     assert "document_chunks_v1" in detail
+
+    assert stateful_api.delete_index(table_name, "document_text") == {}
+    table = stateful_api.get_table(table_name)
+    enrichment_names = {
+        enrichment["name"] for enrichment in table.get("artifact_enrichments", [])
+    }
+    assert "document_units_v1" not in enrichment_names
+    assert "document_chunks_v1" not in enrichment_names
+
+    # Exercise the first post-delete write through the same resident writer.
+    # A dangling generated-enrichment target must not retain full-index debt.
+    batch = stateful_api.batch_write(
+        table_name,
+        inserts={"doc:after-delete": {"body": "index and inline producers are gone"}},
+        sync_level="full_index",
+    )
+    assert batch["status"] == "committed"
+    assert batch["inserted"] == 1
 
 
 def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_query(stateful_api):
@@ -569,6 +698,74 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
 
     hits = result["responses"][0]["hits"]["hits"]
     assert hits[0]["_id"] == "doc:a"
+
+
+def test_stateful_back_to_back_external_embedding_indexes_admit_immediate_batch(stateful_api):
+    table_name = f"stateful_external_embeddings_online_admission_{time.time_ns()}"
+    index_names = ("vectors_one", "vectors_two")
+    vector = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert created["name"] == table_name
+
+    for index_name in index_names:
+        # Do not wait for runtime readiness between creates. The regression
+        # requires each short write-capability admission to complete while the
+        # prior index can still have background lifecycle work queued.
+        assert (
+            stateful_api.post(
+                f"/tables/{table_name}/indexes/{index_name}",
+                {
+                    "name": index_name,
+                    "type": "embeddings",
+                    "external": True,
+                    "dimension": len(vector),
+                    "distance_metric": "cosine",
+                },
+            )
+            == {}
+        )
+
+    batch = stateful_api.batch_write(
+        table_name,
+        inserts={
+            "doc:a": {
+                "content": "one document, two vectors",
+                "_embeddings": {index_name: vector for index_name in index_names},
+            }
+        },
+        sync_level="full_index",
+    )
+    assert batch["status"] == "committed"
+    assert batch["inserted"] == 1
+
+    for index_name in index_names:
+        ready = wait_until(
+            lambda index_name=index_name: _ready_index(
+                stateful_api,
+                table_name,
+                index_name,
+                expected_docs=1,
+            ),
+            timeout_s=30.0,
+            interval_s=0.25,
+        )
+        assert ready is not None, json.dumps(
+            stateful_api.get_index(table_name, index_name),
+            indent=2,
+            sort_keys=True,
+        )
+        assert int(ready.get("total_indexed", ready.get("doc_count", 0))) == 1
+
+        result = stateful_api.query_table(
+            table_name,
+            {
+                "embeddings": {index_name: vector},
+                "indexes": [index_name],
+                "limit": 5,
+            },
+        )
+        assert _response_hit_ids(result) == ["doc:a"]
 
 
 def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
