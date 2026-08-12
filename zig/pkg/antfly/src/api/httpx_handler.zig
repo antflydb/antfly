@@ -1284,9 +1284,9 @@ pub const AntflyApiHandler = struct {
     fn internalObserveSplit(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const group_id = (try internalGroupId(ctx)) orelse return textResponse(ctx, 400, "invalid group id");
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid split transition request");
-        var record = @import("http_internal_group_write_routes.zig").parseSplitTransitionRecord(ctx.allocator, body) catch
+        var record = @import("internal_transition_wire.zig").parseSplitTransitionRecord(ctx.allocator, body) catch
             return textResponse(ctx, 400, "invalid split transition request");
-        defer @import("http_internal_group_write_routes.zig").freeSplitTransitionRecordOwned(ctx.allocator, &record);
+        defer @import("internal_transition_wire.zig").freeSplitTransitionRecordOwned(ctx.allocator, &record);
         const observation = self.internalGroupOperations().observeSplit(
             operationContext(ctx, null),
             group_id,
@@ -1298,9 +1298,9 @@ pub const AntflyApiHandler = struct {
     fn internalObserveMerge(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const group_id = (try internalGroupId(ctx)) orelse return textResponse(ctx, 400, "invalid group id");
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid merge transition request");
-        var record = @import("http_internal_group_write_routes.zig").parseMergeTransitionRecord(ctx.allocator, body) catch
+        var record = @import("internal_transition_wire.zig").parseMergeTransitionRecord(ctx.allocator, body) catch
             return textResponse(ctx, 400, "invalid merge transition request");
-        defer @import("http_internal_group_write_routes.zig").freeMergeTransitionRecordOwned(ctx.allocator, &record);
+        defer @import("internal_transition_wire.zig").freeMergeTransitionRecordOwned(ctx.allocator, &record);
         const observation = self.internalGroupOperations().observeMerge(
             operationContext(ctx, null),
             group_id,
@@ -1312,9 +1312,9 @@ pub const AntflyApiHandler = struct {
     fn internalExecuteTransition(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const group_id = (try internalGroupId(ctx)) orelse return textResponse(ctx, 400, "invalid group id");
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transition action request");
-        var action = @import("http_internal_group_write_routes.zig").parseTransitionAction(ctx.allocator, body) catch
+        var action = @import("internal_transition_wire.zig").parseTransitionAction(ctx.allocator, body) catch
             return textResponse(ctx, 400, "invalid transition action request");
-        defer @import("http_internal_group_write_routes.zig").freeTransitionActionOwned(ctx.allocator, &action);
+        defer @import("internal_transition_wire.zig").freeTransitionActionOwned(ctx.allocator, &action);
         self.internalGroupOperations().executeTransition(
             operationContext(ctx, null),
             group_id,

@@ -130,6 +130,10 @@ that end state:
   capability, keeping local job-state and remote HTTP details out of the
   operation. The old repair branch, probes, and compatibility-context fields
   have been deleted.
+- The obsolete internal write-route dispatcher has been deleted. Split/merge
+  JSON ownership is isolated in `internal_transition_wire.zig`; it contains no
+  route matching, HTTP request/response conversion, or runtime capability
+  context.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those
