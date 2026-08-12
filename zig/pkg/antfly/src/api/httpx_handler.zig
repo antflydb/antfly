@@ -331,6 +331,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.txn_resolve_suffix, httpx.Handler.bind(self, internalTxnResolve));
         try server.post(table_prefix ++ routes.txn_status_suffix, httpx.Handler.bind(self, internalTxnStatus));
         try server.post(table_prefix ++ routes.txn_acknowledge_suffix, httpx.Handler.bind(self, internalTxnAcknowledge));
+        try server.post(table_prefix ++ routes.artifact_repair_suffix, httpx.Handler.bind(self, internalArtifactRepairList));
         const document_artifact_prefix = table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ ":artifact_name";
         try server.post(document_artifact_prefix ++ routes.placement_update_suffix, httpx.Handler.bind(self, internalDocumentArtifactPlacementUpdate));
         try server.post(document_artifact_prefix ++ routes.child_range_batch_suffix, httpx.Handler.bind(self, internalDocumentArtifactChildRangeBatch));
@@ -347,7 +348,6 @@ pub const AntflyApiHandler = struct {
             table_prefix ++ routes.query_preflight_suffix,
             table_prefix ++ routes.vector_worker_suffix,
             table_prefix ++ routes.routed_batch_suffix,
-            table_prefix ++ routes.artifact_repair_suffix,
             table_prefix ++ routes.artifact_repair_run_suffix,
             table_prefix ++ routes.artifacts_marker ++ "*",
             table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ "*",
@@ -1190,6 +1190,24 @@ pub const AntflyApiHandler = struct {
             .failures = failures,
             .shard_cursors = shard_cursors,
         });
+    }
+
+    fn internalArtifactRepairList(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse "{}";
+        var input = std.json.parseFromSlice(db_mod.types.ArtifactRepairListRequest, ctx.allocator, if (body.len > 0) body else "{}", .{ .allocate = .alloc_always }) catch
+            return textResponse(ctx, 400, "invalid artifact repair list request");
+        defer input.deinit();
+        var result = self.internalGroupOperations().listArtifactRepairIssues(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            input.value,
+        ) catch |err| return internalArtifactWriteErrorResponse(ctx, err, "invalid artifact repair list request");
+        defer result.deinit(ctx.allocator);
+        return ctx.json(result);
     }
 
     fn internalGroupId(ctx: *httpx.Context) !?u64 {
@@ -5557,6 +5575,13 @@ test "httpx internal control routes call typed operations directly" {
     defer invalid_table_reprocess.deinit();
     try std.testing.expectEqual(@as(u16, 400), invalid_table_reprocess.status.code);
     try std.testing.expectEqualStrings("invalid document artifact reprocess request", invalid_table_reprocess.body.?);
+
+    const repair_list_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/repair/issues", .{base_url});
+    defer alloc.free(repair_list_url);
+    var invalid_repair_list = try requestWithRetry(&client, client_io.io(), .POST, repair_list_url, "[]", &headers, 20);
+    defer invalid_repair_list.deinit();
+    try std.testing.expectEqual(@as(u16, 400), invalid_repair_list.status.code);
+    try std.testing.expectEqualStrings("invalid artifact repair list request", invalid_repair_list.body.?);
 
     inline for (.{ "txn-begin", "txn-prepare", "txn-resolve", "txn-status", "txn-acknowledge" }) |suffix| {
         const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/{s}", .{ base_url, suffix });

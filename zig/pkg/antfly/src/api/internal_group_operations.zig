@@ -372,6 +372,27 @@ pub const Operations = struct {
         }) orelse error.NotFound;
     }
 
+    /// The returned result owns its nested allocations and must be deinitialized
+    /// with the same allocator by the caller.
+    pub fn listArtifactRepairIssues(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        input: db_mod.types.ArtifactRepairListRequest,
+    ) Error!db_mod.types.ArtifactRepairListResult {
+        try request.ensureActive();
+        const writes = self.writes orelse return error.NotFound;
+        return (writes.listArtifactRepairIssuesGroupLocal(alloc, group_id, table_name, input) catch |err| switch (err) {
+            error.InvalidArgument => return error.InvalidArgument,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
     fn transitionActionMatchesGroup(action: @import("../metadata/domain.zig").TransitionAction, group_id: u64) bool {
         return switch (action) {
             .none => group_id == 0,

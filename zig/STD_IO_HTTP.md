@@ -121,6 +121,9 @@ that end state:
 - Table-range artifact reprocessing is also a typed operation with an owned
   result and a concrete `httpx` adapter; its response projection remains at
   the transport edge and its manual dispatcher branch has been deleted.
+- Artifact-repair issue listing now returns an owned typed result through a
+  concrete `httpx` handler; the compatibility dispatcher no longer owns that
+  route.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those
