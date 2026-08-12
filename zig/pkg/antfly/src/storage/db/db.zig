@@ -6491,6 +6491,11 @@ pub const DB = struct {
                     work.manager.checkpointIo().sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
                     if (retries >= retries_per_job) {
                         work.manager.repair_cleanup_state.store(0, .release);
+                        // Manual lanes run `submit` synchronously. Propagate the
+                        // failure to that caller and leave the filesystem/key
+                        // namespace as the durable retry marker; resubmitting
+                        // here would recurse forever on a persistent error.
+                        if (work.lane.executesInline()) return err;
                         scheduleInactiveRepairShadowCleanupContext(work.manager, work.lane, work.owner_id);
                         return;
                     }
@@ -6504,6 +6509,10 @@ pub const DB = struct {
                     // cleanup lane between bounded slices and rediscover the
                     // first remaining namespace on the next job.
                     work.manager.repair_cleanup_state.store(0, .release);
+                    // A manual runtime has no autonomous queue. Bound the
+                    // foreground call and let the next maintenance request or
+                    // reopen rediscover the durable orphan marker.
+                    if (work.lane.executesInline()) return;
                     scheduleInactiveRepairShadowCleanupContext(work.manager, work.lane, work.owner_id);
                     return;
                 }
@@ -6645,6 +6654,7 @@ pub const DB = struct {
                 // Yield the durable-job lane between bounded slices. The
                 // outbox cursor makes resubmission idempotent across failures.
                 work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
+                if (work.lane.executesInline()) return;
                 scheduleGeneratedArtifactCleanupContext(work.ctx, work.lane, work.owner_id);
                 return;
             }
@@ -15477,26 +15487,33 @@ pub const DB = struct {
         } else null;
 
         var worker_applied = installed.applied;
-        if (installed.needs_enrichment_replay and !installed.managed_admission_pending) {
-            // A newly admitted index owns a fresh coverage generation. Establish
-            // its worker baseline only after current artifact reconstruction.
-            const rebuilt = switch (cfg.kind) {
-                .dense_vector => try rebuildDenseIndexForTargetCoverageContext(self.async_context, cfg.name, 2048),
-                .sparse_vector => try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, cfg.name, 2048),
-                else => 0,
-            };
-            const generation_baseline = self.core.nextDerivedSequence();
-            if (rebuilt > 0 or generation_baseline > worker_applied) {
-                worker_applied = generation_baseline;
-                try self.core.saveAppliedSequence(cfg.name, worker_applied);
-                try saveIndexStatusSnapshots(self.alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
-                    .index_name = cfg.name,
-                    .sequence = worker_applied,
-                }});
+        if (installed.needs_enrichment_replay) {
+            if (!installed.managed_admission_pending) {
+                // Ordinary admission can seed its serving generation directly
+                // from retained artifacts before the worker begins replay.
+                const rebuilt = switch (cfg.kind) {
+                    .dense_vector => try rebuildDenseIndexForTargetCoverageContext(self.async_context, cfg.name, 2048),
+                    .sparse_vector => try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, cfg.name, 2048),
+                    else => 0,
+                };
+                const generation_baseline = self.core.nextDerivedSequence();
+                if (rebuilt > 0 or generation_baseline > worker_applied) {
+                    worker_applied = generation_baseline;
+                    try self.core.saveAppliedSequence(cfg.name, worker_applied);
+                    try saveIndexStatusSnapshots(self.alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
+                        .index_name = cfg.name,
+                        .sequence = worker_applied,
+                    }});
+                }
             }
             if (self.enrichment_runtime != null) {
+                // Managed admission deliberately leaves the serving generation
+                // empty and fail-closed while its shadow repair runs. It still
+                // must append source-document enrichment work: the shadow
+                // generation consumes those durable artifacts, and deletion
+                // may have retired every artifact from the prior incarnation.
                 const refs = try self.replayGeneratedEnrichmentsFromStoredDocs(self.alloc);
-                if (refs == 0) {
+                if (refs == 0 and !installed.managed_admission_pending) {
                     const target_sequence = self.core.nextDerivedSequence();
                     try self.core.saveAppliedSequence(cfg.name, target_sequence);
                     try self.markEnrichmentAppliedIfNoPendingThrough(target_sequence);
@@ -34449,6 +34466,102 @@ fn recordEmbeddingArtifactRepairIssueContext(
     if (ctx.repair_issue_counter) |counter| _ = counter.fetchAdd(1, .monotonic);
 }
 
+/// Successful index publication is the authoritative resolution boundary for
+/// artifact diagnoses. Retire only diagnoses that are no newer than the batch
+/// which proved the artifact readable and consumable. Provider failures also
+/// require produced/skipped coverage and settle their shared completion fence
+/// in the same metadata transaction.
+fn clearPublishedEmbeddingArtifactRepairIssueContext(
+    ctx: *const AsyncContext,
+    index_name: []const u8,
+    artifact_key: []const u8,
+    published_sequence: u64,
+) !void {
+    const artifact_key_hex = try bytesToHexAlloc(ctx.alloc, artifact_key);
+    defer ctx.alloc.free(artifact_key_hex);
+    const issue_key = try internal_keys.artifactRepairIssueKeyAlloc(ctx.alloc, index_name, "embedding", artifact_key_hex);
+    defer ctx.alloc.free(issue_key);
+
+    const mutable_ctx = @constCast(ctx);
+    lockAtomicWithBackoff(&mutable_ctx.artifact_repair_issue_mutex);
+    defer mutable_ctx.artifact_repair_issue_mutex.unlock();
+
+    const loaded = (try loadArtifactRepairIssueFromStoreByKey(ctx.alloc, ctx.store, issue_key)) orelse return;
+    var issue = loaded;
+    defer issue.deinit(ctx.alloc);
+    if (issue.sequence > published_sequence) return;
+
+    var completion_key: ?[]u8 = null;
+    defer if (completion_key) |key| ctx.alloc.free(key);
+    var completion: ArtifactRepairCompletionState = .{};
+    var encoded_completion: [artifact_repair_completion_state_len]u8 = undefined;
+    if (issue.reason == .enrichment_failed) {
+        if (ctx.index_manager.denseIndex(index_name) == null and
+            ctx.index_manager.sparseIndex(index_name) == null)
+        {
+            return;
+        }
+        const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return;
+        const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(ctx.alloc, index_name, generation, issue.doc_key);
+        defer ctx.alloc.free(marker_key);
+        const raw_outcome = ctx.store.get(ctx.alloc, marker_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        defer ctx.alloc.free(raw_outcome);
+        const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, raw_outcome) orelse
+            return error.InvalidDerivedCoverageOutcome;
+        if (outcome != .produced and outcome != .skipped) return;
+
+        completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(ctx.alloc, "embedding", artifact_key_hex);
+        completion = (try loadArtifactRepairCompletionStateFromStore(ctx.alloc, ctx.store, completion_key.?)) orelse .{};
+        completion.completed_sequence = @max(completion.completed_sequence, published_sequence);
+        completion.pending_issues -|= 1;
+    }
+
+    const kind_key = try artifactRepairIssueKindKeyForIssueAlloc(ctx.alloc, issue);
+    defer ctx.alloc.free(kind_key);
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    var borrowed_write_count: usize = 0;
+    defer {
+        for (writes.items[borrowed_write_count..]) |write| ctx.alloc.free(@constCast(write.value));
+        writes.deinit(ctx.alloc);
+    }
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(ctx.alloc);
+    var owned_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (owned_delete_keys.items) |key| ctx.alloc.free(@constCast(key));
+        owned_delete_keys.deinit(ctx.alloc);
+    }
+
+    try deletes.append(ctx.alloc, issue_key);
+    try deletes.append(ctx.alloc, kind_key);
+    if (completion_key) |key| {
+        if (completion.pending_issues == 0) {
+            try deletes.append(ctx.alloc, key);
+        } else {
+            encodeArtifactRepairCompletionState(&encoded_completion, completion);
+            try writes.append(ctx.alloc, .{ .key = key, .value = &encoded_completion });
+        }
+    }
+    borrowed_write_count = writes.items.len;
+    try appendArtifactRepairSummaryDirtyForStore(ctx.alloc, ctx.store, &writes, &deletes, &owned_delete_keys);
+    try ctx.store.putBatch(writes.items, deletes.items);
+}
+
+fn clearPublishedEmbeddingArtifactRepairIssuesContext(
+    ctx: *const AsyncContext,
+    index_name: []const u8,
+    writes: anytype,
+    published_sequence: u64,
+) !void {
+    for (writes) |write| {
+        const artifact_key = write.artifact_key orelse continue;
+        try clearPublishedEmbeddingArtifactRepairIssueContext(ctx, index_name, artifact_key, published_sequence);
+    }
+}
+
 fn repairKindFromArtifactKind(kind: types.ArtifactKind) types.ArtifactRepairKind {
     return switch (kind) {
         .asset => .asset,
@@ -35023,6 +35136,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 try ctx.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, dense_finish_options);
                 dense_streaming_session_open = false;
             }
+            try clearPublishedEmbeddingArtifactRepairIssuesContext(ctx, index_ref.name, dense_embeddings.writes, batch.sequence);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_apply_ns, dense_apply_start_ns);
         },
         .sparse_vector => {
@@ -35084,6 +35198,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             const sparse_embedding_apply_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
             try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, sparse_embeddings.writes, batch_options);
             try accountSparseCoverage(ctx, index_ref.name, batch, sparse_embeddings.writes);
+            try clearPublishedEmbeddingArtifactRepairIssuesContext(ctx, index_ref.name, sparse_embeddings.writes, batch.sequence);
             if (emit_sparse_write_profile) sparse_embedding_apply_ns = monotonicTimeNs() - sparse_embedding_apply_start_ns;
             if (before_sparse_profile) |before| {
                 if (ctx.index_manager.sparseWriteProfileByName(index_ref.name)) |after| {
@@ -52123,6 +52238,58 @@ test "db repair completion cannot clear debt behind terminal coverage" {
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
+test "db successful embedding publication retires covered provider failure debt" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    });
+
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "semantic");
+    defer alloc.free(artifact_key);
+    var issue = types.ArtifactRepairIssue{
+        .artifact_kind = .embedding,
+        .index_name = try alloc.dupe(u8, "semantic"),
+        .doc_key = try alloc.dupe(u8, "doc:a"),
+        .artifact_name = try alloc.dupe(u8, "semantic"),
+        .artifact_key = try bytesToHexAlloc(alloc, artifact_key),
+        .reason = .enrichment_failed,
+        .sequence = 7,
+    };
+    defer issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    const generation = db.core.index_manager.coverageGenerationForIndex("semantic") orelse return error.TestUnexpectedResult;
+    const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "semantic", generation, "doc:a");
+    defer alloc.free(marker_key);
+    try db.core.store.put(marker_key, "produced");
+
+    // An older successful replay cannot discharge a newer provider failure.
+    try clearPublishedEmbeddingArtifactRepairIssueContext(db.async_context, "semantic", artifact_key, 6);
+    {
+        const pending = try db.listArtifactRepairIssues(alloc, .embedding, "semantic", 1);
+        defer types.freeArtifactRepairIssues(alloc, pending);
+        try std.testing.expectEqual(@as(usize, 1), pending.len);
+    }
+
+    try clearPublishedEmbeddingArtifactRepairIssueContext(db.async_context, "semantic", artifact_key, 7);
+    const remaining = try db.listArtifactRepairIssues(alloc, .embedding, "semantic", 1);
+    defer types.freeArtifactRepairIssues(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+
+    const completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(alloc, "embedding", issue.artifact_key);
+    defer alloc.free(completion_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, completion_key));
+}
+
 test "db shared repair completion reprocesses consumer with terminal coverage" {
     const alloc = std.testing.allocator;
 
@@ -68131,6 +68298,48 @@ test "db managed vector admission captures writes while durable repair is pendin
     } else return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 0), target.doc_count);
     try std.testing.expect(target.replay_target_sequence > target.replay_applied_sequence);
+}
+
+test "db managed vector admission durably seeds missing enrichment artifacts" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"before admission\"}" }},
+        .sync_level = .write,
+    });
+    try db.addEnrichment(.{
+        .name = "semantic_embedding",
+        .kind = .embedding,
+        .field = "body",
+        .expected_dims = 3,
+    });
+
+    const before_admission = db.core.nextDerivedSequence();
+    const repair_id = (try db.admitManagedIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"semantic_embedding\"}",
+    })) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(repair_id != 0);
+
+    // Artifact production is a durable replay record owned by the enrichment
+    // worker, while the canonical serving generation remains empty and gated.
+    // The generation repair will consume the produced artifact in its shadow.
+    try std.testing.expect(db.core.nextDerivedSequence() > before_admission);
+    const canonical = db.core.denseIndex("semantic_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), canonical.index.stats().active_count);
+    try std.testing.expect(db.core.index_manager.repairUnavailable("semantic_idx"));
 }
 
 test "db managed algebraic admission builds and reopens an isolated generation" {

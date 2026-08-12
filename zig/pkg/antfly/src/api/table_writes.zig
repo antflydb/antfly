@@ -20318,14 +20318,43 @@ fn overlayRuntimeStatusReplayTargetFromDb(
 
 fn runtimeStatusHasNonReplayBackfillSignal(item: db_mod.types.DBIndexStats) bool {
     if (!item.backfill_active) return false;
-    if (item.load_error != null) return true;
-    if (item.enrichment_failed) return true;
-    if (item.repair_degraded or item.repair_issue_count != 0) return true;
-    if (!item.repair_summary_ready) return true;
-    if (!std.mem.eql(u8, item.projection_checkpoint_status, "clean")) return true;
+    // Health and activity are independent axes. Load failures, terminal
+    // coverage gaps, and incomplete repair summaries are degraded states, but
+    // none proves that a worker is still making progress. Preserve the bit
+    // only when a durable build/checkpoint or algebraic runtime explicitly
+    // reports active work.
+    if (std.mem.eql(u8, item.projection_checkpoint_status, "rebuilding")) return true;
+    if (item.index_repair_id != null and
+        !std.mem.eql(u8, item.index_repair_phase, "terminal") and
+        !std.mem.eql(u8, item.index_repair_automation, "paused")) return true;
     if (item.algebraic_active_progress != null) return true;
     if (item.algebraic_adaptive_backfilling_count != 0) return true;
     return false;
+}
+
+test "runtime status distinguishes degraded health from active generation work" {
+    var degraded = db_mod.types.DBIndexStats{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .backfill_active = true,
+        .repair_degraded = true,
+        .repair_issue_count = 3,
+        .repair_summary_ready = false,
+        .projection_checkpoint_status = "degraded",
+    };
+    try std.testing.expect(!runtimeStatusHasNonReplayBackfillSignal(degraded));
+
+    degraded.projection_checkpoint_status = "rebuilding";
+    try std.testing.expect(runtimeStatusHasNonReplayBackfillSignal(degraded));
+
+    degraded.projection_checkpoint_status = "degraded";
+    degraded.index_repair_id = 42;
+    degraded.index_repair_phase = "building";
+    degraded.index_repair_automation = "enabled";
+    try std.testing.expect(runtimeStatusHasNonReplayBackfillSignal(degraded));
+
+    degraded.index_repair_automation = "paused";
+    try std.testing.expect(!runtimeStatusHasNonReplayBackfillSignal(degraded));
 }
 
 fn startupCatchUpStatsForPhase(
