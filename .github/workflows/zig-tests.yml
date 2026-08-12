@@ -734,6 +734,9 @@ jobs:
     if: github.event_name == 'pull_request' && needs.changes.outputs.e2e == 'true'
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
+    permissions:
+      contents: read
+      pull-requests: read
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
@@ -745,6 +748,21 @@ jobs:
       ANTFLY_CI_ZIG_STRIP: "true"
       ANTFLY_CI_BUILD_CAPI: "true"
     steps:
+      - name: Verify current PR head
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const expected = context.payload.pull_request.head.sha;
+            const { data: pull } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+            if (pull.head.sha !== expected) {
+              core.setFailed(
+                `Superseded PR head: expected ${expected}, current ${pull.head.sha}`,
+              );
+            }
+
       - uses: actions/checkout@v6
         with:
           submodules: true
@@ -790,6 +808,10 @@ jobs:
       needs.e2e-base-build.result == 'success'
     runs-on: arc-antfly-heavy
     timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
     strategy:
       fail-fast: false
       matrix:
@@ -801,6 +823,21 @@ jobs:
       HF_HOME: /mnt/cache/antfly/zig/hf
       ANTFLY_CI_TRACE: "1"
     steps:
+      - name: Verify current PR head
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const expected = context.payload.pull_request.head.sha;
+            const { data: pull } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+            if (pull.head.sha !== expected) {
+              core.setFailed(
+                `Superseded PR head: expected ${expected}, current ${pull.head.sha}`,
+              );
+            }
+
       - uses: actions/checkout@v6
         with:
           submodules: true

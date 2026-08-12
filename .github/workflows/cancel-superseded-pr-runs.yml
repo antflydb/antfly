@@ -1,0 +1,90 @@
+name: Cancel Superseded PR Runs
+
+on:
+  pull_request_target:
+    branches: ["main"]
+    types: [synchronize]
+
+# This privileged workflow intentionally never checks out or executes pull
+# request code. It only reconciles Actions runs using trusted default-branch
+# JavaScript from actions/github-script.
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cancel-superseded:
+    runs-on: arc-antfly-standard
+    timeout-minutes: 5
+    steps:
+      - name: Cancel superseded PR workflow runs
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pull = context.payload.pull_request;
+            const activeStatuses = new Set([
+              "in_progress",
+              "pending",
+              "queued",
+              "requested",
+              "waiting",
+            ]);
+
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              {
+                owner,
+                repo,
+                event: "pull_request",
+                branch: pull.head.ref,
+                per_page: 100,
+              },
+            );
+            const staleRuns = runs.filter((run) =>
+              run.head_sha !== pull.head.sha &&
+              activeStatuses.has(run.status) &&
+              run.pull_requests.some((candidate) => candidate.number === pull.number)
+            );
+
+            if (staleRuns.length === 0) {
+              core.info("No superseded PR workflow runs are active");
+              return;
+            }
+
+            for (const run of staleRuns) {
+              core.info(
+                `Requesting cancellation of superseded ${run.name} run ${run.id}`,
+              );
+              try {
+                await github.rest.actions.cancelWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: run.id,
+                });
+              } catch (error) {
+                if (error.status !== 409) throw error;
+              }
+            }
+
+            await new Promise((resolve) => setTimeout(resolve, 15_000));
+            for (const run of staleRuns) {
+              const current = await github.rest.actions.getWorkflowRun({
+                owner,
+                repo,
+                run_id: run.id,
+              });
+              if (!activeStatuses.has(current.data.status)) continue;
+
+              core.warning(
+                `Force-cancelling stuck superseded ${run.name} run ${run.id}`,
+              );
+              try {
+                await github.request(
+                  "POST /repos/{owner}/{repo}/actions/runs/{run_id}/force-cancel",
+                  { owner, repo, run_id: run.id },
+                );
+              } catch (error) {
+                if (error.status !== 409) throw error;
+              }
+            }
