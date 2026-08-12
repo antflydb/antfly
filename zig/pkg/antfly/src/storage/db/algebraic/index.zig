@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const platform_sync = @import("antfly_platform").sync;
 const adaptive_mod = @import("adaptive.zig");
 const algebra = @import("algebra.zig");
 const cylinder = @import("cylinder.zig");
@@ -2700,6 +2701,11 @@ pub const Index = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     append_only_accumulator_resource_bytes: u64 = 0,
     maintenance_accumulator_resource_bytes: u64 = 0,
+    /// Serializes the read-modify-write storage counter with every mutation
+    /// transaction owned by this physical generation. Runtime LSM write
+    /// transactions may overlap even though their commits are serialized, so
+    /// the lock must be acquired before opening the underlying transaction.
+    storage_accounting_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn open(alloc: Allocator, name: []const u8, config_json: []const u8) !Index {
         return try openWithStorageNamespace(alloc, name, name, config_json);
@@ -2744,12 +2750,17 @@ pub const Index = struct {
 
     fn StorageAccountingTxn(comptime Inner: type) type {
         return struct {
+            const CachedValueLength = struct {
+                value_len: ?u64,
+            };
+
             index: *Index,
             inner: Inner,
             prefixes: [4][]u8,
             counter_key: []u8,
             bytes: u64,
             dirty: bool = false,
+            prior_value_lengths: std.StringHashMapUnmanaged(CachedValueLength) = .empty,
 
             fn init(index: *Index, inner: Inner) !@This() {
                 const fact_prefix = try storagePrefixAlloc(index.alloc, index.storage_namespace);
@@ -2778,9 +2789,36 @@ pub const Index = struct {
             }
 
             fn deinit(self: *@This()) void {
+                var cached_keys = self.prior_value_lengths.keyIterator();
+                while (cached_keys.next()) |key| self.index.alloc.free(key.*);
+                self.prior_value_lengths.deinit(self.index.alloc);
                 for (self.prefixes) |prefix| self.index.alloc.free(prefix);
                 self.index.alloc.free(self.counter_key);
                 self.* = undefined;
+            }
+
+            fn rememberValueLength(self: *@This(), key: []const u8, value_len: ?u64) !void {
+                if (self.prior_value_lengths.getPtr(key)) |cached| {
+                    cached.value_len = value_len;
+                    return;
+                }
+                const owned_key = try self.index.alloc.dupe(u8, key);
+                errdefer self.index.alloc.free(owned_key);
+                try self.prior_value_lengths.put(self.index.alloc, owned_key, .{ .value_len = value_len });
+            }
+
+            fn valueLength(self: *@This(), key: []const u8) !?u64 {
+                if (self.prior_value_lengths.get(key)) |cached| return cached.value_len;
+                const old = self.inner.get(key) catch |err| switch (err) {
+                    error.NotFound => {
+                        try self.rememberValueLength(key, null);
+                        return null;
+                    },
+                    else => return err,
+                };
+                const value_len: u64 = @intCast(old.len);
+                try self.rememberValueLength(key, value_len);
+                return value_len;
             }
 
             fn counts(self: *const @This(), key: []const u8) bool {
@@ -2796,24 +2834,34 @@ pub const Index = struct {
             }
 
             pub fn get(self: *@This(), key: []const u8) ![]const u8 {
-                return try self.inner.get(key);
+                const value = self.inner.get(key) catch |err| switch (err) {
+                    error.NotFound => {
+                        if (self.counts(key)) try self.rememberValueLength(key, null);
+                        return err;
+                    },
+                    else => return err,
+                };
+                if (self.counts(key)) try self.rememberValueLength(key, @intCast(value.len));
+                return value;
             }
 
             pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
-                return try self.inner.getManySorted(keys, values);
+                try self.inner.getManySorted(keys, values);
+                for (keys, values) |key, value| {
+                    if (!self.counts(key)) continue;
+                    try self.rememberValueLength(key, if (value) |bytes| @intCast(bytes.len) else null);
+                }
             }
 
             pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
-                const old = if (self.counts(key)) self.inner.get(key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                } else null;
-                const old_bytes = if (old) |existing| entryBytes(key, existing) else 0;
+                const old_value_len = if (self.counts(key)) try self.valueLength(key) else null;
+                const old_bytes = if (old_value_len) |len| @as(u64, @intCast(key.len)) +| len else 0;
                 try self.inner.put(key, value);
                 if (!self.counts(key)) return;
                 self.bytes -|= old_bytes;
                 self.bytes +|= entryBytes(key, value);
                 self.dirty = true;
+                try self.rememberValueLength(key, @intCast(value.len));
             }
 
             pub fn appendPut(self: *@This(), key: []const u8, value: []const u8) !void {
@@ -2821,19 +2869,18 @@ pub const Index = struct {
                 if (!self.counts(key)) return;
                 self.bytes +|= entryBytes(key, value);
                 self.dirty = true;
+                try self.rememberValueLength(key, @intCast(value.len));
             }
 
             pub fn delete(self: *@This(), key: []const u8) !void {
-                const old = if (self.counts(key)) self.inner.get(key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                } else null;
-                const old_bytes = if (old) |existing| entryBytes(key, existing) else 0;
+                const old_value_len = if (self.counts(key)) try self.valueLength(key) else null;
+                const old_bytes = if (old_value_len) |len| @as(u64, @intCast(key.len)) +| len else 0;
                 try self.inner.delete(key);
                 if (old_bytes != 0) {
                     self.bytes -|= old_bytes;
                     self.dirty = true;
                 }
+                if (self.counts(key)) try self.rememberValueLength(key, null);
             }
 
             pub fn openCursor(self: *@This()) !backend_erased.Cursor {
@@ -2849,8 +2896,25 @@ pub const Index = struct {
         };
     }
 
-    fn storageAccountingTxn(self: *Index, inner: anytype) !StorageAccountingTxn(@TypeOf(inner)) {
-        return try StorageAccountingTxn(@TypeOf(inner)).init(self, inner);
+    const StorageAccountingScope = struct {
+        index: *Index,
+
+        fn deinit(self: *@This()) void {
+            self.index.storage_accounting_mutex.unlock();
+            self.* = undefined;
+        }
+
+        fn txn(self: *@This(), inner: anytype) !StorageAccountingTxn(@TypeOf(inner)) {
+            return try StorageAccountingTxn(@TypeOf(inner)).init(self.index, inner);
+        }
+    };
+
+    /// Acquires generation-wide accounting ownership before callers open their
+    /// backend transaction. Keeping transaction construction on this scope
+    /// makes the required ordering explicit at every mutation site.
+    fn storageAccountingScope(self: *Index) StorageAccountingScope {
+        platform_sync.lockYielding(&self.storage_accounting_mutex);
+        return .{ .index = self };
     }
 
     pub fn attachResourceManager(self: *Index, manager: *resource_manager_mod.ResourceManager) void {
@@ -2907,9 +2971,11 @@ pub const Index = struct {
         }
         errdefer self.abortBulkIngestSession();
         if (self.bulk_dirty_path_promotion_dictionaries.count() > 0) {
+            var storage_accounting = self.storageAccountingScope();
+            defer storage_accounting.deinit();
             var txn = try store.beginWriteTxn();
             errdefer txn.abort();
-            var accounting = try self.storageAccountingTxn(&txn);
+            var accounting = try storage_accounting.txn(&txn);
             defer accounting.deinit();
             try self.flushBulkSessionPathPromotionDictionariesTxn(&accounting);
             try accounting.finish();
@@ -2939,9 +3005,11 @@ pub const Index = struct {
         }
 
         if (options.batch_options.mode == .bulk_ingest) {
+            var storage_accounting = self.storageAccountingScope();
+            defer storage_accounting.deinit();
             var write_batch = try store.beginWriteBatchWithOptions(options.batch_options);
             errdefer write_batch.abort();
-            var accounting = try self.storageAccountingTxn(write_batch.asTxn());
+            var accounting = try storage_accounting.txn(write_batch.asTxn());
             defer accounting.deinit();
             try self.applyBatchMutationsWithTxn(&accounting, batch, options);
             try accounting.finish();
@@ -2949,9 +3017,11 @@ pub const Index = struct {
             return;
         }
 
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        var accounting = try self.storageAccountingTxn(&txn);
+        var accounting = try storage_accounting.txn(&txn);
         defer accounting.deinit();
         try self.applyBatchMutationsWithTxn(&accounting, batch, options);
         try accounting.finish();
@@ -3124,9 +3194,11 @@ pub const Index = struct {
         batch: derived_types.DerivedBatch,
         options: ApplyOptions,
     ) !void {
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var write_batch = try store.beginWriteBatchWithOptions(options.batch_options);
         errdefer write_batch.abort();
-        var accounting = try self.storageAccountingTxn(write_batch.asTxn());
+        var accounting = try storage_accounting.txn(write_batch.asTxn());
         defer accounting.deinit();
         const txn = &accounting;
         var accumulator = AppendOnlyAccumulator{};
@@ -3246,9 +3318,11 @@ pub const Index = struct {
     ) !void {
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var raw_txn = try store.beginWriteTxn();
         errdefer raw_txn.abort();
-        var txn = try self.storageAccountingTxn(&raw_txn);
+        var txn = try storage_accounting.txn(&raw_txn);
         defer txn.deinit();
         const axis_id = try self.ensureSymbol(&txn, axes_canonical);
         self.alloc.free(axis_id);
@@ -3426,9 +3500,11 @@ pub const Index = struct {
         const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.storage_namespace, expr_id);
         defer self.alloc.free(prefix);
 
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var raw_txn = try store.beginWriteTxn();
         errdefer raw_txn.abort();
-        var txn = try self.storageAccountingTxn(&raw_txn);
+        var txn = try storage_accounting.txn(&raw_txn);
         defer txn.deinit();
 
         var keys = std.ArrayListUnmanaged([]u8).empty;
@@ -9251,9 +9327,11 @@ pub const Index = struct {
             else
                 "schemaless_typed_path_recommended";
             const decision = if (should_start_backfill) "schemaless_path_backfill_started" else base_decision;
+            var storage_accounting = self.storageAccountingScope();
+            defer storage_accounting.deinit();
             var raw_txn = try store.beginWriteTxn();
             errdefer raw_txn.abort();
-            var txn = try self.storageAccountingTxn(&raw_txn);
+            var txn = try storage_accounting.txn(&raw_txn);
             defer txn.deinit();
             try self.persistPathProfileHistoryTxn(&txn, recommendation);
             const prior_state_payload = txn.get(state_key) catch |err| switch (err) {
@@ -12103,9 +12181,11 @@ pub const Index = struct {
             updates.deinit(self.alloc);
         }
 
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var raw_txn = try store.beginWriteTxn();
         errdefer raw_txn.abort();
-        var txn = try self.storageAccountingTxn(&raw_txn);
+        var txn = try storage_accounting.txn(&raw_txn);
         defer txn.deinit();
         const state = try self.encodePersistedMaterializationStateAlloc(recommendation, lifecycle, existing_state.observation_count);
         defer self.alloc.free(state);
@@ -12163,9 +12243,11 @@ pub const Index = struct {
         const key = try adaptive_mod.observationKeyAlloc(self.alloc, self.storage_namespace, shape);
         defer self.alloc.free(key);
 
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var raw_txn = try store.beginWriteTxn();
         errdefer raw_txn.abort();
-        var txn = try self.storageAccountingTxn(&raw_txn);
+        var txn = try storage_accounting.txn(&raw_txn);
         defer txn.deinit();
         const existing = txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
@@ -12207,9 +12289,11 @@ pub const Index = struct {
 
         const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(state_key);
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var raw_txn = try store.beginWriteTxn();
         errdefer raw_txn.abort();
-        var txn = try self.storageAccountingTxn(&raw_txn);
+        var txn = try storage_accounting.txn(&raw_txn);
         defer txn.deinit();
         try txn.put(key, encoded);
         if (txn.get(state_key)) |existing| {
@@ -12378,9 +12462,11 @@ pub const Index = struct {
     ) !void {
         const key = try adaptive_mod.candidateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(key);
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var raw_txn = try store.beginWriteTxn();
         errdefer raw_txn.abort();
-        var txn = try self.storageAccountingTxn(&raw_txn);
+        var txn = try storage_accounting.txn(&raw_txn);
         defer txn.deinit();
         var prior_candidate: ?PersistedAdaptiveCandidate = null;
         const prior_payload = txn.get(key) catch |err| switch (err) {
@@ -12420,9 +12506,11 @@ pub const Index = struct {
         defer self.alloc.free(key);
         const payload = try self.encodePersistedAdaptiveProgressAlloc(recommendation, materialization_id, lifecycle, target_sequence, applied_sequence, rows_processed, target_rows, cursor_key);
         defer self.alloc.free(payload);
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var raw_txn = try store.beginWriteTxn();
         errdefer raw_txn.abort();
-        var txn = try self.storageAccountingTxn(&raw_txn);
+        var txn = try storage_accounting.txn(&raw_txn);
         defer txn.deinit();
         try txn.put(key, payload);
         try txn.finish();
@@ -12505,9 +12593,11 @@ pub const Index = struct {
         for (progress_rows) |progress| {
             if (self.adaptiveProgressMatchesCurrentConfig(progress)) continue;
             if (progress.lifecycle == .rebuild_required) continue;
+            var storage_accounting = self.storageAccountingScope();
+            defer storage_accounting.deinit();
             var raw_txn = try store.beginWriteTxn();
             errdefer raw_txn.abort();
-            var txn = try self.storageAccountingTxn(&raw_txn);
+            var txn = try storage_accounting.txn(&raw_txn);
             defer txn.deinit();
             try self.markAdaptiveMaterializationRebuildRequiredTxn(&txn, progress);
             try txn.finish();
@@ -12897,9 +12987,11 @@ pub const Index = struct {
         const processed: u64 = @intCast(payloads.items.len);
         const total_processed = progress.rows_processed + processed;
 
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var raw_txn = try store.beginWriteTxn();
         errdefer raw_txn.abort();
-        var txn = try self.storageAccountingTxn(&raw_txn);
+        var txn = try storage_accounting.txn(&raw_txn);
         defer txn.deinit();
         for (payloads.items) |item| {
             var facts = fact_mod.decodeListAlloc(self.alloc, item.payload) catch |err| switch (err) {
@@ -13050,9 +13142,11 @@ pub const Index = struct {
 
         const processed: u64 = @intCast(items.items.len);
         const total_processed = progress.rows_processed + processed;
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var raw_txn = try store.beginWriteTxn();
         errdefer raw_txn.abort();
-        var txn = try self.storageAccountingTxn(&raw_txn);
+        var txn = try storage_accounting.txn(&raw_txn);
         defer txn.deinit();
         const owns_dictionary = try self.putPathPromotionDictionaryRegistryTxn(&txn, spec, if (reached_end) "ready" else "building");
         for (items.items) |item| {
@@ -13229,9 +13323,11 @@ pub const Index = struct {
         const processed: u64 = @intCast(payloads.items.len);
         const total_processed = progress.rows_processed + processed;
 
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var raw_txn = try store.beginWriteTxn();
         errdefer raw_txn.abort();
-        var txn = try self.storageAccountingTxn(&raw_txn);
+        var txn = try storage_accounting.txn(&raw_txn);
         defer txn.deinit();
         for (payloads.items) |item| {
             var changed_fact = ProjectedFact.decode(self.alloc, item.payload) catch |err| switch (err) {
@@ -13330,9 +13426,11 @@ pub const Index = struct {
         const candidate_key = try adaptive_mod.candidateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(candidate_key);
 
+        var storage_accounting = self.storageAccountingScope();
+        defer storage_accounting.deinit();
         var raw_txn = try store.beginWriteTxn();
         errdefer raw_txn.abort();
-        var txn = try self.storageAccountingTxn(&raw_txn);
+        var txn = try storage_accounting.txn(&raw_txn);
         defer txn.deinit();
         for (keys.items) |key| txn.delete(key) catch |err| switch (err) {
             error.NotFound => {},
@@ -17534,6 +17632,176 @@ fn wildcardMatch(pattern: []const u8, text: []const u8) bool {
     return wildcard_mod.match(pattern, text);
 }
 
+fn measuredStorageBytesForTest(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    storage_namespace: []const u8,
+) !u64 {
+    const fact_prefix = try storagePrefixAlloc(alloc, storage_namespace);
+    defer alloc.free(fact_prefix);
+    const tuple_prefix = try tupleStoragePrefixAlloc(alloc, storage_namespace);
+    defer alloc.free(tuple_prefix);
+    const dictionary_prefix = try dictionaryStoragePrefixAlloc(alloc, storage_namespace);
+    defer alloc.free(dictionary_prefix);
+    const registry_prefix = try dictionaryRegistryPrefixAlloc(alloc, storage_namespace);
+    defer alloc.free(registry_prefix);
+    const counter_key = try storageBytesKeyAlloc(alloc, storage_namespace);
+    defer alloc.free(counter_key);
+
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var total: u64 = 0;
+    for ([_][]const u8{ fact_prefix, tuple_prefix, dictionary_prefix, registry_prefix }) |prefix| {
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (std.mem.eql(u8, entry.key, counter_key)) continue;
+            total = total +| @as(u64, @intCast(entry.key.len)) +| @as(u64, @intCast(entry.value.len));
+        }
+    }
+    return total;
+}
+
+fn accountedPutForTest(
+    index: *Index,
+    store: *docstore_mod.DocStore,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    var storage_accounting = index.storageAccountingScope();
+    defer storage_accounting.deinit();
+    var raw_txn = try store.beginWriteTxn();
+    errdefer raw_txn.abort();
+    var txn = try storage_accounting.txn(&raw_txn);
+    defer txn.deinit();
+    try txn.put(key, value);
+    try txn.finish();
+    try raw_txn.commit();
+}
+
+test "algebraic storage accounting reuses transaction reads for updates" {
+    const alloc = std.testing.allocator;
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "materializations": []
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg_accounting_cache", cfg);
+    defer idx.close();
+    const data_key = try idx.keyAlloc(&.{"cache-test"});
+    defer alloc.free(data_key);
+
+    const CountingTxn = struct {
+        data_key: []const u8,
+        get_count: usize = 0,
+
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            self.get_count += 1;
+            if (std.mem.eql(u8, key, self.data_key)) return "old";
+            return error.NotFound;
+        }
+
+        pub fn put(_: *@This(), _: []const u8, _: []const u8) !void {}
+    };
+    var inner = CountingTxn{ .data_key = data_key };
+    var accounting = try Index.StorageAccountingTxn(*CountingTxn).init(&idx, &inner);
+    defer accounting.deinit();
+
+    _ = try accounting.get(data_key);
+    try accounting.put(data_key, "replacement");
+    try std.testing.expectEqual(@as(usize, 2), inner.get_count);
+}
+
+test "algebraic storage accounting serializes concurrent generation writes" {
+    const alloc = std.heap.smp_allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "materializations": []
+        \\}
+    ;
+    var idx = try Index.openWithStorageNamespace(alloc, "alg_accounting", "alg_accounting::generation", cfg);
+    defer idx.close();
+
+    const worker_count = 8;
+    const writes_per_worker = 8;
+    const Worker = struct {
+        index: *Index,
+        store: *docstore_mod.DocStore,
+        start: *std.atomic.Value(bool),
+        worker_id: usize,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            for (0..8) |write_id| {
+                const component = std.fmt.allocPrint(self.index.alloc, "concurrent-{d}-{d}", .{ self.worker_id, write_id }) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                defer self.index.alloc.free(component);
+                const key = self.index.keyAlloc(&.{component}) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                defer self.index.alloc.free(key);
+                accountedPutForTest(self.index, self.store, key, "value") catch |err| {
+                    self.failure = err;
+                    return;
+                };
+            }
+        }
+    };
+
+    var start = std.atomic.Value(bool).init(false);
+    var workers: [worker_count]Worker = undefined;
+    var threads: [worker_count]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer {
+        start.store(true, .release);
+        for (threads[0..spawned]) |thread| thread.join();
+    }
+    for (&workers, 0..) |*worker, worker_id| {
+        worker.* = .{
+            .index = &idx,
+            .store = &store,
+            .start = &start,
+            .worker_id = worker_id,
+        };
+        threads[worker_id] = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        spawned += 1;
+    }
+    start.store(true, .release);
+    for (threads) |thread| thread.join();
+    spawned = 0;
+    for (workers) |worker| if (worker.failure) |err| return err;
+
+    var expected: u64 = 0;
+    for (0..worker_count) |worker_id| {
+        for (0..writes_per_worker) |write_id| {
+            const component = try std.fmt.allocPrint(alloc, "concurrent-{d}-{d}", .{ worker_id, write_id });
+            defer alloc.free(component);
+            const key = try idx.keyAlloc(&.{component});
+            defer alloc.free(key);
+            expected += @intCast(key.len + "value".len);
+        }
+    }
+    const measured = try measuredStorageBytesForTest(alloc, &store, idx.storageNamespace());
+    try std.testing.expectEqual(expected, measured);
+    try std.testing.expectEqual(measured, try idx.storageBytes(&store));
+}
+
 test "algebraic wildcard helpers preserve escaped literals" {
     try std.testing.expect(wildcardMatch("foo\\*bar", "foo*bar"));
     try std.testing.expect(!wildcardMatch("foo\\*bar", "fooxbar"));
@@ -20330,6 +20598,10 @@ test "algebraic index materialized expression rows use tensor law mutation" {
     const raw = (try idx.materializedExpressionRawValueAlloc(&store, expr, axes, "2026-05-15", .sum)).?;
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("4", raw);
+    try std.testing.expectEqual(
+        try measuredStorageBytesForTest(alloc, &store, idx.storageNamespace()),
+        try idx.storageBytes(&store),
+    );
 
     var count_expr = expr;
     count_expr.law_id = .count;
