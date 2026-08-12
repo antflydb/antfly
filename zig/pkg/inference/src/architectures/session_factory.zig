@@ -386,6 +386,13 @@ fn sessionTaskForModelType(model_type: manifest_mod.ModelType, override: ?TaskOv
     };
 }
 
+const deberta_classifier_weight_mirror_min_rows: usize = 128;
+
+fn debertaClassifierPrefersWeightMirrors(batch: usize, seq_len: usize) bool {
+    const rows = std.math.mul(usize, batch, seq_len) catch return false;
+    return rows >= deberta_classifier_weight_mirror_min_rows;
+}
+
 pub const UnsupportedTensorTypeCount = struct {
     tensor_type: gguf_mod.tensor_types.TensorType,
     count: usize,
@@ -4426,6 +4433,13 @@ test "sessionTaskForModelType maps classifier and recognizer tasks" {
     try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.reranker, .generic));
 }
 
+test "DeBERTa classifier mirrors are reserved for material encoder workloads" {
+    try std.testing.expect(!debertaClassifierPrefersWeightMirrors(1, 127));
+    try std.testing.expect(debertaClassifierPrefersWeightMirrors(1, 128));
+    try std.testing.expect(debertaClassifierPrefersWeightMirrors(8, 16));
+    try std.testing.expect(!debertaClassifierPrefersWeightMirrors(std.math.maxInt(usize), 2));
+}
+
 test "detectArchitecture recognizes generic deberta classifier configs" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5801,7 +5815,12 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const attention_mask = inputs[1].asInt64();
 
             if (self.task == .classifier) {
-                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, false);
+                // Long-sequence DeBERTa rerankers need the same bounded F16
+                // mirrors as GLiNER to stay on the resident fused-layer path.
+                // Non-Metal backends ignore this preference, and the existing
+                // TERMITE_METAL_DISABLE_DEBERTA_WEIGHT_MIRRORS switch opts out.
+                const prefer_weight_mirrors = debertaClassifierPrefersWeightMirrors(batch, seq_len);
+                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, prefer_weight_mirrors);
                 defer cb.free(hidden_ct);
 
                 const logits = try runDebertaSequenceClassifierCt(&cb, allocator, cfg, hidden_ct, batch, seq_len);
