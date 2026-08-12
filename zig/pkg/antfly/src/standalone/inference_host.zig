@@ -476,12 +476,19 @@ const ManifestServer = struct {
     owner: *LinkedInferenceState,
 
     fn register(self: *const ManifestServer, method: http_abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
-        try self.owner.route_validator.add(switch (method) {
+        self.owner.route_validator.add(switch (method) {
             .get => .GET,
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
-        }, path, handler);
+        }, path, handler) catch |err| {
+            std.log.err("linked inference route manifest rejected method={s} path={s} err={}", .{
+                @tagName(method),
+                path,
+                err,
+            });
+            return err;
+        };
         const route = try self.owner.alloc.create(RouteState);
         errdefer self.owner.alloc.destroy(route);
         route.* = .{ .owner = self.owner, .handler = handler };

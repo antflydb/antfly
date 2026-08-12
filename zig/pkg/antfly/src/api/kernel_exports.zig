@@ -443,12 +443,19 @@ fn ManifestServer(comptime prefix: []const u8) type {
         owner: *HandlerState,
 
         fn register(self: *const @This(), method: abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
-            try self.owner.route_validator.add(switch (method) {
+            self.owner.route_validator.add(switch (method) {
                 .get => .GET,
                 .post => .POST,
                 .put => .PUT,
                 .delete => .DELETE,
-            }, prefix ++ path, handler);
+            }, prefix ++ path, handler) catch |err| {
+                std.log.err("API kernel route manifest rejected method={s} path={s} err={}", .{
+                    @tagName(method),
+                    prefix ++ path,
+                    err,
+                });
+                return err;
+            };
             const route = try self.owner.alloc.create(RouteState);
             errdefer self.owner.alloc.destroy(route);
             route.* = .{ .owner = self.owner, .handler = handler };

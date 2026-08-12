@@ -10162,10 +10162,13 @@ pub const Node = struct {
         );
         self.request_surfaces_published = true;
         const router = api.ServerRouter(Node).init(self);
-        var prefixed = PrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
-        if (comptime std.mem.eql(u8, prefix, public_api_prefix)) {
-            try server.get(prefix ++ "/models", httpx.Handler.bind(self, mlModelsHandler));
-        }
+        var prefixed = PrefixedServer(prefix, @TypeOf(server.*)){
+            .inner = server,
+            .models_handler = if (comptime std.mem.eql(u8, prefix, public_api_prefix))
+                httpx.Handler.bind(self, mlModelsHandler)
+            else
+                null,
+        };
         try router.register(&prefixed);
         try server.get(prefix ++ "/metrics", httpx.Handler.bind(self, metricsHandler));
     }
@@ -11490,13 +11493,18 @@ fn appendModelInfo(
 fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
     return struct {
         inner: *Inner,
+        models_handler: ?httpx.Handler = null,
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             try self.inner.post(prefix ++ path, handler);
         }
 
         pub fn get(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            try self.inner.get(prefix ++ path, handler);
+            const route_handler = if (comptime std.mem.eql(u8, path, "/models"))
+                self.models_handler orelse handler
+            else
+                handler;
+            try self.inner.get(prefix ++ path, route_handler);
         }
 
         pub fn put(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
@@ -11561,6 +11569,7 @@ const RecordingServer = struct {
     }
 
     fn append(self: *@This(), method: RecordingRouteMethod, comptime path: []const u8) !void {
+        if (self.hasRoute(method, path)) return error.DuplicateRoute;
         try self.routes.append(self.allocator, .{
             .method = method,
             .path = try self.allocator.dupe(u8, path),
@@ -11588,6 +11597,14 @@ const RecordingServer = struct {
             if (route.method == method and std.mem.eql(u8, route.path, path)) return true;
         }
         return false;
+    }
+
+    fn routeCount(self: *const @This(), method: RecordingRouteMethod, path: []const u8) usize {
+        var count: usize = 0;
+        for (self.routes.items) |route| {
+            if (route.method == method and std.mem.eql(u8, route.path, path)) count += 1;
+        }
+        return count;
     }
 };
 
@@ -13443,6 +13460,7 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/embeddings"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/generate/batch"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
+    try std.testing.expectEqual(@as(usize, 1), server.routeCount(.get, public_api_prefix ++ "/models"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/healthz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
