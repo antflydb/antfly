@@ -28,6 +28,7 @@ const tensor_mod = @import("tensor.zig");
 const token = @import("token.zig");
 const value_mod = @import("value.zig");
 const symbol = @import("symbol.zig");
+const backend_erased = @import("../../backend_erased.zig");
 const backend_types = @import("../../backend_types.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
@@ -64,6 +65,16 @@ pub fn dictionaryStoragePrefixAlloc(alloc: Allocator, storage_namespace: []const
 
 pub fn dictionaryRegistryPrefixAlloc(alloc: Allocator, storage_namespace: []const u8) ![]u8 {
     return try token.canonicalTupleAlloc(alloc, &.{ "dictionary_registry:v1", storage_namespace });
+}
+
+pub fn storageBytesKeyAlloc(alloc: Allocator, storage_namespace: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    const prefix = try storagePrefixAlloc(alloc, storage_namespace);
+    defer alloc.free(prefix);
+    try out.appendSlice(alloc, prefix);
+    try token.appendComponent(&out, alloc, "storage-bytes:v1");
+    return try out.toOwnedSlice(alloc);
 }
 pub const path_fact_exists_constraint_value = "pathfact-exists:v1";
 const path_fact_any_constraint_tag = "pathfact-any:v1";
@@ -2719,6 +2730,129 @@ pub const Index = struct {
         return self.storage_namespace;
     }
 
+    pub fn storageBytes(self: *const Index, store: *docstore_mod.DocStore) !u64 {
+        const key = try storageBytesKeyAlloc(self.alloc, self.storage_namespace);
+        defer self.alloc.free(key);
+        const raw = store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        if (raw.len != @sizeOf(u64)) return error.InvalidAlgebraicStorageByteCounter;
+        return std.mem.readInt(u64, raw[0..@sizeOf(u64)], .little);
+    }
+
+    fn StorageAccountingTxn(comptime Inner: type) type {
+        return struct {
+            index: *Index,
+            inner: Inner,
+            prefixes: [4][]u8,
+            counter_key: []u8,
+            bytes: u64,
+            dirty: bool = false,
+
+            fn init(index: *Index, inner: Inner) !@This() {
+                const fact_prefix = try storagePrefixAlloc(index.alloc, index.storage_namespace);
+                errdefer index.alloc.free(fact_prefix);
+                const tuple_prefix = try tupleStoragePrefixAlloc(index.alloc, index.storage_namespace);
+                errdefer index.alloc.free(tuple_prefix);
+                const dictionary_prefix = try dictionaryStoragePrefixAlloc(index.alloc, index.storage_namespace);
+                errdefer index.alloc.free(dictionary_prefix);
+                const registry_prefix = try dictionaryRegistryPrefixAlloc(index.alloc, index.storage_namespace);
+                errdefer index.alloc.free(registry_prefix);
+                const counter_key = try storageBytesKeyAlloc(index.alloc, index.storage_namespace);
+                errdefer index.alloc.free(counter_key);
+                const raw = inner.get(counter_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (raw) |value| if (value.len != @sizeOf(u64))
+                    return error.InvalidAlgebraicStorageByteCounter;
+                return .{
+                    .index = index,
+                    .inner = inner,
+                    .prefixes = .{ fact_prefix, tuple_prefix, dictionary_prefix, registry_prefix },
+                    .counter_key = counter_key,
+                    .bytes = if (raw) |value| std.mem.readInt(u64, value[0..@sizeOf(u64)], .little) else 0,
+                };
+            }
+
+            fn deinit(self: *@This()) void {
+                for (self.prefixes) |prefix| self.index.alloc.free(prefix);
+                self.index.alloc.free(self.counter_key);
+                self.* = undefined;
+            }
+
+            fn counts(self: *const @This(), key: []const u8) bool {
+                if (std.mem.eql(u8, key, self.counter_key)) return false;
+                for (self.prefixes) |prefix| {
+                    if (std.mem.startsWith(u8, key, prefix)) return true;
+                }
+                return false;
+            }
+
+            fn entryBytes(key: []const u8, value: []const u8) u64 {
+                return @as(u64, @intCast(key.len)) +| @as(u64, @intCast(value.len));
+            }
+
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                return try self.inner.get(key);
+            }
+
+            pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+                return try self.inner.getManySorted(keys, values);
+            }
+
+            pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                const old = if (self.counts(key)) self.inner.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                } else null;
+                const old_bytes = if (old) |existing| entryBytes(key, existing) else 0;
+                try self.inner.put(key, value);
+                if (!self.counts(key)) return;
+                self.bytes -|= old_bytes;
+                self.bytes +|= entryBytes(key, value);
+                self.dirty = true;
+            }
+
+            pub fn appendPut(self: *@This(), key: []const u8, value: []const u8) !void {
+                try self.inner.appendPut(key, value);
+                if (!self.counts(key)) return;
+                self.bytes +|= entryBytes(key, value);
+                self.dirty = true;
+            }
+
+            pub fn delete(self: *@This(), key: []const u8) !void {
+                const old = if (self.counts(key)) self.inner.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                } else null;
+                const old_bytes = if (old) |existing| entryBytes(key, existing) else 0;
+                try self.inner.delete(key);
+                if (old_bytes != 0) {
+                    self.bytes -|= old_bytes;
+                    self.dirty = true;
+                }
+            }
+
+            pub fn openCursor(self: *@This()) !backend_erased.Cursor {
+                return try self.inner.openCursor();
+            }
+
+            fn finish(self: *@This()) !void {
+                if (!self.dirty) return;
+                var encoded: [@sizeOf(u64)]u8 = undefined;
+                std.mem.writeInt(u64, &encoded, self.bytes, .little);
+                try self.inner.put(self.counter_key, &encoded);
+            }
+        };
+    }
+
+    fn storageAccountingTxn(self: *Index, inner: anytype) !StorageAccountingTxn(@TypeOf(inner)) {
+        return try StorageAccountingTxn(@TypeOf(inner)).init(self, inner);
+    }
+
     pub fn attachResourceManager(self: *Index, manager: *resource_manager_mod.ResourceManager) void {
         self.resource_manager = manager;
     }
@@ -2775,7 +2909,10 @@ pub const Index = struct {
         if (self.bulk_dirty_path_promotion_dictionaries.count() > 0) {
             var txn = try store.beginWriteTxn();
             errdefer txn.abort();
-            try self.flushBulkSessionPathPromotionDictionariesTxn(&txn);
+            var accounting = try self.storageAccountingTxn(&txn);
+            defer accounting.deinit();
+            try self.flushBulkSessionPathPromotionDictionariesTxn(&accounting);
+            try accounting.finish();
             try txn.commit();
         }
         self.clearBulkDirtyPathPromotionDictionaries();
@@ -2804,15 +2941,20 @@ pub const Index = struct {
         if (options.batch_options.mode == .bulk_ingest) {
             var write_batch = try store.beginWriteBatchWithOptions(options.batch_options);
             errdefer write_batch.abort();
-            const txn = write_batch.asTxn();
-            try self.applyBatchMutationsWithTxn(txn, batch, options);
+            var accounting = try self.storageAccountingTxn(write_batch.asTxn());
+            defer accounting.deinit();
+            try self.applyBatchMutationsWithTxn(&accounting, batch, options);
+            try accounting.finish();
             try write_batch.commit();
             return;
         }
 
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        try self.applyBatchMutationsWithTxn(&txn, batch, options);
+        var accounting = try self.storageAccountingTxn(&txn);
+        defer accounting.deinit();
+        try self.applyBatchMutationsWithTxn(&accounting, batch, options);
+        try accounting.finish();
         try txn.commit();
     }
 
@@ -2984,7 +3126,9 @@ pub const Index = struct {
     ) !void {
         var write_batch = try store.beginWriteBatchWithOptions(options.batch_options);
         errdefer write_batch.abort();
-        const txn = write_batch.asTxn();
+        var accounting = try self.storageAccountingTxn(write_batch.asTxn());
+        defer accounting.deinit();
+        const txn = &accounting;
         var accumulator = AppendOnlyAccumulator{};
         defer {
             self.clearAccumulatorResourceUsage(&self.append_only_accumulator_resource_bytes);
@@ -3018,6 +3162,7 @@ pub const Index = struct {
             try self.flushBatchMaintenanceContextTxn(txn, ctx);
         }
 
+        try accounting.finish();
         try write_batch.commit();
     }
 
@@ -3101,8 +3246,10 @@ pub const Index = struct {
     ) !void {
         const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
         defer self.alloc.free(expr_id);
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try self.storageAccountingTxn(&raw_txn);
+        defer txn.deinit();
         const axis_id = try self.ensureSymbol(&txn, axes_canonical);
         self.alloc.free(axis_id);
         const key = try tensor_mod.expressionKeyAlloc(self.alloc, self.storage_namespace, .{
@@ -3120,12 +3267,14 @@ pub const Index = struct {
                 error.NotFound => {},
                 else => return err,
             };
-            try txn.commit();
+            try txn.finish();
+            try raw_txn.commit();
             return;
         };
         defer self.alloc.free(encoded);
         try txn.put(key, encoded);
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
     }
 
     pub fn materializedExpressionRawValueAlloc(
@@ -3277,8 +3426,10 @@ pub const Index = struct {
         const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.storage_namespace, expr_id);
         defer self.alloc.free(prefix);
 
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try self.storageAccountingTxn(&raw_txn);
+        defer txn.deinit();
 
         var keys = std.ArrayListUnmanaged([]u8).empty;
         defer {
@@ -3332,7 +3483,8 @@ pub const Index = struct {
             written += 1;
         }
 
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         return written;
     }
 
@@ -9099,8 +9251,10 @@ pub const Index = struct {
             else
                 "schemaless_typed_path_recommended";
             const decision = if (should_start_backfill) "schemaless_path_backfill_started" else base_decision;
-            var txn = try store.beginWriteTxn();
-            errdefer txn.abort();
+            var raw_txn = try store.beginWriteTxn();
+            errdefer raw_txn.abort();
+            var txn = try self.storageAccountingTxn(&raw_txn);
+            defer txn.deinit();
             try self.persistPathProfileHistoryTxn(&txn, recommendation);
             const prior_state_payload = txn.get(state_key) catch |err| switch (err) {
                 error.NotFound => null,
@@ -9155,7 +9309,8 @@ pub const Index = struct {
                 defer self.alloc.free(progress_payload);
                 try txn.put(progress_key, progress_payload);
             }
-            try txn.commit();
+            try txn.finish();
+            try raw_txn.commit();
         }
         return changed;
     }
@@ -11948,8 +12103,10 @@ pub const Index = struct {
             updates.deinit(self.alloc);
         }
 
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try self.storageAccountingTxn(&raw_txn);
+        defer txn.deinit();
         const state = try self.encodePersistedMaterializationStateAlloc(recommendation, lifecycle, existing_state.observation_count);
         defer self.alloc.free(state);
         try txn.put(state_key, state);
@@ -11965,7 +12122,8 @@ pub const Index = struct {
             defer self.alloc.free(encoded);
             try txn.put(update.key, encoded);
         }
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         self.invalidateAdaptiveReadySpecCache();
     }
 
@@ -12005,8 +12163,10 @@ pub const Index = struct {
         const key = try adaptive_mod.observationKeyAlloc(self.alloc, self.storage_namespace, shape);
         defer self.alloc.free(key);
 
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try self.storageAccountingTxn(&raw_txn);
+        defer txn.deinit();
         const existing = txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -12027,7 +12187,8 @@ pub const Index = struct {
             defer self.alloc.free(state);
             try txn.put(state_key, state);
         }
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         self.invalidateAdaptiveReadySpecCache();
     }
 
@@ -12046,8 +12207,10 @@ pub const Index = struct {
 
         const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(state_key);
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try self.storageAccountingTxn(&raw_txn);
+        defer txn.deinit();
         try txn.put(key, encoded);
         if (txn.get(state_key)) |existing| {
             var state = self.decodePersistedMaterializationState(existing) catch null;
@@ -12061,7 +12224,8 @@ pub const Index = struct {
             error.NotFound => {},
             else => return err,
         }
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
     }
 
     fn adaptiveCostInputs(
@@ -12214,8 +12378,10 @@ pub const Index = struct {
     ) !void {
         const key = try adaptive_mod.candidateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(key);
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try self.storageAccountingTxn(&raw_txn);
+        defer txn.deinit();
         var prior_candidate: ?PersistedAdaptiveCandidate = null;
         const prior_payload = txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
@@ -12234,7 +12400,8 @@ pub const Index = struct {
         defer self.alloc.free(history_payload);
         try txn.put(key, payload);
         try txn.put(history_key, history_payload);
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
     }
 
     fn persistAdaptiveProgress(
@@ -12253,10 +12420,13 @@ pub const Index = struct {
         defer self.alloc.free(key);
         const payload = try self.encodePersistedAdaptiveProgressAlloc(recommendation, materialization_id, lifecycle, target_sequence, applied_sequence, rows_processed, target_rows, cursor_key);
         defer self.alloc.free(payload);
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try self.storageAccountingTxn(&raw_txn);
+        defer txn.deinit();
         try txn.put(key, payload);
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         self.invalidateAdaptiveReadySpecCache();
     }
 
@@ -12335,10 +12505,13 @@ pub const Index = struct {
         for (progress_rows) |progress| {
             if (self.adaptiveProgressMatchesCurrentConfig(progress)) continue;
             if (progress.lifecycle == .rebuild_required) continue;
-            var txn = try store.beginWriteTxn();
-            errdefer txn.abort();
+            var raw_txn = try store.beginWriteTxn();
+            errdefer raw_txn.abort();
+            var txn = try self.storageAccountingTxn(&raw_txn);
+            defer txn.deinit();
             try self.markAdaptiveMaterializationRebuildRequiredTxn(&txn, progress);
-            try txn.commit();
+            try txn.finish();
+            try raw_txn.commit();
             changed += 1;
         }
         return changed;
@@ -12724,8 +12897,10 @@ pub const Index = struct {
         const processed: u64 = @intCast(payloads.items.len);
         const total_processed = progress.rows_processed + processed;
 
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try self.storageAccountingTxn(&raw_txn);
+        defer txn.deinit();
         for (payloads.items) |item| {
             var facts = fact_mod.decodeListAlloc(self.alloc, item.payload) catch |err| switch (err) {
                 error.InvalidAlgebraicFact => continue,
@@ -12751,7 +12926,8 @@ pub const Index = struct {
             target_rows,
             cursor_key,
         );
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         if (reached_end and next_cursor_key.len > 0) {
             self.alloc.free(next_cursor_key);
             next_cursor_key = &.{};
@@ -12874,8 +13050,10 @@ pub const Index = struct {
 
         const processed: u64 = @intCast(items.items.len);
         const total_processed = progress.rows_processed + processed;
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try self.storageAccountingTxn(&raw_txn);
+        defer txn.deinit();
         const owns_dictionary = try self.putPathPromotionDictionaryRegistryTxn(&txn, spec, if (reached_end) "ready" else "building");
         for (items.items) |item| {
             const item_kind = std.meta.stringToEnum(pathfact_mod.Kind, item.kind) orelse continue;
@@ -12936,7 +13114,8 @@ pub const Index = struct {
             target_rows,
             cursor_key,
         );
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         if (reached_end and next_cursor_key.len > 0) {
             self.alloc.free(next_cursor_key);
             next_cursor_key = &.{};
@@ -13050,8 +13229,10 @@ pub const Index = struct {
         const processed: u64 = @intCast(payloads.items.len);
         const total_processed = progress.rows_processed + processed;
 
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try self.storageAccountingTxn(&raw_txn);
+        defer txn.deinit();
         for (payloads.items) |item| {
             var changed_fact = ProjectedFact.decode(self.alloc, item.payload) catch |err| switch (err) {
                 error.InvalidAlgebraicFact => continue,
@@ -13077,7 +13258,8 @@ pub const Index = struct {
             target_rows,
             cursor_key,
         );
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
         if (reached_end and next_cursor_key.len > 0) {
             self.alloc.free(next_cursor_key);
             next_cursor_key = &.{};
@@ -13148,8 +13330,10 @@ pub const Index = struct {
         const candidate_key = try adaptive_mod.candidateKeyAlloc(self.alloc, self.storage_namespace, recommendation);
         defer self.alloc.free(candidate_key);
 
-        var txn = try store.beginWriteTxn();
-        errdefer txn.abort();
+        var raw_txn = try store.beginWriteTxn();
+        errdefer raw_txn.abort();
+        var txn = try self.storageAccountingTxn(&raw_txn);
+        defer txn.deinit();
         for (keys.items) |key| txn.delete(key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
@@ -13163,7 +13347,8 @@ pub const Index = struct {
             else => return err,
         };
         try self.deleteAdaptiveDictionaryIfOwnedTxn(&txn, recommendation, materialization_id);
-        try txn.commit();
+        try txn.finish();
+        try raw_txn.commit();
     }
 
     fn deleteAdaptiveDictionaryIfOwnedTxn(

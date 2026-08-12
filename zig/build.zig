@@ -5586,6 +5586,8 @@ pub fn build(b: *std.Build) void {
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
             "db managed vector admission captures writes while durable repair is pending",
             "db managed algebraic admission builds and reopens an isolated generation",
+            "db algebraic generation build yields and resumes from its durable source cursor",
+            "db forced algebraic repair persists an operator generation intent before execution",
             "db algebraic post-commit activation crash recovers through generation repair",
             "table provisioner admits algebraic index on a non-empty table through generation repair",
             "target index reconciliation never mutates sibling indexes",

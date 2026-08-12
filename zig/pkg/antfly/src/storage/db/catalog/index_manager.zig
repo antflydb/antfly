@@ -9832,6 +9832,17 @@ pub const IndexManager = struct {
     /// measures the selected index generation rather than the entire table DB;
     /// node admission adds separate replay and cleanup headroom.
     pub fn activeIndexStorageBytes(self: *const IndexManager, name: []const u8) !u64 {
+        for (self.algebraic_indexes.items) |*entry| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            const store = self.primary_store orelse return error.PrimaryStoreUnavailable;
+            return try entry.index.storageBytes(store);
+        }
+        for (self.status_only_index_configs) |cfg| {
+            if (cfg.kind != .algebraic or !std.mem.eql(u8, cfg.name, name)) continue;
+            const storage_namespace = try self.algebraicStorageNamespaceAlloc(name);
+            defer self.alloc.free(storage_namespace);
+            return try self.algebraicStorageNamespaceBytes(storage_namespace);
+        }
         const path = try self.activeIndexPath(name);
         defer self.alloc.free(path);
         if (builtin.os.tag == .freestanding) return 0;
@@ -9852,6 +9863,19 @@ pub const IndexManager = struct {
             total +|= stat.size;
         }
         return total;
+    }
+
+    pub fn algebraicStorageNamespaceBytes(self: *const IndexManager, storage_namespace: []const u8) !u64 {
+        const store = self.primary_store orelse return error.PrimaryStoreUnavailable;
+        const key = try algebraic_mod.index.storageBytesKeyAlloc(self.alloc, storage_namespace);
+        defer self.alloc.free(key);
+        const raw = store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        if (raw.len != @sizeOf(u64)) return error.InvalidAlgebraicStorageByteCounter;
+        return std.mem.readInt(u64, raw[0..@sizeOf(u64)], .little);
     }
 
     /// A pointer-selected generation is publication state, not an empty index
