@@ -3971,7 +3971,10 @@ test "metadata replication backfill applies configured update transforms" {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             const rows = try inner_alloc.alloc(std.json.Value, 1);
-            rows[0] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"doc:7\",\"user_name\":\"Alice\",\"score\":10,\"profile\":{\"city\":\"sf\"}}", .{});
+            errdefer inner_alloc.free(rows);
+            var parsed = try std.json.parseFromSlice(std.json.Value, inner_alloc, "{\"id\":\"doc:7\",\"user_name\":\"Alice\",\"score\":10,\"profile\":{\"city\":\"sf\"}}", .{});
+            defer parsed.deinit();
+            rows[0] = try cloneJsonValueAllocLocal(inner_alloc, parsed.value);
             return .{ .rows = rows, .total = 1 };
         }
 
