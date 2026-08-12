@@ -220,7 +220,9 @@ pub const Config = struct {
     rope_layout: RopeLayout = .half_split,
     sliding_window_pattern: u32 = 6,
     rope_partial_factor: f32 = 1.0, // Gemma 4 full attention: 0.25 (only rotate 25% of head_dim)
-    rope_dim_override: u32 = 0, // When >0, overrides rope_dim for all layers (from rope_freqs.weight)
+    // Active rotary width decoded from rope_freqs.weight. For Gemma 4 this
+    // limits non-sliding layers while preserving their full frequency domain.
+    rope_dim_override: u32 = 0,
 
     // Optional model-specific decode semantics.
     norm_weight_offset: f32 = 0.0,
@@ -341,14 +343,14 @@ pub const Config = struct {
         return self.family == .gemma and
             self.hasPle() and
             self.sliding_window > 0 and
-            self.hasMixedSlidingAndGlobalAttentionLayers();
+            self.hasGlobalAttentionLayers();
     }
 
     /// Retention window for a layer-packed KV pool. Mixed global/sliding
     /// attention keeps full history unless the lower-memory override is forced.
     pub fn kvPoolSlidingWindowSize(self: Config, force_sliding_trim: bool) ?u32 {
         if (self.position_encoding == .absolute) return null;
-        if (self.sliding_window > 0 and self.hasMixedSlidingAndGlobalAttentionLayers() and !force_sliding_trim) return null;
+        if (self.sliding_window > 0 and self.hasGlobalAttentionLayers() and !force_sliding_trim) return null;
         if (self.sliding_window > 0) return self.sliding_window;
         if (self.max_position_embeddings > 0) return self.max_position_embeddings;
         return null;
@@ -414,9 +416,12 @@ pub const Config = struct {
 
     /// Backend-facing RoPE base for the active rotary width.
     ///
-    /// Gemma 4 can define a smaller active prefix over a wider frequency
-    /// domain. Folding that domain into theta preserves the same frequencies
-    /// for backends whose RoPE contract is expressed in active dimensions.
+    /// Backends express frequencies in terms of the number of dimensions they
+    /// rotate. Gemma 4 can instead define a smaller active prefix over a wider
+    /// frequency domain via `rope_freqs.weight`. Folding that wider domain into
+    /// theta keeps the ordinary backend RoPE contract exact for active lanes:
+    ///
+    ///   theta' = theta^(active_dim / frequency_dim)
     pub fn layerRopeEffectiveTheta(self: Config, layer_index: usize) f32 {
         const base_theta = self.layerRopeTheta(layer_index);
         const active_dim = self.layerRopeActiveDim(layer_index);

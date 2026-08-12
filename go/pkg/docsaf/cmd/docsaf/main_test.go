@@ -74,6 +74,38 @@ func TestDocsafEmbedderConfigSupportsOllama(t *testing.T) {
 	}
 }
 
+func TestCreateHierarchyIndexesIncludesSelectivePDFOCRInSingleConfig(t *testing.T) {
+	indexes, err := createHierarchyIndexes(512, 50, defaultDocsafEmbeddingProvider, defaultDocsafEmbeddingModel, "", 0, `{"provider":"antfly","model":"reader"}`, 200, 75)
+	if err != nil {
+		t.Fatalf("createHierarchyIndexes: %v", err)
+	}
+	documentUnits := indexes["document_units"].(map[string]any)
+	artifact := documentUnits["artifact"].(map[string]any)
+	producer := artifact["producer_json"].(map[string]any)
+	config := producer["config"].(map[string]any)
+	ocr := config["ocr"].(map[string]any)
+	if ocr["render_dpi"] != 200 {
+		t.Fatalf("render_dpi = %#v, want 200", ocr["render_dpi"])
+	}
+	quality := ocr["quality"].(map[string]any)
+	if quality["min_content_chars"] != 75 {
+		t.Fatalf("min_content_chars = %#v, want 75", quality["min_content_chars"])
+	}
+	reader := ocr["config"].(map[string]any)
+	if reader["model"] != "reader" {
+		t.Fatalf("reader model = %#v, want reader", reader["model"])
+	}
+	documentText := indexes["document_text"].(map[string]any)
+	enrichments := documentText["enrichments"].([]map[string]any)
+	chunk := enrichments[1]
+	if chunk["name"] != docsaf.DefaultDocumentChunksArtifact {
+		t.Fatalf("chunk name = %#v, want %q", chunk["name"], docsaf.DefaultDocumentChunksArtifact)
+	}
+	if chunk["full_text_index"] != true {
+		t.Fatalf("full_text_index = %#v, want true", chunk["full_text_index"])
+	}
+}
+
 func TestDocsafEmbedderConfigSupportsOpenRouter(t *testing.T) {
 	cfg, err := docsafEmbedderConfig("openrouter", "openai/text-embedding-3-small", "")
 	if err != nil {

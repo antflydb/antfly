@@ -27,6 +27,7 @@ const gguf_format = @import("../gguf/format.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
 const managed_receipt = @import("../registry/managed_receipt.zig");
 const build_options = @import("build_options");
+const jinja = @import("jinja");
 
 /// Built-in chat template for Gemma 4 models (uses <|turn>/<turn|> tokens).
 /// Applied when tokenizer_config.json has sot_token=<|turn> but no
@@ -68,7 +69,11 @@ const gemma4_chat_template =
     "{{ '<turn|>\\n' }}" ++
     "{%- endfor -%}" ++
     "{%- if add_generation_prompt -%}" ++
+    "{%- if enable_thinking is defined and not enable_thinking -%}" ++
+    "{{ '<|turn>model\\n<|channel>final\\n<channel|>' }}" ++
+    "{%- else -%}" ++
     "{{ '<|turn>model\\n<|channel>thought\\n<channel|>' }}" ++
+    "{%- endif -%}" ++
     "{%- endif -%}";
 
 pub const ModelType = enum {
@@ -81,6 +86,20 @@ pub const ModelType = enum {
     classifier,
     reader,
     transcriber,
+};
+
+/// Records why `model_type` was selected. The default enum value is a neutral
+/// placeholder, not an explicit embedder declaration; compatibility policy
+/// must be able to distinguish those cases before using artifact metadata to
+/// infer a serving route.
+pub const ModelTypeOrigin = enum {
+    default,
+    path,
+    config,
+    manifest,
+    tasks,
+    heuristic,
+    bundle,
 };
 
 pub const TokenizerType = enum {
@@ -150,6 +169,7 @@ pub const ModelManifest = struct {
 
     // Identity
     model_type: ModelType = .embedder,
+    model_type_origin: ModelTypeOrigin = .default,
 
     // Files (allocated strings — absolute paths)
     onnx_path: ?[]const u8 = null,
@@ -182,7 +202,11 @@ pub const ModelManifest = struct {
     max_position_embeddings: u32 = 512,
     num_hidden_layers: u32 = 12,
     num_attention_heads: u32 = 12,
+    bert_vocab_size: u32 = 30522,
+    bert_type_vocab_size: u32 = 2,
+    bert_layer_norm_eps: f32 = 1e-12,
     bert_model_type: bert.ModelType = .bert,
+    bert_pad_token_id: i64 = 0,
     config_model_arch: []const u8 = "",
 
     // Pipeline config
@@ -227,6 +251,19 @@ pub const ModelManifest = struct {
     pad_token: []const u8 = "",
     add_bos_token: bool = false,
     add_eos_token: bool = false,
+
+    pub fn maxTextSequenceLength(self: *const ModelManifest) usize {
+        const position_id_mode: bert.PositionIdMode = if (self.bert_model_type == .roberta)
+            .roberta_padding
+        else
+            .absolute;
+        const config = bert.Config{
+            .max_position_embeddings = self.max_position_embeddings,
+            .pad_token_id = self.bert_pad_token_id,
+            .position_id_mode = position_id_mode,
+        };
+        return config.maxSequenceLength();
+    }
 
     pub fn deinit(self: *ModelManifest) void {
         if (self.onnx_path) |p| self.allocator.free(p);
@@ -696,6 +733,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
 
     if (inferModelTypeFromPath(model_dir_path)) |model_type| {
         manifest.model_type = model_type;
+        manifest.model_type_origin = .path;
     }
 
     // Try to parse config.json, then clip_config.json for CLIPCLAP-style repos.
@@ -825,6 +863,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
 
     if (inferModelTypeFromPath(model_dir_path)) |model_type| {
         manifest.model_type = model_type;
+        manifest.model_type_origin = .path;
     }
 
     if (try catalog.readOptional("config.json")) |config_bytes| {
@@ -928,21 +967,29 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
 
     if (hasRerankPathHint(model_dir_path) and (manifest.model_type == .embedder or manifest.model_type == .classifier)) {
         manifest.model_type = .reranker;
+        manifest.model_type_origin = .path;
         return;
     }
 
     if (inferModelTypeFromTasks(manifest.tasks)) |task_model_type| {
         manifest.model_type = task_model_type;
+        manifest.model_type_origin = .tasks;
         return;
     }
 
     if (manifest.gliner_model_type.len > 0) {
         manifest.model_type = .recognizer;
+        if (manifest.inference_bundle_family.len > 0) {
+            manifest.model_type_origin = .bundle;
+        } else if (manifest.model_type_origin != .config) {
+            manifest.model_type_origin = .heuristic;
+        }
         return;
     }
 
     if (manifest.native_arch_hint == .whisper) {
         manifest.model_type = .transcriber;
+        manifest.model_type_origin = .config;
         return;
     }
     if (manifest.model_type != .embedder) return;
@@ -950,10 +997,12 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         std.mem.eql(u8, manifest.config_model_arch, "vision-encoder-decoder"))
     {
         manifest.model_type = .reader;
+        manifest.model_type_origin = .config;
         return;
     }
     if (manifest.config_model_arch.len > 0 and gpt.isGenerativeModel(manifest.config_model_arch)) {
         manifest.model_type = .generator;
+        manifest.model_type_origin = .config;
     }
 }
 
@@ -1064,6 +1113,32 @@ fn applyGgufTokenizerMetadata(
 
     const view = gguf_metadata.View.init(&parsed);
 
+    // Architecture metadata belongs to the selected weight artifact. A
+    // colocated GGUF export may still provide a tokenizer fallback, but it
+    // must not overwrite the config for higher-precedence safetensors.
+    if (manifest.usesGgufWeights()) {
+        if (bert.parseGgufMetadata(view)) |config| {
+            manifest.hidden_size = config.hidden_size;
+            manifest.intermediate_size = config.intermediate_size;
+            manifest.max_position_embeddings = config.max_position_embeddings;
+            manifest.num_hidden_layers = config.num_hidden_layers;
+            manifest.num_attention_heads = config.num_attention_heads;
+            manifest.bert_vocab_size = config.vocab_size;
+            manifest.bert_type_vocab_size = config.type_vocab_size;
+            manifest.bert_layer_norm_eps = config.layer_norm_eps;
+            manifest.bert_model_type = config.model_type;
+            manifest.bert_pad_token_id = config.pad_token_id;
+        }
+        if (view.getU64("bert.pooling_type")) |pooling_type| {
+            manifest.pooling = switch (pooling_type) {
+                1 => .mean,
+                2 => .cls,
+                3 => .last,
+                else => manifest.pooling,
+            };
+        }
+    }
+
     const gguf_model_name = view.getString("tokenizer.ggml.model");
     if (gguf_model_name) |model_name| {
         if (artifactExists(catalog, allocator, model_dir_path, "tokenizer.model")) {
@@ -1130,7 +1205,9 @@ fn supportsGgufSentencePieceFallback(model_name: []const u8) bool {
 }
 
 fn supportsGgufHuggingFaceFallback(model_name: []const u8) bool {
-    return std.mem.eql(u8, model_name, "gpt2") or std.mem.eql(u8, model_name, "gemma4");
+    return std.mem.eql(u8, model_name, "gpt2") or
+        std.mem.eql(u8, model_name, "gemma4") or
+        std.mem.eql(u8, model_name, "t5");
 }
 
 fn hasGgufSentencePieceMetadata(parsed: *const gguf_format.File) bool {
@@ -1151,12 +1228,19 @@ fn hasGgufSentencePieceMetadata(parsed: *const gguf_format.File) bool {
 
 fn hasGgufHuggingFaceMetadata(parsed: *const gguf_format.File) bool {
     const tokens = findMetadataEntry(parsed, "tokenizer.ggml.tokens") orelse return false;
-    const merges = findMetadataEntry(parsed, "tokenizer.ggml.merges") orelse return false;
-
-    return tokens.value == .array and
-        merges.value == .array and
-        tokens.value.array.element_type == .string and
-        merges.value.array.element_type == .string;
+    if (tokens.value != .array or tokens.value.array.element_type != .string) return false;
+    if (findMetadataEntry(parsed, "tokenizer.ggml.merges")) |merges| {
+        if (merges.value == .array and merges.value.array.element_type == .string) return true;
+    }
+    const scores = findMetadataEntry(parsed, "tokenizer.ggml.scores") orelse return false;
+    const token_types = findMetadataEntry(parsed, "tokenizer.ggml.token_type") orelse return false;
+    return scores.value == .array and
+        token_types.value == .array and
+        (scores.value.array.element_type == .f32 or scores.value.array.element_type == .f64) and
+        (token_types.value.array.element_type == .i32 or
+            token_types.value.array.element_type == .i64 or
+            token_types.value.array.element_type == .u32 or
+            token_types.value.array.element_type == .u64);
 }
 
 fn applyGgufSpecialTokenString(
@@ -1487,11 +1571,27 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
     if (obj.get("max_position_embeddings")) |v| {
         if (jsonU32(v)) |val| manifest.max_position_embeddings = val;
     }
+    if (obj.get("pad_token_id")) |v| {
+        if (v == .integer) manifest.bert_pad_token_id = v.integer;
+    }
     if (obj.get("num_hidden_layers")) |v| {
         if (jsonU32(v)) |val| manifest.num_hidden_layers = val;
     }
     if (obj.get("num_attention_heads")) |v| {
         if (jsonU32(v)) |val| manifest.num_attention_heads = val;
+    }
+    if (obj.get("vocab_size")) |v| {
+        if (jsonU32(v)) |val| manifest.bert_vocab_size = val;
+    }
+    if (obj.get("type_vocab_size")) |v| {
+        if (jsonU32(v)) |val| manifest.bert_type_vocab_size = val;
+    }
+    if (obj.get("layer_norm_eps")) |v| {
+        manifest.bert_layer_norm_eps = switch (v) {
+            .float => |value| @floatCast(value),
+            .integer => |value| @floatFromInt(value),
+            else => manifest.bert_layer_norm_eps,
+        };
     }
 
     if (obj.get("num_labels")) |v| {
@@ -1545,6 +1645,7 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
                 if (item != .string) continue;
                 if (inferModelTypeFromArchitectureName(item.string)) |inferred| {
                     manifest.model_type = inferred;
+                    manifest.model_type_origin = .config;
                     break;
                 }
             }
@@ -1557,6 +1658,10 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
             const config_model_arch = try allocator.dupe(u8, s);
             if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
             manifest.config_model_arch = config_model_arch;
+            // Even when `model_type` describes an encoder family and leaves the
+            // enum at its embedder value, it is explicit role evidence rather
+            // than the neutral ModelManifest default.
+            manifest.model_type_origin = .config;
             if (std.mem.eql(u8, s, "roberta") or std.mem.eql(u8, s, "xlm-roberta")) {
                 manifest.bert_model_type = .roberta;
             } else if (std.mem.eql(u8, s, "distilbert")) {
@@ -1588,6 +1693,7 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
 
     if (jina_v5_embedding_config) {
         manifest.model_type = .embedder;
+        manifest.model_type_origin = .config;
         manifest.pooling = .last;
         manifest.normalize = true;
         if (manifest.embedding_text_prefix.len > 0) allocator.free(manifest.embedding_text_prefix);
@@ -1618,6 +1724,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
                 if (item != .string) continue;
                 if (inferModelTypeFromArchitectureName(item.string)) |inferred| {
                     manifest.model_type = inferred;
+                    manifest.model_type_origin = .config;
                     break;
                 }
             }
@@ -1630,6 +1737,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
             const config_model_arch = try allocator.dupe(u8, s);
             if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
             manifest.config_model_arch = config_model_arch;
+            manifest.model_type_origin = .config;
             if (std.mem.eql(u8, s, "whisper")) {
                 manifest.native_arch_hint = .whisper;
             } else if (std.mem.eql(u8, s, "florence2") or
@@ -1657,6 +1765,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
 
     if (isJinaV5TextEmbeddingConfig(&obj)) {
         manifest.model_type = .embedder;
+        manifest.model_type_origin = .config;
     }
 }
 
@@ -1735,6 +1844,7 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
             inline for (.{ "embedder", "reranker", "chunker", "generator", "recognizer", "rewriter", "classifier", "reader", "transcriber" }) |name| {
                 if (std.mem.eql(u8, s, name)) {
                     manifest.model_type = @field(ModelType, name);
+                    manifest.model_type_origin = .manifest;
                 }
             }
         }
@@ -1800,6 +1910,7 @@ fn parseGlinerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, jso
             const gliner_model_type = try allocator.dupe(u8, v.string);
             if (manifest.gliner_model_type.len > 0) allocator.free(manifest.gliner_model_type);
             manifest.gliner_model_type = gliner_model_type;
+            manifest.model_type_origin = .config;
         }
     }
     if (obj.get("default_labels")) |v| {
@@ -1891,6 +2002,7 @@ fn parseInferenceBundleJsonInternal(
             replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
             if (owned_wrapper) |value| replaceOwnedString(allocator, &manifest.gliner_model_type, value);
             manifest.model_type = .recognizer;
+            manifest.model_type_origin = .bundle;
             return;
         }
         const encoder_path = try resolveBundlePath(allocator, catalog, model_dir_path, encoder.?.string);
@@ -1916,6 +2028,7 @@ fn parseInferenceBundleJsonInternal(
             setOptionalPath(allocator, &manifest.gliner_head_safetensors_path, head_path);
         }
         manifest.model_type = .recognizer;
+        manifest.model_type_origin = .bundle;
         return;
     }
     if (std.mem.eql(u8, bundle_family, "clipclap_gguf_bundle/v1")) {
@@ -1936,6 +2049,7 @@ fn parseInferenceBundleJsonInternal(
         setOptionalPath(allocator, &manifest.gguf_path, clip_path);
         setOptionalPath(allocator, &manifest.audio_model_path, clap_path);
         manifest.native_arch_hint = .clip;
+        manifest.model_type_origin = .bundle;
         replaceOwnedString(allocator, &manifest.config_model_arch, config_model_arch);
         return;
     }
@@ -2058,6 +2172,7 @@ fn parseInferenceVariantsJsonInternal(
     setOptionalPath(allocator, &manifest.audio_model_path, pair.clap_path);
     pair.clap_path = "";
     manifest.native_arch_hint = .clip;
+    manifest.model_type_origin = .bundle;
     if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
     manifest.config_model_arch = arch;
     try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
@@ -2116,6 +2231,7 @@ fn parseGliner2InferenceVariantsJson(
     setOptionalPath(allocator, &manifest.gliner_head_gguf_path, pair.head_path);
     pair.head_path = "";
     manifest.model_type = .recognizer;
+    manifest.model_type_origin = .bundle;
     try setManifestInputs(allocator, manifest, &.{"text"});
 }
 
@@ -2176,6 +2292,7 @@ fn applyFlorence2GgufBundle(
     path = "";
     manifest.native_arch_hint = .florence;
     manifest.model_type = .reader;
+    manifest.model_type_origin = .bundle;
     if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
     manifest.config_model_arch = arch;
     arch = "";
@@ -2464,9 +2581,11 @@ test "rerank model name overrides sequence classifier config" {
     var manifest = ModelManifest{
         .allocator = std.testing.allocator,
         .model_type = .classifier,
+        .model_type_origin = .config,
     };
     try applyImplicitModelTypeHints(&manifest, "/tmp/models/mixedbread-ai/mxbai-rerank-base-v1");
     try std.testing.expectEqual(ModelType.reranker, manifest.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.path, manifest.model_type_origin);
 }
 
 test "Whisper conditional generation config remains a transcriber" {
@@ -2499,6 +2618,7 @@ test "parseModelManifestJson parses inputs array" {
     try std.testing.expect(manifest.hasInput("text"));
     try std.testing.expect(manifest.hasInput("image"));
     try std.testing.expectEqual(Sparse3DOutputLayout.seq_batch, manifest.sparse_3d_output_layout.?);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
 }
 
 fn parseTokenizerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
@@ -2598,15 +2718,34 @@ test "manifest from config.json" {
     defer manifest.deinit();
 
     const config_json =
-        \\{"model_type": "bert", "hidden_size": 384, "max_position_embeddings": 256, "num_hidden_layers": 6}
+        \\{"model_type": "bert", "hidden_size": 384, "max_position_embeddings": 256, "num_hidden_layers": 6, "vocab_size": 250002, "type_vocab_size": 1, "layer_norm_eps": 0.00001}
     ;
     try parseConfigJson(&manifest, allocator, config_json);
 
     try std.testing.expectEqual(@as(u32, 384), manifest.hidden_size);
     try std.testing.expectEqual(@as(u32, 256), manifest.max_position_embeddings);
     try std.testing.expectEqual(@as(u32, 6), manifest.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 250002), manifest.bert_vocab_size);
+    try std.testing.expectEqual(@as(u32, 1), manifest.bert_type_vocab_size);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.00001), manifest.bert_layer_norm_eps, 0.0000001);
     try std.testing.expectEqual(bert.ModelType.bert, manifest.bert_model_type);
     try std.testing.expectEqualStrings("bert", manifest.config_model_arch);
+    try std.testing.expectEqual(ModelTypeOrigin.config, manifest.model_type_origin);
+}
+
+test "RoBERTa manifest reserves padding position indices" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    const config_json =
+        \\{"model_type": "roberta", "max_position_embeddings": 514, "pad_token_id": 1}
+    ;
+    try parseConfigJson(&manifest, allocator, config_json);
+
+    try std.testing.expectEqual(bert.ModelType.roberta, manifest.bert_model_type);
+    try std.testing.expectEqual(@as(i64, 1), manifest.bert_pad_token_id);
+    try std.testing.expectEqual(@as(usize, 512), manifest.maxTextSequenceLength());
 }
 
 test "manifest treats jina embeddings v5 as qwen3 embedder with last pooling" {
@@ -2842,6 +2981,7 @@ test "manifest parses clipclap gguf bundle marker" {
     );
 
     try std.testing.expect(manifest.isClipclapGgufBundle());
+    try std.testing.expectEqual(ModelTypeOrigin.bundle, manifest.model_type_origin);
     try std.testing.expectEqual(NativeArchHint.clip, manifest.native_arch_hint);
     try std.testing.expectEqualStrings("clipclap", manifest.config_model_arch);
     try std.testing.expect(manifest.gguf_path != null);
@@ -4067,6 +4207,34 @@ test "gemma4 tokenizer config replaces unsupported upstream chat template" {
     try std.testing.expect(std.mem.indexOf(u8, manifest.chat_template.?, "format_parameters") == null);
 }
 
+test "built-in gemma4 chat template renders explicit thinking modes" {
+    var template = try jinja.Template.init(std.testing.allocator, gemma4_chat_template);
+    defer template.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const messages = [_]jinja.ChatMessage{.{ .role = "user", .content = "hello" }};
+
+    var default_context = try jinja.chatTemplateContext(arena, &messages, .{ .bos_token = "<bos>" });
+    const default_prompt = try template.render(arena, &default_context);
+    try std.testing.expect(std.mem.endsWith(u8, default_prompt, "<|channel>thought\n<channel|>"));
+
+    var enabled_context = try jinja.chatTemplateContext(arena, &messages, .{
+        .bos_token = "<bos>",
+        .enable_thinking = true,
+    });
+    const enabled_prompt = try template.render(arena, &enabled_context);
+    try std.testing.expect(std.mem.endsWith(u8, enabled_prompt, "<|channel>thought\n<channel|>"));
+
+    var disabled_context = try jinja.chatTemplateContext(arena, &messages, .{
+        .bos_token = "<bos>",
+        .enable_thinking = false,
+    });
+    const disabled_prompt = try template.render(arena, &disabled_context);
+    try std.testing.expect(std.mem.endsWith(u8, disabled_prompt, "<|channel>final\n<channel|>"));
+}
+
 test "manifest infers huggingface tokenizer from gguf gpt2 metadata" {
     const allocator = std.testing.allocator;
 
@@ -4109,6 +4277,64 @@ test "manifest prefers huggingface tokenizer from gemma4 gguf bpe metadata" {
     try std.testing.expectEqual(TokenizerType.huggingface, manifest.tokenizer_type.?);
     try std.testing.expectEqualStrings("<bos>", manifest.bos_token);
     try std.testing.expectEqualStrings("<eos>", manifest.eos_token);
+}
+
+test "manifest applies BERT and T5 tokenizer metadata from GGUF" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithBertT5Tokenizer(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bge-m3-q4_k_m.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(TokenizerType.huggingface, manifest.tokenizer_type.?);
+    try std.testing.expectEqual(PoolingStrategy.cls, manifest.pooling);
+    try std.testing.expectEqual(@as(u32, 1024), manifest.hidden_size);
+    try std.testing.expectEqual(@as(u32, 4096), manifest.intermediate_size);
+    try std.testing.expectEqual(@as(u32, 8192), manifest.max_position_embeddings);
+    try std.testing.expectEqual(@as(u32, 24), manifest.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 16), manifest.num_attention_heads);
+    try std.testing.expectEqual(bert.ModelType.roberta, manifest.bert_model_type);
+}
+
+test "colocated GGUF does not overwrite selected safetensors BERT config" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{"model_type":"xlm-roberta","hidden_size":777,"intermediate_size":1554,"max_position_embeddings":8194,"num_hidden_layers":7,"num_attention_heads":7,"vocab_size":250002,"type_vocab_size":1,"pad_token_id":1}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = config_json });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = "" });
+    const gguf_bytes = try buildTestGgufWithBertT5Tokenizer(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "quantized.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(NativeWeightArtifactKind.safetensors, manifest.nativeWeightArtifactKind().?);
+    try std.testing.expectEqual(@as(u32, 777), manifest.hidden_size);
+    try std.testing.expectEqual(@as(u32, 1554), manifest.intermediate_size);
+    try std.testing.expectEqual(@as(u32, 8194), manifest.max_position_embeddings);
+    try std.testing.expectEqual(@as(u32, 7), manifest.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 7), manifest.num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 250002), manifest.bert_vocab_size);
+    try std.testing.expectEqual(@as(u32, 1), manifest.bert_type_vocab_size);
+    try std.testing.expectEqual(bert.ModelType.roberta, manifest.bert_model_type);
+    try std.testing.expectEqual(PoolingStrategy.mean, manifest.pooling);
 }
 
 fn buildTestGgufWithGpt2Tokenizer(allocator: std.mem.Allocator) ![]u8 {
@@ -4168,6 +4394,35 @@ fn buildTestGgufWithGemma4Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     return data.toOwnedSlice(allocator);
 }
 
+fn buildTestGgufWithBertT5Tokenizer(allocator: std.mem.Allocator) ![]u8 {
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, gguf_format.magic);
+    try appendTestLe(u32, allocator, &data, 3);
+    try appendTestLe(u64, allocator, &data, 0);
+    try appendTestLe(u64, allocator, &data, 16);
+
+    try appendTestMetadataString(allocator, &data, "general.architecture", "bert");
+    try appendTestMetadataU32(allocator, &data, "bert.block_count", 24);
+    try appendTestMetadataU32(allocator, &data, "bert.context_length", 8192);
+    try appendTestMetadataU32(allocator, &data, "bert.embedding_length", 1024);
+    try appendTestMetadataU32(allocator, &data, "bert.feed_forward_length", 4096);
+    try appendTestMetadataU32(allocator, &data, "bert.attention.head_count", 16);
+    try appendTestMetadataF32(allocator, &data, "bert.attention.layer_norm_epsilon", 1e-5);
+    try appendTestMetadataU32(allocator, &data, "bert.pooling_type", 2);
+    try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "t5");
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.tokens", &.{ "<s>", "<pad>", "</s>", "<unk>", "\u{2581}hello" });
+    try appendTestMetadataF32Array(allocator, &data, "tokenizer.ggml.scores", &.{ 0, 0, 0, 0, -1 });
+    try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 3, 3, 2, 1 });
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 0);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 2);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.padding_token_id", 1);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.unknown_token_id", 3);
+
+    return data.toOwnedSlice(allocator);
+}
+
 fn appendTestLe(comptime T: type, allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), value: T) !void {
     const bytes = std.mem.asBytes(&std.mem.nativeToLittle(T, value));
     try data.appendSlice(allocator, bytes);
@@ -4194,6 +4449,12 @@ fn appendTestMetadataBool(allocator: std.mem.Allocator, data: *std.ArrayListUnma
     try appendTestString(allocator, data, key);
     try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.bool_));
     try appendTestLe(u8, allocator, data, @intFromBool(value));
+}
+
+fn appendTestMetadataF32(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: f32) !void {
+    try appendTestString(allocator, data, key);
+    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
+    try appendTestLe(u32, allocator, data, @bitCast(value));
 }
 
 fn appendTestMetadataStringArray(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const []const u8) !void {

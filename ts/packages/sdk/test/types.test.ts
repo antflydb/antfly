@@ -6,8 +6,10 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, expectTypeOf, it } from "vitest";
+import { match as matchQuery } from "../src/query-helpers.js";
 import type {
   AntflyQuery,
+  BatchRequest,
   BooleanQuery,
   BoolFieldQuery,
   ConjunctionQuery,
@@ -26,7 +28,6 @@ import {
   queryResultHitsTotal,
   queryResultTotalHits,
 } from "../src/types.js";
-import { match as matchQuery } from "../src/query-helpers.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -40,6 +41,21 @@ function generatedSortProfileDeclaration(): string {
 }
 
 describe("Antfly Query Type Integration", () => {
+  describe("Batch transform types", () => {
+    it("accepts the numeric $min transform operator", () => {
+      const request: BatchRequest = {
+        transforms: [
+          {
+            key: "doc-1",
+            operations: [{ op: "$min", path: "priority", value: 4 }],
+          },
+        ],
+      };
+
+      expect(request.transforms?.[0]?.operations[0]?.op).toBe("$min");
+    });
+  });
+
   describe("QueryRequest type safety", () => {
     it("should accept valid MatchQuery in full_text_search", () => {
       const query: QueryRequest = {

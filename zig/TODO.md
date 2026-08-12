@@ -79,7 +79,7 @@ Passing / skipped Antfly E2E areas in the latest full run:
 
 - PR/push Zig CI runs focused serverless tests, ReleaseFast CLI build, and CLI
   smoke.
-- Full `zig build test` is nightly/manual.
+- Full `make test` is nightly/manual.
 - Antfly Python E2E is not currently part of the GitHub workflows found in
   `.github/workflows`.
 - Antfly inference standalone and Python E2E coverage is not part of normal PR CI.

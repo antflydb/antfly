@@ -31,6 +31,7 @@ const http_common = @import("http/http_common.zig");
 const std_http_listener = @import("http/std_http_listener.zig");
 const platform_time = @import("antfly_platform").time;
 const prometheus = @import("prometheus.zig");
+const thread_config = @import("../runtime_thread_config.zig");
 
 const StdHttpListener = std_http_listener.StdHttpListener;
 const StdHttpListenerConfig = std_http_listener.StdHttpListenerConfig;
@@ -38,7 +39,7 @@ const HttpRequest = http_common.HttpRequest;
 const HttpResponse = http_common.HttpResponse;
 const RequestExecutor = http_common.RequestExecutor;
 const metrics_cache_ttl_ms: u64 = 5 * std.time.ms_per_s;
-const health_thread_stack_size: usize = 1 * 1024 * 1024;
+const health_thread_stack_size = thread_config.minimum_partitioned_stack_size;
 
 pub const ReadinessChecker = struct {
     ptr: *anyopaque,
@@ -141,7 +142,8 @@ pub const HealthServer = struct {
         return try self.listener.baseUri(alloc);
     }
 
-    /// Conditional init + start. Returns null when `port` is unset so callers
+    /// Conditional init + start. Returns null when `port` is unset and
+    /// propagates startup errors when a port was explicitly configured, so callers
     /// can write `const hs = try HealthServer.startIfConfigured(...); defer
     /// if (hs) |h| h.deinit();` without scattering if-blocks through each
     /// runtime. Prints the bound URI prefixed with `label` on success.
@@ -169,11 +171,7 @@ pub const HealthServer = struct {
             .bind_port = p,
         }, ready, metrics);
         errdefer hs.deinit();
-        hs.start() catch |err| {
-            hs.deinit();
-            std.log.warn("{s} health api disabled port={d} err={}", .{ label, p, err });
-            return null;
-        };
+        try hs.start();
         const uri = try hs.baseUri(alloc);
         defer alloc.free(uri);
         std.debug.print("{s} health api listening on {s}\n", .{ label, uri });
@@ -478,6 +476,13 @@ test "health server startIfConfiguredOnHost uses provided bind host" {
     defer hs.deinit();
 
     try testing.expectEqualStrings("127.0.0.1", hs.listener.cfg.bind_host);
+}
+
+test "health server startIfConfiguredOnHost propagates configured bind failures" {
+    try testing.expectError(
+        error.ParseFailed,
+        HealthServer.startIfConfiguredOnHost(testing.allocator, "test", "not-an-ip", 4200, null, null),
+    );
 }
 
 test "health server unknown path returns 404" {

@@ -29,7 +29,7 @@
 
 const std = @import("std");
 const db_mod = @import("../storage/db/mod.zig");
-const table_writes = @import("table_writes.zig");
+const table_writes = @import("table_write_source.zig");
 const distributed_txn = @import("distributed_txn.zig");
 
 const EntitySink = db_mod.EntitySink;

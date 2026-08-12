@@ -7,6 +7,7 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
+from ...models.table_status import TableStatus
 from ...types import Response
 
 
@@ -24,7 +25,12 @@ def _get_kwargs(
     return _kwargs
 
 
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Error | None:
+def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Error | TableStatus | None:
+    if response.status_code == 200:
+        response_200 = TableStatus.from_dict(response.json())
+
+        return response_200
+
     if response.status_code == 404:
         response_404 = Error.from_dict(response.json())
 
@@ -36,7 +42,7 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Error]:
+def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Error | TableStatus]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -49,7 +55,7 @@ def sync_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-) -> Response[Error]:
+) -> Response[Error | TableStatus]:
     """Get table details
 
     Args:
@@ -60,7 +66,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error]
+        Response[Error | TableStatus]
     """
 
     kwargs = _get_kwargs(
@@ -78,7 +84,7 @@ def sync(
     table_name: str,
     *,
     client: AuthenticatedClient,
-) -> Error | None:
+) -> Error | TableStatus | None:
     """Get table details
 
     Args:
@@ -89,7 +95,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error
+        Error | TableStatus
     """
 
     return sync_detailed(
@@ -102,7 +108,7 @@ async def asyncio_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-) -> Response[Error]:
+) -> Response[Error | TableStatus]:
     """Get table details
 
     Args:
@@ -113,7 +119,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error]
+        Response[Error | TableStatus]
     """
 
     kwargs = _get_kwargs(
@@ -129,7 +135,7 @@ async def asyncio(
     table_name: str,
     *,
     client: AuthenticatedClient,
-) -> Error | None:
+) -> Error | TableStatus | None:
     """Get table details
 
     Args:
@@ -140,7 +146,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error
+        Error | TableStatus
     """
 
     return (

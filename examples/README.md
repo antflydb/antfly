@@ -77,7 +77,7 @@ export a portable `.afb` backup for restore or promotion.
 **Quick start:**
 ```bash
 cd zig
-zig build lite-capi
+zig build capi
 cd ../examples/antfly-lite-go
 GOWORK=off go run . --reset
 ```
@@ -104,7 +104,7 @@ hybrid search.
 **Quick start:**
 ```bash
 cd zig
-zig build lite-capi
+zig build capi
 cd ../examples/antfly-lite-retrieval-go
 GOWORK=off go run . --reset
 ```

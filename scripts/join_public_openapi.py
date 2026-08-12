@@ -23,6 +23,8 @@ from pathlib import Path
 import yaml
 from openapi_spec_validator import validate_spec
 
+from public_openapi_overlays import add_unified_auth_responses
+
 
 ROOT = Path(__file__).resolve().parent.parent
 JOIN_OPENAPI = ROOT / "scripts/join_openapi.py"
@@ -256,7 +258,13 @@ def join_specs() -> dict:
     for path, item in antfly.get("paths", {}).items():
         paths[antfly_public_path(path)] = copy.deepcopy(item)
     for path, item in inference.get("paths", {}).items():
-        paths[inference_public_path(path)] = walk_refs(item, inference_schema_name)
+        # walk_refs namespaces the schemas into the joined document; the
+        # overlay then documents the unified server's auth middleware, which
+        # the standalone inference contract intentionally omits.
+        paths[inference_public_path(path)] = add_unified_auth_responses(
+            walk_refs(item, inference_schema_name),
+            error_schema_ref="#/components/schemas/InferenceError",
+        )
     for path, item in extensions.get("paths", {}).items():
         paths[extension_public_path(path)] = copy.deepcopy(item)
 

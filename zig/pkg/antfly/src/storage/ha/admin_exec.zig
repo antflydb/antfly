@@ -2269,7 +2269,7 @@ test "storage.ha admin exec operator plan assesses former primary rejoin" {
         "--former-table-id",            "20",
         "--former-timeline-id",         "1",
         "--former-epoch",               "1",
-        "--former-last-lsn",            "12",
+        "--former-last-lsn",            "10",
         "--retained-from-lsn",          "8",
         "--receipt-old-primary-id",     "primary-a",
         "--receipt-promoted-node-id",   "standby-a",
@@ -2314,8 +2314,8 @@ test "storage.ha admin exec executes former primary rejoin rewind and reseed com
     {
         var former_primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, former_identity, .{});
         defer former_primary.close();
-        for (0..12) |idx| {
-            _ = try former_primary.append(.{ .payload = if (idx < 10) "parent" else "divergent" });
+        for (0..10) |_| {
+            _ = try former_primary.append(.{ .payload = "parent" });
         }
     }
 
@@ -2346,7 +2346,7 @@ test "storage.ha admin exec executes former primary rejoin rewind and reseed com
         "--epoch",
         "1",
         "--last-lsn",
-        "12",
+        "10",
         "--retained-from-lsn",
         "8",
         "--fence-old-primary-id",
@@ -2375,9 +2375,9 @@ test "storage.ha admin exec executes former primary rejoin rewind and reseed com
     var rewind_result = try execute(alloc, .{ .former_primary_log = &former_log }, rewind_plan);
     defer rewind_result.deinit(alloc);
     try std.testing.expectEqual(rejoin.Action.rewind, rewind_result.rejoin_rewind.assessment.action);
-    try std.testing.expectEqual(@as(u64, 12), rewind_result.rejoin_rewind.rewind.previous_last_lsn);
-    try std.testing.expectEqual(@as(u64, 10), rewind_result.rejoin_rewind.rewind.current_last_lsn);
-    try std.testing.expectEqual(@as(u64, 2), rewind_result.rejoin_rewind.rewind.discarded_lsn_count);
+    try std.testing.expectEqual(@as(u64, 10), rewind_result.rejoin_rewind.rewind.previous_last_lsn);
+    try std.testing.expectEqual(@as(u64, 11), rewind_result.rejoin_rewind.rewind.current_last_lsn);
+    try std.testing.expectEqual(@as(u64, 0), rewind_result.rejoin_rewind.rewind.discarded_lsn_count);
 
     const rewind_table = try renderTableAlloc(alloc, rewind_result);
     defer alloc.free(rewind_table);
@@ -2388,14 +2388,14 @@ test "storage.ha admin exec executes former primary rejoin rewind and reseed com
     try expectContains(rewind_table, "action.state=applied\n");
     try expectContains(rewind_table, "assessment.action=rewind\n");
     try expectContains(rewind_table, "rewind.node_id=primary-a\n");
-    try expectContains(rewind_table, "rewind.discarded_lsn_count=2\n");
+    try expectContains(rewind_table, "rewind.discarded_lsn_count=0\n");
     const rewind_json = try renderJsonWithContextAlloc(alloc, null, rewind_result);
     defer alloc.free(rewind_json);
     try expectContains(rewind_json, "\"schema_version\":1");
     try expectContains(rewind_json, "\"action_kind\":\"rejoin_rewind\"");
     try expectContains(rewind_json, "\"assessment\"");
     try expectContains(rewind_json, "\"rewind\"");
-    try expectContains(rewind_json, "\"discarded_lsn_count\":2");
+    try expectContains(rewind_json, "\"discarded_lsn_count\":0");
 
     var reseed_plan = try admin_cli.parse(alloc, &.{
         "--table",

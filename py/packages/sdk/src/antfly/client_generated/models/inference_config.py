@@ -41,7 +41,9 @@ class InferenceConfig:
 
             Defaults to ~/.antfly/inference/ml.
              Example: ~/.antfly/inference/ml.
-        content_security (InferenceContentSecurityConfig | Unset):
+        content_security (InferenceContentSecurityConfig | Unset): Inference merges configured fields over a fail-closed
+            baseline. HTTP(S), file, and S3 content require explicit allowlists; data URIs remain allowed within the
+            configured size budget.
         s3_credentials (InferenceCredentials | Unset):
         keep_alive (str | Unset): How long to keep models loaded in memory after last use (Ollama-compatible).
             Models are automatically unloaded after this duration of inactivity.
@@ -54,34 +56,29 @@ class InferenceConfig:
             idle model from any registry is evicted to make room. Set to 0 for unlimited.
             Defaults to 10.
              Default: 10. Example: 3.
-        pool_size (int | Unset): Number of concurrent inference pipelines per model. Each pipeline loads
-            a copy of the model, so higher values use more memory but allow more
-            concurrent requests. Note: pool_size multiplies per-model memory
-            independently of max_loaded_models.
-             Default: 1. Example: 1.
+        pool_size (int | Unset): Legacy compatibility field. The current Zig inference runtime does not
+            create per-model pipeline pools from this setting; configuring it has no effect.
         prompt_cache (InferencePromptCacheConfig | Unset): Native generator prompt KV cache configuration.
-        backend_priority (list[str] | Unset): Backend priority order for model loading with optional device specifiers.
-            Format: `backend` or `backend:device` where device defaults to `auto`.
-
-            Antfly inference tries entries in order and uses the first available backend+device
-            combination that supports the model.
-
-            **Examples**:
-            - `["native", "onnx", "xla"]` - Try backends with auto device detection
-            - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
-             Example: ['cuda', 'onnx:cuda', 'xla:tpu', 'native'].
-        max_concurrent_requests (int | Unset): Maximum number of concurrent inference requests allowed.
-            Additional requests will be queued up to max_queue_size.
-            Set to 0 for unlimited (default).
-             Default: 0. Example: 4.
-        max_queue_size (int | Unset): Maximum number of requests to queue when max_concurrent_requests is reached.
-            When the queue is full, new requests receive 503 Service Unavailable with Retry-After header.
-            Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
-             Default: 0. Example: 100.
-        request_timeout (str | Unset): Maximum time to wait for a request to complete, including queue wait time.
-            Use Go duration format: "30s", "1m", "0" (no timeout, default).
-            Requests exceeding this timeout receive 504 Gateway Timeout.
-             Default: '0'. Example: 30s.
+        backend_priority (list[str] | Unset): Legacy compatibility field. The current Zig inference runtime selects a
+            backend from model metadata, explicit preload settings, and compiled capabilities;
+            configuring this list has no effect.
+        max_concurrent_requests (int | Unset): Maximum concurrent weighted inference admission units in the Zig runtime.
+            Request body size, generation workload, and image byte/count reservations
+            can consume more than one unit. Read and image-extraction admission reserves the
+            effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per
+            two images. A positive capacity also clamps each such request's downloaded-image
+            ceiling to 16 MiB times this value. Set to 0 disables both admission accounting
+            and that capacity-derived clamp.
+            When a positive limit is exhausted, new requests are rejected immediately
+            with 503 Service Unavailable and Retry-After: 1; they are not retained in
+            an in-process queue. Set to 0 only as an operational escape hatch for
+            trusted testing environments; unlimited admission is not recommended for
+            production native generation. Use a positive production limit. The default is 32.
+             Default: 32. Example: 32.
+        max_queue_size (int | Unset): Legacy Go-runtime queue setting. The current Zig runtime does not retain
+            excess inference requests in memory and ignores this field.
+        request_timeout (str | Unset): Legacy Go-runtime queue/request timeout. The current Zig runtime ignores
+            this field; its HTTP listener applies a separate fixed transport timeout.
         preload (list[InferenceModelRef] | Unset): Models to preload and warm at startup. Generators run a tiny
             generation
             request so native/Metal weights, KV setup, and kernels use the same
@@ -89,12 +86,8 @@ class InferenceConfig:
             best available warm path for that kind.
              Example: [{'kind': 'generator', 'name': 'antflydb/gemma-e2b', 'backend': 'metal', 'format': 'gguf',
             'quantization': 'q4_k'}].
-        max_memory_mb (int | Unset): Maximum memory (in MB) to use for loaded models.
-            When this limit is approached, least recently used models are unloaded.
-            Set to 0 for unlimited (default). This is an advisory limit - actual memory
-            usage depends on model sizes and may temporarily exceed this value.
-            Works alongside max_loaded_models for fine-grained control.
-             Default: 0. Example: 4096.
+        max_memory_mb (int | Unset): Legacy compatibility field. The current Zig runtime uses explicit host,
+            backend, combined, KV, and scratch budgets instead and ignores this field.
         model_strategies (InferenceConfigModelStrategies | Unset): Per-model loading strategy overrides. Maps model
             names to their loading strategy.
             Models not in this map load on demand. keep_alive controls their idle
@@ -106,11 +99,14 @@ class InferenceConfig:
 
             This allows mixing eager and lazy models in the same pool.
              Example: {'BAAI/bge-small-en-v1.5': 'eager', 'mirth/chonky-mmbert-small-multilingual-1': 'lazy'}.
-        allow_downloads (bool | Unset): Whether the dashboard should show model download commands.
-            Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed
-            deployments (e.g., Kubernetes operator) where models are managed externally.
+        allow_downloads (bool | Unset): Legacy compatibility field controlling whether dashboards show model
+            download commands. It defaults to true for standalone deployments;
+            managed deployments historically set it to false. Download-command
+            availability is a build-time setting in the current Zig runtime, so
+            configuring this field has no effect.
              Default: True.
-        log (InferenceschemasConfig | Unset): Logging configuration for inference services
+        log (InferenceschemasConfig | Unset): Legacy inference-local logging configuration. The current unified Zig
+            runtime ignores it; configure the top-level `log` object instead.
     """
 
     api_url: str
@@ -121,14 +117,14 @@ class InferenceConfig:
     s3_credentials: InferenceCredentials | Unset = UNSET
     keep_alive: str | Unset = "5m"
     max_loaded_models: int | Unset = 10
-    pool_size: int | Unset = 1
+    pool_size: int | Unset = UNSET
     prompt_cache: InferencePromptCacheConfig | Unset = UNSET
     backend_priority: list[str] | Unset = UNSET
-    max_concurrent_requests: int | Unset = 0
-    max_queue_size: int | Unset = 0
-    request_timeout: str | Unset = "0"
+    max_concurrent_requests: int | Unset = 32
+    max_queue_size: int | Unset = UNSET
+    request_timeout: str | Unset = UNSET
     preload: list[InferenceModelRef] | Unset = UNSET
-    max_memory_mb: int | Unset = 0
+    max_memory_mb: int | Unset = UNSET
     model_strategies: InferenceConfigModelStrategies | Unset = UNSET
     allow_downloads: bool | Unset = True
     log: InferenceschemasConfig | Unset = UNSET

@@ -110,11 +110,14 @@ pub const KvManager = struct {
         const shared_blocks = @min(shareable_blocks, requested_blocks);
 
         const sequence_id = try self.attachSequence(pool_id);
+        errdefer self.releaseSequence(sequence_id) catch {};
         const sequence_state = try self.sequenceMut(sequence_id);
+        try sequence_state.block_table.blocks.ensureTotalCapacity(self.allocator, shared_blocks);
+        const refreshed_source_state = try self.sequenceState(source_sequence_id);
 
-        for (source_state.block_table.blocks.items[0..shared_blocks]) |block_id| {
+        for (refreshed_source_state.block_table.blocks.items[0..shared_blocks]) |block_id| {
             try storage.retain(block_id);
-            try sequence_state.block_table.appendExisting(self.allocator, block_id);
+            sequence_state.block_table.blocks.appendAssumeCapacity(block_id);
         }
         sequence_state.block_table.markSharedPrefix(@intCast(shared_blocks));
         if (shared_blocks > 0) sequence_state.block_table.tail_tokens = page_size;
@@ -125,16 +128,17 @@ pub const KvManager = struct {
         const storage = self.getPoolMut(pool_id) orelse return error.InvalidPoolId;
         const page_size = storage.config.page_size_tokens;
         if (page_size == 0) return error.InvalidPoolId;
-        if (token_count > block_ids.len * page_size) return error.InvalidKvShape;
-        if (token_count % page_size != 0) return error.InvalidKvShape;
+        const retained_token_count = std.math.mul(usize, block_ids.len, @as(usize, page_size)) catch return error.InvalidKvShape;
+        if (token_count != retained_token_count) return error.InvalidKvShape;
 
         const sequence_id = try self.attachSequence(pool_id);
         errdefer self.releaseSequence(sequence_id) catch {};
         const sequence_state = try self.sequenceMut(sequence_id);
+        try sequence_state.block_table.blocks.ensureTotalCapacity(self.allocator, block_ids.len);
 
         for (block_ids) |block_id| {
             try storage.retain(block_id);
-            try sequence_state.block_table.appendExisting(self.allocator, block_id);
+            sequence_state.block_table.blocks.appendAssumeCapacity(block_id);
         }
         sequence_state.block_table.markSharedPrefix(@intCast(block_ids.len));
         if (block_ids.len > 0) sequence_state.block_table.tail_tokens = page_size;
@@ -155,9 +159,10 @@ pub const KvManager = struct {
             for (out.items) |block_id| _ = storage.releaseRef(self.allocator, block_id) catch {};
             out.clearRetainingCapacity();
         }
+        try out.ensureTotalCapacity(self.allocator, block_count);
         for (sequence_state.block_table.blocks.items[0..block_count]) |block_id| {
             try storage.retain(block_id);
-            try out.append(self.allocator, block_id);
+            out.appendAssumeCapacity(block_id);
         }
     }
 
@@ -768,6 +773,11 @@ test "manager can attach sequence with retained blocks" {
     try manager.retainSequencePrefixBlocks(source_id, 4, &blocks);
     defer manager.releaseRetainedBlocks(pool_id, blocks.items);
 
+    try std.testing.expectError(
+        error.InvalidKvShape,
+        manager.attachSequenceWithRetainedBlocks(pool_id, blocks.items, 2),
+    );
+
     const derived_id = try manager.attachSequenceWithRetainedBlocks(pool_id, blocks.items, 4);
     const pool = manager.getPool(pool_id).?;
     try std.testing.expectEqual(@as(u32, 3), pool.blockInfo(0).?.refcount);
@@ -776,6 +786,75 @@ test "manager can attach sequence with retained blocks" {
     try manager.releaseSequence(derived_id);
     try std.testing.expectEqual(@as(u32, 2), pool.blockInfo(0).?.refcount);
     try std.testing.expectEqual(@as(u32, 2), pool.blockInfo(1).?.refcount);
+}
+
+test "manager retain paths do not leak block refs on allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var manager = KvManager.init(allocator);
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+        failing.resize_fail_index = std.math.maxInt(usize);
+        manager.deinit();
+    }
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+    });
+    const source_id = try manager.attachSequence(pool_id);
+    try manager.appendTokens(source_id, 4);
+
+    // Recycle an empty sequence so the failure below is specifically the
+    // destination block-table allocation, after attachSequence succeeds.
+    const empty_id = try manager.attachSequence(pool_id);
+    try manager.releaseSequence(empty_id);
+
+    const pool = manager.getPool(pool_id).?;
+    try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(0).?.refcount);
+    try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(1).?.refcount);
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        manager.attachSequenceWithSharedPrefix(pool_id, source_id, 4),
+    );
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(?usize, null), manager.tokenCount(empty_id));
+    try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(0).?.refcount);
+    try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(1).?.refcount);
+
+    const source_blocks = manager.blockTable(source_id).?.blocks.items;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        manager.attachSequenceWithRetainedBlocks(pool_id, source_blocks, 4),
+    );
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(?usize, null), manager.tokenCount(empty_id));
+    try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(0).?.refcount);
+    try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(1).?.refcount);
+
+    var retained: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
+    defer retained.deinit(allocator);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        manager.retainSequencePrefixBlocks(source_id, 4, &retained),
+    );
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(usize, 0), retained.items.len);
+    try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(0).?.refcount);
+    try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(1).?.refcount);
 }
 
 test "manager reuses released sequence slots" {

@@ -20,19 +20,19 @@ type CORSConfig struct {
 	// AllowCredentials Indicates whether credentials (cookies, auth headers) are allowed. Note: If true, allowed_origins cannot be ['*'].
 	AllowCredentials bool `json:"allow_credentials,omitempty,omitzero"`
 
-	// AllowedHeaders Headers that can be used in CORS requests
+	// AllowedHeaders Headers that can be used in CORS requests. ['*'] allows any valid requested header; when credentials are enabled, the server reflects the validated requested header names because browsers treat '*' as a literal name in credentialed CORS.
 	AllowedHeaders []string `json:"allowed_headers,omitempty,omitzero"`
 
 	// AllowedMethods HTTP methods allowed for CORS requests
 	AllowedMethods []string `json:"allowed_methods,omitempty,omitzero"`
 
-	// AllowedOrigins List of allowed origins for CORS requests. Use ['*'] to allow all origins. Defaults to ['*'] if empty and enabled is true.
+	// AllowedOrigins List of allowed origins for CORS requests. Use ['*'] to allow all origins. Defaults to ['*'] if empty and enabled is true. Credentialed CORS rejects both '*' and the opaque 'null' origin.
 	AllowedOrigins []string `json:"allowed_origins,omitempty,omitzero"`
 
 	// Enabled Controls whether CORS is enabled
 	Enabled bool `json:"enabled,omitempty,omitzero"`
 
-	// ExposedHeaders Headers exposed to the client. Useful if your API returns custom headers that the frontend needs to read.
+	// ExposedHeaders Headers exposed to the client. Useful if your API returns custom headers that the frontend needs to read. ['*'] is rejected when credentials are enabled because browsers treat it as a literal header name.
 	ExposedHeaders []string `json:"exposed_headers,omitempty,omitzero"`
 
 	// MaxAge How long (in seconds) the results of a preflight request can be cached
@@ -42,18 +42,21 @@ type CORSConfig struct {
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
+	"H4sIAAAAAAAC/5xVQW/bOBP9KwNe3Bay6g8BvoP2FLjBNkC3CRoXW6AIgrE4srhLcVhyFMdb5L8vSEmO",
+	"7aS76F5ka0gO37z3ZvRd1dx5duQkquq7inVLHea/y6tPN0t2jdmkNx/YUxBDeQ2t5e1dHUiTE4M2BzU1",
+	"2FtRVYM2UqE0xToYL4adqtSl06ZGoQjblqSlAAfH4VXN/KehWAD20kJLqCnE14CBIF9GuoSPLFTBZQMS",
+	"eiqm+B0HszEuQo3OscCa4Ovszey2VIWSnSdVqTWzJXTqsVDTofGGI9xf1ZKdkJP5Kp0r1HkvLQfzF+Ya",
+	"CvVl/om+9RSF9Px3I23aUtfkRRXqKqNQt6d1vx8uAmlREsSEr4+kwThIFEMYUsZygD2UFQHdDu7RGj1t",
+	"ID3S8kti0B3Rl2gih2tLugBpCSKFewoQqLFUS8yxnA1TntOM4LCjCGuqsY8E68DbmDEHQoHZmxlgBARr",
+	"hALavDvBf0JAOteSKKcH7Lylf2XztlBGqMsKjDJFCcZtkkpjAEPA3aFqHUnL+lS1Xy9WqlDXVzf553N6",
+	"vrv4cLG6SLJcry6vPt6khfPV8v0L+qxW1zDmnSwFDYdjcY4L+/GF/6mq0cBDVYfYPpgowM0e1uT0Z/BK",
+	"+BxH24PwsD89pxMlvBvoiml52GcaoM7LDtDpyTxgYm6uEpan2kKgP7KV1izt4Amns6/Y47eeYOZ6a2fj",
+	"jSdOaEV8rN6+HUNlzZ0q9lH0vjxc+SkSR+RHlsjz4YTLZMbA9mn85KJMnEp/cVrQg+d4Oi1e6u5xY2I3",
+	"UVJbQ06yKk1vE9U77gOcX19CIOlDmlZ9FO6mSTeMh3S0CblrNDgineUKhHoaDiaOOpD+xynwo142ctzK",
+	"B/1/ItmX+YoF7XzJvZOfk6TDhzvc0JEkZ/9fLJ61Hm/BstvAK+MgUs1Ox9eZhEAxmzV5H3yaYmbTymT3",
+	"aYzWWLdZuD3s4ZbOONP1naoWe2zGCW0oqMcnuLxOPKrHFDKu4efiDl+/PuSBBcOnMffeuZPG7mAYHUZr",
+	"S1sMmUAxknCo3/ZROMqiCnVPIQ75F+Wi/F8ijD059EZV6qxclGeqUB6ljapKLfX4dwAAAP//iR65q6QH",
+	"AAA=",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

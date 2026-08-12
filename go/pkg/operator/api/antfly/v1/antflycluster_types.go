@@ -230,6 +230,9 @@ const (
 	// ReasonHAAdminActionRetrying indicates an HA admin action hit a retryable error and will be retried.
 	ReasonHAAdminActionRetrying = "HAAdminActionRetrying"
 
+	// ReasonHAAdminRetryBudgetExhausted indicates an exact HA action reached its bounded retry limit.
+	ReasonHAAdminRetryBudgetExhausted = "HAAdminRetryBudgetExhausted"
+
 	// ReasonHAStandbyUnhealthy indicates at least one desired standby is unhealthy.
 	ReasonHAStandbyUnhealthy = "HAStandbyUnhealthy"
 
@@ -312,13 +315,17 @@ const (
 
 	// ClusterModeStandalone is the single-node operator-managed standalone topology.
 	ClusterModeStandalone ClusterMode = "Standalone"
+
+	// ClusterModeSwarm is retained during the one-way migration from the legacy
+	// single-node resource layout to the Standalone API/runtime.
+	ClusterModeSwarm ClusterMode = "Swarm"
 )
 
 // AntflyClusterSpec defines the desired state of AntflyCluster
 type AntflyClusterSpec struct {
 	// Mode selects the runtime topology managed by the operator.
 	// +optional
-	// +kubebuilder:validation:Enum=Distributed;Standalone
+	// +kubebuilder:validation:Enum=Distributed;Standalone;Swarm
 	// +kubebuilder:default=Distributed
 	Mode ClusterMode `json:"mode,omitempty"`
 
@@ -331,6 +338,11 @@ type AntflyClusterSpec struct {
 	// Standalone defines the single-node standalone topology when Mode=Standalone.
 	// +optional
 	Standalone *StandaloneSpec `json:"standalone,omitempty"`
+
+	// Swarm is the deprecated single-node shape retained only for rolling
+	// compatibility. It is normalized to Standalone with LegacySwarmV1 layout.
+	// +optional
+	Swarm *SwarmSpec `json:"swarm,omitempty"`
 
 	// Inference configures inference pools used by this cluster.
 	// Pools may be owned by this cluster, referenced as customer-managed shared
@@ -573,6 +585,27 @@ const (
 	HARuntimeRoleStandby HARuntimeRole = "Standby"
 )
 
+// HAStartupGatePolicy selects the fail-closed runtime startup policy.
+type HAStartupGatePolicy string
+
+const (
+	// HAStartupGatePolicySuspend is an explicit declarative hold used while a
+	// demoted/former-primary runtime awaits exact rewind or reseed repair.
+	HAStartupGatePolicySuspend HAStartupGatePolicy = "Suspend"
+	// HAStartupGatePolicyRequireActivatedSeed keeps the runtime offline until the
+	// operator has observed an exact, durable target-volume activation receipt.
+	HAStartupGatePolicyRequireActivatedSeed HAStartupGatePolicy = "RequireActivatedSeed"
+)
+
+// HAReceiptMatchPolicy selects how startup receipt evidence is compared.
+type HAReceiptMatchPolicy string
+
+const (
+	// HAReceiptMatchPolicyExact requires every configured identity and optional
+	// digest/PVC UID field to match exactly.
+	HAReceiptMatchPolicyExact HAReceiptMatchPolicy = "Exact"
+)
+
 // HighAvailabilitySpec configures hot-standby HA for an AntflyCluster.
 type HighAvailabilitySpec struct {
 	// Mode selects whether hot standby is managed.
@@ -649,9 +682,94 @@ type HAStandbySpec struct {
 	// +optional
 	SeedContentRoot string `json:"seedContentRoot,omitempty"`
 
+	// SeedArtifact enables operator-managed immutable transport for this standby's
+	// base backup. The operator publishes the source manifest and all referenced
+	// files to object storage, restores them into a target staging root, verifies
+	// identity and checksums, and only then invokes standby bootstrap.
+	// +optional
+	SeedArtifact *HASeedArtifactSpec `json:"seedArtifact,omitempty"`
+
 	// RouteSelector is the public-api Service selector to use when this standby is promoted.
 	// +optional
 	RouteSelector map[string]string `json:"routeSelector,omitempty"`
+}
+
+// HASeedArtifactSpec configures portable, publish-last seed transport.
+type HASeedArtifactSpec struct {
+	// Location is an object-store URI. Production deployments should use s3://
+	// or gs://; file:// is supported for local development and KinD fixtures.
+	// +kubebuilder:validation:Pattern=`^(s3://|gs://|file://).+`
+	Location string `json:"location"`
+
+	// Generation is the exact immutable generation shared by capture, publish,
+	// restore, activation, startup gating, and restart. Production startup gates
+	// require this field; it is never recomputed from mutable observed LSN state.
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.:-]+$`
+	// +optional
+	Generation string `json:"generation,omitempty"`
+
+	// TopologyID and TopologyGeneration identify the Colony topology revision
+	// that authorized this entire seed chain. The operator freezes both into
+	// every planned artifact action and refuses execution when they are absent.
+	// +optional
+	TopologyID string `json:"topologyID,omitempty"`
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	TopologyGeneration int64 `json:"topologyGeneration,omitempty"`
+
+	// NodeID is the exact target standby identity carried by the portable
+	// artifact and checked again before restore and activation.
+	// +optional
+	NodeID string `json:"nodeID,omitempty"`
+
+	// TargetPVCUID optionally pins the desired target claim incarnation. The
+	// controller always resolves the live UID and rejects a configured mismatch.
+	// +optional
+	TargetPVCUID string `json:"targetPVCUID,omitempty"`
+
+	// GenerationPrefix is prepended to the deterministic generation selected by
+	// the operator. It must be a safe HA identifier and defaults to "seed".
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.:-]+$`
+	// +optional
+	GenerationPrefix string `json:"generationPrefix,omitempty"`
+
+	// StagingRoot is the absolute target path into which the verified generation
+	// is restored. It must be on target standby durable storage and must not be a
+	// live primary data root.
+	// +kubebuilder:validation:Pattern=`^/.*`
+	StagingRoot string `json:"stagingRoot"`
+
+	// SourcePVC is mounted read-only only by the publish Job. Keeping source and
+	// target claims action-scoped allows an RWO primary PVC and an RWO standby
+	// PVC to be attached on different nodes without one Job requesting both.
+	// +optional
+	SourcePVC *HASeedArtifactPVCSpec `json:"sourcePVC,omitempty"`
+
+	// TargetPVC is mounted read-write only by the restore Job.
+	// +optional
+	TargetPVC *HASeedArtifactPVCSpec `json:"targetPVC,omitempty"`
+
+	// CredentialsSecretRef injects object-store credentials into artifact Jobs.
+	// For S3 this Secret normally contains AWS_ACCESS_KEY_ID,
+	// AWS_SECRET_ACCESS_KEY, and optionally AWS_REGION/AWS_ENDPOINT_URL.
+	// Workload identity may be used by omitting this field.
+	// +optional
+	CredentialsSecretRef *corev1.LocalObjectReference `json:"credentialsSecretRef,omitempty"`
+
+	// RetainGenerations is the desired number of complete immutable generations
+	// to retain after a newer seed becomes ready. Zero defaults to two.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	RetainGenerations int32 `json:"retainGenerations,omitempty"`
+}
+
+// HASeedArtifactPVCSpec mounts one seed source or target PVC into an artifact Job.
+type HASeedArtifactPVCSpec struct {
+	// ClaimName is the PVC in the AntflyCluster namespace.
+	ClaimName string `json:"claimName"`
+
+	// MountPath is the absolute path used by the corresponding artifact action.
+	MountPath string `json:"mountPath"`
 }
 
 // HARuntimeSpec configures how the operator starts this Antfly process in the HA runtime.
@@ -665,6 +783,13 @@ type HARuntimeSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	NodeID string `json:"nodeID"`
 
+	// FencingLease configures the single topology-stable Kubernetes Lease that
+	// every runtime watches before promotion. Only the topology anchor operator
+	// may renew or transfer it; runtime ServiceAccounts receive exact read-only
+	// access. This reference must be copied unchanged to every standby CR.
+	// +optional
+	FencingLease *HARuntimeFencingLeaseSpec `json:"fencingLease,omitempty"`
+
 	// FencePath is the durable promotion fence WAL path shared by HA admin fence and promotion operations.
 	// Defaults to /antflydb/ha/fence.wal.
 	// +optional
@@ -675,6 +800,18 @@ type HARuntimeSpec struct {
 	// as primary.logPath, and the Standalone runtime wiring defaults it to primary.logPath when omitted.
 	// +optional
 	FormerPrimaryLogPath string `json:"formerPrimaryLogPath,omitempty"`
+
+	// SeedCaptureRoot is the durable node-local root used for immutable,
+	// runtime-owned point-in-time seed generations. It is configured on both
+	// primary and standby roles so an in-place promoted standby can seed its
+	// replacement without restarting. Defaults to /antflydb/ha/seed-captures.
+	// +optional
+	SeedCaptureRoot string `json:"seedCaptureRoot,omitempty"`
+
+	// StartupGate keeps a standby runtime at zero replicas until the operator has
+	// observed an exact activation receipt on its deterministic target PVC.
+	// +optional
+	StartupGate *HAStartupGateSpec `json:"startupGate,omitempty"`
 
 	// AdminTokenEnvVar is the Antfly process environment variable containing the bearer token required by /admin/v1/ha.
 	// When set, the operator passes --admin-token-env and the runtime rejects typed admin requests without a matching Authorization header.
@@ -697,6 +834,85 @@ type HARuntimeSpec struct {
 	// Standby configures standby-side durable HA state and optional continuous pull source.
 	// +optional
 	Standby *HAStandbyRuntimeSpec `json:"standby,omitempty"`
+}
+
+// HARuntimeFencingLeaseSpec binds one runtime to the shared HA authority.
+type HARuntimeFencingLeaseSpec struct {
+	// Name is the exact Lease name in the runtime Pod namespace.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// TopologyID is stable across primary handoff and distinct from a local
+	// standby AntflyCluster UID. Colony uses the durable Cloud instance ID,
+	// which exists before the first CR is created, and propagates it unchanged
+	// to every topology member.
+	// +kubebuilder:validation:MinLength=1
+	TopologyID string `json:"topologyID"`
+
+	// WatchdogGraceSeconds is the maximum API-unreachable interval before the
+	// runtime durably self-fences. It must be less than the Lease duration.
+	// +kubebuilder:validation:Minimum=10
+	// +kubebuilder:validation:Maximum=29
+	// +kubebuilder:default=10
+	// +optional
+	WatchdogGraceSeconds int32 `json:"watchdogGraceSeconds,omitempty"`
+}
+
+// HAStartupGateSpec declares the exact receipt required before a runtime may
+// start. runtimeEligible is a declarative suspension fence: false always keeps
+// replicas at zero, while true remains subject to policy-specific verification.
+type HAStartupGateSpec struct {
+	// Policy selects either an unconditional Suspend hold or exact activated-seed startup.
+	// +kubebuilder:validation:Enum=Suspend;RequireActivatedSeed
+	Policy HAStartupGatePolicy `json:"policy"`
+
+	// RuntimeEligible is necessary but never sufficient for startup. False always
+	// forces replicas to zero, including during declarative role handoff. True is
+	// honored only after the operator-observed policy evidence matches.
+	RuntimeEligible bool `json:"runtimeEligible"`
+
+	// ReceiptMatchPolicy must be Exact for RequireActivatedSeed and omitted for Suspend.
+	// +kubebuilder:validation:Enum=Exact
+	// +optional
+	ReceiptMatchPolicy HAReceiptMatchPolicy `json:"receiptMatchPolicy,omitempty"`
+
+	// RequiredReceipt binds the one target volume generation this runtime may open.
+	// It is required for RequireActivatedSeed and forbidden for Suspend.
+	// +optional
+	RequiredReceipt *HARequiredSeedActivationReceipt `json:"requiredReceipt,omitempty"`
+}
+
+// HARequiredSeedActivationReceipt is the desired exact startup identity.
+type HARequiredSeedActivationReceipt struct {
+	TopologyID string `json:"topologyID"`
+	// TopologyGeneration optionally rejects a receipt from an older replacement
+	// topology generation. When non-zero it is matched exactly.
+	// +optional
+	TopologyGeneration int64  `json:"topologyGeneration,omitempty"`
+	NodeID             string `json:"nodeID"`
+	SlotName           string `json:"slotName"`
+	Generation         string `json:"generation"`
+	TargetPVCName      string `json:"targetPVCName"`
+
+	// Optional exact evidence. When configured, omission or mismatch fails closed.
+	// +optional
+	ManifestSHA256 string `json:"manifestSHA256,omitempty"`
+	// +optional
+	AggregateSHA256 string `json:"aggregateSHA256,omitempty"`
+	// +optional
+	SeedReceiptSHA256 string `json:"seedReceiptSHA256,omitempty"`
+	// +optional
+	CaptureReceiptSHA256 string `json:"captureReceiptSHA256,omitempty"`
+	// +optional
+	MaterializedReceiptSHA256 string `json:"materializedReceiptSHA256,omitempty"`
+	// +optional
+	MaterializedAggregateSHA256 string `json:"materializedAggregateSHA256,omitempty"`
+	// +optional
+	TargetLocalNodeID uint64 `json:"targetLocalNodeID,omitempty"`
+	// +optional
+	TargetReplicaID uint64 `json:"targetReplicaID,omitempty"`
+	// +optional
+	TargetPVCUID string `json:"targetPVCUID,omitempty"`
 }
 
 // HAPrimaryRuntimeSpec configures primary-side HA WAL and replication slot state.
@@ -760,9 +976,52 @@ type HAAdminSpec struct {
 	// +optional
 	JobTimeoutSeconds *int64 `json:"jobTimeoutSeconds,omitempty"`
 
-	// JobTTLSecondsAfterFinished controls how long completed CLI-backed HA admin Jobs are retained.
+	// JobTTLSecondsAfterFinished controls how long completed CLI-backed HA admin Jobs are retained
+	// after their terminal evidence has been checkpointed in AntflyCluster status.
 	// +optional
 	JobTTLSecondsAfterFinished *int32 `json:"jobTTLSecondsAfterFinished,omitempty"`
+
+	// DirectRetryLimit bounds retryable typed HA admin failures and expired uncertain
+	// reservations charged to the action's retry budget. Successful prerequisite
+	// polls do not consume it. Once exhausted, the action becomes terminally Failed
+	// until its semantic identity changes or RetryGeneration is incremented. Defaults to 8.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	DirectRetryLimit *int32 `json:"directRetryLimit,omitempty"`
+
+	// DirectRetryBaseSeconds is the initial typed HA admin retry delay. Backoff is
+	// exponential and persisted in action status. Defaults to 5 seconds.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	DirectRetryBaseSeconds *int32 `json:"directRetryBaseSeconds,omitempty"`
+
+	// DirectRetryMaxSeconds caps the typed HA admin retry delay. Defaults to 120 seconds.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	DirectRetryMaxSeconds *int32 `json:"directRetryMaxSeconds,omitempty"`
+
+	// DirectReservationSeconds bounds an in-flight typed HA admin attempt reservation.
+	// After an operator crash, the exact frozen request may be replayed only after this
+	// lease expires; runtime HA actions are required to return idempotent receipts.
+	// Defaults to 30 seconds.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	DirectReservationSeconds *int32 `json:"directReservationSeconds,omitempty"`
+
+	// DirectPrerequisiteTimeoutSeconds bounds a successful typed assessment that
+	// is waiting for a promotion candidate to apply its frozen boundary. Defaults
+	// to 600 seconds and is independent of the request-failure retry budget.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	DirectPrerequisiteTimeoutSeconds *int32 `json:"directPrerequisiteTimeoutSeconds,omitempty"`
+
+	// RetryGeneration is an operator-controlled recovery nonce. Incrementing it
+	// intentionally creates a new execution identity for terminal HA actions while
+	// leaving ordinary observation changes unable to reset the retry budget. It is
+	// monotonic and the admission webhook rejects decreases.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	RetryGeneration int64 `json:"retryGeneration,omitempty"`
 
 	// EnvFrom is applied to CLI-backed HA admin Job containers, commonly for backup object-store credentials.
 	// +optional
@@ -872,6 +1131,24 @@ type HAAutomaticFailoverPolicy struct {
 	// MaximumLagLSN is the tolerated standby lag for automatic promotion.
 	// +optional
 	MaximumLagLSN uint64 `json:"maximumLagLSN,omitempty"`
+
+	// MinimumConsecutiveFailures is the number of consecutive primary admin
+	// observations that must fail before automatic failover may begin. This
+	// prevents one transient transport failure from reserving an irreversible
+	// fencing transaction.
+	// +kubebuilder:validation:Minimum=2
+	// +kubebuilder:default=3
+	// +optional
+	MinimumConsecutiveFailures int32 `json:"minimumConsecutiveFailures,omitempty"`
+
+	// MinimumUnreachableDurationSeconds is the minimum continuous primary admin
+	// outage required before automatic failover may begin. A successful probe
+	// resets the outage window and consecutive-failure count.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=3600
+	// +kubebuilder:default=30
+	// +optional
+	MinimumUnreachableDurationSeconds int32 `json:"minimumUnreachableDurationSeconds,omitempty"`
 }
 
 // MetadataNodesSpec defines the configuration for metadata nodes
@@ -1011,6 +1288,13 @@ type DataNodesSpec struct {
 
 // StandaloneSpec defines the configuration for operator-managed standalone mode.
 type StandaloneSpec struct {
+	// ResourceIdentity selects the immutable Kubernetes identity layout for the
+	// single-node workload. LegacySwarmV1 preserves pre-Standalone PVC names.
+	// +optional
+	// +kubebuilder:validation:Enum=StandaloneV1;LegacySwarmV1
+	// +kubebuilder:default=StandaloneV1
+	ResourceIdentity StandaloneResourceIdentity `json:"resourceIdentity,omitempty"`
+
 	// Replicas is the number of standalone replicas. MVP only supports 1.
 	Replicas int32 `json:"replicas,omitempty"`
 
@@ -1063,6 +1347,16 @@ type StandaloneSpec struct {
 	// +optional
 	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
 }
+
+// SwarmSpec is the deprecated wire-compatible predecessor of StandaloneSpec.
+type SwarmSpec = StandaloneSpec
+
+type StandaloneResourceIdentity string
+
+const (
+	StandaloneResourceIdentityV1          StandaloneResourceIdentity = "StandaloneV1"
+	StandaloneResourceIdentityLegacySwarm StandaloneResourceIdentity = "LegacySwarmV1"
+)
 
 // StandaloneInferenceSpec defines inference configuration for standalone mode.
 type StandaloneInferenceSpec struct {
@@ -1164,6 +1458,10 @@ type StorageSpec struct {
 	// +optional
 	StandaloneStorage string `json:"standaloneStorage,omitempty"`
 
+	// SwarmStorage is the deprecated name read during rolling migration.
+	// +optional
+	SwarmStorage string `json:"swarmStorage,omitempty"`
+
 	// Engine selects the persistence engine. Local stores a directory tree on
 	// PVCs. Lite stores the complete database in one .aflite file and is valid
 	// only with spec.mode=Standalone.
@@ -1202,6 +1500,10 @@ type StorageAutoGrowSpec struct {
 	// MaxStandaloneStorage is the maximum size for standalone PVC auto-grow. If omitted
 	// in standalone mode, MaxDataStorage is used as the limit.
 	MaxStandaloneStorage string `json:"maxStandaloneStorage,omitempty"`
+
+	// MaxSwarmStorage is the deprecated legacy-layout storage ceiling.
+	// +optional
+	MaxSwarmStorage string `json:"maxSwarmStorage,omitempty"`
 
 	// GrowThresholdPercent is the percent-used threshold that triggers growth.
 	// Defaults to 85 when omitted.
@@ -1586,6 +1888,31 @@ type HAStatus struct {
 	// +optional
 	PrimaryAdminStatusCode int `json:"primaryAdminStatusCode,omitempty"`
 
+	// PrimaryAdminConsecutiveFailures is the persisted number of consecutive
+	// failed primary admin observations in the current outage window.
+	// +optional
+	PrimaryAdminConsecutiveFailures int32 `json:"primaryAdminConsecutiveFailures,omitempty"`
+
+	// PrimaryAdminUnreachableSince records the first failed observation in the
+	// current uninterrupted outage window.
+	// +optional
+	PrimaryAdminUnreachableSince *metav1.Time `json:"primaryAdminUnreachableSince,omitempty"`
+
+	// PrimaryAdminFailureThresholdMet reports that both configured automatic
+	// failover debounce thresholds have been crossed. Candidate selection must
+	// never infer this from one transport error.
+	// +optional
+	PrimaryAdminFailureThresholdMet bool `json:"primaryAdminFailureThresholdMet,omitempty"`
+
+	// PrimaryWatchdogProof is the last runtime-originated, authenticated proof
+	// that the exact primary process had the Kubernetes Lease watchdog active.
+	// Active capability without authority is retained only for a same-owner
+	// bootstrap/restart Lease renewal and is never authoritative primary health.
+	// The operator retains it across an admin outage only for binding to the
+	// same live Pod/container incarnation at a later isolation boundary.
+	// +optional
+	PrimaryWatchdogProof *HAWatchdogProofStatus `json:"primaryWatchdogProof,omitempty"`
+
 	// DesiredStandbyCount is the count requested by spec.highAvailability.
 	// +optional
 	DesiredStandbyCount int32 `json:"desiredStandbyCount,omitempty"`
@@ -1645,6 +1972,84 @@ type HAStatus struct {
 	// LastPromotion records the last completed promotion.
 	// +optional
 	LastPromotion *HAPromotionStatus `json:"lastPromotion,omitempty"`
+
+	// StartupGate is operator-observed state. In particular, activationReceipt
+	// never appears in spec and cannot be self-asserted by a caller.
+	// +optional
+	StartupGate *HAStartupGateStatus `json:"startupGate,omitempty"`
+}
+
+// HAWatchdogProofStatus records an authenticated runtime observation. It is not
+// itself a fencing receipt: automatic failover additionally binds it to the
+// exact Kubernetes Pod/container incarnation and an uncached Lease transfer.
+type HAWatchdogProofStatus struct {
+	CapabilityVersion int32 `json:"capabilityVersion"`
+
+	Active bool `json:"active"`
+
+	AuthorityGranted bool `json:"authorityGranted"`
+
+	// AuthorityRemainingMS is the conservative operator-side remainder after
+	// subtracting the full authenticated admin request RTT and safety margin.
+	AuthorityRemainingMS int32 `json:"authorityRemainingMS"`
+
+	LeaseName string `json:"leaseName"`
+
+	LeaseNamespace string `json:"leaseNamespace"`
+
+	TopologyID string `json:"topologyID"`
+
+	LocalNodeID string `json:"localNodeID"`
+
+	ObservedHolderNodeID string `json:"observedHolderNodeID"`
+
+	PodUID string `json:"podUID"`
+
+	ProcessBootID string `json:"processBootID"`
+
+	ObservedLeaseTransitions int32 `json:"observedLeaseTransitions"`
+
+	MaxFenceLatencyMS int32 `json:"maxFenceLatencyMS"`
+
+	ObservedAt metav1.Time `json:"observedAt"`
+}
+
+// HAStartupGateStatus reports whether the exact activated target is eligible.
+type HAStartupGateStatus struct {
+	RuntimeEligible bool   `json:"runtimeEligible"`
+	Reason          string `json:"reason,omitempty"`
+	// +optional
+	ActivationReceipt *HASeedActivationReceiptStatus `json:"activationReceipt,omitempty"`
+}
+
+// HASeedActivationReceiptStatus is operator-observed evidence from the
+// activation Job and the Kubernetes PVC object it wrote.
+type HASeedActivationReceiptStatus struct {
+	TopologyID                  string `json:"topologyID"`
+	TopologyGeneration          int64  `json:"topologyGeneration,omitempty"`
+	NodeID                      string `json:"nodeID"`
+	SlotName                    string `json:"slotName"`
+	Generation                  string `json:"generation"`
+	TargetPVCName               string `json:"targetPVCName"`
+	TargetPVCUID                string `json:"targetPVCUID,omitempty"`
+	ClusterID                   uint64 `json:"clusterID,omitempty"`
+	ShardID                     uint64 `json:"shardID,omitempty"`
+	TableID                     uint64 `json:"tableID,omitempty"`
+	TimelineID                  uint64 `json:"timelineID,omitempty"`
+	Epoch                       uint64 `json:"epoch,omitempty"`
+	BackupLSN                   uint64 `json:"backupLSN,omitempty"`
+	CheckpointLSN               uint64 `json:"checkpointLSN,omitempty"`
+	ManifestID                  string `json:"manifestID,omitempty"`
+	ManifestSHA256              string `json:"manifestSHA256,omitempty"`
+	AggregateSHA256             string `json:"aggregateSHA256,omitempty"`
+	SeedReceiptSHA256           string `json:"seedReceiptSHA256,omitempty"`
+	CaptureReceiptSHA256        string `json:"captureReceiptSHA256,omitempty"`
+	MaterializedReceiptSHA256   string `json:"materializedReceiptSHA256,omitempty"`
+	MaterializedAggregateSHA256 string `json:"materializedAggregateSHA256,omitempty"`
+	TargetLocalNodeID           uint64 `json:"targetLocalNodeID,omitempty"`
+	TargetReplicaID             uint64 `json:"targetReplicaID,omitempty"`
+	GenerationPath              string `json:"generationPath,omitempty"`
+	RawGenerationPath           string `json:"rawGenerationPath,omitempty"`
 }
 
 // HAStandbyStatus reports one hot standby slot.
@@ -1696,6 +2101,11 @@ type HAStandbyStatus struct {
 	LastSuccessNs uint64 `json:"lastSuccessNs,omitempty"`
 
 	ReplicationFailuresTotal uint64 `json:"replicationFailuresTotal,omitempty"`
+
+	// WatchdogProof is authenticated runtime evidence from this exact standby
+	// process before any in-place promotion is attempted.
+	// +optional
+	WatchdogProof *HAWatchdogProofStatus `json:"watchdogProof,omitempty"`
 }
 
 // HASyncStatus reports the current synchronous durability policy state.
@@ -1739,6 +2149,154 @@ type HAFencingStatus struct {
 	// Reason describes the latest fencing readiness decision.
 	// +optional
 	Reason string `json:"reason,omitempty"`
+}
+
+// HAPhysicalIsolationPodIdentity binds a physical-isolation intent to one
+// exact former-primary Pod incarnation. Pod names alone are reusable and are
+// therefore never sufficient evidence at this safety boundary.
+type HAPhysicalIsolationPodIdentity struct {
+	Name string `json:"name"`
+
+	UID string `json:"uid"`
+}
+
+// HAPhysicalIsolationLeaseScope records the complete topology scope frozen in
+// the Kubernetes fencing Lease at holder transfer.
+type HAPhysicalIsolationLeaseScope struct {
+	TopologyID string `json:"topologyID"`
+
+	ClusterID uint64 `json:"clusterID"`
+
+	ShardID uint64 `json:"shardID,omitempty"`
+
+	TableID uint64 `json:"tableID,omitempty"`
+
+	TimelineID uint64 `json:"timelineID"`
+
+	Epoch uint64 `json:"epoch"`
+
+	CurrentPrimaryID string `json:"currentPrimaryID"`
+
+	PrimaryLSN uint64 `json:"primaryLSN"`
+}
+
+// HAPhysicalIsolationReceiptStatus is the compatibility-named, typed receipt
+// that an automatic failover crossed its logical write-authority boundary. It
+// is not proof of power-off or process exit. The intent half is checkpointed
+// before the old StatefulSet is scaled. The final half is populated only after
+// exact runtime watchdog proof, an uncached Lease transfer, and a fresh
+// controller-local monotonic wait of the proof-bound maximum fence latency.
+// Pod absence is supplemental Kubernetes topology evidence only.
+type HAPhysicalIsolationReceiptStatus struct {
+	ClusterUID string `json:"clusterUID"`
+
+	StatefulSetName string `json:"statefulSetName"`
+
+	StatefulSetUID string `json:"statefulSetUID"`
+
+	InitialStatefulSetGeneration int64 `json:"initialStatefulSetGeneration"`
+
+	InitialStatefulSetResourceVersion string `json:"initialStatefulSetResourceVersion"`
+
+	// +optional
+	// +kubebuilder:validation:MaxItems=256
+	InitialOldPods []HAPhysicalIsolationPodIdentity `json:"initialOldPods,omitempty"`
+
+	InitialPodListResourceVersion string `json:"initialPodListResourceVersion"`
+
+	LeaseName string `json:"leaseName"`
+
+	LeaseUID string `json:"leaseUID"`
+
+	LeaseResourceVersion string `json:"leaseResourceVersion"`
+
+	LeaseHolder string `json:"leaseHolder"`
+
+	LeaseGeneration uint64 `json:"leaseGeneration"`
+
+	LeaseScope HAPhysicalIsolationLeaseScope `json:"leaseScope"`
+
+	LeaseTransferTime metav1.Time `json:"leaseTransferTime"`
+
+	// WatchdogMaxFenceLatencyMS is copied exactly from the authenticated old
+	// runtime proof and must equal the configured runtime watchdog bound.
+	WatchdogMaxFenceLatencyMS int32 `json:"watchdogMaxFenceLatencyMS"`
+
+	// WatchdogProof is mandatory for every automatic Lease-transfer path. Pod
+	// API absence can result from force deletion while the old process survives.
+	// +optional
+	WatchdogProof *HAPhysicalIsolationWatchdogProofStatus `json:"watchdogProof,omitempty"`
+
+	// Final observations below are absent until the controller has re-read the
+	// exact objects through its uncached APIReader after scaling to zero.
+	// +optional
+	IsolatedStatefulSetGeneration int64 `json:"isolatedStatefulSetGeneration,omitempty"`
+
+	// +optional
+	IsolatedStatefulSetObservedGeneration int64 `json:"isolatedStatefulSetObservedGeneration,omitempty"`
+
+	// +optional
+	IsolatedStatefulSetResourceVersion string `json:"isolatedStatefulSetResourceVersion,omitempty"`
+
+	// +optional
+	ObservedLeaseResourceVersion string `json:"observedLeaseResourceVersion,omitempty"`
+
+	// AbsenceProven records an uncached PodList observation. It never asserts
+	// that a force-deleted or partitioned process has exited.
+	// +optional
+	AbsenceProven bool `json:"absenceProven,omitempty"`
+
+	// +optional
+	AbsencePodListResourceVersion string `json:"absencePodListResourceVersion,omitempty"`
+
+	// +optional
+	FrozenBoundaryLSN uint64 `json:"frozenBoundaryLSN,omitempty"`
+
+	// +optional
+	ObservedAt *metav1.Time `json:"observedAt,omitempty"`
+
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+}
+
+// HAPhysicalIsolationWatchdogProofStatus binds the runtime-originated proof to
+// the exact old Pod and container process observed through the uncached API.
+type HAPhysicalIsolationWatchdogProofStatus struct {
+	CapabilityVersion int32 `json:"capabilityVersion"`
+
+	Active bool `json:"active"`
+
+	AuthorityGranted bool `json:"authorityGranted"`
+
+	LeaseName string `json:"leaseName"`
+
+	LeaseNamespace string `json:"leaseNamespace"`
+
+	TopologyID string `json:"topologyID"`
+
+	LocalNodeID string `json:"localNodeID"`
+
+	ObservedHolderNodeID string `json:"observedHolderNodeID"`
+
+	PodName string `json:"podName"`
+
+	PodUID string `json:"podUID"`
+
+	ContainerName string `json:"containerName"`
+
+	ContainerID string `json:"containerID"`
+
+	ContainerRestartCount int32 `json:"containerRestartCount"`
+
+	ContainerStartedAt metav1.Time `json:"containerStartedAt"`
+
+	ProcessBootID string `json:"processBootID"`
+
+	ObservedLeaseTransitions int32 `json:"observedLeaseTransitions"`
+
+	MaxFenceLatencyMS int32 `json:"maxFenceLatencyMS"`
+
+	RuntimeObservedAt metav1.Time `json:"runtimeObservedAt"`
 }
 
 // HAPlannedActionStatus reports one planned HA operator action.
@@ -1811,6 +2369,72 @@ type HAPlannedActionStatus struct {
 	// +optional
 	SeedContentRoot string `json:"seedContentRoot,omitempty"`
 
+	// SeedArtifactTargetRoot is the target PVC root that owns immutable activated generations.
+	// +optional
+	SeedArtifactTargetRoot string `json:"seedArtifactTargetRoot,omitempty"`
+
+	// SeedArtifactLocation is the object-store URI used by portable seed actions.
+	// +optional
+	SeedArtifactLocation string `json:"seedArtifactLocation,omitempty"`
+
+	// SeedArtifactGeneration is the immutable generation selected by the operator.
+	// +optional
+	SeedArtifactGeneration string `json:"seedArtifactGeneration,omitempty"`
+
+	// SeedArtifactRetainGenerations is the retention bound applied after bootstrap.
+	// +optional
+	SeedArtifactRetainGenerations int32 `json:"seedArtifactRetainGenerations,omitempty"`
+
+	// SeedArtifactCaptureRoot is the durable source capture root proven by the
+	// successful runtime capture response. It is never accepted from spec.
+	// +optional
+	SeedArtifactCaptureRoot string `json:"seedArtifactCaptureRoot,omitempty"`
+
+	// SeedCaptureReceiptPath and SeedCaptureReceiptSHA256 bind portable
+	// publication, restore, and activation to the exact immutable runtime-owned
+	// capture COMPLETE receipt.
+	// +optional
+	SeedCaptureReceiptPath string `json:"seedCaptureReceiptPath,omitempty"`
+	// +optional
+	SeedCaptureReceiptSHA256 string `json:"seedCaptureReceiptSHA256,omitempty"`
+
+	// SeedArtifactProtectedGenerations freezes the current, in-flight and rollback
+	// generations that a local GC operation must preserve.
+	// +optional
+	// +kubebuilder:validation:MaxItems=256
+	SeedArtifactProtectedGenerations []string `json:"seedArtifactProtectedGenerations,omitempty"`
+
+	// Topology fields bind every seed action in this chain to one exact desired
+	// topology generation and target PVC identity.
+	// +optional
+	TopologyID string `json:"topologyID,omitempty"`
+	// +optional
+	TopologyGeneration int64 `json:"topologyGeneration,omitempty"`
+	// +optional
+	TopologyNodeID string `json:"topologyNodeID,omitempty"`
+	// +optional
+	TargetPVCName string `json:"targetPVCName,omitempty"`
+	// +optional
+	TargetPVCUID string `json:"targetPVCUID,omitempty"`
+	// +optional
+	TargetLocalNodeID uint64 `json:"targetLocalNodeID,omitempty"`
+	// +optional
+	TargetReplicaID uint64 `json:"targetReplicaID,omitempty"`
+	// +optional
+	SourcePVCName string `json:"sourcePVCName,omitempty"`
+	// +optional
+	SourcePVCUID string `json:"sourcePVCUID,omitempty"`
+
+	// SeedArtifactReceipt is the typed, validated receipt emitted by a completed
+	// portable publish, restore, or prune Job.
+	// +optional
+	SeedArtifactReceipt *HASeedArtifactReceiptStatus `json:"seedArtifactReceipt,omitempty"`
+
+	// PhysicalIsolationReceipt is the typed Kubernetes object-incarnation and
+	// timing proof required for a successful IsolateFormerPrimary action.
+	// +optional
+	PhysicalIsolationReceipt *HAPhysicalIsolationReceiptStatus `json:"physicalIsolationReceipt,omitempty"`
+
 	// AdminJobName records direct-admin-api for typed execution or the Kubernetes Job created for CLI-backed execution.
 	// +optional
 	AdminJobName string `json:"adminJobName,omitempty"`
@@ -1827,11 +2451,128 @@ type HAPlannedActionStatus struct {
 	// +optional
 	AdminStatusCode int `json:"adminStatusCode,omitempty"`
 
+	// OperationID is the stable controller identity for this desired HA operation.
+	// It excludes mutable observations such as LSN progress and human-readable
+	// reasons so replanning cannot orphan an in-flight execution.
+	// +optional
+	OperationID string `json:"operationID,omitempty"`
+
+	// ExecutionStateVersion distinguishes durable bounded-retry state from legacy
+	// Pending/Failed status written before attempt reservations were introduced.
+	// +optional
+	ExecutionStateVersion int32 `json:"executionStateVersion,omitempty"`
+
+	// RetryGeneration is the explicit recovery nonce captured when this operation
+	// was planned.
+	// +optional
+	RetryGeneration int64 `json:"retryGeneration,omitempty"`
+
+	// AttemptCount is the durable number of direct requests or Kubernetes Job pod
+	// attempts observed for this exact action identity.
+	// +optional
+	AttemptCount int32 `json:"attemptCount,omitempty"`
+
+	// RetryBudgetUsed is the durable number of retryable direct-request failures
+	// and expired uncertain reservations charged to the bounded retry budget.
+	// Successful prerequisite polls do not consume this budget; AttemptCount still
+	// records every dispatched request.
+	// +optional
+	RetryBudgetUsed int32 `json:"retryBudgetUsed,omitempty"`
+
+	// Retryable reports whether the latest failure remains within its retry budget.
+	// +optional
+	Retryable bool `json:"retryable,omitempty"`
+
+	// ErrorClass is a stable machine-readable terminal or retry classification.
+	// +optional
+	ErrorClass string `json:"errorClass,omitempty"`
+
+	// FirstAttemptAt records when execution of this exact action identity began.
+	// +optional
+	FirstAttemptAt *metav1.Time `json:"firstAttemptAt,omitempty"`
+
+	// LastAttemptAt records the most recent execution attempt.
+	// +optional
+	LastAttemptAt *metav1.Time `json:"lastAttemptAt,omitempty"`
+
+	// NextRetryAt records the persisted earliest time for the next direct retry.
+	// +optional
+	NextRetryAt *metav1.Time `json:"nextRetryAt,omitempty"`
+
+	// InFlightAttempt is the attempt number durably reserved before a typed admin
+	// request is sent. A nonzero value prevents concurrent or immediate crash replay.
+	// +optional
+	InFlightAttempt int32 `json:"inFlightAttempt,omitempty"`
+
+	// AttemptID identifies the exact in-flight reservation for result checkpointing.
+	// +optional
+	AttemptID string `json:"attemptID,omitempty"`
+
+	// ReservationExpiresAt is the earliest time an uncheckpointed in-flight request
+	// may be replayed with its frozen, idempotent operation payload.
+	// +optional
+	ReservationExpiresAt *metav1.Time `json:"reservationExpiresAt,omitempty"`
+
+	// PrerequisiteDeadlineAt bounds a non-failure wait such as promotion boundary
+	// application. It is preserved across observation replans and request polls.
+	// +optional
+	PrerequisiteDeadlineAt *metav1.Time `json:"prerequisiteDeadlineAt,omitempty"`
+
+	// CompletedAt records terminal success or failure.
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+
 	Reason string `json:"reason,omitempty"`
+}
+
+// HASeedArtifactReceiptStatus summarizes a durable portable seed receipt.
+type HASeedArtifactReceiptStatus struct {
+	ActionKind                  string `json:"actionKind,omitempty"`
+	Scope                       string `json:"scope,omitempty"`
+	FormatVersion               int32  `json:"formatVersion"`
+	Generation                  string `json:"generation"`
+	SlotName                    string `json:"slotName"`
+	ClusterID                   uint64 `json:"clusterID,omitempty"`
+	ShardID                     uint64 `json:"shardID,omitempty"`
+	TableID                     uint64 `json:"tableID,omitempty"`
+	TimelineID                  uint64 `json:"timelineID,omitempty"`
+	Epoch                       uint64 `json:"epoch,omitempty"`
+	ManifestID                  string `json:"manifestID,omitempty"`
+	BackupLSN                   uint64 `json:"backupLSN,omitempty"`
+	CheckpointLSN               uint64 `json:"checkpointLSN,omitempty"`
+	ManifestSHA256              string `json:"manifestSHA256,omitempty"`
+	AggregateSHA256             string `json:"aggregateSHA256,omitempty"`
+	SeedReceiptSHA256           string `json:"seedReceiptSHA256,omitempty"`
+	CaptureReceiptSHA256        string `json:"captureReceiptSHA256,omitempty"`
+	GenerationPath              string `json:"generationPath,omitempty"`
+	RawGenerationPath           string `json:"rawGenerationPath,omitempty"`
+	MaterializedReceiptSHA256   string `json:"materializedReceiptSHA256,omitempty"`
+	MaterializedAggregateSHA256 string `json:"materializedAggregateSHA256,omitempty"`
+	TargetLocalNodeID           uint64 `json:"targetLocalNodeID,omitempty"`
+	TargetReplicaID             uint64 `json:"targetReplicaID,omitempty"`
+	TotalBytes                  uint64 `json:"totalBytes,omitempty"`
+	FileCount                   int32  `json:"fileCount,omitempty"`
+	RetainedCount               int32  `json:"retainedCount,omitempty"`
+	DeletedCount                int32  `json:"deletedCount,omitempty"`
+	ProtectedCount              int32  `json:"protectedCount,omitempty"`
+	ResumedTombstoneCount       int32  `json:"resumedTombstoneCount,omitempty"`
+	SkippedIneligibleCount      int32  `json:"skippedIneligibleCount,omitempty"`
+	CheckpointSHA256            string `json:"checkpointSHA256,omitempty"`
+	TopologyID                  string `json:"topologyID,omitempty"`
+	TopologyGeneration          int64  `json:"topologyGeneration,omitempty"`
+	NodeID                      string `json:"nodeID,omitempty"`
+	TargetPVCName               string `json:"targetPVCName,omitempty"`
+	TargetPVCUID                string `json:"targetPVCUID,omitempty"`
 }
 
 // HAAdminActionResultStatus records correlation fields from a typed HA admin action response.
 type HAAdminActionResultStatus struct {
+	// RawReceiptJSON is the bounded exact JSON response for lifecycle receipts
+	// that a later action must re-verify independently.
+	// +optional
+	// +kubebuilder:validation:MaxLength=65536
+	RawReceiptJSON string `json:"rawReceiptJSON,omitempty"`
+
 	// SchemaVersion is the response schema version returned by the HA admin API.
 	// +optional
 	SchemaVersion uint32 `json:"schemaVersion,omitempty"`
@@ -1883,6 +2624,52 @@ type HAAdminActionResultStatus struct {
 	// CheckpointLSN is the standby checkpoint LSN returned by seed bootstrap.
 	// +optional
 	CheckpointLSN uint64 `json:"checkpointLSN,omitempty"`
+
+	// SeedArtifactGeneration binds a slot activation receipt to an immutable target generation.
+	// +optional
+	SeedArtifactGeneration string `json:"seedArtifactGeneration,omitempty"`
+
+	// SeedReceiptSHA256 binds slot activation to the durable target activation receipt.
+	// +optional
+	SeedReceiptSHA256 string `json:"seedReceiptSHA256,omitempty"`
+
+	// ManifestSHA256 and AggregateSHA256 preserve the verified artifact digest evidence.
+	// +optional
+	ManifestSHA256 string `json:"manifestSHA256,omitempty"`
+	// +optional
+	AggregateSHA256 string `json:"aggregateSHA256,omitempty"`
+
+	// CaptureReceiptSHA256 is the digest of the exact immutable runtime capture
+	// COMPLETE bytes that authorized every downstream portable seed action.
+	// +optional
+	CaptureReceiptSHA256 string `json:"captureReceiptSHA256,omitempty"`
+
+	// Runtime-owned seed capture evidence and the primary-PVC paths consumed by
+	// the dependent publish action.
+	// +optional
+	SeedClusterID uint64 `json:"seedClusterID,omitempty"`
+	// +optional
+	SeedShardID uint64 `json:"seedShardID,omitempty"`
+	// +optional
+	SeedTableID uint64 `json:"seedTableID,omitempty"`
+	// +optional
+	SeedTimelineID uint64 `json:"seedTimelineID,omitempty"`
+	// +optional
+	SeedEpoch uint64 `json:"seedEpoch,omitempty"`
+	// +optional
+	SeedSourcePlanSHA256 string `json:"seedSourcePlanSHA256,omitempty"`
+	// +optional
+	SeedFileCount uint64 `json:"seedFileCount,omitempty"`
+	// +optional
+	SeedTotalBytes uint64 `json:"seedTotalBytes,omitempty"`
+	// +optional
+	SeedGenerationRoot string `json:"seedGenerationRoot,omitempty"`
+	// +optional
+	SeedContentRoot string `json:"seedContentRoot,omitempty"`
+	// +optional
+	SeedManifestPath string `json:"seedManifestPath,omitempty"`
+	// +optional
+	SeedAlreadyCaptured bool `json:"seedAlreadyCaptured,omitempty"`
 
 	// PromotionRequiredLSN is the minimum LSN checked by a promotion assessment.
 	// +optional

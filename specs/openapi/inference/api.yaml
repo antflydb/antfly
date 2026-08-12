@@ -26,6 +26,15 @@ info:
     - Centralized model serving across distributed nodes
     - Privacy-preserving ML inference (data never leaves your infrastructure)
 
+    ## Authentication
+    The standalone inference listener speaks plaintext HTTP and does not provide built-in
+    authentication. It refuses non-loopback binds by default. Keep the loopback default, or put
+    it behind a trusted proxy that terminates TLS and authenticates every request; only then use
+    `--allow-insecure-public-bind` to opt into a non-loopback listener. When authentication is
+    enabled, the unified Antfly server requires a valid principal with `inference/*` read
+    permission for `/ai/v1` and `/ml/v1`. Global `*/*` read or admin grants also satisfy this
+    requirement through the existing wildcard policy.
+
     ## Features
 
     ### Embedding Generation
@@ -62,7 +71,9 @@ paths:
 
         Accepts the OpenAI embeddings request shape and returns the same OpenAI-compatible
         response envelope. For sparse-capable models, `data[i].embedding` is a sparse
-        vector object instead of a dense float array.
+        vector object instead of a dense float array. Dense image inputs are header-validated
+        and admitted against the aggregate decoded-pixel budget before model loading. Remote
+        URL byte potential is reserved before fetch; inline sources use their actual encoded size.
       operationId: generateEmbeddings
       requestBody:
         required: true
@@ -83,8 +94,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Encoded media, image dimensions, or aggregate decoded pixels exceed the configured limit
           content:
             application/json:
               schema:
@@ -93,6 +116,12 @@ paths:
           $ref: '#/components/responses/TransientCapacity'
         '500':
           description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: Remote content fetch failed
           content:
             application/json:
               schema:
@@ -156,6 +185,8 @@ paths:
         Text-only requests can be served immediately. Image-bearing requests reserve the stable
         contract for native ColQwen-style late-interaction reranking as that encoder lands.
         Image-bearing requests already run native Zig image preprocessing and grid preparation.
+        Remote URL byte potential is reserved before fetch, and image headers plus aggregate
+        decoded pixels are admitted before model loading.
       operationId: rerankMultimodalPrompts
       requestBody:
         required: true
@@ -176,8 +207,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Encoded media, image dimensions, or aggregate decoded pixels exceed the configured limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: Remote content fetch failed
           content:
             application/json:
               schema:
@@ -267,12 +316,28 @@ paths:
 
         Set `stream: true` to receive Server-Sent Events (SSE) with incremental
         token deltas. Each event contains a `ChatCompletionChunk` object.
-        The stream ends with `data: [DONE]`.
+        A successful stream ends with `data: [DONE]`. If generation or stream
+        writing fails after the HTTP response starts, the server instead emits
+        an `event: error` frame whose data is a plain-text error message, then
+        closes the stream without a `[DONE]` frame.
 
         ## Input Format
 
         Uses OpenAI-compatible chat format with messages array containing role
         (system, user, assistant) and content. Set `stream: true` for streaming responses.
+
+        Downloaded and inline encoded media is limited cumulatively across the request
+        to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
+        `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+        download limit disables nonempty media. Remote URL byte potential is reserved before
+        fetch; inline sources reserve their actual encoded size without adding it to the
+        existing request-body reservation. Accepted image headers are then validated and
+        decoded source pixels are admitted at a conservative 16 bytes per pixel against
+        the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+        concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
+        limits each source edge. Malformed images return 400, while dimension or aggregate
+        excess returns 413 before model loading. Initial capacity admission occurs before
+        media fetch, so an overloaded server returns 503 without fetching content.
       operationId: generateContent
       requestBody:
         required: true
@@ -298,8 +363,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Media content exceeds the per-object or aggregate decoded request size limit
           content:
             application/json:
               schema:
@@ -310,8 +387,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '502':
+          description: Remote content fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+        '507':
+          description: Generation request exceeds the configured memory budget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /generate/batch:
     post:
       summary: Generate text for a synchronous batch of requests
@@ -321,8 +410,18 @@ paths:
         native batched KV decoder; unsupported per-item options are returned as
         per-item errors without failing sibling requests.
 
+        A syntactically valid batch envelope returns HTTP 200 even when some or
+        all items fail. Clients must inspect each item's mutually exclusive
+        `response` and `error` fields, plus `summary`, rather than treating HTTP
+        200 as success for every item. Fatal service or envelope failures still
+        use non-2xx responses.
+
         This endpoint implements the synchronous form only. Future async durable
         batching will use the same request item shape with `mode: async`.
+
+        Batch generation is text-only. Image or other multimodal content parts are
+        rejected per item as `UNSUPPORTED_MULTIMODAL` before media fetch or model loading;
+        other item failures remain independently reported.
       operationId: generateBatchContent
       requestBody:
         required: true
@@ -332,13 +431,19 @@ paths:
               $ref: '#/components/schemas/GenerateBatchRequest'
       responses:
         '200':
-          description: Batch generation results in request order
+          description: Batch generation results in request order; item failures are represented in `data[].error`
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/GenerateBatchResponse'
         '400':
           description: Invalid batch envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Batch envelope contains more than 128 request items
           content:
             application/json:
               schema:
@@ -382,8 +487,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Media content exceeds the configured size limit
           content:
             application/json:
               schema:
@@ -394,8 +511,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '502':
+          description: Remote content fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+        '507':
+          description: Generation request exceeds the configured memory budget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /rewrite:
     post:
       summary: Rewrite text using Seq2Seq models
@@ -475,6 +604,22 @@ paths:
         - **Florence-2 Caption**: `<CAPTION>` for image description
         - **Pix2Struct**: natural-language questions like `What type of document is this?`
         - **Moondream**: natural-language prompts like `Describe this image.`
+
+        Image admission reserves the effective downloaded-byte ceiling at 16 MiB per
+        weighted capacity unit and at least one unit per two declared images. The effective
+        ceiling is the minimum of the configured per-image limit times image count, the
+        read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
+        `max_concurrent_requests`. Admission happens before model resolution or download.
+
+        After download, image headers are validated before model loading. Decoded source
+        pixels are admitted at a conservative 16 bytes per pixel against the lower of
+        512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+        setting still uses the finite 512 MiB ceiling. The reservation grows atomically
+        from downloaded-byte admission before inference. `max_image_dimension` limits
+        each source edge; malformed images return 400 and dimension or aggregate excess
+        returns 413. The same decoded-pixel policy covers generate/chat, dense embedding,
+        multimodal reranking, image `/extract`, and the embedded read, extract, and dense
+        embedding APIs. Batch generation rejects multimodal content before media fetch.
       operationId: readImages
       requestBody:
         required: true
@@ -495,14 +640,32 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '413':
+          description: Media content exceeds the configured size limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: Remote content fetch failed
           content:
             application/json:
               schema:
@@ -591,6 +754,10 @@ paths:
         canonical public API for named entity recognition, relation extraction,
         text/document classification, token classification, and structured
         document extraction.
+
+        Image-backed extraction uses the same byte-reserving and image-count-weighted
+        admission policy as `/read`, before model resolution or download. Text-only
+        extraction consumes one admission unit.
       operationId: extract
       requestBody:
         required: true
@@ -611,14 +778,32 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '413':
+          description: Media content exceeds the configured size limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: Remote content fetch failed
           content:
             application/json:
               schema:
@@ -701,7 +886,10 @@ paths:
         as OpenAI's `/v1/embeddings` API, served here under `/ai/v1/embeddings`.
         For sparse-capable models, each `data` item still uses the `embedding`
         field, but its value is a sparse vector object instead of a dense float array.
-        Use this endpoint for drop-in compatibility with OpenAI SDKs.
+        Dense image inputs are header-validated and admitted against the aggregate
+        decoded-pixel budget before model loading. Remote URL byte potential is reserved
+        before fetch; inline sources use their actual encoded size. Use this endpoint for
+        drop-in compatibility with OpenAI SDKs.
       operationId: createEmbedding
       requestBody:
         required: true
@@ -722,8 +910,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Encoded media, image dimensions, or aggregate decoded pixels exceed the configured limit
           content:
             application/json:
               schema:
@@ -732,6 +932,12 @@ paths:
           $ref: '#/components/responses/TransientCapacity'
         '500':
           description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: Remote content fetch failed
           content:
             application/json:
               schema:
@@ -832,7 +1038,8 @@ components:
             - request_queue
         retryable:
           type: boolean
-          description: Whether retrying the same request may succeed
+          x-go-type-skip-optional-pointer: false
+          description: Whether retrying the request may succeed
         retry_after_ms:
           type: integer
           minimum: 0
@@ -2149,13 +2356,15 @@ components:
               enum:
                 - function
             function:
-              type: object
-              required:
-                - name
-              properties:
-                name:
-                  type: string
-                  description: The name of the function to call
+              $ref: '#/components/schemas/ToolChoiceFunction'
+    ToolChoiceFunction:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: The name of the function to call
     Role:
       $ref: '../shared/generating.yaml#/components/schemas/ChatMessageRole'
     FinishReason:
@@ -2196,6 +2405,28 @@ components:
         tool_call_id:
           type: string
           description: ID of the tool call this message is responding to (only for role=tool)
+    GenerateStreamOptions:
+      type: object
+      description: Options that apply only to streamed generation responses.
+      properties:
+        include_usage:
+          type: boolean
+          description: |
+            When true, emit a final usage-only chunk before the `[DONE]` sentinel.
+            All preceding chunks carry null or omitted usage.
+          default: false
+    GenerateChatTemplateKwargs:
+      type: object
+      additionalProperties: false
+      description: Typed options passed to the model's chat template.
+      properties:
+        enable_thinking:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: |
+            Controls templates that support an `enable_thinking` variable. False asks the
+            template to open a public/final response channel directly. Omitted preserves the
+            model template's default behavior.
     GenerateRequest:
       type: object
       required:
@@ -2213,27 +2444,49 @@ components:
           description: Conversation messages (OpenAI-compatible format)
         max_tokens:
           type: integer
+          minimum: 1
+          maximum: 2147483647
           description: Maximum tokens to generate
           default: 256
           example: 256
         temperature:
           type: number
           format: float
+          x-go-type-skip-optional-pointer: false
           description: Sampling temperature (0.0 = deterministic, higher = more random)
-          default: 1
+          minimum: 0
+          maximum: 2
+          default: 0
           example: 0.7
         top_p:
           type: number
           format: float
+          x-go-type-skip-optional-pointer: false
           description: Nucleus sampling probability
-          default: 1
+          minimum: 0
+          maximum: 1
+          default: 0
         top_k:
           type: integer
+          x-go-type-skip-optional-pointer: false
+          minimum: 0
+          maximum: 2147483647
           description: Top-k sampling (inference extension, not in OpenAI API)
-          default: 50
+          default: 0
         stream:
           type: boolean
           description: If true, partial message deltas will be sent as SSE events
+          default: false
+        stream_options:
+          $ref: '#/components/schemas/GenerateStreamOptions'
+        chat_template_kwargs:
+          $ref: '#/components/schemas/GenerateChatTemplateKwargs'
+        ignore_eos:
+          type: boolean
+          description: |
+            inference-native benchmarking and controlled-generation extension. When true, generation
+            does not stop on the model's end-of-sequence token and continues until another stop
+            condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
           default: false
         tools:
           type: array
@@ -2246,21 +2499,29 @@ components:
           type: number
           format: float
           description: Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to top_p.
+          minimum: 0
+          maximum: 1
           default: 0
         repetition_penalty:
           type: number
           format: float
           description: Repetition penalty factor applied to previously generated tokens (1.0 = disabled, >1.0 penalizes, <1.0 encourages)
+          minimum: 0
+          exclusiveMinimum: true
           default: 1
         frequency_penalty:
           type: number
           format: float
           description: Additive penalty based on token frequency in context (logit -= frequency_penalty * count)
+          minimum: -2
+          maximum: 2
           default: 0
         presence_penalty:
           type: number
           format: float
           description: Additive penalty for tokens that appeared at all in context (logit -= presence_penalty if count > 0)
+          minimum: -2
+          maximum: 2
           default: 0
         response_format:
           $ref: '#/components/schemas/GenerateResponseFormat'
@@ -2282,7 +2543,25 @@ components:
           maximum: 16
           description: |
             inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
-          default: 4
+        speculation_policy:
+          type: string
+          enum:
+            - auto
+            - force
+            - "off"
+          description: |
+            inference-native speculative decoding policy: `auto`, `force`, or `off`.
+            Defaults to `auto` when a draft model is requested.
+        speculation_calibration:
+          type: string
+          enum:
+            - none
+            - probe
+            - positive
+          description: |
+            inference-native speculative decoding calibration state: `none`, `probe`, or `positive`.
+            Defaults to `probe` for `auto` draft requests so they are measured instead of silently disabled,
+            and to `none` for `force` or `off`.
         cache_dtype:
           type: string
           enum:
@@ -2298,11 +2577,14 @@ components:
           type: number
           format: float
           minimum: 0.0
+          exclusiveMinimum: true
           maximum: 1.0
           description: |
             inference-native KV cache compaction ratio applied after prefill via Attention Matching.
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+            The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
+            device-backed compaction is not yet supported.
         prompt_cache_key:
           type: string
           maxLength: 256
@@ -2314,6 +2596,9 @@ components:
           type: boolean
           description: |
             inference-native prompt prefix cache control. False bypasses prompt cache for this request.
+            On Metal, an eligible cache request stays on the eager paged-attention path instead of
+            automatically selecting whole-model compiled execution. Explicit `mode: compiled` is
+            rejected while prompt caching is active.
         backend:
           $ref: '#/components/schemas/ModelBackend'
         mode:
@@ -2398,6 +2683,28 @@ components:
           description: List of completion choices (currently always 1)
         usage:
           $ref: '#/components/schemas/GenerateUsage'
+        speculation:
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/GenerateSpeculationStatus'
+    GenerateSpeculationStatus:
+      type: object
+      description: Effective speculative-decoding decision for this completion.
+      required:
+        - policy
+        - calibration
+        - decision
+      properties:
+        policy:
+          type: string
+        calibration:
+          type: string
+        decision:
+          type: string
+        disabled_reason:
+          type: string
+          nullable: true
     GenerateBatchMode:
       type: string
       enum:
@@ -2436,6 +2743,7 @@ components:
       properties:
         code:
           type: string
+          description: Stable machine-readable item error code, including `CONTENT_TOO_LARGE` for aggregate media-budget failures.
         message:
           type: string
         retryable:
@@ -2568,6 +2876,20 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/GenerateChunkChoice'
+        usage:
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          description: |
+            Authoritative token accounting. When `stream_options.include_usage` is true,
+            streaming responses emit this only on the final chunk, after the finish chunk
+            and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
+          allOf:
+            - $ref: '#/components/schemas/GenerateUsage'
+        speculation:
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/GenerateSpeculationStatus'
     GenerateChunkChoice:
       type: object
       required:
@@ -2720,15 +3042,21 @@ components:
           type: string
           description: |
             Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
-            full KV blocks under prompt_cache_key with O(1) block lookup and is the
-            scalable production mode. `simple` keeps the linear-scan retained-prefix
-            cache and is only suitable for small caches or debugging.
+            full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an
+            opt-in page-aligned compressed radix tree with shared-prefix ownership and
+            leaf-only LRU eviction; it is currently qualified for native and Metal
+            backends. Eligible Metal requests use eager paged attention; explicit compiled
+            generation is incompatible with prompt caching. `simple` keeps the linear-scan
+            retained-prefix cache and is only suitable for small caches or debugging.
           enum:
             - simple
             - block_hash
+            - radix
           default: block_hash
         max_bytes_mb:
           type: integer
+          minimum: 0
+          maximum: 17592186044415
           description: |
             Node-wide target for live prompt-cache entries. The runtime divides it
             across participating model caches and evicts using estimated metadata
@@ -2737,10 +3065,13 @@ components:
           default: 512
         min_tokens:
           type: integer
+          minimum: 0
           description: Minimum prompt length eligible for prompt KV caching.
           default: 64
         ttl_ms:
           type: integer
+          minimum: 0
+          maximum: 9223372036854775807
           description: |
             Idle time-to-live for prompt KV cache entries. Refreshed on every cache
             hit, so only entries left unused for this duration expire.
@@ -2780,7 +3111,7 @@ components:
           example: ~/.antfly/inference/ml
         content_security:
           $ref: '#/components/schemas/ContentSecurityConfig'
-          description: Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts.
+          description: Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
         s3_credentials:
           $ref: '#/components/schemas/Credentials'
           description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
@@ -2806,12 +3137,9 @@ components:
         pool_size:
           type: integer
           description: |
-            Number of concurrent inference pipelines per model. Each pipeline loads
-            a copy of the model, so higher values use more memory but allow more
-            concurrent requests. Note: pool_size multiplies per-model memory
-            independently of max_loaded_models.
-          default: 1
-          example: 1
+            Legacy compatibility field. The current Zig inference runtime does not
+            create per-model pipeline pools from this setting; configuring it has no effect.
+          deprecated: true
         prompt_cache:
           $ref: '#/components/schemas/PromptCacheConfig'
           description: Native generator prompt KV cache settings.
@@ -2820,48 +3148,40 @@ components:
           items:
             $ref: '#/components/schemas/BackendPriorityEntry'
           description: |
-            Backend priority order for model loading with optional device specifiers.
-            Format: `backend` or `backend:device` where device defaults to `auto`.
-
-            Antfly inference tries entries in order and uses the first available backend+device
-            combination that supports the model.
-
-            **Examples**:
-            - `["native", "onnx", "xla"]` - Try backends with auto device detection
-            - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
-          default:
-            - native
-            - onnx
-            - xla
-          example:
-            - cuda
-            - onnx:cuda
-            - xla:tpu
-            - native
+            Legacy compatibility field. The current Zig inference runtime selects a
+            backend from model metadata, explicit preload settings, and compiled capabilities;
+            configuring this list has no effect.
+          deprecated: true
         max_concurrent_requests:
           type: integer
           description: |
-            Maximum number of concurrent inference requests allowed.
-            Additional requests will be queued up to max_queue_size.
-            Set to 0 for unlimited (default).
-          default: 0
-          example: 4
+            Maximum concurrent weighted inference admission units in the Zig runtime.
+            Request body size, generation workload, and image byte/count reservations
+            can consume more than one unit. Read and image-extraction admission reserves the
+            effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per
+            two images. A positive capacity also clamps each such request's downloaded-image
+            ceiling to 16 MiB times this value. Set to 0 disables both admission accounting
+            and that capacity-derived clamp.
+            When a positive limit is exhausted, new requests are rejected immediately
+            with 503 Service Unavailable and Retry-After: 1; they are not retained in
+            an in-process queue. Set to 0 only as an operational escape hatch for
+            trusted testing environments; unlimited admission is not recommended for
+            production native generation. Use a positive production limit. The default is 32.
+          minimum: 0
+          default: 32
+          example: 32
         max_queue_size:
           type: integer
           description: |
-            Maximum number of requests to queue when max_concurrent_requests is reached.
-            When the queue is full, new requests receive 503 Service Unavailable with Retry-After header.
-            Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
-          default: 0
-          example: 100
+            Legacy Go-runtime queue setting. The current Zig runtime does not retain
+            excess inference requests in memory and ignores this field.
+          deprecated: true
         request_timeout:
           type: string
           description: |
-            Maximum time to wait for a request to complete, including queue wait time.
-            Use Go duration format: "30s", "1m", "0" (no timeout, default).
-            Requests exceeding this timeout receive 504 Gateway Timeout.
-          default: '0'
-          example: 30s
+            Legacy Go-runtime queue/request timeout. The current Zig runtime ignores
+            this field; its HTTP listener applies a separate fixed transport timeout.
+          deprecated: true
         preload:
           type: array
           description: |
@@ -2880,13 +3200,9 @@ components:
         max_memory_mb:
           type: integer
           description: |
-            Maximum memory (in MB) to use for loaded models.
-            When this limit is approached, least recently used models are unloaded.
-            Set to 0 for unlimited (default). This is an advisory limit - actual memory
-            usage depends on model sizes and may temporarily exceed this value.
-            Works alongside max_loaded_models for fine-grained control.
-          default: 0
-          example: 4096
+            Legacy compatibility field. The current Zig runtime uses explicit host,
+            backend, combined, KV, and scratch budgets instead and ignores this field.
+          deprecated: true
         model_strategies:
           type: object
           additionalProperties:
@@ -2911,10 +3227,13 @@ components:
         allow_downloads:
           type: boolean
           description: |
-            Whether the dashboard should show model download commands.
-            Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed
-            deployments (e.g., Kubernetes operator) where models are managed externally.
+            Legacy compatibility field controlling whether dashboards show model
+            download commands. It defaults to true for standalone deployments;
+            managed deployments historically set it to false. Download-command
+            availability is a build-time setting in the current Zig runtime, so
+            configuring this field has no effect.
           default: true
+          deprecated: true
         log:
           $ref: '#/components/schemas/schemas-Config'
     BackendRuntimes:
@@ -2999,19 +3318,18 @@ components:
           description: 'Animation: display delay in milliseconds'
     ContentSecurityConfig:
       type: object
+      description: Inference merges configured fields over a fail-closed baseline. HTTP(S), file, and S3 content require explicit allowlists; data URIs remain allowed within the configured size budget.
       properties:
         allowed_hosts:
           type: array
-          description: Whitelist of allowed hostnames/IPs for link downloads. If empty, all hosts are allowed (except private IPs if block_private_ips is true).
+          description: Explicit HTTP(S) host allowlist for inference downloads. Omission and an explicit empty list both deny all hosts. With block_private_ips enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address.
           items:
             type: string
           example:
-            - example.com
-            - cdn.example.com
-            - 192.0.2.1
+            - 93.184.216.34
         block_private_ips:
           type: boolean
-          description: Block requests to private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)
+          description: Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special destinations.
           default: true
         max_download_size_bytes:
           type: integer
@@ -3022,19 +3340,16 @@ components:
           x-go-type: int64
         download_timeout_seconds:
           type: integer
-          description: Timeout for individual download operations in seconds
+          description: Maximum HTTP download duration in seconds. Defaults to 30; 0 disables the deadline.
           default: 30
-          minimum: 1
-          example: 30
+          minimum: 0
         max_image_dimension:
           type: integer
-          description: Maximum image width/height in pixels (images will be resized)
-          default: 2048
+          description: Maximum source-image width or height for accepted inference image inputs, including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation rejects multimodal content before fetch. Non-inference scraping consumers do not enforce this setting.
           minimum: 1
-          example: 2048
         allowed_paths:
           type: array
-          description: Whitelist of allowed path prefixes for file:// and s3:// URLs. If empty, all paths are allowed. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
+          description: Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission and an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
           items:
             type: string
           example:
@@ -3090,7 +3405,8 @@ components:
       example: terminal
     schemas-Config:
       type: object
-      description: Logging configuration for inference services
+      description: Legacy inference-local logging configuration. The current unified Zig runtime ignores it; configure the top-level `log` object instead.
+      deprecated: true
       properties:
         level:
           $ref: '#/components/schemas/Level'

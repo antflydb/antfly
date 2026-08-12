@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.inference_generate_response_object import InferenceGenerateResponseObject
+from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.inference_generate_choice import InferenceGenerateChoice
+    from ..models.inference_generate_speculation_status import InferenceGenerateSpeculationStatus
     from ..models.inference_generate_usage import InferenceGenerateUsage
 
 
@@ -27,6 +29,7 @@ class InferenceGenerateResponse:
         model (str): Model used for generation
         choices (list[InferenceGenerateChoice]): List of completion choices (currently always 1)
         usage (InferenceGenerateUsage):
+        speculation (InferenceGenerateSpeculationStatus | None | Unset):
     """
 
     id: str
@@ -35,9 +38,12 @@ class InferenceGenerateResponse:
     model: str
     choices: list[InferenceGenerateChoice]
     usage: InferenceGenerateUsage
+    speculation: InferenceGenerateSpeculationStatus | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.inference_generate_speculation_status import InferenceGenerateSpeculationStatus
+
         id = self.id
 
         object_ = self.object_.value
@@ -53,6 +59,14 @@ class InferenceGenerateResponse:
 
         usage = self.usage.to_dict()
 
+        speculation: dict[str, Any] | None | Unset
+        if isinstance(self.speculation, Unset):
+            speculation = UNSET
+        elif isinstance(self.speculation, InferenceGenerateSpeculationStatus):
+            speculation = self.speculation.to_dict()
+        else:
+            speculation = self.speculation
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -65,12 +79,15 @@ class InferenceGenerateResponse:
                 "usage": usage,
             }
         )
+        if speculation is not UNSET:
+            field_dict["speculation"] = speculation
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.inference_generate_choice import InferenceGenerateChoice
+        from ..models.inference_generate_speculation_status import InferenceGenerateSpeculationStatus
         from ..models.inference_generate_usage import InferenceGenerateUsage
 
         d = dict(src_dict)
@@ -91,6 +108,23 @@ class InferenceGenerateResponse:
 
         usage = InferenceGenerateUsage.from_dict(d.pop("usage"))
 
+        def _parse_speculation(data: object) -> InferenceGenerateSpeculationStatus | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                speculation_type_1 = InferenceGenerateSpeculationStatus.from_dict(data)
+
+                return speculation_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(InferenceGenerateSpeculationStatus | None | Unset, data)
+
+        speculation = _parse_speculation(d.pop("speculation", UNSET))
+
         inference_generate_response = cls(
             id=id,
             object_=object_,
@@ -98,6 +132,7 @@ class InferenceGenerateResponse:
             model=model,
             choices=choices,
             usage=usage,
+            speculation=speculation,
         )
 
         inference_generate_response.additional_properties = d

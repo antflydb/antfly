@@ -44,15 +44,35 @@ def _parse_response(
 
         return response_400
 
+    if response.status_code == 401:
+        response_401 = InferenceError.from_dict(response.json())
+
+        return response_401
+
+    if response.status_code == 403:
+        response_403 = InferenceError.from_dict(response.json())
+
+        return response_403
+
     if response.status_code == 404:
         response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
+    if response.status_code == 413:
+        response_413 = InferenceError.from_dict(response.json())
+
+        return response_413
+
     if response.status_code == 500:
         response_500 = InferenceError.from_dict(response.json())
 
         return response_500
+
+    if response.status_code == 502:
+        response_502 = InferenceError.from_dict(response.json())
+
+        return response_502
 
     if response.status_code == 503:
         response_503 = InferenceTransientCapacityError.from_dict(response.json())
@@ -87,7 +107,10 @@ def sync_detailed(
     as OpenAI's `/v1/embeddings` API, served here under `/ai/v1/embeddings`.
     For sparse-capable models, each `data` item still uses the `embedding`
     field, but its value is a sparse vector object instead of a dense float array.
-    Use this endpoint for drop-in compatibility with OpenAI SDKs.
+    Dense image inputs are header-validated and admitted against the aggregate
+    decoded-pixel budget before model loading. Remote URL byte potential is reserved
+    before fetch; inline sources use their actual encoded size. Use this endpoint for
+    drop-in compatibility with OpenAI SDKs.
 
     Args:
         body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
@@ -123,7 +146,10 @@ def sync(
     as OpenAI's `/v1/embeddings` API, served here under `/ai/v1/embeddings`.
     For sparse-capable models, each `data` item still uses the `embedding`
     field, but its value is a sparse vector object instead of a dense float array.
-    Use this endpoint for drop-in compatibility with OpenAI SDKs.
+    Dense image inputs are header-validated and admitted against the aggregate
+    decoded-pixel budget before model loading. Remote URL byte potential is reserved
+    before fetch; inline sources use their actual encoded size. Use this endpoint for
+    drop-in compatibility with OpenAI SDKs.
 
     Args:
         body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
@@ -154,7 +180,10 @@ async def asyncio_detailed(
     as OpenAI's `/v1/embeddings` API, served here under `/ai/v1/embeddings`.
     For sparse-capable models, each `data` item still uses the `embedding`
     field, but its value is a sparse vector object instead of a dense float array.
-    Use this endpoint for drop-in compatibility with OpenAI SDKs.
+    Dense image inputs are header-validated and admitted against the aggregate
+    decoded-pixel budget before model loading. Remote URL byte potential is reserved
+    before fetch; inline sources use their actual encoded size. Use this endpoint for
+    drop-in compatibility with OpenAI SDKs.
 
     Args:
         body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
@@ -188,7 +217,10 @@ async def asyncio(
     as OpenAI's `/v1/embeddings` API, served here under `/ai/v1/embeddings`.
     For sparse-capable models, each `data` item still uses the `embedding`
     field, but its value is a sparse vector object instead of a dense float array.
-    Use this endpoint for drop-in compatibility with OpenAI SDKs.
+    Dense image inputs are header-validated and admitted against the aggregate
+    decoded-pixel budget before model loading. Remote URL byte potential is reserved
+    before fetch; inline sources use their actual encoded size. Use this endpoint for
+    drop-in compatibility with OpenAI SDKs.
 
     Args:
         body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference

@@ -753,6 +753,26 @@ spec:
                 properties:
                   admin:
                     properties:
+                      directPrerequisiteTimeoutSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      directReservationSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      directRetryBaseSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      directRetryLimit:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      directRetryMaxSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
                       envFrom:
                         items:
                           properties:
@@ -791,6 +811,10 @@ spec:
                         type: integer
                       primaryURL:
                         type: string
+                      retryGeneration:
+                        format: int64
+                        minimum: 0
+                        type: integer
                       tokenEnvVar:
                         pattern: ^$|^[A-Za-z_][A-Za-z0-9_]*$
                         type: string
@@ -1637,6 +1661,17 @@ spec:
                       maximumLagLSN:
                         format: int64
                         type: integer
+                      minimumConsecutiveFailures:
+                        default: 3
+                        format: int32
+                        minimum: 2
+                        type: integer
+                      minimumUnreachableDurationSeconds:
+                        default: 30
+                        format: int32
+                        maximum: 3600
+                        minimum: 1
+                        type: integer
                       requireRemoteApply:
                         default: true
                         type: boolean
@@ -1699,6 +1734,24 @@ spec:
                         x-kubernetes-map-type: atomic
                       fencePath:
                         type: string
+                      fencingLease:
+                        properties:
+                          name:
+                            minLength: 1
+                            type: string
+                          topologyID:
+                            minLength: 1
+                            type: string
+                          watchdogGraceSeconds:
+                            default: 10
+                            format: int32
+                            maximum: 29
+                            minimum: 10
+                            type: integer
+                        required:
+                        - name
+                        - topologyID
+                        type: object
                       formerPrimaryLogPath:
                         type: string
                       nodeID:
@@ -1716,6 +1769,8 @@ spec:
                         - Primary
                         - Standby
                         type: string
+                      seedCaptureRoot:
+                        type: string
                       standby:
                         properties:
                           logPath:
@@ -1726,6 +1781,65 @@ spec:
                             type: string
                           upstreamURL:
                             type: string
+                        type: object
+                      startupGate:
+                        properties:
+                          policy:
+                            enum:
+                            - Suspend
+                            - RequireActivatedSeed
+                            type: string
+                          receiptMatchPolicy:
+                            enum:
+                            - Exact
+                            type: string
+                          requiredReceipt:
+                            properties:
+                              aggregateSHA256:
+                                type: string
+                              captureReceiptSHA256:
+                                type: string
+                              generation:
+                                type: string
+                              manifestSHA256:
+                                type: string
+                              materializedAggregateSHA256:
+                                type: string
+                              materializedReceiptSHA256:
+                                type: string
+                              nodeID:
+                                type: string
+                              seedReceiptSHA256:
+                                type: string
+                              slotName:
+                                type: string
+                              targetLocalNodeID:
+                                format: int64
+                                type: integer
+                              targetPVCName:
+                                type: string
+                              targetPVCUID:
+                                type: string
+                              targetReplicaID:
+                                format: int64
+                                type: integer
+                              topologyGeneration:
+                                format: int64
+                                type: integer
+                              topologyID:
+                                type: string
+                            required:
+                            - generation
+                            - nodeID
+                            - slotName
+                            - targetPVCName
+                            - topologyID
+                            type: object
+                          runtimeEligible:
+                            type: boolean
+                        required:
+                        - policy
+                        - runtimeEligible
                         type: object
                     required:
                     - nodeID
@@ -1750,6 +1864,65 @@ spec:
                         routeSelector:
                           additionalProperties:
                             type: string
+                          type: object
+                        seedArtifact:
+                          properties:
+                            credentialsSecretRef:
+                              properties:
+                                name:
+                                  default: ""
+                                  type: string
+                              type: object
+                              x-kubernetes-map-type: atomic
+                            generation:
+                              pattern: ^[A-Za-z0-9_.:-]+$
+                              type: string
+                            generationPrefix:
+                              pattern: ^[A-Za-z0-9_.:-]+$
+                              type: string
+                            location:
+                              pattern: ^(s3://|gs://|file://).+
+                              type: string
+                            nodeID:
+                              type: string
+                            retainGenerations:
+                              format: int32
+                              minimum: 1
+                              type: integer
+                            sourcePVC:
+                              properties:
+                                claimName:
+                                  type: string
+                                mountPath:
+                                  type: string
+                              required:
+                              - claimName
+                              - mountPath
+                              type: object
+                            stagingRoot:
+                              pattern: ^/.*
+                              type: string
+                            targetPVC:
+                              properties:
+                                claimName:
+                                  type: string
+                                mountPath:
+                                  type: string
+                              required:
+                              - claimName
+                              - mountPath
+                              type: object
+                            targetPVCUID:
+                              type: string
+                            topologyGeneration:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            topologyID:
+                              type: string
+                          required:
+                          - location
+                          - stagingRoot
                           type: object
                         seedContentRoot:
                           type: string
@@ -3340,6 +3513,7 @@ spec:
                 enum:
                 - Distributed
                 - Standalone
+                - Swarm
                 type: string
               productTier:
                 properties:
@@ -3912,6 +4086,12 @@ spec:
                   replicas:
                     format: int32
                     type: integer
+                  resourceIdentity:
+                    default: StandaloneV1
+                    enum:
+                    - StandaloneV1
+                    - LegacySwarmV1
+                    type: string
                   resources:
                     properties:
                       cpu:
@@ -4078,9 +4258,648 @@ spec:
                         type: string
                       maxStandaloneStorage:
                         type: string
+                      maxSwarmStorage:
+                        type: string
                     type: object
                   storageClass:
                     type: string
+                  swarmStorage:
+                    type: string
+                type: object
+              swarm:
+                properties:
+                  affinity:
+                    properties:
+                      nodeAffinity:
+                        properties:
+                          preferredDuringSchedulingIgnoredDuringExecution:
+                            items:
+                              properties:
+                                preference:
+                                  properties:
+                                    matchExpressions:
+                                      items:
+                                        properties:
+                                          key:
+                                            type: string
+                                          operator:
+                                            type: string
+                                          values:
+                                            items:
+                                              type: string
+                                            type: array
+                                            x-kubernetes-list-type: atomic
+                                        required:
+                                        - key
+                                        - operator
+                                        type: object
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    matchFields:
+                                      items:
+                                        properties:
+                                          key:
+                                            type: string
+                                          operator:
+                                            type: string
+                                          values:
+                                            items:
+                                              type: string
+                                            type: array
+                                            x-kubernetes-list-type: atomic
+                                        required:
+                                        - key
+                                        - operator
+                                        type: object
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                                weight:
+                                  format: int32
+                                  type: integer
+                              required:
+                              - preference
+                              - weight
+                              type: object
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          requiredDuringSchedulingIgnoredDuringExecution:
+                            properties:
+                              nodeSelectorTerms:
+                                items:
+                                  properties:
+                                    matchExpressions:
+                                      items:
+                                        properties:
+                                          key:
+                                            type: string
+                                          operator:
+                                            type: string
+                                          values:
+                                            items:
+                                              type: string
+                                            type: array
+                                            x-kubernetes-list-type: atomic
+                                        required:
+                                        - key
+                                        - operator
+                                        type: object
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    matchFields:
+                                      items:
+                                        properties:
+                                          key:
+                                            type: string
+                                          operator:
+                                            type: string
+                                          values:
+                                            items:
+                                              type: string
+                                            type: array
+                                            x-kubernetes-list-type: atomic
+                                        required:
+                                        - key
+                                        - operator
+                                        type: object
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                                type: array
+                                x-kubernetes-list-type: atomic
+                            required:
+                            - nodeSelectorTerms
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        type: object
+                      podAffinity:
+                        properties:
+                          preferredDuringSchedulingIgnoredDuringExecution:
+                            items:
+                              properties:
+                                podAffinityTerm:
+                                  properties:
+                                    labelSelector:
+                                      properties:
+                                        matchExpressions:
+                                          items:
+                                            properties:
+                                              key:
+                                                type: string
+                                              operator:
+                                                type: string
+                                              values:
+                                                items:
+                                                  type: string
+                                                type: array
+                                                x-kubernetes-list-type: atomic
+                                            required:
+                                            - key
+                                            - operator
+                                            type: object
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                        matchLabels:
+                                          additionalProperties:
+                                            type: string
+                                          type: object
+                                      type: object
+                                      x-kubernetes-map-type: atomic
+                                    matchLabelKeys:
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    mismatchLabelKeys:
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    namespaceSelector:
+                                      properties:
+                                        matchExpressions:
+                                          items:
+                                            properties:
+                                              key:
+                                                type: string
+                                              operator:
+                                                type: string
+                                              values:
+                                                items:
+                                                  type: string
+                                                type: array
+                                                x-kubernetes-list-type: atomic
+                                            required:
+                                            - key
+                                            - operator
+                                            type: object
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                        matchLabels:
+                                          additionalProperties:
+                                            type: string
+                                          type: object
+                                      type: object
+                                      x-kubernetes-map-type: atomic
+                                    namespaces:
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    topologyKey:
+                                      type: string
+                                  required:
+                                  - topologyKey
+                                  type: object
+                                weight:
+                                  format: int32
+                                  type: integer
+                              required:
+                              - podAffinityTerm
+                              - weight
+                              type: object
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          requiredDuringSchedulingIgnoredDuringExecution:
+                            items:
+                              properties:
+                                labelSelector:
+                                  properties:
+                                    matchExpressions:
+                                      items:
+                                        properties:
+                                          key:
+                                            type: string
+                                          operator:
+                                            type: string
+                                          values:
+                                            items:
+                                              type: string
+                                            type: array
+                                            x-kubernetes-list-type: atomic
+                                        required:
+                                        - key
+                                        - operator
+                                        type: object
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    matchLabels:
+                                      additionalProperties:
+                                        type: string
+                                      type: object
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                                matchLabelKeys:
+                                  items:
+                                    type: string
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                                mismatchLabelKeys:
+                                  items:
+                                    type: string
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                                namespaceSelector:
+                                  properties:
+                                    matchExpressions:
+                                      items:
+                                        properties:
+                                          key:
+                                            type: string
+                                          operator:
+                                            type: string
+                                          values:
+                                            items:
+                                              type: string
+                                            type: array
+                                            x-kubernetes-list-type: atomic
+                                        required:
+                                        - key
+                                        - operator
+                                        type: object
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    matchLabels:
+                                      additionalProperties:
+                                        type: string
+                                      type: object
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                                namespaces:
+                                  items:
+                                    type: string
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                                topologyKey:
+                                  type: string
+                              required:
+                              - topologyKey
+                              type: object
+                            type: array
+                            x-kubernetes-list-type: atomic
+                        type: object
+                      podAntiAffinity:
+                        properties:
+                          preferredDuringSchedulingIgnoredDuringExecution:
+                            items:
+                              properties:
+                                podAffinityTerm:
+                                  properties:
+                                    labelSelector:
+                                      properties:
+                                        matchExpressions:
+                                          items:
+                                            properties:
+                                              key:
+                                                type: string
+                                              operator:
+                                                type: string
+                                              values:
+                                                items:
+                                                  type: string
+                                                type: array
+                                                x-kubernetes-list-type: atomic
+                                            required:
+                                            - key
+                                            - operator
+                                            type: object
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                        matchLabels:
+                                          additionalProperties:
+                                            type: string
+                                          type: object
+                                      type: object
+                                      x-kubernetes-map-type: atomic
+                                    matchLabelKeys:
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    mismatchLabelKeys:
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    namespaceSelector:
+                                      properties:
+                                        matchExpressions:
+                                          items:
+                                            properties:
+                                              key:
+                                                type: string
+                                              operator:
+                                                type: string
+                                              values:
+                                                items:
+                                                  type: string
+                                                type: array
+                                                x-kubernetes-list-type: atomic
+                                            required:
+                                            - key
+                                            - operator
+                                            type: object
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                        matchLabels:
+                                          additionalProperties:
+                                            type: string
+                                          type: object
+                                      type: object
+                                      x-kubernetes-map-type: atomic
+                                    namespaces:
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    topologyKey:
+                                      type: string
+                                  required:
+                                  - topologyKey
+                                  type: object
+                                weight:
+                                  format: int32
+                                  type: integer
+                              required:
+                              - podAffinityTerm
+                              - weight
+                              type: object
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          requiredDuringSchedulingIgnoredDuringExecution:
+                            items:
+                              properties:
+                                labelSelector:
+                                  properties:
+                                    matchExpressions:
+                                      items:
+                                        properties:
+                                          key:
+                                            type: string
+                                          operator:
+                                            type: string
+                                          values:
+                                            items:
+                                              type: string
+                                            type: array
+                                            x-kubernetes-list-type: atomic
+                                        required:
+                                        - key
+                                        - operator
+                                        type: object
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    matchLabels:
+                                      additionalProperties:
+                                        type: string
+                                      type: object
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                                matchLabelKeys:
+                                  items:
+                                    type: string
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                                mismatchLabelKeys:
+                                  items:
+                                    type: string
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                                namespaceSelector:
+                                  properties:
+                                    matchExpressions:
+                                      items:
+                                        properties:
+                                          key:
+                                            type: string
+                                          operator:
+                                            type: string
+                                          values:
+                                            items:
+                                              type: string
+                                            type: array
+                                            x-kubernetes-list-type: atomic
+                                        required:
+                                        - key
+                                        - operator
+                                        type: object
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    matchLabels:
+                                      additionalProperties:
+                                        type: string
+                                      type: object
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                                namespaces:
+                                  items:
+                                    type: string
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                                topologyKey:
+                                  type: string
+                              required:
+                              - topologyKey
+                              type: object
+                            type: array
+                            x-kubernetes-list-type: atomic
+                        type: object
+                    type: object
+                  envFrom:
+                    items:
+                      properties:
+                        configMapRef:
+                          properties:
+                            name:
+                              default: ""
+                              type: string
+                            optional:
+                              type: boolean
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        prefix:
+                          type: string
+                        secretRef:
+                          properties:
+                            name:
+                              default: ""
+                              type: string
+                            optional:
+                              type: boolean
+                          type: object
+                          x-kubernetes-map-type: atomic
+                      type: object
+                    type: array
+                  health:
+                    properties:
+                      host:
+                        type: string
+                      port:
+                        format: int32
+                        type: integer
+                    type: object
+                  inference:
+                    properties:
+                      apiURL:
+                        type: string
+                      enabled:
+                        type: boolean
+                    type: object
+                  metadataAPI:
+                    properties:
+                      host:
+                        type: string
+                      port:
+                        format: int32
+                        type: integer
+                    type: object
+                  metadataRaft:
+                    properties:
+                      host:
+                        type: string
+                      port:
+                        format: int32
+                        type: integer
+                    type: object
+                  nodeID:
+                    format: int32
+                    type: integer
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  replicas:
+                    format: int32
+                    type: integer
+                  resourceIdentity:
+                    default: StandaloneV1
+                    enum:
+                    - StandaloneV1
+                    - LegacySwarmV1
+                    type: string
+                  resources:
+                    properties:
+                      cpu:
+                        type: string
+                      limits:
+                        properties:
+                          cpu:
+                            type: string
+                          gpu:
+                            type: string
+                          memory:
+                            type: string
+                        type: object
+                      memory:
+                        type: string
+                    required:
+                    - limits
+                    type: object
+                  startupProbe:
+                    properties:
+                      failureThreshold:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      periodSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      timeoutSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    type: object
+                  storeAPI:
+                    properties:
+                      host:
+                        type: string
+                      port:
+                        format: int32
+                        type: integer
+                    type: object
+                  storeRaft:
+                    properties:
+                      host:
+                        type: string
+                      port:
+                        format: int32
+                        type: integer
+                    type: object
+                  tolerations:
+                    items:
+                      properties:
+                        effect:
+                          type: string
+                        key:
+                          type: string
+                        operator:
+                          type: string
+                        tolerationSeconds:
+                          format: int64
+                          type: integer
+                        value:
+                          type: string
+                      type: object
+                    type: array
+                  topologySpreadConstraints:
+                    items:
+                      properties:
+                        labelSelector:
+                          properties:
+                            matchExpressions:
+                              items:
+                                properties:
+                                  key:
+                                    type: string
+                                  operator:
+                                    type: string
+                                  values:
+                                    items:
+                                      type: string
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - key
+                                - operator
+                                type: object
+                              type: array
+                              x-kubernetes-list-type: atomic
+                            matchLabels:
+                              additionalProperties:
+                                type: string
+                              type: object
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        matchLabelKeys:
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        maxSkew:
+                          format: int32
+                          type: integer
+                        minDomains:
+                          format: int32
+                          type: integer
+                        nodeAffinityPolicy:
+                          type: string
+                        nodeTaintsPolicy:
+                          type: string
+                        topologyKey:
+                          type: string
+                        whenUnsatisfiable:
+                          type: string
+                      required:
+                      - maxSkew
+                      - topologyKey
+                      - whenUnsatisfiable
+                      type: object
+                    type: array
+                required:
+                - resources
                 type: object
             required:
             - config
@@ -4377,9 +5196,13 @@ spec:
                               type: string
                             actionTarget:
                               type: string
+                            aggregateSHA256:
+                              type: string
                             backupLSN:
                               format: int64
                               type: integer
+                            captureReceiptSHA256:
+                              type: string
                             checkpointLSN:
                               format: int64
                               type: integer
@@ -4438,6 +5261,8 @@ spec:
                               type: string
                             manifestID:
                               type: string
+                            manifestSHA256:
+                              type: string
                             promotionAppliedLSN:
                               format: int64
                               type: integer
@@ -4463,6 +5288,9 @@ spec:
                               type: boolean
                             promotionSafe:
                               type: boolean
+                            rawReceiptJSON:
+                              maxLength: 65536
+                              type: string
                             rejoinAction:
                               type: string
                             rejoinReason:
@@ -4495,6 +5323,41 @@ spec:
                             schemaVersion:
                               format: int32
                               type: integer
+                            seedAlreadyCaptured:
+                              type: boolean
+                            seedArtifactGeneration:
+                              type: string
+                            seedClusterID:
+                              format: int64
+                              type: integer
+                            seedContentRoot:
+                              type: string
+                            seedEpoch:
+                              format: int64
+                              type: integer
+                            seedFileCount:
+                              format: int64
+                              type: integer
+                            seedGenerationRoot:
+                              type: string
+                            seedManifestPath:
+                              type: string
+                            seedReceiptSHA256:
+                              type: string
+                            seedShardID:
+                              format: int64
+                              type: integer
+                            seedSourcePlanSHA256:
+                              type: string
+                            seedTableID:
+                              format: int64
+                              type: integer
+                            seedTimelineID:
+                              format: int64
+                              type: integer
+                            seedTotalBytes:
+                              format: int64
+                              type: integer
                             slotAction:
                               type: string
                             slotName:
@@ -4513,8 +5376,21 @@ spec:
                           type: integer
                         adminURL:
                           type: string
+                        attemptCount:
+                          format: int32
+                          type: integer
+                        attemptID:
+                          type: string
+                        completedAt:
+                          format: date-time
+                          type: string
                         dependsOn:
                           type: string
+                        errorClass:
+                          type: string
+                        executionStateVersion:
+                          format: int32
+                          type: integer
                         executor:
                           type: string
                         fenceAuthority:
@@ -4526,21 +5402,346 @@ spec:
                           type: string
                         fenceReason:
                           type: string
+                        firstAttemptAt:
+                          format: date-time
+                          type: string
+                        inFlightAttempt:
+                          format: int32
+                          type: integer
                         kind:
+                          type: string
+                        lastAttemptAt:
+                          format: date-time
+                          type: string
+                        nextRetryAt:
+                          format: date-time
                           type: string
                         observedLSN:
                           format: int64
                           type: integer
+                        operationID:
+                          type: string
                         phase:
                           type: string
+                        physicalIsolationReceipt:
+                          properties:
+                            absencePodListResourceVersion:
+                              type: string
+                            absenceProven:
+                              type: boolean
+                            clusterUID:
+                              type: string
+                            completedAt:
+                              format: date-time
+                              type: string
+                            frozenBoundaryLSN:
+                              format: int64
+                              type: integer
+                            initialOldPods:
+                              items:
+                                properties:
+                                  name:
+                                    type: string
+                                  uid:
+                                    type: string
+                                required:
+                                - name
+                                - uid
+                                type: object
+                              maxItems: 256
+                              type: array
+                            initialPodListResourceVersion:
+                              type: string
+                            initialStatefulSetGeneration:
+                              format: int64
+                              type: integer
+                            initialStatefulSetResourceVersion:
+                              type: string
+                            isolatedStatefulSetGeneration:
+                              format: int64
+                              type: integer
+                            isolatedStatefulSetObservedGeneration:
+                              format: int64
+                              type: integer
+                            isolatedStatefulSetResourceVersion:
+                              type: string
+                            leaseGeneration:
+                              format: int64
+                              type: integer
+                            leaseHolder:
+                              type: string
+                            leaseName:
+                              type: string
+                            leaseResourceVersion:
+                              type: string
+                            leaseScope:
+                              properties:
+                                clusterID:
+                                  format: int64
+                                  type: integer
+                                currentPrimaryID:
+                                  type: string
+                                epoch:
+                                  format: int64
+                                  type: integer
+                                primaryLSN:
+                                  format: int64
+                                  type: integer
+                                shardID:
+                                  format: int64
+                                  type: integer
+                                tableID:
+                                  format: int64
+                                  type: integer
+                                timelineID:
+                                  format: int64
+                                  type: integer
+                                topologyID:
+                                  type: string
+                              required:
+                              - clusterID
+                              - currentPrimaryID
+                              - epoch
+                              - primaryLSN
+                              - timelineID
+                              - topologyID
+                              type: object
+                            leaseTransferTime:
+                              format: date-time
+                              type: string
+                            leaseUID:
+                              type: string
+                            observedAt:
+                              format: date-time
+                              type: string
+                            observedLeaseResourceVersion:
+                              type: string
+                            statefulSetName:
+                              type: string
+                            statefulSetUID:
+                              type: string
+                            watchdogMaxFenceLatencyMS:
+                              format: int32
+                              type: integer
+                            watchdogProof:
+                              properties:
+                                active:
+                                  type: boolean
+                                authorityGranted:
+                                  type: boolean
+                                capabilityVersion:
+                                  format: int32
+                                  type: integer
+                                containerID:
+                                  type: string
+                                containerName:
+                                  type: string
+                                containerRestartCount:
+                                  format: int32
+                                  type: integer
+                                containerStartedAt:
+                                  format: date-time
+                                  type: string
+                                leaseName:
+                                  type: string
+                                leaseNamespace:
+                                  type: string
+                                localNodeID:
+                                  type: string
+                                maxFenceLatencyMS:
+                                  format: int32
+                                  type: integer
+                                observedHolderNodeID:
+                                  type: string
+                                observedLeaseTransitions:
+                                  format: int32
+                                  type: integer
+                                podName:
+                                  type: string
+                                podUID:
+                                  type: string
+                                processBootID:
+                                  type: string
+                                runtimeObservedAt:
+                                  format: date-time
+                                  type: string
+                                topologyID:
+                                  type: string
+                              required:
+                              - active
+                              - authorityGranted
+                              - capabilityVersion
+                              - containerID
+                              - containerName
+                              - containerRestartCount
+                              - containerStartedAt
+                              - leaseName
+                              - leaseNamespace
+                              - localNodeID
+                              - maxFenceLatencyMS
+                              - observedHolderNodeID
+                              - observedLeaseTransitions
+                              - podName
+                              - podUID
+                              - processBootID
+                              - runtimeObservedAt
+                              - topologyID
+                              type: object
+                          required:
+                          - clusterUID
+                          - initialPodListResourceVersion
+                          - initialStatefulSetGeneration
+                          - initialStatefulSetResourceVersion
+                          - leaseGeneration
+                          - leaseHolder
+                          - leaseName
+                          - leaseResourceVersion
+                          - leaseScope
+                          - leaseTransferTime
+                          - leaseUID
+                          - statefulSetName
+                          - statefulSetUID
+                          - watchdogMaxFenceLatencyMS
+                          type: object
+                        prerequisiteDeadlineAt:
+                          format: date-time
+                          type: string
                         reason:
+                          type: string
+                        reservationExpiresAt:
+                          format: date-time
                           type: string
                         retainedFromLSN:
                           format: int64
                           type: integer
+                        retryBudgetUsed:
+                          format: int32
+                          type: integer
+                        retryGeneration:
+                          format: int64
+                          type: integer
+                        retryable:
+                          type: boolean
                         routeFrom:
                           type: string
                         routeTo:
+                          type: string
+                        seedArtifactCaptureRoot:
+                          type: string
+                        seedArtifactGeneration:
+                          type: string
+                        seedArtifactLocation:
+                          type: string
+                        seedArtifactProtectedGenerations:
+                          items:
+                            type: string
+                          maxItems: 256
+                          type: array
+                        seedArtifactReceipt:
+                          properties:
+                            actionKind:
+                              type: string
+                            aggregateSHA256:
+                              type: string
+                            backupLSN:
+                              format: int64
+                              type: integer
+                            captureReceiptSHA256:
+                              type: string
+                            checkpointLSN:
+                              format: int64
+                              type: integer
+                            checkpointSHA256:
+                              type: string
+                            clusterID:
+                              format: int64
+                              type: integer
+                            deletedCount:
+                              format: int32
+                              type: integer
+                            epoch:
+                              format: int64
+                              type: integer
+                            fileCount:
+                              format: int32
+                              type: integer
+                            formatVersion:
+                              format: int32
+                              type: integer
+                            generation:
+                              type: string
+                            generationPath:
+                              type: string
+                            manifestID:
+                              type: string
+                            manifestSHA256:
+                              type: string
+                            materializedAggregateSHA256:
+                              type: string
+                            materializedReceiptSHA256:
+                              type: string
+                            nodeID:
+                              type: string
+                            protectedCount:
+                              format: int32
+                              type: integer
+                            rawGenerationPath:
+                              type: string
+                            resumedTombstoneCount:
+                              format: int32
+                              type: integer
+                            retainedCount:
+                              format: int32
+                              type: integer
+                            scope:
+                              type: string
+                            seedReceiptSHA256:
+                              type: string
+                            shardID:
+                              format: int64
+                              type: integer
+                            skippedIneligibleCount:
+                              format: int32
+                              type: integer
+                            slotName:
+                              type: string
+                            tableID:
+                              format: int64
+                              type: integer
+                            targetLocalNodeID:
+                              format: int64
+                              type: integer
+                            targetPVCName:
+                              type: string
+                            targetPVCUID:
+                              type: string
+                            targetReplicaID:
+                              format: int64
+                              type: integer
+                            timelineID:
+                              format: int64
+                              type: integer
+                            topologyGeneration:
+                              format: int64
+                              type: integer
+                            topologyID:
+                              type: string
+                            totalBytes:
+                              format: int64
+                              type: integer
+                          required:
+                          - formatVersion
+                          - generation
+                          - slotName
+                          type: object
+                        seedArtifactRetainGenerations:
+                          format: int32
+                          type: integer
+                        seedArtifactTargetRoot:
+                          type: string
+                        seedCaptureReceiptPath:
+                          type: string
+                        seedCaptureReceiptSHA256:
                           type: string
                         seedContentRoot:
                           type: string
@@ -4548,19 +5749,48 @@ spec:
                           type: string
                         slotName:
                           type: string
+                        sourcePVCName:
+                          type: string
+                        sourcePVCUID:
+                          type: string
                         standbyName:
                           type: string
                         targetLSN:
                           format: int64
                           type: integer
+                        targetLocalNodeID:
+                          format: int64
+                          type: integer
+                        targetPVCName:
+                          type: string
+                        targetPVCUID:
+                          type: string
+                        targetReplicaID:
+                          format: int64
+                          type: integer
+                        topologyGeneration:
+                          format: int64
+                          type: integer
+                        topologyID:
+                          type: string
+                        topologyNodeID:
+                          type: string
                       type: object
                     type: array
+                  primaryAdminConsecutiveFailures:
+                    format: int32
+                    type: integer
+                  primaryAdminFailureThresholdMet:
+                    type: boolean
                   primaryAdminLastError:
                     type: string
                   primaryAdminReachable:
                     type: boolean
                   primaryAdminStatusCode:
                     type: integer
+                  primaryAdminUnreachableSince:
+                    format: date-time
+                    type: string
                   primaryLSN:
                     format: int64
                     type: integer
@@ -4583,6 +5813,57 @@ spec:
                         type: string
                       stale:
                         type: boolean
+                    type: object
+                  primaryWatchdogProof:
+                    properties:
+                      active:
+                        type: boolean
+                      authorityGranted:
+                        type: boolean
+                      authorityRemainingMS:
+                        format: int32
+                        type: integer
+                      capabilityVersion:
+                        format: int32
+                        type: integer
+                      leaseName:
+                        type: string
+                      leaseNamespace:
+                        type: string
+                      localNodeID:
+                        type: string
+                      maxFenceLatencyMS:
+                        format: int32
+                        type: integer
+                      observedAt:
+                        format: date-time
+                        type: string
+                      observedHolderNodeID:
+                        type: string
+                      observedLeaseTransitions:
+                        format: int32
+                        type: integer
+                      podUID:
+                        type: string
+                      processBootID:
+                        type: string
+                      topologyID:
+                        type: string
+                    required:
+                    - active
+                    - authorityGranted
+                    - authorityRemainingMS
+                    - capabilityVersion
+                    - leaseName
+                    - leaseNamespace
+                    - localNodeID
+                    - maxFenceLatencyMS
+                    - observedAt
+                    - observedHolderNodeID
+                    - observedLeaseTransitions
+                    - podUID
+                    - processBootID
+                    - topologyID
                     type: object
                   readSafeStandbyCount:
                     format: int32
@@ -4671,11 +5952,140 @@ spec:
                         upstreamLSN:
                           format: int64
                           type: integer
+                        watchdogProof:
+                          properties:
+                            active:
+                              type: boolean
+                            authorityGranted:
+                              type: boolean
+                            authorityRemainingMS:
+                              format: int32
+                              type: integer
+                            capabilityVersion:
+                              format: int32
+                              type: integer
+                            leaseName:
+                              type: string
+                            leaseNamespace:
+                              type: string
+                            localNodeID:
+                              type: string
+                            maxFenceLatencyMS:
+                              format: int32
+                              type: integer
+                            observedAt:
+                              format: date-time
+                              type: string
+                            observedHolderNodeID:
+                              type: string
+                            observedLeaseTransitions:
+                              format: int32
+                              type: integer
+                            podUID:
+                              type: string
+                            processBootID:
+                              type: string
+                            topologyID:
+                              type: string
+                          required:
+                          - active
+                          - authorityGranted
+                          - authorityRemainingMS
+                          - capabilityVersion
+                          - leaseName
+                          - leaseNamespace
+                          - localNodeID
+                          - maxFenceLatencyMS
+                          - observedAt
+                          - observedHolderNodeID
+                          - observedLeaseTransitions
+                          - podUID
+                          - processBootID
+                          - topologyID
+                          type: object
                         writeLagLSN:
                           format: int64
                           type: integer
                       type: object
                     type: array
+                  startupGate:
+                    properties:
+                      activationReceipt:
+                        properties:
+                          aggregateSHA256:
+                            type: string
+                          backupLSN:
+                            format: int64
+                            type: integer
+                          captureReceiptSHA256:
+                            type: string
+                          checkpointLSN:
+                            format: int64
+                            type: integer
+                          clusterID:
+                            format: int64
+                            type: integer
+                          epoch:
+                            format: int64
+                            type: integer
+                          generation:
+                            type: string
+                          generationPath:
+                            type: string
+                          manifestID:
+                            type: string
+                          manifestSHA256:
+                            type: string
+                          materializedAggregateSHA256:
+                            type: string
+                          materializedReceiptSHA256:
+                            type: string
+                          nodeID:
+                            type: string
+                          rawGenerationPath:
+                            type: string
+                          seedReceiptSHA256:
+                            type: string
+                          shardID:
+                            format: int64
+                            type: integer
+                          slotName:
+                            type: string
+                          tableID:
+                            format: int64
+                            type: integer
+                          targetLocalNodeID:
+                            format: int64
+                            type: integer
+                          targetPVCName:
+                            type: string
+                          targetPVCUID:
+                            type: string
+                          targetReplicaID:
+                            format: int64
+                            type: integer
+                          timelineID:
+                            format: int64
+                            type: integer
+                          topologyGeneration:
+                            format: int64
+                            type: integer
+                          topologyID:
+                            type: string
+                        required:
+                        - generation
+                        - nodeID
+                        - slotName
+                        - targetPVCName
+                        - topologyID
+                        type: object
+                      reason:
+                        type: string
+                      runtimeEligible:
+                        type: boolean
+                    required:
+                    - runtimeEligible
+                    type: object
                   sync:
                     properties:
                       action:

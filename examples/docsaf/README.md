@@ -70,6 +70,19 @@ Traverse and load in one command:
   --create-table
 ```
 
+Docsaf is a client of Antfly, not an Antfly server dependency. Enable Antfly's
+server-side page-quality fallback and scanned-table OCR from that client with:
+
+```bash
+./docsaf sync \
+  --dir ./docs \
+  --base-url s3://docs-bucket \
+  --table docs \
+  --create-table \
+  --ocr-config-json '{"provider":"antfly","model":"<reader-model>"}' \
+  --ocr-render-dpi 150
+```
+
 For local smoke tests, inline file bytes as `data:` URLs:
 
 ```bash

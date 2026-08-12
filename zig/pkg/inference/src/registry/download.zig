@@ -1357,7 +1357,11 @@ pub fn writeManagedArtifactAndUpdatePlan(
 
     const receipt_json = try std.json.Stringify.valueAlloc(
         allocator,
-        ManagedDownloadReceipt{ .artifacts = artifacts.items },
+        ManagedDownloadReceipt{
+            .version = validated.parsed.value.version,
+            .source = validated.parsed.value.source,
+            .artifacts = artifacts.items,
+        },
         .{},
     );
     defer allocator.free(receipt_json);
@@ -1465,6 +1469,27 @@ pub fn managedDownloadState(
         return .complete;
     }
     return .unmanaged;
+}
+
+/// Verify that a completed managed directory was published for the exact Hub
+/// reference being requested. Version-1 receipts predate source identity and
+/// therefore cannot prove an explicit variant match.
+pub fn managedDownloadMatchesSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+    owner: []const u8,
+    name: []const u8,
+    variant: []const u8,
+) bool {
+    const receipt = managed_receipt.loadValidated(allocator, io, dest_dir) catch return false;
+    var validated = receipt orelse return false;
+    defer validated.deinit();
+    const source = validated.parsed.value.source orelse return false;
+    return validated.parsed.value.version == 2 and
+        std.mem.eql(u8, source.owner, owner) and
+        std.mem.eql(u8, source.name, name) and
+        std.mem.eql(u8, source.variant, variant);
 }
 
 pub fn managedDownloadPublicationBlocked(
@@ -1714,7 +1739,11 @@ pub fn downloadModel(
 
     const receipt_json = try std.json.Stringify.valueAlloc(
         allocator,
-        ManagedDownloadReceipt{ .artifacts = receipts.items },
+        ManagedDownloadReceipt{
+            .version = 2,
+            .source = .{ .owner = owner, .name = name, .variant = variant },
+            .artifacts = receipts.items,
+        },
         .{},
     );
     defer allocator.free(receipt_json);
@@ -3249,6 +3278,31 @@ test "managed download publication keeps incomplete state fail closed" {
     );
 }
 
+test "managed download receipt source identity is exact" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "managed-source");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const artifact_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(artifact_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = artifact_path, .data = "payload" });
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = complete_path,
+        .data =
+        \\{"version":2,"source":{"owner":"owner","name":"model","variant":"gguf:Q4_K_M"},"artifacts":[{"path":"model.gguf","size":7}]}
+        ,
+    });
+
+    try std.testing.expect(managedDownloadMatchesSource(allocator, io, dest_dir, "owner", "model", "gguf:Q4_K_M"));
+    try std.testing.expect(!managedDownloadMatchesSource(allocator, io, dest_dir, "owner", "model", "gguf:Q8_0"));
+}
+
 test "managed staging artifact replacement updates the publication receipt" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3267,7 +3321,7 @@ test "managed staging artifact replacement updates the publication receipt" {
         allocator,
         io,
         plan_path,
-        "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}",
+        "{\"version\":2,\"source\":{\"owner\":\"owner\",\"name\":\"model\",\"variant\":\"gguf:Q4_K_M\"},\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}",
     );
 
     const manifest_json = "{\"type\":\"generator\"}";
@@ -3283,9 +3337,12 @@ test "managed staging artifact replacement updates the publication receipt" {
     const manifest_artifact = plan.find("model_manifest.json") orelse
         return error.TestExpectedManifestArtifact;
     try std.testing.expectEqual(@as(u64, manifest_json.len), manifest_artifact.size);
+    try std.testing.expectEqual(@as(u32, 2), plan.parsed.value.version);
+    try std.testing.expectEqualStrings("gguf:Q4_K_M", plan.parsed.value.source.?.variant);
 
     try completeManagedDownload(allocator, io, dest_dir);
     try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
+    try std.testing.expect(managedDownloadMatchesSource(allocator, io, dest_dir, "owner", "model", "gguf:Q4_K_M"));
 }
 
 test "managed model transaction reuses artifacts and publishes completed repair" {

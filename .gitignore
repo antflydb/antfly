@@ -96,5 +96,10 @@ scripts/__pycache__/
 
 /datasets/
 
+# Local inference benchmark inputs, outputs, and runtime lock directories
+/.benchmark-assets/
+/.benchmark-results/
+/zig/group-*/
+
 # TLA+ model checker state directories
 specs/tla/states/

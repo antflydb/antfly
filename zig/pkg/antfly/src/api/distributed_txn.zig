@@ -21,6 +21,7 @@ const http_client_mod = @import("http_client.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
+const contract = @import("distributed_txn_contract.zig");
 
 pub const table_participant_prefix = "table:";
 const table_participant_v2_prefix = "table2:";
@@ -60,32 +61,10 @@ pub const TxnAcknowledgeRequest = struct {
     participant: []const u8,
 };
 
-pub const TableCommitRequest = struct {
-    table_name: []const u8,
-    writes: []const db_mod.types.TransactionWrite = &.{},
-    deletes: []const []const u8 = &.{},
-    transforms: []const db_mod.types.DocumentTransform = &.{},
-    predicates: []const db_mod.types.TransactionVersionPredicate = &.{},
-};
-
-pub const CommitConflict = struct {
-    table_name: []const u8,
-    key: []const u8,
-    message: []const u8,
-    group_id: ?u64 = null,
-    phase: ?ParticipantPhase = null,
-};
-
-pub const ParticipantPhase = enum {
-    begin,
-    prepare,
-    resolve,
-};
-
-pub const CommitOutcome = union(enum) {
-    committed: ExecuteResult,
-    conflict: CommitConflict,
-};
+pub const TableCommitRequest = contract.TableCommitRequest;
+pub const CommitConflict = contract.CommitConflict;
+pub const ParticipantPhase = contract.ParticipantPhase;
+pub const CommitOutcome = contract.CommitOutcome;
 
 pub const ParticipantWorker = struct {
     ptr: *anyopaque,
@@ -347,20 +326,7 @@ pub const LocalTableWriteParticipantWorker = struct {
     }
 };
 
-pub const ExecuteResult = struct {
-    participant_count: usize,
-    /// Stable sessions persist their terminal result before acknowledging the
-    /// coordinator itself. These coordinates identify that durable decision
-    /// record without recomputing it from mutable table routing.
-    coordinator_group_id: ?u64 = null,
-    coordinator_table_name: ?[]const u8 = null,
-    /// The commit decision is durable, but at least one participant still
-    /// needs phase-two delivery by foreground retry or recovery.
-    propagation_pending: bool = false,
-    /// Participant writes are durable, but the requested visibility barrier
-    /// was not reached before the response was produced.
-    visibility_pending: bool = false,
-};
+pub const ExecuteResult = contract.ExecuteResult;
 
 pub const ExecuteOptions = struct {
     /// Preserve the terminal coordinator decision for an externally supplied
@@ -1905,6 +1871,7 @@ fn parseTransformOpType(text: []const u8) ?db_mod.types.TransformOpType {
     if (std.mem.eql(u8, text, "$unset")) return .unset;
     if (std.mem.eql(u8, text, "$inc")) return .inc;
     if (std.mem.eql(u8, text, "$addToSet")) return .add_to_set;
+    if (std.mem.eql(u8, text, "$min")) return .min;
     if (std.mem.eql(u8, text, "$max")) return .max;
     return null;
 }
@@ -1978,6 +1945,7 @@ test "txn prepare parser round-trips transforms" {
                 .key = "doc:a",
                 .operations = &.{
                     .{ .op = .set, .path = "status", .value_json = "\"updated\"" },
+                    .{ .op = .min, .path = "priority", .value_json = "2" },
                     .{ .op = .max, .path = "version", .value_json = "3" },
                 },
                 .upsert = true,
@@ -1994,6 +1962,8 @@ test "txn prepare parser round-trips transforms" {
     try std.testing.expectEqualStrings("doc:a", parsed.req.transforms[0].key);
     try std.testing.expectEqual(db_mod.types.TransformOpType.set, parsed.req.transforms[0].operations[0].op);
     try std.testing.expectEqualStrings("\"updated\"", parsed.req.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.min, parsed.req.transforms[0].operations[1].op);
+    try std.testing.expectEqualStrings("2", parsed.req.transforms[0].operations[1].value_json.?);
 }
 
 test "transaction request parsers release owned prefixes after malformed input" {

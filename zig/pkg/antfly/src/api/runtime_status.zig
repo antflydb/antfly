@@ -14,7 +14,9 @@
 
 const std = @import("std");
 const platform_time = @import("antfly_platform").time;
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 
 pub const RuntimeStatusSource = enum {

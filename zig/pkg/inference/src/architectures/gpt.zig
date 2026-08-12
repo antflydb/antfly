@@ -1300,20 +1300,32 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
     var final_ple_vectors = ple_vectors;
     var prepared_final_hidden_input = false;
     var prepared_ple_vectors = false;
-    var original_hidden_input: CT = undefined;
-    var owns_original_hidden_input = false;
+    const original_hidden_input = hidden_input;
+    var owns_original_hidden_input = true;
+    const graph_replay_required = cudaDecodeGraphReplayRequired() and
+        cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context);
+    const capture_greedy_token = cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context);
+    const graph_replay_label = if (capture_greedy_token) "gpt.greedy_token_decode" else "gpt.final_hidden_decode";
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+    errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+    errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
     if (cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
-        if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput("gpt.final_hidden_decode", hidden_input)) |prepared| {
+        const replay_kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+        const prepared_replay_input = if (capture_greedy_token)
+            try cb.debugCudaGraphPrepareGreedyTokenReplayInput(graph_replay_label, hidden_input, replay_kv_seq_len)
+        else
+            try cb.debugCudaGraphPrepareFinalHiddenReplayInput(graph_replay_label, hidden_input, replay_kv_seq_len);
+        if (prepared_replay_input) |prepared| {
             final_hidden_input = prepared;
             prepared_final_hidden_input = true;
-            original_hidden_input = hidden_input;
-            owns_original_hidden_input = true;
             var replay_inputs_ready = true;
             if (ple_vectors) |ple| {
                 if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
                     final_ple_vectors = prepared_ple;
                     prepared_ple_vectors = true;
                 } else {
+                    if (graph_replay_required) return error.CudaGraphReplayRequired;
                     replay_inputs_ready = false;
                 }
             }
@@ -1321,12 +1333,10 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
                 cb.free(final_hidden_input);
                 prepared_final_hidden_input = false;
                 final_hidden_input = original_hidden_input;
-                owns_original_hidden_input = false;
             }
+        } else if (graph_replay_required) {
+            return error.CudaGraphReplayRequired;
         }
-        errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
-        errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
-        errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
 
         if (prepared_final_hidden_input) {
             const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
@@ -1334,8 +1344,8 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
             const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
             const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
             const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
-            _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
-            const capture_greedy_token = cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context);
+            const decode_scalars_ready = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+            if (!decode_scalars_ready and graph_replay_required) return error.CudaGraphReplayRequired;
             if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
                 cb.free(final_hidden_input);
                 prepared_final_hidden_input = false;
@@ -1356,7 +1366,7 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
                     .total_rows = batch * query_seq_len,
                 });
             }
-            capture_final_hidden = try cb.debugCudaGraphCaptureBegin("gpt.final_hidden_decode");
+            capture_final_hidden = try cb.debugCudaGraphCaptureBegin(graph_replay_label);
             if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.capture_input", final_hidden_input);
             if (capture_final_hidden) {
                 try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
@@ -1364,8 +1374,7 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
             }
         }
     }
-    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
-
+    if (!prepared_final_hidden_input) owns_original_hidden_input = false;
     prepared_final_hidden_input = false;
     const hidden_result = hidden_result_blk: {
         break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, final_ple_vectors) catch |err| {
@@ -1373,6 +1382,7 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
                 cb.debugCudaGraphCaptureEnd(false) catch {};
                 capture_final_hidden = false;
             }
+            if (graph_replay_required) return err;
             if (prepared_ple_vectors) {
                 cb.free(final_ple_vectors.?);
                 prepared_ple_vectors = false;
@@ -1391,30 +1401,58 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
         prepared_ple_vectors = false;
         final_ple_vectors = ple_vectors;
     }
-    if (owns_original_hidden_input) {
+    if (owns_original_hidden_input and !capture_final_hidden) {
         cb.free(original_hidden_input);
         owns_original_hidden_input = false;
     }
-    errdefer cb.free(hidden_result.hidden);
+    var captured_hidden_owned = true;
+    errdefer if (captured_hidden_owned) cb.free(hidden_result.hidden);
     if (capture_final_hidden) {
-        if (cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context)) {
+        if (capture_greedy_token) {
             if (try tryGreedyLastTokenTensorFastPathFromFinalHidden(cb, config, hidden_result)) |token| {
-                errdefer cb.free(token);
+                var token_owned = true;
+                errdefer if (token_owned) cb.free(token);
                 try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, token);
                 try cb.debugCudaGraphCaptureEnd(true);
                 capture_final_hidden = false;
                 cb.free(hidden_result.hidden);
+                captured_hidden_owned = false;
+                if (owns_original_hidden_input) {
+                    cb.free(original_hidden_input);
+                    owns_original_hidden_input = false;
+                }
+                token_owned = false;
                 return greedyResultFromTokenTensor(cb, allocator, token);
             }
             try cb.debugCudaGraphCaptureEnd(false);
             capture_final_hidden = false;
-            if (cudaDecodeGraphReplayRequired()) return error.CudaGraphReplayRequired;
-            return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, hidden_result);
+            cb.free(hidden_result.hidden);
+            captured_hidden_owned = false;
+            if (greedyCaptureAbortAction(graph_replay_required) == .fail_required) return error.CudaGraphReplayRequired;
+
+            const fallback_input = original_hidden_input;
+            owns_original_hidden_input = false;
+            const fallback_hidden_result = try forwardFinalHiddenTensorFromEmbeddings(
+                cb,
+                allocator,
+                config,
+                fallback_input,
+                batch,
+                seq_len,
+                decode_context,
+                ple_vectors,
+            );
+            return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, fallback_hidden_result);
         }
         try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, hidden_result.hidden);
         try cb.debugCudaGraphCaptureEnd(true);
         capture_final_hidden = false;
     }
+    if (owns_original_hidden_input) {
+        cb.free(original_hidden_input);
+        owns_original_hidden_input = false;
+    }
+    captured_hidden_owned = false;
     return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, hidden_result);
 }
 
@@ -1433,20 +1471,32 @@ fn forwardGreedyLastTokenTensorOnlyFromEmbeddings(
     var final_ple_vectors = ple_vectors;
     var prepared_final_hidden_input = false;
     var prepared_ple_vectors = false;
-    var original_hidden_input: CT = undefined;
-    var owns_original_hidden_input = false;
+    const original_hidden_input = hidden_input;
+    var owns_original_hidden_input = true;
+    const graph_replay_required = cudaDecodeGraphReplayRequired() and
+        cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context);
+    const capture_greedy_token = cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context);
+    const graph_replay_label = if (capture_greedy_token) "gpt.greedy_token_decode" else "gpt.final_hidden_decode";
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+    errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+    errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
     if (cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
-        if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput("gpt.final_hidden_decode", hidden_input)) |prepared| {
+        const replay_kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+        const prepared_replay_input = if (capture_greedy_token)
+            try cb.debugCudaGraphPrepareGreedyTokenReplayInput(graph_replay_label, hidden_input, replay_kv_seq_len)
+        else
+            try cb.debugCudaGraphPrepareFinalHiddenReplayInput(graph_replay_label, hidden_input, replay_kv_seq_len);
+        if (prepared_replay_input) |prepared| {
             final_hidden_input = prepared;
             prepared_final_hidden_input = true;
-            original_hidden_input = hidden_input;
-            owns_original_hidden_input = true;
             var replay_inputs_ready = true;
             if (ple_vectors) |ple| {
                 if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
                     final_ple_vectors = prepared_ple;
                     prepared_ple_vectors = true;
                 } else {
+                    if (graph_replay_required) return error.CudaGraphReplayRequired;
                     replay_inputs_ready = false;
                 }
             }
@@ -1454,12 +1504,10 @@ fn forwardGreedyLastTokenTensorOnlyFromEmbeddings(
                 cb.free(final_hidden_input);
                 prepared_final_hidden_input = false;
                 final_hidden_input = original_hidden_input;
-                owns_original_hidden_input = false;
             }
+        } else if (graph_replay_required) {
+            return error.CudaGraphReplayRequired;
         }
-        errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
-        errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
-        errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
 
         if (prepared_final_hidden_input) {
             const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
@@ -1467,8 +1515,8 @@ fn forwardGreedyLastTokenTensorOnlyFromEmbeddings(
             const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
             const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
             const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
-            _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
-            const capture_greedy_token = cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context);
+            const decode_scalars_ready = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+            if (!decode_scalars_ready and graph_replay_required) return error.CudaGraphReplayRequired;
             if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
                 cb.free(final_hidden_input);
                 prepared_final_hidden_input = false;
@@ -1488,7 +1536,7 @@ fn forwardGreedyLastTokenTensorOnlyFromEmbeddings(
                     .total_rows = batch * query_seq_len,
                 });
             }
-            capture_final_hidden = try cb.debugCudaGraphCaptureBegin("gpt.final_hidden_decode");
+            capture_final_hidden = try cb.debugCudaGraphCaptureBegin(graph_replay_label);
             if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.capture_input", final_hidden_input);
             if (capture_final_hidden) {
                 try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
@@ -1496,8 +1544,7 @@ fn forwardGreedyLastTokenTensorOnlyFromEmbeddings(
             }
         }
     }
-    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
-
+    if (!prepared_final_hidden_input) owns_original_hidden_input = false;
     prepared_final_hidden_input = false;
     const hidden_result = hidden_result_blk: {
         break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, final_ple_vectors) catch |err| {
@@ -1505,6 +1552,7 @@ fn forwardGreedyLastTokenTensorOnlyFromEmbeddings(
                 cb.debugCudaGraphCaptureEnd(false) catch {};
                 capture_final_hidden = false;
             }
+            if (graph_replay_required) return err;
             if (prepared_ple_vectors) {
                 cb.free(final_ple_vectors.?);
                 prepared_ple_vectors = false;
@@ -1523,30 +1571,58 @@ fn forwardGreedyLastTokenTensorOnlyFromEmbeddings(
         prepared_ple_vectors = false;
         final_ple_vectors = ple_vectors;
     }
-    if (owns_original_hidden_input) {
+    if (owns_original_hidden_input and !capture_final_hidden) {
         cb.free(original_hidden_input);
         owns_original_hidden_input = false;
     }
-    errdefer cb.free(hidden_result.hidden);
+    var captured_hidden_owned = true;
+    errdefer if (captured_hidden_owned) cb.free(hidden_result.hidden);
     if (capture_final_hidden) {
-        if (cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context)) {
+        if (capture_greedy_token) {
             if (try tryGreedyLastTokenTensorFastPathFromFinalHidden(cb, config, hidden_result)) |token| {
-                errdefer cb.free(token);
+                var token_owned = true;
+                errdefer if (token_owned) cb.free(token);
                 try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, token);
                 try cb.debugCudaGraphCaptureEnd(true);
                 capture_final_hidden = false;
                 cb.free(hidden_result.hidden);
+                captured_hidden_owned = false;
+                if (owns_original_hidden_input) {
+                    cb.free(original_hidden_input);
+                    owns_original_hidden_input = false;
+                }
+                token_owned = false;
                 return token;
             }
             try cb.debugCudaGraphCaptureEnd(false);
             capture_final_hidden = false;
-            if (cudaDecodeGraphReplayRequired()) return error.CudaGraphReplayRequired;
-            return forwardGreedyLastTokenTensorOnlyFromFinalHidden(cb, config, hidden_result);
+            cb.free(hidden_result.hidden);
+            captured_hidden_owned = false;
+            if (greedyCaptureAbortAction(graph_replay_required) == .fail_required) return error.CudaGraphReplayRequired;
+
+            const fallback_input = original_hidden_input;
+            owns_original_hidden_input = false;
+            const fallback_hidden_result = try forwardFinalHiddenTensorFromEmbeddings(
+                cb,
+                allocator,
+                config,
+                fallback_input,
+                batch,
+                seq_len,
+                decode_context,
+                ple_vectors,
+            );
+            return forwardGreedyLastTokenTensorOnlyFromFinalHidden(cb, config, fallback_hidden_result);
         }
         try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, hidden_result.hidden);
         try cb.debugCudaGraphCaptureEnd(true);
         capture_final_hidden = false;
     }
+    if (owns_original_hidden_input) {
+        cb.free(original_hidden_input);
+        owns_original_hidden_input = false;
+    }
+    captured_hidden_owned = false;
     return forwardGreedyLastTokenTensorOnlyFromFinalHidden(cb, config, hidden_result);
 }
 
@@ -1556,20 +1632,47 @@ const CudaDecodeGraphReplayMode = enum {
     required,
 };
 
-fn cudaDecodeGraphReplayMode() CudaDecodeGraphReplayMode {
-    const raw = platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY") orelse return .off;
+const GreedyCaptureAbortAction = enum {
+    retry_eager,
+    fail_required,
+};
+
+fn greedyCaptureAbortAction(graph_replay_required: bool) GreedyCaptureAbortAction {
+    return if (graph_replay_required) .fail_required else .retry_eager;
+}
+
+fn cudaDecodeGraphReplayModeFromValue(raw_opt: ?[]const u8) CudaDecodeGraphReplayMode {
+    const raw = raw_opt orelse return .off;
     if (std.mem.eql(u8, raw, "off") or std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "no")) return .off;
     if (std.mem.eql(u8, raw, "required") or std.mem.eql(u8, raw, "require") or std.mem.eql(u8, raw, "force")) return .required;
     if (std.mem.eql(u8, raw, "auto") or std.mem.eql(u8, raw, "on") or std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "yes")) return .auto;
-    return .off;
+    return .required;
+}
+
+fn cudaDecodeGraphReplayMode() CudaDecodeGraphReplayMode {
+    return cudaDecodeGraphReplayModeFromValue(platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"));
 }
 
 fn cudaDecodeGraphReplayRequested() bool {
     return cudaDecodeGraphReplayMode() != .off;
 }
 
-fn cudaDecodeGraphReplayRequired() bool {
+pub fn cudaDecodeGraphReplayRequired() bool {
     return cudaDecodeGraphReplayMode() == .required;
+}
+
+test "cuda decode graph replay mode parsing requires replay for unknown values" {
+    try std.testing.expectEqual(CudaDecodeGraphReplayMode.off, cudaDecodeGraphReplayModeFromValue(null));
+    try std.testing.expectEqual(CudaDecodeGraphReplayMode.required, cudaDecodeGraphReplayModeFromValue("unknown"));
+    try std.testing.expectEqual(CudaDecodeGraphReplayMode.required, cudaDecodeGraphReplayModeFromValue(""));
+    try std.testing.expectEqual(CudaDecodeGraphReplayMode.auto, cudaDecodeGraphReplayModeFromValue("auto"));
+    try std.testing.expectEqual(CudaDecodeGraphReplayMode.required, cudaDecodeGraphReplayModeFromValue("required"));
+    try std.testing.expectEqual(CudaDecodeGraphReplayMode.required, cudaDecodeGraphReplayModeFromValue("force"));
+}
+
+test "null greedy capture retries eagerly unless replay is required" {
+    try std.testing.expectEqual(GreedyCaptureAbortAction.retry_eager, greedyCaptureAbortAction(false));
+    try std.testing.expectEqual(GreedyCaptureAbortAction.fail_required, greedyCaptureAbortAction(true));
 }
 
 fn cudaCaptureFinalHiddenProbeEnabled(
@@ -1879,13 +1982,16 @@ fn forwardFinalHiddenTensorFromEmbeddingsWithReplayLabel(
     var final_ple_vectors = ple_vectors;
     var prepared_final_hidden_input = false;
     var prepared_ple_vectors = false;
-    var original_hidden_input: CT = undefined;
-    var owns_original_hidden_input = false;
-    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(replay_label, hidden_input)) |prepared| {
+    const original_hidden_input = hidden_input;
+    var owns_original_hidden_input = true;
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+    errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+    errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
+    const replay_kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(replay_label, hidden_input, replay_kv_seq_len)) |prepared| {
         final_hidden_input = prepared;
         prepared_final_hidden_input = true;
-        original_hidden_input = hidden_input;
-        owns_original_hidden_input = true;
         var replay_inputs_ready = true;
         if (ple_vectors) |ple| {
             if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
@@ -1899,12 +2005,8 @@ fn forwardFinalHiddenTensorFromEmbeddingsWithReplayLabel(
             cb.free(final_hidden_input);
             prepared_final_hidden_input = false;
             final_hidden_input = original_hidden_input;
-            owns_original_hidden_input = false;
         }
     }
-    errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
-    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
-    errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
 
     if (prepared_final_hidden_input) {
         const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
@@ -1935,8 +2037,7 @@ fn forwardFinalHiddenTensorFromEmbeddingsWithReplayLabel(
             if (final_ple_vectors) |ple| try cb.debugCudaGraphRegisterFinalHiddenReplayAuxInput(ple);
         }
     }
-    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
-
+    if (!prepared_final_hidden_input) owns_original_hidden_input = false;
     prepared_final_hidden_input = false;
     const hidden_result = hidden_result_blk: {
         break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, final_ple_vectors) catch |err| {
@@ -1997,13 +2098,16 @@ fn forwardFinalHiddenTensorFromEmbeddingsWithReplayLabelDiscard(
     var final_ple_vectors = ple_vectors;
     var prepared_final_hidden_input = false;
     var prepared_ple_vectors = false;
-    var original_hidden_input: CT = undefined;
-    var owns_original_hidden_input = false;
-    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(replay_label, hidden_input)) |prepared| {
+    const original_hidden_input = hidden_input;
+    var owns_original_hidden_input = true;
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+    errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+    errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
+    const replay_kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(replay_label, hidden_input, replay_kv_seq_len)) |prepared| {
         final_hidden_input = prepared;
         prepared_final_hidden_input = true;
-        original_hidden_input = hidden_input;
-        owns_original_hidden_input = true;
         var replay_inputs_ready = true;
         if (ple_vectors) |ple| {
             if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
@@ -2017,12 +2121,8 @@ fn forwardFinalHiddenTensorFromEmbeddingsWithReplayLabelDiscard(
             cb.free(final_hidden_input);
             prepared_final_hidden_input = false;
             final_hidden_input = original_hidden_input;
-            owns_original_hidden_input = false;
         }
     }
-    errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
-    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
-    errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
 
     if (prepared_final_hidden_input) {
         const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
@@ -2050,8 +2150,7 @@ fn forwardFinalHiddenTensorFromEmbeddingsWithReplayLabelDiscard(
             if (final_ple_vectors) |ple| try cb.debugCudaGraphRegisterFinalHiddenReplayAuxInput(ple);
         }
     }
-    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
-
+    if (!prepared_final_hidden_input) owns_original_hidden_input = false;
     prepared_final_hidden_input = false;
     const hidden_result = hidden_result_blk: {
         break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, final_ple_vectors) catch |err| {
@@ -2163,9 +2262,14 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
     var final_ple_vectors = ple_vectors;
     var prepared_final_hidden_input = false;
     var prepared_ple_vectors = false;
-    var original_hidden_input: CT = undefined;
-    var owns_original_hidden_input = false;
-    const prepared = (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(replay_label, hidden_input)) orelse
+    const original_hidden_input = hidden_input;
+    var owns_original_hidden_input = true;
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+    errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+    errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
+    const prepared = (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(replay_label, hidden_input, kv_seq_len)) orelse {
+        owns_original_hidden_input = false;
         return forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
             cb,
             allocator,
@@ -2177,10 +2281,9 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
             decode_context,
             ple_vectors,
         );
+    };
     final_hidden_input = prepared;
     prepared_final_hidden_input = true;
-    original_hidden_input = hidden_input;
-    owns_original_hidden_input = true;
     if (ple_vectors) |ple| {
         if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
             final_ple_vectors = prepared_ple;
@@ -2202,9 +2305,6 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
             );
         }
     }
-    errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
-    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
-    errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
 
     _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
     if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
@@ -2233,8 +2333,6 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
         try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
         if (final_ple_vectors) |ple| try cb.debugCudaGraphRegisterFinalHiddenReplayAuxInput(ple);
     }
-    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
-
     prepared_final_hidden_input = false;
     const hidden_result = forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesAndTrace(
         cb,
@@ -7161,6 +7259,11 @@ pub fn applyPreparedAttention(
     return result;
 }
 
+fn attentionQueryRopeScale(global_head_dim: u32, head_dim: u32) ?f32 {
+    if (global_head_dim == 0) return null;
+    return @sqrt(@as(f32, @floatFromInt(head_dim)));
+}
+
 fn applyAttentionWithSink(
     cb: *const ComputeBackend,
     config: Config,
@@ -7203,8 +7306,17 @@ fn applyAttentionWithSink(
             const kv_batch_views = dc.kv_batch.?;
             const max_q_len = attention.query_sequence_len;
             const rope_started_at = monotonicNowNs();
-            const Q_rope = try applyPerItemRope(cb, Q, kv_batch_views, batch, max_q_len, num_heads * head_dim, head_dim, rope_dim, rope_theta, config.rope_freq_scale, rope_consecutive_pairs);
-            defer cb.free(Q_rope);
+            const unscaled_q_rope = try applyPerItemRope(cb, Q, kv_batch_views, batch, max_q_len, num_heads * head_dim, head_dim, rope_dim, rope_theta, config.rope_freq_scale, rope_consecutive_pairs);
+            defer cb.free(unscaled_q_rope);
+            const scaled_q_rope: ?CT = if (attentionQueryRopeScale(config.global_head_dim, head_dim)) |scale| blk: {
+                if (try cb.multiplyScalar(unscaled_q_rope, scale)) |scaled| break :blk scaled;
+                const scale_shape = [_]i32{1};
+                const scale_ct = try cb.fromFloat32Shape(&[_]f32{scale}, &scale_shape);
+                defer cb.free(scale_ct);
+                break :blk try cb.multiply(unscaled_q_rope, scale_ct);
+            } else null;
+            defer if (scaled_q_rope) |scaled| cb.free(scaled);
+            const Q_rope = scaled_q_rope orelse unscaled_q_rope;
             const K_rope = try applyPerItemRope(cb, K, kv_batch_views, batch, max_q_len, num_kv_heads * head_dim, head_dim, rope_dim, rope_theta, config.rope_freq_scale, rope_consecutive_pairs);
             defer cb.free(K_rope);
             debug_timing_stats.attention_rope_nanos += @intCast(monotonicNowNs() - rope_started_at);
@@ -7220,8 +7332,7 @@ fn applyAttentionWithSink(
 
         const position_offset = positionOffset(seq_len, attention.query_sequence_len, decode_context);
         const rope_started_at = monotonicNowNs();
-        const Q_rope = if (config.global_head_dim != 0) blk: {
-            const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
+        const Q_rope = if (attentionQueryRopeScale(config.global_head_dim, head_dim)) |scale| blk: {
             if (try cb.ropeScaled(Q, scale, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs)) |scaled_rope| break :blk scaled_rope;
             const scaled = if (try cb.multiplyScalar(Q, scale)) |scaled_q|
                 scaled_q
@@ -7469,8 +7580,7 @@ pub fn applyAttentionResidual(
         const rope_theta = config.layerRopeEffectiveTheta(layer);
         const position_offset = positionOffset(seq_len, attention.query_sequence_len, decode_context);
         const rope_started_at = monotonicNowNs();
-        const Q_rope = if (config.global_head_dim != 0) blk: {
-            const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
+        const Q_rope = if (attentionQueryRopeScale(config.global_head_dim, head_dim)) |scale| blk: {
             if (try cb.ropeScaled(Q, scale, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs)) |scaled_rope| break :blk scaled_rope;
             const scaled = if (try cb.multiplyScalar(Q, scale)) |scaled_q|
                 scaled_q
@@ -10108,6 +10218,9 @@ fn applyReluSquared(cb: *const ComputeBackend, input: CT) !CT {
 // --- Embedding weight helper ---
 
 test "gemma4 q attention scale is not duplicated for rope attention" {
+    try std.testing.expect(attentionQueryRopeScale(0, 256) == null);
+    try std.testing.expectEqual(@as(f32, 16.0), attentionQueryRopeScale(256, 256).?);
+
     const llama_cfg: Config = .{ .family = .llama };
     try std.testing.expect(!shouldScaleGemma4QBeforeAttention(llama_cfg, false));
 

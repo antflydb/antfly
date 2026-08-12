@@ -106,6 +106,13 @@ case "$strip" in
 esac
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "$repo_root" show -s --format=%ct HEAD)}"
+if ! [[ "$source_date_epoch" =~ ^[0-9]+$ ]]; then
+  echo "SOURCE_DATE_EPOCH must be a non-negative integer, got: $source_date_epoch" >&2
+  exit 2
+fi
+export SOURCE_DATE_EPOCH="$source_date_epoch"
+
 work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${target}"
 prefix="${work_root}/zig-out"
 stage="${work_root}/stage"
@@ -143,11 +150,11 @@ zig_build_options=(
   -Doptimize="$optimize"
   -Dstrip="$strip"
   -Dcpu=baseline
-  -Dedition=full
   -Dantfly-bin-name=antfly
   -Dantfly-version="$version"
   -Donnx=false
   -Dmetal="$metal"
+  -Dcuda=false
   -Dsystem-blas="$system_blas"
 )
 
@@ -157,25 +164,34 @@ zig_install_args=(
   --global-cache-dir "$cache_root/global"
 )
 
-run_zig_build_step() {
-  local step="$1"
-  local -a command=(zig build)
+run_zig_build_steps() {
+  local -a command=(
+    python3
+    "$repo_root/zig/tools/run_bounded_zig_build.py"
+    --zig
+    zig
+    --max-rss-cap
+    21474836480
+    --
+    build
+  )
 
   if [ -n "$jobs" ]; then
     command+=("-j$jobs")
   fi
-  command+=("${zig_build_options[@]}" "$step" "${zig_install_args[@]}")
+  command+=("${zig_build_options[@]}" "$@" "${zig_install_args[@]}")
   "${command[@]}"
 }
 
-run_zig_build_step_with_retry() {
-  local step="$1"
-  local first_attempt_log="$work_root/${step}-attempt-1.log"
-  local retry_log="$work_root/${step}-attempt-2.log"
+run_zig_build_steps_with_retry() {
+  local label="$1"
+  shift
+  local first_attempt_log="$work_root/${label}-attempt-1.log"
+  local retry_log="$work_root/${label}-attempt-2.log"
   local status
 
   set +e
-  run_zig_build_step "$step" 2>&1 | tee "$first_attempt_log"
+  run_zig_build_steps "$@" 2>&1 | tee "$first_attempt_log"
   status=${PIPESTATUS[0]}
   set -e
 
@@ -195,9 +211,9 @@ run_zig_build_step_with_retry() {
     return "$status"
   fi
 
-  echo "::warning::Zig ARM64 ReleaseSmall hit a compiler allocation failure; retrying $step once with the populated local cache"
+  echo "::warning::Zig ARM64 ReleaseSmall hit a compiler allocation failure; retrying $label once with the populated local cache"
   set +e
-  run_zig_build_step "$step" 2>&1 | tee "$retry_log"
+  run_zig_build_steps "$@" 2>&1 | tee "$retry_log"
   status=${PIPESTATUS[0]}
   set -e
   return "$status"
@@ -205,8 +221,10 @@ run_zig_build_step_with_retry() {
 
 (
   cd "$repo_root/zig"
-  run_zig_build_step_with_retry install
-  run_zig_build_step_with_retry lite-capi
+  # API and the shared PIC application/storage unit occupy the initial bounded
+  # memory group. Inference starts after API, while the short remote CLI unit
+  # starts after application/storage, preserving useful overlap deterministically.
+  run_zig_build_steps_with_retry archive antfly capi
 )
 
 test -x "$prefix/bin/antfly"
@@ -229,7 +247,10 @@ fi
 cp "$repo_root/README.md" "$stage/README.md"
 cp "$repo_root/LICENSE" "$stage/LICENSE"
 
-tar -C "$stage" -czf "$out_dir/$archive_name" .
+python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
+  --source "$stage" \
+  --output "$out_dir/$archive_name" \
+  --mtime "$source_date_epoch"
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
 grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null

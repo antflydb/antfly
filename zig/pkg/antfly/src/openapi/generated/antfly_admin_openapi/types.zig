@@ -147,6 +147,27 @@ pub const HAIdentity = struct {
     epoch: i64,
 };
 
+pub const HALeaseWatchdogProof = struct {
+    capability_version: i64,
+    /// Watchdog capability is running and has validated this exact shared Lease.
+    active: bool,
+    /// This process is the current holder and its suspend-inclusive local deadline has not elapsed.
+    authority_granted: bool,
+    /// Suspend-inclusive local authority remaining when this proof snapshot was created; zero when authority is not granted.
+    authority_remaining_ms: i64,
+    lease_name: []const u8,
+    lease_namespace: []const u8,
+    stable_topology_id: []const u8,
+    /// Local runtime node id producing the proof.
+    local_node_id: HANodeID,
+    /// Holder identity copied from the exact validated Kubernetes Lease.
+    observed_holder_node_id: HANodeID,
+    pod_uid: []const u8,
+    process_boot_id: []const u8,
+    observed_lease_transitions: i64,
+    max_fence_latency_ms: i64,
+};
+
 /// Stable HA node id.
 pub const HANodeID = []const u8;
 
@@ -174,6 +195,7 @@ pub const HAPrimarySnapshot = struct {
     slots: []const HASlotSnapshot,
     retention: HARetentionSnapshot,
     durability: ?HADurabilityDecision = null,
+    lease_watchdog: ?HALeaseWatchdogProof = null,
 };
 
 pub const HAPrimaryStatusResponse = struct {
@@ -342,6 +364,89 @@ pub const HARetentionSnapshot = struct {
     reseed_recommended: i64,
 };
 
+pub const HARuntimeLifecycleObservation = struct {
+    node_id: ?[]const u8 = null,
+    role: []const u8,
+    pod_uid: ?[]const u8 = null,
+    fenced: bool,
+    observed_at_unix_ns: i64,
+};
+
+pub const HASeedArtifactCaptureResponse = struct {
+    schema_version: i64,
+    action: HAActionReceipt,
+    slot_name: HASlotName,
+    generation: []const u8,
+    topology_id: []const u8,
+    topology_generation: i64,
+    node_id: []const u8,
+    target_pvc_name: []const u8,
+    target_pvc_uid: []const u8,
+    cluster_id: i64,
+    shard_id: i64,
+    table_id: i64,
+    timeline_id: i64,
+    epoch: i64,
+    manifest_id: []const u8,
+    source_plan_sha256: []const u8,
+    backup_lsn: i64,
+    checkpoint_lsn: i64,
+    end_record_lsn: i64,
+    manifest_sha256: []const u8,
+    /// SHA-256 of the exact immutable runtime capture COMPLETE response bytes.
+    capture_receipt_sha256: []const u8,
+    file_count: i64,
+    total_bytes: i64,
+    generation_root: []const u8,
+    content_root: []const u8,
+    manifest_path: []const u8,
+    already_captured: bool,
+};
+
+pub const HASeedLifecycleReceiptEvent = struct {
+    cursor: i64,
+    kind: []const u8,
+    generation: []const u8,
+    slot_name: HASlotName,
+    topology_id: []const u8,
+    topology_generation: i64,
+    node_id: []const u8,
+    target_pvc_name: []const u8,
+    target_pvc_uid: []const u8,
+    receipt_sha256: []const u8,
+    receipt_json: []const u8,
+    recorded_at_unix_ns: i64,
+    pod_uid: ?[]const u8 = null,
+    authoritative_state: []const u8,
+};
+
+pub const HASeedLifecycleReceiptInventoryResponse = struct {
+    schema_version: i64,
+    entries: []const HASeedLifecycleReceiptEvent,
+    first_cursor: i64,
+    end_cursor: i64,
+    next_cursor: i64,
+    history_truncated: bool,
+    gap: bool,
+    has_more: bool,
+    runtime: HARuntimeLifecycleObservation,
+};
+
+pub const HASeededSlotActivateResponse = struct {
+    schema_version: i64,
+    action: HAActionReceipt,
+    slot_name: HASlotName,
+    generation: []const u8,
+    manifest_id: []const u8,
+    timeline_id: i64,
+    checkpoint_lsn: i64,
+    seed_receipt_sha256: []const u8,
+    /// SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
+    capture_receipt_sha256: []const u8,
+    manifest_sha256: []const u8,
+    aggregate_sha256: []const u8,
+};
+
 /// Stable standby replication slot name.
 pub const HASlotName = []const u8;
 
@@ -394,6 +499,7 @@ pub const HAStandbySnapshot = struct {
     unapplied_lsn_count: i64,
     caught_up_to_received: bool,
     can_serve_safe_reads: bool,
+    lease_watchdog: ?HALeaseWatchdogProof = null,
 };
 
 pub const HAStandbyStatusResponse = struct {
@@ -412,6 +518,11 @@ pub const HASyncPolicy = struct {
     standby_names: ?[]const HASlotName = null,
     /// Caller-visible action when synchronous durability is not currently satisfied.
     failure_policy: ?[]const u8 = null,
+};
+
+pub const HAWatchdogProofResponse = struct {
+    schema_version: i64,
+    proof: HALeaseWatchdogProof,
 };
 
 pub const HAWriteCheckResponse = struct {
@@ -465,6 +576,29 @@ pub const ReplicationSlotCreateRequest = struct {
     slot_name: HASlotName,
     /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
     initial_lsn: ?i64 = null,
+};
+
+pub const SeedArtifactCaptureRequest = struct {
+    slot_name: HASlotName,
+    generation: []const u8,
+    topology_id: []const u8,
+    topology_generation: i64,
+    node_id: []const u8,
+    target_pvc_name: []const u8,
+    target_pvc_uid: []const u8,
+};
+
+pub const SeededSlotActivateRequest = struct {
+    slot_name: HASlotName,
+    generation: []const u8,
+    manifest_id: []const u8,
+    timeline_id: i64,
+    checkpoint_lsn: i64,
+    seed_receipt_sha256: []const u8,
+    /// SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
+    capture_receipt_sha256: []const u8,
+    manifest_sha256: []const u8,
+    aggregate_sha256: []const u8,
 };
 
 pub const StandbyBootstrapRequest = struct {

@@ -42,6 +42,12 @@ pub const CompactionConfig = struct {
     chunk_size: usize = 512,
     /// Number of reference queries sampled from cached K values.
     num_ref_queries: usize = 64,
+
+    pub fn validate(self: CompactionConfig) !void {
+        if (!std.math.isFinite(self.target_ratio) or self.target_ratio <= 0.0 or self.target_ratio > 1.0) {
+            return error.InvalidCompactionRatio;
+        }
+    }
 };
 
 pub const CompactionResult = struct {
@@ -89,6 +95,7 @@ pub fn compactLayerHead(
     head_dim: usize,
     config: CompactionConfig,
 ) !CompactionResult {
+    try config.validate();
     const M = @max(1, @as(usize, @intFromFloat(@ceil(@as(f32, @floatFromInt(n_tokens)) * config.target_ratio))));
 
     // Degenerate: keep everything.
@@ -171,6 +178,7 @@ pub fn compactSequence(
     pool_id: block_mod.KvPoolId,
     config: CompactionConfig,
 ) !CompactedSequence {
+    try config.validate();
     const pool = kv_manager.getPool(pool_id) orelse return error.InvalidPoolId;
     const num_layers: usize = pool.config.num_layers_packed;
     const num_kv_heads: usize = pool.config.num_kv_heads;
@@ -262,6 +270,7 @@ pub fn compactStorageSequence(
     sequence_id: manager_mod.SequenceId,
     config: CompactionConfig,
 ) !CompactedSequence {
+    try config.validate();
     const pool = kv_storage.getPool(kv_storage.poolId()) orelse return error.InvalidPoolId;
     const num_layers: usize = pool.config.num_layers_packed;
     const num_kv_heads: usize = pool.config.num_kv_heads;
@@ -344,6 +353,7 @@ pub fn compactGatheredSequence(
     head_dim: usize,
     config: CompactionConfig,
 ) !CompactedSequence {
+    try config.validate();
     if (gathered_layers.len == 0) return error.EmptySequence;
     if (token_count == 0) return error.EmptySequence;
 
@@ -463,6 +473,15 @@ fn partialSort(indices: []usize, mass: []const f32, M: usize) void {
 }
 
 // --- Tests ---
+
+test "compaction config rejects unsafe ratios" {
+    try (CompactionConfig{ .target_ratio = 1.0 }).validate();
+    try std.testing.expectError(error.InvalidCompactionRatio, (CompactionConfig{ .target_ratio = 0.0 }).validate());
+    try std.testing.expectError(error.InvalidCompactionRatio, (CompactionConfig{ .target_ratio = -0.1 }).validate());
+    try std.testing.expectError(error.InvalidCompactionRatio, (CompactionConfig{ .target_ratio = 1.1 }).validate());
+    try std.testing.expectError(error.InvalidCompactionRatio, (CompactionConfig{ .target_ratio = std.math.nan(f32) }).validate());
+    try std.testing.expectError(error.InvalidCompactionRatio, (CompactionConfig{ .target_ratio = std.math.inf(f32) }).validate());
+}
 
 test "compactLayerHead preserves output at ratio 1.0" {
     const allocator = std.testing.allocator;

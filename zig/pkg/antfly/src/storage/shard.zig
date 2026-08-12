@@ -26,7 +26,6 @@ const platform_time = @import("antfly_platform").time;
 const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
 const lsm_backend = @import("lsm_backend.zig");
-const lmdb = @import("lmdb.zig");
 const mem_backend = @import("mem_backend.zig");
 const docstore = @import("docstore.zig");
 const internal_keys = @import("internal_keys.zig");
@@ -984,9 +983,9 @@ test "shard split basic lifecycle" {
     try std.testing.expect(mgr.split_state == null);
 
     // Keys c, d, e should be deleted from store
-    try std.testing.expectError(lmdb.Error.NotFound, store.get(alloc, "c"));
-    try std.testing.expectError(lmdb.Error.NotFound, store.get(alloc, "d"));
-    try std.testing.expectError(lmdb.Error.NotFound, store.get(alloc, "e"));
+    try std.testing.expectError(error.NotFound, store.get(alloc, "c"));
+    try std.testing.expectError(error.NotFound, store.get(alloc, "d"));
+    try std.testing.expectError(error.NotFound, store.get(alloc, "e"));
 
     // Keys a, b still exist
     const va = try store.get(alloc, "a");
@@ -1107,8 +1106,8 @@ test "shard streamRange copies data" {
     defer alloc.free(vd);
     try std.testing.expectEqualStrings("4", vd);
 
-    try std.testing.expectError(lmdb.Error.NotFound, dst_store.get(alloc, "a"));
-    try std.testing.expectError(lmdb.Error.NotFound, dst_store.get(alloc, "e"));
+    try std.testing.expectError(error.NotFound, dst_store.get(alloc, "a"));
+    try std.testing.expectError(error.NotFound, dst_store.get(alloc, "e"));
 }
 
 test "shard streamRange copies data between lsm backend stores" {
@@ -1235,7 +1234,7 @@ test "shard finalize deletes split-off data" {
 
     // Keys ca, cb, da should be deleted
     for ([_][]const u8{ "ca", "cb", "da" }) |key| {
-        try std.testing.expectError(lmdb.Error.NotFound, store.get(alloc, key));
+        try std.testing.expectError(error.NotFound, store.get(alloc, key));
     }
 }
 
@@ -1282,6 +1281,6 @@ test "shard state persistence across restart" {
         try std.testing.expect(mgr.split_state == null);
 
         // d should be deleted (was in split-off range)
-        try std.testing.expectError(lmdb.Error.NotFound, store.get(alloc, "d"));
+        try std.testing.expectError(error.NotFound, store.get(alloc, "d"));
     }
 }

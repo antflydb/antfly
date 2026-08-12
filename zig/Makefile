@@ -36,13 +36,13 @@ force-download-onnx: ## Force re-download of ONNX Runtime + GenAI.
 	$(MAKE) download-onnx
 
 build: download-onnx ## Build antfly with embedded inference + ONNX inference.
-	$(ZIG) build install $(ZIG_BUILD_FLAGS)
+	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build antfly $(ZIG_BUILD_FLAGS)
 
-test: ## Run the default Zig test aggregate.
-	$(ZIG) build test
+test: ## Run the default Zig test aggregate with bounded scheduler memory.
+	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build test $(ZIG_BUILD_FLAGS)
 
-unit-test: ## Run hermetic Antfly unit tests.
-	$(ZIG) build unit-test $(ZIG_BUILD_FLAGS)
+unit-test: ## Run hermetic Antfly unit tests with bounded scheduler memory.
+	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build unit-test $(ZIG_BUILD_FLAGS)
 
 clean-onnx: ## Remove downloaded ONNX Runtime files.
 	rm -rf $(ONNXRUNTIME_ROOT)
@@ -57,11 +57,14 @@ inference-e2e-models: ## Prefetch the curated inference E2E model set with `antf
 # TLA+ Verification Commands
 # ====================================================================================
 
-.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
+.PHONY: generate generated-check tls-compat-check openapi-generate openapi-check snowball-generate snowball-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
 
 generate: openapi-generate snowball-generate cabi-header-generate ## Regenerate checked-in generated sources.
 
-generated-check: openapi-check snowball-check cabi-header-check ## Check all checked-in generated sources are current.
+generated-check: tls-compat-check openapi-check snowball-check cabi-header-check ## Check all checked-in generated sources are current.
+
+tls-compat-check: ## Verify the checked-in Zig 0.16 TLS compatibility patch has not drifted.
+	@sh lib/httpx/src/tls/check_client_compat.sh
 
 openapi-generate:
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py openapi.yaml

@@ -509,16 +509,17 @@ pub const KvStorageRuntime = struct {
         if (pool_id != self.storage.pool_id) return error.InvalidPoolId;
         const page_size = self.storage.config.page_size_tokens;
         if (page_size == 0) return error.InvalidPoolId;
-        if (token_count > block_ids.len * page_size) return error.InvalidKvShape;
-        if (token_count % page_size != 0) return error.InvalidKvShape;
+        const retained_token_count = std.math.mul(usize, block_ids.len, @as(usize, page_size)) catch return error.InvalidKvShape;
+        if (token_count != retained_token_count) return error.InvalidKvShape;
 
         const sequence_id = try self.attachSequence(pool_id);
         errdefer self.releaseSequence(sequence_id) catch {};
         const sequence_state = try self.sequenceMut(sequence_id);
+        try sequence_state.block_table.blocks.ensureTotalCapacity(self.allocator, block_ids.len);
 
         for (block_ids) |block_id| {
             try self.storage.retain(block_id);
-            try sequence_state.block_table.appendExisting(self.allocator, block_id);
+            sequence_state.block_table.blocks.appendAssumeCapacity(block_id);
         }
         sequence_state.block_table.markSharedPrefix(@intCast(block_ids.len));
         if (block_ids.len > 0) sequence_state.block_table.tail_tokens = page_size;
@@ -551,9 +552,10 @@ pub const KvStorageRuntime = struct {
             for (out.items) |block_id| _ = self.storage.releaseRef(self.allocator, block_id) catch {};
             out.clearRetainingCapacity();
         }
+        try out.ensureTotalCapacity(self.allocator, block_count);
         for (sequence_state.block_table.blocks.items[0..block_count]) |block_id| {
             try self.storage.retain(block_id);
-            try out.append(self.allocator, block_id);
+            out.appendAssumeCapacity(block_id);
         }
     }
 
@@ -939,6 +941,11 @@ test "storage runtime can attach sequence with retained blocks" {
     try runtime.retainSequencePrefixBlocks(source_id, 4, &blocks);
     defer runtime.releaseRetainedBlocks(blocks.items);
 
+    try std.testing.expectError(
+        error.InvalidKvShape,
+        runtime.attachSequenceWithRetainedBlocks(runtime.poolId(), blocks.items, 2),
+    );
+
     const derived_id = try runtime.attachSequenceWithRetainedBlocks(runtime.poolId(), blocks.items, 4);
     const storage = runtime.getPool(runtime.poolId()).?;
     try std.testing.expectEqual(@as(u32, 3), storage.blockInfo(0).?.refcount);
@@ -947,6 +954,60 @@ test "storage runtime can attach sequence with retained blocks" {
     try runtime.releaseSequence(derived_id);
     try std.testing.expectEqual(@as(u32, 2), storage.blockInfo(0).?.refcount);
     try std.testing.expectEqual(@as(u32, 2), storage.blockInfo(1).?.refcount);
+}
+
+test "storage runtime retain paths do not leak block refs on allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var runtime = try KvStorageRuntime.init(allocator, .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+    });
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+        failing.resize_fail_index = std.math.maxInt(usize);
+        runtime.deinit();
+    }
+
+    const source_id = try runtime.attachSequence(runtime.poolId());
+    try runtime.appendTokens(source_id, 4);
+    const empty_id = try runtime.attachSequence(runtime.poolId());
+    try runtime.releaseSequence(empty_id);
+
+    const storage = runtime.getPool(runtime.poolId()).?;
+    try std.testing.expectEqual(@as(u32, 1), storage.blockInfo(0).?.refcount);
+    try std.testing.expectEqual(@as(u32, 1), storage.blockInfo(1).?.refcount);
+
+    const source_blocks = runtime.blockTable(source_id).?.blocks.items;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        runtime.attachSequenceWithRetainedBlocks(runtime.poolId(), source_blocks, 4),
+    );
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(?usize, null), runtime.tokenCount(empty_id));
+    try std.testing.expectEqual(@as(u32, 1), storage.blockInfo(0).?.refcount);
+    try std.testing.expectEqual(@as(u32, 1), storage.blockInfo(1).?.refcount);
+
+    var retained: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
+    defer retained.deinit(allocator);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        runtime.retainSequencePrefixBlocks(source_id, 4, &retained),
+    );
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(usize, 0), retained.items.len);
+    try std.testing.expectEqual(@as(u32, 1), storage.blockInfo(0).?.refcount);
+    try std.testing.expectEqual(@as(u32, 1), storage.blockInfo(1).?.refcount);
 }
 
 test "storage runtime reuses released sequence slots" {

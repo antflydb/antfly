@@ -14,6 +14,7 @@
 
 const build_options = @import("build_options");
 const std = @import("std");
+const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const decoder_bitnet_runtime = @import("../backends/decoder_bitnet_runtime.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
@@ -31,6 +32,7 @@ const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const contracts = @import("backend_contracts.zig");
 const model_runtime = @import("model_runtime.zig");
+const quant_matmul = @import("quant_matmul.zig");
 
 const c_std = @cImport(@cInclude("stdlib.h"));
 
@@ -491,7 +493,7 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
-        "metal_runtime_memory: buffers={d} total_mb={d} embedding_mb={d} norm_mb={d} dense_linear_mb={d} dense_linear_buffers={d} dense_largest_slot={d} dense_largest_mb={d} dense_largest_in={d} dense_largest_out={d} dense_weight_mb={d} dense_f32_mb={d} dense_bf16_mb={d} dense_f32_slots={d} dense_bf16_slots={d} quant_linear_mb={d} scratch_mb={d} scratch_pool_mb={d} scratch_pool_slots={d} scratch_pool_in_use={d} scratch_pool_pending={d} reuse_pool_mb={d} reuse_pool_slots={d} reuse_pool_peak_slots={d} reuse_allocs={d} reuse_hits={d} attention_span_mb={d} hidden_state_mb={d} frame_retained_mb={d}\n",
+        "metal_runtime_memory: buffers={d} total_mb={d} embedding_mb={d} norm_mb={d} dense_linear_mb={d} dense_linear_buffers={d} dense_largest_slot={d} dense_largest_mb={d} dense_largest_in={d} dense_largest_out={d} dense_weight_mb={d} dense_f32_mb={d} dense_bf16_mb={d} dense_f16_mb={d} dense_f32_slots={d} dense_bf16_slots={d} dense_f16_slots={d} quant_linear_mb={d} scratch_mb={d} scratch_pool_mb={d} scratch_pool_slots={d} scratch_pool_in_use={d} scratch_pool_pending={d} reuse_pool_mb={d} reuse_pool_slots={d} reuse_pool_peak_slots={d} reuse_allocs={d} reuse_hits={d} attention_span_mb={d} hidden_state_mb={d} frame_retained_mb={d}\n",
         .{
             provider_stats.metal_runtime_buffer_count,
             provider_stats.metal_runtime_total_bytes / (1024 * 1024),
@@ -506,8 +508,10 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             provider_stats.metal_runtime_dense_linear_weight_bytes / (1024 * 1024),
             provider_stats.metal_runtime_dense_linear_f32_weight_bytes / (1024 * 1024),
             provider_stats.metal_runtime_dense_linear_bf16_weight_bytes / (1024 * 1024),
+            provider_stats.metal_runtime_dense_linear_f16_weight_bytes / (1024 * 1024),
             provider_stats.metal_runtime_dense_linear_f32_slots,
             provider_stats.metal_runtime_dense_linear_bf16_slots,
+            provider_stats.metal_runtime_dense_linear_f16_slots,
             provider_stats.metal_runtime_quant_linear_bytes / (1024 * 1024),
             provider_stats.metal_runtime_scratch_bytes / (1024 * 1024),
             provider_stats.metal_runtime_scratch_pool_bytes / (1024 * 1024),
@@ -669,17 +673,34 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
-        "metal_attention_dispatch: paged_1x={d} decode_gqa_split={d} decode_gqa_split_fallback={d}\n",
+        "metal_attention_dispatch: paged_1x={d} decode_gqa_split={d} decode_gqa_split_fallback={d} generated_decode_1x={d} generated_flash_prefill={d} generated_flash_prefill_hd512={d} prefill_direct_kv={d} prefill_paged_kv={d} generated_rms_norm={d}\n",
         .{
             provider_stats.metal_runtime_paged_attention_1x_calls,
             provider_stats.metal_runtime_decode_gqa_split_calls,
             provider_stats.metal_runtime_decode_gqa_split_fallback_calls,
+            provider_stats.metal_runtime_generated_attention_decode_1x_calls,
+            provider_stats.metal_runtime_generated_attention_flash_prefill_calls,
+            provider_stats.metal_runtime_generated_attention_flash_prefill_hd512_calls,
+            provider_stats.metal_runtime_attention_prefill_direct_kv_calls,
+            provider_stats.metal_runtime_attention_prefill_paged_kv_calls,
+            provider_stats.metal_runtime_generated_rms_norm_calls,
         },
     );
     std.debug.print(
-        "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
+        "metal_prepared_frame: fast_path={d} fallback={d}\n",
+        .{
+            provider_stats.metal_runtime_prepared_frame_fast_path_calls,
+            provider_stats.metal_runtime_prepared_frame_fallback_calls,
+        },
+    );
+    std.debug.print(
+        "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_rows={d}/{d}/{d}/{d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
         .{
             provider_stats.metal_runtime_q4_0_linear_reduce,
+            provider_stats.metal_runtime_q4_0_linear_reduce_rows_1,
+            provider_stats.metal_runtime_q4_0_linear_reduce_rows_2_8,
+            provider_stats.metal_runtime_q4_0_linear_reduce_rows_9_64,
+            provider_stats.metal_runtime_q4_0_linear_reduce_rows_65_plus,
             provider_stats.metal_runtime_q4_0_linear_reduce_f16_input,
             provider_stats.metal_runtime_q4_0_linear_reduce_f16_output,
             provider_stats.metal_runtime_q4_0_linear_reduce_f16_input_f16_output,
@@ -704,17 +725,63 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
-        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_in_f16={d}\n",
+        "metal_q4_0_policy: mmv_nr4_nsg2={d} mmv_nr8_nsg2={d} mmv_nr4_nsg4={d} mmv_nr8_nsg4={d} mmv_variant_fallbacks={d} mm_sg_aligned={d} mm_sg_aligned_tail={d} mm_sg_unrolled={d}\n",
+        .{
+            provider_stats.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches,
+            provider_stats.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches,
+            provider_stats.metal_runtime_q4_0_mmv_nr4_nsg4_dispatches,
+            provider_stats.metal_runtime_q4_0_mmv_nr8_nsg4_dispatches,
+            provider_stats.metal_runtime_q4_0_mmv_variant_fallbacks,
+            provider_stats.metal_runtime_q4_0_mm_sg_aligned_dispatches,
+            provider_stats.metal_runtime_q4_0_mm_sg_aligned_tail_dispatches,
+            provider_stats.metal_runtime_q4_0_mm_sg_unrolled_dispatches,
+        },
+    );
+    std.debug.print(
+        "metal_q4_0_pair_activation_policy: mmv_nr4_nsg2={d} mmv_nr8_nsg2={d} mmv_nr4_nsg4={d} mmv_nr8_nsg4={d} mmv_variant_fallbacks={d} mm_m32_n64_aligned={d} mm_m32_n64_tail={d} mm_m32_n32_aligned={d} mm_m32_n32_tail={d} mm_variant_fallbacks={d}\n",
+        .{
+            provider_stats.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg2_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg2_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg4_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg4_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mmv_variant_fallbacks,
+            provider_stats.metal_runtime_q4_0_pair_activation_mm_m32_n64_aligned_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mm_m32_n64_tail_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mm_m32_n32_aligned_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mm_m32_n32_tail_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mm_variant_fallbacks,
+        },
+    );
+    std.debug.print(
+        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d}\n",
         .{
             provider_stats.metal_runtime_q4_k_linear_reduce,
+            provider_stats.metal_runtime_q4_k_linear_reduce_rows_1,
+            provider_stats.metal_runtime_q4_k_linear_reduce_rows_2_8,
+            provider_stats.metal_runtime_q4_k_linear_reduce_rows_9_64,
+            provider_stats.metal_runtime_q4_k_linear_reduce_rows_65_plus,
             provider_stats.metal_runtime_q4_k_pair_reduce,
             provider_stats.metal_runtime_q4_k_pair_activation_reduce,
             provider_stats.metal_runtime_q4_k_pair_activation_reduce_f16_output,
             provider_stats.metal_runtime_q4_k_activation_rhs_reduce,
             provider_stats.metal_runtime_q6_k_linear_reduce,
+            provider_stats.metal_runtime_q6_k_linear_reduce_rows_1,
+            provider_stats.metal_runtime_q6_k_linear_reduce_rows_2_8,
+            provider_stats.metal_runtime_q6_k_linear_reduce_rows_9_64,
+            provider_stats.metal_runtime_q6_k_linear_reduce_rows_65_plus,
             provider_stats.metal_runtime_q6_k_linear_reduce_f16_input,
         },
     );
+    // Counter names and their order come from the shared table so this line
+    // stays byte-identical to the historical hand-written format string.
+    std.debug.print("metal_generated_quant_dispatch:", .{});
+    for (quant_matmul.generated_quant_counter_names) |counter| {
+        std.debug.print(" {s}={d}", .{
+            counter.name,
+            quant_matmul.generatedQuantDispatchCount(&provider_stats.metal_runtime_antfly_generated_dispatch_counts, counter.format, counter.epilogue),
+        });
+    }
+    std.debug.print("\n", .{});
     std.debug.print(
         "metal_q4_0_ple_dispatch: activation_rhs_reduce_out_f16={d} linear_reduce_in_f16={d}\n",
         .{
@@ -1916,8 +1983,15 @@ fn envFlag(name: [:0]const u8) bool {
     return slice.len > 0 and !std.mem.eql(u8, slice, "0");
 }
 
+fn pipelinedDecodeFrameEnabledForFlags(enable_requested: bool, disable_requested: bool) bool {
+    return enable_requested and !disable_requested;
+}
+
 fn pipelinedDecodeFrameEnabled() bool {
-    return !envFlag("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME");
+    return pipelinedDecodeFrameEnabledForFlags(
+        platform.env.getenvBool("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"),
+        platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"),
+    );
 }
 
 fn decoderRuntimePrefillAfterPrepareRequested() bool {
@@ -2397,4 +2471,119 @@ fn forwardLastLogits(
     const vocab_size: usize = @intCast(runtime_ctx.gpt_config.vocab_size);
     const last_pos_offset = (query_seq_len - 1) * vocab_size;
     return allocator.dupe(f32, logits[last_pos_offset..][0..vocab_size]);
+}
+
+test "metal executor preserves mixed Gemma global KV history" {
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+    };
+
+    try std.testing.expectEqual(@as(?u32, null), executorKvSlidingWindowSize(config));
+
+    config.num_hidden_layers = 5;
+    try std.testing.expectEqual(@as(?u32, 512), executorKvSlidingWindowSize(config));
+}
+
+test "metal executor limits lazy device KV reserve to mixed-geometry Gemma" {
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+        .ple_hidden_size = 256,
+    };
+
+    try std.testing.expect(!executorUsesLazyDeviceKvReserve(config));
+
+    config.global_head_dim = 512;
+    try std.testing.expect(executorUsesLazyDeviceKvReserve(config));
+
+    config.ple_hidden_size = 0;
+    try std.testing.expect(!executorUsesLazyDeviceKvReserve(config));
+
+    config.ple_hidden_size = 256;
+    config.global_head_dim = 0;
+    config.num_kv_shared_layers = 1;
+    try std.testing.expect(executorUsesLazyDeviceKvReserve(config));
+
+    config.family = .llama;
+    try std.testing.expect(!executorUsesLazyDeviceKvReserve(config));
+}
+
+test "metal executor preserves split KV policy through its views and reset" {
+    const allocator = std.testing.allocator;
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .f16,
+        .page_size_tokens = 16,
+        .num_layers_packed = 2,
+        .num_kv_heads = 2,
+        .head_dim = 256,
+    });
+    defer storage.deinit();
+
+    var metadata = ExecutorKvMetadataLayer.init(allocator, storage.poolId(), true);
+    defer metadata.deinit(&storage);
+    try metadata.configureKvPolicy(128, true);
+    _ = try metadata.notePrefill(&storage, 32);
+    try metadata.configureKvPolicy(128, true);
+    try std.testing.expectError(error.InvalidPagedKvState, metadata.configureKvPolicy(64, true));
+
+    const view = metadata.kv_view.?;
+    try std.testing.expectEqual(@as(usize, 128), view.max_inflight_tokens);
+    try std.testing.expect(view.allow_swa_ring);
+
+    const contract_view = executorContractKvCacheView(view);
+    try std.testing.expectEqual(@as(usize, 128), contract_view.max_inflight_tokens);
+    try std.testing.expect(contract_view.allow_swa_ring);
+    const decode_view = executorDecodeKvCacheView(view);
+    try std.testing.expectEqual(@as(usize, 128), decode_view.max_inflight_tokens);
+    try std.testing.expect(decode_view.allow_swa_ring);
+
+    try metadata.reset(&storage);
+    try std.testing.expectEqual(@as(usize, 0), metadata.max_inflight_tokens);
+    try std.testing.expect(!metadata.allow_swa_ring);
+    try std.testing.expect(metadata.kv_view == null);
+}
+
+test "metal executor only enables split KV policy for mixed local and global Gemma" {
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+        .ple_hidden_size = 256,
+    };
+    try std.testing.expect(config.supportsSplitSwaGlobalKvRing());
+
+    config.ple_hidden_size = 0;
+    try std.testing.expect(!config.supportsSplitSwaGlobalKvRing());
+    config.ple_hidden_size = 256;
+
+    config.sliding_window = 0;
+    try std.testing.expect(!config.supportsSplitSwaGlobalKvRing());
+    config.sliding_window = 512;
+
+    config.sliding_window_pattern = 7;
+    try std.testing.expect(!config.supportsSplitSwaGlobalKvRing());
+    config.sliding_window_pattern = 6;
+
+    config.family = .llama;
+    try std.testing.expect(!config.supportsSplitSwaGlobalKvRing());
+}
+
+test "metal executor keeps speculative decode frames opt in" {
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false));
+    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(true, false));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, true));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(true, true));
 }

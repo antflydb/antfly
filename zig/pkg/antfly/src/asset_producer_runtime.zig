@@ -76,14 +76,14 @@ pub const Runtime = struct {
     pub fn producer(self: *Runtime) asset_producer.Producer {
         return .{
             .ptr = self,
-            .vtable = &.{ .produce = produce, .produce_batch = produceBatch },
+            .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .can_produce_batch = canProduceBatch },
         };
     }
 
     pub fn ownedProducer(self: *Runtime) asset_producer.Producer {
         return .{
             .ptr = self,
-            .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .deinit = deinitProducer },
+            .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .can_produce_batch = canProduceBatch, .deinit = deinitProducer },
         };
     }
 
@@ -96,6 +96,90 @@ pub const Runtime = struct {
     fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         return try self.produceOne(alloc, request);
+    }
+
+    fn canProduceBatch(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request) !bool {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        if (requests.len == 0) return true;
+        const first = requests[0];
+        for (requests) |request| {
+            if (request.producer_type != first.producer_type) return false;
+        }
+        return switch (first.producer_type) {
+            .copy => true,
+            .document_extraction => false,
+            .reader => try self.canReadBatch(alloc, requests),
+            .generator => try self.canGenerateBatch(alloc, requests),
+            // The transcriber interface accepts one audio input per call. Its
+            // produceBatch implementation is therefore a compatibility loop,
+            // not an atomic provider batch, and must be isolated by callers.
+            .transcriber => false,
+            .extractor => try self.canExtractBatch(alloc, requests),
+        };
+    }
+
+    fn requestsShareConfig(requests: []const asset_producer.Request) bool {
+        for (requests[1..]) |request| {
+            if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return false;
+        }
+        return true;
+    }
+
+    fn canReadBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
+        _ = self;
+        if (!requestsShareConfig(requests)) return false;
+        for (requests[1..]) |request| {
+            if (request.inline_media_trusted != requests[0].inline_media_trusted) return false;
+        }
+        var cfg = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer cfg.deinit();
+        if (!readerSupportsPerImageBatch(cfg.value.provider)) return false;
+
+        var shared_prompt: ?[]const u8 = cfg.value.prompt;
+        for (requests, 0..) |request, i| {
+            var source = try parseReaderSource(alloc, request.source_text, request.source_parts_json);
+            defer source.deinit(alloc);
+            if (source.images.len == 0) return false;
+            const effective_prompt = source.prompt orelse cfg.value.prompt;
+            if (i == 0) {
+                shared_prompt = effective_prompt;
+            } else if (!optionalStringsEqual(shared_prompt, effective_prompt)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn canGenerateBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
+        _ = self;
+        if (!requestsShareConfig(requests)) return false;
+        for (requests) |request| {
+            if (request.source_parts_json) |parts| if (parts.len > 0) return false;
+        }
+        var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
+        defer parsed.deinit(alloc);
+        const cfg = parsed.generator;
+        return cfg.provider == .antfly and
+            cfg.url.len > 0 and
+            cfg.api_key == null and
+            cfg.project_id == null and
+            cfg.location == null and
+            cfg.credentials_path == null and
+            cfg.tools_json == null and
+            cfg.tool_choice_json == null and
+            parsed.tool_output == .content;
+    }
+
+    fn canExtractBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
+        if (!requestsShareConfig(requests)) return false;
+        var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
+        defer cfg.deinit(alloc);
+        if (!isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) return true;
+        const local = self.antfly_provider orelse return false;
+        return local.extract != null;
     }
 
     fn produceOne(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
@@ -295,6 +379,9 @@ pub const Runtime = struct {
         for (requests) |request| {
             if (request.producer_type != .reader) return error.BatchIncompatible;
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
+            // Never collapse external and internally generated media into one
+            // request: trust is intentionally carried at the request boundary.
+            if (request.inline_media_trusted != requests[0].inline_media_trusted) return error.BatchIncompatible;
         }
 
         var cfg_parsed = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
@@ -302,10 +389,12 @@ pub const Runtime = struct {
             .ignore_unknown_fields = true,
         });
         defer cfg_parsed.deinit();
-        if (!isLocalReaderProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) return error.BatchIncompatible;
-        const local = self.antfly_provider orelse return error.BatchIncompatible;
-        const read_images = local.read_images orelse return error.BatchIncompatible;
-
+        // The Antfly reader contract returns one independently addressable
+        // result per input image. OpenAI and Vertex accept multiple images in
+        // one prompt, but produce one response for the prompt as a whole, so
+        // flattening requests across those providers loses the request/result
+        // boundary. Let the generic batch path execute them sequentially.
+        if (!readerSupportsPerImageBatch(cfg_parsed.value.provider)) return error.BatchIncompatible;
         const sources = try alloc.alloc(ReaderSource, requests.len);
         var sources_filled: usize = 0;
         defer {
@@ -317,16 +406,13 @@ pub const Runtime = struct {
         var flat_images = std.ArrayListUnmanaged([]const u8).empty;
         defer flat_images.deinit(alloc);
 
-        var shared_prompt: ?[]const u8 = null;
+        var shared_prompt: ?[]const u8 = cfg_parsed.value.prompt;
         for (requests, 0..) |request, i| {
             sources[i] = try parseReaderSource(alloc, request.source_text, request.source_parts_json);
             sources_filled += 1;
-            if (!optionalStringsEqual(shared_prompt, sources[i].prompt)) {
-                if (i == 0) {
-                    shared_prompt = sources[i].prompt;
-                } else {
-                    return error.BatchIncompatible;
-                }
+            const effective_prompt = sources[i].prompt orelse cfg_parsed.value.prompt;
+            if (!optionalStringsEqual(shared_prompt, effective_prompt)) {
+                if (i == 0) shared_prompt = effective_prompt else return error.BatchIncompatible;
             }
             image_counts[i] = sources[i].images.len;
             try flat_images.appendSlice(alloc, sources[i].images);
@@ -344,10 +430,12 @@ pub const Runtime = struct {
         while (image_offset < flat_images.items.len) {
             const image_end = @min(image_offset + local_reader_batch_max_images, flat_images.items.len);
             const chunk_images = flat_images.items[image_offset..image_end];
-            const chunk_results = try read_images(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
+            const chunk_results = try self.readImagesWithConfig(alloc, cfg_parsed.value, .{
                 .images = chunk_images,
                 .prompt = shared_prompt,
                 .max_tokens = cfg_parsed.value.max_tokens,
+                .inline_content_trust = if (requests[0].inline_media_trusted) .trusted_internal else .untrusted,
+                .source_fingerprint = requests[0].source_fingerprint,
             });
             if (chunk_results.len != chunk_images.len) {
                 for (chunk_results) |*result| readers.deinitResult(alloc, result);
@@ -418,41 +506,37 @@ pub const Runtime = struct {
         var source = try parseReaderSource(alloc, request.source_text, request.source_parts_json);
         defer source.deinit(alloc);
 
-        if (isLocalReaderProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) {
+        const results = try self.readImagesWithConfig(alloc, cfg_parsed.value, .{
+            .images = source.images,
+            .prompt = source.prompt orelse cfg_parsed.value.prompt,
+            .max_tokens = cfg_parsed.value.max_tokens,
+            .inline_content_trust = if (request.inline_media_trusted) .trusted_internal else .untrusted,
+            .source_fingerprint = request.source_fingerprint,
+        });
+        defer {
+            for (results) |*result| readers.deinitResult(alloc, result);
+            alloc.free(results);
+        }
+        return try encodeReaderResults(alloc, request.content_type, results);
+    }
+
+    fn readImagesWithConfig(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) ![]readers.Result {
+        if (isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
-            const results = try read_images(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
-                .images = source.images,
-                .prompt = source.prompt,
-                .max_tokens = cfg_parsed.value.max_tokens,
-            });
-            defer {
-                for (results) |*result| readers.deinitResult(alloc, result);
-                alloc.free(results);
-            }
-            return try encodeReaderResults(alloc, request.content_type, results);
+            return try read_images(local.ptr, alloc, cfg.model orelse "", request);
         }
 
         var registry = readers.Registry.init(alloc);
         defer registry.deinit();
-        try registry.registerConfig("asset", cfg_parsed.value);
+        try registry.registerConfig("asset", cfg);
 
         var runtime = readers.Runtime.init(alloc);
         defer runtime.deinit();
         try runtime.loadFromRegistry(self.http, &registry);
 
         const provider = try runtime.get("asset");
-        const results = try provider.read(alloc, .{
-            .images = source.images,
-            .prompt = source.prompt,
-            .max_tokens = cfg_parsed.value.max_tokens,
-        });
-        defer {
-            for (results) |*result| readers.deinitResult(alloc, result);
-            alloc.free(results);
-        }
-
-        return try encodeReaderResults(alloc, request.content_type, results);
+        return try provider.read(alloc, request);
     }
 
     fn transcribe(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
@@ -661,6 +745,10 @@ fn toolCallArgumentsOutputAlloc(alloc: Allocator, calls: []const generating_runt
 
 fn isLocalReaderProvider(provider: readers.Provider, url: ?[]const u8) bool {
     return provider == .antfly and url == null;
+}
+
+fn readerSupportsPerImageBatch(provider: readers.Provider) bool {
+    return provider == .antfly;
 }
 
 fn isLocalTranscriberProvider(provider: transcribing.Provider, url: ?[]const u8) bool {
@@ -1356,6 +1444,7 @@ test "asset producer runtime routes antfly reader without url to local provider"
             try std.testing.expectEqual(@as(usize, 1), request.images.len);
             try std.testing.expectEqualStrings("data:image/png;base64,aaa", request.images[0]);
             try std.testing.expectEqualStrings("extract", request.prompt.?);
+            try std.testing.expectEqual(readers.InlineContentTrust.untrusted, request.inline_content_trust);
 
             const out = try a.alloc(readers.Result, 1);
             out[0] = .{ .text = try a.dupe(u8, "local read text") };
@@ -1416,6 +1505,7 @@ test "asset producer runtime batches compatible antfly reader requests" {
             try std.testing.expectEqualStrings("data:image/png;base64,aaa", request.images[0]);
             try std.testing.expectEqualStrings("data:image/png;base64,bbb", request.images[1]);
             try std.testing.expect(request.prompt == null);
+            try std.testing.expectEqual(readers.InlineContentTrust.trusted_internal, request.inline_content_trust);
 
             const out = try a.alloc(readers.Result, 2);
             out[0] = .{ .text = try a.dupe(u8, "first") };
@@ -1436,12 +1526,14 @@ test "asset producer runtime batches compatible antfly reader requests" {
             .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
             .source_text = "data:image/png;base64,aaa",
             .content_type = "text/plain",
+            .inline_media_trusted = true,
         },
         .{
             .producer_type = .reader,
             .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
             .source_text = "data:image/png;base64,bbb",
             .content_type = "text/plain",
+            .inline_media_trusted = true,
         },
     });
     defer {
@@ -1453,6 +1545,76 @@ test "asset producer runtime batches compatible antfly reader requests" {
     try std.testing.expectEqualStrings("first", results[0]);
     try std.testing.expectEqualStrings("second", results[1]);
     try std.testing.expectEqual(@as(usize, 1), local.read_calls);
+}
+
+fn expectSingleImageOpenAiReaderRequest(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqual(.POST, req.method);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, req.body, "\"type\":\"image_url\""));
+}
+
+test "asset producer runtime keeps prompt-level remote readers sequential" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/chat/completions", .assert_request = expectSingleImageOpenAiReaderRequest, .respond = .{
+            .body = "{\"choices\":[{\"message\":{\"content\":\"ocr text\"}}]}",
+        } },
+    });
+    defer server.deinit();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.init(alloc, &client);
+    const producer = runtime.producer();
+    const cfg_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"provider\":\"openai\",\"model\":\"vision-reader\",\"base_url\":\"{s}\"}}",
+        .{server.baseUrl()},
+    );
+    defer alloc.free(cfg_json);
+
+    const requests = [_]asset_producer.Request{
+        .{ .producer_type = .reader, .config_json = cfg_json, .source_text = "data:image/png;base64,aaa", .content_type = "text/plain" },
+        .{ .producer_type = .reader, .config_json = cfg_json, .source_text = "data:image/png;base64,bbb", .content_type = "text/plain" },
+    };
+    try std.testing.expect(!(try producer.canProduceBatch(alloc, &requests)));
+
+    var results: ?[][]u8 = null;
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(
+            a: Allocator,
+            p: asset_producer.Producer,
+            cfg: []const u8,
+            out: *?[][]u8,
+            err_out: *?anyerror,
+        ) std.Io.Cancelable!void {
+            out.* = p.produceBatch(a, &.{
+                .{ .producer_type = .reader, .config_json = cfg, .source_text = "data:image/png;base64,aaa", .content_type = "text/plain" },
+                .{ .producer_type = .reader, .config_json = cfg, .source_text = "data:image/png;base64,bbb", .content_type = "text/plain" },
+            }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+
+    try group.concurrent(io, Fiber.run, .{ alloc, producer, cfg_json, &results, &run_err });
+    try server.handleOne();
+    try server.handleOne();
+    try group.await(io);
+    if (run_err) |err| return err;
+    defer {
+        for (results.?) |result| alloc.free(result);
+        alloc.free(results.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), results.?.len);
+    try std.testing.expectEqualStrings("ocr text", results.?[0]);
+    try std.testing.expectEqualStrings("ocr text", results.?[1]);
 }
 
 test "asset producer runtime chunks local antfly reader batches to inference cap" {
@@ -1590,7 +1752,7 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
     var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
     const producer = runtime.producer();
 
-    const results = try producer.produceBatch(alloc, &.{
+    const requests = [_]asset_producer.Request{
         .{
             .producer_type = .transcriber,
             .config_json = "{\"provider\":\"antfly\",\"model\":\"local-transcriber\",\"language_code\":\"en-US\"}",
@@ -1603,7 +1765,10 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
             .source_text = "file:///tmp/b.wav",
             .content_type = "text/plain",
         },
-    });
+    };
+    try std.testing.expect(!(try producer.canProduceBatch(alloc, &requests)));
+
+    const results = try producer.produceBatch(alloc, &requests);
     defer {
         for (results) |result| alloc.free(result);
         alloc.free(results);

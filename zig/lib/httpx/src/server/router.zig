@@ -22,6 +22,7 @@ pub const RouteParam = struct {
 /// Route match result containing the handler and extracted parameters.
 pub const RouteMatch = struct {
     handler: Handler,
+    data: ?*anyopaque,
     params: []const RouteParam,
 };
 
@@ -34,6 +35,7 @@ const Route = struct {
     pattern_owned: bool = false,
     segments: []const Segment,
     handler: Handler,
+    data: ?*anyopaque = null,
 };
 
 const Segment = union(enum) {
@@ -85,12 +87,18 @@ pub const Router = struct {
 
     /// Adds a route to the router.
     pub fn add(self: *Self, method: types.Method, pattern: []const u8, handler: Handler) !void {
+        return self.addWithData(method, pattern, handler, null);
+    }
+
+    /// Adds a route with borrowed opaque request data.
+    pub fn addWithData(self: *Self, method: types.Method, pattern: []const u8, handler: Handler, data: ?*anyopaque) !void {
         const segments = try self.parsePattern(pattern);
         try self.routesFor(method).append(self.allocator, .{
             .method = method,
             .pattern = pattern,
             .segments = segments,
             .handler = handler,
+            .data = data,
         });
     }
 
@@ -139,11 +147,12 @@ pub const Router = struct {
     /// `params_buf` is caller-owned storage for matched route parameters;
     /// the returned slice borrows from it, so it remains valid as long as
     /// the caller keeps the buffer alive.
-    pub fn find(self: *Self, method: types.Method, path: []const u8, params_buf: *[16]RouteParam) ?struct { handler: Handler, params: []const RouteParam } {
+    pub fn find(self: *Self, method: types.Method, path: []const u8, params_buf: *[16]RouteParam) ?RouteMatch {
         for (self.routesForConst(method)) |route| {
             if (self.matchRoute(route, path, params_buf)) |param_count| {
                 return .{
                     .handler = route.handler,
+                    .data = route.data,
                     .params = params_buf[0..param_count],
                 };
             }
@@ -295,6 +304,9 @@ test "Router basic matching" {
     try router.add(.GET, "/users/:id", handler);
     try router.add(.POST, "/users", handler);
 
+    var route_state: u8 = 1;
+    try router.addWithData(.PUT, "/users", handler, &route_state);
+
     const result1 = router.find(.GET, "/users", &pbuf);
     try std.testing.expect(result1 != null);
     try std.testing.expectEqual(@as(usize, 0), result1.?.params.len);
@@ -307,6 +319,9 @@ test "Router basic matching" {
 
     const result3 = router.find(.DELETE, "/users", &pbuf);
     try std.testing.expect(result3 == null);
+
+    const result4 = router.find(.PUT, "/users", &pbuf).?;
+    try std.testing.expectEqual(@as(?*anyopaque, &route_state), result4.data);
 }
 
 test "Router multiple parameters" {

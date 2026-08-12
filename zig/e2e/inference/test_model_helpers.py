@@ -6,6 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
+import hashlib
 import json
 import tempfile
 import threading
@@ -24,7 +25,9 @@ from .models import (
     DEFAULT_TOOL_GENERATOR_MODEL,
     _env_model_specs,
     _looks_like_model_dir,
+    _model_path,
     bootstrap_models_for_listing,
+    find_local_model_path,
 )
 
 
@@ -44,6 +47,28 @@ def test_completed_nested_model_payload_is_available(tmp_path):
     (model_dir / "onnx" / "model.onnx").write_bytes(b"complete")
 
     assert _looks_like_model_dir(model_dir)
+
+
+def test_explicit_variant_uses_registry_install_path(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
+    spec = models.ModelSpec(
+        name="model",
+        repo="owner/model",
+        task="generators",
+        variant="gguf:Q4_K_M",
+    )
+    variant_hash = hashlib.sha256(spec.variant.encode()).hexdigest()[:16]
+
+    assert _model_path(spec) == tmp_path / "owner" / f"model--antfly-{variant_hash}"
+
+
+def test_bare_model_name_finds_completed_explicit_variant(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
+    model_dir = tmp_path / "owner" / "model--antfly-0123456789abcdef"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.gguf").write_bytes(b"complete")
+
+    assert find_local_model_path("owner/model") == model_dir
 
 
 def test_unsupported_framework_bin_is_not_a_completed_model(tmp_path):
@@ -91,7 +116,7 @@ def test_managed_completion_receipt_requires_every_artifact(tmp_path):
     assert not _looks_like_model_dir(model_dir)
 
 
-def test_managed_completion_receipt_accepts_complete_artifact_set(tmp_path):
+def test_managed_completion_receipt_accepts_v1_complete_artifact_set(tmp_path):
     model_dir = tmp_path / "owner" / "complete-shards"
     model_dir.mkdir(parents=True)
     (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"first")
@@ -106,6 +131,33 @@ def test_managed_completion_receipt_accepts_complete_artifact_set(tmp_path):
     (model_dir / ".antfly-download-complete.json").write_text(json.dumps(receipt))
 
     assert _looks_like_model_dir(model_dir)
+
+
+def test_managed_completion_receipt_accepts_v2_complete_artifact_set(tmp_path):
+    model_dir = tmp_path / "owner" / "complete-v2"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.gguf").write_bytes(b"complete")
+    receipt = {
+        "version": 2,
+        "source": {"owner": "owner", "name": "complete-v2", "variant": "auto"},
+        "artifacts": [{"path": "model.gguf", "size": 8, "sha256": None}],
+    }
+    (model_dir / ".antfly-download-complete.json").write_text(json.dumps(receipt))
+
+    assert _looks_like_model_dir(model_dir)
+
+
+def test_managed_completion_receipt_rejects_unknown_version(tmp_path):
+    model_dir = tmp_path / "owner" / "future-version"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.gguf").write_bytes(b"complete")
+    receipt = {
+        "version": 3,
+        "artifacts": [{"path": "model.gguf", "size": 8}],
+    }
+    (model_dir / ".antfly-download-complete.json").write_text(json.dumps(receipt))
+
+    assert not _looks_like_model_dir(model_dir)
 
 
 def test_managed_completion_receipt_rejects_boolean_numeric_fields(tmp_path):

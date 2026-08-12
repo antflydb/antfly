@@ -25,7 +25,6 @@ const db_types = @import("../../storage/db/types.zig");
 const range_state = @import("../../storage/db/range_state.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 const range_transition = @import("range_transition.zig");
-const lmdb = @import("../../storage/lmdb.zig");
 
 pub const DestinationConfig = struct {
     root_dir: []const u8,

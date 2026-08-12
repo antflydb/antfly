@@ -267,7 +267,8 @@ pub const MetalKvStorage = struct {
         if (!allow_swa_ring or sliding_window == 0 or max_inflight_tokens == 0 or page_size_tokens == 0) return 0;
         // Production requests opt in through the typed KV policy. Keep only a
         // hard rollback flag here.
-        if (!splitSwaKvRingEnabled()) return 0;
+        if (envFlagEnabled("TERMITE_METAL_DISABLE_SPLIT_SWA_KV_RING")) return 0;
+        if (envFlagEnabled("TERMITE_METAL_DISABLE_PAGED_SLOT_ATTENTION")) return 0;
         return storage_runtime.swaRingPageCount(page_size_tokens, sliding_window, max_inflight_tokens, allow_swa_ring);
     }
 
@@ -693,7 +694,7 @@ pub const MetalKvStorage = struct {
         const slot = binding.slot;
         if (binding.ring_page_count > 0) return error.RingKvRequiresPagedAttention;
         if (!binding.logical_contiguous) return error.DeviceReadFallback;
-        if (!binding.covers(gather.token_count)) return error.DeviceReadFallback;
+        if (binding.written_tokens < gather.token_count) return error.DeviceReadFallback;
         const info = try self.slotInfo(slot);
 
         const k_handle = info.encoded_key_handle orelse return error.DeviceReadFallback;
@@ -781,7 +782,7 @@ pub const MetalKvStorage = struct {
         const slot = binding.slot;
         if (binding.ring_page_count > 0) return error.RingKvRequiresPagedAttention;
         if (!binding.logical_contiguous) return error.DeviceReadFallback;
-        if (!binding.covers(gather.token_count)) return error.DeviceReadFallback;
+        if (binding.written_tokens < gather.token_count) return error.DeviceReadFallback;
         const info = try self.slotInfo(slot);
         if (info.key_row_bytes != token_width * @sizeOf(f32)) return error.DeviceReadFallback;
         if (info.v_row_stride != token_width) return error.DeviceReadFallback;
@@ -838,36 +839,17 @@ pub const MetalKvStorage = struct {
             .layer_index = @intCast(gather.layer_index),
         };
         const active_frame = metal_runtime.hasActiveFrame(self.runtime);
-        const binding = self.slot_map.get(key) orelse {
-            if (traceKvGather()) std.debug.print("kv-paged-read-fallback: seq={d} layer={d} reason=no-binding\n", .{ gather.sequence_id, gather.layer_index });
-            return error.DeviceReadFallback;
-        };
+        const binding = self.slot_map.get(key) orelse return error.DeviceReadFallback;
         const slot = binding.slot;
         const ring_page_count = binding.ring_page_count;
         const info_opt = self.slotInfo(slot) catch |err| blk: {
             if (!active_frame) return err;
             break :blk null;
         };
-        // An active frame may request a reserved slot immediately before a
-        // fused operation encodes its suffix. Only that explicitly declared
-        // suffix may be pending; all preceding tokens must already be covered.
-        if (gather.pending_suffix_token_count != 0 and !active_frame) {
-            if (traceKvGather()) std.debug.print("kv-paged-read-fallback: seq={d} layer={d} reason=pending-without-frame pending={d}\n", .{ gather.sequence_id, gather.layer_index, gather.pending_suffix_token_count });
-            return error.DeviceReadFallback;
-        }
-        if (!binding.coversBeforePendingSuffix(gather.token_count, gather.pending_suffix_token_count)) {
-            if (traceKvGather()) std.debug.print("kv-paged-read-fallback: seq={d} layer={d} reason=coverage written={d} requested={d} pending={d}\n", .{ gather.sequence_id, gather.layer_index, binding.written_tokens, gather.token_count, gather.pending_suffix_token_count });
-            return error.DeviceReadFallback;
-        }
+        if (!active_frame and binding.written_tokens < gather.token_count) return error.DeviceReadFallback;
         if (info_opt) |info| {
-            if (info.key_row_bytes != 0 and info.key_row_bytes != key_row_bytes) {
-                if (traceKvGather()) std.debug.print("kv-paged-read-fallback: seq={d} layer={d} reason=key-row-bytes actual={d} expected={d}\n", .{ gather.sequence_id, gather.layer_index, info.key_row_bytes, key_row_bytes });
-                return error.DeviceReadFallback;
-            }
-            if (info.v_row_stride != 0 and info.v_row_stride != token_width) {
-                if (traceKvGather()) std.debug.print("kv-paged-read-fallback: seq={d} layer={d} reason=value-row-stride actual={d} expected={d}\n", .{ gather.sequence_id, gather.layer_index, info.v_row_stride, token_width });
-                return error.DeviceReadFallback;
-            }
+            if (info.key_row_bytes != 0 and info.key_row_bytes != key_row_bytes) return error.DeviceReadFallback;
+            if (info.v_row_stride != 0 and info.v_row_stride != token_width) return error.DeviceReadFallback;
         }
         return .{
             .runtime = @ptrCast(self.runtime),

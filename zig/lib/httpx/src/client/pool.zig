@@ -98,8 +98,7 @@ pub const Connection = struct {
         const host_owned = try allocator.dupe(u8, host);
         errdefer allocator.free(host_owned);
 
-        const addr = try resolveAddress(io, host, port);
-        var socket = try Socket.connect(addr, io);
+        var socket = try Socket.connectHost(host, port, io);
         errdefer socket.close();
         socket.setKeepAlive(true) catch {};
 
@@ -120,6 +119,7 @@ pub const Connection = struct {
 /// Context passed to `TlsConnection.createNew` for TLS-specific configuration.
 pub const TlsPoolContext = struct {
     verify_ssl: bool,
+    ca_file: ?[]const u8 = null,
 };
 
 /// Pooled TLS connection bundle.
@@ -168,14 +168,14 @@ pub const TlsConnection = struct {
         errdefer allocator.destroy(entry);
 
         // Resolve and connect the TCP socket.
-        const addr = try resolveAddress(io, host, port);
-        entry.socket = try Socket.connect(addr, io);
+        entry.socket = try Socket.connectHost(host, port, io);
         errdefer entry.socket.close();
 
         // Initialize the TLS session.  The session stores internal pointers to
         // entry.socket (via SocketIoReader/Writer), so the entry must already
         // live at its final heap address — which it does.
-        const tls_cfg = if (ctx.verify_ssl) TlsConfig.init(allocator) else TlsConfig.insecure(allocator);
+        var tls_cfg = if (ctx.verify_ssl) TlsConfig.init(allocator) else TlsConfig.insecure(allocator);
+        tls_cfg.ca_file = ctx.ca_file;
         entry.session = TlsSession.init(tls_cfg, io);
         errdefer entry.session.deinit();
 

@@ -24,6 +24,7 @@ const introducer_mod = @import("../../introducer.zig");
 const search_agg_mod = @import("../../search/aggregation.zig");
 const search_mod = @import("../../search/search.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
+const background_text_stats = @import("background_text_stats.zig");
 const geo_mod = @import("../../search/geo.zig");
 const regex_mod = @import("../../search/regex.zig");
 const doc_identity = @import("doc_identity.zig");
@@ -134,32 +135,13 @@ pub const SearchAggregationResult = struct {
     }
 };
 
-pub const DistributedBackgroundTextStats = struct {
-    aggregation_name: []const u8,
-    field: []const u8,
-    background_doc_count: u32 = 0,
-    term_doc_freqs: []const distributed_stats_mod.TermDocFreq = &.{},
-
-    pub fn deinit(self: *DistributedBackgroundTextStats, alloc: Allocator) void {
-        alloc.free(self.aggregation_name);
-        alloc.free(self.field);
-        for (self.term_doc_freqs) |item| alloc.free(item.term);
-        if (self.term_doc_freqs.len > 0) alloc.free(self.term_doc_freqs);
-        self.* = undefined;
-    }
-};
+pub const DistributedBackgroundTextStats = background_text_stats.DistributedBackgroundTextStats;
 
 pub fn deinitDistributedBackgroundTextStats(
     alloc: Allocator,
     items: []const DistributedBackgroundTextStats,
 ) void {
-    for (items) |item| {
-        alloc.free(item.aggregation_name);
-        alloc.free(item.field);
-        for (item.term_doc_freqs) |term_doc_freq| alloc.free(term_doc_freq.term);
-        if (item.term_doc_freqs.len > 0) alloc.free(item.term_doc_freqs);
-    }
-    if (items.len > 0) alloc.free(items);
+    background_text_stats.deinitAll(alloc, items);
 }
 
 pub fn deinitResults(alloc: Allocator, results: []SearchAggregationResult) void {

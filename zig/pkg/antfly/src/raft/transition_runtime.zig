@@ -13,8 +13,8 @@
 // limitations.
 
 const std = @import("std");
-const data = @import("../data/mod.zig");
-const metadata = @import("../metadata/mod.zig");
+const data = @import("../data/domain.zig");
+const metadata = @import("../metadata/domain.zig");
 const shard_ops = @import("shard_ops.zig");
 const raft_state_machine = @import("state_machine/mod.zig");
 

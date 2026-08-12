@@ -18,6 +18,8 @@ This file fits with the other architecture docs:
   boundaries, compiled backend attachment, and graph memory planning.
 - [GGML.md](GGML.md): GGUF/GGML format compatibility plus the upstream ggml
   execution shape we use as a reference.
+- [QUANT_KERNEL_COMPILER.md](QUANT_KERNEL_COMPILER.md): build-time quant kernel
+  specs, generated artifacts, Metal promotion gates, and evidence flow.
 - this file: the concrete Metal backend plan, kernels, runtime
   session shape, scratch/frame ownership, and performance gap.
 
@@ -476,6 +478,12 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
 ## Benchmark Anchors
 
 These are local directional anchors, not absolute device claims.
+
+The current Gemma 4 QAT baseline/no-MTP plan, canonical 2K+300 comparator, and
+promotion gates live in
+[GEMMA4_METAL_PERFORMANCE.md](./GEMMA4_METAL_PERFORMANCE.md). Older anchors
+below remain useful implementation history, but they are not the current
+llama.cpp gap unless rerun under that contract.
 
 - Current compiled partitioned graph anchor, Gemma4 Q8_0 short prompt:
   `ANTFLY_INFERENCE_GRAPH_EXECUTOR_STATS=1` with `--backend metal --mode compiled

@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const http_common = @import("http_common.zig");
+const thread_config = @import("../../runtime_thread_config.zig");
 
 const observation_interval_ms: u64 = 25;
 // Linux exposes POLLRDHUP under its GNU poll ABI, but Zig 0.16's
@@ -150,7 +151,11 @@ pub const Observer = struct {
             self.kernel_fd = null;
         };
         self.stopping.store(false, .release);
-        self.thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, run, .{self});
+        self.thread = try std.Thread.spawn(
+            .{ .stack_size = thread_config.minimum_partitioned_stack_size },
+            run,
+            .{self},
+        );
     }
 
     pub fn deinit(self: *Observer) void {

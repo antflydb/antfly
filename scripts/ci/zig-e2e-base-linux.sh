@@ -39,7 +39,7 @@ fi
 
 cd "$repo_root/zig"
 if [[ ! -x ./zig-out/bin/antfly ]]; then
-  echo "missing ./zig-out/bin/antfly; rerun without SKIP_BUILD=1 or build install -Dedition=full first" >&2
+  echo "missing ./zig-out/bin/antfly; rerun without SKIP_BUILD=1 or run 'zig build antfly' first" >&2
   exit 1
 fi
 chmod +x ./zig-out/bin/antfly
@@ -53,6 +53,14 @@ fi
 
 export ANTFLY_BIN="${ANTFLY_BIN:-./zig-out/bin/antfly}"
 export ANTFLY_LSM_OPEN_DEBUG="${ANTFLY_LSM_OPEN_DEBUG:-1}"
+e2e_suite="${ANTFLY_E2E_SUITE:-all}"
+case "$e2e_suite" in
+  all|antfly|inference) ;;
+  *)
+    echo "ANTFLY_E2E_SUITE must be all, antfly, or inference; got: $e2e_suite" >&2
+    exit 2
+    ;;
+esac
 # ANTFLY_FS_PATH_DEBUG is intentionally not defaulted on: it logs one line per
 # path component on every filesystem op (~8k lines/s per node), slowing the
 # servers and flooding the per-node log tails captured on failure until they
@@ -71,10 +79,12 @@ else
 fi
 
 antfly_status=0
-UV_PROJECT_ENVIRONMENT="$antfly_venv" uv run --project e2e/antfly pytest -q --continue-on-collection-errors "${antfly_args[@]}" || antfly_status=$?
+if [[ "$e2e_suite" != "inference" ]]; then
+  UV_PROJECT_ENVIRONMENT="$antfly_venv" uv run --project e2e/antfly pytest -q --continue-on-collection-errors "${antfly_args[@]}" || antfly_status=$?
+fi
 
 inference_status=0
-if [[ "$run_inference" == "1" ]]; then
+if [[ "$e2e_suite" == "inference" ]] || [[ "$e2e_suite" == "all" && "$run_inference" == "1" ]]; then
   UV_PROJECT_ENVIRONMENT="$inference_venv" uv run --project e2e/inference pytest -q --continue-on-collection-errors \
     -m "not slow and not multimodal and not model_integration and not browser_integration" \
     e2e/inference || inference_status=$?

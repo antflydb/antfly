@@ -29,7 +29,11 @@ pub const RenderError = error{
     TransientPromptFailure,
 };
 
-pub const RenderConfig = struct {};
+pub const RenderConfig = struct {
+    io: ?std.Io = null,
+    deadline_ns: ?u64 = null,
+    max_media_parts: ?usize = null,
+};
 
 pub const default_remote_fetch_max_download_size_bytes: u64 = 100 * 1024 * 1024;
 
@@ -209,6 +213,7 @@ fn applyContentSecurityOverride(
 ) void {
     if (override.allowed_hosts) |value| effective.allowed_hosts = value;
     if (override.block_private_ips) |value| effective.block_private_ips = value;
+    if (override.nat64_prefixes) |value| effective.nat64_prefixes = value;
     if (override.max_download_size_bytes) |value| effective.max_download_size_bytes = value;
     if (override.download_timeout_seconds) |value| effective.download_timeout_seconds = value;
     if (override.max_image_dimension) |value| effective.max_image_dimension = value;

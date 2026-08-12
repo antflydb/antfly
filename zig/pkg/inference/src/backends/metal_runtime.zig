@@ -21,7 +21,10 @@ const decoder_gpt_runtime = @import("decoder_gpt_runtime.zig");
 const ops = @import("../ops/ops.zig");
 const model_runtime = @import("../graph/model_runtime.zig");
 const metal_command_planner = @import("../graph/metal_command_planner.zig");
+const kernel_jit = @import("../graph/kernel_jit.zig");
+const quant_kernel_compiler = @import("../graph/quant_kernel_compiler.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
+const quant_matmul = @import("../graph/quant_matmul.zig");
 const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const tensor_store_mod = @import("../models/tensor_store.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
@@ -29,10 +32,55 @@ const metal_tensor = @import("metal_tensor.zig");
 const native = @import("native.zig");
 const runtime_root = @import("../runtime/root.zig");
 const turboquant = @import("../runtime/kv/turboquant.zig");
+const io_compat = @import("../io/compat.zig");
+const kernel_jit_profile_output = @import("../kernel_jit_profile_output.zig");
+const workload_profile_policy = @import("../workload_profile_policy.zig");
+
+// Qualification evidence is valid only for the exact generated candidate,
+// handwritten baseline, and backend-specific qualification implementation.
+// The build graph hashes the checked-in source files once; runtime keys carry
+// those identities without embedding or repeatedly hashing multi-megabyte
+// sources during model load.
+const unavailable_source_sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+const metal_jit_baseline_implementation_sha256 = if (@hasDecl(build_options, "metal_jit_baseline_implementation_sha256"))
+    build_options.metal_jit_baseline_implementation_sha256
+else
+    unavailable_source_sha256;
+const metal_jit_qualification_implementation_sha256 = if (@hasDecl(build_options, "metal_jit_qualification_implementation_sha256"))
+    build_options.metal_jit_qualification_implementation_sha256
+else
+    unavailable_source_sha256;
+const metal_jit_max_observed_shapes_per_format = 16;
+const metal_jit_quant_format_count = 12;
+const metal_jit_max_fixture_bytes = 256 * 1024 * 1024;
+const metal_jit_fixture_safety_margin_bytes = 16 * 1024 * 1024;
+const metal_jit_measure_target_macs: u64 = 128 * 1024 * 1024;
+const metal_jit_measure_target_ns: u64 = 20 * std.time.ns_per_ms;
+const metal_jit_max_measure_iters: u32 = 1024;
+const metal_jit_qualification_policy_identity = "metal-v19:correctness=route-wide-generic+exact-signature-full-bundled-differential+columns8-cpu,cold+repeat-before-timing,pattern-bank29,matrix-fp16-abs-q4k0.002-q6k0.003;benchmark=after-correctness,exact-rows+shape,calibrated-target-ns20000000+macs-fallback134217728,iters2-1024-even,warmup2-every-repeat,shared-input-weight+separate-outputs,selection-interleaved-abba5+independent-confirmation-interleaved-abba5,gpu-timestamps-required,post-output-check;winner=both-phases-median+worst-repeat>=1.02,ranked-confirmation-fallback,candidates<=8;q4_0-exact-2d-rows2-shape-general-tile2or4or8-small-output-nr2;q4_k+q6_k-exact-2d-rows2-plus-nr2or4or8-matrix40or64x64x32-row-tiled+homogeneous-qkv-companion;qualified-coverage=all-eligible-calibrated-denominator+floor2pct+target90pct+attempts<=5-per-regime;fixture-max268435456,margin16777216;scope-max-shapes16";
 
 pub const QuantizedStorage = weight_source_mod.QuantizedStorage;
 const c_file = @import("../util/c_file.zig");
 pub const MetalTensor = metal_tensor.MetalTensor;
+
+/// Preserve the optional-fallback contract while releasing a newly allocated
+/// device output when the Metal runtime rejects an operation. `errdefer` alone
+/// is insufficient because `return null` is a successful optional return.
+fn finishDeviceOutput(output: *MetalTensor, rc: c_int) ?MetalTensor {
+    if (rc != 0) {
+        output.deinit();
+        return null;
+    }
+    return output.*;
+}
+
+fn finishHostOutput(output: []f32, shape: []const i32, rc: c_int) ?MetalTensor {
+    if (rc != 0) {
+        std.heap.c_allocator.free(output);
+        return null;
+    }
+    return MetalTensor.owned(output, shape);
+}
 
 const c = struct {
     pub const backend_array = extern struct {
@@ -59,6 +107,667 @@ const metal_tensor_bridge = struct {
 
 pub const RawMetalProvider = opaque {};
 pub const RawMetalDecodeRuntime = opaque {};
+pub const RawMetalGeneratedPipeline = opaque {};
+
+pub const MetalDeviceInfo = extern struct {
+    registry_id: u64 = 0,
+    recommended_max_working_set_size: u64 = 0,
+    max_buffer_length: u64 = 0,
+    max_threads_per_threadgroup_width: u32 = 0,
+    max_threads_per_threadgroup_height: u32 = 0,
+    max_threads_per_threadgroup_depth: u32 = 0,
+    max_threadgroup_memory_length: u32 = 0,
+    apple_gpu_family: u16 = 0,
+    mac_gpu_family: u16 = 0,
+    common_gpu_family: u16 = 0,
+    metal_gpu_family: u16 = 0,
+    has_unified_memory: u8 = 0,
+    reserved: [7]u8 = @splat(0),
+};
+
+pub const MetalGeneratedPipelineInfo = extern struct {
+    static_threadgroup_memory_length: u64 = 0,
+    thread_execution_width: u32 = 0,
+    max_total_threads_per_threadgroup: u32 = 0,
+};
+
+/// Bounded split-GQA schedule portfolio shared with the Objective-C bridge.
+/// AUTO preserves the production s32/k32/256-thread stage+reducer route.
+pub const DecodeGqaSplitVariant = enum(c_uint) {
+    auto = 0,
+    s8_k32_r256 = 1,
+    s16_k32_r256 = 2,
+    s24_k32_r256 = 3,
+    s32_k32_r256 = 4,
+};
+
+pub const DecodeGqaSplitShape = enum(c_uint) {
+    swa_hd256 = 0,
+    global_hd512 = 1,
+};
+
+pub const RawDecodeGqaSplitScheduleStats = extern struct {
+    calls: [2][4]u64 = .{
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    },
+    fallback_calls: u64 = 0,
+    invalid_override_count: u64 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(RawDecodeGqaSplitScheduleStats) == 80);
+    std.debug.assert(@offsetOf(RawDecodeGqaSplitScheduleStats, "calls") == 0);
+    std.debug.assert(@offsetOf(RawDecodeGqaSplitScheduleStats, "fallback_calls") == 64);
+    std.debug.assert(@offsetOf(RawDecodeGqaSplitScheduleStats, "invalid_override_count") == 72);
+}
+
+/// Stable ABI shared with termite_metal_jit_pipeline_slot. Values are persisted
+/// indirectly through ArtifactKey-qualified route records, so append only.
+pub const MetalJitPipelineSlot = enum(c_uint) {
+    q4_k_bias_gelu,
+    q4_0,
+    q4_1,
+    q5_0,
+    q5_1,
+    q2_k,
+    q2_k_bias,
+    q2_k_bias_gelu,
+    q3_k,
+    q3_k_bias,
+    q3_k_bias_gelu,
+    q4_k_bias,
+    q4_k,
+    q8_0,
+    q8_0_bias,
+    q8_0_bias_gelu,
+    q8_0_relu,
+    q8_1,
+    q8_k,
+    q5_k,
+    q5_k_bias,
+    q5_k_bias_gelu,
+    q6_k,
+    q6_k_bias,
+    q6_k_bias_gelu,
+};
+
+pub const metal_jit_pipeline_slot_count = @typeInfo(MetalJitPipelineSlot).@"enum".fields.len;
+
+pub const MetalJitRoute = struct {
+    slot: MetalJitPipelineSlot,
+    kernel_id: []const u8,
+    gate_env: ?[]const u8,
+};
+
+/// Mapping from typed Metal matmul artifacts to existing production dispatch
+/// slots. RMSNorm and attention candidates stay in the offline registry until
+/// they have model-scope derivation and live qualification; they are not
+/// advertised as runtime-JIT routes.
+pub const metal_jit_routes = [_]MetalJitRoute{
+    .{ .slot = .q4_k_bias_gelu, .kernel_id = quant_kernel_compiler.first_lazy_metal_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS_GELU" },
+    .{ .slot = .q4_0, .kernel_id = quant_kernel_compiler.first_general_metal_q4_0_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q4_0_SMALL_BATCH" },
+    .{ .slot = .q4_1, .kernel_id = quant_kernel_compiler.first_general_metal_q4_1_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q4_1_SMALL_BATCH" },
+    .{ .slot = .q5_0, .kernel_id = quant_kernel_compiler.first_general_metal_q5_0_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q5_0_SMALL_BATCH" },
+    .{ .slot = .q5_1, .kernel_id = quant_kernel_compiler.first_general_metal_q5_1_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q5_1_SMALL_BATCH" },
+    .{ .slot = .q2_k, .kernel_id = quant_kernel_compiler.first_general_metal_q2_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH" },
+    .{ .slot = .q2_k_bias, .kernel_id = quant_kernel_compiler.first_general_metal_q2_bias_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH_BIAS" },
+    .{ .slot = .q2_k_bias_gelu, .kernel_id = quant_kernel_compiler.first_general_metal_q2_bias_gelu_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH_BIAS_GELU" },
+    .{ .slot = .q3_k, .kernel_id = quant_kernel_compiler.first_general_metal_q3_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH" },
+    .{ .slot = .q3_k_bias, .kernel_id = quant_kernel_compiler.first_general_metal_q3_bias_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH_BIAS" },
+    .{ .slot = .q3_k_bias_gelu, .kernel_id = quant_kernel_compiler.first_general_metal_q3_bias_gelu_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH_BIAS_GELU" },
+    .{ .slot = .q4_k_bias, .kernel_id = quant_kernel_compiler.first_general_metal_q4_bias_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS" },
+    .{ .slot = .q4_k, .kernel_id = quant_kernel_compiler.first_general_metal_q4_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH" },
+    .{ .slot = .q8_0, .kernel_id = quant_kernel_compiler.first_general_metal_q8_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH" },
+    .{ .slot = .q8_0_bias, .kernel_id = quant_kernel_compiler.first_general_metal_q8_bias_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS" },
+    .{ .slot = .q8_0_bias_gelu, .kernel_id = quant_kernel_compiler.first_general_metal_q8_bias_gelu_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS_GELU" },
+    .{ .slot = .q8_0_relu, .kernel_id = quant_kernel_compiler.first_general_metal_q8_relu_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_RELU" },
+    .{ .slot = .q8_1, .kernel_id = quant_kernel_compiler.first_general_metal_q8_1_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q8_1_SMALL_BATCH" },
+    .{ .slot = .q8_k, .kernel_id = quant_kernel_compiler.first_general_metal_q8_k_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q8_K_SMALL_BATCH" },
+    .{ .slot = .q5_k, .kernel_id = quant_kernel_compiler.first_general_metal_q5_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH" },
+    .{ .slot = .q5_k_bias, .kernel_id = quant_kernel_compiler.first_general_metal_q5_bias_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH_BIAS" },
+    .{ .slot = .q5_k_bias_gelu, .kernel_id = quant_kernel_compiler.first_general_metal_q5_bias_gelu_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH_BIAS_GELU" },
+    .{ .slot = .q6_k, .kernel_id = quant_kernel_compiler.first_general_metal_q6_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH" },
+    .{ .slot = .q6_k_bias, .kernel_id = quant_kernel_compiler.first_general_metal_q6_bias_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH_BIAS" },
+    .{ .slot = .q6_k_bias_gelu, .kernel_id = quant_kernel_compiler.first_general_metal_q6_bias_gelu_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH_BIAS_GELU" },
+};
+
+pub fn metalJitRouteForArtifact(artifact: quant_kernel_compiler.GeneratedArtifact) ?MetalJitRoute {
+    if (artifact.backend != .metal) return null;
+    for (metal_jit_routes) |route| {
+        if (std.mem.eql(u8, route.kernel_id, artifact.kernel_id)) return route;
+    }
+    return null;
+}
+
+pub const MetalJitPipelineOwners = [metal_jit_pipeline_slot_count]?*RawMetalGeneratedPipeline;
+pub const MetalJitArtifactKeys = [metal_jit_pipeline_slot_count]?kernel_jit.ArtifactKey;
+pub const MetalJitRouteStates = [metal_jit_pipeline_slot_count]kernel_jit.RouteState;
+pub const MetalJitQualifiedRoutes = [metal_jit_pipeline_slot_count]bool;
+
+pub const empty_metal_jit_pipeline_owners: MetalJitPipelineOwners = [_]?*RawMetalGeneratedPipeline{null} ** metal_jit_pipeline_slot_count;
+pub const empty_metal_jit_artifact_keys: MetalJitArtifactKeys = [_]?kernel_jit.ArtifactKey{null} ** metal_jit_pipeline_slot_count;
+pub const empty_metal_jit_route_states: MetalJitRouteStates = [_]kernel_jit.RouteState{.missing} ** metal_jit_pipeline_slot_count;
+pub const empty_metal_jit_qualified_routes: MetalJitQualifiedRoutes = [_]bool{false} ** metal_jit_pipeline_slot_count;
+
+/// Model-specific JIT surface. Session construction fills this from the GGUF
+/// tensor types it actually loaded plus the model operations it can execute.
+/// Required mode therefore fails closed only for routes that the model can
+/// reach, never for an unrelated format in the global artifact registry.
+pub const MetalJitScopeInvalidReason = enum {
+    none,
+    invalid_shape,
+    fixture_resource_limit,
+    shape_capacity,
+    dimension_overflow,
+    scope_discovery,
+};
+
+pub const MetalJitRouteScope = struct {
+    quant_format_mask: u16 = 0,
+    // Deterministically sorted distinct [out_dim, in_dim] matrices that fit
+    // bounded live qualification. An activated format-wide pipeline is still
+    // dispatched only for these exact shapes; any rejected/oversized shape
+    // remains on the bundled fallback.
+    observed_shapes: [metal_jit_quant_format_count][metal_jit_max_observed_shapes_per_format][2]usize =
+        [_][metal_jit_max_observed_shapes_per_format][2]usize{
+            [_][2]usize{.{ 0, 0 }} ** metal_jit_max_observed_shapes_per_format,
+        } ** metal_jit_quant_format_count,
+    observed_shape_counts: [metal_jit_quant_format_count]u8 = @splat(0),
+    conformance_complete: bool = true,
+    invalid_reason: MetalJitScopeInvalidReason = .none,
+    invalid_format: quant_matmul.Format = .unknown,
+    invalid_shape: [2]usize = .{ 0, 0 },
+    const all_quant_formats: u16 = (@as(u16, 1) << metal_jit_quant_format_count) - 1;
+
+    pub fn none() MetalJitRouteScope {
+        return .{};
+    }
+
+    pub fn all() MetalJitRouteScope {
+        return .{
+            .quant_format_mask = all_quant_formats,
+        };
+    }
+
+    pub fn fromTensorTypes(types: []const gguf_tensor_types.KnownTensorType) MetalJitRouteScope {
+        var result = MetalJitRouteScope.none();
+        for (types) |tensor_type| result.includeTensorType(tensor_type);
+        return result;
+    }
+
+    pub fn includeTensorType(self: *MetalJitRouteScope, tensor_type: gguf_tensor_types.KnownTensorType) void {
+        const format = quantFormatForTensorType(tensor_type) orelse return;
+        self.includeQuantFormat(format);
+    }
+
+    pub fn quantFormatForTensorType(tensor_type: gguf_tensor_types.KnownTensorType) ?quant_matmul.Format {
+        return switch (tensor_type) {
+            .Q4_0 => .q4_0,
+            .Q4_1 => .q4_1,
+            .Q5_0 => .q5_0,
+            .Q5_1 => .q5_1,
+            .Q8_0 => .q8_0,
+            .Q8_1 => .q8_1,
+            .Q2_K => .q2_k,
+            .Q3_K => .q3_k,
+            .Q4_K => .q4_k,
+            .Q5_K => .q5_k,
+            .Q6_K => .q6_k,
+            .Q8_K => .q8_k,
+            else => null,
+        };
+    }
+
+    pub fn includeQuantFormat(self: *MetalJitRouteScope, format: quant_matmul.Format) void {
+        const bit = metalJitQuantFormatBit(format) orelse return;
+        self.quant_format_mask |= bit;
+    }
+
+    /// Record one model-observed matrix. Invalid, over-budget, or excess
+    /// shapes make the overall scope incomplete. Required mode fails closed;
+    /// optional modes may still qualify supported shapes because dispatch has
+    /// an exact-shape allowlist and falls back for every omitted shape.
+    pub fn includeQuantShape(
+        self: *MetalJitRouteScope,
+        format: quant_matmul.Format,
+        out_dim: usize,
+        in_dim: usize,
+    ) bool {
+        self.includeQuantFormat(format);
+        if (out_dim > @as(usize, std.math.maxInt(u32)) or in_dim > @as(usize, std.math.maxInt(u32))) {
+            self.invalidate(.dimension_overflow, format, out_dim, in_dim);
+            return false;
+        }
+        const format_index = metalJitQuantFormatIndex(format) orelse {
+            self.invalidate(.invalid_shape, format, out_dim, in_dim);
+            return false;
+        };
+        _ = metalJitFixtureBytes(format, 8, in_dim, out_dim) catch |err| {
+            self.invalidate(
+                if (err == error.MetalJitFixtureResourceLimit) .fixture_resource_limit else .invalid_shape,
+                format,
+                out_dim,
+                in_dim,
+            );
+            return false;
+        };
+        const count = &self.observed_shape_counts[format_index];
+        const shapes = &self.observed_shapes[format_index];
+        const shape = [2]usize{ out_dim, in_dim };
+        for (shapes[0..count.*]) |existing| {
+            if (existing[0] == out_dim and existing[1] == in_dim) return true;
+        }
+        if (count.* == shapes.len) {
+            self.invalidate(.shape_capacity, format, out_dim, in_dim);
+            return false;
+        }
+        var insert_at: usize = count.*;
+        for (shapes[0..count.*], 0..) |existing, index| {
+            if (out_dim < existing[0] or (out_dim == existing[0] and in_dim < existing[1])) {
+                insert_at = index;
+                break;
+            }
+        }
+        var index: usize = count.*;
+        while (index > insert_at) : (index -= 1) shapes[index] = shapes[index - 1];
+        shapes[insert_at] = shape;
+        count.* += 1;
+        return true;
+    }
+
+    pub fn invalidate(
+        self: *MetalJitRouteScope,
+        reason: MetalJitScopeInvalidReason,
+        format: quant_matmul.Format,
+        out_dim: usize,
+        in_dim: usize,
+    ) void {
+        if (self.conformance_complete) {
+            self.invalid_reason = reason;
+            self.invalid_format = format;
+            self.invalid_shape = .{ out_dim, in_dim };
+        }
+        self.conformance_complete = false;
+    }
+
+    pub fn observedShapes(self: *const MetalJitRouteScope, format: quant_matmul.Format) []const [2]usize {
+        const format_index = metalJitQuantFormatIndex(format) orelse return &.{};
+        return self.observed_shapes[format_index][0..self.observed_shape_counts[format_index]];
+    }
+
+    pub fn includes(self: MetalJitRouteScope, artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+        return switch (artifact.op) {
+            .small_batch_matmul => |op| if (metalJitQuantFormatBit(op.format)) |bit|
+                (self.quant_format_mask & bit) != 0 and self.observedShapes(op.format).len != 0
+            else
+                false,
+            .microkernel, .attention => false,
+        };
+    }
+
+    pub fn eql(a: MetalJitRouteScope, b: MetalJitRouteScope) bool {
+        return a.quant_format_mask == b.quant_format_mask and
+            a.conformance_complete == b.conformance_complete and
+            a.invalid_reason == b.invalid_reason and
+            a.invalid_format == b.invalid_format and
+            a.invalid_shape[0] == b.invalid_shape[0] and
+            a.invalid_shape[1] == b.invalid_shape[1] and
+            std.meta.eql(a.observed_shape_counts, b.observed_shape_counts) and
+            std.meta.eql(a.observed_shapes, b.observed_shapes);
+    }
+};
+
+fn metalJitQuantFormatIndex(format: quant_matmul.Format) ?u4 {
+    return switch (format) {
+        .q4_0 => 0,
+        .q4_1 => 1,
+        .q5_0 => 2,
+        .q5_1 => 3,
+        .q8_0 => 4,
+        .q8_1 => 5,
+        .q2_k => 6,
+        .q3_k => 7,
+        .q4_k => 8,
+        .q5_k => 9,
+        .q6_k => 10,
+        .q8_k => 11,
+        else => null,
+    };
+}
+
+fn metalJitQuantFormatBit(format: quant_matmul.Format) ?u16 {
+    const index = metalJitQuantFormatIndex(format) orelse return null;
+    return @as(u16, 1) << index;
+}
+
+fn metalJitPreciseMath(artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+    return artifact.opKind() != .small_batch_matmul;
+}
+
+fn metalJitBaselineIdentity(source: []const u8) ?[]const u8 {
+    const prefix = "production_baseline=";
+    const start = (std.mem.indexOf(u8, source, prefix) orelse return null) + prefix.len;
+    const tail = source[start..];
+    var end: usize = 0;
+    while (end < tail.len and !std.ascii.isWhitespace(tail[end])) : (end += 1) {}
+    if (end == 0) return null;
+    return tail[0..end];
+}
+
+fn metalJitRuntimeIdentity(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    buffer: []u8,
+) ![]const u8 {
+    return switch (artifact.op) {
+        .small_batch_matmul => |op| std.fmt.bufPrint(
+            buffer,
+            "op=small_batch_matmul,format={s},rows={s},epilogue={s},activation={s},function={s},output={s},min_in_dim={d}",
+            .{
+                @tagName(op.format),
+                @tagName(op.row_bucket),
+                @tagName(op.epilogue),
+                @tagName(op.activation),
+                if (op.function) |function| @tagName(function) else "runtime",
+                @tagName(op.output),
+                artifact.runtime_shape.min_in_dim,
+            },
+        ),
+        .microkernel => |op| std.fmt.bufPrint(buffer, "op=microkernel,kind={s}", .{@tagName(op.kind)}),
+        .attention => |op| std.fmt.bufPrint(
+            buffer,
+            "op=attention,kind={s},head_dim={d}",
+            .{ @tagName(op.kind), op.head_dim },
+        ),
+    };
+}
+
+fn metalJitScheduleIdentity(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    buffer: []u8,
+) ![]const u8 {
+    const schedule = switch (artifact.op) {
+        .small_batch_matmul => |op| return std.fmt.bufPrint(
+            buffer,
+            "threads={d},cols={d}",
+            .{
+                quant_kernel_compiler.metalGeneratedThreadsPerThreadgroup(op.format, op.row_bucket, op.epilogue),
+                quant_kernel_compiler.metalGeneratedColsPerThreadgroup(op.format, op.row_bucket, op.epilogue),
+            },
+        ),
+        .microkernel => |op| op.schedule,
+        .attention => |op| op.schedule,
+    };
+    return std.fmt.bufPrint(
+        buffer,
+        "threads={d},cols={d},reduction={s},key_chunk={d},skip_rescale={d},serial_threads={d},stage2_threads={d},kv_splits={d},query_heads_per_kv={d},split_min_tokens={d},max_kv_tokens={d},storage={s},key_storage={s}",
+        .{
+            schedule.threads_per_threadgroup,
+            schedule.cols_per_threadgroup,
+            @tagName(schedule.reduction),
+            schedule.key_chunk,
+            @intFromBool(schedule.skip_rescale),
+            schedule.attention_serial_threads_per_threadgroup,
+            schedule.attention_stage2_threads_per_threadgroup,
+            schedule.attention_kv_splits,
+            schedule.attention_query_heads_per_kv_head,
+            schedule.attention_split_kv_min_tokens,
+            schedule.attention_max_kv_tokens,
+            @tagName(schedule.attention_storage),
+            @tagName(schedule.attention_key_storage),
+        },
+    );
+}
+
+fn metalJitRequiredThreads(artifact: quant_kernel_compiler.GeneratedArtifact) usize {
+    return switch (artifact.op) {
+        .small_batch_matmul => |op| quant_kernel_compiler.metalGeneratedThreadsPerThreadgroup(op.format, op.row_bucket, op.epilogue),
+        .microkernel => |op| op.schedule.threads_per_threadgroup,
+        .attention => |op| op.schedule.threads_per_threadgroup,
+    };
+}
+
+fn align16(value: usize) usize {
+    return (value + 15) & ~@as(usize, 15);
+}
+
+fn metalJitMaximumDynamicThreadgroupMemory(artifact: quant_kernel_compiler.GeneratedArtifact) usize {
+    const op = artifact.attentionOp() orelse return 0;
+    return switch (op.kind) {
+        .decode_1x => align16((4096 * 2 + 256) * @sizeOf(f32)),
+        .prefill_flash => if (op.head_dim == 512)
+            13_888
+        else
+            align16(24 * 256 + 52 * @as(usize, op.schedule.key_chunk) + 352),
+    };
+}
+
+pub fn validateMetalJitSchedule(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    device: MetalDeviceInfo,
+    pipeline: MetalGeneratedPipelineInfo,
+) !void {
+    const threads = metalJitRequiredThreads(artifact);
+    if (threads == 0 or
+        threads > device.max_threads_per_threadgroup_width or
+        threads > pipeline.max_total_threads_per_threadgroup)
+    {
+        return error.MetalJitThreadgroupLimitExceeded;
+    }
+    const dynamic_bytes = metalJitMaximumDynamicThreadgroupMemory(artifact);
+    const total_bytes = std.math.add(usize, @intCast(pipeline.static_threadgroup_memory_length), dynamic_bytes) catch
+        return error.MetalJitThreadgroupMemoryLimitExceeded;
+    if (total_bytes > device.max_threadgroup_memory_length) {
+        return error.MetalJitThreadgroupMemoryLimitExceeded;
+    }
+}
+
+fn validateMetalJitCandidateSchedule(
+    schedule: quant_kernel_compiler.KernelSchedule,
+    device: MetalDeviceInfo,
+    pipeline: MetalGeneratedPipelineInfo,
+) !void {
+    const threads = schedule.threads_per_threadgroup;
+    if (threads == 0 or
+        threads > device.max_threads_per_threadgroup_width or
+        threads > pipeline.max_total_threads_per_threadgroup)
+    {
+        return error.MetalJitThreadgroupLimitExceeded;
+    }
+    if (pipeline.thread_execution_width != 32 or threads % pipeline.thread_execution_width != 0) {
+        return error.MetalJitUnsupportedExecutionWidth;
+    }
+    if (pipeline.static_threadgroup_memory_length > device.max_threadgroup_memory_length) {
+        return error.MetalJitThreadgroupMemoryLimitExceeded;
+    }
+}
+
+fn metalJitConformanceIdentity(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    scope: *const MetalJitRouteScope,
+) kernel_jit.ArtifactKey {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("metal-runtime-jit-conformance/v3");
+    hasher.update(metal_jit_qualification_policy_identity);
+    if (artifact.matmulOp()) |op| {
+        var format_bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &format_bytes, @intFromEnum(op.format), .little);
+        hasher.update(&format_bytes);
+        for (scope.observedShapes(op.format)) |shape| {
+            var encoded: [16]u8 = undefined;
+            std.mem.writeInt(u64, encoded[0..8], @intCast(shape[0]), .little);
+            std.mem.writeInt(u64, encoded[8..16], @intCast(shape[1]), .little);
+            hasher.update(&encoded);
+        }
+    }
+    var digest: kernel_jit.ArtifactKey = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn metalJitArtifactKey(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    source: []const u8,
+    device: MetalDeviceInfo,
+    device_name: []const u8,
+    compiler_identity: []const u8,
+    scope: *const MetalJitRouteScope,
+) !kernel_jit.ArtifactKey {
+    const baseline_symbol = metalJitBaselineIdentity(source) orelse
+        return error.MissingMetalJitBaselineIdentity;
+    const conformance_identity = metalJitConformanceIdentity(artifact, scope);
+    var baseline_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    baseline_hasher.update("antfly.metal.baseline-qualification.v1");
+    for ([_][]const u8{
+        baseline_symbol,
+        metal_jit_baseline_implementation_sha256,
+        metal_jit_qualification_implementation_sha256,
+        &conformance_identity,
+        metal_jit_qualification_policy_identity,
+    }) |field| {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, field.len, .little);
+        baseline_hasher.update(&length);
+        baseline_hasher.update(field);
+    }
+    var baseline_digest: kernel_jit.ArtifactKey = undefined;
+    baseline_hasher.final(&baseline_digest);
+    const baseline_identity = std.fmt.bytesToHex(baseline_digest, .lower);
+    var runtime_buffer: [320]u8 = undefined;
+    const runtime_identity = try metalJitRuntimeIdentity(artifact, &runtime_buffer);
+    var schedule_buffer: [384]u8 = undefined;
+    const schedule_identity = try metalJitScheduleIdentity(artifact, &schedule_buffer);
+    var target_buffer: [160]u8 = undefined;
+    const target_identity = try std.fmt.bufPrint(
+        &target_buffer,
+        "apple={d},mac={d},common={d},metal={d}",
+        .{ device.apple_gpu_family, device.mac_gpu_family, device.common_gpu_family, device.metal_gpu_family },
+    );
+    var device_buffer: [512]u8 = undefined;
+    const device_identity = try std.fmt.bufPrint(
+        &device_buffer,
+        "name={s},registry={x},unified={d},max_threads={d},threadgroup_memory={d}",
+        .{
+            device_name,
+            device.registry_id,
+            device.has_unified_memory,
+            device.max_threads_per_threadgroup_width,
+            device.max_threadgroup_memory_length,
+        },
+    );
+    return kernel_jit.artifactKey(.{
+        .backend = .metal,
+        .semantic_identity = artifact.kernel_id,
+        .runtime_identity = runtime_identity,
+        .target_identity = target_identity,
+        .device_identity = device_identity,
+        .schedule_identity = schedule_identity,
+        .baseline_identity = &baseline_identity,
+        .compiler_identity = compiler_identity,
+        .compiler_options = if (metalJitPreciseMath(artifact)) "math=safe" else "math=default",
+        .source = source,
+    });
+}
+
+fn metalJitExactArtifactKey(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    source: []const u8,
+    device: MetalDeviceInfo,
+    device_name: []const u8,
+    compiler_identity: []const u8,
+    scope: *const MetalJitRouteScope,
+    signature: RawWorkloadProfileEntry,
+    schedule: quant_kernel_compiler.KernelSchedule,
+) !kernel_jit.ArtifactKey {
+    const base = try metalJitArtifactKey(
+        artifact,
+        source,
+        device,
+        device_name,
+        compiler_identity,
+        scope,
+    );
+    var encoded: [80]u8 = @splat(0);
+    std.mem.writeInt(u64, encoded[0..8], signature.rows, .little);
+    std.mem.writeInt(u64, encoded[8..16], signature.in_dim, .little);
+    std.mem.writeInt(u64, encoded[16..24], signature.out_dim, .little);
+    std.mem.writeInt(u32, encoded[24..28], signature.format, .little);
+    encoded[28] = signature.dispatch;
+    encoded[29] = signature.input_encoding;
+    encoded[30] = signature.output_encoding;
+    encoded[31] = signature.epilogue;
+    encoded[32] = signature.implementation;
+    encoded[33] = signature.regime;
+    encoded[34] = signature.fusion;
+    encoded[35] = signature.layout;
+    std.mem.writeInt(u16, encoded[36..38], schedule.threads_per_threadgroup, .little);
+    encoded[38] = schedule.cols_per_threadgroup;
+    encoded[39] = @intFromEnum(schedule.reduction);
+    encoded[40] = schedule.rows_per_threadgroup;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly.metal.exact-workload.v3");
+    hasher.update(&base);
+    hasher.update(&encoded);
+    var digest: kernel_jit.ArtifactKey = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+// Model sessions have independent JIT state, but they all target the same
+// process-wide Metal device. Keep source compilation and live qualification
+// from competing for that device when several models cold-load concurrently.
+// Exact-key cache reuse avoids most repeat qualifications; this lock provides
+// the bounded fallback when two sessions miss the same key at once.
+var metal_jit_process_gpu_mutex: std.Io.Mutex = .init;
+
+const metal_jit_rejection_memo_capacity = 128;
+const metal_jit_rejection_ttl_ns: u128 = std.time.ns_per_hour;
+
+const MetalJitRejectionMemoEntry = struct {
+    key: kernel_jit.ArtifactKey = @splat(0),
+    rejected_at_ns: u128 = 0,
+    occupied: bool = false,
+};
+
+// Guarded by metal_jit_process_gpu_mutex. This bounded process-local negative
+// cache prevents a broken or unprofitable exact artifact from being benchmarked
+// once per concurrently loaded model. It deliberately expires so transient
+// device pressure cannot quarantine a candidate forever.
+var metal_jit_rejection_memo = [_]MetalJitRejectionMemoEntry{.{}} ** metal_jit_rejection_memo_capacity;
+
+fn metalJitRejectionMemoContains(key: kernel_jit.ArtifactKey, now_ns: u128) bool {
+    for (&metal_jit_rejection_memo) |*entry| {
+        if (!entry.occupied) continue;
+        if (now_ns < entry.rejected_at_ns or now_ns - entry.rejected_at_ns >= metal_jit_rejection_ttl_ns) {
+            entry.* = .{};
+            continue;
+        }
+        if (std.mem.eql(u8, &entry.key, &key)) return true;
+    }
+    return false;
+}
+
+fn metalJitRejectionMemoRecord(key: kernel_jit.ArtifactKey, now_ns: u128) void {
+    var victim: *MetalJitRejectionMemoEntry = &metal_jit_rejection_memo[0];
+    for (&metal_jit_rejection_memo) |*entry| {
+        if (entry.occupied and std.mem.eql(u8, &entry.key, &key)) {
+            entry.rejected_at_ns = now_ns;
+            return;
+        }
+        if (!entry.occupied) {
+            victim = entry;
+            break;
+        }
+        if (entry.rejected_at_ns < victim.rejected_at_ns) victim = entry;
+    }
+    victim.* = .{ .key = key, .rejected_at_ns = now_ns, .occupied = true };
+}
+
+fn metalJitRejectionMemoClear(key: kernel_jit.ArtifactKey) void {
+    for (&metal_jit_rejection_memo) |*entry| {
+        if (entry.occupied and std.mem.eql(u8, &entry.key, &key)) entry.* = .{};
+    }
+}
 
 pub const decoder_runtime_layer_norm_slot_capacity: usize = 256;
 pub const decoder_runtime_rms_norm_slot_capacity: usize = 512;
@@ -175,6 +884,12 @@ pub const ComputeRegion = enum(usize) {
     other = 8,
 };
 
+pub const FrameRegime = enum(u8) {
+    none = 0,
+    prefill = 1,
+    decode = 2,
+};
+
 pub const ComputeSource = enum(usize) {
     quant_linear = 0,
     quant_qkv = 1,
@@ -269,7 +984,7 @@ fn getenvFlagValue(comptime name: [*:0]const u8) ?bool {
     if (S.cached) |cached| return cached;
     const c_std = @cImport(@cInclude("stdlib.h"));
     const flag: ?bool = blk: {
-        const value = c_std.getenv(name) orelse break :blk null;
+        const value = c_std.getenv(S.cache_key) orelse break :blk null;
         const slice = std.mem.span(value);
         break :blk slice.len != 0 and
             !std.mem.eql(u8, slice, "0") and
@@ -296,15 +1011,6 @@ fn q4_0LinearRmsAddSumsqDisabled() bool {
         getenvFlagValue("TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_SUMSQ_EXPERIMENT") orelse
         false;
     return !enabled;
-}
-
-fn q4_0F16FfnEnabled() bool {
-    const enabled = getenvFlagValue("TERMITE_METAL_Q4_0_F16_FFN_EXPERIMENT") orelse
-        getenvFlagValue("TERMITE_METAL_ENABLE_Q4_0_F16_FFN") orelse
-        false;
-    return enabled and
-        getenvFlagEnabled("ANTFLY_INFERENCE_GEMMA4_ALLOW_UNSAFE_Q4_0_F16_FFN") and
-        !getenvFlagEnabled("TERMITE_METAL_DISABLE_Q4_0_F16_FFN");
 }
 
 fn q4_0Ple1xReduceEnabled() bool {
@@ -376,8 +1082,26 @@ fn runtimeDenseFallbackAllowedForRequest(request: anytype, storage: *const Quant
     return runtimeDenseFallbackAllowedForQuantizedStorage(storage);
 }
 
+fn f32ToBf16BitsRoundNearestEven(value: f32) u16 {
+    const bits: u32 = @bitCast(value);
+    const lsb = (bits >> 16) & 1;
+    const rounded = bits +% (0x7fff + lsb);
+    return @intCast(rounded >> 16);
+}
+
 fn f32ToF16Bits(value: f32) u16 {
     return @bitCast(@as(f16, @floatCast(value)));
+}
+
+test "Metal BF16 mirror conversion rounds ties to even" {
+    try std.testing.expectEqual(@as(u16, 0x3f80), f32ToBf16BitsRoundNearestEven(1.0));
+    try std.testing.expectEqual(@as(u16, 0x3f80), f32ToBf16BitsRoundNearestEven(@bitCast(@as(u32, 0x3f808000))));
+    try std.testing.expectEqual(@as(u16, 0x3f82), f32ToBf16BitsRoundNearestEven(@bitCast(@as(u32, 0x3f818000))));
+}
+
+test "Metal F16 mirror conversion uses IEEE half precision" {
+    try std.testing.expectEqual(@as(u16, 0x3c00), f32ToF16Bits(1.0));
+    try std.testing.expectEqual(@as(u16, 0xc000), f32ToF16Bits(-2.0));
 }
 
 fn traceGlinerStages() bool {
@@ -791,6 +1515,7 @@ pub fn decoderRuntimePreparedSlotsMatchFamily(self: anytype, gpt_config: anytype
                 const layer_head_dim = gpt_config.effectiveHeadDimForLayer(layer);
                 const layer_kv_heads = gpt_config.effectiveKVHeadsForLayer(layer);
                 const attention_input_size = gpt_config.num_attention_heads * layer_head_dim;
+                const shares_kv = gpt_config.family == .gemma and gpt_config.layerSharesKv(layer);
                 if (!decoderRuntimeRmsNormSlotPrepared(self, decoder_gated_runtime.normSlot(layer, .attn_pre), gpt_config.hidden_size)) {
                     if (trace) std.debug.print("prepare-trace: slot-miss family={s} layer={d} kind=attn_pre_norm slot={d} hidden={d}\n", .{ @tagName(gpt_config.family), layer, decoder_gated_runtime.normSlot(layer, .attn_pre), gpt_config.hidden_size });
                     return false;
@@ -818,11 +1543,11 @@ pub fn decoderRuntimePreparedSlotsMatchFamily(self: anytype, gpt_config: anytype
                     if (trace) std.debug.print("prepare-trace: slot-miss family={s} layer={d} kind=attn_q slot={d} in={d} out={d}\n", .{ @tagName(gpt_config.family), layer, decoder_gated_runtime.linearSlot(layer, .attn_q), gpt_config.hidden_size, attention_input_size });
                     return false;
                 }
-                if (!decoderRuntimeLinearSlotPrepared(self, decoder_gated_runtime.linearSlot(layer, .attn_k), gpt_config.hidden_size, layer_kv_heads * layer_head_dim)) {
+                if (!shares_kv and !decoderRuntimeLinearSlotPrepared(self, decoder_gated_runtime.linearSlot(layer, .attn_k), gpt_config.hidden_size, layer_kv_heads * layer_head_dim)) {
                     if (trace) std.debug.print("prepare-trace: slot-miss family={s} layer={d} kind=attn_k slot={d} in={d} out={d}\n", .{ @tagName(gpt_config.family), layer, decoder_gated_runtime.linearSlot(layer, .attn_k), gpt_config.hidden_size, layer_kv_heads * layer_head_dim });
                     return false;
                 }
-                if (!decoderRuntimeLinearSlotPrepared(self, decoder_gated_runtime.linearSlot(layer, .attn_v), gpt_config.hidden_size, layer_kv_heads * layer_head_dim)) {
+                if (!shares_kv and !decoderRuntimeLinearSlotPrepared(self, decoder_gated_runtime.linearSlot(layer, .attn_v), gpt_config.hidden_size, layer_kv_heads * layer_head_dim)) {
                     if (trace) std.debug.print("prepare-trace: slot-miss family={s} layer={d} kind=attn_v slot={d} in={d} out={d}\n", .{ @tagName(gpt_config.family), layer, decoder_gated_runtime.linearSlot(layer, .attn_v), gpt_config.hidden_size, layer_kv_heads * layer_head_dim });
                     return false;
                 }
@@ -868,6 +1593,78 @@ pub fn decoderRuntimePreparedSlotsMatchFamily(self: anytype, gpt_config: anytype
         },
         else => return false,
     }
+}
+
+test "Gemma shared-KV prepared family matching omits only shared K/V slots" {
+    const gpt_mod = @import("../models/gpt.zig");
+    const PreparedSlots = struct {
+        raw_absolute_embeddings_prepared: bool = false,
+        raw_layer_norm_slots_prepared: [decoder_runtime_layer_norm_slot_capacity]bool = [_]bool{false} ** decoder_runtime_layer_norm_slot_capacity,
+        raw_layer_norm_slot_hidden_sizes: [decoder_runtime_layer_norm_slot_capacity]usize = [_]usize{0} ** decoder_runtime_layer_norm_slot_capacity,
+        raw_rms_norm_slots_prepared: [decoder_runtime_rms_norm_slot_capacity]bool = [_]bool{false} ** decoder_runtime_rms_norm_slot_capacity,
+        raw_rms_norm_slot_hidden_sizes: [decoder_runtime_rms_norm_slot_capacity]usize = [_]usize{0} ** decoder_runtime_rms_norm_slot_capacity,
+        raw_linear_slots_prepared: [decoder_runtime_linear_slot_capacity]bool = [_]bool{false} ** decoder_runtime_linear_slot_capacity,
+        raw_linear_slot_in_dims: [decoder_runtime_linear_slot_capacity]usize = [_]usize{0} ** decoder_runtime_linear_slot_capacity,
+        raw_linear_slot_out_dims: [decoder_runtime_linear_slot_capacity]usize = [_]usize{0} ** decoder_runtime_linear_slot_capacity,
+    };
+    const Mark = struct {
+        fn rms(slots: *PreparedSlots, slot: usize, hidden_size: usize) void {
+            slots.raw_rms_norm_slots_prepared[slot] = true;
+            slots.raw_rms_norm_slot_hidden_sizes[slot] = hidden_size;
+        }
+
+        fn linear(slots: *PreparedSlots, slot: usize, in_dim: usize, out_dim: usize) void {
+            slots.raw_linear_slots_prepared[slot] = true;
+            slots.raw_linear_slot_in_dims[slot] = in_dim;
+            slots.raw_linear_slot_out_dims[slot] = out_dim;
+        }
+    };
+
+    const config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 16,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 8,
+        .intermediate_size = 32,
+        .shared_layer_intermediate_size = 24,
+        .vocab_size = 64,
+        .num_kv_shared_layers = 1,
+        .norm_type = .rms_norm,
+    };
+    var slots = PreparedSlots{};
+    for (0..config.num_hidden_layers) |layer| {
+        Mark.rms(&slots, decoder_gated_runtime.normSlot(layer, .attn_pre), config.hidden_size);
+        Mark.rms(&slots, decoder_gated_runtime.normSlot(layer, .attn_post), config.hidden_size);
+        Mark.rms(&slots, decoder_gated_runtime.normSlot(layer, .ffn_pre), config.hidden_size);
+        Mark.rms(&slots, decoder_gated_runtime.normSlot(layer, .ffn_post), config.hidden_size);
+
+        const head_dim = config.effectiveHeadDimForLayer(layer);
+        const attention_input_size = config.num_attention_heads * head_dim;
+        const kv_dim = config.effectiveKVHeadsForLayer(layer) * head_dim;
+        Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .attn_q), config.hidden_size, attention_input_size);
+        if (!config.layerSharesKv(layer)) {
+            Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .attn_k), config.hidden_size, kv_dim);
+            Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .attn_v), config.hidden_size, kv_dim);
+        }
+        Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .attn_out_proj), attention_input_size, config.hidden_size);
+        Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .mlp_gate), config.hidden_size, config.intermediateSize(layer));
+        Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .mlp_up), config.hidden_size, config.intermediateSize(layer));
+        Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .mlp_down), config.intermediateSize(layer), config.hidden_size);
+    }
+    Mark.rms(&slots, decoder_gated_runtime.finalNormSlot(config.num_hidden_layers), config.hidden_size);
+    Mark.linear(&slots, decoder_gated_runtime.finalLmHeadSlot(config.num_hidden_layers), config.hidden_size, config.vocab_size);
+
+    try std.testing.expect(decoderRuntimePreparedSlotsMatchFamily(&slots, config));
+
+    var no_shared_kv = config;
+    no_shared_kv.num_kv_shared_layers = 0;
+    try std.testing.expect(!decoderRuntimePreparedSlotsMatchFamily(&slots, no_shared_kv));
+
+    const shared_q_slot = decoder_gated_runtime.linearSlot(1, .attn_q);
+    slots.raw_linear_slots_prepared[shared_q_slot] = false;
+    try std.testing.expect(!decoderRuntimePreparedSlotsMatchFamily(&slots, config));
 }
 
 pub fn supportsDecoderRuntimeConfig(gpt_config: anytype) bool {
@@ -1338,9 +2135,8 @@ pub fn decoderRuntimeEmbedAbsolutePosition(self: anytype, request: anytype, stat
         request.hidden_size,
         output.ptr,
     );
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(request.hidden_size) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTensor {
@@ -1420,8 +2216,7 @@ pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTen
         request.dim,
         output.ptr,
     );
-    if (rc != 0) return null;
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype) !?MetalTensor {
@@ -1477,7 +2272,10 @@ pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype)
             output.deviceByteOffset(),
         )
     else blk: {
-        if (request.weight.isDevice() or request.gamma.isDevice() or request.beta.isDevice()) return null;
+        if (request.weight.isDevice() or request.gamma.isDevice() or request.beta.isDevice()) {
+            output.deinit();
+            return null;
+        }
         var weight = request.weight;
         var gamma = request.gamma;
         var beta = request.beta;
@@ -1497,7 +2295,10 @@ pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype)
         );
     };
     const encode_ns = if (trace) monotonicNowNs() - encode_start_ns else 0;
-    if (rc != 0) return null;
+    if (rc != 0) {
+        output.deinit();
+        return null;
+    }
     if (trace) {
         std.debug.print(
             "metal_gliner_stage: deberta_embeddings_runtime total_ms={d:.3} pack_ms={d:.3} alloc_ms={d:.3} encode_ms={d:.3} device_inputs={} total={d} dim={d}\n",
@@ -1582,8 +2383,7 @@ pub fn decoderRuntimeQuantEmbeddingLookupDeviceToken(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (lookup_rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, lookup_rc);
 }
 
 pub fn decoderRuntimeQuantEmbeddingLookup(
@@ -1666,8 +2466,7 @@ pub fn decoderRuntimeQuantEmbeddingLookup(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (lookup_rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, lookup_rc);
 }
 
 fn quantizedEmbeddingRows(storage: *const QuantizedStorage, dim: usize) ?usize {
@@ -1762,7 +2561,10 @@ pub fn decoderRuntimeNativeBf16EmbeddingLookup(
             rows,
             dim,
         );
-        if (prep_rc != 0) return null;
+        if (prep_rc != 0) {
+            output.deinit();
+            return null;
+        }
     }
 
     const lookup_rc = termite_metal_decode_runtime_embedding_lookup_bf16_prepared_device(
@@ -1773,8 +2575,7 @@ pub fn decoderRuntimeNativeBf16EmbeddingLookup(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (lookup_rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, lookup_rc);
 }
 
 pub fn decoderRuntimeApplyRope(self: anytype, request: anytype) !?MetalTensor {
@@ -1829,8 +2630,7 @@ pub fn decoderRuntimeApplyRope(self: anytype, request: anytype) !?MetalTensor {
         if (request.consecutive_pairs) 1 else 0,
         output.ptr,
     );
-    if (rc != 0) return null;
-    return MetalTensor.owned(output, request.input.shape());
+    return finishHostOutput(output, request.input.shape(), rc);
 }
 
 pub fn decoderRuntimeApplyHeadRmsNormRope(self: anytype, request: anytype) !?MetalTensor {
@@ -1861,8 +2661,7 @@ pub fn decoderRuntimeApplyHeadRmsNormRope(self: anytype, request: anytype) !?Met
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn decoderRuntimeApplyHeadRmsNormRopeBatched(self: anytype, request: anytype, heads_per_row: usize, position_period: usize) !?MetalTensor {
@@ -1895,8 +2694,7 @@ pub fn decoderRuntimeApplyHeadRmsNormRopeBatched(self: anytype, request: anytype
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn decoderRuntimeApplyHeadRmsNormRopeInto(self: anytype, request: anytype, output: MetalTensor) !bool {
@@ -2065,6 +2863,10 @@ pub fn decoderRuntimeApplyAttentionF32(self: anytype, request: anytype) !?MetalT
             output.deviceByteOffset(),
         );
         if (device_rc == 0) return output;
+        if (traceQuantBlockRequested()) std.debug.print(
+            "metal-runtime-attention-f32-device-null rc={d} q_len={d} kv_len={d} heads={d} kv_heads={d} head_dim={d}\n",
+            .{ device_rc, request.q_len, request.kv_len, request.num_heads, request.num_kv_heads, request.head_dim },
+        );
         output.deinit();
     }
 
@@ -2092,8 +2894,7 @@ pub fn decoderRuntimeApplyAttentionF32(self: anytype, request: anytype) !?MetalT
         total_sequence_len,
         output.ptr,
     );
-    if (rc != 0) return null;
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeApplyAttentionF32DeviceBatched(self: anytype, request: anytype) !?MetalTensor {
@@ -2190,15 +2991,6 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecode
         if (!plannedContractAllowsPagedAttention(request.planned_layer_contract)) return null;
     }
 
-    const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
-    var output = try MetalTensor.deviceAllocate(
-        @ptrCast(runtime),
-        q_rows * attention_input_size * @sizeOf(f32),
-        .private,
-        &attention_shape,
-    );
-    errdefer output.deinit();
-
     const Request = @TypeOf(request);
     const page_size: usize = if (@hasField(Request, "page_size")) request.page_size else @min(request.kv_tokens, 256);
     if (page_size == 0) return null;
@@ -2228,6 +3020,15 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecode
     const sinks: ?[]const f32 = if (@hasField(Request, "sinks")) request.sinks else null;
     const sinks_ptr: ?[*]const f32 = if (sinks) |slice| slice.ptr else null;
     const sink_count: usize = if (sinks) |slice| slice.len else 0;
+
+    const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
+    var output = try MetalTensor.deviceAllocate(
+        @ptrCast(runtime),
+        q_rows * attention_input_size * @sizeOf(f32),
+        .private,
+        &attention_shape,
+    );
+    errdefer output.deinit();
 
     const rc = termite_metal_decode_runtime_attention_paged_slot_device(
         runtime,
@@ -2274,6 +3075,7 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecode
                 request.kv_position_offset,
             },
         );
+        output.deinit();
         return null;
     }
 
@@ -2291,6 +3093,76 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecode
         }
     }
 
+    return output;
+}
+
+/// Donated-KV attention encoded onto the CALLER's active frame (e.g. the MTP
+/// draft attending target KV): no draft-frame flush, no KV-owner drain — Q
+/// ordering and output completeness ride the frame's own submit+wait. Returns
+/// null when the safety preconditions do not hold (caller falls back to the
+/// flush + on-KV-owner-runtime path).
+pub fn decoderRuntimeApplyPagedKvAttentionSlotOnFrame(
+    kv_runtime: *RawMetalDecodeRuntime,
+    frame_provider: anytype,
+    request: anytype,
+) !?MetalTensor {
+    const frame_runtime = frame_provider.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(frame_runtime) == 0) return null;
+    if (termite_metal_decode_runtime_ready(kv_runtime) == 0) return null;
+    if (termite_metal_decode_runtime_has_active_frame(frame_runtime) == 0) return null;
+    if (!request.q.isDevice()) return null;
+    if (request.q.ndim() != 2) return null;
+    if (request.kv_tokens == 0 or request.num_heads == 0 or request.num_kv_heads == 0 or request.head_dim == 0) return null;
+    if (request.num_heads % request.num_kv_heads != 0) return null;
+
+    const q_rows: usize = @intCast(request.q.dim(0));
+    const attention_input_size = request.num_heads * request.head_dim;
+    if (q_rows == 0 or @as(usize, @intCast(request.q.dim(1))) != attention_input_size) return null;
+    if (request.page_size == 0 or request.block_token_offsets.len == 0) return null;
+
+    const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
+    var output = try MetalTensor.deviceAllocate(
+        @ptrCast(frame_runtime),
+        q_rows * attention_input_size * @sizeOf(f32),
+        .private,
+        &attention_shape,
+    );
+    errdefer output.deinit();
+
+    const rc = termite_metal_decode_runtime_attention_paged_slot_device_on_frame(
+        kv_runtime,
+        frame_runtime,
+        request.slot,
+        request.format,
+        request.q.deviceHandle(),
+        request.q.deviceByteOffset(),
+        request.block_token_offsets.ptr,
+        request.block_token_offsets.len,
+        request.page_size,
+        q_rows,
+        request.kv_tokens,
+        request.num_heads,
+        request.num_kv_heads,
+        request.head_dim,
+        request.key_row_bytes,
+        request.base_key_row_bytes,
+        request.query_position_offset,
+        request.kv_position_offset,
+        request.sliding_window,
+        0.0,
+        null,
+        0,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) {
+        if (traceQuantBlockRequested()) std.debug.print(
+            "metal-runtime-paged-attention-slot-on-frame-null rc={d} slot={d} q_rows={d} kv_tokens={d}\n",
+            .{ rc, request.slot, q_rows, request.kv_tokens },
+        );
+        output.deinit();
+        return null;
+    }
     return output;
 }
 
@@ -2374,15 +3246,6 @@ pub fn decoderRuntimeApplyQuantizedKvAttention(self: anytype, request: anytype) 
         request.kv_position_offset,
     ) != 0) return null;
 
-    const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
-    var output = try MetalTensor.deviceAllocate(
-        @ptrCast(runtime),
-        q_rows * attention_input_size * @sizeOf(f32),
-        .private,
-        &attention_shape,
-    );
-    errdefer output.deinit();
-
     const Request = @TypeOf(request);
     const page_size: usize = if (@hasField(Request, "page_size")) request.page_size else @min(request.kv_tokens, 256);
     if (page_size == 0) return null;
@@ -2405,7 +3268,16 @@ pub fn decoderRuntimeApplyQuantizedKvAttention(self: anytype, request: anytype) 
     const sinks_ptr: ?[*]const f32 = if (sinks) |slice| slice.ptr else null;
     const sink_count: usize = if (sinks) |slice| slice.len else 0;
 
-    if (termite_metal_decode_runtime_attention_paged_slot_device(
+    const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
+    var output = try MetalTensor.deviceAllocate(
+        @ptrCast(runtime),
+        q_rows * attention_input_size * @sizeOf(f32),
+        .private,
+        &attention_shape,
+    );
+    errdefer output.deinit();
+
+    const rc = termite_metal_decode_runtime_attention_paged_slot_device(
         runtime,
         0,
         runtime_format,
@@ -2429,9 +3301,8 @@ pub fn decoderRuntimeApplyQuantizedKvAttention(self: anytype, request: anytype) 
         sink_count,
         output.deviceHandle(),
         output.deviceByteOffset(),
-    ) != 0) return null;
-
-    return output;
+    );
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn sampleLogitsDevice(self: anytype, request: anytype) !?usize {
@@ -2441,9 +3312,14 @@ pub fn sampleLogitsDevice(self: anytype, request: anytype) !?usize {
     if (request.input.ndim() != 2) return null;
     if (@as(usize, @intCast(request.input.dim(0))) != 1) return null;
     if (@as(usize, @intCast(request.input.dim(1))) != request.out_dim) return null;
+    if (request.top_k > 256) return null;
 
     var penalty_entries = try buildSamplePenaltyEntries(std.heap.c_allocator, request.token_history);
     defer penalty_entries.deinit(std.heap.c_allocator);
+    // The 65..256 path is a single-thread bounded sampler; scanning a very
+    // large sparse penalty table there is slower than the canonical host
+    // fallback. Parallel top-k and Gumbel paths keep the full device history.
+    if (penalty_entries.token_ids.len > 512 and request.top_k > 64) return null;
     var token_id: u32 = 0;
     if (!request.input.isDevice()) {
         var input = request.input;
@@ -2518,6 +3394,76 @@ pub fn argmaxLogitsSuppressDevice(self: anytype, input: MetalTensor, out_dim: us
     );
     if (rc != 0) return null;
     return token_id;
+}
+
+/// Batched multi-row argmax over a device-resident [rows_total, dim] logits
+/// tensor: rows [row_start, row_start+out.len) are argmaxed (with optional
+/// suppression) in ONE command buffer with ONE sync and ONE download. The
+/// per-row `argmaxLogitsDevice` path flushes + cancels + re-begins the decoder
+/// frame per row, which dominated MTP verify wall time. Returns false (no
+/// tokens written) on any unsupported condition so callers can fall back
+/// all-or-nothing.
+pub fn argmaxLogitsRowsSuppressDevice(
+    self: anytype,
+    input: MetalTensor,
+    row_start: usize,
+    dim: usize,
+    suppress_token_ids: []const i32,
+    out: []u32,
+) !bool {
+    return argmaxLogitsRowsSuppressDeviceWithFrameMode(self, input, row_start, dim, suppress_token_ids, out, false);
+}
+
+pub fn argmaxLogitsRowsSuppressDeviceConsumeActiveFrame(
+    self: anytype,
+    input: MetalTensor,
+    row_start: usize,
+    dim: usize,
+    suppress_token_ids: []const i32,
+    out: []u32,
+) !bool {
+    return argmaxLogitsRowsSuppressDeviceWithFrameMode(self, input, row_start, dim, suppress_token_ids, out, true);
+}
+
+fn argmaxLogitsRowsSuppressDeviceWithFrameMode(
+    self: anytype,
+    input: MetalTensor,
+    row_start: usize,
+    dim: usize,
+    suppress_token_ids: []const i32,
+    out: []u32,
+    consume_active_frame: bool,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (!input.isDevice()) return false;
+    if (dim == 0 or out.len == 0) return false;
+    if (input.ndim() != 2) return false;
+    if (@as(usize, @intCast(input.dim(1))) != dim) return false;
+    const rows_total: usize = @intCast(input.dim(0));
+    const row_end = std.math.add(usize, row_start, out.len) catch return false;
+    if (row_end > rows_total) return false;
+    const row_bytes = std.math.mul(usize, dim, @sizeOf(f32)) catch return false;
+    const start_bytes = std.math.mul(usize, row_start, row_bytes) catch return false;
+
+    const rc = termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset() + start_bytes,
+        out.len,
+        dim,
+        if (suppress_token_ids.len == 0) null else suppress_token_ids.ptr,
+        suppress_token_ids.len,
+        out.ptr,
+        @intFromBool(consume_active_frame),
+    );
+    return rc == 0;
+}
+
+pub fn reserveArgmaxRows(self: anytype, rows: usize, out_dim: usize) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    return termite_metal_decode_runtime_reserve_argmax_rows(runtime, rows, out_dim) == 0;
 }
 
 pub fn encodeArgmaxLogitsDevice(self: anytype, input: MetalTensor, out_dim: usize) !bool {
@@ -2679,8 +3625,7 @@ pub fn decoderRuntimeApplyLayerNorm(self: anytype, request: anytype, stats: anyt
         request.eps,
         output.ptr,
     );
-    if (rc != 0) return null;
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeApplyAddLayerNorm(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
@@ -2787,8 +3732,7 @@ pub fn decoderRuntimeApplyRmsNorm(self: anytype, request: anytype, stats: anytyp
         request.eps,
         output.ptr,
     );
-    if (rc != 0) return null;
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeApplyRmsNormWeightDevice(
@@ -2820,8 +3764,7 @@ pub fn decoderRuntimeApplyRmsNormWeightDevice(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn decoderRuntimeApplyRmsNormWeightDeviceInto(
@@ -2996,9 +3939,8 @@ pub fn decoderRuntimeApplyLayerNormLinear(self: anytype, request: anytype) !?Met
         request.out_dim,
         output.ptr,
     );
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(request.out_dim) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeApplyLayerNormLinearSample(self: anytype, request: anytype) !?usize {
@@ -3018,10 +3960,11 @@ pub fn decoderRuntimeApplyLayerNormLinearSample(self: anytype, request: anytype)
 
     const bounded_top_p = request.top_p <= 0.0 or request.top_p >= 1.0 or
         request.top_k > 0 or request.out_dim <= 256;
-    if (bounded_top_p) {
+    if (request.top_k <= 256 and bounded_top_p) {
         if (decoderRuntimeReserveSampleTailScratch(self, request.out_dim, request.top_k)) {
             var penalty_entries = try buildSamplePenaltyEntries(std.heap.c_allocator, request.token_history);
             defer penalty_entries.deinit(std.heap.c_allocator);
+            if (penalty_entries.token_ids.len > 512 and request.top_k > 64) return null;
             var input = request.input;
             const input_host = try tensorHostSlice(&input);
             var token_id: u32 = 0;
@@ -3423,6 +4366,7 @@ pub fn decoderRuntimeApplyPleResidualDevice(self: anytype, request: anytype) !?M
         );
         if (rc == 0) return output;
         if (tracePleResidualRuntimeEnabled()) std.debug.print("metal_graph_fusion_trace: ple_residual runtime_direct_q8 rc={d}\n", .{rc});
+        output.deinit();
     }
     if ((ple_gate_kind == .q4_0 and ple_proj_kind == .q4_0) or
         (ple_gate_kind == .q4_k and ple_proj_kind == .q4_k))
@@ -3456,6 +4400,7 @@ pub fn decoderRuntimeApplyPleResidualDevice(self: anytype, request: anytype) !?M
         );
         if (rc == 0) return output;
         if (tracePleResidualRuntimeEnabled()) std.debug.print("metal_graph_fusion_trace: ple_residual runtime_direct_quantized kind={s} rc={d}\n", .{ @tagName(ple_gate_kind), rc });
+        output.deinit();
     }
 
     if (!runtimeLinearSlotSupportsDeviceApply(self, request.gate_linear_slot, request.hidden_size, request.ple_hidden_size) or
@@ -3592,8 +4537,7 @@ pub fn decoderRuntimeApplyAttentionOutputResidualDevice(self: anytype, request: 
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn decoderRuntimeReadTokenId(self: anytype) !?usize {
@@ -3672,6 +4616,37 @@ pub fn decoderRuntimeApplyLinearArgmax(self: anytype, request: anytype) !?usize 
     return token_id;
 }
 
+/// Frame-tail linear+argmax encode: appends the lm-head linear + argmax (into
+/// the runtime's token buffer) to the runtime's ACTIVE frame without
+/// submitting. Returns true when encoded — the caller must then submit+wait
+/// the frame through its normal path and read the token from the token
+/// buffer. Returns false without touching the frame when preconditions fail.
+pub fn decoderRuntimeApplyLinearArgmaxFrameEncode(self: anytype, request: anytype) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (termite_metal_decode_runtime_has_active_frame(runtime) == 0) return false;
+    if (request.in_dim == 0 or request.out_dim == 0) return false;
+    if (request.slot >= decoder_runtime_linear_slot_capacity) return false;
+    if (!self.raw_linear_slots_prepared[request.slot]) return false;
+    if (self.raw_linear_slot_kinds[request.slot] != .dense) return false;
+    if (self.raw_linear_slot_in_dims[request.slot] != request.in_dim) return false;
+    if (self.raw_linear_slot_out_dims[request.slot] != request.out_dim) return false;
+    if (request.input.ndim() != 2) return false;
+    if (@as(usize, @intCast(request.input.dim(0))) != 1) return false;
+    if (@as(usize, @intCast(request.input.dim(1))) != request.in_dim) return false;
+    if (!request.input.isDevice()) return false;
+
+    const rc = termite_metal_decode_runtime_apply_linear_argmax_device_frame_encode(
+        runtime,
+        request.slot,
+        request.input.deviceHandle(),
+        request.input.deviceByteOffset(),
+        request.in_dim,
+        request.out_dim,
+    );
+    return rc == 0;
+}
+
 pub fn decoderRuntimeApplyRmsNormLinearSample(self: anytype, request: anytype) !?usize {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -3689,10 +4664,11 @@ pub fn decoderRuntimeApplyRmsNormLinearSample(self: anytype, request: anytype) !
 
     const bounded_top_p = request.top_p <= 0.0 or request.top_p >= 1.0 or
         request.top_k > 0 or request.out_dim <= 256;
-    if (bounded_top_p) {
+    if (request.top_k <= 256 and bounded_top_p) {
         if (decoderRuntimeReserveSampleTailScratch(self, request.out_dim, request.top_k)) {
             var penalty_entries = try buildSamplePenaltyEntries(std.heap.c_allocator, request.token_history);
             defer penalty_entries.deinit(std.heap.c_allocator);
+            if (penalty_entries.token_ids.len > 512 and request.top_k > 64) return null;
             var input = request.input;
             const input_host = try tensorHostSlice(&input);
             var token_id: u32 = 0;
@@ -3746,6 +4722,7 @@ var resident_sample_seed_state: u64 = 0;
 pub fn decoderRuntimeResidentLogitsSamplingSupported(self: anytype, out_dim: usize, top_k: usize, top_p: f32) bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (top_k > 256) return false;
     const bounded_top_p = top_p <= 0.0 or top_p >= 1.0 or top_k > 0 or out_dim <= 256;
     if (!bounded_top_p) return false;
     return decoderRuntimeReserveSampleTailScratch(self, out_dim, top_k);
@@ -3756,8 +4733,7 @@ pub fn decoderRuntimeSampleResidentLogits(self: anytype, request: anytype) !?usi
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.out_dim == 0) return null;
     if (!decoderRuntimeResidentLogitsSamplingSupported(self, request.out_dim, request.top_k, request.top_p)) return null;
-    // Only materialize penalty entries when the config actually penalizes:
-    // the kernel binds them via setBytes, which caps at 4KB (512 entries).
+    // Only materialize penalty entries when the config actually penalizes.
     const penalties_active = request.repetition_penalty != 1.0 or
         request.frequency_penalty != 0.0 or
         request.presence_penalty != 0.0;
@@ -3766,8 +4742,8 @@ pub fn decoderRuntimeSampleResidentLogits(self: anytype, request: anytype) !?usi
         if (penalties_active) request.token_history else &.{},
     );
     defer penalty_entries.deinit(std.heap.c_allocator);
-    const max_penalty_entries: usize = 512;
-    const penalty_count = @min(penalty_entries.token_ids.len, max_penalty_entries);
+    if (penalty_entries.token_ids.len > 512 and request.top_k > 64) return null;
+    const penalty_count = penalty_entries.token_ids.len;
     if (resident_sample_seed_state == 0) {
         // ASLR-derived per-process entropy, same trick as makeSampleSeed.
         resident_sample_seed_state = (@as(u64, @truncate(@intFromPtr(request.token_history.ptr))) ^
@@ -3849,9 +4825,8 @@ pub fn decoderRuntimeApplyActivation(self: anytype, request: anytype, stats: any
         request.dim,
         output.ptr,
     );
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(request.dim) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeApplyActivationDeviceInto(self: anytype, input: MetalTensor, kind: u32, rows: usize, dim: usize, output_override: MetalTensor) !?MetalTensor {
@@ -4118,8 +5093,7 @@ fn decoderRuntimeApplyPrimitiveUnaryImpl(self: anytype, input: MetalTensor, acti
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeApplySoftmaxDevice(self: anytype, input: MetalTensor, rows: usize, dim: usize, log_softmax: bool) !?MetalTensor {
@@ -4141,8 +5115,7 @@ pub fn decoderRuntimeApplySoftmaxDevice(self: anytype, input: MetalTensor, rows:
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeMaskedBceWithLogitsLossDevice(
@@ -4271,8 +5244,7 @@ fn decoderRuntimeReduceLastDimDeviceImpl(self: anytype, input: MetalTensor, rows
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeMultiplyReduceLastDimDevice(self: anytype, lhs: MetalTensor, rhs: MetalTensor, rows: usize, dim: usize, output_shape: []const i32) !?MetalTensor {
@@ -4295,8 +5267,7 @@ pub fn decoderRuntimeMultiplyReduceLastDimDevice(self: anytype, lhs: MetalTensor
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeReduceAxisF32Device(
@@ -4335,8 +5306,7 @@ pub fn decoderRuntimeReduceAxisF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeBroadcastLastDimDevice(self: anytype, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, output_shape: []const i32) !?MetalTensor {
@@ -4382,8 +5352,7 @@ fn decoderRuntimeBroadcastLastDimDeviceImpl(self: anytype, input: MetalTensor, r
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeBroadcastF32Device(
@@ -4416,8 +5385,7 @@ pub fn decoderRuntimeBroadcastF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeGatherAxis0F32_2DDevice(
@@ -4449,7 +5417,12 @@ pub fn decoderRuntimeGatherAxis0F32_2DDevice(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        // return null is not an error return, so the errdefer above
+        // does not run; release the fresh device buffer explicitly.
+        output_device.deinit();
+        return null;
+    }
     return output_device;
 }
 
@@ -4526,8 +5499,7 @@ pub fn decoderRuntimeGlinerWordEmbeddingsF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeConcatLastDimF32_2DDevice(
@@ -4561,7 +5533,12 @@ pub fn decoderRuntimeConcatLastDimF32_2DDevice(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        // return null is not an error return, so the errdefer above
+        // does not run; release the fresh device buffer explicitly.
+        output_device.deinit();
+        return null;
+    }
     return output_device;
 }
 
@@ -4596,8 +5573,7 @@ pub fn decoderRuntimeGlinerGruCombineF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeArgmaxAxisF32Device(
@@ -4626,8 +5602,7 @@ pub fn decoderRuntimeArgmaxAxisF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeConvertDTypeF32Device(self: anytype, input: MetalTensor, kind: u32) !?MetalTensor {
@@ -4646,8 +5621,7 @@ pub fn decoderRuntimeConvertDTypeF32Device(self: anytype, input: MetalTensor, ki
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 fn metalSdpaRuntimeSucceeded(rc: c_int) !bool {
@@ -4725,7 +5699,10 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (!try metalSdpaRuntimeSucceeded(rc)) return null;
+    if (!try metalSdpaRuntimeSucceeded(rc)) {
+        output_device.deinit();
+        return null;
+    }
     return output_device;
 }
 
@@ -4767,8 +5744,7 @@ pub fn decoderRuntimeFlorenceWindowPackF32Device(
         dim,
         window_size,
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeFlorenceWindowUnpackF32Device(
@@ -4809,8 +5785,7 @@ pub fn decoderRuntimeFlorenceWindowUnpackF32Device(
         dim,
         window_size,
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeFlorenceChannelAttentionF32Device(
@@ -4841,8 +5816,7 @@ pub fn decoderRuntimeFlorenceChannelAttentionF32Device(
         dim,
         groups,
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeDisentangledRelativeAttentionF32Device(self: anytype, request: anytype) !?MetalTensor {
@@ -4887,8 +5861,7 @@ pub fn decoderRuntimeDisentangledRelativeAttentionF32Device(self: anytype, reque
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeDisentangledRelativeAttentionBackwardF32Device(self: anytype, request: anytype) !?MetalTensor {
@@ -5078,8 +6051,7 @@ fn decoderRuntimeTransposeF32DeviceImpl(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeDotGeneral2DF32Device(
@@ -5157,8 +6129,7 @@ fn decoderRuntimeDotGeneral2DF32DeviceImpl(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeDotGeneral2DManyF32DeviceInto(
@@ -5501,8 +6472,7 @@ pub fn decoderRuntimeDotGeneralBatchedF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeScatterAddAxis0F32Device(
@@ -5579,8 +6549,7 @@ pub fn decoderRuntimeConv1dF32Device(self: anytype, request: anytype) !?MetalTen
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeConv2dF32Device(self: anytype, request: anytype) !?MetalTensor {
@@ -5630,8 +6599,7 @@ pub fn decoderRuntimeConv2dF32Device(self: anytype, request: anytype) !?MetalTen
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
@@ -5661,13 +6629,13 @@ pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !
     if (rows == 0 or @as(usize, @intCast(request.rhs.dim(0))) != rows) return null;
     if (@as(usize, @intCast(request.lhs.dim(1))) != request.dim or @as(usize, @intCast(request.rhs.dim(1))) != request.dim) return null;
     if (rows != 1) {
-        const out = try std.heap.c_allocator.alloc(f32, request.lhs.elemCount());
-        errdefer std.heap.c_allocator.free(out);
         var lhs = request.lhs;
         var rhs = request.rhs;
         const lhs_slice = try tensorHostSlice(&lhs);
         const rhs_slice = try tensorHostSlice(&rhs);
         if (lhs_slice.len == 0 or rhs_slice.len == 0) return null;
+        const out = try std.heap.c_allocator.alloc(f32, request.lhs.elemCount());
+        errdefer std.heap.c_allocator.free(out);
         for (out, 0..) |*o, i| {
             o.* = lhs_slice[i % lhs_slice.len] + rhs_slice[i % rhs_slice.len];
         }
@@ -5706,9 +6674,8 @@ pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !
         request.dim,
         output.ptr,
     );
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(request.dim) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeApplyAddRhsRepeat(self: anytype, lhs: MetalTensor, rhs: MetalTensor) !?MetalTensor {
@@ -5955,13 +6922,13 @@ pub fn decoderRuntimeApplyMultiply(
     if (rows == 0 or @as(usize, @intCast(rhs.dim(0))) != rows) return null;
     if (@as(usize, @intCast(lhs.dim(1))) != dim or @as(usize, @intCast(rhs.dim(1))) != dim) return null;
     if (rows != 1) {
-        const out = try std.heap.c_allocator.alloc(f32, lhs.elemCount());
-        errdefer std.heap.c_allocator.free(out);
         var lhs_host = lhs;
         var rhs_host = rhs;
         const lhs_slice = try tensorHostSlice(&lhs_host);
         const rhs_slice = try tensorHostSlice(&rhs_host);
         if (lhs_slice.len == 0 or rhs_slice.len == 0) return null;
+        const out = try std.heap.c_allocator.alloc(f32, lhs.elemCount());
+        errdefer std.heap.c_allocator.free(out);
         for (out, 0..) |*o, i| {
             o.* = lhs_slice[i % lhs_slice.len] * rhs_slice[i % rhs_slice.len];
         }
@@ -5998,9 +6965,8 @@ pub fn decoderRuntimeApplyMultiply(
         dim,
         output.ptr,
     );
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(dim) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub extern fn termite_metal_decode_runtime_force_planned_compute_barrier(runtime: ?*RawMetalDecodeRuntime) c_int;
@@ -6080,8 +7046,7 @@ pub fn decoderRuntimeApplyMultiplyRhsRepeat(self: anytype, lhs: MetalTensor, rhs
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 fn decoderRuntimeApplyFlatBinaryDevice(
@@ -6142,8 +7107,7 @@ fn decoderRuntimeApplyFlatBinaryDeviceImpl(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeApplySubtract(self: anytype, lhs: MetalTensor, rhs: MetalTensor) !?MetalTensor {
@@ -6182,8 +7146,7 @@ pub fn decoderRuntimeApplyDivideRhsRepeat(self: anytype, lhs: MetalTensor, rhs: 
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeApplyLessThan(self: anytype, lhs: MetalTensor, rhs: MetalTensor) !?MetalTensor {
@@ -6485,8 +7448,7 @@ pub fn decoderRuntimeApplyWhereSelect(self: anytype, cond: MetalTensor, on_true:
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeApplyScale(
@@ -6510,8 +7472,7 @@ pub fn decoderRuntimeApplyScale(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeApplyLinearActivationLinearResidual(self: anytype, request: anytype) !?MetalTensor {
@@ -6550,10 +7511,8 @@ pub fn decoderRuntimeApplyLinearActivationLinearResidual(self: anytype, request:
         @intFromEnum(request.activation),
         output.ptr,
     );
-    if (rc != 0) return null;
-
     const shape = [_]i32{ 1, @intCast(request.hidden_size) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn tryRawProviderQuantizedLinearHost(
@@ -6585,6 +7544,7 @@ pub fn tryRawProviderQuantizedLinearHostWithDispatch(
         .known => |known| switch (known) {
             .Q4_0 => return in_dim % 32 == 0 and termite_metal_provider_linear_q4_0(
                 raw_provider,
+                self.raw_decode_runtime,
                 input,
                 rows,
                 in_dim,
@@ -6673,6 +7633,7 @@ pub fn tryRawProviderQuantizedLinearHostWithDispatch(
             ) == 0,
             .Q4_K => return in_dim % 256 == 0 and termite_metal_provider_linear_q4_k(
                 raw_provider,
+                self.raw_decode_runtime,
                 input,
                 rows,
                 in_dim,
@@ -6846,6 +7807,7 @@ pub fn decoderRuntimeApplyLinear(self: anytype, request: anytype) !?MetalTensor 
     errdefer std.heap.c_allocator.free(output);
     var input = request.input;
     if (!(try tryRawLinearHost(self, request.slot, try tensorHostConstPtr(&input), request.in_dim, request.out_dim, output.ptr))) {
+        std.heap.c_allocator.free(output);
         return null;
     }
 
@@ -6989,9 +7951,8 @@ pub fn decoderRuntimeApplyRmsNormLinear(self: anytype, request: anytype) !?Metal
         request.out_dim,
         output.ptr,
     );
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(request.out_dim) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anytype) !bool {
@@ -7009,8 +7970,16 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         request.disable_mapped_quant_weight
     else
         false;
+    const prefer_bf16_fallback = if (@hasField(@TypeOf(request), "prefer_bf16_fallback"))
+        request.prefer_bf16_fallback
+    else
+        false;
     const prefer_f16_mps_fallback = if (@hasField(@TypeOf(request), "prefer_f16_mps_fallback"))
         request.prefer_f16_mps_fallback
+    else
+        false;
+    const prefer_f32_mps_fallback = if (@hasField(@TypeOf(request), "prefer_f32_mps_fallback"))
+        request.prefer_f32_mps_fallback
     else
         false;
     if (self.raw_linear_slots_prepared[request.slot] and
@@ -7018,7 +7987,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         self.raw_linear_slot_out_dims[request.slot] == request.out_dim and
         ((request.quantized_storage != null and
             (self.raw_linear_slot_kinds[request.slot] == .dense or
-                (!prefer_f16_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized))) or
+                (!prefer_bf16_fallback and !prefer_f16_mps_fallback and !prefer_f32_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized))) or
             (request.quantized_storage == null and
                 (self.raw_linear_slot_kinds[request.slot] == .dense or
                     (retain_dense_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized)))))
@@ -7070,9 +8039,11 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                 if (quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, dense_weight)) {
                     const f16_weight = try std.heap.c_allocator.alloc(u16, dense_values);
                     defer std.heap.c_allocator.free(f16_weight);
-                    for (dense_weight, f16_weight) |value, *bits| bits.* = f32ToF16Bits(value);
+                    for (dense_weight, f16_weight) |value, *bits| {
+                        bits.* = f32ToF16Bits(value);
+                    }
                     const f16_bytes = std.mem.sliceAsBytes(f16_weight);
-                    const rc = termite_metal_decode_runtime_prepare_linear_f16(
+                    const f16_rc = termite_metal_decode_runtime_prepare_linear_f16(
                         runtime,
                         request.slot,
                         f16_bytes.ptr,
@@ -7081,7 +8052,58 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                         request.in_dim,
                         request.out_dim,
                     );
-                    if (rc == 0) {
+                    if (f16_rc == 0) {
+                        stats.decoder_runtime_prepare_linear_calls += 1;
+                        self.raw_linear_slot_kinds[request.slot] = .dense;
+                        self.raw_linear_slots_prepared[request.slot] = true;
+                        self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
+                        self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
+                        return true;
+                    }
+                } else |_| {}
+            }
+            if (prefer_f32_mps_fallback) {
+                const dense_weight = try std.heap.c_allocator.alloc(f32, dense_values);
+                defer std.heap.c_allocator.free(dense_weight);
+                if (quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, dense_weight)) {
+                    const dense_rc = termite_metal_decode_runtime_prepare_linear(
+                        runtime,
+                        request.slot,
+                        dense_weight.ptr,
+                        bias_base,
+                        request.in_dim,
+                        request.out_dim,
+                    );
+                    if (dense_rc == 0 and termite_metal_decode_runtime_prefer_linear_mps(runtime, request.slot) == 0) {
+                        stats.decoder_runtime_prepare_linear_calls += 1;
+                        self.raw_linear_slot_kinds[request.slot] = .dense;
+                        self.raw_linear_slots_prepared[request.slot] = true;
+                        self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
+                        self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
+                        return true;
+                    }
+                } else |_| {}
+            }
+            if (prefer_bf16_fallback) {
+                const dense_weight = try std.heap.c_allocator.alloc(f32, dense_values);
+                defer std.heap.c_allocator.free(dense_weight);
+                if (quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, dense_weight)) {
+                    const bf16_weight = try std.heap.c_allocator.alloc(u16, dense_values);
+                    defer std.heap.c_allocator.free(bf16_weight);
+                    for (dense_weight, bf16_weight) |value, *bits| {
+                        bits.* = f32ToBf16BitsRoundNearestEven(value);
+                    }
+                    const bf16_bytes = std.mem.sliceAsBytes(bf16_weight);
+                    const bf16_rc = termite_metal_decode_runtime_prepare_linear_bf16(
+                        runtime,
+                        request.slot,
+                        bf16_bytes.ptr,
+                        bf16_bytes.len,
+                        bias_base,
+                        request.in_dim,
+                        request.out_dim,
+                    );
+                    if (bf16_rc == 0) {
                         stats.decoder_runtime_prepare_linear_calls += 1;
                         self.raw_linear_slot_kinds[request.slot] = .dense;
                         self.raw_linear_slots_prepared[request.slot] = true;
@@ -7416,6 +8438,9 @@ test "direct quant runtime storage skips retained dense fallback by default" {
     try std.testing.expect(!runtimeDenseFallbackAllowedForRequest(.{
         .dense_fallback_max_bytes = @as(?usize, 128 * 1024 * 1024),
     }, &q40_storage));
+    try std.testing.expect(runtimeDenseFallbackAllowedForRequest(.{
+        .allow_direct_quant_fallback = true,
+    }, &q40_storage));
 
     var q4_raw: [144]u8 = undefined;
     @memset(q4_raw[0..], 0);
@@ -7430,6 +8455,9 @@ test "direct quant runtime storage skips retained dense fallback by default" {
     try std.testing.expect(!runtimeDenseFallbackAllowedForRequest(.{}, &q4_storage));
     try std.testing.expect(!runtimeDenseFallbackAllowedForRequest(.{
         .dense_fallback_max_bytes = @as(?usize, 128 * 1024 * 1024),
+    }, &q4_storage));
+    try std.testing.expect(runtimeDenseFallbackAllowedForRequest(.{
+        .allow_direct_quant_fallback = true,
     }, &q4_storage));
 
     var q8_raw: [34]u8 = undefined;
@@ -7635,6 +8663,821 @@ pub const RawAttentionGatedBlockTiming = extern struct {
     blit_copies: u64 = 0,
 };
 
+pub const workload_profile_capacity: usize = 256;
+
+/// Explicit execution regime for a workload census. Rows alone cannot
+/// distinguish encoder, prefill, decode, or speculative verification work.
+pub const WorkloadRegime = enum(u8) {
+    unknown = 0,
+    encoder = 1,
+    prefill = 2,
+    decode = 3,
+    speculative_draft = 4,
+    speculative_verify = 5,
+};
+
+pub const WorkloadImplementation = enum(u8) {
+    bundled = 0,
+    generated = 1,
+};
+
+pub const RawWorkloadProfileEntry = extern struct {
+    hash: u64 = 0,
+    call_count: u64 = 0,
+    logical_bytes: u64 = 0,
+    macs: u64 = 0,
+    /// Estimated by an isolated calibration pass; never a claimed hardware
+    /// DRAM-counter measurement. Zero while `calibrated == 0`.
+    estimated_gpu_nanos: u64 = 0,
+    rows: u64 = 0,
+    in_dim: u64 = 0,
+    out_dim: u64 = 0,
+    format: u32 = 0,
+    dispatch: u8 = 0,
+    input_encoding: u8 = 0,
+    output_encoding: u8 = 0,
+    epilogue: u8 = 0,
+    implementation: u8 = 0,
+    regime: u8 = 0,
+    fusion: u8 = 0,
+    layout: u8 = 0,
+    calibrated: u8 = 0,
+    occupied: u8 = 0,
+};
+
+pub const RawWorkloadProfileSnapshot = extern struct {
+    dropped_signatures: u64 = 0,
+    dropped_dispatches: u64 = 0,
+    whole_frame_gpu_nanos: u64 = 0,
+    profiled_frame_count: u64 = 0,
+    entry_count: u32 = 0,
+    active: u8 = 0,
+    complete: u8 = 0,
+    regime: u8 = 0,
+    reserved: u8 = 0,
+    entries: [workload_profile_capacity]RawWorkloadProfileEntry = [_]RawWorkloadProfileEntry{.{}} ** workload_profile_capacity,
+
+    pub fn observedEntries(self: *const RawWorkloadProfileSnapshot) []const RawWorkloadProfileEntry {
+        return self.entries[0..@min(@as(usize, self.entry_count), self.entries.len)];
+    }
+
+    /// Qualification must fail closed when the bounded table overflowed or a
+    /// census is still active.
+    pub fn eligibleForSelection(self: *const RawWorkloadProfileSnapshot) bool {
+        return self.complete != 0 and self.active == 0 and self.dropped_signatures == 0 and self.dropped_dispatches == 0;
+    }
+};
+
+pub const stage_bucket_count: usize = 6;
+
+pub const RawStageRegimeTiming = extern struct {
+    sampled_frames: u64 = 0,
+    whole_frame_gpu_nanos: u64 = 0,
+    bucket_nanos: [stage_bucket_count]u64 = [_]u64{0} ** stage_bucket_count,
+};
+
+pub const RawStageTimingSnapshot = extern struct {
+    enabled: u64 = 0,
+    supported: u64 = 0,
+    complete: u64 = 0,
+    barrier_sample_count: u64 = 0,
+    allocation_failures: u64 = 0,
+    resolve_failures: u64 = 0,
+    overflow_failures: u64 = 0,
+    dropped_frames: u64 = 0,
+    prefill: RawStageRegimeTiming = .{},
+    decode: RawStageRegimeTiming = .{},
+};
+
+pub const RawMetalJitExactDispatchStats = extern struct {
+    q4_0_hits: u64 = 0,
+    q4_k_hits: u64 = 0,
+};
+
+pub const workload_selection_target_percent = workload_profile_policy.selection_target_percent;
+pub const workload_selection_minimum_percent = workload_profile_policy.selection_minimum_percent;
+pub const workload_selection_maximum_signatures = workload_profile_policy.maximum_attempts_per_regime;
+pub const workload_tuning_regime_count = workload_profile_policy.tuning_regime_count;
+pub const workload_tuning_maximum_winners = workload_selection_maximum_signatures * workload_tuning_regime_count;
+
+comptime {
+    if (workload_tuning_maximum_winners != @as(usize, workload_profile_policy.maximum_tuning_signatures)) {
+        @compileError("Metal workload tuning capacity must match the shared profile policy");
+    }
+}
+
+pub const WorkloadSignatureSelection = struct {
+    indices: [workload_selection_maximum_signatures]u16 = [_]u16{0} ** workload_selection_maximum_signatures,
+    count: u8 = 0,
+    eligible_estimated_gpu_nanos: u64 = 0,
+    selected_estimated_gpu_nanos: u64 = 0,
+    reached_target: bool = false,
+
+    pub fn selectedIndices(self: *const WorkloadSignatureSelection) []const u16 {
+        return self.indices[0..self.count];
+    }
+};
+
+pub const MetalWorkloadQualifiedKernel = struct {
+    signature: RawWorkloadProfileEntry,
+    key: kernel_jit.ArtifactKey,
+    record: kernel_jit.QualificationRecord,
+    schedule: quant_kernel_compiler.KernelSchedule,
+};
+
+pub const MetalWorkloadTuningSummary = struct {
+    selected_count: u8 = 0,
+    qualified_count: u8 = 0,
+    active_count: u8 = 0,
+    qkv_active_count: u8 = 0,
+    failed_count: u8 = 0,
+    activation_failed_count: u8 = 0,
+    coverage_complete: bool = false,
+    winners: [workload_tuning_maximum_winners]MetalWorkloadQualifiedKernel = undefined,
+
+    pub fn qualifiedKernels(self: *const MetalWorkloadTuningSummary) []const MetalWorkloadQualifiedKernel {
+        return self.winners[0..self.qualified_count];
+    }
+};
+
+const MetalWorkloadQualifiedCoverage = struct {
+    eligible_estimated_gpu_nanos: u64,
+    qualified_estimated_gpu_nanos: u64 = 0,
+    attempted_count: u8 = 0,
+    winner_count: u8 = 0,
+    rejected_count: u8 = 0,
+
+    fn targetEstimatedGpuNanos(self: MetalWorkloadQualifiedCoverage) u64 {
+        const product = @as(u128, self.eligible_estimated_gpu_nanos) * workload_selection_target_percent;
+        return @intCast((product + 99) / 100);
+    }
+
+    fn complete(self: MetalWorkloadQualifiedCoverage) bool {
+        return self.qualified_estimated_gpu_nanos >= self.targetEstimatedGpuNanos();
+    }
+
+    fn recordAttempt(
+        self: *MetalWorkloadQualifiedCoverage,
+        estimated_gpu_nanos: u64,
+        qualified: bool,
+    ) void {
+        self.attempted_count += 1;
+        if (qualified) {
+            self.winner_count += 1;
+            self.qualified_estimated_gpu_nanos = workloadProfileSaturatingAdd(
+                self.qualified_estimated_gpu_nanos,
+                estimated_gpu_nanos,
+            );
+        } else {
+            self.rejected_count += 1;
+        }
+    }
+};
+
+fn validateMetalWorkloadTuningForMode(
+    mode: kernel_jit.Mode,
+    summary: MetalWorkloadTuningSummary,
+) !void {
+    if (mode.failClosed() and
+        (!summary.coverage_complete or
+            summary.qualified_count == 0 or
+            summary.active_count != summary.qualified_count))
+    {
+        return error.MetalJitRequiredRouteFailed;
+    }
+}
+
+fn workloadProfileSaturatingAdd(lhs: u64, rhs: u64) u64 {
+    return if (std.math.maxInt(u64) - lhs < rhs) std.math.maxInt(u64) else lhs + rhs;
+}
+
+fn workloadProfileSaturatingMul(lhs: u64, rhs: u64) u64 {
+    if (lhs == 0 or rhs == 0) return 0;
+    return if (lhs > std.math.maxInt(u64) / rhs) std.math.maxInt(u64) else lhs * rhs;
+}
+
+/// Applies the result of a dedicated command-buffer calibration. The stored
+/// value is aggregate estimated operator time for the observed call count, not
+/// a hardware counter and not whole-frame GPU duration.
+pub fn workloadProfileApplyCalibration(
+    snapshot: *RawWorkloadProfileSnapshot,
+    entry_index: usize,
+    estimated_gpu_nanos_per_call: u64,
+) !void {
+    if (entry_index >= snapshot.observedEntries().len) return error.InvalidWorkloadProfileEntry;
+    if (estimated_gpu_nanos_per_call == 0) return error.InvalidWorkloadCalibration;
+    const entry = &snapshot.entries[entry_index];
+    if (entry.occupied == 0 or entry.call_count == 0) return error.InvalidWorkloadProfileEntry;
+    entry.estimated_gpu_nanos = workloadProfileSaturatingMul(entry.call_count, estimated_gpu_nanos_per_call);
+    entry.calibrated = 1;
+}
+
+fn workloadProfileEntryInFirstMetalSlice(entry: RawWorkloadProfileEntry) bool {
+    const q4_0_format = workloadProfileQuantFormatId("q4_0").?;
+    const q4_k_format = workloadProfileQuantFormatId("q4_k").?;
+    const q6_k_format = workloadProfileQuantFormatId("q6_k").?;
+    const f32_encoding: u8 = 0;
+    const no_epilogue: u8 = 0;
+    const scalar_dispatch = workloadProfileDispatchId("scalar").?;
+    const small_batch_dispatch = workloadProfileDispatchId("small_batch").?;
+    const matches_bundled_dispatch =
+        (entry.format == q4_0_format and
+            (entry.dispatch == small_batch_dispatch or entry.dispatch == scalar_dispatch)) or
+        ((entry.format == q4_k_format or entry.format == q6_k_format) and entry.dispatch == scalar_dispatch);
+    const rows_supported = if (entry.format == q4_0_format)
+        entry.rows >= 2 and entry.rows <= 8
+    else
+        entry.rows >= 2;
+    return entry.occupied != 0 and
+        entry.implementation == @intFromEnum(WorkloadImplementation.bundled) and
+        entry.regime != @intFromEnum(WorkloadRegime.unknown) and
+        (entry.format == q4_0_format or entry.format == q4_k_format or entry.format == q6_k_format) and
+        matches_bundled_dispatch and
+        rows_supported and
+        entry.input_encoding == f32_encoding and
+        entry.output_encoding == f32_encoding and
+        entry.epilogue == no_epilogue and
+        entry.fusion == 0 and
+        entry.layout == 0;
+}
+
+fn workloadProfileEntryEligibleForFirstMetalSlice(entry: RawWorkloadProfileEntry) bool {
+    return workloadProfileEntryInFirstMetalSlice(entry) and
+        entry.calibrated != 0 and
+        entry.estimated_gpu_nanos != 0;
+}
+
+/// Calibrates every eligible Q4_0/Q4_K/Q6_K no-bias exact signature with its
+/// bundled Metal route. Each sample gets a fresh command buffer; the capture
+/// must already be stopped, complete, and overflow-free.
+pub fn calibrateFirstMetalTuningSlice(
+    allocator: std.mem.Allocator,
+    runtime: ?*RawMetalDecodeRuntime,
+    snapshot: *RawWorkloadProfileSnapshot,
+) !void {
+    if (!snapshot.eligibleForSelection()) return error.IncompleteWorkloadProfile;
+    if (runtime == null) return error.WorkloadProfileUnavailable;
+
+    for (snapshot.observedEntries(), 0..) |entry, index| {
+        if (!workloadProfileEntryInFirstMetalSlice(entry)) continue;
+        const rows = std.math.cast(usize, entry.rows) orelse return error.UnsupportedWorkloadCalibrationShape;
+        const in_dim = std.math.cast(usize, entry.in_dim) orelse return error.UnsupportedWorkloadCalibrationShape;
+        const out_dim = std.math.cast(usize, entry.out_dim) orelse return error.UnsupportedWorkloadCalibrationShape;
+        if (rows > std.math.maxInt(c_uint) or in_dim > std.math.maxInt(c_uint) or out_dim > std.math.maxInt(c_uint)) {
+            return error.UnsupportedWorkloadCalibrationShape;
+        }
+        const quant_format: quant_matmul.Format = if (entry.format == workloadProfileQuantFormatId("q4_0").?)
+            .q4_0
+        else if (entry.format == workloadProfileQuantFormatId("q4_k").?)
+            .q4_k
+        else
+            .q6_k;
+        const values_per_block = quant_format.valuesPerBlock().?;
+        const bytes_per_block = quant_format.bytesPerBlock().?;
+        if (in_dim % values_per_block != 0) return error.UnsupportedWorkloadCalibrationShape;
+        _ = metalJitFixtureBytes(quant_format, rows, in_dim, out_dim) catch |err| switch (err) {
+            error.MetalJitFixtureResourceLimit => {
+                std.log.warn(
+                    "Metal workload calibration rejected over-budget fixture format={d} rows={d} in_dim={d} out_dim={d} max_bytes={d}",
+                    .{ entry.format, rows, in_dim, out_dim, metal_jit_max_fixture_bytes },
+                );
+                return error.MetalJitFixtureResourceLimit;
+            },
+            else => return error.UnsupportedWorkloadCalibrationShape,
+        };
+        const input_count = std.math.mul(usize, rows, in_dim) catch return error.UnsupportedWorkloadCalibrationShape;
+        const weight_count = std.math.mul(
+            usize,
+            out_dim,
+            std.math.mul(usize, in_dim / values_per_block, bytes_per_block) catch return error.UnsupportedWorkloadCalibrationShape,
+        ) catch return error.UnsupportedWorkloadCalibrationShape;
+
+        const input = try allocator.alloc(f32, input_count);
+        defer allocator.free(input);
+        @memset(input, 0.25);
+        const weight = try allocator.alloc(u8, weight_count);
+        defer allocator.free(weight);
+        @memset(weight, 0);
+
+        var elapsed_nanos: u64 = 0;
+        const rc = termite_metal_calibrate_quant_signature(
+            runtime,
+            @intCast(entry.format),
+            input.ptr,
+            input.len,
+            weight.ptr,
+            weight.len,
+            @intCast(rows),
+            @intCast(in_dim),
+            @intCast(out_dim),
+            @intCast(kernel_jit.warmup_repeats),
+            @intCast(kernel_jit.measurement_repeats),
+            &elapsed_nanos,
+        );
+        if (rc != 0) {
+            std.log.warn(
+                "Metal workload calibration failed format={d} rows={d} in_dim={d} out_dim={d} rc={d}",
+                .{ entry.format, rows, in_dim, out_dim, rc },
+            );
+            return error.MetalWorkloadCalibrationFailed;
+        }
+        const per_call = @max(@as(u64, 1), elapsed_nanos / kernel_jit.measurement_repeats);
+        try workloadProfileApplyCalibration(snapshot, index, per_call);
+    }
+}
+
+fn workloadProfileEntryComesBefore(lhs: RawWorkloadProfileEntry, rhs: RawWorkloadProfileEntry) bool {
+    if (lhs.estimated_gpu_nanos != rhs.estimated_gpu_nanos) return lhs.estimated_gpu_nanos > rhs.estimated_gpu_nanos;
+    if (lhs.regime != rhs.regime) return lhs.regime < rhs.regime;
+    if (lhs.format != rhs.format) return lhs.format < rhs.format;
+    if (lhs.dispatch != rhs.dispatch) return lhs.dispatch < rhs.dispatch;
+    if (lhs.rows != rhs.rows) return lhs.rows < rhs.rows;
+    if (lhs.in_dim != rhs.in_dim) return lhs.in_dim < rhs.in_dim;
+    if (lhs.out_dim != rhs.out_dim) return lhs.out_dim < rhs.out_dim;
+    if (lhs.input_encoding != rhs.input_encoding) return lhs.input_encoding < rhs.input_encoding;
+    if (lhs.output_encoding != rhs.output_encoding) return lhs.output_encoding < rhs.output_encoding;
+    if (lhs.epilogue != rhs.epilogue) return lhs.epilogue < rhs.epilogue;
+    if (lhs.fusion != rhs.fusion) return lhs.fusion < rhs.fusion;
+    return lhs.layout < rhs.layout;
+}
+
+/// Picks the smallest descending-cost prefix that can cover 90% of calibrated
+/// eligible work, while excluding signatures below 2% and capping the package
+/// at five exact signatures. Incomplete census data fails closed.
+fn selectFirstMetalTuningSignaturesFiltered(
+    snapshot: *const RawWorkloadProfileSnapshot,
+    regime: ?WorkloadRegime,
+    stop_at_target: bool,
+) !WorkloadSignatureSelection {
+    if (!snapshot.eligibleForSelection()) return error.IncompleteWorkloadProfile;
+
+    var ordered: [workload_profile_capacity]u16 = undefined;
+    var ordered_count: usize = 0;
+    var result: WorkloadSignatureSelection = .{};
+    for (snapshot.observedEntries(), 0..) |entry, index| {
+        if (!workloadProfileEntryEligibleForFirstMetalSlice(entry)) continue;
+        if (regime) |wanted| {
+            if (entry.regime != @intFromEnum(wanted)) continue;
+        }
+        result.eligible_estimated_gpu_nanos = workloadProfileSaturatingAdd(
+            result.eligible_estimated_gpu_nanos,
+            entry.estimated_gpu_nanos,
+        );
+        var insertion = ordered_count;
+        while (insertion > 0 and workloadProfileEntryComesBefore(entry, snapshot.entries[ordered[insertion - 1]])) : (insertion -= 1) {
+            ordered[insertion] = ordered[insertion - 1];
+        }
+        ordered[insertion] = @intCast(index);
+        ordered_count += 1;
+    }
+    if (result.eligible_estimated_gpu_nanos == 0) return result;
+
+    const minimum_product = @as(u128, result.eligible_estimated_gpu_nanos) * workload_selection_minimum_percent;
+    const target_product = @as(u128, result.eligible_estimated_gpu_nanos) * workload_selection_target_percent;
+    const minimum_cost: u64 = @intCast((minimum_product + 99) / 100);
+    const target_cost: u64 = @intCast((target_product + 99) / 100);
+    for (ordered[0..ordered_count]) |index| {
+        if (result.count == workload_selection_maximum_signatures or
+            (stop_at_target and result.selected_estimated_gpu_nanos >= target_cost)) break;
+        const entry = snapshot.entries[index];
+        if (entry.estimated_gpu_nanos < minimum_cost) continue;
+        result.indices[result.count] = index;
+        result.count += 1;
+        result.selected_estimated_gpu_nanos = workloadProfileSaturatingAdd(
+            result.selected_estimated_gpu_nanos,
+            entry.estimated_gpu_nanos,
+        );
+    }
+    result.reached_target = result.selected_estimated_gpu_nanos >= target_cost;
+    return result;
+}
+
+pub fn selectFirstMetalTuningSignatures(snapshot: *const RawWorkloadProfileSnapshot) !WorkloadSignatureSelection {
+    return selectFirstMetalTuningSignaturesFiltered(snapshot, null, true);
+}
+
+/// Per-regime selection prevents a large encoder/prefill signature from
+/// starving the launch-sensitive decode or speculative buckets. Each regime
+/// independently applies 90% coverage, a 2% floor, and a five-signature cap.
+pub fn selectFirstMetalTuningSignaturesForRegime(
+    snapshot: *const RawWorkloadProfileSnapshot,
+    regime: WorkloadRegime,
+) !WorkloadSignatureSelection {
+    if (regime == .unknown) return error.InvalidWorkloadRegime;
+    return selectFirstMetalTuningSignaturesFiltered(snapshot, regime, true);
+}
+
+fn selectFirstMetalTuningCandidatePoolForRegime(
+    snapshot: *const RawWorkloadProfileSnapshot,
+    regime: WorkloadRegime,
+) !WorkloadSignatureSelection {
+    if (regime == .unknown) return error.InvalidWorkloadRegime;
+    return selectFirstMetalTuningSignaturesFiltered(snapshot, regime, false);
+}
+
+pub const WorkloadProfileMetadata = struct {
+    requested_tokens: ?u64 = null,
+    effective_tokens: ?u64 = null,
+    batch: ?u32 = null,
+    mtp_k: ?u32 = null,
+};
+
+pub const WorkloadProfileExport = struct {
+    allocator: std.mem.Allocator,
+    snapshot: RawWorkloadProfileSnapshot,
+    device_registry_id: u64,
+    compiler_fingerprint: []u8,
+    model_fingerprint: []u8,
+    entries: []kernel_jit_profile_output.ProfileEntry,
+    qualified_kernels: []kernel_jit_profile_output.QualifiedKernel,
+    tuning_selected_count: u8,
+    tuning_qualified_count: u8,
+    tuning_failed_count: u8,
+    tuning_coverage_complete: bool,
+
+    pub fn deinit(self: *WorkloadProfileExport) void {
+        for (self.qualified_kernels) |kernel| self.allocator.free(kernel.artifact_key);
+        self.allocator.free(self.qualified_kernels);
+        self.allocator.free(self.entries);
+        self.allocator.free(self.compiler_fingerprint);
+        self.allocator.free(self.model_fingerprint);
+        self.* = undefined;
+    }
+
+    pub fn report(self: *const WorkloadProfileExport, metadata: WorkloadProfileMetadata) kernel_jit_profile_output.ProfileReport {
+        return .{
+            .complete = self.snapshot.complete != 0 and self.snapshot.active == 0,
+            .dropped_signatures = self.snapshot.dropped_signatures,
+            .dropped_dispatches = self.snapshot.dropped_dispatches,
+            .device_registry_id = self.device_registry_id,
+            .whole_frame_gpu_nanos = self.snapshot.whole_frame_gpu_nanos,
+            .profiled_frame_count = self.snapshot.profiled_frame_count,
+            .compiler_fingerprint = self.compiler_fingerprint,
+            .model_fingerprint = self.model_fingerprint,
+            .requested_tokens = metadata.requested_tokens,
+            .effective_tokens = metadata.effective_tokens,
+            .batch = metadata.batch,
+            .mtp_k = metadata.mtp_k,
+            .entries = self.entries,
+            .qualified_kernels = self.qualified_kernels,
+            .tuning_selected_signatures = self.tuning_selected_count,
+            .tuning_qualified_signatures = self.tuning_qualified_count,
+            .tuning_failed_signatures = self.tuning_failed_count,
+            .tuning_coverage_complete = self.tuning_coverage_complete,
+        };
+    }
+};
+
+fn workloadRegimeName(value: u8) []const u8 {
+    return switch (value) {
+        1 => "encoder",
+        2 => "prefill",
+        3 => "decode",
+        4 => "speculative_draft",
+        5 => "speculative_verify",
+        else => "unknown",
+    };
+}
+
+fn workloadQuantFormatName(value: u32) []const u8 {
+    return switch (value) {
+        1 => "q1_0",
+        2 => "i2_s",
+        3 => "i8_s",
+        4 => "q2_k",
+        5 => "q3_k",
+        6 => "q4_0",
+        7 => "q4_1",
+        8 => "q4_k",
+        9 => "q5_0",
+        10 => "q5_1",
+        11 => "q5_k",
+        12 => "q6_k",
+        13 => "q8_0",
+        14 => "q8_1",
+        15 => "q8_k",
+        19 => "iq2_xs",
+        23 => "iq4_nl",
+        24 => "iq4_xs",
+        27 => "mxfp4",
+        28 => "nvfp4",
+        29 => "tl1",
+        30 => "tl2",
+        else => "unsupported",
+    };
+}
+
+fn workloadDispatchName(value: u8) []const u8 {
+    return switch (value) {
+        0 => "scalar",
+        1 => "mmv",
+        2 => "small_batch",
+        3 => "mm",
+        else => "unknown",
+    };
+}
+
+fn workloadEncodingName(value: u8) []const u8 {
+    return switch (value) {
+        0 => "f32",
+        1 => "bf16",
+        2 => "f16",
+        else => "unknown",
+    };
+}
+
+fn workloadEpilogueName(value: u8) []const u8 {
+    return switch (value) {
+        0 => "none",
+        1 => "pair_activation_mul",
+        2 => "qkv",
+        3 => "pair",
+        4 => "activation_rhs_mul",
+        5 => "pair_activation_rms_scale_1x",
+        else => "unknown",
+    };
+}
+
+fn workloadFingerprintAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
+}
+
+pub fn metalJitScopeFingerprintAlloc(
+    allocator: std.mem.Allocator,
+    scope: *const MetalJitRouteScope,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly.metal-model-scope.v1");
+    var header: [22]u8 = @splat(0);
+    std.mem.writeInt(u16, header[0..2], scope.quant_format_mask, .little);
+    header[2] = @intFromBool(scope.conformance_complete);
+    header[3] = @intFromEnum(scope.invalid_reason);
+    std.mem.writeInt(u16, header[4..6], @intCast(@intFromEnum(scope.invalid_format)), .little);
+    std.mem.writeInt(u64, header[6..14], @intCast(scope.invalid_shape[0]), .little);
+    std.mem.writeInt(u64, header[14..22], @intCast(scope.invalid_shape[1]), .little);
+    hasher.update(&header);
+
+    const formats = [_]quant_matmul.Format{
+        .q4_0,
+        .q4_1,
+        .q5_0,
+        .q5_1,
+        .q8_0,
+        .q8_1,
+        .q2_k,
+        .q3_k,
+        .q4_k,
+        .q5_k,
+        .q6_k,
+        .q8_k,
+    };
+    inline for (formats) |format| {
+        const format_index = metalJitQuantFormatIndex(format).?;
+        var format_header: [3]u8 = undefined;
+        std.mem.writeInt(u16, format_header[0..2], @intCast(@intFromEnum(format)), .little);
+        format_header[2] = scope.observed_shape_counts[format_index];
+        hasher.update(&format_header);
+        for (scope.observedShapes(format)) |shape| {
+            var encoded: [16]u8 = undefined;
+            std.mem.writeInt(u64, encoded[0..8], @intCast(shape[0]), .little);
+            std.mem.writeInt(u64, encoded[8..16], @intCast(shape[1]), .little);
+            hasher.update(&encoded);
+        }
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
+}
+
+fn workloadProfileQuantFormatId(name: []const u8) ?u32 {
+    const formats = [_]struct { name: []const u8, id: u32 }{
+        .{ .name = "q1_0", .id = 1 },
+        .{ .name = "i2_s", .id = 2 },
+        .{ .name = "i8_s", .id = 3 },
+        .{ .name = "q2_k", .id = 4 },
+        .{ .name = "q3_k", .id = 5 },
+        .{ .name = "q4_0", .id = 6 },
+        .{ .name = "q4_1", .id = 7 },
+        .{ .name = "q4_k", .id = 8 },
+        .{ .name = "q5_0", .id = 9 },
+        .{ .name = "q5_1", .id = 10 },
+        .{ .name = "q5_k", .id = 11 },
+        .{ .name = "q6_k", .id = 12 },
+        .{ .name = "q8_0", .id = 13 },
+        .{ .name = "q8_1", .id = 14 },
+        .{ .name = "q8_k", .id = 15 },
+        .{ .name = "iq2_xs", .id = 19 },
+        .{ .name = "iq4_nl", .id = 23 },
+        .{ .name = "iq4_xs", .id = 24 },
+        .{ .name = "mxfp4", .id = 27 },
+        .{ .name = "nvfp4", .id = 28 },
+        .{ .name = "tl1", .id = 29 },
+        .{ .name = "tl2", .id = 30 },
+    };
+    for (formats) |format| if (std.mem.eql(u8, name, format.name)) return format.id;
+    return null;
+}
+
+fn workloadProfileDispatchId(name: []const u8) ?u8 {
+    if (std.mem.eql(u8, name, "scalar")) return 0;
+    if (std.mem.eql(u8, name, "mmv")) return 1;
+    if (std.mem.eql(u8, name, "small_batch")) return 2;
+    if (std.mem.eql(u8, name, "mm")) return 3;
+    return null;
+}
+
+fn workloadProfileEncodingId(name: []const u8) ?u8 {
+    if (std.mem.eql(u8, name, "f32")) return 0;
+    if (std.mem.eql(u8, name, "bf16")) return 1;
+    if (std.mem.eql(u8, name, "f16")) return 2;
+    return null;
+}
+
+fn workloadProfileEpilogueId(name: []const u8) ?u8 {
+    if (std.mem.eql(u8, name, "none")) return 0;
+    if (std.mem.eql(u8, name, "pair_activation_mul")) return 1;
+    if (std.mem.eql(u8, name, "qkv")) return 2;
+    if (std.mem.eql(u8, name, "pair")) return 3;
+    if (std.mem.eql(u8, name, "activation_rhs_mul")) return 4;
+    if (std.mem.eql(u8, name, "pair_activation_rms_scale_1x")) return 5;
+    return null;
+}
+
+fn validateWorkloadProfileModelFingerprint(
+    allocator: std.mem.Allocator,
+    report: kernel_jit_profile_output.ProfileReport,
+    scope: *const MetalJitRouteScope,
+) !void {
+    const fingerprint = try metalJitScopeFingerprintAlloc(allocator, scope);
+    defer allocator.free(fingerprint);
+    if (!std.mem.eql(u8, report.model_fingerprint, fingerprint)) {
+        return error.StaleQualifiedKernelModelScope;
+    }
+}
+
+pub fn workloadProfileExportWithTuningAlloc(
+    allocator: std.mem.Allocator,
+    snapshot: RawWorkloadProfileSnapshot,
+    tuning: MetalWorkloadTuningSummary,
+    scope: *const MetalJitRouteScope,
+) !WorkloadProfileExport {
+    var device_info: MetalDeviceInfo = .{};
+    if (termite_metal_device_info_get(&device_info) != 0) return error.WorkloadProfileUnavailable;
+    var compiler_buffer: [4096]u8 = undefined;
+    const compiler_len = termite_metal_copy_compiler_identity(null, 0);
+    if (compiler_len == 0 or compiler_len > compiler_buffer.len or
+        termite_metal_copy_compiler_identity(compiler_buffer[0..].ptr, compiler_buffer.len) != compiler_len)
+    {
+        return error.WorkloadProfileUnavailable;
+    }
+
+    const compiler_fingerprint = try workloadFingerprintAlloc(allocator, compiler_buffer[0..compiler_len]);
+    errdefer allocator.free(compiler_fingerprint);
+    const model_fingerprint = try metalJitScopeFingerprintAlloc(allocator, scope);
+    errdefer allocator.free(model_fingerprint);
+    const entries = try allocator.alloc(kernel_jit_profile_output.ProfileEntry, snapshot.observedEntries().len);
+    errdefer allocator.free(entries);
+    for (snapshot.observedEntries(), entries) |raw, *entry| {
+        if (raw.rows > std.math.maxInt(u32) or raw.in_dim > std.math.maxInt(u32) or raw.out_dim > std.math.maxInt(u32)) {
+            return error.UnsupportedWorkloadProfileShape;
+        }
+        entry.* = .{
+            .regime = workloadRegimeName(raw.regime),
+            .quant_format = workloadQuantFormatName(raw.format),
+            .dispatch = workloadDispatchName(raw.dispatch),
+            .implementation = if (raw.implementation == @intFromEnum(WorkloadImplementation.generated)) "generated" else "bundled",
+            .rows = @intCast(raw.rows),
+            .in_dim = @intCast(raw.in_dim),
+            .out_dim = @intCast(raw.out_dim),
+            .input_encoding = workloadEncodingName(raw.input_encoding),
+            .output_encoding = workloadEncodingName(raw.output_encoding),
+            .epilogue = workloadEpilogueName(raw.epilogue),
+            .fusion = if (raw.fusion == 1) "sumsq" else "none",
+            .layout = if (raw.layout == 0) "row_major" else "unknown",
+            .call_count = raw.call_count,
+            .logical_bytes = raw.logical_bytes,
+            .macs = raw.macs,
+            .estimated_gpu_nanos = if (raw.calibrated != 0) raw.estimated_gpu_nanos else null,
+            .calibrated = raw.calibrated != 0,
+        };
+    }
+    const qualified_kernels = try allocator.alloc(
+        kernel_jit_profile_output.QualifiedKernel,
+        tuning.qualifiedKernels().len,
+    );
+    var qualified_count: usize = 0;
+    errdefer {
+        for (qualified_kernels[0..qualified_count]) |kernel| allocator.free(kernel.artifact_key);
+        allocator.free(qualified_kernels);
+    }
+    for (tuning.qualifiedKernels(), qualified_kernels) |qualified, *kernel| {
+        const key_hex = kernel_jit.artifactKeyHex(qualified.key);
+        const key = try allocator.dupe(u8, &key_hex);
+        qualified_count += 1;
+        kernel.* = .{
+            .artifact_key = key,
+            .regime = workloadRegimeName(qualified.signature.regime),
+            .quant_format = workloadQuantFormatName(qualified.signature.format),
+            .dispatch = workloadDispatchName(qualified.signature.dispatch),
+            .implementation = if (qualified.signature.implementation == @intFromEnum(WorkloadImplementation.generated)) "generated" else "bundled",
+            .rows = @intCast(qualified.signature.rows),
+            .in_dim = @intCast(qualified.signature.in_dim),
+            .out_dim = @intCast(qualified.signature.out_dim),
+            .input_encoding = workloadEncodingName(qualified.signature.input_encoding),
+            .output_encoding = workloadEncodingName(qualified.signature.output_encoding),
+            .epilogue = workloadEpilogueName(qualified.signature.epilogue),
+            .fusion = if (qualified.signature.fusion == 1) "sumsq" else "none",
+            .layout = if (qualified.signature.layout == 0) "row_major" else "unknown",
+            .candidate_index = @intCast(qualified.record.candidate_index),
+            .threads_per_threadgroup = qualified.schedule.threads_per_threadgroup,
+            .cols_per_threadgroup = qualified.schedule.cols_per_threadgroup,
+            .rows_per_threadgroup = qualified.schedule.rows_per_threadgroup,
+            .reduction = @tagName(qualified.schedule.reduction),
+            .measured_speedup = qualified.record.measured_speedup,
+            .minimum_repeat_speedup = qualified.record.minimum_repeat_speedup,
+        };
+    }
+    return .{
+        .allocator = allocator,
+        .snapshot = snapshot,
+        .device_registry_id = device_info.registry_id,
+        .compiler_fingerprint = compiler_fingerprint,
+        .model_fingerprint = model_fingerprint,
+        .entries = entries,
+        .qualified_kernels = qualified_kernels,
+        .tuning_selected_count = tuning.selected_count,
+        .tuning_qualified_count = tuning.qualified_count,
+        .tuning_failed_count = tuning.failed_count,
+        .tuning_coverage_complete = tuning.coverage_complete and tuning.selected_count != 0,
+    };
+}
+
+pub fn workloadProfileExportAlloc(
+    allocator: std.mem.Allocator,
+    snapshot: RawWorkloadProfileSnapshot,
+    scope: *const MetalJitRouteScope,
+) !WorkloadProfileExport {
+    return workloadProfileExportWithTuningAlloc(allocator, snapshot, .{}, scope);
+}
+
+test "Metal workload model fingerprint binds the complete route scope" {
+    var scope = MetalJitRouteScope.none();
+    try std.testing.expect(scope.includeQuantShape(.q4_0, 512, 256));
+    try std.testing.expect(scope.includeQuantShape(.q4_0, 256, 256));
+    try std.testing.expect(scope.includeQuantShape(.q4_k, 512, 512));
+    const fingerprint = try metalJitScopeFingerprintAlloc(std.testing.allocator, &scope);
+    defer std.testing.allocator.free(fingerprint);
+
+    var equivalent_scope = MetalJitRouteScope.none();
+    try std.testing.expect(equivalent_scope.includeQuantShape(.q4_k, 512, 512));
+    try std.testing.expect(equivalent_scope.includeQuantShape(.q4_0, 256, 256));
+    try std.testing.expect(equivalent_scope.includeQuantShape(.q4_0, 512, 256));
+    const equivalent_fingerprint = try metalJitScopeFingerprintAlloc(std.testing.allocator, &equivalent_scope);
+    defer std.testing.allocator.free(equivalent_fingerprint);
+    try std.testing.expectEqualStrings(fingerprint, equivalent_fingerprint);
+
+    const report = kernel_jit_profile_output.ProfileReport{
+        .complete = true,
+        .device_registry_id = 1,
+        .compiler_fingerprint = "sha256:compiler",
+        .model_fingerprint = fingerprint,
+        .entries = &.{},
+    };
+    try validateWorkloadProfileModelFingerprint(std.testing.allocator, report, &equivalent_scope);
+
+    var subset_scope = MetalJitRouteScope.none();
+    try std.testing.expect(subset_scope.includeQuantShape(.q4_0, 256, 256));
+    try std.testing.expectError(
+        error.StaleQualifiedKernelModelScope,
+        validateWorkloadProfileModelFingerprint(std.testing.allocator, report, &subset_scope),
+    );
+
+    var stale_scope = scope;
+    stale_scope.invalidate(.scope_discovery, .q4_k, 1024, 512);
+    try std.testing.expectError(
+        error.StaleQualifiedKernelModelScope,
+        validateWorkloadProfileModelFingerprint(std.testing.allocator, report, &stale_scope),
+    );
+
+    var stale_report = report;
+    stale_report.model_fingerprint = "sha256:stale";
+    try std.testing.expectError(
+        error.StaleQualifiedKernelModelScope,
+        validateWorkloadProfileModelFingerprint(std.testing.allocator, stale_report, &scope),
+    );
+}
+
+comptime {
+    std.debug.assert(@sizeOf(RawWorkloadProfileEntry) == 80);
+    std.debug.assert(@sizeOf(RawWorkloadProfileSnapshot) == 20_520);
+    std.debug.assert(@sizeOf(RawStageRegimeTiming) == 64);
+    std.debug.assert(@sizeOf(RawStageTimingSnapshot) == 192);
+}
+
 pub const RawRuntimeMemoryStats = extern struct {
     buffer_count: u64 = 0,
     total_bytes: u64 = 0,
@@ -7653,8 +9496,11 @@ pub const RawRuntimeMemoryStats = extern struct {
     dense_linear_weight_bytes: u64 = 0,
     dense_linear_f32_weight_bytes: u64 = 0,
     dense_linear_bf16_weight_bytes: u64 = 0,
+    dense_linear_f16_weight_bytes: u64 = 0,
     dense_linear_f32_slots: u64 = 0,
     dense_linear_bf16_slots: u64 = 0,
+    dense_linear_f16_slots: u64 = 0,
+    dense_qkv_packed_bytes: u64 = 0,
     quant_linear_bytes: u64 = 0,
     scratch_bytes: u64 = 0,
     scratch_pool_bytes: u64 = 0,
@@ -7693,7 +9539,18 @@ pub const RawRuntimeMemoryStats = extern struct {
     deberta_attention_gemm_fallbacks: u64 = 0,
     paged_attention_1x_calls: u64 = 0,
     decode_gqa_split_calls: u64 = 0,
-    decode_gqa_split_fallback_calls: u64 = 0,
+    generated_attention_decode_1x_calls: u64 = 0,
+    generated_attention_flash_prefill_calls: u64 = 0,
+    generated_attention_flash_prefill_hd512_calls: u64 = 0,
+    attention_prefill_direct_kv_calls: u64 = 0,
+    attention_prefill_paged_kv_calls: u64 = 0,
+    generated_rms_norm_calls: u64 = 0,
+    prepared_frame_fast_path_calls: u64 = 0,
+    prepared_frame_fallback_calls: u64 = 0,
+    frame_begin_count: u64 = 0,
+    frame_submit_count: u64 = 0,
+    frame_wait_nanos: u64 = 0,
+    frame_gpu_nanos: u64 = 0,
     compute_encoder_count: u64 = 0,
     blit_encoder_count: u64 = 0,
     last_frame_compute_encoder_count: u64 = 0,
@@ -7747,10 +9604,32 @@ pub const RawRuntimeMemoryStats = extern struct {
     q8_0_linear_mmv_f16_input: u64 = 0,
     q8_0_linear_family_dispatch_counts: [12][4]u64 = [_][4]u64{[_]u64{0} ** 4} ** 12,
     q4_0_linear_reduce: u64 = 0,
+    q4_0_linear_reduce_rows_1: u64 = 0,
+    q4_0_linear_reduce_rows_2_8: u64 = 0,
+    q4_0_linear_reduce_rows_9_64: u64 = 0,
+    q4_0_linear_reduce_rows_65_plus: u64 = 0,
     q4_0_linear_reduce_f16_input: u64 = 0,
     q4_0_linear_reduce_f16_output: u64 = 0,
     q4_0_linear_reduce_f16_input_f16_output: u64 = 0,
     q4_0_linear_reduce_sumsq: u64 = 0,
+    q4_0_mmv_nr4_nsg2_dispatches: u64 = 0,
+    q4_0_mmv_nr8_nsg2_dispatches: u64 = 0,
+    q4_0_mmv_nr4_nsg4_dispatches: u64 = 0,
+    q4_0_mmv_nr8_nsg4_dispatches: u64 = 0,
+    q4_0_mmv_variant_fallbacks: u64 = 0,
+    q4_0_pair_activation_mmv_nr4_nsg2_dispatches: u64 = 0,
+    q4_0_pair_activation_mmv_nr8_nsg2_dispatches: u64 = 0,
+    q4_0_pair_activation_mmv_nr4_nsg4_dispatches: u64 = 0,
+    q4_0_pair_activation_mmv_nr8_nsg4_dispatches: u64 = 0,
+    q4_0_pair_activation_mmv_variant_fallbacks: u64 = 0,
+    q4_0_mm_sg_aligned_dispatches: u64 = 0,
+    q4_0_mm_sg_aligned_tail_dispatches: u64 = 0,
+    q4_0_mm_sg_unrolled_dispatches: u64 = 0,
+    q4_0_pair_activation_mm_m32_n64_aligned_dispatches: u64 = 0,
+    q4_0_pair_activation_mm_m32_n64_tail_dispatches: u64 = 0,
+    q4_0_pair_activation_mm_m32_n32_aligned_dispatches: u64 = 0,
+    q4_0_pair_activation_mm_m32_n32_tail_dispatches: u64 = 0,
+    q4_0_pair_activation_mm_variant_fallbacks: u64 = 0,
     q4_0_pair: u64 = 0,
     q4_0_pair_reduce: u64 = 0,
     q4_0_pair_activation_reduce: u64 = 0,
@@ -7765,26 +9644,5431 @@ pub const RawRuntimeMemoryStats = extern struct {
     q4_0_pair_activation_reduce_encode_nanos: u64 = 0,
     q4_0_activation_rhs_reduce_encode_nanos: u64 = 0,
     q4_k_linear_reduce: u64 = 0,
+    q4_k_linear_reduce_rows_1: u64 = 0,
+    q4_k_linear_reduce_rows_2_8: u64 = 0,
+    q4_k_linear_reduce_rows_9_64: u64 = 0,
+    q4_k_linear_reduce_rows_65_plus: u64 = 0,
     q4_k_pair_reduce: u64 = 0,
     q4_k_pair_activation_reduce: u64 = 0,
     q4_k_pair_activation_reduce_f16_output: u64 = 0,
     q4_k_activation_rhs_reduce: u64 = 0,
     q6_k_linear_reduce: u64 = 0,
+    q6_k_linear_reduce_rows_1: u64 = 0,
+    q6_k_linear_reduce_rows_2_8: u64 = 0,
+    q6_k_linear_reduce_rows_9_64: u64 = 0,
+    q6_k_linear_reduce_rows_65_plus: u64 = 0,
     q6_k_linear_reduce_f16_input: u64 = 0,
+    // Mirrors `uint64_t antfly_generated_dispatch_counts[12][4]` in
+    // termite_metal_decode_runtime_memory_stats (metal_kernels.m); the extern
+    // layout must stay in lockstep with the C struct.
+    antfly_generated_dispatch_counts: quant_matmul.GeneratedQuantDispatchCounts = quant_matmul.generated_quant_dispatch_counts_zero,
     rms_norm_add_sumsq: u64 = 0,
 };
 
+test "metal generated attention and RMS opt-ins are fail-closed and execution-counted" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "BOOL missing_requested_generated_pipeline"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "missing_requested_generated_pipeline || missing_quant_reduce_pipeline"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "runtime->generated_attention_decode_1x_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "runtime->generated_attention_flash_prefill_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "runtime->generated_attention_flash_prefill_hd512_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "runtime->attention_flash_hd512_generated_pipeline = termite_metal_make_pipeline"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_PREFILL_FLASH_HD512"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "runtime->generated_rms_norm_calls += 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "return termite_metal_encode_rms_norm_generated("));
+}
+
+test "metal top-p sampling retains the crossing token and cutoff ties" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    // Both the bounded serial sampler and the parallel top-k reducer identify
+    // the first probability that reaches the nucleus threshold, then retain
+    // every candidate tied at that cutoff. The crossing token itself must not
+    // be cleared.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "if (cumulative >= threshold) { nucleus_cutoff = probs[i]; break; }"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "if (probs[i] < nucleus_cutoff) probs[i] = 0.0f;"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source, "if (cumulative > threshold && i > 0u) probs[i] = 0.0f;"));
+}
+
+test "metal prefill direct KV is selected-only, bounded, rollback-safe, and counted" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+    const generated = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/ops/metal/generated/attention_prefill_flash.metal", std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(generated);
+
+    // The checked-in renderer output and embedded hd256 source both start at
+    // the first 32-token tile that can intersect the live sliding window.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "uint kc_start = 0u; if (p.swa_scan_clamp != 0u && p.sliding_window != 0u)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "for (uint kc = kc_start; kc < p.kv_tokens; kc += 32u)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, generated, "uint kc_start = 0u; if (p.swa_scan_clamp != 0u && p.sliding_window != 0u)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, generated, "for (uint kc = kc_start; kc < p.kv_tokens; kc += 32u)"));
+
+    // Resolve the rollback once per runtime. A process-global lazy cache would
+    // race when independent model runtimes are created concurrently.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "BOOL swa_scan_clamp_enabled;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "runtime->swa_scan_clamp_enabled ="));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "runtime.swa_scan_clamp_enabled = source_runtime->swa_scan_clamp_enabled"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source, "termite_metal_swa_scan_clamp_disabled"));
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "(uint64_t)base + (uint64_t)(kv_tokens - 1u) > UINT32_MAX"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, ".block_count = (uint32_t)needed_blocks"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "const size_t block_table_bytes = needed_blocks * sizeof(uint32_t)"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "const bool use_prefill_direct_kv = (use_prefill_hd512 || use_prefill_sg)"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "params.contiguous_blocks = 1u"));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, source, "termite_metal_record_prefill_kv_route(runtime, use_prefill_direct_kv)"));
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "apple_gpu_family == 9u && [device.name hasPrefix:@\"Apple M4\"]"));
+    try std.testing.expect(std.mem.indexOf(u8, source, "TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD").? <
+        std.mem.indexOf(u8, source, "TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD").?);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, source, "return termite_metal_env_flag_enabled(getenv(\"TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD\"));"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->attention_prefill_direct_kv_calls = runtime->attention_prefill_direct_kv_calls"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->attention_prefill_paged_kv_calls = runtime->attention_prefill_paged_kv_calls"));
+}
+
+test "metal prepared frame fast path is qualified, diagnosable, and shares lifecycle" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_FORCE_DIAGNOSTIC_COMMAND_BUFFERS"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "apple_gpu_family == 9u && [device.name hasPrefix:@\"Apple M4\"]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "id<MTLCommandBuffer> command_buffer = [queue commandBuffer]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->workload_profile_active == 0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->prepared_frame_diagnostics_forced = termite_metal_prepared_frame_diagnostics_enabled()"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "!runtime->prepared_frame_diagnostics_forced"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "return termite_metal_decode_runtime_begin_frame_internal(runtime, false)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "return termite_metal_decode_runtime_begin_frame_internal(runtime, true)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->prepared_frame_fast_path_calls = runtime->prepared_frame_fast_path_calls"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->prepared_frame_fallback_calls = runtime->prepared_frame_fallback_calls"));
+}
+
+test "metal DeBERTa flash4 eligibility dispatches the flash4 pipeline" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    const function_start = std.mem.indexOf(u8, source, "int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(").?;
+    const function_end = std.mem.indexOfPos(u8, source, function_start, "int termite_metal_decode_runtime_disentangled_relative_attention_backward_f32_device(").?;
+    const function_source = source[function_start..function_end];
+
+    const eligibility = std.mem.indexOf(u8, function_source, "if (flash4_attention_requested &&").?;
+    const dispatch = std.mem.indexOf(u8, function_source, "setComputePipelineState:runtime->disentangled_relative_attention_f32_flash4_pipeline").?;
+    const fallback = std.mem.indexOf(u8, function_source, "if (gemm_attention_requested &&").?;
+    try std.testing.expect(eligibility < dispatch);
+    try std.testing.expect(dispatch < fallback);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, function_source, "runtime->deberta_attention_flash_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, function_source, "dispatchThreadgroups:MTLSizeMake((seq_len + flash_query_block - 1u) / flash_query_block, num_heads, batch)"));
+}
+
+test "metal paged attention masks value rows without divergent branching" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    const masked_accumulation = "value += weight * select(float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]), 0.0f, weight == 0.0f)";
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, masked_accumulation));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source, "if (weight != 0.0f) value += weight"));
+}
+
+test "Metal stage timing preserves the prepared frame topology" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    const diagnostics_start = std.mem.indexOf(u8, source, "static bool termite_metal_prepared_frame_diagnostics_enabled(void)").?;
+    const diagnostics_end = std.mem.indexOfPos(u8, source, diagnostics_start, "static uint64_t termite_metal_env_bounded_u64").?;
+    try std.testing.expect(std.mem.indexOf(u8, source[diagnostics_start..diagnostics_end], "TERMITE_METAL_STAGE_TIMING") == null);
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sampleCountersInBuffer:frame->buffer"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_new_fast_prepared_command_buffer"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "int termite_metal_decode_runtime_stage_timing_snapshot("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "int termite_metal_decode_runtime_reset_stage_timing("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->stage_timing_prefill_seen = 0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->stage_timing_decode_selected = 0"));
+}
+
+test "metal Q4_0 MMV portfolio is M4-qualified, observable, and cloned into host dispatch" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_Q4_0_MMV_VARIANT"));
+    inline for (.{
+        "TERMITE_METAL_Q4_0_MMV_ATTENTION_VARIANT",
+        "TERMITE_METAL_Q4_0_MMV_FFN_GATE_UP_VARIANT",
+        "TERMITE_METAL_Q4_0_MMV_FFN_DOWN_VARIANT",
+        "TERMITE_METAL_Q4_0_MMV_PLE_VARIANT",
+        "TERMITE_METAL_Q4_0_MMV_TAIL_VARIANT",
+    }) |environment_name| {
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, environment_name));
+    }
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const BOOL is_m4_gemma4_ffn = runtime->apple_m4_device"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "global_override != TERMITE_METAL_Q4_0_MMV_VARIANT_AUTO"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->q4_0_mmv_workload_variant_overrides[workload]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, ".q4_0_mmv_workload = TERMITE_METAL_Q4_0_MMV_WORKLOAD_ATTENTION"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, ".q4_0_mmv_workload = TERMITE_METAL_Q4_0_MMV_WORKLOAD_FFN_GATE_UP"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, ".q4_0_mmv_workload = TERMITE_METAL_Q4_0_MMV_WORKLOAD_FFN_DOWN"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.apple_m4_device = source_runtime->apple_m4_device"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sizeof(runtime.q4_0_mmv_workload_variant_overrides)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.q4_0_mmv_trace_emitted = source_runtime->q4_0_mmv_trace_emitted"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.q4_0_mmv_trace_workload_mask = source_runtime->q4_0_mmv_trace_workload_mask"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "source_runtime->q4_0_mmv_nr4_nsg2_dispatches += runtime.q4_0_mmv_nr4_nsg2_dispatches"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->q4_0_mmv_variant_fallbacks = runtime->q4_0_mmv_variant_fallbacks"));
+}
+
+test "metal Q4_0 pair activation portfolios are exact gated and observable" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_FUSION"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MMV_VARIANT"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_MM"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_MM"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MM_VARIANT"));
+    inline for (.{ "nr4_nsg2", "nr8_nsg2", "nr4_nsg4", "nr8_nsg4" }) |variant| {
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_q4_0_pair_activation_1x_reduce_" ++ variant));
+    }
+    inline for (.{ "m32_n64_aligned", "m32_n64_tail", "m32_n32_aligned", "m32_n32_tail" }) |variant| {
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_q4_0_pair_activation_mm_" ++ variant));
+    }
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "descriptor->in_dim == 2560u && descriptor->out_dim == 10240u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "selection.threadgroup_memory_bytes = 16u * 1024u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "selection.threadgroup_memory_bytes = 8u * 1024u"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->q4_0_pair_activation_mmv_variant_fallbacks = runtime->q4_0_pair_activation_mmv_variant_fallbacks"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->q4_0_pair_activation_mm_variant_fallbacks = runtime->q4_0_pair_activation_mm_variant_fallbacks"));
+}
+
+test "concurrent planned dispatch policy is fail closed and hazards share production classifier" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_concurrent_planned_dispatch_policy_probe(0, 0, 0));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_concurrent_planned_dispatch_policy_probe(1, 0, 0));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_concurrent_planned_dispatch_policy_probe(0, 1, 0));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_concurrent_planned_dispatch_policy_probe(1, 1, 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_planned_range_hazard_probe(0, 16, 0, 8, 24, 0, 1));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_planned_range_hazard_probe(0, 16, 0, 8, 24, 1, 1));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_planned_range_hazard_probe(0, 16, 1, 8, 24, 1, 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_planned_range_hazard_probe(0, 16, 1, 16, 24, 1, 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_planned_range_hazard_probe(0, 16, 1, 8, 24, 1, 0));
+}
+
+test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const variants = [_]struct {
+        variant: DecodeGqaSplitVariant,
+        cap: usize,
+    }{
+        .{ .variant = .s8_k32_r256, .cap = 8 },
+        .{ .variant = .s16_k32_r256, .cap = 16 },
+        .{ .variant = .s24_k32_r256, .cap = 24 },
+        .{ .variant = .s32_k32_r256, .cap = 32 },
+    };
+    const kv_boundaries = [_]usize{ 511, 512, 513, 1023, 1024, 2003, 4095, 4096, 8191 };
+    for (variants) |case| {
+        for ([_]usize{ 1, 2 }) |num_kv_heads| {
+            for (kv_boundaries) |kv_tokens| {
+                var resolved: c_uint = 99;
+                var split_count: c_uint = 99;
+                var scratch_bytes: usize = 99;
+                const rc = termite_metal_decode_gqa_split_policy_probe(
+                    @intFromEnum(case.variant),
+                    1,
+                    kv_tokens,
+                    8,
+                    num_kv_heads,
+                    512,
+                    0,
+                    &resolved,
+                    &split_count,
+                    &scratch_bytes,
+                );
+                if (kv_tokens < 512) {
+                    try std.testing.expectEqual(@as(c_int, 0), rc);
+                    try std.testing.expectEqual(@as(c_uint, @intFromEnum(DecodeGqaSplitVariant.auto)), resolved);
+                    try std.testing.expectEqual(@as(c_uint, 0), split_count);
+                    try std.testing.expectEqual(@as(usize, 0), scratch_bytes);
+                    continue;
+                }
+                const expected_splits = @min(case.cap, (kv_tokens + 31) / 32);
+                try std.testing.expectEqual(@as(c_int, 1), rc);
+                try std.testing.expectEqual(@as(c_uint, @intFromEnum(case.variant)), resolved);
+                try std.testing.expectEqual(@as(c_uint, @intCast(expected_splits)), split_count);
+                try std.testing.expectEqual(
+                    @as(usize, 8 * expected_splits * (512 + 2) * @sizeOf(f32)),
+                    scratch_bytes,
+                );
+            }
+        }
+    }
+
+    var auto_resolved: c_uint = 99;
+    var auto_splits: c_uint = 99;
+    var auto_scratch: usize = 99;
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_decode_gqa_split_policy_probe(
+        @intFromEnum(DecodeGqaSplitVariant.auto),
+        2,
+        8191,
+        8,
+        2,
+        256,
+        512,
+        &auto_resolved,
+        &auto_splits,
+        &auto_scratch,
+    ));
+    try std.testing.expectEqual(@as(c_uint, @intFromEnum(DecodeGqaSplitVariant.s32_k32_r256)), auto_resolved);
+    try std.testing.expectEqual(@as(c_uint, 32), auto_splits);
+    try std.testing.expectEqual(@as(usize, 2 * 8 * 32 * (256 + 2) * @sizeOf(f32)), auto_scratch);
+
+    try std.testing.expectEqual(@as(c_int, -2), termite_metal_decode_gqa_split_policy_probe(
+        99,
+        1,
+        512,
+        8,
+        2,
+        512,
+        0,
+        &auto_resolved,
+        &auto_splits,
+        &auto_scratch,
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_gqa_split_policy_probe(
+        @intFromEnum(DecodeGqaSplitVariant.auto),
+        1,
+        512,
+        8,
+        2,
+        384,
+        0,
+        &auto_resolved,
+        &auto_splits,
+        &auto_scratch,
+    ));
+}
+
+test "Metal exact JIT pipeline lookup includes regime dispatch rows and both matrix dimensions" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const q4_0: c_uint = @intFromEnum(MetalJitPipelineSlot.q4_0);
+    const q4_k: c_uint = @intFromEnum(MetalJitPipelineSlot.q4_k);
+    const q4_1: c_uint = @intFromEnum(MetalJitPipelineSlot.q4_1);
+    const encoder: u8 = @intFromEnum(WorkloadRegime.encoder);
+    const prefill: u8 = @intFromEnum(WorkloadRegime.prefill);
+    const unknown: u8 = @intFromEnum(WorkloadRegime.unknown);
+    const scalar = workloadProfileDispatchId("scalar").?;
+    const small_batch = workloadProfileDispatchId("small_batch").?;
+
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_jit_exact_pipeline_lookup_probe(q4_0, encoder, small_batch, 4, 4096, 3072, encoder, small_batch, 4, 4096, 3072));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_exact_pipeline_lookup_probe(q4_0, encoder, small_batch, 4, 4096, 3072, encoder, scalar, 4, 4096, 3072));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_exact_pipeline_lookup_probe(q4_0, encoder, small_batch, 4, 4096, 3072, prefill, small_batch, 4, 4096, 3072));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_exact_pipeline_lookup_probe(q4_0, encoder, small_batch, 4, 4096, 3072, unknown, small_batch, 4, 4096, 3072));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_exact_pipeline_lookup_probe(q4_0, encoder, small_batch, 4, 4096, 3072, encoder, small_batch, 2, 4096, 3072));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_exact_pipeline_lookup_probe(q4_k, encoder, scalar, 4, 4096, 3072, encoder, scalar, 4, 4096, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_exact_pipeline_lookup_probe(q4_k, encoder, scalar, 4, 4096, 3072, encoder, small_batch, 4, 4096, 3072));
+    try std.testing.expectEqual(@as(c_int, -1), termite_metal_jit_exact_pipeline_lookup_probe(q4_1, encoder, small_batch, 4, 4096, 3072, encoder, small_batch, 4, 4096, 3072));
+}
+
+test "Metal exact JIT telemetry isolates route hits and resets" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    var before: RawMetalJitExactDispatchStats = .{};
+    var after: RawMetalJitExactDispatchStats = .{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_exact_dispatch_stats_probe(
+        @intFromEnum(MetalJitPipelineSlot.q4_0),
+        &before,
+        &after,
+    ));
+    try std.testing.expectEqual(@as(u64, 2), before.q4_0_hits);
+    try std.testing.expectEqual(@as(u64, 0), before.q4_k_hits);
+    try std.testing.expectEqualDeep(RawMetalJitExactDispatchStats{}, after);
+
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_exact_dispatch_stats_probe(
+        @intFromEnum(MetalJitPipelineSlot.q4_k),
+        &before,
+        &after,
+    ));
+    try std.testing.expectEqual(@as(u64, 0), before.q4_0_hits);
+    try std.testing.expectEqual(@as(u64, 2), before.q4_k_hits);
+    try std.testing.expectEqualDeep(RawMetalJitExactDispatchStats{}, after);
+    try std.testing.expectEqual(@as(c_int, -2), termite_metal_jit_exact_dispatch_stats_probe(
+        @intFromEnum(MetalJitPipelineSlot.q4_1),
+        &before,
+        &after,
+    ));
+}
+
+test "Metal native provider initializes fresh encoder workloads with encoder regime" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+
+    const snapshot = try provider.workloadProfileSnapshot();
+    try std.testing.expectEqual(@as(u8, @intFromEnum(WorkloadRegime.encoder)), snapshot.regime);
+}
+
+test "Metal workload profile lifecycle is bounded and fail closed" {
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+
+    try workloadProfileBegin(runtime, .encoder);
+    try std.testing.expectError(error.WorkloadProfileUnavailable, workloadProfileBegin(runtime, .encoder));
+    var snapshot = try workloadProfileSnapshot(runtime);
+    try std.testing.expectEqual(@as(u8, 1), snapshot.active);
+    try std.testing.expectEqual(@as(u8, 1), snapshot.complete);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(WorkloadRegime.encoder)), snapshot.regime);
+    try std.testing.expectEqual(@as(u32, 0), snapshot.entry_count);
+    try std.testing.expect(!snapshot.eligibleForSelection());
+
+    try workloadProfileSetRegime(runtime, .speculative_verify);
+    try workloadProfileEnd(runtime);
+    try std.testing.expectError(error.WorkloadProfileUnavailable, workloadProfileEnd(runtime));
+    snapshot = try workloadProfileSnapshot(runtime);
+    try std.testing.expectEqual(@as(u8, 0), snapshot.active);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(WorkloadRegime.speculative_verify)), snapshot.regime);
+    try std.testing.expect(snapshot.eligibleForSelection());
+    try std.testing.expectEqual(@as(usize, 0), snapshot.observedEntries().len);
+}
+
+test "Metal workload profile captures device and host-provider quant signatures" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const generated_disable_env = "TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT";
+    const generated_enable_env = "TERMITE_METAL_ENABLE_ANTFLY_GENERATED_QUANT";
+    const q4_0_generated_enable_env = "TERMITE_METAL_ENABLE_ANTFLY_Q4_0_SMALL_BATCH";
+    const original_generated_disable = if (std.c.getenv(generated_disable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    const original_generated_enable = if (std.c.getenv(generated_enable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    const original_q4_0_generated_enable = if (std.c.getenv(q4_0_generated_enable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (original_generated_disable) |value| {
+            _ = setenv(generated_disable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(generated_disable_env);
+        }
+        if (original_generated_enable) |value| {
+            _ = setenv(generated_enable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(generated_enable_env);
+        }
+        if (original_q4_0_generated_enable) |value| {
+            _ = setenv(q4_0_generated_enable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(q4_0_generated_enable_env);
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), setenv(generated_disable_env, "0", 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv(generated_enable_env, "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv(q4_0_generated_enable_env, "1", 1));
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const rows: usize = 2;
+    const in_dim: usize = 128;
+    const out_dim: usize = 17;
+    const values_per_block: usize = 32;
+    const bytes_per_block: usize = 18;
+    const weight_row_bytes = (in_dim / values_per_block) * bytes_per_block;
+    var weight_raw: [out_dim * weight_row_bytes]u8 = undefined;
+    var dense_row: [in_dim]f32 = undefined;
+    for (0..out_dim) |row| {
+        for (&dense_row, 0..) |*value, col| {
+            const signed = @as(i32, @intCast((row * 17 + col * 11) % 101)) - 50;
+            value.* = @as(f32, @floatFromInt(signed)) / 73.0;
+        }
+        for (0..in_dim / values_per_block) |block| {
+            quant_codec.quantizeQ4_0Block(
+                dense_row[block * values_per_block ..][0..values_per_block],
+                weight_raw[row * weight_row_bytes + block * bytes_per_block ..][0..bytes_per_block],
+            );
+        }
+    }
+
+    const shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
+    const storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = &weight_raw,
+        .shape = &shape,
+        .raw_owned = false,
+        .allocator = std.testing.allocator,
+    };
+    const bias_data = [_]f32{0.0} ** out_dim;
+    var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(out_dim)});
+    defer bias.deinit();
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    var stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .weight = dummy_weight,
+        .bias = bias,
+        .quantized_storage = @as(?*const QuantizedStorage, &storage),
+        .slot = 0,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .retain_dense_fallback = false,
+    }, &stats));
+
+    var input_data: [rows * in_dim]f32 = undefined;
+    for (&input_data, 0..) |*value, index| {
+        const signed = @as(i32, @intCast((index * 19 + 3) % 107)) - 53;
+        value.* = @as(f32, @floatFromInt(signed)) / 89.0;
+    }
+    var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ @intCast(rows), @intCast(in_dim) });
+    defer input.deinit();
+
+    try workloadProfileBegin(runtime, .encoder);
+    var profile_active = true;
+    defer if (profile_active) workloadProfileEnd(runtime) catch {};
+    var output = (try decoderRuntimeApplyLinear(&provider, .{
+        .slot = 0,
+        .input = input,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    defer output.deinit();
+
+    const actual = try tensorHostSlice(&output);
+    try workloadProfileEnd(runtime);
+    profile_active = false;
+
+    var weight_host: [out_dim * in_dim]f32 = undefined;
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, &weight_raw, &weight_host);
+    var expected: [rows * out_dim]f32 = undefined;
+    native.sgemmTransBSync(rows, out_dim, in_dim, 1.0, &input_data, &weight_host, 0.0, &expected);
+    for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 5e-3);
+
+    var snapshot = try workloadProfileSnapshot(runtime);
+    try std.testing.expect(snapshot.eligibleForSelection());
+    try std.testing.expectEqual(@as(u32, 1), snapshot.entry_count);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.observedEntries().len);
+    // This isolated linear dispatch does not open a model frame. Frame timing
+    // is therefore either absent as a 0/0 pair or present as a nonzero pair.
+    try std.testing.expectEqual(snapshot.profiled_frame_count == 0, snapshot.whole_frame_gpu_nanos == 0);
+
+    const entry = snapshot.entries[0];
+    try std.testing.expectEqual(@as(u8, @intFromEnum(WorkloadImplementation.bundled)), entry.implementation);
+    try std.testing.expectEqual(@as(u64, 1), entry.call_count);
+    try std.testing.expectEqual(@as(u64, rows), entry.rows);
+    try std.testing.expectEqual(@as(u64, in_dim), entry.in_dim);
+    try std.testing.expectEqual(@as(u64, out_dim), entry.out_dim);
+    try std.testing.expectEqual(@as(u32, 6), entry.format);
+    try std.testing.expectEqual(@as(u8, 2), entry.dispatch);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(WorkloadRegime.encoder)), entry.regime);
+    try std.testing.expectEqual(@as(u64, rows * in_dim * out_dim), entry.macs);
+    try std.testing.expectEqual(
+        @as(u64, rows * in_dim * @sizeOf(f32) + out_dim * weight_row_bytes + rows * out_dim * @sizeOf(f32)),
+        entry.logical_bytes,
+    );
+
+    try calibrateFirstMetalTuningSlice(std.testing.allocator, runtime, &snapshot);
+    try std.testing.expectEqual(@as(u8, 1), snapshot.entries[0].calibrated);
+    try std.testing.expect(snapshot.entries[0].estimated_gpu_nanos > 0);
+
+    const selection = try selectFirstMetalTuningSignatures(&snapshot);
+    try std.testing.expectEqual(@as(u8, 1), selection.count);
+    try std.testing.expectEqualSlices(u16, &.{0}, selection.selectedIndices());
+    try std.testing.expect(selection.reached_target);
+    try std.testing.expectEqual(selection.eligible_estimated_gpu_nanos, selection.selected_estimated_gpu_nanos);
+
+    var exported = try workloadProfileExportAlloc(std.testing.allocator, snapshot, &provider.jit_scope);
+    defer exported.deinit();
+    const report = exported.report(.{ .batch = rows });
+    try kernel_jit_profile_output.validateReport(report);
+    try std.testing.expectEqualStrings("q4_0", report.entries[0].quant_format);
+    try std.testing.expectEqualStrings("small_batch", report.entries[0].dispatch);
+    try std.testing.expect(report.entries[0].calibrated);
+
+    try workloadProfileBegin(runtime, .encoder);
+    profile_active = true;
+    // A rejected nested capture must not overwrite the saved generated-route
+    // state that the outer capture restores below.
+    try std.testing.expectError(error.WorkloadProfileUnavailable, workloadProfileBegin(runtime, .encoder));
+    var host_output: [rows * out_dim]f32 = undefined;
+    for (0..2) |_| {
+        try std.testing.expect(try tryRawProviderQuantizedLinearHost(
+            &provider,
+            &storage,
+            &input_data,
+            rows,
+            in_dim,
+            out_dim,
+            &host_output,
+        ));
+    }
+    try workloadProfileEnd(runtime);
+    profile_active = false;
+    for (expected, host_output) |want, got| try std.testing.expectApproxEqAbs(want, got, 5e-3);
+    const host_snapshot = try workloadProfileSnapshot(runtime);
+    try std.testing.expect(host_snapshot.eligibleForSelection());
+    try std.testing.expectEqual(@as(u64, 0), host_snapshot.dropped_signatures);
+    try std.testing.expectEqual(@as(u64, 0), host_snapshot.dropped_dispatches);
+    try std.testing.expectEqual(@as(u32, 1), host_snapshot.entry_count);
+    try std.testing.expectEqual(@as(u64, 2), host_snapshot.entries[0].call_count);
+    try std.testing.expectEqual(@as(u32, 6), host_snapshot.entries[0].format);
+    try std.testing.expectEqual(@as(u64, rows), host_snapshot.entries[0].rows);
+    try std.testing.expectEqual(@as(u64, in_dim), host_snapshot.entries[0].in_dim);
+    try std.testing.expectEqual(@as(u64, out_dim), host_snapshot.entries[0].out_dim);
+    try std.testing.expectEqual(workloadProfileDispatchId("small_batch").?, host_snapshot.entries[0].dispatch);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(WorkloadImplementation.bundled)), host_snapshot.entries[0].implementation);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(WorkloadRegime.encoder)), host_snapshot.entries[0].regime);
+
+    const generated_before = runtimeMemorySnapshot(runtime);
+    var generated_output = (try decoderRuntimeApplyLinear(&provider, .{
+        .slot = 0,
+        .input = input,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    defer generated_output.deinit();
+    const generated_actual = try tensorHostSlice(&generated_output);
+    for (expected, generated_actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 5e-3);
+    const generated_after = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(
+        quant_matmul.generatedQuantDispatchCount(
+            &generated_before.antfly_generated_dispatch_counts,
+            .q4_0,
+            .none,
+        ) + 1,
+        quant_matmul.generatedQuantDispatchCount(
+            &generated_after.antfly_generated_dispatch_counts,
+            .q4_0,
+            .none,
+        ),
+    );
+
+    const q4_k_in_dim: usize = 256;
+    var q4_k_dense: [out_dim * q4_k_in_dim]f32 = undefined;
+    fillMetalJitFixture(&q4_k_dense, 7, 23, 11, 16.0, 91);
+    const q4_k_raw = try quant_codec.quantizeQ4_KFromF32(std.testing.allocator, &q4_k_dense);
+    defer std.testing.allocator.free(q4_k_raw);
+    const q4_k_shape = [_]i64{ @intCast(out_dim), @intCast(q4_k_in_dim) };
+    const q4_k_storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_K },
+        .raw_bytes = q4_k_raw,
+        .shape = &q4_k_shape,
+        .raw_owned = false,
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .weight = dummy_weight,
+        .bias = bias,
+        .quantized_storage = @as(?*const QuantizedStorage, &q4_k_storage),
+        .slot = 1,
+        .in_dim = q4_k_in_dim,
+        .out_dim = out_dim,
+        .retain_dense_fallback = false,
+    }, &stats));
+    var q4_k_input_data: [rows * q4_k_in_dim]f32 = undefined;
+    fillMetalJitFixture(&q4_k_input_data, 5, 19, 9, 48.0, 17);
+    var q4_k_input = try testDeviceTensorFromSlice(runtime, &q4_k_input_data, &[_]i32{ @intCast(rows), @intCast(q4_k_in_dim) });
+    defer q4_k_input.deinit();
+
+    try workloadProfileBegin(runtime, .encoder);
+    profile_active = true;
+    var q4_k_output = (try decoderRuntimeApplyLinear(&provider, .{
+        .slot = 1,
+        .input = q4_k_input,
+        .in_dim = q4_k_in_dim,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    defer q4_k_output.deinit();
+    try workloadProfileEnd(runtime);
+    profile_active = false;
+    var q4_k_snapshot = try workloadProfileSnapshot(runtime);
+    try std.testing.expectEqual(@as(u32, 1), q4_k_snapshot.entry_count);
+    try std.testing.expectEqual(@as(u64, 1), q4_k_snapshot.entries[0].call_count);
+    try std.testing.expectEqual(workloadProfileQuantFormatId("q4_k").?, q4_k_snapshot.entries[0].format);
+    try std.testing.expectEqual(workloadProfileDispatchId("scalar").?, q4_k_snapshot.entries[0].dispatch);
+    try std.testing.expect(workloadProfileEntryInFirstMetalSlice(q4_k_snapshot.entries[0]));
+    try calibrateFirstMetalTuningSlice(std.testing.allocator, runtime, &q4_k_snapshot);
+    try std.testing.expectEqual(@as(u8, 1), q4_k_snapshot.entries[0].calibrated);
+
+    try workloadProfileBegin(runtime, .encoder);
+    profile_active = true;
+    var q4_k_host_output: [rows * out_dim]f32 = undefined;
+    for (0..2) |_| {
+        try std.testing.expect(try tryRawProviderQuantizedLinearHost(
+            &provider,
+            &q4_k_storage,
+            &q4_k_input_data,
+            rows,
+            q4_k_in_dim,
+            out_dim,
+            &q4_k_host_output,
+        ));
+    }
+    try workloadProfileEnd(runtime);
+    profile_active = false;
+    const q4_k_host_snapshot = try workloadProfileSnapshot(runtime);
+    try std.testing.expect(q4_k_host_snapshot.eligibleForSelection());
+    try std.testing.expectEqual(@as(u64, 0), q4_k_host_snapshot.dropped_signatures);
+    try std.testing.expectEqual(@as(u64, 0), q4_k_host_snapshot.dropped_dispatches);
+    try std.testing.expectEqual(@as(u32, 1), q4_k_host_snapshot.entry_count);
+    try std.testing.expectEqual(@as(u64, 2), q4_k_host_snapshot.entries[0].call_count);
+    try std.testing.expectEqual(workloadProfileQuantFormatId("q4_k").?, q4_k_host_snapshot.entries[0].format);
+    try std.testing.expectEqual(@as(u64, rows), q4_k_host_snapshot.entries[0].rows);
+    try std.testing.expectEqual(@as(u64, q4_k_in_dim), q4_k_host_snapshot.entries[0].in_dim);
+    try std.testing.expectEqual(@as(u64, out_dim), q4_k_host_snapshot.entries[0].out_dim);
+    try std.testing.expectEqual(workloadProfileDispatchId("scalar").?, q4_k_host_snapshot.entries[0].dispatch);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(WorkloadImplementation.bundled)), q4_k_host_snapshot.entries[0].implementation);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(WorkloadRegime.encoder)), q4_k_host_snapshot.entries[0].regime);
+}
+
+test "Metal workload signature selection enforces calibrated 90 2 5 policy" {
+    try std.testing.expectEqual(@as(u64, 90), workload_selection_target_percent);
+    try std.testing.expectEqual(@as(u64, 2), workload_selection_minimum_percent);
+    try std.testing.expectEqual(@as(usize, 5), workload_selection_maximum_signatures);
+    try std.testing.expectEqual(
+        @as(usize, kernel_jit_profile_output.maximum_tuning_signatures),
+        workload_tuning_maximum_winners,
+    );
+
+    var snapshot: RawWorkloadProfileSnapshot = .{
+        .entry_count = 6,
+        .complete = 1,
+    };
+    const costs = [_]u64{ 50, 30, 15, 3, 2 };
+    for (costs, 0..) |cost, index| {
+        snapshot.entries[index] = .{
+            .hash = index + 1,
+            .call_count = 1,
+            .rows = 2 + index % 7,
+            .in_dim = 1024,
+            .out_dim = 2048 + index,
+            .format = if (index % 2 == 0) 6 else 8,
+            .dispatch = 0,
+            .input_encoding = 0,
+            .output_encoding = 0,
+            .epilogue = 0,
+            .implementation = @intFromEnum(WorkloadImplementation.bundled),
+            .regime = @intFromEnum(WorkloadRegime.encoder),
+            .occupied = 1,
+        };
+        try workloadProfileApplyCalibration(&snapshot, index, cost);
+    }
+    // A larger but uncalibrated entry must never influence selection.
+    snapshot.entries[5] = .{
+        .hash = 99,
+        .call_count = 1,
+        .rows = 4,
+        .in_dim = 4096,
+        .out_dim = 4096,
+        .format = 8,
+        .implementation = @intFromEnum(WorkloadImplementation.bundled),
+        .regime = @intFromEnum(WorkloadRegime.encoder),
+        .occupied = 1,
+    };
+
+    const selection = try selectFirstMetalTuningSignatures(&snapshot);
+    try std.testing.expectEqual(@as(u64, 100), selection.eligible_estimated_gpu_nanos);
+    try std.testing.expectEqual(@as(u64, 95), selection.selected_estimated_gpu_nanos);
+    try std.testing.expectEqual(@as(u8, 3), selection.count);
+    try std.testing.expectEqualSlices(u16, &.{ 0, 1, 2 }, selection.selectedIndices());
+    try std.testing.expect(selection.reached_target);
+
+    snapshot.complete = 0;
+    try std.testing.expectError(error.IncompleteWorkloadProfile, selectFirstMetalTuningSignatures(&snapshot));
+}
+
+test "Metal workload signature selection includes two percent excludes below and caps five" {
+    var cutoff_snapshot: RawWorkloadProfileSnapshot = .{
+        .entry_count = 30,
+        .complete = 1,
+    };
+    for (0..cutoff_snapshot.entry_count) |index| {
+        const entry = &cutoff_snapshot.entries[index];
+        entry.* = .{
+            .hash = index + 1,
+            .call_count = 1,
+            .rows = 2,
+            .in_dim = 1024,
+            .out_dim = 2048 + index,
+            .format = 6,
+            .input_encoding = 0,
+            .output_encoding = 0,
+            .epilogue = 0,
+            .implementation = @intFromEnum(WorkloadImplementation.bundled),
+            .regime = @intFromEnum(WorkloadRegime.encoder),
+            .occupied = 1,
+        };
+        try workloadProfileApplyCalibration(&cutoff_snapshot, index, if (index == 0) 70 else if (index == 1) 2 else 1);
+    }
+    const cutoff = try selectFirstMetalTuningSignatures(&cutoff_snapshot);
+    try std.testing.expectEqual(@as(u64, 100), cutoff.eligible_estimated_gpu_nanos);
+    try std.testing.expectEqual(@as(u64, 72), cutoff.selected_estimated_gpu_nanos);
+    try std.testing.expectEqualSlices(u16, &.{ 0, 1 }, cutoff.selectedIndices());
+    try std.testing.expect(!cutoff.reached_target);
+
+    var cap_snapshot: RawWorkloadProfileSnapshot = .{
+        .entry_count = 10,
+        .complete = 1,
+    };
+    for (0..cap_snapshot.entry_count) |index| {
+        const entry = &cap_snapshot.entries[index];
+        entry.* = .{
+            .hash = index + 1,
+            .call_count = 1,
+            .rows = 2,
+            .in_dim = 1024,
+            .out_dim = 2048 + index,
+            .format = 6,
+            .input_encoding = 0,
+            .output_encoding = 0,
+            .epilogue = 0,
+            .implementation = @intFromEnum(WorkloadImplementation.bundled),
+            .regime = @intFromEnum(WorkloadRegime.encoder),
+            .occupied = 1,
+        };
+        try workloadProfileApplyCalibration(&cap_snapshot, index, 10);
+    }
+    const capped = try selectFirstMetalTuningSignatures(&cap_snapshot);
+    try std.testing.expectEqual(@as(u8, 5), capped.count);
+    try std.testing.expectEqual(@as(u64, 50), capped.selected_estimated_gpu_nanos);
+    try std.testing.expect(!capped.reached_target);
+}
+
+test "Metal qualified coverage backfills within bounded candidate pool" {
+    var snapshot: RawWorkloadProfileSnapshot = .{
+        .entry_count = 6,
+        .complete = 1,
+    };
+    const costs = [_]u64{ 50, 20, 9, 8, 8, 1 };
+    for (costs, 0..) |cost, index| {
+        snapshot.entries[index] = .{
+            .hash = index + 1,
+            .call_count = 1,
+            .rows = 2,
+            .in_dim = 1024,
+            .out_dim = 2048 + index,
+            .format = 6,
+            .dispatch = 0,
+            .input_encoding = 0,
+            .output_encoding = 0,
+            .epilogue = 0,
+            .implementation = @intFromEnum(WorkloadImplementation.bundled),
+            .regime = @intFromEnum(WorkloadRegime.encoder),
+            .occupied = 1,
+        };
+        try workloadProfileApplyCalibration(&snapshot, index, cost);
+    }
+
+    // The public selector remains the smallest raw-cost prefix.
+    const prefix = try selectFirstMetalTuningSignaturesForRegime(&snapshot, .encoder);
+    try std.testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3 }, prefix.selectedIndices());
+    try std.testing.expectEqual(@as(u64, 87), prefix.selected_estimated_gpu_nanos);
+
+    // Tuning gets one bounded backfill candidate beyond that prefix.
+    const candidates = try selectFirstMetalTuningCandidatePoolForRegime(&snapshot, .encoder);
+    try std.testing.expectEqual(@as(u64, 96), candidates.eligible_estimated_gpu_nanos);
+    try std.testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3, 4 }, candidates.selectedIndices());
+    try std.testing.expectEqual(@as(u64, 95), candidates.selected_estimated_gpu_nanos);
+
+    var backfilled = MetalWorkloadQualifiedCoverage{ .eligible_estimated_gpu_nanos = 96 };
+    const fourth_fails_fifth_wins = [_]bool{ true, true, true, false, true };
+    for (candidates.selectedIndices(), fourth_fails_fifth_wins) |index, qualified| {
+        if (backfilled.complete()) break;
+        backfilled.recordAttempt(snapshot.entries[index].estimated_gpu_nanos, qualified);
+    }
+    try std.testing.expect(backfilled.complete());
+    try std.testing.expectEqual(@as(u64, 87), backfilled.targetEstimatedGpuNanos());
+    try std.testing.expectEqual(@as(u64, 87), backfilled.qualified_estimated_gpu_nanos);
+    try std.testing.expectEqual(@as(u8, 5), backfilled.attempted_count);
+    try std.testing.expectEqual(@as(u8, 4), backfilled.winner_count);
+    try std.testing.expectEqual(@as(u8, 1), backfilled.rejected_count);
+
+    var incomplete = MetalWorkloadQualifiedCoverage{ .eligible_estimated_gpu_nanos = 96 };
+    const fourth_and_fifth_fail = [_]bool{ true, true, true, false, false };
+    for (candidates.selectedIndices(), fourth_and_fifth_fail) |index, qualified| {
+        if (incomplete.complete()) break;
+        incomplete.recordAttempt(snapshot.entries[index].estimated_gpu_nanos, qualified);
+    }
+    try std.testing.expect(!incomplete.complete());
+    try std.testing.expectEqual(@as(u64, 79), incomplete.qualified_estimated_gpu_nanos);
+    try std.testing.expectEqual(@as(u8, 5), incomplete.attempted_count);
+    try std.testing.expectEqual(@as(u8, 3), incomplete.winner_count);
+    try std.testing.expectEqual(@as(u8, 2), incomplete.rejected_count);
+}
+
+test "Metal qualified coverage candidate pool is deterministic and capped" {
+    var snapshot: RawWorkloadProfileSnapshot = .{
+        .entry_count = 10,
+        .complete = 1,
+    };
+    for (0..snapshot.entry_count) |index| {
+        snapshot.entries[index] = .{
+            .hash = index + 1,
+            .call_count = 1,
+            .rows = 2,
+            .in_dim = 1024,
+            .out_dim = 2057 - index,
+            .format = 6,
+            .dispatch = 0,
+            .input_encoding = 0,
+            .output_encoding = 0,
+            .epilogue = 0,
+            .implementation = @intFromEnum(WorkloadImplementation.bundled),
+            .regime = @intFromEnum(WorkloadRegime.encoder),
+            .occupied = 1,
+        };
+        try workloadProfileApplyCalibration(&snapshot, index, 10);
+    }
+
+    const first = try selectFirstMetalTuningCandidatePoolForRegime(&snapshot, .encoder);
+    const second = try selectFirstMetalTuningCandidatePoolForRegime(&snapshot, .encoder);
+    try std.testing.expectEqual(@as(u64, 100), first.eligible_estimated_gpu_nanos);
+    try std.testing.expectEqual(@as(u8, workload_selection_maximum_signatures), first.count);
+    try std.testing.expectEqualSlices(u16, &.{ 9, 8, 7, 6, 5 }, first.selectedIndices());
+    try std.testing.expectEqualSlices(u16, first.selectedIndices(), second.selectedIndices());
+    try std.testing.expectEqual(@as(u64, 50), first.selected_estimated_gpu_nanos);
+    try std.testing.expect(!first.reached_target);
+}
+
+test "Metal required weighted tuning needs nonempty fully active winners" {
+    try std.testing.expect(!(MetalWorkloadTuningSummary{}).coverage_complete);
+
+    const complete = MetalWorkloadTuningSummary{
+        .selected_count = 5,
+        .qualified_count = 4,
+        .active_count = 4,
+        .failed_count = 1,
+        .coverage_complete = true,
+    };
+    try validateMetalWorkloadTuningForMode(.required, complete);
+
+    var inactive = complete;
+    inactive.active_count = 3;
+    inactive.activation_failed_count = 1;
+    try std.testing.expectError(
+        error.MetalJitRequiredRouteFailed,
+        validateMetalWorkloadTuningForMode(.required, inactive),
+    );
+    try validateMetalWorkloadTuningForMode(.on, inactive);
+
+    var empty = complete;
+    empty.selected_count = 0;
+    empty.qualified_count = 0;
+    empty.active_count = 0;
+    try std.testing.expectError(
+        error.MetalJitRequiredRouteFailed,
+        validateMetalWorkloadTuningForMode(.required, empty),
+    );
+
+    var incomplete = complete;
+    incomplete.coverage_complete = false;
+    try std.testing.expectError(
+        error.MetalJitRequiredRouteFailed,
+        validateMetalWorkloadTuningForMode(.required, incomplete),
+    );
+}
+
 pub extern fn termite_metal_device_available() c_int;
+pub extern fn termite_metal_copy_device_name(buffer: [*c]u8, capacity: usize) usize;
+pub extern fn termite_metal_copy_compiler_identity(buffer: [*c]u8, capacity: usize) usize;
+pub extern fn termite_metal_device_info_get(info: *MetalDeviceInfo) c_int;
+pub extern fn termite_metal_generated_pipeline_create(
+    source: [*]const u8,
+    source_len: usize,
+    kernel_name: [*:0]const u8,
+    precise_math: c_int,
+    error_buffer: [*c]u8,
+    error_capacity: usize,
+) ?*RawMetalGeneratedPipeline;
+pub extern fn termite_metal_generated_pipeline_info_get(
+    generated: ?*const RawMetalGeneratedPipeline,
+    info: *MetalGeneratedPipelineInfo,
+) c_int;
+pub extern fn termite_metal_jit_route_activation_allowed(slot: c_uint) c_int;
+pub extern fn termite_metal_jit_route_gate_probe(
+    slot: c_uint,
+    env_name: [*:0]const u8,
+    qualified_out_dim: usize,
+    qualified_in_dim: usize,
+    query_out_dim: usize,
+    query_in_dim: usize,
+) c_int;
+pub extern fn termite_metal_q4_k_generic_provider_dispatch_policy_probe(
+    workload_profile_active: c_int,
+    exact_pipeline_count: usize,
+    generated_candidate_enabled: c_int,
+    generated_pipeline_available: c_int,
+    rows: usize,
+) c_int;
+pub extern fn termite_metal_generated_pipeline_install(
+    provider: ?*RawMetalProvider,
+    runtime: ?*RawMetalDecodeRuntime,
+    generated: ?*const RawMetalGeneratedPipeline,
+    slot: c_uint,
+    qualified_shape_pairs: [*c]const usize,
+    qualified_shape_count: usize,
+) c_int;
+pub extern fn termite_metal_generated_pipeline_install_exact(
+    provider: ?*RawMetalProvider,
+    runtime: ?*RawMetalDecodeRuntime,
+    generated: ?*const RawMetalGeneratedPipeline,
+    slot: c_uint,
+    regime: u8,
+    dispatch: u8,
+    rows: c_uint,
+    out_dim: usize,
+    in_dim: usize,
+    threads_per_threadgroup: c_uint,
+    cols_per_threadgroup: c_uint,
+    rows_per_threadgroup: c_uint,
+) c_int;
+pub extern fn termite_metal_generated_pipeline_install_exact_qkv(
+    provider: ?*RawMetalProvider,
+    runtime: ?*RawMetalDecodeRuntime,
+    generated: ?*const RawMetalGeneratedPipeline,
+    slot: c_uint,
+    regime: u8,
+    dispatch: u8,
+    rows: c_uint,
+    out_dim: usize,
+    in_dim: usize,
+) c_int;
+pub extern fn termite_metal_jit_exact_pipeline_lookup_probe(
+    slot: c_uint,
+    installed_regime: u8,
+    installed_dispatch: u8,
+    installed_rows: usize,
+    installed_out_dim: usize,
+    installed_in_dim: usize,
+    query_regime: u8,
+    query_dispatch: u8,
+    query_rows: usize,
+    query_out_dim: usize,
+    query_in_dim: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_jit_exact_dispatch_stats_snapshot(
+    runtime: ?*RawMetalDecodeRuntime,
+    stats: *RawMetalJitExactDispatchStats,
+) c_int;
+pub extern fn termite_metal_decode_runtime_jit_exact_dispatch_stats_reset(
+    runtime: ?*RawMetalDecodeRuntime,
+) c_int;
+pub extern fn termite_metal_jit_exact_dispatch_stats_probe(
+    slot: c_uint,
+    before_reset: *RawMetalJitExactDispatchStats,
+    after_reset: *RawMetalJitExactDispatchStats,
+) c_int;
+pub extern fn termite_metal_generated_pipeline_destroy(generated: ?*RawMetalGeneratedPipeline) void;
+pub extern fn termite_metal_run_jit_quant_route_check(
+    provider: ?*RawMetalProvider,
+    runtime: ?*RawMetalDecodeRuntime,
+    generated: ?*const RawMetalGeneratedPipeline,
+    format: c_uint,
+    implementation: c_uint,
+    input: [*]const f32,
+    input_count: usize,
+    weight: [*]const u8,
+    weight_count: usize,
+    output: [*]f32,
+    output_count: usize,
+    rows: c_uint,
+    in_dim: c_uint,
+    out_dim: c_uint,
+    threads_per_threadgroup: c_uint,
+    cols_per_threadgroup: c_uint,
+    rows_per_threadgroup: c_uint,
+    warmup_iters: c_uint,
+    measure_iters: c_uint,
+    elapsed_nanos: *u64,
+) c_int;
+pub extern fn termite_metal_run_jit_quant_route_paired_measure(
+    provider: ?*RawMetalProvider,
+    runtime: ?*RawMetalDecodeRuntime,
+    generated: ?*const RawMetalGeneratedPipeline,
+    format: c_uint,
+    input: [*]const f32,
+    input_count: usize,
+    weight: [*]const u8,
+    weight_count: usize,
+    baseline_output: [*]f32,
+    candidate_output: [*]f32,
+    output_count: usize,
+    rows: c_uint,
+    in_dim: c_uint,
+    out_dim: c_uint,
+    threads_per_threadgroup: c_uint,
+    cols_per_threadgroup: c_uint,
+    rows_per_threadgroup: c_uint,
+    warmup_iters: c_uint,
+    measure_iters: c_uint,
+    baseline_first: c_uint,
+    baseline_elapsed_nanos: *u64,
+    candidate_elapsed_nanos: *u64,
+) c_int;
+pub extern fn termite_metal_calibrate_quant_signature(
+    runtime: ?*RawMetalDecodeRuntime,
+    format: c_uint,
+    input: [*]const f32,
+    input_count: usize,
+    weight: [*]const u8,
+    weight_count: usize,
+    rows: c_uint,
+    in_dim: c_uint,
+    out_dim: c_uint,
+    warmup_iters: c_uint,
+    measure_iters: c_uint,
+    elapsed_nanos: *u64,
+) c_int;
+
+pub const MetalJitQualificationImplementation = enum(c_uint) {
+    baseline,
+    candidate,
+};
+
+pub const MetalJitQualificationMeasurements = struct {
+    correctness_passed: bool,
+    timing_passed: bool = true,
+    aggregate_measured_speedup: ?f64 = null,
+    aggregate_minimum_repeat_speedup: ?f64 = null,
+    max_absolute_error: f64,
+    max_relative_error: f64,
+    baseline_nanos: [kernel_jit.measurement_repeats]u64,
+    candidate_nanos: [kernel_jit.measurement_repeats]u64,
+};
+
+pub const MetalJitQualificationRequest = struct {
+    allocator: std.mem.Allocator,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    scope: *const MetalJitRouteScope,
+    provider: ?*RawMetalProvider,
+    runtime: ?*RawMetalDecodeRuntime,
+    generated: *const RawMetalGeneratedPipeline,
+};
+
+pub const MetalJitQualificationHarness = struct {
+    context: ?*anyopaque = null,
+    qualify_fn: *const fn (
+        context: ?*anyopaque,
+        request: MetalJitQualificationRequest,
+    ) anyerror!MetalJitQualificationMeasurements = liveMetalJitQualification,
+
+    pub fn qualify(
+        self: MetalJitQualificationHarness,
+        request: MetalJitQualificationRequest,
+    ) !MetalJitQualificationMeasurements {
+        return self.qualify_fn(self.context, request);
+    }
+};
+
+pub const MetalJitOptions = struct {
+    config: kernel_jit.Config = .{},
+    load_context: kernel_jit.LoadContext = .dynamic,
+    // Callers must derive model scope explicitly. A legacy/direct constructor
+    // remains dormant instead of silently treating the global registry as the
+    // loaded model's required surface.
+    scope: MetalJitRouteScope = MetalJitRouteScope.none(),
+    qualification_harness: MetalJitQualificationHarness = .{},
+};
+
+pub fn validateMetalJitLoadContext(config: kernel_jit.Config, load_context: kernel_jit.LoadContext) !void {
+    if (!load_context.allowsQualification() and
+        (config.mode.failClosed() or config.qualified_profile_path != null or config.profile_capture_only))
+    {
+        return error.KernelJitRequiredDynamicLoad;
+    }
+}
+
+test "Metal qualified profiles and required mode reject dynamic loads" {
+    try validateMetalJitLoadContext(.{ .mode = .on }, .dynamic);
+    try std.testing.expectError(
+        error.KernelJitRequiredDynamicLoad,
+        validateMetalJitLoadContext(.{
+            .mode = .on,
+            .qualified_profile_path = "/tmp/qualified-profile.json",
+        }, .dynamic),
+    );
+    try std.testing.expectError(
+        error.KernelJitRequiredDynamicLoad,
+        validateMetalJitLoadContext(.{ .mode = .required }, .dynamic),
+    );
+    try validateMetalJitLoadContext(.{
+        .mode = .on,
+        .qualified_profile_path = "/tmp/qualified-profile.json",
+    }, .startup_preload);
+}
+
+const MetalJitQualificationOutcome = enum(u8) {
+    qualified,
+    active,
+    rejected,
+};
+
+const MetalJitQualificationJob = struct {
+    session: *MetalJitSession,
+    raw_provider: ?*RawMetalProvider,
+    raw_decode_runtime: ?*RawMetalDecodeRuntime,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    route: MetalJitRoute,
+    key: kernel_jit.ArtifactKey,
+    generated: *RawMetalGeneratedPipeline,
+    mode: kernel_jit.Mode,
+    outcome: MetalJitQualificationOutcome = .rejected,
+};
+
+/// Heap-stable cache/harness state retained by the provider until teardown.
+/// All compilation and qualification is synchronous during startup preload.
+pub const MetalJitSession = struct {
+    allocator: std.mem.Allocator,
+    cache: ?kernel_jit.ArtifactCache = null,
+    qualification_cache_persistent: bool = false,
+    qualification_harness: MetalJitQualificationHarness,
+    scope: MetalJitRouteScope,
+};
+
+pub fn metalJitHasPersistentQualificationCache(owner: anytype) bool {
+    const session = owner.jit_session orelse return false;
+    return session.cache != null and session.qualification_cache_persistent;
+}
+
+pub fn destroyMetalJitSession(session: ?*MetalJitSession) void {
+    const value = session orelse return;
+    if (value.cache) |*cache| cache.deinit();
+    const allocator = value.allocator;
+    allocator.destroy(value);
+}
+
+fn metalJitMonotonicNowNs() u128 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return 0,
+    }
+}
+
+fn metalJitCFormat(format: quant_matmul.Format) ?c_uint {
+    return switch (format) {
+        .q2_k => 4,
+        .q3_k => 5,
+        .q4_0 => 6,
+        .q4_k => 8,
+        .q5_k => 11,
+        .q6_k => 12,
+        .q8_0 => 13,
+        .q8_k => 15,
+        else => null,
+    };
+}
+
+fn metalJitQuantizeFixture(
+    allocator: std.mem.Allocator,
+    format: quant_matmul.Format,
+    dense_weight: []const f32,
+) ![]u8 {
+    return switch (format) {
+        .q2_k => quant_codec.quantizeQ2_KFromF32(allocator, dense_weight),
+        .q3_k => quant_codec.quantizeQ3_KFromF32(allocator, dense_weight),
+        .q4_0 => quant_codec.quantizeQ4_0FromF32(allocator, dense_weight),
+        .q4_k => quant_codec.quantizeQ4_KFromF32(allocator, dense_weight),
+        .q5_k => quant_codec.quantizeQ5_KFromF32(allocator, dense_weight),
+        .q6_k => quant_codec.quantizeQ6_KFromF32(allocator, dense_weight),
+        .q8_0 => quant_codec.quantizeQ8_0FromF32(allocator, dense_weight),
+        .q8_k => quant_codec.quantizeQ8_KFromF32(allocator, dense_weight),
+        else => error.UnsupportedMetalJitQualificationFormat,
+    };
+}
+
+fn runMetalJitQuantFixture(
+    request: MetalJitQualificationRequest,
+    format: quant_matmul.Format,
+    implementation: MetalJitQualificationImplementation,
+    input: []const f32,
+    weight: []const u8,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    threads: usize,
+    cols: usize,
+    rows_per_threadgroup: usize,
+    warmup_iters: u32,
+    measure_iters: u32,
+) !u64 {
+    var elapsed_nanos: u64 = 0;
+    const rc = termite_metal_run_jit_quant_route_check(
+        request.provider,
+        request.runtime,
+        request.generated,
+        metalJitCFormat(format) orelse return error.UnsupportedMetalJitQualificationFormat,
+        @intFromEnum(implementation),
+        input.ptr,
+        input.len,
+        weight.ptr,
+        weight.len,
+        output.ptr,
+        output.len,
+        @intCast(rows),
+        @intCast(in_dim),
+        @intCast(out_dim),
+        @intCast(threads),
+        @intCast(cols),
+        @intCast(rows_per_threadgroup),
+        warmup_iters,
+        measure_iters,
+        &elapsed_nanos,
+    );
+    if (rc != 0) {
+        std.log.warn("Metal runtime JIT qualification dispatch failed for {s}: rc={d}", .{ request.artifact.kernel_id, rc });
+        return error.MetalJitQualificationDispatchFailed;
+    }
+    if (elapsed_nanos == 0) return error.InvalidKernelJitMeasurements;
+    return elapsed_nanos;
+}
+
+const MetalJitPairedNanos = struct {
+    baseline: u64,
+    candidate: u64,
+};
+
+fn runMetalJitPairedQuantFixture(
+    request: MetalJitQualificationRequest,
+    format: quant_matmul.Format,
+    input: []const f32,
+    weight: []const u8,
+    baseline_output: []f32,
+    candidate_output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    threads: usize,
+    cols: usize,
+    rows_per_threadgroup: usize,
+    warmup_iters: u32,
+    measure_iters: u32,
+    baseline_first: bool,
+) !MetalJitPairedNanos {
+    if (baseline_output.len != candidate_output.len) return error.InvalidMetalJitQualificationOutput;
+    var result = MetalJitPairedNanos{ .baseline = 0, .candidate = 0 };
+    const rc = termite_metal_run_jit_quant_route_paired_measure(
+        request.provider,
+        request.runtime,
+        request.generated,
+        metalJitCFormat(format) orelse return error.UnsupportedMetalJitQualificationFormat,
+        input.ptr,
+        input.len,
+        weight.ptr,
+        weight.len,
+        baseline_output.ptr,
+        candidate_output.ptr,
+        baseline_output.len,
+        @intCast(rows),
+        @intCast(in_dim),
+        @intCast(out_dim),
+        @intCast(threads),
+        @intCast(cols),
+        @intCast(rows_per_threadgroup),
+        warmup_iters,
+        measure_iters,
+        @intFromBool(baseline_first),
+        &result.baseline,
+        &result.candidate,
+    );
+    if (rc != 0) {
+        std.log.warn("Metal runtime JIT paired qualification dispatch failed for {s}: rc={d}", .{ request.artifact.kernel_id, rc });
+        if (rc == -14) return error.MetalJitGpuTimestampsUnavailable;
+        return error.MetalJitQualificationDispatchFailed;
+    }
+    if (result.baseline == 0 or result.candidate == 0) return error.InvalidKernelJitMeasurements;
+    return result;
+}
+
+const MetalJitConformanceShape = struct {
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+};
+
+fn logMetalJitCorrectnessRejection(
+    request: MetalJitQualificationRequest,
+    format: quant_matmul.Format,
+    stage: []const u8,
+    shape: MetalJitConformanceShape,
+    max_absolute_error: f64,
+    max_relative_error: f64,
+) void {
+    std.log.warn(
+        "metal_jit_qualification_rejected backend=metal kernel={s} format={s} stage={s} reason=correctness rows={d} out_dim={d} in_dim={d} measured_speedup=not_measured minimum_repeat_speedup=not_measured required_speedup={d:.2} max_absolute_error={d:.7} max_relative_error={d:.7}",
+        .{
+            request.artifact.kernel_id,
+            @tagName(format),
+            stage,
+            shape.rows,
+            shape.out_dim,
+            shape.in_dim,
+            kernel_jit.minimum_speedup,
+            max_absolute_error,
+            max_relative_error,
+        },
+    );
+}
+
+fn logMetalJitTimingRejection(
+    request: MetalJitQualificationRequest,
+    format: quant_matmul.Format,
+    shape: MetalJitConformanceShape,
+    evidence: kernel_jit.CandidateEvidence,
+    rejection_error: anyerror,
+    max_absolute_error: f64,
+    max_relative_error: f64,
+) void {
+    const reason = if (evidence.measured_speedup < kernel_jit.minimum_speedup)
+        "median_speedup"
+    else if (evidence.minimum_repeat_speedup < kernel_jit.minimum_speedup)
+        "worst_repeat_speedup"
+    else
+        @errorName(rejection_error);
+    std.log.warn(
+        "metal_jit_qualification_rejected backend=metal kernel={s} format={s} stage=observed reason={s} rows={d} out_dim={d} in_dim={d} measured_speedup={d:.6} minimum_repeat_speedup={d:.6} required_speedup={d:.2} max_absolute_error={d:.7} max_relative_error={d:.7}",
+        .{
+            request.artifact.kernel_id,
+            @tagName(format),
+            reason,
+            shape.rows,
+            shape.out_dim,
+            shape.in_dim,
+            evidence.measured_speedup,
+            evidence.minimum_repeat_speedup,
+            kernel_jit.minimum_speedup,
+            max_absolute_error,
+            max_relative_error,
+        },
+    );
+}
+
+fn metalJitFixtureBytes(
+    format: quant_matmul.Format,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !usize {
+    if (rows == 0 or in_dim == 0 or out_dim == 0) return error.InvalidMetalJitFixtureShape;
+    const values_per_block = format.valuesPerBlock() orelse return error.UnsupportedMetalJitQualificationFormat;
+    const bytes_per_block = format.bytesPerBlock() orelse return error.UnsupportedMetalJitQualificationFormat;
+    if (values_per_block == 0 or bytes_per_block == 0 or in_dim % values_per_block != 0) {
+        return error.InvalidMetalJitFixtureShape;
+    }
+    const blocks_per_row = in_dim / values_per_block;
+    const weight_blocks = try std.math.mul(usize, out_dim, blocks_per_row);
+    const weight_bytes = try std.math.mul(usize, weight_blocks, bytes_per_block);
+    const input_elements = try std.math.mul(usize, rows, in_dim);
+    const input_bytes = try std.math.mul(usize, input_elements, @sizeOf(f32));
+    const output_elements = try std.math.mul(usize, rows, out_dim);
+    const one_output_bytes = try std.math.mul(usize, output_elements, @sizeOf(f32));
+    // Observed-shape correctness samples output columns with one dequantized
+    // f32 weight row; it never materializes the full dense matrix. The peak
+    // GPU phase keeps host W+I+2O while the paired C harness owns shared Metal
+    // W+I plus distinct baseline/candidate outputs.
+    // Account both phases with checked arithmetic, then reserve headroom for
+    // allocator/command-buffer overhead.
+    const two_weight_bytes = try std.math.mul(usize, weight_bytes, 2);
+    const two_input_bytes = try std.math.mul(usize, input_bytes, 2);
+    const four_output_bytes = try std.math.mul(usize, one_output_bytes, 4);
+    const gpu_peak_without_margin = try std.math.add(
+        usize,
+        try std.math.add(usize, two_weight_bytes, two_input_bytes),
+        four_output_bytes,
+    );
+    const two_output_bytes = try std.math.mul(usize, one_output_bytes, 2);
+    const sampled_weight_row_bytes = try std.math.mul(usize, in_dim, @sizeOf(f32));
+    const cpu_peak_without_margin = try std.math.add(
+        usize,
+        try std.math.add(
+            usize,
+            try std.math.add(usize, weight_bytes, input_bytes),
+            two_output_bytes,
+        ),
+        sampled_weight_row_bytes,
+    );
+    const peak_bytes = @max(gpu_peak_without_margin, cpu_peak_without_margin);
+    const admitted_bytes = try std.math.add(usize, peak_bytes, metal_jit_fixture_safety_margin_bytes);
+    if (admitted_bytes > metal_jit_max_fixture_bytes) return error.MetalJitFixtureResourceLimit;
+    return admitted_bytes;
+}
+
+fn validateMetalJitFixtureForDevice(
+    format: quant_matmul.Format,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    device: MetalDeviceInfo,
+) !void {
+    _ = try metalJitFixtureBytes(format, rows, in_dim, out_dim);
+    const values_per_block = format.valuesPerBlock().?;
+    const bytes_per_block = format.bytesPerBlock().?;
+    const input_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, in_dim), @sizeOf(f32));
+    const weight_bytes = try std.math.mul(
+        usize,
+        try std.math.mul(usize, out_dim, in_dim / values_per_block),
+        bytes_per_block,
+    );
+    const output_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, out_dim), @sizeOf(f32));
+    const max_buffer_length = std.math.cast(usize, device.max_buffer_length) orelse std.math.maxInt(usize);
+    if (max_buffer_length == 0 or input_bytes > max_buffer_length or weight_bytes > max_buffer_length or output_bytes > max_buffer_length) {
+        return error.MetalJitFixtureBufferLimitExceeded;
+    }
+}
+
+fn metalJitPatternWeight(
+    allocator: std.mem.Allocator,
+    format: quant_matmul.Format,
+    in_dim: usize,
+    out_dim: usize,
+    seed: usize,
+) ![]u8 {
+    _ = try metalJitFixtureBytes(format, 8, in_dim, out_dim);
+    const values_per_block = format.valuesPerBlock().?;
+    const bytes_per_block = format.bytesPerBlock().?;
+    const block_count = try std.math.mul(usize, out_dim, in_dim / values_per_block);
+    const raw_len = try std.math.mul(usize, block_count, bytes_per_block);
+    const raw = try allocator.alloc(u8, raw_len);
+    errdefer allocator.free(raw);
+    const pattern_count = @min(block_count, @as(usize, 29));
+    const pattern_bank = try allocator.alloc(u8, try std.math.mul(usize, pattern_count, bytes_per_block));
+    defer allocator.free(pattern_bank);
+    const dense_block = try allocator.alloc(f32, values_per_block);
+    defer allocator.free(dense_block);
+    for (0..pattern_count) |pattern_index| {
+        fillMetalJitFixture(dense_block, 7 + pattern_index * 2, 23 + pattern_index % 7, 11, 16.0, seed + pattern_index * 17);
+        const encoded_block = try metalJitQuantizeFixture(allocator, format, dense_block);
+        defer allocator.free(encoded_block);
+        if (encoded_block.len != bytes_per_block) return error.InvalidMetalJitQuantizedBlock;
+        const offset = pattern_index * bytes_per_block;
+        @memcpy(pattern_bank[offset..][0..bytes_per_block], encoded_block);
+    }
+    const blocks_per_row = in_dim / values_per_block;
+    for (0..block_count) |block_index| {
+        const output_row = block_index / blocks_per_row;
+        const local_block = block_index % blocks_per_row;
+        const pattern_index = (local_block * 7 + output_row * 11) % pattern_count;
+        const source_offset = pattern_index * bytes_per_block;
+        const destination_offset = block_index * bytes_per_block;
+        @memcpy(raw[destination_offset..][0..bytes_per_block], pattern_bank[source_offset..][0..bytes_per_block]);
+    }
+    return raw;
+}
+
+fn metalJitMeasureIterations(
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    calibrated_nanos_per_call: ?u64,
+) u32 {
+    const boundedEven = struct {
+        fn apply(raw: u128) u32 {
+            var bounded = @max(@as(u128, 2), @min(@as(u128, metal_jit_max_measure_iters), raw));
+            if (bounded % 2 != 0) bounded = @min(@as(u128, metal_jit_max_measure_iters), bounded + 1);
+            return @intCast(bounded);
+        }
+    }.apply;
+    if (calibrated_nanos_per_call) |per_call| {
+        if (per_call != 0) {
+            const scaled = (@as(u128, metal_jit_measure_target_ns) + per_call - 1) / per_call;
+            return boundedEven(scaled);
+        }
+    }
+    const macs = @as(u128, rows) * @as(u128, in_dim) * @as(u128, out_dim);
+    if (macs == 0) return 2;
+    const scaled = @as(u128, metal_jit_measure_target_macs) / macs;
+    return boundedEven(scaled);
+}
+
+fn metalJitPairedRepeatStartsWithBaseline(repeat: usize) bool {
+    return repeat % 2 == 0;
+}
+
+const metal_jit_conformance_shape_count = 7;
+
+fn metalJitConformanceShapes(format: quant_matmul.Format) ![metal_jit_conformance_shape_count]MetalJitConformanceShape {
+    const values_per_block: usize = switch (format) {
+        .q4_0, .q8_0 => 32,
+        .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k => 256,
+        else => return error.UnsupportedMetalJitQualificationFormat,
+    };
+    const base_in_dim = @max(@as(usize, 512), values_per_block * 2);
+    return .{
+        .{ .rows = 2, .in_dim = base_in_dim, .out_dim = 255 },
+        .{ .rows = 3, .in_dim = base_in_dim + values_per_block, .out_dim = 257 },
+        .{ .rows = 4, .in_dim = base_in_dim * 2, .out_dim = 256 },
+        .{ .rows = 5, .in_dim = base_in_dim, .out_dim = 257 },
+        .{ .rows = 6, .in_dim = base_in_dim + values_per_block, .out_dim = 255 },
+        .{ .rows = 7, .in_dim = base_in_dim * 2, .out_dim = 257 },
+        .{ .rows = 8, .in_dim = base_in_dim + values_per_block, .out_dim = 256 },
+    };
+}
+
+fn metalJitQualificationTolerance(format: quant_matmul.Format) f64 {
+    return if (format == .q2_k or format == .q3_k or format == .q8_k) 0.001 else 0.0005;
+}
+
+fn metalJitObservedQualificationTolerance(format: quant_matmul.Format, rows_per_threadgroup: usize) f64 {
+    // Matrix exact schedules use the FP16-input simdgroup-MMA path.
+    // Keep scalar candidates on the existing strict tolerance.
+    if (rows_per_threadgroup == 40 or rows_per_threadgroup == 64) return switch (format) {
+        .q4_k => 0.002,
+        .q6_k => 0.003,
+        else => metalJitQualificationTolerance(format),
+    };
+    return metalJitQualificationTolerance(format);
+}
+
+fn fillMetalJitFixture(values: []f32, multiplier: usize, modulus: usize, center: i32, divisor: f32, seed: usize) void {
+    for (values, 0..) |*value, index| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast(((index + seed) * multiplier) % modulus)) - center)) / divisor;
+    }
+}
+
+const MetalJitConformanceResult = struct {
+    passed: bool,
+    max_absolute_error: f64,
+    max_relative_error: f64,
+};
+
+fn runMetalJitConformanceShape(
+    request: MetalJitQualificationRequest,
+    format: quant_matmul.Format,
+    shape: MetalJitConformanceShape,
+    threads: usize,
+    cols: usize,
+    seed: usize,
+) !MetalJitConformanceResult {
+    const dense_weight = try request.allocator.alloc(f32, shape.in_dim * shape.out_dim);
+    defer request.allocator.free(dense_weight);
+    fillMetalJitFixture(dense_weight, 7, 23, 11, 16.0, seed);
+    const raw_weight = try metalJitQuantizeFixture(request.allocator, format, dense_weight);
+    defer request.allocator.free(raw_weight);
+    const input = try request.allocator.alloc(f32, shape.rows * shape.in_dim);
+    defer request.allocator.free(input);
+    fillMetalJitFixture(input, 5, 19, 9, 48.0, seed + 3);
+    const expected = try request.allocator.alloc(f32, shape.rows * shape.out_dim);
+    defer request.allocator.free(expected);
+    try quant_kernel_compiler.referenceMatmulNoBias(
+        request.allocator,
+        format,
+        raw_weight,
+        input,
+        shape.rows,
+        shape.in_dim,
+        shape.out_dim,
+        expected,
+    );
+    const baseline_output = try request.allocator.alloc(f32, expected.len);
+    defer request.allocator.free(baseline_output);
+    const candidate_output = try request.allocator.alloc(f32, expected.len);
+    defer request.allocator.free(candidate_output);
+    @memset(baseline_output, 0);
+    @memset(candidate_output, 0);
+    _ = try runMetalJitQuantFixture(request, format, .baseline, input, raw_weight, baseline_output, shape.rows, shape.in_dim, shape.out_dim, threads, cols, 1, 0, 1);
+    _ = try runMetalJitQuantFixture(request, format, .candidate, input, raw_weight, candidate_output, shape.rows, shape.in_dim, shape.out_dim, threads, cols, 1, 0, 1);
+
+    const tolerance = metalJitQualificationTolerance(format);
+    var result = MetalJitConformanceResult{
+        .passed = true,
+        .max_absolute_error = 0,
+        .max_relative_error = 0,
+    };
+    for (expected, baseline_output, candidate_output) |want_f32, baseline_f32, candidate_f32| {
+        const want: f64 = want_f32;
+        const baseline: f64 = baseline_f32;
+        const candidate: f64 = candidate_f32;
+        if (!std.math.isFinite(baseline) or !std.math.isFinite(candidate)) {
+            result.passed = false;
+            continue;
+        }
+        const baseline_diff = @abs(baseline - want);
+        const candidate_diff = @abs(candidate - want);
+        const diff = @max(baseline_diff, candidate_diff);
+        result.max_absolute_error = @max(result.max_absolute_error, diff);
+        result.max_relative_error = @max(result.max_relative_error, diff / @max(@abs(want), 1.0e-6));
+        if (baseline_diff > tolerance or candidate_diff > tolerance) result.passed = false;
+    }
+    return result;
+}
+
+fn metalJitTensorTypeForFormat(format: quant_matmul.Format) ?gguf_tensor_types.TensorType {
+    return switch (format) {
+        .q2_k => .{ .known = .Q2_K },
+        .q3_k => .{ .known = .Q3_K },
+        .q4_0 => .{ .known = .Q4_0 },
+        .q4_k => .{ .known = .Q4_K },
+        .q5_k => .{ .known = .Q5_K },
+        .q6_k => .{ .known = .Q6_K },
+        .q8_0 => .{ .known = .Q8_0 },
+        .q8_k => .{ .known = .Q8_K },
+        else => null,
+    };
+}
+
+/// Validate every generated output against the bundled kernel, then
+/// independently check eight range-spanning output columns against a CPU
+/// oracle without materializing the full f32 weight matrix.
+fn runMetalJitObservedOracle(
+    request: MetalJitQualificationRequest,
+    format: quant_matmul.Format,
+    raw_weight: []const u8,
+    input: []const f32,
+    baseline_output: []const f32,
+    candidate_output: []const f32,
+    shape: MetalJitConformanceShape,
+    rows_per_threadgroup: usize,
+) !MetalJitConformanceResult {
+    const input_len = try std.math.mul(usize, shape.rows, shape.in_dim);
+    const output_len = try std.math.mul(usize, shape.rows, shape.out_dim);
+    if (input.len != input_len or baseline_output.len != output_len or candidate_output.len != output_len) {
+        return error.InvalidMetalJitFixtureShape;
+    }
+    const tensor_type = metalJitTensorTypeForFormat(format) orelse
+        return error.UnsupportedMetalJitQualificationFormat;
+    const weight_row = try request.allocator.alloc(f32, shape.in_dim);
+    defer request.allocator.free(weight_row);
+    const sample_count = @min(shape.out_dim, @as(usize, 8));
+    const tolerance = metalJitObservedQualificationTolerance(format, rows_per_threadgroup);
+    var result = MetalJitConformanceResult{
+        .passed = true,
+        .max_absolute_error = 0,
+        .max_relative_error = 0,
+    };
+    for (baseline_output, candidate_output) |baseline_f32, candidate_f32| {
+        const baseline: f64 = baseline_f32;
+        const candidate: f64 = candidate_f32;
+        if (!std.math.isFinite(baseline) or !std.math.isFinite(candidate)) {
+            result.passed = false;
+            continue;
+        }
+        const diff = @abs(candidate - baseline);
+        result.max_absolute_error = @max(result.max_absolute_error, diff);
+        result.max_relative_error = @max(result.max_relative_error, diff / @max(@abs(baseline), 1.0e-6));
+        if (diff > tolerance) result.passed = false;
+    }
+    for (0..sample_count) |sample_index| {
+        const output_column = if (sample_count == 1)
+            0
+        else
+            @as(usize, @intCast(
+                (@as(u128, sample_index) * @as(u128, shape.out_dim - 1)) /
+                    @as(u128, sample_count - 1),
+            ));
+        try quant_codec.dequantizeRow(tensor_type, raw_weight, shape.in_dim, output_column, weight_row);
+        for (0..shape.rows) |row| {
+            var expected: f32 = 0;
+            const input_row = input[row * shape.in_dim ..][0..shape.in_dim];
+            for (input_row, weight_row) |input_value, weight_value| expected += input_value * weight_value;
+            const output_index = row * shape.out_dim + output_column;
+            const want: f64 = expected;
+            const baseline: f64 = baseline_output[output_index];
+            const candidate: f64 = candidate_output[output_index];
+            if (!std.math.isFinite(want) or !std.math.isFinite(baseline) or !std.math.isFinite(candidate)) {
+                result.passed = false;
+                continue;
+            }
+            const baseline_diff = @abs(baseline - want);
+            const candidate_diff = @abs(candidate - want);
+            const diff = @max(baseline_diff, candidate_diff);
+            result.max_absolute_error = @max(result.max_absolute_error, diff);
+            result.max_relative_error = @max(result.max_relative_error, diff / @max(@abs(want), 1.0e-6));
+            if (baseline_diff > tolerance or candidate_diff > tolerance) result.passed = false;
+        }
+    }
+    return result;
+}
+
+fn runMetalJitObservedShape(
+    request: MetalJitQualificationRequest,
+    format: quant_matmul.Format,
+    shape: MetalJitConformanceShape,
+    threads: usize,
+    cols: usize,
+    rows_per_threadgroup: usize,
+    seed: usize,
+    measure_timing: bool,
+    calibrated_nanos_per_call: ?u64,
+) !MetalJitQualificationMeasurements {
+    _ = try metalJitFixtureBytes(format, shape.rows, shape.in_dim, shape.out_dim);
+    const raw_weight = try metalJitPatternWeight(request.allocator, format, shape.in_dim, shape.out_dim, seed);
+    defer request.allocator.free(raw_weight);
+    const input_len = try std.math.mul(usize, shape.rows, shape.in_dim);
+    const input = try request.allocator.alloc(f32, input_len);
+    defer request.allocator.free(input);
+    fillMetalJitFixture(input, 5, 19, 9, 48.0, seed + 3);
+    const output_len = try std.math.mul(usize, shape.rows, shape.out_dim);
+    const baseline_output = try request.allocator.alloc(f32, output_len);
+    defer request.allocator.free(baseline_output);
+    const candidate_output = try request.allocator.alloc(f32, output_len);
+    defer request.allocator.free(candidate_output);
+    @memset(baseline_output, 0);
+    @memset(candidate_output, 0);
+    _ = try runMetalJitQuantFixture(request, format, .baseline, input, raw_weight, baseline_output, shape.rows, shape.in_dim, shape.out_dim, threads, cols, rows_per_threadgroup, 0, 1);
+    _ = try runMetalJitQuantFixture(request, format, .candidate, input, raw_weight, candidate_output, shape.rows, shape.in_dim, shape.out_dim, threads, cols, rows_per_threadgroup, 0, 1);
+
+    const correctness = try runMetalJitObservedOracle(
+        request,
+        format,
+        raw_weight,
+        input,
+        baseline_output,
+        candidate_output,
+        shape,
+        rows_per_threadgroup,
+    );
+    if (!correctness.passed) return .{
+        .correctness_passed = false,
+        .max_absolute_error = correctness.max_absolute_error,
+        .max_relative_error = correctness.max_relative_error,
+        .baseline_nanos = @splat(0),
+        .candidate_nanos = @splat(0),
+    };
+    if (!measure_timing) {
+        _ = try runMetalJitQuantFixture(
+            request,
+            format,
+            .candidate,
+            input,
+            raw_weight,
+            candidate_output,
+            shape.rows,
+            shape.in_dim,
+            shape.out_dim,
+            threads,
+            cols,
+            rows_per_threadgroup,
+            quant_kernel_compiler.metal_promotion_warmup_repeat_runs,
+            1,
+        );
+        const repeated_correctness = try runMetalJitObservedOracle(
+            request,
+            format,
+            raw_weight,
+            input,
+            baseline_output,
+            candidate_output,
+            shape,
+            rows_per_threadgroup,
+        );
+        return .{
+            .correctness_passed = repeated_correctness.passed,
+            .max_absolute_error = @max(correctness.max_absolute_error, repeated_correctness.max_absolute_error),
+            .max_relative_error = @max(correctness.max_relative_error, repeated_correctness.max_relative_error),
+            .baseline_nanos = @splat(0),
+            .candidate_nanos = @splat(0),
+        };
+    }
+
+    const measure_iters = metalJitMeasureIterations(
+        shape.rows,
+        shape.in_dim,
+        shape.out_dim,
+        calibrated_nanos_per_call,
+    );
+    var baseline_nanos: [kernel_jit.measurement_repeats]u64 = undefined;
+    var candidate_nanos: [kernel_jit.measurement_repeats]u64 = undefined;
+    for (0..kernel_jit.measurement_repeats) |repeat| {
+        const baseline_first = metalJitPairedRepeatStartsWithBaseline(repeat);
+        const measured = try runMetalJitPairedQuantFixture(
+            request,
+            format,
+            input,
+            raw_weight,
+            baseline_output,
+            candidate_output,
+            shape.rows,
+            shape.in_dim,
+            shape.out_dim,
+            threads,
+            cols,
+            rows_per_threadgroup,
+            quant_kernel_compiler.metal_promotion_warmup_repeat_runs,
+            measure_iters,
+            baseline_first,
+        );
+        baseline_nanos[repeat] = measured.baseline;
+        candidate_nanos[repeat] = measured.candidate;
+        std.log.info(
+            "metal_jit_paired_repeat kernel={s} format={s} rows={d} out_dim={d} in_dim={d} seed={d} repeat={d} order={s} warmup_iters={d} measure_iters={d} baseline_nanos={d} candidate_nanos={d}",
+            .{
+                request.artifact.kernel_id,
+                @tagName(format),
+                shape.rows,
+                shape.out_dim,
+                shape.in_dim,
+                seed,
+                repeat,
+                if (baseline_first) "ABBA" else "BAAB",
+                quant_kernel_compiler.metal_promotion_warmup_repeat_runs,
+                measure_iters,
+                measured.baseline,
+                measured.candidate,
+            },
+        );
+    }
+    const post_timing_correctness = try runMetalJitObservedOracle(
+        request,
+        format,
+        raw_weight,
+        input,
+        baseline_output,
+        candidate_output,
+        shape,
+        rows_per_threadgroup,
+    );
+    return .{
+        .correctness_passed = post_timing_correctness.passed,
+        .max_absolute_error = @max(correctness.max_absolute_error, post_timing_correctness.max_absolute_error),
+        .max_relative_error = @max(correctness.max_relative_error, post_timing_correctness.max_relative_error),
+        .baseline_nanos = baseline_nanos,
+        .candidate_nanos = candidate_nanos,
+    };
+}
+
+fn liveMetalJitQualification(
+    _: ?*anyopaque,
+    request: MetalJitQualificationRequest,
+) !MetalJitQualificationMeasurements {
+    const op = request.artifact.matmulOp() orelse return error.UnsupportedMetalJitQualificationOp;
+    if (!request.artifact.production_enabled or op.epilogue != .none or metalJitCFormat(op.format) == null) {
+        return error.UnsupportedMetalJitQualificationOp;
+    }
+    const threads = metalJitRequiredThreads(request.artifact);
+    const cols = quant_kernel_compiler.metalGeneratedColsPerThreadgroup(op.format, op.row_bucket, op.epilogue);
+    var max_absolute_error: f64 = 0;
+    var max_relative_error: f64 = 0;
+    // Correctness covers the full routed row bucket and representative input
+    // block/output tail boundaries before any benchmark work begins. Timing
+    // can never compensate for one failed matrix cell.
+    const conformance_shapes = try metalJitConformanceShapes(op.format);
+    for (conformance_shapes, 0..) |shape, shape_index| {
+        const result = try runMetalJitConformanceShape(request, op.format, shape, threads, cols, shape_index * 11 + 1);
+        max_absolute_error = @max(max_absolute_error, result.max_absolute_error);
+        max_relative_error = @max(max_relative_error, result.max_relative_error);
+        if (!result.passed) {
+            logMetalJitCorrectnessRejection(
+                request,
+                op.format,
+                "conformance",
+                shape,
+                result.max_absolute_error,
+                result.max_relative_error,
+            );
+            return .{
+                .correctness_passed = false,
+                .max_absolute_error = max_absolute_error,
+                .max_relative_error = max_relative_error,
+                .baseline_nanos = @splat(0),
+                .candidate_nanos = @splat(0),
+            };
+        }
+    }
+
+    // A format-wide slot is model-safe only when every observed matrix passes
+    // its full bundled-kernel differential and sampled independent CPU oracle
+    // at every routed row count. Complete that domain before timing so an
+    // early slow cell cannot hide a later correctness failure.
+    // Persisted median and worst-repeat speedups are componentwise minima over
+    // the whole domain; any slower cell rejects the route. Iterations scale
+    // inversely with matrix work so a large
+    // model cannot turn one admitted qualification into an unbounded preload.
+    const observed_shapes = request.scope.observedShapes(op.format);
+    if (observed_shapes.len == 0) return error.MissingMetalJitObservedShape;
+    // Cross the exact model dimensions with every row count admitted by the
+    // generated small-batch route. Generic fixtures alone cannot prove that a
+    // row-specific path also handles every real stride and output tail.
+    for (observed_shapes, 0..) |observed, shape_index| {
+        for (2..9) |rows| {
+            const cell_shape = MetalJitConformanceShape{
+                .rows = rows,
+                .in_dim = observed[1],
+                .out_dim = observed[0],
+            };
+            var cell = try runMetalJitObservedShape(
+                request,
+                op.format,
+                cell_shape,
+                threads,
+                cols,
+                1,
+                101 + shape_index * 17 + (rows - 2) * 5,
+                false,
+                null,
+            );
+            max_absolute_error = @max(max_absolute_error, cell.max_absolute_error);
+            max_relative_error = @max(max_relative_error, cell.max_relative_error);
+            if (!cell.correctness_passed) {
+                logMetalJitCorrectnessRejection(
+                    request,
+                    op.format,
+                    "observed",
+                    cell_shape,
+                    cell.max_absolute_error,
+                    cell.max_relative_error,
+                );
+                cell.max_absolute_error = max_absolute_error;
+                cell.max_relative_error = max_relative_error;
+                return cell;
+            }
+        }
+    }
+    std.log.info(
+        "metal_jit_correctness_complete backend=metal kernel={s} format={s} conformance_cases={d} observed_shapes={d} observed_cells={d} rows=2-8 repeated=true max_absolute_error={d:.7} max_relative_error={d:.7} tolerance={d:.7}",
+        .{
+            request.artifact.kernel_id,
+            @tagName(op.format),
+            conformance_shapes.len,
+            observed_shapes.len,
+            observed_shapes.len * 7,
+            max_absolute_error,
+            max_relative_error,
+            metalJitQualificationTolerance(op.format),
+        },
+    );
+    var representative_measurements: ?MetalJitQualificationMeasurements = null;
+    var aggregate_measured_speedup: f64 = std.math.inf(f64);
+    var aggregate_minimum_repeat_speedup: f64 = std.math.inf(f64);
+    const timed_rows = [_]usize{ 2, 8 };
+    for (observed_shapes, 0..) |observed, shape_index| {
+        for (timed_rows, 0..) |rows, row_index| {
+            const cell_shape = MetalJitConformanceShape{
+                .rows = rows,
+                .in_dim = observed[1],
+                .out_dim = observed[0],
+            };
+            var cell = try runMetalJitObservedShape(
+                request,
+                op.format,
+                cell_shape,
+                threads,
+                cols,
+                1,
+                101 + shape_index * 17 + row_index * 5,
+                true,
+                null,
+            );
+            max_absolute_error = @max(max_absolute_error, cell.max_absolute_error);
+            max_relative_error = @max(max_relative_error, cell.max_relative_error);
+            if (!cell.correctness_passed) {
+                logMetalJitCorrectnessRejection(
+                    request,
+                    op.format,
+                    "observed",
+                    cell_shape,
+                    cell.max_absolute_error,
+                    cell.max_relative_error,
+                );
+                cell.max_absolute_error = max_absolute_error;
+                cell.max_relative_error = max_relative_error;
+                return cell;
+            }
+            const timing_evidence = kernel_jit.evidenceFromPairedNanos(
+                0,
+                true,
+                &cell.baseline_nanos,
+                &cell.candidate_nanos,
+            ) catch |err| {
+                std.log.warn(
+                    "metal_jit_qualification_rejected backend=metal kernel={s} format={s} stage=observed reason={s} rows={d} out_dim={d} in_dim={d} measured_speedup=invalid minimum_repeat_speedup=invalid required_speedup={d:.2} max_absolute_error={d:.7} max_relative_error={d:.7}",
+                    .{
+                        request.artifact.kernel_id,
+                        @tagName(op.format),
+                        @errorName(err),
+                        cell_shape.rows,
+                        cell_shape.out_dim,
+                        cell_shape.in_dim,
+                        kernel_jit.minimum_speedup,
+                        max_absolute_error,
+                        max_relative_error,
+                    },
+                );
+                cell.timing_passed = false;
+                cell.max_absolute_error = max_absolute_error;
+                cell.max_relative_error = max_relative_error;
+                return cell;
+            };
+            const record = metalJitQualificationRecord(cell) catch |err| {
+                logMetalJitTimingRejection(
+                    request,
+                    op.format,
+                    cell_shape,
+                    timing_evidence,
+                    err,
+                    max_absolute_error,
+                    max_relative_error,
+                );
+                cell.timing_passed = false;
+                cell.max_absolute_error = max_absolute_error;
+                cell.max_relative_error = max_relative_error;
+                return cell;
+            };
+            aggregate_measured_speedup = @min(aggregate_measured_speedup, record.measured_speedup);
+            aggregate_minimum_repeat_speedup = @min(aggregate_minimum_repeat_speedup, record.minimum_repeat_speedup);
+            if (representative_measurements == null) representative_measurements = cell;
+        }
+    }
+    var result = representative_measurements orelse return error.MissingMetalJitObservedShape;
+    result.aggregate_measured_speedup = aggregate_measured_speedup;
+    result.aggregate_minimum_repeat_speedup = aggregate_minimum_repeat_speedup;
+    result.max_absolute_error = max_absolute_error;
+    result.max_relative_error = max_relative_error;
+    return result;
+}
+
+pub fn metalJitQualificationRecord(
+    measurements: MetalJitQualificationMeasurements,
+) !kernel_jit.QualificationRecord {
+    return metalJitQualificationRecordForCandidate(measurements, 0);
+}
+
+fn metalJitQualificationRecordForCandidate(
+    measurements: MetalJitQualificationMeasurements,
+    candidate_index: usize,
+) !kernel_jit.QualificationRecord {
+    // A failed correctness pass never enters the timing/evidence machinery and
+    // can therefore never create a persistent qualification record.
+    if (!measurements.correctness_passed) return error.MetalJitCorrectnessFailed;
+    if (!measurements.timing_passed) return error.MetalJitQualificationRejected;
+    const evidence = try kernel_jit.evidenceFromPairedNanos(
+        candidate_index,
+        true,
+        &measurements.baseline_nanos,
+        &measurements.candidate_nanos,
+    );
+    const record = kernel_jit.QualificationRecord{
+        .candidate_index = @intCast(evidence.candidate_index),
+        .repeat_count = kernel_jit.measurement_repeats,
+        .correctness_passed = evidence.correctness_passed,
+        .measured_speedup = @min(evidence.measured_speedup, measurements.aggregate_measured_speedup orelse std.math.inf(f64)),
+        .minimum_repeat_speedup = @min(evidence.minimum_repeat_speedup, measurements.aggregate_minimum_repeat_speedup orelse std.math.inf(f64)),
+        .max_absolute_error = measurements.max_absolute_error,
+        .max_relative_error = measurements.max_relative_error,
+    };
+    try record.validate();
+    if (!record.eligible()) return error.MetalJitQualificationRejected;
+    return record;
+}
+
+pub const MetalExactTuningWinner = struct {
+    generated: *RawMetalGeneratedPipeline,
+    key: kernel_jit.ArtifactKey,
+    record: kernel_jit.QualificationRecord,
+    schedule: quant_kernel_compiler.KernelSchedule,
+    candidate_index: u8,
+};
+
+fn metalJitArtifactForExactSignature(signature: RawWorkloadProfileEntry) ?quant_kernel_compiler.GeneratedArtifact {
+    if (!workloadProfileEntryInFirstMetalSlice(signature)) return null;
+    const format: quant_matmul.Format = if (signature.format == workloadProfileQuantFormatId("q4_0").?)
+        .q4_0
+    else if (signature.format == workloadProfileQuantFormatId("q4_k").?)
+        .q4_k
+    else
+        .q6_k;
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend != .metal) continue;
+        const op = artifact.matmulOp() orelse continue;
+        if (op.format == format and op.row_bucket == .rows_2_8 and op.epilogue == .none) return artifact;
+    }
+    return null;
+}
+
+fn createMetalScheduleCandidatePipeline(
+    allocator: std.mem.Allocator,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    source: []const u8,
+    schedule: quant_kernel_compiler.KernelSchedule,
+    device: MetalDeviceInfo,
+) !*RawMetalGeneratedPipeline {
+    return createNamedMetalScheduleCandidatePipeline(allocator, artifact, artifact.kernel_id, source, schedule, device);
+}
+
+fn createMetalQkvScheduleCandidatePipeline(
+    allocator: std.mem.Allocator,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    source: []const u8,
+    schedule: quant_kernel_compiler.KernelSchedule,
+    device: MetalDeviceInfo,
+) !*RawMetalGeneratedPipeline {
+    const kernel_name = try std.fmt.allocPrint(allocator, "{s}_qkv", .{artifact.kernel_id});
+    defer allocator.free(kernel_name);
+    return createNamedMetalScheduleCandidatePipeline(allocator, artifact, kernel_name, source, schedule, device);
+}
+
+fn createNamedMetalScheduleCandidatePipeline(
+    allocator: std.mem.Allocator,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    kernel_name_raw: []const u8,
+    source: []const u8,
+    schedule: quant_kernel_compiler.KernelSchedule,
+    device: MetalDeviceInfo,
+) !*RawMetalGeneratedPipeline {
+    const kernel_name = try allocator.dupeZ(u8, kernel_name_raw);
+    defer allocator.free(kernel_name);
+    var error_buffer: [4096]u8 = @splat(0);
+    const generated = termite_metal_generated_pipeline_create(
+        source.ptr,
+        source.len,
+        kernel_name.ptr,
+        @intFromBool(metalJitPreciseMath(artifact)),
+        error_buffer[0..].ptr,
+        error_buffer.len,
+    ) orelse {
+        const detail = std.mem.sliceTo(error_buffer[0..], 0);
+        if (detail.len != 0) std.log.warn("Metal exact candidate compilation failed: {s}", .{detail});
+        return error.MetalJitPipelineCompilationFailed;
+    };
+    errdefer termite_metal_generated_pipeline_destroy(generated);
+    var pipeline_info: MetalGeneratedPipelineInfo = .{};
+    if (termite_metal_generated_pipeline_info_get(generated, &pipeline_info) != 0) {
+        return error.MetalJitPipelineReflectionFailed;
+    }
+    try validateMetalJitCandidateSchedule(schedule, device, pipeline_info);
+    return generated;
+}
+
+fn activateMetalExactQkvCompanion(
+    owner: anytype,
+    allocator: std.mem.Allocator,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    signature: RawWorkloadProfileEntry,
+    schedule: quant_kernel_compiler.KernelSchedule,
+    device: MetalDeviceInfo,
+) !bool {
+    if (getenvFlagEnabled("TERMITE_METAL_DISABLE_GENERATED_QKV")) return false;
+    const op = artifact.matmulOp() orelse return false;
+    if (op.epilogue != .none or (op.format != .q4_k and op.format != .q6_k)) return false;
+    if (!owner.canOwnExactJitPipeline()) return error.TooManyExactJitPipelines;
+    const emitted = try quant_kernel_compiler.emitMetalQkvScheduleCandidateSource(allocator, artifact, schedule);
+    defer emitted.deinit(allocator);
+    const generated = try createMetalQkvScheduleCandidatePipeline(allocator, artifact, emitted.data, schedule, device);
+    var retained = false;
+    defer if (!retained) termite_metal_generated_pipeline_destroy(generated);
+    const route = metalJitRouteForArtifact(artifact) orelse return error.MissingMetalJitRoute;
+    if (termite_metal_generated_pipeline_install_exact_qkv(
+        owner.raw_provider,
+        owner.raw_decode_runtime,
+        generated,
+        @intFromEnum(route.slot),
+        signature.regime,
+        signature.dispatch,
+        @intCast(signature.rows),
+        @intCast(signature.out_dim),
+        @intCast(signature.in_dim),
+    ) != 0) return error.MetalJitQkvActivationFailed;
+    owner.ownExactJitPipeline(generated);
+    retained = true;
+    return true;
+}
+
+fn metalJitCachedExactQualification(
+    allocator: std.mem.Allocator,
+    cache: ?*kernel_jit.ArtifactCache,
+    key: kernel_jit.ArtifactKey,
+    candidate_index: usize,
+) ?kernel_jit.QualificationRecord {
+    const value = cache orelse return null;
+    const payload = value.load(.qualification, key) catch |err| {
+        std.log.warn("Metal exact qualification cache load failed: {s}", .{@errorName(err)});
+        return null;
+    } orelse return null;
+    defer allocator.free(payload);
+    const record = kernel_jit.QualificationRecord.decode(payload) catch return null;
+    if (record.candidate_index != candidate_index or !record.eligible()) return null;
+    return record;
+}
+
+fn persistMetalJitQualification(
+    allocator: std.mem.Allocator,
+    cache: *kernel_jit.ArtifactCache,
+    key: kernel_jit.ArtifactKey,
+    record: kernel_jit.QualificationRecord,
+) !void {
+    const encoded = try record.encode();
+    try cache.store(.qualification, key, &encoded);
+    const persisted = metalJitCachedExactQualification(
+        allocator,
+        cache,
+        key,
+        @intCast(record.candidate_index),
+    ) orelse return error.MetalJitQualificationPersistenceFailed;
+    if (persisted.measured_speedup != record.measured_speedup or
+        persisted.minimum_repeat_speedup != record.minimum_repeat_speedup or
+        persisted.max_absolute_error != record.max_absolute_error or
+        persisted.max_relative_error != record.max_relative_error)
+    {
+        return error.MetalJitQualificationPersistenceFailed;
+    }
+}
+
+/// Compiles and qualifies the bounded schedule catalog for one exact observed
+/// Q4_0/Q4_K signature. The returned pipeline is owned by the caller. Every
+/// candidate is checked against both the bundled Metal route and a sampled CPU
+/// oracle before its paired timing can participate in winner selection.
+pub fn tuneMetalExactSignature(
+    allocator: std.mem.Allocator,
+    cache: ?*kernel_jit.ArtifactCache,
+    provider: ?*RawMetalProvider,
+    runtime: ?*RawMetalDecodeRuntime,
+    scope: *const MetalJitRouteScope,
+    signature: RawWorkloadProfileEntry,
+    device: MetalDeviceInfo,
+    device_name: []const u8,
+    compiler_identity: []const u8,
+) !?MetalExactTuningWinner {
+    const persistent_cache = cache orelse return error.MetalJitQualificationCacheUnavailable;
+    if (!workloadProfileEntryEligibleForFirstMetalSlice(signature)) {
+        return error.UnsupportedMetalExactSignature;
+    }
+    const artifact = metalJitArtifactForExactSignature(signature) orelse
+        return error.UnsupportedMetalExactSignature;
+    const op = artifact.matmulOp().?;
+    const rows = std.math.cast(usize, signature.rows) orelse return error.UnsupportedMetalExactSignature;
+    const in_dim = std.math.cast(usize, signature.in_dim) orelse return error.UnsupportedMetalExactSignature;
+    const out_dim = std.math.cast(usize, signature.out_dim) orelse return error.UnsupportedMetalExactSignature;
+    const shape = MetalJitConformanceShape{ .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+    try validateMetalJitFixtureForDevice(op.format, rows, in_dim, out_dim, device);
+
+    var schedules: [kernel_jit.maximum_candidates]quant_kernel_compiler.KernelSchedule = undefined;
+    const candidate_count = quant_kernel_compiler.metalScheduleCandidatesForExactShape(
+        op.format,
+        op.epilogue,
+        rows,
+        in_dim,
+        out_dim,
+        &schedules,
+    );
+    if (candidate_count == 0) return error.MissingMetalScheduleCandidates;
+    var evidence: [kernel_jit.maximum_candidates]kernel_jit.CandidateEvidence = undefined;
+    var records: [kernel_jit.maximum_candidates]?kernel_jit.QualificationRecord = @splat(null);
+    var records_confirmed: [kernel_jit.maximum_candidates]bool = @splat(false);
+    var keys: [kernel_jit.maximum_candidates]kernel_jit.ArtifactKey = undefined;
+    var pipelines: [kernel_jit.maximum_candidates]?*RawMetalGeneratedPipeline = @splat(null);
+    defer for (&pipelines) |*pipeline| {
+        if (pipeline.*) |owned| termite_metal_generated_pipeline_destroy(owned);
+    };
+
+    metal_jit_process_gpu_mutex.lockUncancelable(io_compat.io());
+    defer metal_jit_process_gpu_mutex.unlock(io_compat.io());
+
+    for (schedules[0..candidate_count], 0..) |schedule, candidate_index| {
+        evidence[candidate_index] = .{
+            .candidate_index = candidate_index,
+            .correctness_passed = false,
+            .measured_speedup = 0,
+            .minimum_repeat_speedup = 0,
+        };
+        const emitted = try quant_kernel_compiler.emitMetalScheduleCandidateSource(allocator, artifact, schedule);
+        defer emitted.deinit(allocator);
+        const key = try metalJitExactArtifactKey(
+            artifact,
+            emitted.data,
+            device,
+            device_name,
+            compiler_identity,
+            scope,
+            signature,
+            schedule,
+        );
+        keys[candidate_index] = key;
+        if (metalJitCachedExactQualification(allocator, persistent_cache, key, candidate_index)) |record| {
+            records[candidate_index] = record;
+            records_confirmed[candidate_index] = true;
+            evidence[candidate_index] = try record.evidence();
+            continue;
+        }
+
+        const generated = createMetalScheduleCandidatePipeline(
+            allocator,
+            artifact,
+            emitted.data,
+            schedule,
+            device,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            std.log.warn(
+                "Metal exact candidate rejected kernel={s} candidate={d} stage=compile reason={s}",
+                .{ artifact.kernel_id, candidate_index, @errorName(err) },
+            );
+            continue;
+        };
+        pipelines[candidate_index] = generated;
+        const request = MetalJitQualificationRequest{
+            .allocator = allocator,
+            .artifact = artifact,
+            .scope = scope,
+            .provider = provider,
+            .runtime = runtime,
+            .generated = generated,
+        };
+        const measurements = runMetalJitObservedShape(
+            request,
+            op.format,
+            shape,
+            schedule.threads_per_threadgroup,
+            schedule.cols_per_threadgroup,
+            schedule.rows_per_threadgroup,
+            4099 + candidate_index * 131 + rows * 17 + in_dim % 97 + out_dim % 89,
+            true,
+            if (signature.call_count == 0)
+                null
+            else
+                @max(@as(u64, 1), signature.estimated_gpu_nanos / signature.call_count),
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            std.log.warn(
+                "Metal exact candidate rejected kernel={s} candidate={d} stage=qualification reason={s}",
+                .{ artifact.kernel_id, candidate_index, @errorName(err) },
+            );
+            continue;
+        };
+        if (!measurements.correctness_passed) {
+            std.log.warn(
+                "Metal exact candidate rejected kernel={s} candidate={d} stage=correctness rows={d} out_dim={d} in_dim={d} max_absolute_error={d:.7} max_relative_error={d:.7}",
+                .{ artifact.kernel_id, candidate_index, rows, out_dim, in_dim, measurements.max_absolute_error, measurements.max_relative_error },
+            );
+            continue;
+        }
+        const candidate_evidence = kernel_jit.evidenceFromPairedNanos(
+            candidate_index,
+            true,
+            &measurements.baseline_nanos,
+            &measurements.candidate_nanos,
+        ) catch |err| {
+            std.log.warn(
+                "Metal exact candidate rejected kernel={s} candidate={d} stage=evidence reason={s}",
+                .{ artifact.kernel_id, candidate_index, @errorName(err) },
+            );
+            continue;
+        };
+        std.log.info(
+            "metal_jit_candidate_evidence kernel={s} candidate={d} phase=selection rows={d} out_dim={d} in_dim={d} threads={d} cols={d} row_tile={d} median_speedup={d:.6} worst_repeat_speedup={d:.6}",
+            .{
+                artifact.kernel_id,
+                candidate_index,
+                rows,
+                out_dim,
+                in_dim,
+                schedule.threads_per_threadgroup,
+                schedule.cols_per_threadgroup,
+                schedule.rows_per_threadgroup,
+                candidate_evidence.measured_speedup,
+                candidate_evidence.minimum_repeat_speedup,
+            },
+        );
+        evidence[candidate_index] = candidate_evidence;
+        records[candidate_index] = metalJitQualificationRecordForCandidate(
+            measurements,
+            candidate_index,
+        ) catch null;
+    }
+
+    while (kernel_jit.selectWinner(evidence[0..candidate_count])) |winner| {
+        const winner_index = winner.candidate_index;
+        var record = records[winner_index] orelse {
+            std.log.warn(
+                "Metal exact winner rejected kernel={s} candidate={d} stage=selection reason=missing_qualification_record",
+                .{ artifact.kernel_id, winner_index },
+            );
+            evidence[winner_index].correctness_passed = false;
+            continue;
+        };
+        if (pipelines[winner_index] == null) {
+            const emitted = try quant_kernel_compiler.emitMetalScheduleCandidateSource(
+                allocator,
+                artifact,
+                schedules[winner_index],
+            );
+            defer emitted.deinit(allocator);
+            pipelines[winner_index] = createMetalScheduleCandidatePipeline(
+                allocator,
+                artifact,
+                emitted.data,
+                schedules[winner_index],
+                device,
+            ) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                std.log.warn(
+                    "Metal exact winner rejected kernel={s} candidate={d} stage=confirmation_compile reason={s}",
+                    .{ artifact.kernel_id, winner_index, @errorName(err) },
+                );
+                evidence[winner_index].correctness_passed = false;
+                continue;
+            };
+        }
+        if (!records_confirmed[winner_index]) {
+            const confirmation = runMetalJitObservedShape(
+                .{
+                    .allocator = allocator,
+                    .artifact = artifact,
+                    .scope = scope,
+                    .provider = provider,
+                    .runtime = runtime,
+                    .generated = pipelines[winner_index].?,
+                },
+                op.format,
+                shape,
+                schedules[winner_index].threads_per_threadgroup,
+                schedules[winner_index].cols_per_threadgroup,
+                schedules[winner_index].rows_per_threadgroup,
+                16381 + winner_index * 257 + rows * 29 + in_dim % 193 + out_dim % 181,
+                true,
+                if (signature.call_count == 0)
+                    null
+                else
+                    @max(@as(u64, 1), signature.estimated_gpu_nanos / signature.call_count),
+            ) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                std.log.warn(
+                    "Metal exact winner rejected kernel={s} candidate={d} stage=independent_confirmation reason={s}",
+                    .{ artifact.kernel_id, winner_index, @errorName(err) },
+                );
+                evidence[winner_index].correctness_passed = false;
+                continue;
+            };
+            const confirmation_evidence = kernel_jit.evidenceFromPairedNanos(
+                winner_index,
+                true,
+                &confirmation.baseline_nanos,
+                &confirmation.candidate_nanos,
+            ) catch |err| {
+                std.log.warn(
+                    "Metal exact winner rejected kernel={s} candidate={d} stage=independent_confirmation reason={s}",
+                    .{ artifact.kernel_id, winner_index, @errorName(err) },
+                );
+                evidence[winner_index].correctness_passed = false;
+                continue;
+            };
+            std.log.info(
+                "metal_jit_candidate_evidence kernel={s} candidate={d} phase=independent_confirmation rows={d} out_dim={d} in_dim={d} threads={d} cols={d} row_tile={d} median_speedup={d:.6} worst_repeat_speedup={d:.6}",
+                .{
+                    artifact.kernel_id,
+                    winner_index,
+                    rows,
+                    out_dim,
+                    in_dim,
+                    schedules[winner_index].threads_per_threadgroup,
+                    schedules[winner_index].cols_per_threadgroup,
+                    schedules[winner_index].rows_per_threadgroup,
+                    confirmation_evidence.measured_speedup,
+                    confirmation_evidence.minimum_repeat_speedup,
+                },
+            );
+            const confirmed_record = metalJitQualificationRecordForCandidate(
+                confirmation,
+                winner_index,
+            ) catch {
+                std.log.info(
+                    "Metal exact winner rejected kernel={s} candidate={d} stage=independent_confirmation reason=repeat_stability",
+                    .{ artifact.kernel_id, winner_index },
+                );
+                evidence[winner_index].correctness_passed = false;
+                continue;
+            };
+            record.measured_speedup = @min(record.measured_speedup, confirmed_record.measured_speedup);
+            record.minimum_repeat_speedup = @min(record.minimum_repeat_speedup, confirmed_record.minimum_repeat_speedup);
+            record.max_absolute_error = @max(record.max_absolute_error, confirmed_record.max_absolute_error);
+            record.max_relative_error = @max(record.max_relative_error, confirmed_record.max_relative_error);
+            record.validate() catch |err| {
+                std.log.warn(
+                    "Metal exact winner rejected kernel={s} candidate={d} stage=independent_confirmation reason={s}",
+                    .{ artifact.kernel_id, winner_index, @errorName(err) },
+                );
+                evidence[winner_index].correctness_passed = false;
+                continue;
+            };
+            if (!record.eligible()) {
+                evidence[winner_index].correctness_passed = false;
+                continue;
+            }
+        }
+        try persistMetalJitQualification(allocator, persistent_cache, keys[winner_index], record);
+        const generated = pipelines[winner_index].?;
+        pipelines[winner_index] = null;
+        return .{
+            .generated = generated,
+            .key = keys[winner_index],
+            .record = record,
+            .schedule = schedules[winner_index],
+            .candidate_index = @intCast(winner_index),
+        };
+    }
+    return null;
+}
+
+/// Runs the offline/pre-serving first tuning slice over each explicit workload
+/// regime. Qualification walks at most five signatures in descending calibrated
+/// cost and stops as soon as qualified winners cover 90% of eligible work.
+pub fn tuneFirstMetalWorkloadSlice(
+    owner: anytype,
+    snapshot: *const RawWorkloadProfileSnapshot,
+) !MetalWorkloadTuningSummary {
+    if (!snapshot.eligibleForSelection()) return error.IncompleteWorkloadProfile;
+    var summary: MetalWorkloadTuningSummary = .{};
+    if (!owner.jit_mode.compiles()) return summary;
+    const session = owner.jit_session orelse {
+        if (owner.jit_mode.failClosed()) return error.MetalJitRequiredRouteFailed;
+        return summary;
+    };
+    if (!metalJitHasPersistentQualificationCache(owner)) {
+        return error.MetalJitQualificationCacheUnavailable;
+    }
+
+    var device: MetalDeviceInfo = .{};
+    if (termite_metal_device_info_get(&device) != 0) return error.WorkloadProfileUnavailable;
+    var device_name_buffer: [4096]u8 = undefined;
+    const device_name_len = termite_metal_copy_device_name(null, 0);
+    if (device_name_len == 0 or device_name_len > device_name_buffer.len or
+        termite_metal_copy_device_name(device_name_buffer[0..].ptr, device_name_buffer.len) != device_name_len)
+    {
+        return error.WorkloadProfileUnavailable;
+    }
+    var compiler_buffer: [4096]u8 = undefined;
+    const compiler_len = termite_metal_copy_compiler_identity(null, 0);
+    if (compiler_len == 0 or compiler_len > compiler_buffer.len or
+        termite_metal_copy_compiler_identity(compiler_buffer[0..].ptr, compiler_buffer.len) != compiler_len)
+    {
+        return error.WorkloadProfileUnavailable;
+    }
+
+    const regimes = [_]WorkloadRegime{
+        .encoder,
+        .prefill,
+        .decode,
+        .speculative_draft,
+        .speculative_verify,
+    };
+    var saw_eligible_regime = false;
+    var all_eligible_regimes_complete = true;
+    for (regimes) |regime| {
+        const candidates = try selectFirstMetalTuningCandidatePoolForRegime(snapshot, regime);
+        var coverage = MetalWorkloadQualifiedCoverage{
+            .eligible_estimated_gpu_nanos = candidates.eligible_estimated_gpu_nanos,
+        };
+        if (coverage.eligible_estimated_gpu_nanos != 0) saw_eligible_regime = true;
+        for (candidates.selectedIndices()) |entry_index| {
+            if (coverage.complete()) break;
+            if (summary.selected_count == workload_tuning_maximum_winners) {
+                return error.MetalWorkloadTuningCapacityExceeded;
+            }
+            summary.selected_count += 1;
+            const signature = snapshot.entries[entry_index];
+            const winner = tuneMetalExactSignature(
+                session.allocator,
+                if (session.cache) |*cache| cache else null,
+                owner.raw_provider,
+                owner.raw_decode_runtime,
+                &session.scope,
+                signature,
+                device,
+                device_name_buffer[0..device_name_len],
+                compiler_buffer[0..compiler_len],
+            ) catch |err| {
+                coverage.recordAttempt(signature.estimated_gpu_nanos, false);
+                summary.failed_count += 1;
+                std.log.warn(
+                    "Metal exact signature tuning failed regime={s} format={d} rows={d} out_dim={d} in_dim={d} reason={s}",
+                    .{ @tagName(regime), signature.format, signature.rows, signature.out_dim, signature.in_dim, @errorName(err) },
+                );
+                continue;
+            } orelse {
+                coverage.recordAttempt(signature.estimated_gpu_nanos, false);
+                summary.failed_count += 1;
+                std.log.info(
+                    "Metal exact signature has no >=1.02x winner regime={s} format={d} rows={d} out_dim={d} in_dim={d}",
+                    .{ @tagName(regime), signature.format, signature.rows, signature.out_dim, signature.in_dim },
+                );
+                continue;
+            };
+            coverage.recordAttempt(signature.estimated_gpu_nanos, true);
+            var retained = false;
+            defer if (!retained) termite_metal_generated_pipeline_destroy(winner.generated);
+
+            if (summary.qualified_count == workload_tuning_maximum_winners) {
+                return error.MetalWorkloadTuningCapacityExceeded;
+            }
+            const qualified_index = summary.qualified_count;
+            summary.winners[qualified_index] = .{
+                .signature = signature,
+                .key = winner.key,
+                .record = winner.record,
+                .schedule = winner.schedule,
+            };
+            summary.qualified_count += 1;
+
+            if (owner.jit_mode.activates()) {
+                const artifact = metalJitArtifactForExactSignature(signature) orelse unreachable;
+                const route = metalJitRouteForArtifact(artifact) orelse return error.MissingMetalJitRoute;
+                if (!owner.canOwnExactJitPipeline()) {
+                    summary.activation_failed_count += 1;
+                    std.log.warn(
+                        "Metal exact qualified winner activation failed regime={s} format={d} rows={d} out_dim={d} in_dim={d} reason=pipeline_capacity",
+                        .{ @tagName(regime), signature.format, signature.rows, signature.out_dim, signature.in_dim },
+                    );
+                    continue;
+                }
+                if (termite_metal_generated_pipeline_install_exact(
+                    owner.raw_provider,
+                    owner.raw_decode_runtime,
+                    winner.generated,
+                    @intFromEnum(route.slot),
+                    signature.regime,
+                    signature.dispatch,
+                    @intCast(signature.rows),
+                    @intCast(signature.out_dim),
+                    @intCast(signature.in_dim),
+                    winner.schedule.threads_per_threadgroup,
+                    winner.schedule.cols_per_threadgroup,
+                    winner.schedule.rows_per_threadgroup,
+                ) != 0) {
+                    summary.activation_failed_count += 1;
+                    std.log.warn(
+                        "Metal exact qualified winner activation failed regime={s} format={d} rows={d} out_dim={d} in_dim={d} reason=install_failed",
+                        .{ @tagName(regime), signature.format, signature.rows, signature.out_dim, signature.in_dim },
+                    );
+                    continue;
+                }
+                owner.ownExactJitPipeline(winner.generated);
+                retained = true;
+                summary.active_count += 1;
+                if (activateMetalExactQkvCompanion(
+                    owner,
+                    session.allocator,
+                    artifact,
+                    signature,
+                    winner.schedule,
+                    device,
+                ) catch |err| blk: {
+                    std.log.warn(
+                        "Metal exact QKV companion activation skipped regime={s} format={d} rows={d} out_dim={d} in_dim={d} reason={s}",
+                        .{ @tagName(regime), signature.format, signature.rows, signature.out_dim, signature.in_dim, @errorName(err) },
+                    );
+                    break :blk false;
+                }) {
+                    summary.qkv_active_count += 1;
+                }
+            }
+        }
+        const regime_complete = coverage.complete();
+        if (coverage.eligible_estimated_gpu_nanos != 0 and !regime_complete) {
+            all_eligible_regimes_complete = false;
+        }
+        std.log.info(
+            "metal_jit_qualified_coverage regime={s} eligible_nanos={d} target_nanos={d} qualified_nanos={d} attempts={d} winners={d} rejections={d} complete={}",
+            .{
+                @tagName(regime),
+                coverage.eligible_estimated_gpu_nanos,
+                coverage.targetEstimatedGpuNanos(),
+                coverage.qualified_estimated_gpu_nanos,
+                coverage.attempted_count,
+                coverage.winner_count,
+                coverage.rejected_count,
+                regime_complete,
+            },
+        );
+    }
+    summary.coverage_complete = saw_eligible_regime and all_eligible_regimes_complete;
+    try validateMetalWorkloadTuningForMode(owner.jit_mode, summary);
+    return summary;
+}
+
+fn workloadRegimeFromName(name: []const u8) ?WorkloadRegime {
+    for ([_]WorkloadRegime{
+        .encoder,
+        .prefill,
+        .decode,
+        .speculative_draft,
+        .speculative_verify,
+    }) |regime| {
+        if (std.mem.eql(u8, name, @tagName(regime))) return regime;
+    }
+    return null;
+}
+
+fn rawSignatureFromQualifiedProfile(
+    report: kernel_jit_profile_output.ProfileReport,
+    qualified: kernel_jit_profile_output.QualifiedKernel,
+) !RawWorkloadProfileEntry {
+    const regime = workloadRegimeFromName(qualified.regime) orelse
+        return error.InvalidQualifiedKernelSignature;
+    const format = workloadProfileQuantFormatId(qualified.quant_format) orelse
+        return error.InvalidQualifiedKernelSignature;
+    const dispatch = workloadProfileDispatchId(qualified.dispatch) orelse
+        return error.InvalidQualifiedKernelSignature;
+    if (!std.mem.eql(u8, qualified.implementation, "bundled") or
+        !std.mem.eql(u8, qualified.input_encoding, "f32") or
+        !std.mem.eql(u8, qualified.output_encoding, "f32") or
+        !std.mem.eql(u8, qualified.epilogue, "none") or
+        !std.mem.eql(u8, qualified.fusion, "none") or
+        !std.mem.eql(u8, qualified.layout, "row_major"))
+    {
+        return error.InvalidQualifiedKernelSignature;
+    }
+    var matched: ?kernel_jit_profile_output.ProfileEntry = null;
+    for (report.entries) |entry| {
+        if (!std.mem.eql(u8, entry.regime, qualified.regime) or
+            !std.mem.eql(u8, entry.quant_format, qualified.quant_format) or
+            !std.mem.eql(u8, entry.dispatch, qualified.dispatch) or
+            !std.mem.eql(u8, entry.implementation, qualified.implementation) or
+            entry.rows != qualified.rows or
+            entry.in_dim != qualified.in_dim or
+            entry.out_dim != qualified.out_dim or
+            !std.mem.eql(u8, entry.input_encoding, qualified.input_encoding) or
+            !std.mem.eql(u8, entry.output_encoding, qualified.output_encoding) or
+            !std.mem.eql(u8, entry.epilogue, qualified.epilogue) or
+            !std.mem.eql(u8, entry.fusion, qualified.fusion) or
+            !std.mem.eql(u8, entry.layout, qualified.layout) or
+            !entry.calibrated or
+            (entry.estimated_gpu_nanos orelse 0) == 0)
+        {
+            continue;
+        }
+        if (matched != null) return error.DuplicateQualifiedKernelSignature;
+        matched = entry;
+    }
+    const entry = matched orelse return error.MissingQualifiedKernelSignature;
+    return .{
+        .hash = 1,
+        .call_count = entry.call_count,
+        .logical_bytes = entry.logical_bytes,
+        .macs = entry.macs,
+        .estimated_gpu_nanos = entry.estimated_gpu_nanos.?,
+        .rows = entry.rows,
+        .in_dim = entry.in_dim,
+        .out_dim = entry.out_dim,
+        .format = format,
+        .dispatch = dispatch,
+        .input_encoding = 0,
+        .output_encoding = 0,
+        .epilogue = 0,
+        .implementation = @intFromEnum(WorkloadImplementation.bundled),
+        .regime = @intFromEnum(regime),
+        .fusion = 0,
+        .layout = 0,
+        .calibrated = 1,
+        .occupied = 1,
+    };
+}
+
+comptime {
+    if (kernel_jit_profile_output.maximum_profile_entries > workload_profile_capacity) {
+        @compileError("workload profile JSON capacity exceeds the Metal selector capacity");
+    }
+}
+
+fn validateQualifiedProfileSelection(report: kernel_jit_profile_output.ProfileReport) !void {
+    workload_profile_policy.validateWeightedCoverage(report) catch
+        return error.InvalidQualifiedKernelSelection;
+}
+
+fn scopeContainsExactSignature(scope: *const MetalJitRouteScope, signature: RawWorkloadProfileEntry) bool {
+    const artifact = metalJitArtifactForExactSignature(signature) orelse return false;
+    const op = artifact.matmulOp().?;
+    const out_dim = std.math.cast(usize, signature.out_dim) orelse return false;
+    const in_dim = std.math.cast(usize, signature.in_dim) orelse return false;
+    if (!scope.includes(artifact)) return false;
+    for (scope.observedShapes(op.format)) |shape| {
+        if (shape[0] == out_dim and shape[1] == in_dim) return true;
+    }
+    return false;
+}
+
+fn activateMetalQualifiedProfileKernel(
+    owner: anytype,
+    context: MetalJitLoadContext,
+    report: kernel_jit_profile_output.ProfileReport,
+    qualified: kernel_jit_profile_output.QualifiedKernel,
+) !bool {
+    const signature = try rawSignatureFromQualifiedProfile(report, qualified);
+    if (!scopeContainsExactSignature(&context.scope, signature)) {
+        return error.StaleQualifiedKernelModelScope;
+    }
+    const artifact = metalJitArtifactForExactSignature(signature) orelse
+        return error.InvalidQualifiedKernelSignature;
+    const op = artifact.matmulOp().?;
+    var schedules: [kernel_jit.maximum_candidates]quant_kernel_compiler.KernelSchedule = undefined;
+    const candidate_count = quant_kernel_compiler.metalScheduleCandidatesForExactShape(
+        op.format,
+        op.epilogue,
+        @intCast(signature.rows),
+        @intCast(signature.in_dim),
+        @intCast(signature.out_dim),
+        &schedules,
+    );
+    if (qualified.candidate_index >= candidate_count) return error.InvalidQualifiedKernelCandidate;
+    const schedule = schedules[qualified.candidate_index];
+    if (schedule.threads_per_threadgroup != qualified.threads_per_threadgroup or
+        schedule.cols_per_threadgroup != qualified.cols_per_threadgroup or
+        schedule.rows_per_threadgroup != qualified.rows_per_threadgroup or
+        !std.mem.eql(u8, @tagName(schedule.reduction), qualified.reduction))
+    {
+        return error.StaleQualifiedKernelSchedule;
+    }
+    const emitted = try quant_kernel_compiler.emitMetalScheduleCandidateSource(
+        context.allocator,
+        artifact,
+        schedule,
+    );
+    defer emitted.deinit(context.allocator);
+    const key = try metalJitExactArtifactKey(
+        artifact,
+        emitted.data,
+        context.device,
+        context.device_name,
+        context.compiler_identity,
+        &context.scope,
+        signature,
+        schedule,
+    );
+    const reported_key = kernel_jit.parseArtifactKeyHex(qualified.artifact_key) catch
+        return error.InvalidQualifiedKernelArtifactKey;
+    if (!std.mem.eql(u8, &key, &reported_key)) return error.StaleQualifiedKernelArtifactKey;
+    const record = metalJitCachedExactQualification(
+        context.allocator,
+        context.cache,
+        key,
+        qualified.candidate_index,
+    ) orelse return error.MissingQualifiedKernelCacheRecord;
+    if (record.measured_speedup != qualified.measured_speedup or
+        record.minimum_repeat_speedup != qualified.minimum_repeat_speedup)
+    {
+        return error.QualifiedKernelEvidenceMismatch;
+    }
+
+    const generated = try createMetalScheduleCandidatePipeline(
+        context.allocator,
+        artifact,
+        emitted.data,
+        schedule,
+        context.device,
+    );
+    var retained = false;
+    defer if (!retained) termite_metal_generated_pipeline_destroy(generated);
+    if (!owner.jit_mode.activates()) return true;
+    const route = metalJitRouteForArtifact(artifact) orelse return error.MissingMetalJitRoute;
+    if (!owner.canOwnExactJitPipeline()) return error.TooManyExactJitPipelines;
+    if (termite_metal_generated_pipeline_install_exact(
+        owner.raw_provider,
+        owner.raw_decode_runtime,
+        generated,
+        @intFromEnum(route.slot),
+        signature.regime,
+        signature.dispatch,
+        @intCast(signature.rows),
+        @intCast(signature.out_dim),
+        @intCast(signature.in_dim),
+        schedule.threads_per_threadgroup,
+        schedule.cols_per_threadgroup,
+        schedule.rows_per_threadgroup,
+    ) != 0) return error.MetalJitActivationFailed;
+    owner.ownExactJitPipeline(generated);
+    retained = true;
+    _ = activateMetalExactQkvCompanion(
+        owner,
+        context.allocator,
+        artifact,
+        signature,
+        schedule,
+        context.device,
+    ) catch |err| blk: {
+        std.log.warn(
+            "Metal cached exact QKV companion activation skipped format={d} rows={d} out_dim={d} in_dim={d} reason={s}",
+            .{ signature.format, signature.rows, signature.out_dim, signature.in_dim, @errorName(err) },
+        );
+        break :blk false;
+    };
+    return true;
+}
+
+fn activateMetalQualifiedProfile(
+    owner: anytype,
+    context: MetalJitLoadContext,
+    profile_path: []const u8,
+) !MetalJitPreloadStop {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io_compat.io(),
+        profile_path,
+        context.allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    defer context.allocator.free(bytes);
+    var parsed = std.json.parseFromSlice(
+        kernel_jit_profile_output.ProfileReport,
+        context.allocator,
+        bytes,
+        .{},
+    ) catch return error.InvalidKernelJitQualifiedProfile;
+    defer parsed.deinit();
+    kernel_jit_profile_output.validateReport(parsed.value) catch
+        return error.InvalidKernelJitQualifiedProfile;
+    const report = parsed.value;
+    if (!report.complete or report.qualified_kernels.len == 0) {
+        return error.IncompleteKernelJitQualifiedProfile;
+    }
+    if (report.device_registry_id != context.device.registry_id) {
+        return error.StaleQualifiedKernelDevice;
+    }
+    const compiler_fingerprint = try workloadFingerprintAlloc(context.allocator, context.compiler_identity);
+    defer context.allocator.free(compiler_fingerprint);
+    if (!std.mem.eql(u8, report.compiler_fingerprint, compiler_fingerprint)) {
+        return error.StaleQualifiedKernelCompiler;
+    }
+    try validateWorkloadProfileModelFingerprint(context.allocator, report, &context.scope);
+    try validateQualifiedProfileSelection(report);
+    if (owner.jit_mode.failClosed() and
+        (!report.tuning_coverage_complete or report.tuning_qualified_signatures == 0))
+    {
+        return error.IncompleteKernelJitQualifiedProfile;
+    }
+
+    var activated: usize = 0;
+    var preload_stop: MetalJitPreloadStop = .complete;
+    for (report.qualified_kernels) |qualified| {
+        if (metalJitPreloadStartBudgetExhausted(owner.jit_mode, context.remainingBudgetNs())) {
+            std.log.warn(
+                "Metal runtime JIT preload admission budget exhausted before qualified profile entry {s}",
+                .{qualified.artifact_key},
+            );
+            preload_stop = .deadline;
+            break;
+        }
+        const accepted = activateMetalQualifiedProfileKernel(
+            owner,
+            context,
+            report,
+            qualified,
+        ) catch |err| {
+            if (owner.jit_mode.failClosed()) return err;
+            std.log.warn(
+                "Metal qualified profile entry skipped key={s} reason={s}",
+                .{ qualified.artifact_key, @errorName(err) },
+            );
+            continue;
+        };
+        activated += @intFromBool(accepted);
+    }
+    if (owner.jit_mode.failClosed() and activated != report.qualified_kernels.len) {
+        return error.MetalJitRequiredRouteFailed;
+    }
+    std.log.info(
+        "metal_jit_qualified_profile mode={s} path={s} entries={d} accepted={d} active={}",
+        .{ @tagName(owner.jit_mode), profile_path, report.qualified_kernels.len, activated, owner.jit_mode.activates() },
+    );
+    return preload_stop;
+}
+
+fn handleMetalQualifiedProfileRejection(mode: kernel_jit.Mode) !void {
+    if (mode.failClosed()) return error.MetalJitRequiredRouteFailed;
+}
+
+fn metalJitRouteFailure(
+    mode: kernel_jit.Mode,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    stage: []const u8,
+    detail: []const u8,
+) !void {
+    std.log.warn("Metal runtime JIT {s} failed for {s}: {s}", .{ stage, artifact.kernel_id, detail });
+    if (mode.failClosed() and artifact.production_enabled) return error.MetalJitRequiredRouteFailed;
+}
+
+fn metalJitCachedQualification(
+    allocator: std.mem.Allocator,
+    cache: ?*kernel_jit.ArtifactCache,
+    key: kernel_jit.ArtifactKey,
+) ?kernel_jit.QualificationRecord {
+    const value = cache orelse return null;
+    const payload = value.load(.qualification, key) catch |err| {
+        // Cache I/O is never a required-mode fatal error. A missing valid
+        // qualification still makes the individual required route fail closed.
+        std.log.warn("Metal runtime JIT qualification cache load failed: {s}", .{@errorName(err)});
+        return null;
+    } orelse return null;
+    defer allocator.free(payload);
+    const record = kernel_jit.QualificationRecord.decode(payload) catch |err| {
+        std.log.warn("Metal runtime JIT qualification payload rejected: {s}", .{@errorName(err)});
+        return null;
+    };
+    // There is one candidate per typed Metal route in this round.
+    if (record.candidate_index != 0 or !record.eligible()) return null;
+    return record;
+}
+
+fn metalJitQualificationWork(job: *MetalJitQualificationJob) anyerror!void {
+    metal_jit_process_gpu_mutex.lockUncancelable(io_compat.io());
+    defer metal_jit_process_gpu_mutex.unlock(io_compat.io());
+
+    if (!job.session.qualification_cache_persistent) {
+        return error.MetalJitQualificationCacheUnavailable;
+    }
+    const cache = if (job.session.cache) |*value| value else return error.MetalJitQualificationCacheUnavailable;
+
+    // Re-read the shared exact-key cache after taking the process GPU lock so
+    // concurrent startup preloads singleflight.
+    if (metalJitCachedQualification(
+        job.session.allocator,
+        cache,
+        job.key,
+    ) != null) {
+        metalJitRejectionMemoClear(job.key);
+        return metalJitActivateQualifiedJob(job);
+    }
+    if (metalJitRejectionMemoContains(job.key, metalJitMonotonicNowNs())) {
+        job.outcome = .rejected;
+        return error.MetalJitQualificationQuarantined;
+    }
+
+    const measurements = job.session.qualification_harness.qualify(.{
+        .allocator = job.session.allocator,
+        .artifact = job.artifact,
+        .scope = &job.session.scope,
+        .provider = job.raw_provider,
+        .runtime = job.raw_decode_runtime,
+        .generated = job.generated,
+    }) catch |err| {
+        job.outcome = .rejected;
+        // Dispatch/device/allocation errors may be transient. Only a completed
+        // deterministic correctness/timing rejection below enters the 1h memo.
+        std.log.warn("Metal runtime JIT live qualification failed for {s}: {s}", .{ job.artifact.kernel_id, @errorName(err) });
+        return err;
+    };
+    const record = metalJitQualificationRecord(measurements) catch |err| {
+        job.outcome = .rejected;
+        metalJitRejectionMemoRecord(job.key, metalJitMonotonicNowNs());
+        std.log.warn("Metal runtime JIT live qualification rejected {s}: {s}", .{ job.artifact.kernel_id, @errorName(err) });
+        return err;
+    };
+
+    // Activation requires a durable exact-key qualification record. This
+    // prevents a live-only winner from being advertised in an offline package
+    // that cannot be loaded by a later process.
+    try persistMetalJitQualification(job.session.allocator, cache, job.key, record);
+    metalJitRejectionMemoClear(job.key);
+    return metalJitActivateQualifiedJob(job);
+}
+
+fn metalJitActivateQualifiedJob(job: *MetalJitQualificationJob) !void {
+    job.outcome = .qualified;
+    if (!job.mode.activates()) return;
+    if (termite_metal_jit_route_activation_allowed(@intFromEnum(job.route.slot)) != 1) {
+        job.outcome = .rejected;
+        return error.MetalJitActivationDisabled;
+    }
+    const qualified_shapes = metalJitArtifactQualifiedShapes(&job.session.scope, job.artifact);
+    if (termite_metal_generated_pipeline_install(
+        job.raw_provider,
+        job.raw_decode_runtime,
+        job.generated,
+        @intFromEnum(job.route.slot),
+        if (qualified_shapes.len == 0) null else @ptrCast(qualified_shapes.ptr),
+        qualified_shapes.len,
+    ) != 0) {
+        job.outcome = .rejected;
+        return error.MetalJitActivationFailed;
+    }
+    job.outcome = .active;
+}
+
+fn metalJitArtifactQualifiedShapes(
+    scope: *const MetalJitRouteScope,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+) []const [2]usize {
+    return switch (artifact.op) {
+        .small_batch_matmul => |op| scope.observedShapes(op.format),
+        else => &.{},
+    };
+}
+
+pub fn metalJitProductionRouteCount(scope: MetalJitRouteScope) usize {
+    var count: usize = 0;
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend == .metal and artifact.production_enabled and scope.includes(artifact)) count += 1;
+    }
+    return count;
+}
+
+fn logMetalJitCompletion(
+    owner: anytype,
+    scope: MetalJitRouteScope,
+    started_at_ns: u128,
+    load_context: kernel_jit.LoadContext,
+    preload_stop: MetalJitPreloadStop,
+) void {
+    const scoped_routes = metalJitProductionRouteCount(scope);
+    var compiled: usize = 0;
+    var qualified: usize = 0;
+    var active: usize = 0;
+    var rejected: usize = 0;
+    var pending: usize = 0;
+    for (owner.jit_route_states, owner.jit_qualified_routes) |state, is_qualified| {
+        if (state != .missing) compiled += 1;
+        if (is_qualified) qualified += 1;
+        switch (state) {
+            .active => active += 1,
+            .rejected, .quarantined => rejected += 1,
+            .queued, .compiling, .validating, .tuning => pending += 1,
+            else => {},
+        }
+    }
+    const finished_at_ns = metalJitMonotonicNowNs();
+    const elapsed_ms: u128 = if (finished_at_ns >= started_at_ns)
+        (finished_at_ns - started_at_ns) / std.time.ns_per_ms
+    else
+        0;
+    std.log.info(
+        "metal_jit_complete backend=metal mode={s} load_context={s} scoped_routes={d} compiled={d} qualified={d} active={d} exact_active={d} rejected={d} pending={d} elapsed_ms={d} reason={s} preload_stop={s} preload_deadline_reached={} postpublication_gpu_work=false",
+        .{
+            @tagName(owner.jit_mode),
+            @tagName(load_context),
+            scoped_routes,
+            compiled,
+            qualified,
+            active,
+            owner.jit_exact_pipeline_owner_count,
+            rejected,
+            pending,
+            elapsed_ms,
+            @tagName(preload_stop),
+            @tagName(preload_stop),
+            preload_stop == .deadline,
+        },
+    );
+}
+
+fn scheduleMetalJitQualification(
+    owner: anytype,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    route: MetalJitRoute,
+    key: kernel_jit.ArtifactKey,
+    generated: *RawMetalGeneratedPipeline,
+) !void {
+    const session = owner.jit_session orelse return error.MissingMetalJitSession;
+    const slot_index = @intFromEnum(route.slot);
+    var job = MetalJitQualificationJob{
+        .session = session,
+        .raw_provider = owner.raw_provider,
+        .raw_decode_runtime = owner.raw_decode_runtime,
+        .artifact = artifact,
+        .route = route,
+        .key = key,
+        .generated = generated,
+        .mode = owner.jit_mode,
+    };
+    metalJitQualificationWork(&job) catch |err| {
+        owner.jit_route_states[slot_index] = .rejected;
+        return err;
+    };
+    switch (job.outcome) {
+        .qualified => {
+            owner.jit_qualified_routes[slot_index] = true;
+            owner.jit_route_states[slot_index] = .eligible;
+        },
+        .active => {
+            owner.jit_qualified_routes[slot_index] = true;
+            owner.jit_route_states[slot_index] = .active;
+        },
+        .rejected => owner.jit_route_states[slot_index] = .rejected,
+    }
+}
+
+const MetalJitLoadContext = struct {
+    allocator: std.mem.Allocator,
+    config: kernel_jit.Config,
+    scope: MetalJitRouteScope,
+    device: MetalDeviceInfo,
+    device_name: []const u8,
+    compiler_identity: []const u8,
+    cache: ?*kernel_jit.ArtifactCache,
+    started_at_ns: u128,
+
+    fn remainingBudgetNs(self: MetalJitLoadContext) u64 {
+        const budget_ns = self.config.preload_budget_ms * std.time.ns_per_ms;
+        return metalJitRemainingBudgetNs(budget_ns, self.started_at_ns, metalJitMonotonicNowNs());
+    }
+};
+
+const MetalJitPreloadStop = enum {
+    complete,
+    profile_capture_only,
+    deadline,
+    dynamic_load,
+    empty_scope,
+    unsupported_shape,
+};
+
+const MetalJitStartupPolicy = enum {
+    profile_capture_only,
+    explicit_profile_only,
+    general_compilation,
+};
+
+fn metalJitRemainingBudgetNs(budget_ns: u64, started_at_ns: u128, now_ns: u128) u64 {
+    if (started_at_ns == 0 or now_ns == 0 or now_ns < started_at_ns) return 0;
+    const elapsed_ns = now_ns - started_at_ns;
+    return if (elapsed_ns >= budget_ns) 0 else @intCast(budget_ns - elapsed_ns);
+}
+
+fn metalJitPreloadStartBudgetExhausted(mode: kernel_jit.Mode, remaining_ns: u64) bool {
+    return !mode.failClosed() and remaining_ns == 0;
+}
+
+fn metalJitStartupPolicy(config: kernel_jit.Config) MetalJitStartupPolicy {
+    if (config.profile_capture_only) return .profile_capture_only;
+    return if (config.qualified_profile_path != null) .explicit_profile_only else .general_compilation;
+}
+
+fn metalJitStopsForEmptyProductionScope(
+    startup_policy: MetalJitStartupPolicy,
+    scope: MetalJitRouteScope,
+) bool {
+    // Exact qualified profiles may intentionally contain candidate routes that
+    // are not production-enabled in the general artifact registry. Their own
+    // fingerprint, shape, schedule, evidence, and cache checks are the complete
+    // fail-closed admission contract.
+    return startup_policy == .general_compilation and metalJitProductionRouteCount(scope) == 0;
+}
+
+/// Compile only production-wired routes synchronously. Candidate-only registry
+/// entries have no runtime activation/qualification contract and must not spend
+/// a model's preload budget or delay production qualification. Metal currently
+/// persists qualification evidence only: MSL/pipeline objects are recompiled at
+/// each model/process load until a trusted, budget-accounted binary cache exists.
+fn compileMetalJitProduction(
+    owner: anytype,
+    context: MetalJitLoadContext,
+) !MetalJitPreloadStop {
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend != .metal) continue;
+        if (!context.scope.includes(artifact)) continue;
+        if (!artifact.production_enabled) continue;
+        if (metalJitPreloadStartBudgetExhausted(context.config.mode, context.remainingBudgetNs())) {
+            std.log.warn("Metal runtime JIT preload admission budget exhausted before {s}", .{artifact.kernel_id});
+            return .deadline;
+        }
+
+        const route = metalJitRouteForArtifact(artifact) orelse {
+            try metalJitRouteFailure(context.config.mode, artifact, "slot mapping", "missing provider/runtime slot");
+            continue;
+        };
+        const slot_index = @intFromEnum(route.slot);
+        owner.jit_route_states[slot_index] = .compiling;
+
+        const emitted = quant_kernel_compiler.emitRuntimeArtifactSource(context.allocator, artifact) catch |err| {
+            owner.jit_route_states[slot_index] = .rejected;
+            try metalJitRouteFailure(context.config.mode, artifact, "source emission", @errorName(err));
+            continue;
+        };
+        defer emitted.deinit(context.allocator);
+
+        const key = metalJitArtifactKey(
+            artifact,
+            emitted.data,
+            context.device,
+            context.device_name,
+            context.compiler_identity,
+            &context.scope,
+        ) catch |err| {
+            owner.jit_route_states[slot_index] = .rejected;
+            try metalJitRouteFailure(context.config.mode, artifact, "artifact identity", @errorName(err));
+            continue;
+        };
+        owner.jit_artifact_keys[slot_index] = key;
+        const qualification = metalJitCachedQualification(context.allocator, context.cache, key);
+        owner.jit_qualified_routes[slot_index] = qualification != null;
+
+        const kernel_name = context.allocator.dupeZ(u8, artifact.kernel_id) catch |err| {
+            owner.jit_route_states[slot_index] = .rejected;
+            try metalJitRouteFailure(context.config.mode, artifact, "kernel name allocation", @errorName(err));
+            continue;
+        };
+        defer context.allocator.free(kernel_name);
+        var error_buffer: [4096]u8 = @splat(0);
+        const generated = blk: {
+            metal_jit_process_gpu_mutex.lockUncancelable(io_compat.io());
+            defer metal_jit_process_gpu_mutex.unlock(io_compat.io());
+            break :blk termite_metal_generated_pipeline_create(
+                emitted.data.ptr,
+                emitted.data.len,
+                kernel_name.ptr,
+                @intFromBool(metalJitPreciseMath(artifact)),
+                error_buffer[0..].ptr,
+                error_buffer.len,
+            );
+        };
+        const owned_generated = generated orelse {
+            owner.jit_route_states[slot_index] = .rejected;
+            const detail = std.mem.sliceTo(error_buffer[0..], 0);
+            try metalJitRouteFailure(
+                context.config.mode,
+                artifact,
+                "pipeline compilation",
+                if (detail.len == 0) "unknown Metal compiler error" else detail,
+            );
+            continue;
+        };
+        owner.jit_route_states[slot_index] = .validating;
+        var pipeline_info: MetalGeneratedPipelineInfo = .{};
+        if (termite_metal_generated_pipeline_info_get(owned_generated, &pipeline_info) != 0) {
+            termite_metal_generated_pipeline_destroy(owned_generated);
+            owner.jit_route_states[slot_index] = .rejected;
+            try metalJitRouteFailure(context.config.mode, artifact, "pipeline reflection", "Metal pipeline info unavailable");
+            continue;
+        }
+        validateMetalJitSchedule(artifact, context.device, pipeline_info) catch |err| {
+            termite_metal_generated_pipeline_destroy(owned_generated);
+            owner.jit_route_states[slot_index] = .rejected;
+            try metalJitRouteFailure(context.config.mode, artifact, "schedule validation", @errorName(err));
+            continue;
+        };
+        if (owner.jit_pipeline_owners[slot_index] != null) {
+            termite_metal_generated_pipeline_destroy(owned_generated);
+            owner.jit_route_states[slot_index] = .rejected;
+            try metalJitRouteFailure(context.config.mode, artifact, "pipeline retention", "duplicate slot owner");
+            continue;
+        }
+        owner.jit_pipeline_owners[slot_index] = owned_generated;
+        owner.jit_route_states[slot_index] = .eligible;
+
+        if (qualification == null) {
+            // Pipeline compilation is non-preemptible and may consume the
+            // remaining admission window. Recheck before starting any live
+            // GPU qualification; optional modes retain the compiled pipeline
+            // but leave the route uninstalled on bundled fallback.
+            if (metalJitPreloadStartBudgetExhausted(context.config.mode, context.remainingBudgetNs())) {
+                std.log.warn("Metal runtime JIT preload admission budget exhausted before qualifying {s}", .{artifact.kernel_id});
+                return .deadline;
+            }
+            scheduleMetalJitQualification(owner, artifact, route, key, owned_generated) catch |err| {
+                owner.jit_route_states[slot_index] = .rejected;
+                try metalJitRouteFailure(context.config.mode, artifact, "live qualification", @errorName(err));
+                continue;
+            };
+            continue;
+        }
+        if (!context.config.mode.activates()) continue;
+        if (termite_metal_jit_route_activation_allowed(@intFromEnum(route.slot)) != 1) {
+            try metalJitRouteFailure(
+                context.config.mode,
+                artifact,
+                "activation",
+                "legacy generated-quant kill switch is active",
+            );
+            continue;
+        }
+        const qualified_shapes = metalJitArtifactQualifiedShapes(&context.scope, artifact);
+        if (termite_metal_generated_pipeline_install(
+            owner.raw_provider,
+            owner.raw_decode_runtime,
+            owned_generated,
+            @intFromEnum(route.slot),
+            if (qualified_shapes.len == 0) null else @ptrCast(qualified_shapes.ptr),
+            qualified_shapes.len,
+        ) != 0) {
+            try metalJitRouteFailure(context.config.mode, artifact, "activation", "provider/runtime slot install failed");
+            continue;
+        }
+        owner.jit_route_states[slot_index] = .active;
+    }
+    return .complete;
+}
+
+pub fn initializeMetalKernelJit(owner: anytype, config: kernel_jit.Config) !void {
+    return initializeMetalKernelJitWithOptions(owner, .{ .config = config });
+}
+
+pub fn initializeMetalKernelJitWithOptions(owner: anytype, options: MetalJitOptions) !void {
+    try options.config.validate();
+    try validateMetalJitLoadContext(options.config, options.load_context);
+    owner.jit_mode = options.config.mode;
+    owner.jit_scope = options.scope;
+    if (!options.config.mode.compiles()) return;
+    const started_at_ns = metalJitMonotonicNowNs();
+    const startup_policy = metalJitStartupPolicy(options.config);
+
+    // A dynamic model load can overlap inference on an already-published
+    // model. Do not let source compilation or qualification contend with that
+    // shared Metal device. Only the explicit pre-serving preload phase owns a
+    // safe live-qualification window.
+    if (!options.load_context.allowsQualification()) {
+        logMetalJitCompletion(owner, options.scope, started_at_ns, options.load_context, .dynamic_load);
+        return;
+    }
+    if (!options.scope.conformance_complete) {
+        std.log.warn(
+            "Metal runtime JIT scope incomplete reason={s} format={s} out_dim={d} in_dim={d}; affected shapes remain on bundled kernels",
+            .{
+                @tagName(options.scope.invalid_reason),
+                @tagName(options.scope.invalid_format),
+                options.scope.invalid_shape[0],
+                options.scope.invalid_shape[1],
+            },
+        );
+        if (options.config.mode.failClosed()) {
+            logMetalJitCompletion(owner, options.scope, started_at_ns, options.load_context, .unsupported_shape);
+            return error.MetalJitRequiredRouteFailed;
+        }
+    }
+    if (metalJitStopsForEmptyProductionScope(startup_policy, options.scope)) {
+        logMetalJitCompletion(
+            owner,
+            options.scope,
+            started_at_ns,
+            options.load_context,
+            if (options.scope.conformance_complete) .empty_scope else .unsupported_shape,
+        );
+        if (options.config.mode.failClosed()) return error.MetalJitRequiredRouteFailed;
+        return;
+    }
+
+    var device: MetalDeviceInfo = .{};
+    if (termite_metal_device_info_get(&device) != 0) {
+        if (options.config.mode.failClosed()) return error.MetalJitRequiredRouteFailed;
+        if (options.config.profile_capture_only) return error.MetalWorkloadProfileUnavailable;
+        std.log.warn("Metal runtime JIT unavailable: Metal device info query failed", .{});
+        return;
+    }
+    var device_name_buffer: [4096]u8 = undefined;
+    const device_name_len = termite_metal_copy_device_name(null, 0);
+    if (device_name_len == 0 or device_name_len > device_name_buffer.len or
+        termite_metal_copy_device_name(device_name_buffer[0..].ptr, device_name_buffer.len) != device_name_len)
+    {
+        if (options.config.mode.failClosed()) return error.MetalJitRequiredRouteFailed;
+        if (options.config.profile_capture_only) return error.MetalWorkloadProfileUnavailable;
+        std.log.warn("Metal runtime JIT unavailable: device identity query failed", .{});
+        return;
+    }
+    var compiler_buffer: [4096]u8 = undefined;
+    const compiler_len = termite_metal_copy_compiler_identity(null, 0);
+    if (compiler_len == 0 or compiler_len > compiler_buffer.len or
+        termite_metal_copy_compiler_identity(compiler_buffer[0..].ptr, compiler_buffer.len) != compiler_len)
+    {
+        if (options.config.mode.failClosed()) return error.MetalJitRequiredRouteFailed;
+        if (options.config.profile_capture_only) return error.MetalWorkloadProfileUnavailable;
+        std.log.warn("Metal runtime JIT unavailable: compiler identity query failed", .{});
+        return;
+    }
+
+    const allocator = std.heap.c_allocator;
+    const session = allocator.create(MetalJitSession) catch |err| {
+        if (options.config.mode.failClosed()) return error.MetalJitRequiredRouteFailed;
+        if (options.config.profile_capture_only) return error.MetalWorkloadProfileUnavailable;
+        std.log.warn("Metal runtime JIT session allocation failed: {s}", .{@errorName(err)});
+        return;
+    };
+    session.* = .{
+        .allocator = allocator,
+        .qualification_harness = options.qualification_harness,
+        .scope = options.scope,
+    };
+    owner.jit_session = session;
+
+    const home: ?[]const u8 = if (std.c.getenv("HOME")) |value| std.mem.span(value) else null;
+    const cache_path = options.config.resolveCacheDir(allocator, home) catch |err| blk: {
+        std.log.warn("Metal runtime JIT cache path resolution failed: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (cache_path) |path| allocator.free(path);
+    if (cache_path) |path| {
+        const max_cache_bytes = options.config.maxCacheBytes() catch unreachable;
+        session.cache = kernel_jit.ArtifactCache.initPath(
+            allocator,
+            io_compat.io(),
+            path,
+            max_cache_bytes,
+        ) catch |err| blk: {
+            // Always soft: required mode will fail the affected route if it
+            // cannot obtain a valid qualification through another source.
+            std.log.warn("Metal runtime JIT cache initialization failed: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        session.qualification_cache_persistent = session.cache != null and max_cache_bytes != 0;
+    }
+
+    const context = MetalJitLoadContext{
+        .allocator = allocator,
+        .config = options.config,
+        .scope = options.scope,
+        .device = device,
+        .device_name = device_name_buffer[0..device_name_len],
+        .compiler_identity = compiler_buffer[0..compiler_len],
+        .cache = if (session.cache) |*value| value else null,
+        .started_at_ns = started_at_ns,
+    };
+    switch (startup_policy) {
+        .profile_capture_only => {
+            if (!metalJitHasPersistentQualificationCache(owner)) {
+                return error.MetalJitQualificationCacheUnavailable;
+            }
+            logMetalJitCompletion(owner, options.scope, started_at_ns, options.load_context, .profile_capture_only);
+            return;
+        },
+        .explicit_profile_only => {
+            const profile_path = options.config.qualified_profile_path.?;
+            const preload_stop = activateMetalQualifiedProfile(owner, context, profile_path) catch |err| blk: {
+                std.log.warn("Metal qualified profile rejected: {s}", .{@errorName(err)});
+                try handleMetalQualifiedProfileRejection(options.config.mode);
+                break :blk MetalJitPreloadStop.complete;
+            };
+            // An explicit profile is the complete activation contract. Never turn
+            // a rejected or empty optional profile into live general compilation.
+            logMetalJitCompletion(owner, options.scope, started_at_ns, options.load_context, preload_stop);
+            return;
+        },
+        .general_compilation => {},
+    }
+    const preload_stop = try compileMetalJitProduction(owner, context);
+    logMetalJitCompletion(
+        owner,
+        options.scope,
+        context.started_at_ns,
+        options.load_context,
+        if (!options.scope.conformance_complete and preload_stop == .complete) .unsupported_shape else preload_stop,
+    );
+}
+
+test "Metal explicit qualified profiles do not enable general live compilation" {
+    try std.testing.expectEqual(
+        MetalJitStartupPolicy.profile_capture_only,
+        metalJitStartupPolicy(.{ .mode = .shadow, .profile_capture_only = true }),
+    );
+    try std.testing.expectEqual(
+        MetalJitStartupPolicy.explicit_profile_only,
+        metalJitStartupPolicy(.{ .mode = .on, .qualified_profile_path = "/tmp/qualified-profile.json" }),
+    );
+    try std.testing.expectEqual(
+        MetalJitStartupPolicy.general_compilation,
+        metalJitStartupPolicy(.{ .mode = .on }),
+    );
+
+    var exact_candidate_scope = MetalJitRouteScope.none();
+    try std.testing.expect(exact_candidate_scope.includeQuantShape(.q4_0, 2560, 10240));
+    try std.testing.expectEqual(@as(usize, 0), metalJitProductionRouteCount(exact_candidate_scope));
+    try std.testing.expect(!metalJitStopsForEmptyProductionScope(.explicit_profile_only, exact_candidate_scope));
+    try std.testing.expect(metalJitStopsForEmptyProductionScope(.general_compilation, exact_candidate_scope));
+}
+
+test "Metal JIT preload start budget is fail safe and required mode is exhaustive" {
+    try std.testing.expectEqual(@as(u64, 60), metalJitRemainingBudgetNs(100, 10, 50));
+    try std.testing.expectEqual(@as(u64, 0), metalJitRemainingBudgetNs(100, 10, 110));
+    try std.testing.expectEqual(@as(u64, 0), metalJitRemainingBudgetNs(100, 0, 50));
+    try std.testing.expectEqual(@as(u64, 0), metalJitRemainingBudgetNs(100, 50, 0));
+    try std.testing.expectEqual(@as(u64, 0), metalJitRemainingBudgetNs(100, 50, 49));
+
+    try std.testing.expect(metalJitPreloadStartBudgetExhausted(.shadow, 0));
+    try std.testing.expect(metalJitPreloadStartBudgetExhausted(.on, 0));
+    try std.testing.expect(!metalJitPreloadStartBudgetExhausted(.required, 0));
+    try std.testing.expect(!metalJitPreloadStartBudgetExhausted(.shadow, 1));
+    try std.testing.expect(!metalJitPreloadStartBudgetExhausted(.on, 1));
+    try std.testing.expect(!metalJitPreloadStartBudgetExhausted(.required, 1));
+}
+
+test "metal runtime JIT maps every typed artifact to one existing slot and full cache identity" {
+    try std.testing.expectEqual(metal_jit_pipeline_slot_count, metal_jit_routes.len);
+    var seen_slots = [_]bool{false} ** metal_jit_pipeline_slot_count;
+    var seen_keys = empty_metal_jit_artifact_keys;
+    var metal_count: usize = 0;
+    var production_count: usize = 0;
+    const device = MetalDeviceInfo{
+        .registry_id = 0x1234,
+        .max_threads_per_threadgroup_width = 1024,
+        .max_threadgroup_memory_length = 64 * 1024,
+        .apple_gpu_family = 9,
+        .common_gpu_family = 3,
+        .metal_gpu_family = 2,
+        .has_unified_memory = 1,
+    };
+    var scope = MetalJitRouteScope.none();
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.matmulOp()) |op| {
+            const values_per_block = op.format.valuesPerBlock() orelse continue;
+            _ = scope.includeQuantShape(op.format, 256, @max(@as(usize, 512), values_per_block * 2));
+        }
+    }
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend != .metal or artifact.matmulOp() == null) {
+            try std.testing.expect(metalJitRouteForArtifact(artifact) == null);
+            continue;
+        }
+        metal_count += 1;
+        const route = metalJitRouteForArtifact(artifact) orelse return error.MissingMetalJitRoute;
+        const slot_index = @intFromEnum(route.slot);
+        try std.testing.expect(slot_index < seen_slots.len);
+        try std.testing.expect(!seen_slots[slot_index]);
+        seen_slots[slot_index] = true;
+        if (artifact.production_enabled) {
+            production_count += 1;
+            try std.testing.expect(route.gate_env != null);
+        }
+        const compiler_gate = quant_kernel_compiler.artifactRuntimeGateEnv(
+            quant_kernel_compiler.matmulArtifactView(artifact),
+        ) orelse return error.MissingMetalJitGate;
+        try std.testing.expectEqualStrings(std.mem.span(compiler_gate), route.gate_env.?);
+        const source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse
+            return error.MissingMetalJitSource;
+        try std.testing.expect(metalJitBaselineIdentity(source) != null);
+        const key = try metalJitArtifactKey(
+            artifact,
+            source,
+            device,
+            "test-metal-device",
+            "Apple-Metal/newLibraryWithSource/test-os",
+            &scope,
+        );
+        for (seen_keys) |prior| {
+            if (prior) |value| try std.testing.expect(!std.mem.eql(u8, &value, &key));
+        }
+        seen_keys[slot_index] = key;
+    }
+    try std.testing.expectEqual(metal_jit_routes.len, metal_count);
+    try std.testing.expectEqual(@as(usize, 7), production_count);
+    for (seen_slots) |seen| try std.testing.expect(seen);
+}
+
+test "metal runtime JIT route scope is model and operation specific" {
+    var scope = MetalJitRouteScope.fromTensorTypes(&.{ .Q2_K, .Q4_0, .F16 });
+    _ = scope.includeQuantShape(.q2_k, 256, 512);
+    _ = scope.includeQuantShape(.q4_0, 256, 512);
+    var included_production: usize = 0;
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend != .metal) continue;
+        const included = scope.includes(artifact);
+        switch (artifact.op) {
+            .small_batch_matmul => |op| {
+                const expected = op.format == .q2_k or op.format == .q4_0;
+                try std.testing.expectEqual(expected, included);
+                if (included and artifact.production_enabled) included_production += 1;
+            },
+            .microkernel => try std.testing.expect(!included),
+            .attention => try std.testing.expect(!included),
+        }
+    }
+    // Q4_0 is still a candidate; only Q2_K is a required production route.
+    try std.testing.expectEqual(@as(usize, 1), included_production);
+    try std.testing.expect(!scope.eql(MetalJitRouteScope.all()));
+    try std.testing.expect(MetalJitRouteScope.none().eql(.{}));
+
+    var oversized_scope = MetalJitRouteScope.none();
+    const too_large_for_c_abi = @as(usize, std.math.maxInt(u32)) + 1;
+    try std.testing.expect(!oversized_scope.includeQuantShape(.q2_k, too_large_for_c_abi, 512));
+    try std.testing.expectEqual(MetalJitScopeInvalidReason.dimension_overflow, oversized_scope.invalid_reason);
+    try std.testing.expectEqual(@as(usize, 0), oversized_scope.observedShapes(.q2_k).len);
+}
+
+test "metal runtime JIT artifact identity includes exact qualified shapes" {
+    const artifact = comptime blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |candidate| {
+            if (candidate.backend == .metal and candidate.production_enabled) break :blk candidate;
+        }
+        @compileError("missing production Metal artifact");
+    };
+    const op = artifact.matmulOp().?;
+    const in_dim = @max(@as(usize, 512), op.format.valuesPerBlock().? * 2);
+    var first_scope = MetalJitRouteScope.none();
+    _ = first_scope.includeQuantShape(op.format, 256, in_dim);
+    var second_scope = MetalJitRouteScope.none();
+    _ = second_scope.includeQuantShape(op.format, 257, in_dim);
+    const source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse
+        return error.MissingMetalJitSource;
+    const device = MetalDeviceInfo{
+        .registry_id = 0x1234,
+        .max_threads_per_threadgroup_width = 1024,
+        .max_threadgroup_memory_length = 64 * 1024,
+        .apple_gpu_family = 9,
+        .common_gpu_family = 3,
+        .metal_gpu_family = 2,
+        .has_unified_memory = 1,
+    };
+    const first_key = try metalJitArtifactKey(
+        artifact,
+        source,
+        device,
+        "test-metal-device",
+        "Apple-Metal/newLibraryWithSource/test-os",
+        &first_scope,
+    );
+    const second_key = try metalJitArtifactKey(
+        artifact,
+        source,
+        device,
+        "test-metal-device",
+        "Apple-Metal/newLibraryWithSource/test-os",
+        &second_scope,
+    );
+    try std.testing.expect(!std.mem.eql(u8, &first_key, &second_key));
+}
+
+test "metal exact artifact identity includes the row tile" {
+    const artifact = comptime blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |candidate| {
+            const op = candidate.matmulOp() orelse continue;
+            if (candidate.backend == .metal and op.format == .q4_0 and op.epilogue == .none) {
+                break :blk candidate;
+            }
+        }
+        @compileError("missing Q4_0 Metal artifact");
+    };
+    const signature = RawWorkloadProfileEntry{
+        .rows = 2,
+        .in_dim = 10240,
+        .out_dim = 2560,
+        .format = workloadProfileQuantFormatId("q4_0").?,
+        .dispatch = workloadProfileDispatchId("small_batch").?,
+        .implementation = @intFromEnum(WorkloadImplementation.bundled),
+        .regime = @intFromEnum(WorkloadRegime.speculative_verify),
+        .occupied = 1,
+    };
+    const device = MetalDeviceInfo{
+        .registry_id = 0x1234,
+        .max_buffer_length = 64 * 1024 * 1024,
+        .max_threads_per_threadgroup_width = 1024,
+        .max_threadgroup_memory_length = 64 * 1024,
+        .apple_gpu_family = 9,
+        .common_gpu_family = 3,
+        .metal_gpu_family = 2,
+        .has_unified_memory = 1,
+    };
+    var scope = MetalJitRouteScope.none();
+    try std.testing.expect(scope.includeQuantShape(.q4_0, 2560, 10240));
+    const source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse
+        return error.MissingMetalJitSource;
+    const row_one = quant_kernel_compiler.KernelSchedule{
+        .threads_per_threadgroup = 32,
+        .cols_per_threadgroup = 2,
+        .rows_per_threadgroup = 1,
+        .reduction = .simdgroup_tiled,
+    };
+    var row_two = row_one;
+    row_two.rows_per_threadgroup = 2;
+    const first_key = try metalJitExactArtifactKey(
+        artifact,
+        source,
+        device,
+        "test-metal-device",
+        "Apple-Metal/newLibraryWithSource/test-os",
+        &scope,
+        signature,
+        row_one,
+    );
+    const second_key = try metalJitExactArtifactKey(
+        artifact,
+        source,
+        device,
+        "test-metal-device",
+        "Apple-Metal/newLibraryWithSource/test-os",
+        &scope,
+        signature,
+        row_two,
+    );
+    try std.testing.expect(!std.mem.eql(u8, &first_key, &second_key));
+
+    var nr8 = row_two;
+    nr8.cols_per_threadgroup = 8;
+    const nr8_key = try metalJitExactArtifactKey(
+        artifact,
+        source,
+        device,
+        "test-metal-device",
+        "Apple-Metal/newLibraryWithSource/test-os",
+        &scope,
+        signature,
+        nr8,
+    );
+    try std.testing.expect(!std.mem.eql(u8, &second_key, &nr8_key));
+}
+
+test "Metal exact activation rejects a stale small-output candidate schedule" {
+    const entry = kernel_jit_profile_output.ProfileEntry{
+        .regime = "speculative_verify",
+        .quant_format = "q4_0",
+        .dispatch = "small_batch",
+        .implementation = "bundled",
+        .rows = 2,
+        .in_dim = 2560,
+        .out_dim = 512,
+        .input_encoding = "f32",
+        .output_encoding = "f32",
+        .epilogue = "none",
+        .fusion = "none",
+        .layout = "row_major",
+        .call_count = 1,
+        .logical_bytes = 1,
+        .macs = 2 * 2560 * 512,
+        .estimated_gpu_nanos = 20_000,
+        .calibrated = true,
+    };
+    // Candidate 1 used to be NR8 for this shape. The v13 catalog maps the
+    // same index to NR2, so activation must reject the stale schedule before
+    // consulting the cache or compiling source.
+    const stale = kernel_jit_profile_output.QualifiedKernel{
+        .artifact_key = "0000000000000000000000000000000000000000000000000000000000000001",
+        .regime = entry.regime,
+        .quant_format = entry.quant_format,
+        .dispatch = entry.dispatch,
+        .implementation = entry.implementation,
+        .rows = entry.rows,
+        .in_dim = entry.in_dim,
+        .out_dim = entry.out_dim,
+        .input_encoding = entry.input_encoding,
+        .output_encoding = entry.output_encoding,
+        .epilogue = entry.epilogue,
+        .fusion = entry.fusion,
+        .layout = entry.layout,
+        .candidate_index = 1,
+        .threads_per_threadgroup = 32,
+        .rows_per_threadgroup = 2,
+        .cols_per_threadgroup = 8,
+        .reduction = "simdgroup_tiled",
+        .measured_speedup = 1.03,
+        .minimum_repeat_speedup = 1.02,
+    };
+    const report = kernel_jit_profile_output.ProfileReport{
+        .complete = true,
+        .device_registry_id = 1,
+        .compiler_fingerprint = "compiler",
+        .model_fingerprint = "model",
+        .entries = &.{entry},
+        .qualified_kernels = &.{stale},
+    };
+    var scope = MetalJitRouteScope.none();
+    try std.testing.expect(scope.includeQuantShape(.q4_0, entry.out_dim, entry.in_dim));
+    const FakeOwner = struct {
+        jit_mode: kernel_jit.Mode = .shadow,
+        raw_provider: ?*RawMetalProvider = null,
+        raw_decode_runtime: ?*RawMetalDecodeRuntime = null,
+
+        fn canOwnExactJitPipeline(_: *@This()) bool {
+            return false;
+        }
+
+        fn ownExactJitPipeline(_: *@This(), _: *RawMetalGeneratedPipeline) void {
+            unreachable;
+        }
+    };
+    var owner: FakeOwner = .{};
+    try std.testing.expectError(
+        error.StaleQualifiedKernelSchedule,
+        activateMetalQualifiedProfileKernel(
+            &owner,
+            .{
+                .allocator = std.testing.allocator,
+                .config = .{},
+                .scope = scope,
+                .device = .{},
+                .device_name = "",
+                .compiler_identity = "",
+                .cache = null,
+                .started_at_ns = 0,
+            },
+            report,
+            stale,
+        ),
+    );
+}
+
+test "Metal qualified profile preserves the exact bundled signature" {
+    const entry = kernel_jit_profile_output.ProfileEntry{
+        .regime = "encoder",
+        .quant_format = "q4_k",
+        .dispatch = "scalar",
+        .implementation = "bundled",
+        .rows = 2,
+        .in_dim = 256,
+        .out_dim = 512,
+        .input_encoding = "f32",
+        .output_encoding = "f32",
+        .epilogue = "none",
+        .fusion = "none",
+        .layout = "row_major",
+        .call_count = 1,
+        .logical_bytes = 1,
+        .macs = 2 * 256 * 512,
+        .estimated_gpu_nanos = 1,
+        .calibrated = true,
+    };
+    const qualified = kernel_jit_profile_output.QualifiedKernel{
+        .artifact_key = "0000000000000000000000000000000000000000000000000000000000000001",
+        .regime = entry.regime,
+        .quant_format = entry.quant_format,
+        .dispatch = entry.dispatch,
+        .implementation = entry.implementation,
+        .rows = entry.rows,
+        .in_dim = entry.in_dim,
+        .out_dim = entry.out_dim,
+        .input_encoding = entry.input_encoding,
+        .output_encoding = entry.output_encoding,
+        .epilogue = entry.epilogue,
+        .fusion = entry.fusion,
+        .layout = entry.layout,
+        .candidate_index = 0,
+        .threads_per_threadgroup = 64,
+        .cols_per_threadgroup = 8,
+        .reduction = "simdgroup",
+        .measured_speedup = 1.03,
+        .minimum_repeat_speedup = 1.02,
+    };
+    const report = kernel_jit_profile_output.ProfileReport{
+        .complete = true,
+        .device_registry_id = 1,
+        .compiler_fingerprint = "compiler",
+        .model_fingerprint = "model",
+        .entries = &.{entry},
+        .qualified_kernels = &.{qualified},
+        .tuning_selected_signatures = 1,
+        .tuning_qualified_signatures = 1,
+        .tuning_coverage_complete = true,
+    };
+    const signature = try rawSignatureFromQualifiedProfile(report, qualified);
+    try std.testing.expectEqual(@as(u8, 0), signature.dispatch);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(WorkloadImplementation.bundled)), signature.implementation);
+    try validateQualifiedProfileSelection(report);
+
+    var relabeled = qualified;
+    relabeled.dispatch = "small_batch";
+    try std.testing.expectError(
+        error.MissingQualifiedKernelSignature,
+        rawSignatureFromQualifiedProfile(report, relabeled),
+    );
+}
+
+test "Metal qualified profile coverage recomputes the selected signature set" {
+    const high = kernel_jit_profile_output.ProfileEntry{
+        .regime = "encoder",
+        .quant_format = "q4_k",
+        .dispatch = "scalar",
+        .implementation = "bundled",
+        .rows = 2,
+        .in_dim = 256,
+        .out_dim = 512,
+        .input_encoding = "f32",
+        .output_encoding = "f32",
+        .epilogue = "none",
+        .fusion = "none",
+        .layout = "row_major",
+        .call_count = 90,
+        .logical_bytes = 1,
+        .macs = 1,
+        .estimated_gpu_nanos = 90,
+        .calibrated = true,
+    };
+    var low = high;
+    low.out_dim = 768;
+    low.call_count = 10;
+    low.estimated_gpu_nanos = 10;
+    const entries = [_]kernel_jit_profile_output.ProfileEntry{ high, low };
+
+    var qualified = kernel_jit_profile_output.QualifiedKernel{
+        .artifact_key = "0000000000000000000000000000000000000000000000000000000000000001",
+        .regime = high.regime,
+        .quant_format = high.quant_format,
+        .dispatch = high.dispatch,
+        .implementation = high.implementation,
+        .rows = high.rows,
+        .in_dim = high.in_dim,
+        .out_dim = high.out_dim,
+        .input_encoding = high.input_encoding,
+        .output_encoding = high.output_encoding,
+        .epilogue = high.epilogue,
+        .fusion = high.fusion,
+        .layout = high.layout,
+        .candidate_index = 0,
+        .threads_per_threadgroup = 32,
+        .cols_per_threadgroup = 1,
+        .reduction = "simd_sum",
+        .measured_speedup = 1.03,
+        .minimum_repeat_speedup = 1.02,
+    };
+    var report = kernel_jit_profile_output.ProfileReport{
+        .complete = true,
+        .device_registry_id = 1,
+        .compiler_fingerprint = "compiler",
+        .model_fingerprint = "model",
+        .entries = &entries,
+        .qualified_kernels = &.{qualified},
+        .tuning_selected_signatures = 1,
+        .tuning_qualified_signatures = 1,
+        .tuning_coverage_complete = true,
+    };
+    try validateQualifiedProfileSelection(report);
+
+    qualified.out_dim = low.out_dim;
+    report.qualified_kernels = &.{qualified};
+    try std.testing.expectError(
+        error.InvalidQualifiedKernelSelection,
+        validateQualifiedProfileSelection(report),
+    );
+
+    report.qualified_kernels = &.{};
+    report.tuning_selected_signatures = 0;
+    report.tuning_qualified_signatures = 0;
+    try std.testing.expectError(
+        error.InvalidQualifiedKernelSelection,
+        validateQualifiedProfileSelection(report),
+    );
+}
+
+test "Metal qualified profile rejection is fail closed only in required mode" {
+    try handleMetalQualifiedProfileRejection(.shadow);
+    try handleMetalQualifiedProfileRejection(.on);
+    try std.testing.expectError(
+        error.MetalJitRequiredRouteFailed,
+        handleMetalQualifiedProfileRejection(.required),
+    );
+}
+
+test "metal runtime JIT correctness matrix covers routed row and tile boundaries" {
+    const q8_shapes = try metalJitConformanceShapes(.q8_0);
+    try std.testing.expectEqualDeep([_]MetalJitConformanceShape{
+        .{ .rows = 2, .in_dim = 512, .out_dim = 255 },
+        .{ .rows = 3, .in_dim = 544, .out_dim = 257 },
+        .{ .rows = 4, .in_dim = 1024, .out_dim = 256 },
+        .{ .rows = 5, .in_dim = 512, .out_dim = 257 },
+        .{ .rows = 6, .in_dim = 544, .out_dim = 255 },
+        .{ .rows = 7, .in_dim = 1024, .out_dim = 257 },
+        .{ .rows = 8, .in_dim = 544, .out_dim = 256 },
+    }, q8_shapes);
+    const k_shapes = try metalJitConformanceShapes(.q4_k);
+    try std.testing.expectEqualDeep([_]MetalJitConformanceShape{
+        .{ .rows = 2, .in_dim = 512, .out_dim = 255 },
+        .{ .rows = 3, .in_dim = 768, .out_dim = 257 },
+        .{ .rows = 4, .in_dim = 1024, .out_dim = 256 },
+        .{ .rows = 5, .in_dim = 512, .out_dim = 257 },
+        .{ .rows = 6, .in_dim = 768, .out_dim = 255 },
+        .{ .rows = 7, .in_dim = 1024, .out_dim = 257 },
+        .{ .rows = 8, .in_dim = 768, .out_dim = 256 },
+    }, k_shapes);
+    try std.testing.expectEqualDeep(q8_shapes, try metalJitConformanceShapes(.q4_0));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "exact-rows+shape"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "full-bundled-differential"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "cold+repeat-before-timing"));
+    try std.testing.expectEqual(@as(usize, 64), metal_jit_baseline_implementation_sha256.len);
+    try std.testing.expectEqual(@as(usize, 64), metal_jit_qualification_implementation_sha256.len);
+}
+
+test "metal runtime JIT observed oracle checks unsampled output columns" {
+    const shape = MetalJitConformanceShape{ .rows = 2, .in_dim = 512, .out_dim = 16 };
+    const raw_weight = try metalJitPatternWeight(std.testing.allocator, .q4_k, shape.in_dim, shape.out_dim, 7);
+    defer std.testing.allocator.free(raw_weight);
+    const input = [_]f32{0} ** (2 * 512);
+    const baseline_output = [_]f32{0} ** (2 * 16);
+    var candidate_output = baseline_output;
+    candidate_output[1] = 0.001;
+    const request = MetalJitQualificationRequest{
+        .allocator = std.testing.allocator,
+        .artifact = undefined,
+        .scope = undefined,
+        .provider = null,
+        .runtime = null,
+        .generated = undefined,
+    };
+
+    const result = try runMetalJitObservedOracle(
+        request,
+        .q4_k,
+        raw_weight,
+        &input,
+        &baseline_output,
+        &candidate_output,
+        shape,
+        1,
+    );
+    try std.testing.expect(!result.passed);
+    try std.testing.expect(result.max_absolute_error > metalJitQualificationTolerance(.q4_k));
+}
+
+test "metal runtime JIT observed fixtures vary blocks and account peak shared memory" {
+    const raw = try metalJitPatternWeight(std.testing.allocator, .q8_0, 32, 30, 7);
+    defer std.testing.allocator.free(raw);
+    const block_bytes: usize = 34;
+    try std.testing.expect(!std.mem.eql(u8, raw[0..block_bytes], raw[block_bytes..][0..block_bytes]));
+    try std.testing.expectEqualSlices(u8, raw[0..block_bytes], raw[29 * block_bytes ..][0..block_bytes]);
+    const row_varied = try metalJitPatternWeight(std.testing.allocator, .q8_0, 29 * 32, 2, 7);
+    defer std.testing.allocator.free(row_varied);
+    const second_row_offset = 29 * block_bytes;
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        row_varied[0..block_bytes],
+        row_varied[second_row_offset..][0..block_bytes],
+    ));
+
+    const in_dim: usize = 4096;
+    const out_dim: usize = 4096;
+    const rows: usize = 8;
+    const weight_bytes = out_dim * (in_dim / 256) * 292;
+    const input_bytes = rows * in_dim * @sizeOf(f32);
+    const output_bytes = rows * out_dim * @sizeOf(f32);
+    const expected_peak = 2 * weight_bytes + 2 * input_bytes + 4 * output_bytes + metal_jit_fixture_safety_margin_bytes;
+    try std.testing.expectEqual(expected_peak, try metalJitFixtureBytes(.q8_k, rows, in_dim, out_dim));
+    try std.testing.expectError(
+        error.MetalJitFixtureResourceLimit,
+        metalJitFixtureBytes(.q8_k, rows, in_dim, 32768),
+    );
+
+    var device = MetalDeviceInfo{ .max_buffer_length = 64 * 1024 * 1024 };
+    try validateMetalJitFixtureForDevice(.q4_0, 2, 10240, 2560, device);
+    device.max_buffer_length = 1024 * 1024;
+    try std.testing.expectError(
+        error.MetalJitFixtureBufferLimitExceeded,
+        validateMetalJitFixtureForDevice(.q4_0, 2, 10240, 2560, device),
+    );
+}
+
+test "metal exact timing calibration targets twenty milliseconds within bounds" {
+    try std.testing.expectEqual(@as(u32, 0), metal_jit_max_measure_iters % 2);
+    try std.testing.expectEqual(@as(u32, 100), metalJitMeasureIterations(2, 10240, 2560, 200_000));
+    try std.testing.expectEqual(@as(u32, 2), metalJitMeasureIterations(2, 10240, 2560, 30_000_000));
+    try std.testing.expectEqual(@as(u32, 68), metalJitMeasureIterations(2, 10240, 2560, 300_000));
+    try std.testing.expectEqual(@as(u32, 1024), metalJitMeasureIterations(2, 2560, 512, 16_224));
+    try std.testing.expectEqual(metal_jit_max_measure_iters, metalJitMeasureIterations(2, 10240, 2560, 1));
+    try std.testing.expectEqual(@as(u32, 2), metalJitMeasureIterations(2, 10240, 2560, null));
+    try std.testing.expect(metalJitPairedRepeatStartsWithBaseline(0));
+    try std.testing.expect(!metalJitPairedRepeatStartsWithBaseline(1));
+    try std.testing.expect(metalJitPairedRepeatStartsWithBaseline(2));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "warmup2-every-repeat"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "gpu-timestamps-required"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "interleaved-abba5"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "small-output-nr2"));
+    try std.testing.expect(std.mem.startsWith(u8, metal_jit_qualification_policy_identity, "metal-v19:"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "q4_k+q6_k-exact-2d-rows2-plus"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "matrix40or64x64x32-row-tiled+homogeneous-qkv-companion"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "qualified-coverage=all-eligible-calibrated-denominator+floor2pct+target90pct+attempts<=5-per-regime"));
+}
+
+test "Metal first tuning slice matches bundled Q4 dispatches and rejects oversized fixtures before allocation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+
+    const entry = RawWorkloadProfileEntry{
+        .call_count = 1,
+        .rows = 8,
+        .in_dim = 4096,
+        .out_dim = 65536,
+        .format = workloadProfileQuantFormatId("q4_k").?,
+        .dispatch = workloadProfileDispatchId("scalar").?,
+        .implementation = @intFromEnum(WorkloadImplementation.bundled),
+        .regime = @intFromEnum(WorkloadRegime.encoder),
+        .occupied = 1,
+    };
+    try std.testing.expect(workloadProfileEntryInFirstMetalSlice(entry));
+    var large_q4_k = entry;
+    large_q4_k.rows = 256;
+    large_q4_k.out_dim = 4096;
+    large_q4_k.in_dim = 1024;
+    try std.testing.expect(workloadProfileEntryInFirstMetalSlice(large_q4_k));
+    var wrong_q4_k_dispatch = entry;
+    wrong_q4_k_dispatch.dispatch = workloadProfileDispatchId("small_batch").?;
+    try std.testing.expect(!workloadProfileEntryInFirstMetalSlice(wrong_q4_k_dispatch));
+    var q4_0_small_batch = entry;
+    q4_0_small_batch.format = workloadProfileQuantFormatId("q4_0").?;
+    q4_0_small_batch.dispatch = workloadProfileDispatchId("small_batch").?;
+    try std.testing.expect(workloadProfileEntryInFirstMetalSlice(q4_0_small_batch));
+    q4_0_small_batch.dispatch = workloadProfileDispatchId("scalar").?;
+    try std.testing.expect(workloadProfileEntryInFirstMetalSlice(q4_0_small_batch));
+    var wrong_dispatch = entry;
+    wrong_dispatch.dispatch = workloadProfileDispatchId("mmv").?;
+    try std.testing.expect(!workloadProfileEntryInFirstMetalSlice(wrong_dispatch));
+    try std.testing.expect(metalJitArtifactForExactSignature(wrong_dispatch) == null);
+
+    var snapshot: RawWorkloadProfileSnapshot = .{
+        .entry_count = 1,
+        .complete = 1,
+    };
+    snapshot.entries[0] = entry;
+    const unreachable_runtime: *RawMetalDecodeRuntime = @ptrFromInt(1);
+    try std.testing.expectError(
+        error.MetalJitFixtureResourceLimit,
+        calibrateFirstMetalTuningSlice(std.testing.failing_allocator, unreachable_runtime, &snapshot),
+    );
+    try std.testing.expectEqual(@as(u8, 0), snapshot.entries[0].calibrated);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.entries[0].estimated_gpu_nanos);
+}
+
+test "metal runtime JIT negative memo is exact bounded and expires" {
+    const first: kernel_jit.ArtifactKey = @splat(0x11);
+    var other = first;
+    other[0] = 0x22;
+    metal_jit_process_gpu_mutex.lockUncancelable(std.testing.io);
+    defer metal_jit_process_gpu_mutex.unlock(std.testing.io);
+    metalJitRejectionMemoClear(first);
+    metalJitRejectionMemoClear(other);
+    defer metalJitRejectionMemoClear(first);
+    metalJitRejectionMemoRecord(first, 1_000);
+    try std.testing.expect(metalJitRejectionMemoContains(first, 1_001));
+    try std.testing.expect(!metalJitRejectionMemoContains(other, 1_001));
+    try std.testing.expect(!metalJitRejectionMemoContains(first, 1_000 + metal_jit_rejection_ttl_ns));
+}
+
+test "metal runtime JIT qualification requires correctness median and every repeat" {
+    const eligible = try metalJitQualificationRecord(.{
+        .correctness_passed = true,
+        .max_absolute_error = 0.0001,
+        .max_relative_error = 0.001,
+        .baseline_nanos = .{ 120, 130, 125, 140, 150 },
+        .candidate_nanos = .{ 100, 100, 100, 100, 100 },
+    });
+    try std.testing.expect(eligible.eligible());
+    try std.testing.expectApproxEqAbs(@as(f64, 1.3), eligible.measured_speedup, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.2), eligible.minimum_repeat_speedup, 0.000001);
+
+    try std.testing.expectError(error.MetalJitCorrectnessFailed, metalJitQualificationRecord(.{
+        .correctness_passed = false,
+        .max_absolute_error = 1,
+        .max_relative_error = 1,
+        .baseline_nanos = @splat(0),
+        .candidate_nanos = @splat(0),
+    }));
+    try std.testing.expectError(error.MetalJitQualificationRejected, metalJitQualificationRecord(.{
+        .correctness_passed = true,
+        .max_absolute_error = 0,
+        .max_relative_error = 0,
+        .baseline_nanos = .{ 120, 120, 101, 120, 120 },
+        .candidate_nanos = .{ 100, 100, 100, 100, 100 },
+    }));
+}
+
+test "metal runtime JIT qualification harness is injectable without a GPU" {
+    const FakeHarness = struct {
+        calls: usize = 0,
+
+        fn qualify(
+            raw: ?*anyopaque,
+            request: MetalJitQualificationRequest,
+        ) !MetalJitQualificationMeasurements {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return error.MissingContext));
+            try std.testing.expect(request.artifact.production_enabled);
+            self.calls += 1;
+            return .{
+                .correctness_passed = true,
+                .max_absolute_error = 0.0001,
+                .max_relative_error = 0.001,
+                .baseline_nanos = @splat(120),
+                .candidate_nanos = @splat(100),
+            };
+        }
+    };
+    const artifact = comptime blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |candidate| {
+            if (candidate.backend == .metal and candidate.production_enabled) break :blk candidate;
+        }
+        @compileError("missing production Metal artifact");
+    };
+    var context = FakeHarness{};
+    const harness = MetalJitQualificationHarness{ .context = &context, .qualify_fn = FakeHarness.qualify };
+    var scope = MetalJitRouteScope.none();
+    const op = artifact.matmulOp().?;
+    _ = scope.includeQuantShape(op.format, 256, @max(@as(usize, 512), op.format.valuesPerBlock().? * 2));
+    const measurements = try harness.qualify(.{
+        .allocator = std.testing.allocator,
+        .artifact = artifact,
+        .scope = &scope,
+        .provider = null,
+        .runtime = null,
+        .generated = @ptrFromInt(16),
+    });
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expect((try metalJitQualificationRecord(measurements)).eligible());
+}
+
+test "metal runtime JIT refuses live qualification without persistent cache" {
+    const artifact = comptime blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |candidate| {
+            if (candidate.backend == .metal and candidate.production_enabled) break :blk candidate;
+        }
+        @compileError("missing production Metal artifact");
+    };
+    var session = MetalJitSession{
+        .allocator = std.testing.allocator,
+        .qualification_harness = .{},
+        .scope = .{},
+    };
+    var job = MetalJitQualificationJob{
+        .session = &session,
+        .raw_provider = null,
+        .raw_decode_runtime = null,
+        .artifact = artifact,
+        .route = metalJitRouteForArtifact(artifact).?,
+        .key = @splat(0x4d),
+        .generated = @ptrFromInt(16),
+        .mode = .shadow,
+    };
+    try std.testing.expectError(
+        error.MetalJitQualificationCacheUnavailable,
+        metalJitQualificationWork(&job),
+    );
+    try std.testing.expectEqual(MetalJitQualificationOutcome.rejected, job.outcome);
+}
+
+test "metal runtime JIT schedule validation enforces reflected device limits" {
+    const matmul = comptime blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend == .metal and artifact.production_enabled) break :blk artifact;
+        }
+        @compileError("missing production Metal artifact");
+    };
+    const decode = comptime blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend == .metal and artifact.opKind() == .attention and
+                artifact.attentionOp().?.kind == .decode_1x) break :blk artifact;
+        }
+        @compileError("missing generated Metal decode attention artifact");
+    };
+    const flash_hd512 = comptime blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend == .metal and artifact.opKind() == .attention and
+                artifact.attentionOp().?.head_dim == 512) break :blk artifact;
+        }
+        @compileError("missing generated Metal hd512 flash attention artifact");
+    };
+    var device = MetalDeviceInfo{
+        .max_threads_per_threadgroup_width = 1024,
+        .max_threadgroup_memory_length = 64 * 1024,
+    };
+    var pipeline = MetalGeneratedPipelineInfo{
+        .thread_execution_width = 32,
+        .max_total_threads_per_threadgroup = 1024,
+    };
+    try validateMetalJitSchedule(matmul, device, pipeline);
+    device.max_threads_per_threadgroup_width = 1;
+    try std.testing.expectError(error.MetalJitThreadgroupLimitExceeded, validateMetalJitSchedule(matmul, device, pipeline));
+    device.max_threads_per_threadgroup_width = 1024;
+    pipeline.max_total_threads_per_threadgroup = 1;
+    try std.testing.expectError(error.MetalJitThreadgroupLimitExceeded, validateMetalJitSchedule(matmul, device, pipeline));
+    pipeline.max_total_threads_per_threadgroup = 1024;
+    device.max_threadgroup_memory_length = 32 * 1024;
+    try std.testing.expectError(error.MetalJitThreadgroupMemoryLimitExceeded, validateMetalJitSchedule(decode, device, pipeline));
+    device.max_threadgroup_memory_length = 13_888;
+    try validateMetalJitSchedule(flash_hd512, device, pipeline);
+
+    const tiled = quant_kernel_compiler.KernelSchedule{
+        .threads_per_threadgroup = 64,
+        .cols_per_threadgroup = 8,
+        .rows_per_threadgroup = 2,
+        .reduction = .simdgroup_tiled,
+    };
+    device.max_threadgroup_memory_length = 64 * 1024;
+    try validateMetalJitCandidateSchedule(tiled, device, pipeline);
+    pipeline.thread_execution_width = 16;
+    try std.testing.expectError(
+        error.MetalJitUnsupportedExecutionWidth,
+        validateMetalJitCandidateSchedule(tiled, device, pipeline),
+    );
+}
+
+test "metal exact Q4_0 tuning bridge qualifies against the bundled baseline" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+
+    const signature = RawWorkloadProfileEntry{
+        .hash = 1,
+        .call_count = 42,
+        .logical_bytes = 1,
+        .macs = 2 * 10240 * 2560,
+        .estimated_gpu_nanos = 42 * 200_000,
+        .rows = 2,
+        .in_dim = 10240,
+        .out_dim = 2560,
+        .format = 6,
+        .dispatch = 2,
+        .input_encoding = 0,
+        .output_encoding = 0,
+        .epilogue = 0,
+        .implementation = @intFromEnum(WorkloadImplementation.bundled),
+        .regime = @intFromEnum(WorkloadRegime.speculative_verify),
+        .fusion = 0,
+        .layout = 0,
+        .calibrated = 1,
+        .occupied = 1,
+    };
+    try std.testing.expect(workloadProfileEntryEligibleForFirstMetalSlice(signature));
+    const artifact = metalJitArtifactForExactSignature(signature) orelse
+        return error.MissingMetalJitArtifact;
+    const op = artifact.matmulOp().?;
+    const live_shapes = [_]MetalJitConformanceShape{
+        .{ .rows = 2, .in_dim = 10240, .out_dim = 2560 },
+        .{ .rows = 2, .in_dim = 2048, .out_dim = 2560 },
+        .{ .rows = 2, .in_dim = 2560, .out_dim = 2048 },
+        .{ .rows = 2, .in_dim = 2560, .out_dim = 512 },
+        // 17 Q4_0 input blocks plus an incomplete output tile.
+        .{ .rows = 2, .in_dim = 544, .out_dim = 255 },
+        // The minimum two-column tile must remain safe for narrower outputs.
+        .{ .rows = 2, .in_dim = 32, .out_dim = 1 },
+    };
+
+    var scope = MetalJitRouteScope.none();
+    for (live_shapes) |shape| {
+        try std.testing.expect(scope.includeQuantShape(op.format, shape.out_dim, shape.in_dim));
+    }
+    var device: MetalDeviceInfo = .{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_device_info_get(&device));
+    var device_name_buffer: [4096]u8 = undefined;
+    const device_name_len = termite_metal_copy_device_name(null, 0);
+    try std.testing.expect(device_name_len > 0 and device_name_len <= device_name_buffer.len);
+    try std.testing.expectEqual(
+        device_name_len,
+        termite_metal_copy_device_name(device_name_buffer[0..].ptr, device_name_buffer.len),
+    );
+    var compiler_buffer: [4096]u8 = undefined;
+    const compiler_len = termite_metal_copy_compiler_identity(null, 0);
+    try std.testing.expect(compiler_len > 0 and compiler_len <= compiler_buffer.len);
+    try std.testing.expectEqual(
+        compiler_len,
+        termite_metal_copy_compiler_identity(compiler_buffer[0..].ptr, compiler_buffer.len),
+    );
+
+    var schedules: [kernel_jit.maximum_candidates]quant_kernel_compiler.KernelSchedule = undefined;
+    const candidate_count = quant_kernel_compiler.metalScheduleCandidatesForExactShape(
+        op.format,
+        op.epilogue,
+        @intCast(signature.rows),
+        @intCast(signature.in_dim),
+        @intCast(signature.out_dim),
+        &schedules,
+    );
+    try std.testing.expectEqual(@as(usize, 8), candidate_count);
+    try std.testing.expectEqual(@as(u8, 2), schedules[0].rows_per_threadgroup);
+
+    const baseline_stats_before = runtimeMemorySnapshot(provider.raw_decode_runtime);
+    for (schedules[0..candidate_count], 0..) |schedule, candidate_index| {
+        const emitted = try quant_kernel_compiler.emitMetalScheduleCandidateSource(
+            std.testing.allocator,
+            artifact,
+            schedule,
+        );
+        defer emitted.deinit(std.testing.allocator);
+        const generated = try createMetalScheduleCandidatePipeline(
+            std.testing.allocator,
+            artifact,
+            emitted.data,
+            schedule,
+            device,
+        );
+        defer termite_metal_generated_pipeline_destroy(generated);
+        metal_jit_process_gpu_mutex.lockUncancelable(std.testing.io);
+        defer metal_jit_process_gpu_mutex.unlock(std.testing.io);
+        for (live_shapes, 0..) |shape, shape_index| {
+            const measure_timing = candidate_index == 0 and shape_index == 0;
+            const measurements = try runMetalJitObservedShape(
+                .{
+                    .allocator = std.testing.allocator,
+                    .artifact = artifact,
+                    .scope = &scope,
+                    .provider = provider.raw_provider,
+                    .runtime = provider.raw_decode_runtime,
+                    .generated = generated,
+                },
+                op.format,
+                shape,
+                schedule.threads_per_threadgroup,
+                schedule.cols_per_threadgroup,
+                schedule.rows_per_threadgroup,
+                4242 + candidate_index * 131 + shape_index * 17,
+                measure_timing,
+                200_000,
+            );
+            try std.testing.expect(measurements.correctness_passed);
+            try std.testing.expect(measurements.max_absolute_error <= metalJitQualificationTolerance(.q4_0));
+            if (measure_timing) {
+                for (measurements.baseline_nanos, measurements.candidate_nanos) |baseline_nanos, candidate_nanos| {
+                    try std.testing.expect(baseline_nanos > 0);
+                    try std.testing.expect(candidate_nanos > 0);
+                }
+            }
+        }
+    }
+    const baseline_stats_after = runtimeMemorySnapshot(provider.raw_decode_runtime);
+    try std.testing.expect(
+        baseline_stats_after.q4_0_linear_reduce_rows_2_8 > baseline_stats_before.q4_0_linear_reduce_rows_2_8,
+    );
+
+    // The wide signature above intentionally retains the original NR4/NR8
+    // catalog. Compile and execute the small-output NR2 replacement directly
+    // so correctness cannot pass while that candidate remains unexercised.
+    var narrow_schedules: [kernel_jit.maximum_candidates]quant_kernel_compiler.KernelSchedule = undefined;
+    const narrow_candidate_count = quant_kernel_compiler.metalScheduleCandidatesForExactShape(
+        op.format,
+        op.epilogue,
+        2,
+        2560,
+        512,
+        &narrow_schedules,
+    );
+    try std.testing.expectEqual(@as(usize, 8), narrow_candidate_count);
+    const narrow_schedule = narrow_schedules[1];
+    try std.testing.expectEqual(@as(u16, 32), narrow_schedule.threads_per_threadgroup);
+    try std.testing.expectEqual(@as(u8, 2), narrow_schedule.cols_per_threadgroup);
+    try std.testing.expectEqual(@as(u8, 2), narrow_schedule.rows_per_threadgroup);
+    try std.testing.expectEqual(
+        quant_kernel_compiler.ReductionKind.simdgroup_tiled,
+        narrow_schedule.reduction,
+    );
+    const narrow_emitted = try quant_kernel_compiler.emitMetalScheduleCandidateSource(
+        std.testing.allocator,
+        artifact,
+        narrow_schedule,
+    );
+    defer narrow_emitted.deinit(std.testing.allocator);
+    const narrow_generated = try createMetalScheduleCandidatePipeline(
+        std.testing.allocator,
+        artifact,
+        narrow_emitted.data,
+        narrow_schedule,
+        device,
+    );
+    var narrow_transferred = false;
+    defer if (!narrow_transferred) termite_metal_generated_pipeline_destroy(narrow_generated);
+    const narrow_live_shapes = [_]MetalJitConformanceShape{
+        .{ .rows = 2, .in_dim = 2560, .out_dim = 512 },
+        .{ .rows = 2, .in_dim = 544, .out_dim = 255 },
+        .{ .rows = 2, .in_dim = 32, .out_dim = 1 },
+    };
+    {
+        metal_jit_process_gpu_mutex.lockUncancelable(std.testing.io);
+        defer metal_jit_process_gpu_mutex.unlock(std.testing.io);
+        for (narrow_live_shapes, 0..) |shape, shape_index| {
+            const measurements = try runMetalJitObservedShape(
+                .{
+                    .allocator = std.testing.allocator,
+                    .artifact = artifact,
+                    .scope = &scope,
+                    .provider = provider.raw_provider,
+                    .runtime = provider.raw_decode_runtime,
+                    .generated = narrow_generated,
+                },
+                op.format,
+                shape,
+                narrow_schedule.threads_per_threadgroup,
+                narrow_schedule.cols_per_threadgroup,
+                narrow_schedule.rows_per_threadgroup,
+                9973 + shape_index * 17,
+                false,
+                200_000,
+            );
+            try std.testing.expect(measurements.correctness_passed);
+            try std.testing.expect(measurements.max_absolute_error <= metalJitQualificationTolerance(.q4_0));
+        }
+    }
+
+    // Prove the exact route is reachable through the host/provider fallback
+    // used by real model execution, not only through the qualification bridge.
+    const provider_schedule = narrow_schedule;
+    var provider_signature = signature;
+    provider_signature.hash = 2;
+    provider_signature.in_dim = 32;
+    provider_signature.out_dim = 1;
+    provider_signature.macs = 2 * 32;
+    provider_signature.estimated_gpu_nanos = provider_signature.call_count * 200_000;
+    const route = metalJitRouteForArtifact(artifact) orelse return error.MissingMetalJitRoute;
+    try std.testing.expect(provider.canOwnExactJitPipeline());
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_generated_pipeline_install_exact(
+        provider.raw_provider,
+        provider.raw_decode_runtime,
+        narrow_generated,
+        @intFromEnum(route.slot),
+        provider_signature.regime,
+        provider_signature.dispatch,
+        @intCast(provider_signature.rows),
+        @intCast(provider_signature.out_dim),
+        @intCast(provider_signature.in_dim),
+        provider_schedule.threads_per_threadgroup,
+        provider_schedule.cols_per_threadgroup,
+        provider_schedule.rows_per_threadgroup,
+    ));
+    provider.ownExactJitPipeline(narrow_generated);
+    narrow_transferred = true;
+    try provider.workloadProfileSetRegime(.speculative_verify);
+    const provider_weight = try metalJitPatternWeight(std.testing.allocator, .q4_0, 32, 1, 9001);
+    defer std.testing.allocator.free(provider_weight);
+    const provider_input = try std.testing.allocator.alloc(f32, 2 * 32);
+    defer std.testing.allocator.free(provider_input);
+    fillMetalJitFixture(provider_input, 5, 19, 9, 48.0, 9004);
+    const provider_baseline = try std.testing.allocator.alloc(f32, 2);
+    defer std.testing.allocator.free(provider_baseline);
+    const provider_output = try std.testing.allocator.alloc(f32, 2);
+    defer std.testing.allocator.free(provider_output);
+    @memset(provider_baseline, 0);
+    @memset(provider_output, 0);
+    {
+        metal_jit_process_gpu_mutex.lockUncancelable(std.testing.io);
+        defer metal_jit_process_gpu_mutex.unlock(std.testing.io);
+        _ = try runMetalJitQuantFixture(
+            .{
+                .allocator = std.testing.allocator,
+                .artifact = artifact,
+                .scope = &scope,
+                .provider = provider.raw_provider,
+                .runtime = provider.raw_decode_runtime,
+                .generated = narrow_generated,
+            },
+            .q4_0,
+            .baseline,
+            provider_input,
+            provider_weight,
+            provider_baseline,
+            2,
+            32,
+            1,
+            provider_schedule.threads_per_threadgroup,
+            provider_schedule.cols_per_threadgroup,
+            provider_schedule.rows_per_threadgroup,
+            0,
+            1,
+        );
+        try resetExactJitDispatchStats(provider.raw_decode_runtime);
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_provider_linear_q4_0(
+            provider.raw_provider,
+            provider.raw_decode_runtime,
+            provider_input.ptr,
+            2,
+            32,
+            provider_weight.ptr,
+            1,
+            provider_output.ptr,
+        ));
+    }
+    const provider_dispatch_stats = try exactJitDispatchStatsSnapshot(provider.raw_decode_runtime);
+    try std.testing.expectEqual(@as(u64, 1), provider_dispatch_stats.q4_0_hits);
+    const provider_tolerance = metalJitQualificationTolerance(.q4_0);
+    for (provider_baseline, provider_output) |baseline, actual| {
+        try std.testing.expect(std.math.isFinite(actual));
+        try std.testing.expect(@abs(@as(f64, actual) - baseline) <= provider_tolerance);
+    }
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var cache = try kernel_jit.ArtifactCache.initDir(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        1024 * 1024,
+    );
+    defer cache.deinit();
+    const winner = try tuneMetalExactSignature(
+        std.testing.allocator,
+        &cache,
+        provider.raw_provider,
+        provider.raw_decode_runtime,
+        &scope,
+        signature,
+        device,
+        device_name_buffer[0..device_name_len],
+        compiler_buffer[0..compiler_len],
+    );
+    defer if (winner) |qualified| termite_metal_generated_pipeline_destroy(qualified.generated);
+    if (winner) |qualified| {
+        try std.testing.expect(qualified.record.correctness_passed);
+        try std.testing.expect(qualified.record.eligible());
+        try std.testing.expectEqual(qualified.candidate_index, qualified.record.candidate_index);
+    }
+}
+
+test "metal exact Q4_K and Q6_K matrix candidates match the bundled baseline" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    var device: MetalDeviceInfo = .{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_device_info_get(&device));
+
+    for ([_]quant_matmul.Format{ .q4_k, .q6_k }) |format| {
+        const rows: usize = 65;
+        const in_dim: usize = 512;
+        const out_dim: usize = 257;
+        const signature = RawWorkloadProfileEntry{
+            .hash = @intFromEnum(format),
+            .call_count = 1,
+            .logical_bytes = 1,
+            .macs = rows * in_dim * out_dim,
+            .estimated_gpu_nanos = 200_000,
+            .rows = rows,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .format = workloadProfileQuantFormatId(@tagName(format)).?,
+            .dispatch = workloadProfileDispatchId("scalar").?,
+            .input_encoding = workloadProfileEncodingId("f32").?,
+            .output_encoding = workloadProfileEncodingId("f32").?,
+            .epilogue = 0,
+            .implementation = @intFromEnum(WorkloadImplementation.bundled),
+            .regime = @intFromEnum(WorkloadRegime.encoder),
+            .fusion = 0,
+            .layout = 0,
+            .calibrated = 1,
+            .occupied = 1,
+        };
+        const artifact = metalJitArtifactForExactSignature(signature) orelse return error.MissingMetalJitArtifact;
+        var schedules: [kernel_jit.maximum_candidates]quant_kernel_compiler.KernelSchedule = undefined;
+        const candidate_count = quant_kernel_compiler.metalScheduleCandidatesForExactShape(
+            format,
+            .none,
+            rows,
+            in_dim,
+            out_dim,
+            &schedules,
+        );
+        try std.testing.expectEqual(@as(usize, 8), candidate_count);
+        const schedule = schedules[7];
+        try std.testing.expectEqual(quant_kernel_compiler.ReductionKind.simdgroup_matrix, schedule.reduction);
+        const emitted = try quant_kernel_compiler.emitMetalScheduleCandidateSource(
+            std.testing.allocator,
+            artifact,
+            schedule,
+        );
+        defer emitted.deinit(std.testing.allocator);
+        const generated = try createMetalScheduleCandidatePipeline(
+            std.testing.allocator,
+            artifact,
+            emitted.data,
+            schedule,
+            device,
+        );
+        defer termite_metal_generated_pipeline_destroy(generated);
+        var scope = MetalJitRouteScope.none();
+        try std.testing.expect(scope.includeQuantShape(format, out_dim, in_dim));
+        metal_jit_process_gpu_mutex.lockUncancelable(std.testing.io);
+        defer metal_jit_process_gpu_mutex.unlock(std.testing.io);
+        const measurements = try runMetalJitObservedShape(
+            .{
+                .allocator = std.testing.allocator,
+                .artifact = artifact,
+                .scope = &scope,
+                .provider = provider.raw_provider,
+                .runtime = provider.raw_decode_runtime,
+                .generated = generated,
+            },
+            format,
+            .{ .rows = rows, .in_dim = in_dim, .out_dim = out_dim },
+            schedule.threads_per_threadgroup,
+            schedule.cols_per_threadgroup,
+            schedule.rows_per_threadgroup,
+            8101 + @intFromEnum(format),
+            false,
+            null,
+        );
+        if (!measurements.correctness_passed) std.debug.print(
+            "matrix candidate mismatch format={s} max_abs={d} max_rel={d}\n",
+            .{ @tagName(format), measurements.max_absolute_error, measurements.max_relative_error },
+        );
+        try std.testing.expect(measurements.correctness_passed);
+        try std.testing.expect(measurements.max_absolute_error <= metalJitObservedQualificationTolerance(format, schedule.rows_per_threadgroup));
+    }
+}
+
+test "metal exact Q4_K provider fallback activates installed route" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+
+    const rows: usize = 65;
+    const in_dim: usize = 512;
+    const out_dim: usize = 257;
+    const signature = RawWorkloadProfileEntry{
+        .hash = 2,
+        .call_count = 1,
+        .logical_bytes = 1,
+        .macs = rows * in_dim * out_dim,
+        .estimated_gpu_nanos = 200_000,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .format = workloadProfileQuantFormatId("q4_k").?,
+        .dispatch = workloadProfileDispatchId("scalar").?,
+        .input_encoding = workloadProfileEncodingId("f32").?,
+        .output_encoding = workloadProfileEncodingId("f32").?,
+        .epilogue = 0,
+        .implementation = @intFromEnum(WorkloadImplementation.bundled),
+        .regime = @intFromEnum(WorkloadRegime.encoder),
+        .fusion = 0,
+        .layout = 0,
+        .calibrated = 1,
+        .occupied = 1,
+    };
+    const artifact = metalJitArtifactForExactSignature(signature) orelse
+        return error.MissingMetalJitArtifact;
+    const op = artifact.matmulOp().?;
+    var scope = MetalJitRouteScope.none();
+    try std.testing.expect(scope.includeQuantShape(op.format, out_dim, in_dim));
+    var schedules: [kernel_jit.maximum_candidates]quant_kernel_compiler.KernelSchedule = undefined;
+    const candidate_count = quant_kernel_compiler.metalScheduleCandidatesForExactShape(
+        op.format,
+        op.epilogue,
+        rows,
+        in_dim,
+        out_dim,
+        &schedules,
+    );
+    try std.testing.expect(candidate_count > 0);
+    const schedule = schedules[candidate_count - 1];
+    try std.testing.expectEqual(quant_kernel_compiler.ReductionKind.simdgroup_matrix, schedule.reduction);
+    const emitted = try quant_kernel_compiler.emitMetalScheduleCandidateSource(
+        std.testing.allocator,
+        artifact,
+        schedule,
+    );
+    defer emitted.deinit(std.testing.allocator);
+    var device: MetalDeviceInfo = .{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_device_info_get(&device));
+    const generated = try createMetalScheduleCandidatePipeline(
+        std.testing.allocator,
+        artifact,
+        emitted.data,
+        schedule,
+        device,
+    );
+    defer termite_metal_generated_pipeline_destroy(generated);
+    const route = metalJitRouteForArtifact(artifact) orelse return error.MissingMetalJitRoute;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_generated_pipeline_install_exact(
+        provider.raw_provider,
+        provider.raw_decode_runtime,
+        generated,
+        @intFromEnum(route.slot),
+        signature.regime,
+        signature.dispatch,
+        rows,
+        out_dim,
+        in_dim,
+        schedule.threads_per_threadgroup,
+        schedule.cols_per_threadgroup,
+        schedule.rows_per_threadgroup,
+    ));
+    try provider.workloadProfileSetRegime(.encoder);
+
+    const raw_weight = try metalJitPatternWeight(std.testing.allocator, .q4_k, in_dim, out_dim, 7001);
+    defer std.testing.allocator.free(raw_weight);
+    const input = try std.testing.allocator.alloc(f32, rows * in_dim);
+    defer std.testing.allocator.free(input);
+    fillMetalJitFixture(input, 5, 19, 9, 48.0, 7004);
+    const baseline = try std.testing.allocator.alloc(f32, rows * out_dim);
+    defer std.testing.allocator.free(baseline);
+    const actual = try std.testing.allocator.alloc(f32, rows * out_dim);
+    defer std.testing.allocator.free(actual);
+    @memset(baseline, 0);
+    @memset(actual, 0);
+    {
+        metal_jit_process_gpu_mutex.lockUncancelable(std.testing.io);
+        defer metal_jit_process_gpu_mutex.unlock(std.testing.io);
+        _ = try runMetalJitQuantFixture(
+            .{
+                .allocator = std.testing.allocator,
+                .artifact = artifact,
+                .scope = &scope,
+                .provider = provider.raw_provider,
+                .runtime = provider.raw_decode_runtime,
+                .generated = generated,
+            },
+            .q4_k,
+            .baseline,
+            input,
+            raw_weight,
+            baseline,
+            rows,
+            in_dim,
+            out_dim,
+            schedule.threads_per_threadgroup,
+            schedule.cols_per_threadgroup,
+            schedule.rows_per_threadgroup,
+            0,
+            1,
+        );
+        try resetExactJitDispatchStats(provider.raw_decode_runtime);
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_provider_linear_q4_k(
+            provider.raw_provider,
+            provider.raw_decode_runtime,
+            input.ptr,
+            rows,
+            in_dim,
+            raw_weight.ptr,
+            out_dim,
+            actual.ptr,
+        ));
+    }
+    const stats = try exactJitDispatchStatsSnapshot(provider.raw_decode_runtime);
+    try std.testing.expectEqual(@as(u64, 1), stats.q4_k_hits);
+    const tolerance = metalJitObservedQualificationTolerance(.q4_k, schedule.rows_per_threadgroup);
+    for (baseline, actual) |expected, observed| {
+        try std.testing.expect(std.math.isFinite(observed));
+        try std.testing.expect(@abs(@as(f64, observed) - expected) <= tolerance);
+    }
+}
+
+test "metal exact Q4_K QKV companion matches three qualified projections" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const rows: usize = 65;
+    const in_dim: usize = 512;
+    const out_dim: usize = 257;
+    const signature = RawWorkloadProfileEntry{
+        .hash = 3,
+        .call_count = 3,
+        .logical_bytes = 1,
+        .macs = 3 * rows * in_dim * out_dim,
+        .estimated_gpu_nanos = 600_000,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .format = workloadProfileQuantFormatId("q4_k").?,
+        .dispatch = workloadProfileDispatchId("scalar").?,
+        .input_encoding = workloadProfileEncodingId("f32").?,
+        .output_encoding = workloadProfileEncodingId("f32").?,
+        .epilogue = 0,
+        .implementation = @intFromEnum(WorkloadImplementation.bundled),
+        .regime = @intFromEnum(WorkloadRegime.encoder),
+        .fusion = 0,
+        .layout = 0,
+        .calibrated = 1,
+        .occupied = 1,
+    };
+    const artifact = metalJitArtifactForExactSignature(signature) orelse return error.MissingMetalJitArtifact;
+    var schedules: [kernel_jit.maximum_candidates]quant_kernel_compiler.KernelSchedule = undefined;
+    const candidate_count = quant_kernel_compiler.metalScheduleCandidatesForExactShape(.q4_k, .none, rows, in_dim, out_dim, &schedules);
+    try std.testing.expectEqual(@as(usize, 8), candidate_count);
+    const schedule = schedules[candidate_count - 1];
+    try std.testing.expectEqual(@as(u8, 64), schedule.rows_per_threadgroup);
+    var device: MetalDeviceInfo = .{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_device_info_get(&device));
+
+    const emitted = try quant_kernel_compiler.emitMetalScheduleCandidateSource(std.testing.allocator, artifact, schedule);
+    defer emitted.deinit(std.testing.allocator);
+    const generated = try createMetalScheduleCandidatePipeline(std.testing.allocator, artifact, emitted.data, schedule, device);
+    defer termite_metal_generated_pipeline_destroy(generated);
+    const qkv_emitted = try quant_kernel_compiler.emitMetalQkvScheduleCandidateSource(std.testing.allocator, artifact, schedule);
+    defer qkv_emitted.deinit(std.testing.allocator);
+    const qkv_generated = try createMetalQkvScheduleCandidatePipeline(std.testing.allocator, artifact, qkv_emitted.data, schedule, device);
+    defer termite_metal_generated_pipeline_destroy(qkv_generated);
+    const route = metalJitRouteForArtifact(artifact) orelse return error.MissingMetalJitRoute;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_generated_pipeline_install_exact(
+        provider.raw_provider,
+        runtime,
+        generated,
+        @intFromEnum(route.slot),
+        signature.regime,
+        signature.dispatch,
+        rows,
+        out_dim,
+        in_dim,
+        schedule.threads_per_threadgroup,
+        schedule.cols_per_threadgroup,
+        schedule.rows_per_threadgroup,
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_generated_pipeline_install_exact_qkv(
+        provider.raw_provider,
+        runtime,
+        qkv_generated,
+        @intFromEnum(route.slot),
+        signature.regime,
+        signature.dispatch,
+        rows,
+        out_dim,
+        in_dim,
+    ));
+    try provider.workloadProfileSetRegime(.encoder);
+
+    const weights = .{
+        try metalJitPatternWeight(std.testing.allocator, .q4_k, in_dim, out_dim, 9101),
+        try metalJitPatternWeight(std.testing.allocator, .q4_k, in_dim, out_dim, 9102),
+        try metalJitPatternWeight(std.testing.allocator, .q4_k, in_dim, out_dim, 9103),
+    };
+    defer {
+        inline for (weights) |weight| std.testing.allocator.free(weight);
+    }
+    const shape = [_]i64{ out_dim, in_dim };
+    var storages = [_]QuantizedStorage{
+        .{ .tensor_type = .{ .known = .Q4_K }, .raw_bytes = weights[0], .shape = &shape, .raw_owned = false, .allocator = std.testing.allocator },
+        .{ .tensor_type = .{ .known = .Q4_K }, .raw_bytes = weights[1], .shape = &shape, .raw_owned = false, .allocator = std.testing.allocator },
+        .{ .tensor_type = .{ .known = .Q4_K }, .raw_bytes = weights[2], .shape = &shape, .raw_owned = false, .allocator = std.testing.allocator },
+    };
+    const zero_bias_data = try std.testing.allocator.alloc(f32, out_dim);
+    defer std.testing.allocator.free(zero_bias_data);
+    @memset(zero_bias_data, 0);
+    var biases = .{
+        try MetalTensor.ownedCloneFrom(zero_bias_data, &[_]i32{@intCast(out_dim)}),
+        try MetalTensor.ownedCloneFrom(zero_bias_data, &[_]i32{@intCast(out_dim)}),
+        try MetalTensor.ownedCloneFrom(zero_bias_data, &[_]i32{@intCast(out_dim)}),
+    };
+    defer {
+        inline for (&biases) |*bias| bias.deinit();
+    }
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    var prep_stats: ops.NativeQuantTimingStats = .{};
+    inline for (0..3) |index| {
+        try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+            .weight = dummy_weight,
+            .bias = biases[index],
+            .quantized_storage = @as(?*const QuantizedStorage, &storages[index]),
+            .slot = 30 + index,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .retain_dense_fallback = false,
+        }, &prep_stats));
+    }
+
+    const input_data = try std.testing.allocator.alloc(f32, rows * in_dim);
+    defer std.testing.allocator.free(input_data);
+    fillMetalJitFixture(input_data, 7, 31, 15, 64.0, 9111);
+    var input = try testDeviceTensorFromSlice(runtime, input_data, &[_]i32{ rows, in_dim });
+    defer input.deinit();
+    const expected = .{
+        try std.testing.allocator.alloc(f32, rows * out_dim),
+        try std.testing.allocator.alloc(f32, rows * out_dim),
+        try std.testing.allocator.alloc(f32, rows * out_dim),
+    };
+    defer {
+        inline for (expected) |values| std.testing.allocator.free(values);
+    }
+    var scope = MetalJitRouteScope.none();
+    try std.testing.expect(scope.includeQuantShape(.q4_k, out_dim, in_dim));
+    metal_jit_process_gpu_mutex.lockUncancelable(std.testing.io);
+    defer metal_jit_process_gpu_mutex.unlock(std.testing.io);
+    inline for (0..3) |index| {
+        _ = try runMetalJitQuantFixture(
+            .{ .allocator = std.testing.allocator, .artifact = artifact, .scope = &scope, .provider = provider.raw_provider, .runtime = runtime, .generated = generated },
+            .q4_k,
+            .candidate,
+            input_data,
+            weights[index],
+            expected[index],
+            rows,
+            in_dim,
+            out_dim,
+            schedule.threads_per_threadgroup,
+            schedule.cols_per_threadgroup,
+            schedule.rows_per_threadgroup,
+            0,
+            1,
+        );
+    }
+    try resetExactJitDispatchStats(runtime);
+    var actual = (try tryApplyQuantizedRuntimeLinearQkv(&provider, 30, 31, 32, input, rows, in_dim, out_dim, out_dim)) orelse return error.UnexpectedNull;
+    defer actual.first.deinit();
+    defer actual.second.deinit();
+    defer actual.third.deinit();
+    const stats = try exactJitDispatchStatsSnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 3), stats.q4_k_hits);
+    const outputs = .{ &actual.first, &actual.second, &actual.third };
+    const tolerance = metalJitObservedQualificationTolerance(.q4_k, schedule.rows_per_threadgroup);
+    inline for (0..3) |index| {
+        const observed = try tensorHostSlice(outputs[index]);
+        for (expected[index], observed) |wanted, got| {
+            try std.testing.expect(std.math.isFinite(got));
+            try std.testing.expect(@abs(@as(f64, got) - wanted) <= tolerance);
+        }
+    }
+}
+
+test "Metal exact qualification must survive persistent cache storage" {
+    const key: kernel_jit.ArtifactKey = @splat(0x5a);
+    const record = kernel_jit.QualificationRecord{
+        .candidate_index = 0,
+        .repeat_count = kernel_jit.measurement_repeats,
+        .correctness_passed = true,
+        .measured_speedup = 1.03,
+        .minimum_repeat_speedup = 1.02,
+        .max_absolute_error = 0.0001,
+        .max_relative_error = 0.001,
+    };
+
+    var disabled_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer disabled_tmp.cleanup();
+    var disabled = try kernel_jit.ArtifactCache.initDir(
+        std.testing.allocator,
+        std.testing.io,
+        disabled_tmp.dir,
+        0,
+    );
+    defer disabled.deinit();
+    try std.testing.expectError(
+        error.MetalJitQualificationPersistenceFailed,
+        persistMetalJitQualification(std.testing.allocator, &disabled, key, record),
+    );
+    try std.testing.expectEqual(@as(usize, 0), disabled.snapshotStats().stores);
+
+    var persisted_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer persisted_tmp.cleanup();
+    var persisted = try kernel_jit.ArtifactCache.initDir(
+        std.testing.allocator,
+        std.testing.io,
+        persisted_tmp.dir,
+        1024 * 1024,
+    );
+    defer persisted.deinit();
+    try persistMetalJitQualification(std.testing.allocator, &persisted, key, record);
+    try std.testing.expectEqual(@as(usize, 1), persisted.snapshotStats().stores);
+    const reloaded = metalJitCachedExactQualification(
+        std.testing.allocator,
+        &persisted,
+        key,
+        record.candidate_index,
+    ) orelse return error.MissingPersistedMetalJitQualification;
+    try std.testing.expectEqualDeep(record, reloaded);
+}
+
+test "metal runtime JIT accepts only eligible qualification at the exact artifact key" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var cache = try kernel_jit.ArtifactCache.initDir(std.testing.allocator, std.testing.io, tmp.dir, 1024 * 1024);
+    defer cache.deinit();
+    const key = kernel_jit.artifactKey(.{
+        .backend = .metal,
+        .semantic_identity = "route",
+        .runtime_identity = "runtime",
+        .target_identity = "target",
+        .device_identity = "device",
+        .schedule_identity = "schedule",
+        .baseline_identity = "baseline",
+        .compiler_identity = "compiler",
+        .compiler_options = "math=default",
+        .source = "source",
+    });
+    const record = kernel_jit.QualificationRecord{
+        .candidate_index = 0,
+        .repeat_count = kernel_jit.measurement_repeats,
+        .correctness_passed = true,
+        .measured_speedup = 1.20,
+        .minimum_repeat_speedup = 1.11,
+        .max_absolute_error = 0.0001,
+        .max_relative_error = 0.001,
+    };
+    const encoded = try record.encode();
+    try cache.store(.qualification, key, &encoded);
+    try std.testing.expect(metalJitCachedQualification(std.testing.allocator, &cache, key) != null);
+    var other_key = key;
+    other_key[0] ^= 1;
+    try std.testing.expect(metalJitCachedQualification(std.testing.allocator, &cache, other_key) == null);
+}
+
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
+
+test "metal runtime JIT activation honors the generated quant kill switch" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const env_name = "TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT";
+    const original = if (std.c.getenv(env_name)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (original) |value| {
+            _ = setenv(env_name, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(env_name);
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), setenv(env_name, "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_route_activation_allowed(@intFromEnum(MetalJitPipelineSlot.q2_k)));
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(env_name));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_jit_route_activation_allowed(@intFromEnum(MetalJitPipelineSlot.q2_k)));
+}
+
+test "metal runtime JIT installed route bypasses legacy opt-in but not global disable" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const disable_env = "TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT";
+    const route_env = "TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH";
+    const original_disable = if (std.c.getenv(disable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    const original_route = if (std.c.getenv(route_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (original_disable) |value| {
+            _ = setenv(disable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(disable_env);
+        }
+        if (original_route) |value| {
+            _ = setenv(route_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(route_env);
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(disable_env));
+    try std.testing.expectEqual(@as(c_int, 0), setenv(route_env, "0", 1));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_jit_route_gate_probe(
+        @intFromEnum(MetalJitPipelineSlot.q2_k),
+        route_env,
+        256,
+        512,
+        256,
+        512,
+    ));
+    // Once a generated route replaces the pipeline pointer, a shape outside
+    // the exact live-qualified allowlist must use the bundled fallback even
+    // when the route itself is active.
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_route_gate_probe(
+        @intFromEnum(MetalJitPipelineSlot.q2_k),
+        route_env,
+        256,
+        512,
+        262144,
+        4096,
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_route_gate_probe(
+        @intFromEnum(MetalJitPipelineSlot.q3_k),
+        route_env,
+        256,
+        512,
+        256,
+        512,
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), setenv(disable_env, "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_route_gate_probe(
+        @intFromEnum(MetalJitPipelineSlot.q2_k),
+        route_env,
+        256,
+        512,
+        256,
+        512,
+    ));
+}
+
+test "metal Q4_K provider keeps the default eager route thin" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+
+    // Ordinary JIT-off eager inference launches the bundled kernel directly.
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 0, 0, 1, 46));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 0, 0, 1, 197));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 0, 1, 0, 46));
+
+    // Profiling and promoted routes still require the generic dispatcher.
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_q4_k_generic_provider_dispatch_policy_probe(1, 0, 0, 0, 46));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 1, 0, 0, 46));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 0, 1, 1, 46));
+
+    // Bundled generated candidates are currently scoped to rows 2...64.
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 0, 1, 1, 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 0, 1, 1, 65));
+}
+
+test "metal runtime JIT C ABI layouts match the Objective-C bridge" {
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(MetalDeviceInfo));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(MetalGeneratedPipelineInfo));
+}
+
+test "metal runtime JIT compiles a generated conformance pipeline and owns its lifetime" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    var device_info: MetalDeviceInfo = .{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_device_info_get(&device_info));
+    try std.testing.expect(device_info.max_threads_per_threadgroup_width > 0);
+    try std.testing.expect(device_info.max_threadgroup_memory_length > 0);
+    try std.testing.expect(device_info.max_buffer_length > 0);
+
+    var device_name: [4096]u8 = undefined;
+    const device_name_len = termite_metal_copy_device_name(null, 0);
+    try std.testing.expect(device_name_len > 0 and device_name_len <= device_name.len);
+    try std.testing.expectEqual(device_name_len, termite_metal_copy_device_name(device_name[0..].ptr, device_name.len));
+
+    const compiler = @import("../graph/quant_kernel_compiler.zig");
+    const artifact = comptime blk: {
+        for (compiler.first_generated_matmul_artifacts) |candidate| {
+            if (candidate.backend == .metal) break :blk candidate;
+        }
+        @compileError("missing generated Metal conformance artifact");
+    };
+    const source = compiler.generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedMetalSource;
+    const kernel_name = try std.testing.allocator.dupeZ(u8, artifact.kernel_id);
+    defer std.testing.allocator.free(kernel_name);
+
+    var error_buffer: [4096]u8 = undefined;
+    const generated = termite_metal_generated_pipeline_create(
+        source.ptr,
+        source.len,
+        kernel_name.ptr,
+        0,
+        error_buffer[0..].ptr,
+        error_buffer.len,
+    ) orelse {
+        std.debug.print("generated Metal JIT pipeline compile failed: {s}\n", .{std.mem.sliceTo(error_buffer[0..], 0)});
+        return error.GeneratedMetalPipelineCompileFailed;
+    };
+    defer termite_metal_generated_pipeline_destroy(generated);
+
+    var pipeline_info: MetalGeneratedPipelineInfo = .{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_generated_pipeline_info_get(generated, &pipeline_info));
+    try std.testing.expect(pipeline_info.thread_execution_width > 0);
+    try std.testing.expect(pipeline_info.max_total_threads_per_threadgroup > 0);
+
+    termite_metal_generated_pipeline_destroy(null);
+    const rejected = termite_metal_generated_pipeline_create(
+        source.ptr,
+        0,
+        kernel_name.ptr,
+        0,
+        error_buffer[0..].ptr,
+        error_buffer.len,
+    );
+    try std.testing.expect(rejected == null);
+    try std.testing.expect(std.mem.sliceTo(error_buffer[0..], 0).len > 0);
+}
+
+fn metalDeviceProbeTraceEnabled() bool {
+    return std.c.getenv("TERMITE_METAL_TRACE_DEVICE_AVAILABLE") != null;
+}
 
 fn sleepMetalProbeRetry() void {
-    var ts = std.c.timespec{ .sec = 0, .nsec = 50_000_000 };
+    var ts = std.c.timespec{ .sec = 0, .nsec = 100_000_000 };
     _ = std.c.nanosleep(&ts, &ts);
 }
 
+// 0 = unprobed, 1 = last probe unavailable, 2 = available. A positive result
+// is cached for the process lifetime. A negative result only downgrades later
+// calls to a single quick probe (no retry sleeps): the full 10x100ms retry
+// window runs once, repeated callers (test-skip guards, backend-selection
+// fallbacks) no longer stack ~1s stalls, and a device that shows up later can
+// still flip the state back to available.
+var metal_device_probe_state = std.atomic.Value(u8).init(0);
+
 pub fn metalDeviceAvailable() bool {
-    for (0..3) |attempt| {
-        if (termite_metal_device_available() != 0) return true;
-        if (attempt != 2) sleepMetalProbeRetry();
+    switch (metal_device_probe_state.load(.acquire)) {
+        2 => return true,
+        1 => {
+            const available = termite_metal_device_available() != 0;
+            if (available) metal_device_probe_state.store(2, .release);
+            return available;
+        },
+        else => {},
+    }
+    const available = probeMetalDeviceAvailable();
+    metal_device_probe_state.store(if (available) 2 else 1, .release);
+    return available;
+}
+
+fn probeMetalDeviceAvailable() bool {
+    const attempts = 10;
+    const trace = metalDeviceProbeTraceEnabled();
+    for (0..attempts) |attempt| {
+        const available = termite_metal_device_available() != 0;
+        if (trace) std.log.warn("metal device probe attempt={d} available={}", .{ attempt + 1, available });
+        if (available) return true;
+        if (attempt + 1 != attempts) sleepMetalProbeRetry();
     }
     return false;
 }
@@ -7796,6 +15080,7 @@ pub extern fn termite_metal_decode_runtime_destroy(runtime: ?*RawMetalDecodeRunt
 pub extern fn termite_metal_decode_runtime_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_reserve(runtime: ?*RawMetalDecodeRuntime, scratch_bytes: usize, token_bytes: usize) c_int;
 pub extern fn termite_metal_decode_runtime_begin_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_begin_prepared_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_submit_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_cancel_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_wait_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
@@ -7821,20 +15106,57 @@ pub extern fn termite_metal_decode_runtime_planned_compute_barrier(runtime: ?*Ra
 pub extern fn termite_metal_decode_runtime_end_planned_compute_scope(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_push_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_pop_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_set_concurrent_planned_dispatch(runtime: ?*RawMetalDecodeRuntime, requested: c_int) c_int;
+pub extern fn termite_metal_decode_runtime_concurrent_planned_dispatch_enabled(runtime: ?*const RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_concurrent_planned_dispatch_policy_probe(requested: c_int, force_enabled: c_int, force_disabled: c_int) c_int;
+pub extern fn termite_metal_planned_range_hazard_probe(a_begin: usize, a_end: usize, a_write: u32, b_begin: usize, b_end: usize, b_write: u32, same_buffer: u32) c_int;
 pub extern fn termite_metal_decode_runtime_frame_cb_count(runtime: ?*RawMetalDecodeRuntime) u64;
+pub extern fn termite_metal_decode_runtime_decode_gqa_split_calls(runtime: ?*const RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_gqa_split_policy_probe(
+    requested_variant: c_uint,
     q_len: usize,
     kv_tokens: usize,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
     sliding_window: usize,
+    resolved_variant_out: *c_uint,
     split_count_out: *c_uint,
     scratch_bytes_out: *usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_decode_gqa_split_schedule_snapshot(
+    runtime: ?*const RawMetalDecodeRuntime,
+    snapshot: *RawDecodeGqaSplitScheduleStats,
+) c_int;
 pub extern fn termite_metal_decode_runtime_last_frame_gpu_nanos(runtime: ?*RawMetalDecodeRuntime) u64;
+pub extern fn termite_metal_decode_runtime_set_active_frame_regime(
+    runtime: ?*RawMetalDecodeRuntime,
+    regime: u8,
+) c_int;
+pub extern fn termite_metal_decode_runtime_stage_timing_snapshot(
+    runtime: ?*RawMetalDecodeRuntime,
+    snapshot: *RawStageTimingSnapshot,
+) c_int;
+pub extern fn termite_metal_decode_runtime_reset_stage_timing(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_workload_profile_begin(
+    runtime: ?*RawMetalDecodeRuntime,
+    regime: u8,
+) c_int;
+pub extern fn termite_metal_decode_runtime_workload_profile_set_regime(
+    runtime: ?*RawMetalDecodeRuntime,
+    regime: u8,
+) c_int;
+pub extern fn termite_metal_decode_runtime_workload_profile_end(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_workload_profile_snapshot(
+    runtime: ?*RawMetalDecodeRuntime,
+    snapshot: *RawWorkloadProfileSnapshot,
+) c_int;
 pub extern fn termite_metal_decode_runtime_memory_snapshot(
     runtime: ?*RawMetalDecodeRuntime,
+    snapshot: *RawRuntimeMemoryStats,
+) c_int;
+pub extern fn termite_metal_provider_generated_quant_snapshot(
+    provider: ?*RawMetalProvider,
     snapshot: *RawRuntimeMemoryStats,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_begin_graph_plan(runtime: ?*RawMetalDecodeRuntime) c_int;
@@ -8022,6 +15344,15 @@ pub fn beginFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {
     };
 }
 
+pub fn beginPreparedFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {
+    return switch (termite_metal_decode_runtime_begin_prepared_frame(runtime)) {
+        0 => {},
+        -1, -2 => FrameError.RuntimeUnavailable,
+        -3, -4 => FrameError.FrameAlreadyActive,
+        else => FrameError.SubmissionFailed,
+    };
+}
+
 pub fn submitFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {
     return switch (termite_metal_decode_runtime_submit_frame(runtime)) {
         0 => {},
@@ -8100,7 +15431,12 @@ pub fn deviceConcatRow(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        // return null is not an error return, so the errdefer above
+        // does not run; release the fresh device buffer explicitly.
+        output.deinit();
+        return null;
+    }
     return output;
 }
 
@@ -8438,9 +15774,93 @@ pub fn lastFrameGpuNanos(runtime: ?*RawMetalDecodeRuntime) u64 {
     return termite_metal_decode_runtime_last_frame_gpu_nanos(runtime);
 }
 
+pub fn setActiveFrameRegime(runtime: ?*RawMetalDecodeRuntime, regime: FrameRegime) FrameError!void {
+    return switch (termite_metal_decode_runtime_set_active_frame_regime(runtime, @intFromEnum(regime))) {
+        0 => {},
+        -1 => FrameError.RuntimeUnavailable,
+        -2 => FrameError.FrameNotActive,
+        else => FrameError.SubmissionFailed,
+    };
+}
+
+pub fn stageTimingSnapshot(runtime: ?*RawMetalDecodeRuntime) RawStageTimingSnapshot {
+    var snapshot: RawStageTimingSnapshot = .{};
+    if (termite_metal_decode_runtime_stage_timing_snapshot(runtime, &snapshot) != 0) return .{};
+    return snapshot;
+}
+
+pub const StageTimingResetError = error{
+    RuntimeUnavailable,
+    FrameActive,
+};
+
+pub fn resetStageTiming(runtime: ?*RawMetalDecodeRuntime) StageTimingResetError!void {
+    return switch (termite_metal_decode_runtime_reset_stage_timing(runtime)) {
+        0 => {},
+        -1 => StageTimingResetError.RuntimeUnavailable,
+        else => StageTimingResetError.FrameActive,
+    };
+}
+
+pub fn workloadProfileBegin(runtime: ?*RawMetalDecodeRuntime, regime: WorkloadRegime) !void {
+    if (termite_metal_decode_runtime_workload_profile_begin(runtime, @intFromEnum(regime)) != 0) {
+        return error.WorkloadProfileUnavailable;
+    }
+}
+
+pub fn workloadProfileSetRegime(runtime: ?*RawMetalDecodeRuntime, regime: WorkloadRegime) !void {
+    if (termite_metal_decode_runtime_workload_profile_set_regime(runtime, @intFromEnum(regime)) != 0) {
+        return error.WorkloadProfileUnavailable;
+    }
+}
+
+pub fn workloadProfileEnd(runtime: ?*RawMetalDecodeRuntime) !void {
+    if (termite_metal_decode_runtime_workload_profile_end(runtime) != 0) {
+        return error.WorkloadProfileUnavailable;
+    }
+}
+
+pub fn workloadProfileSnapshot(runtime: ?*RawMetalDecodeRuntime) !RawWorkloadProfileSnapshot {
+    var snapshot: RawWorkloadProfileSnapshot = .{};
+    if (termite_metal_decode_runtime_workload_profile_snapshot(runtime, &snapshot) != 0) {
+        return error.WorkloadProfileUnavailable;
+    }
+    return snapshot;
+}
+
+pub fn exactJitDispatchStatsSnapshot(runtime: ?*RawMetalDecodeRuntime) !RawMetalJitExactDispatchStats {
+    var stats: RawMetalJitExactDispatchStats = .{};
+    if (termite_metal_decode_runtime_jit_exact_dispatch_stats_snapshot(runtime, &stats) != 0) {
+        return error.MetalJitExactDispatchStatsUnavailable;
+    }
+    return stats;
+}
+
+pub fn resetExactJitDispatchStats(runtime: ?*RawMetalDecodeRuntime) !void {
+    if (termite_metal_decode_runtime_jit_exact_dispatch_stats_reset(runtime) != 0) {
+        return error.MetalJitExactDispatchStatsUnavailable;
+    }
+}
+
 pub fn runtimeMemorySnapshot(runtime: ?*RawMetalDecodeRuntime) RawRuntimeMemoryStats {
     var snapshot: RawRuntimeMemoryStats = .{};
     _ = termite_metal_decode_runtime_memory_snapshot(runtime, &snapshot);
+    return snapshot;
+}
+
+pub fn decodeGqaSplitScheduleSnapshot(
+    runtime: ?*const RawMetalDecodeRuntime,
+) !RawDecodeGqaSplitScheduleStats {
+    var snapshot: RawDecodeGqaSplitScheduleStats = .{};
+    if (termite_metal_decode_runtime_decode_gqa_split_schedule_snapshot(runtime, &snapshot) != 0) {
+        return error.MetalDecodeGqaSplitScheduleStatsUnavailable;
+    }
+    return snapshot;
+}
+
+pub fn providerGeneratedQuantSnapshot(provider: ?*RawMetalProvider) RawRuntimeMemoryStats {
+    var snapshot: RawRuntimeMemoryStats = .{};
+    _ = termite_metal_provider_generated_quant_snapshot(provider, &snapshot);
     return snapshot;
 }
 
@@ -9038,6 +16458,10 @@ pub extern fn termite_metal_decode_runtime_prepare_linear(
     in_dim: usize,
     out_dim: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_prefer_linear_mps(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_prepare_linear_f16(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -9066,6 +16490,14 @@ pub extern fn termite_metal_decode_runtime_prepare_linear_bf16_no_copy(
     out_dim: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_clear_linear_slot(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_clear_layer_norm_slot(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_clear_rms_norm_slot(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
 ) c_int;
@@ -9258,7 +16690,8 @@ pub extern fn termite_metal_decode_runtime_apply_quantized_linear_layer_norm_dev
 ) c_int;
 pub extern fn termite_metal_decode_runtime_apply_quantized_ffn_layer_norm_device(
     runtime: ?*RawMetalDecodeRuntime,
-    format: u32,
+    first_format: u32,
+    second_format: u32,
     first_linear_slot: usize,
     second_linear_slot: usize,
     layer_norm_slot: usize,
@@ -9299,6 +16732,58 @@ pub extern fn termite_metal_decode_runtime_apply_quantized_linear_slot_device(
     slot: usize,
     input_handle: ?*anyopaque,
     input_offset: usize,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_slot_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    bias_handle: ?*anyopaque,
+    bias_offset: usize,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_gelu_slot_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    bias_handle: ?*anyopaque,
+    bias_offset: usize,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_quantized_linear_q6_k_bias_slot_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    bias_handle: ?*anyopaque,
+    bias_offset: usize,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_quantized_linear_q6_k_bias_gelu_slot_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    bias_handle: ?*anyopaque,
+    bias_offset: usize,
     rows: usize,
     in_dim: usize,
     out_dim: usize,
@@ -9616,6 +17101,14 @@ pub extern fn termite_metal_decode_runtime_apply_linear_argmax_device(
     out_dim: usize,
     output_token_id: [*c]u32,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_apply_linear_argmax_device_frame_encode(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    in_dim: usize,
+    out_dim: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_argmax_from_logits_device(
     runtime: ?*RawMetalDecodeRuntime,
     logits_handle: ?*anyopaque,
@@ -9631,6 +17124,22 @@ pub extern fn termite_metal_decode_runtime_argmax_from_logits_suppress_device(
     suppress_token_ids: [*c]const i32,
     suppress_count: usize,
     output_token_id: [*c]u32,
+) c_int;
+pub extern fn termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    logits_handle: ?*anyopaque,
+    logits_offset: usize,
+    rows: usize,
+    out_dim: usize,
+    suppress_token_ids: [*c]const i32,
+    suppress_count: usize,
+    output_token_ids: [*c]u32,
+    consume_active_frame: c_int,
+) c_int;
+pub extern fn termite_metal_decode_runtime_reserve_argmax_rows(
+    runtime: ?*RawMetalDecodeRuntime,
+    rows: usize,
+    out_dim: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_encode_argmax_from_logits_device(
     runtime: ?*RawMetalDecodeRuntime,
@@ -10919,7 +18428,7 @@ pub extern fn termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
 
 /// Mirrors the C-side attention-span namespaces. Legacy/direct attention owns
 /// the lower 256 slots; device-paged KV hooks lease from the upper 256 so a
-/// retained prompt prefix cannot be overwritten by an intervening request.
+/// retained radix prefix cannot be overwritten by an intervening request.
 pub const legacy_attention_span_slot_capacity: usize = 256;
 pub const paged_kv_slot_capacity: usize = 256;
 pub const paged_kv_slot_base: usize = legacy_attention_span_slot_capacity;
@@ -10958,6 +18467,32 @@ pub extern fn termite_metal_decode_runtime_attention_span_device(
 ) c_int;
 pub extern fn termite_metal_decode_runtime_attention_paged_slot_device(
     runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    format: u32,
+    q_handle: ?*anyopaque,
+    q_offset: usize,
+    block_table: [*c]const u32,
+    block_count: usize,
+    page_size: usize,
+    q_len: usize,
+    kv_tokens: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    key_row_bytes: usize,
+    base_key_row_bytes: usize,
+    query_position_offset: usize,
+    kv_position_offset: usize,
+    sliding_window: usize,
+    softcap: f32,
+    sinks: ?[*]const f32,
+    sink_count: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_attention_paged_slot_device_on_frame(
+    kv_runtime: ?*RawMetalDecodeRuntime,
+    frame_runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
     format: u32,
     q_handle: ?*anyopaque,
@@ -11901,6 +19436,7 @@ pub extern fn termite_metal_decode_runtime_apply_rms_norm_i2_s_linear_residual_s
 ) c_int;
 pub extern fn termite_metal_provider_linear_q4_0(
     provider: ?*RawMetalProvider,
+    runtime: ?*RawMetalDecodeRuntime,
     input: [*c]const f32,
     rows: usize,
     in_dim: usize,
@@ -11944,6 +19480,35 @@ pub extern fn termite_metal_provider_linear_q8_0(
     out_dim: usize,
     output: [*c]f32,
 ) c_int;
+pub extern fn termite_metal_provider_linear_q8_0_bias(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q8_0_bias_gelu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q8_0_relu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    output: [*c]f32,
+) c_int;
 pub extern fn termite_metal_provider_linear_q8_1(
     provider: ?*RawMetalProvider,
     input: [*c]const f32,
@@ -11972,6 +19537,26 @@ pub extern fn termite_metal_provider_linear_q2_k(
     out_dim: usize,
     output: [*c]f32,
 ) c_int;
+pub extern fn termite_metal_provider_linear_q2_k_bias(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q2_k_bias_gelu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
 pub extern fn termite_metal_provider_linear_q3_k(
     provider: ?*RawMetalProvider,
     input: [*c]const f32,
@@ -11981,13 +19566,54 @@ pub extern fn termite_metal_provider_linear_q3_k(
     out_dim: usize,
     output: [*c]f32,
 ) c_int;
-pub extern fn termite_metal_provider_linear_q4_k(
+pub extern fn termite_metal_provider_linear_q3_k_bias(
     provider: ?*RawMetalProvider,
     input: [*c]const f32,
     rows: usize,
     in_dim: usize,
     weight_raw: [*c]const u8,
     out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q3_k_bias_gelu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q4_k(
+    provider: ?*RawMetalProvider,
+    runtime: ?*RawMetalDecodeRuntime,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q4_k_bias(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q4_k_bias_gelu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
     output: [*c]f32,
 ) c_int;
 pub extern fn termite_metal_provider_linear_q5_k(
@@ -11999,6 +19625,26 @@ pub extern fn termite_metal_provider_linear_q5_k(
     out_dim: usize,
     output: [*c]f32,
 ) c_int;
+pub extern fn termite_metal_provider_linear_q5_k_bias(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q5_k_bias_gelu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
 pub extern fn termite_metal_provider_linear_q6_k(
     provider: ?*RawMetalProvider,
     input: [*c]const f32,
@@ -12006,6 +19652,26 @@ pub extern fn termite_metal_provider_linear_q6_k(
     in_dim: usize,
     weight_raw: [*c]const u8,
     out_dim: usize,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q6_k_bias(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q6_k_bias_gelu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
     output: [*c]f32,
 ) c_int;
 pub extern fn termite_metal_provider_linear_iq4_xs(
@@ -12889,8 +20555,7 @@ pub fn decoderRuntimeCopyQuantLinearSlotToF32(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn decoderRuntimeCopyF32ToQuantLinearSlot(
@@ -12997,28 +20662,31 @@ pub fn decoderRuntimeGetRowsQuantLinearSlot(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
-pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
+pub fn releaseRawLinearSlot(self: anytype, slot: usize) void {
     if (self.raw_decode_runtime) |runtime| {
         _ = termite_metal_decode_runtime_clear_linear_slot(runtime, slot);
     }
     if (self.raw_linear_slot_dense_weights[slot]) |*weight_tensor| {
         weight_tensor.deinit();
     }
-    self.raw_linear_slot_dense_weights[slot] = null;
     if (self.raw_linear_slot_dense_biases[slot]) |*bias_tensor| {
         bias_tensor.deinit();
     }
-    self.raw_linear_slot_dense_biases[slot] = null;
     if (self.raw_linear_slot_kinds[slot] == .quantized) {
         if (self.raw_linear_slot_quantized_storage[slot]) |storage| {
             storage.deinit();
             std.heap.c_allocator.destroy(storage);
         }
     }
+}
+
+pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
+    releaseRawLinearSlot(self, slot);
+    self.raw_linear_slot_dense_weights[slot] = null;
+    self.raw_linear_slot_dense_biases[slot] = null;
     self.raw_linear_slot_quantized_storage[slot] = null;
     self.raw_linear_slot_kinds[slot] = .none;
     self.raw_linear_slot_in_dims[slot] = 0;
@@ -13027,6 +20695,36 @@ pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
     setRuntimeQuantMappedDisabled(self, slot, false);
     setRuntimeQuantPrepareMode(self, slot, .none);
     self.raw_linear_slots_prepared[slot] = false;
+}
+
+pub fn releaseRawLayerNormSlot(self: anytype, slot: usize) void {
+    if (self.raw_decode_runtime) |runtime| {
+        _ = termite_metal_decode_runtime_clear_layer_norm_slot(runtime, slot);
+    }
+    if (self.raw_layer_norm_slot_weights[slot]) |*weight| weight.deinit();
+    if (self.raw_layer_norm_slot_biases[slot]) |*bias| bias.deinit();
+}
+
+pub fn clearRawLayerNormSlot(self: anytype, slot: usize) void {
+    releaseRawLayerNormSlot(self, slot);
+    self.raw_layer_norm_slot_weights[slot] = null;
+    self.raw_layer_norm_slot_biases[slot] = null;
+    self.raw_layer_norm_slot_hidden_sizes[slot] = 0;
+    self.raw_layer_norm_slots_prepared[slot] = false;
+}
+
+pub fn releaseRawRmsNormSlot(self: anytype, slot: usize) void {
+    if (self.raw_decode_runtime) |runtime| {
+        _ = termite_metal_decode_runtime_clear_rms_norm_slot(runtime, slot);
+    }
+    if (self.raw_rms_norm_slot_weights[slot]) |*weight| weight.deinit();
+}
+
+pub fn clearRawRmsNormSlot(self: anytype, slot: usize) void {
+    releaseRawRmsNormSlot(self, slot);
+    self.raw_rms_norm_slot_weights[slot] = null;
+    self.raw_rms_norm_slot_hidden_sizes[slot] = 0;
+    self.raw_rms_norm_slots_prepared[slot] = false;
 }
 
 pub fn makeQuantizedWeightDeviceArray(storage: *const QuantizedStorage) !c.backend_array {
@@ -13172,6 +20870,85 @@ test "dupQuantizedStorage duplicates owned mmap regions as mmap backed" {
     try std.testing.expectEqualSlices(u8, payload[0..], duped.raw_bytes);
 }
 
+const GeneratedRuntimeLinearEpilogue = enum {
+    bias,
+    bias_gelu,
+};
+const generated_runtime_fused_linear_max_rows = 16;
+
+fn tryApplyGeneratedQuantizedRuntimeLinearEpilogue(
+    self: anytype,
+    runtime: *RawMetalDecodeRuntime,
+    kind: RawQuantizedRuntimeLinearKind,
+    epilogue: GeneratedRuntimeLinearEpilogue,
+    slot: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !?MetalTensor {
+    if (!input.isDevice() or rows < 2 or rows > generated_runtime_fused_linear_max_rows) return null;
+    if (self.raw_linear_slot_dense_biases[slot] == null) return null;
+
+    const apply: @TypeOf(&termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_slot_device) = switch (kind) {
+        .q4_k => switch (epilogue) {
+            .bias => &termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_slot_device,
+            .bias_gelu => &termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_gelu_slot_device,
+        },
+        .q6_k => switch (epilogue) {
+            .bias => &termite_metal_decode_runtime_apply_quantized_linear_q6_k_bias_slot_device,
+            .bias_gelu => &termite_metal_decode_runtime_apply_quantized_linear_q6_k_bias_gelu_slot_device,
+        },
+        else => return null,
+    };
+    const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
+    var output = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
+    errdefer output.deinit();
+    const rc = apply(
+        runtime,
+        slot,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        null,
+        0,
+        rows,
+        in_dim,
+        out_dim,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) {
+        output.deinit();
+        return null;
+    }
+    return output;
+}
+
+pub fn tryApplyQuantizedRuntimeLinearBiasGelu(
+    self: anytype,
+    slot: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    const kind = ensureQuantizedRuntimeLinearSlotPrepared(self, slot, in_dim, out_dim);
+    if (kind == .none) return null;
+    return tryApplyGeneratedQuantizedRuntimeLinearEpilogue(
+        self,
+        runtime,
+        kind,
+        .bias_gelu,
+        slot,
+        input,
+        rows,
+        in_dim,
+        out_dim,
+    );
+}
+
 pub fn tryApplyQuantizedRuntimeLinear(
     self: anytype,
     slot: usize,
@@ -13203,6 +20980,18 @@ pub fn tryApplyQuantizedRuntimeLinear(
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
         return MetalTensor.owned(output, &shape);
     }
+
+    if (try tryApplyGeneratedQuantizedRuntimeLinearEpilogue(
+        self,
+        runtime,
+        kind,
+        .bias,
+        slot,
+        input,
+        rows,
+        in_dim,
+        out_dim,
+    )) |tensor| return tensor;
 
     const frame_active = hasActiveFrame(self.raw_decode_runtime);
     if (input.isDevice() and
@@ -13301,7 +21090,10 @@ pub fn tryApplyQuantizedRuntimeLinear(
         .tq2_0,
         => unreachable,
     };
-    if (rc != 0) return null;
+    if (rc != 0) {
+        std.heap.c_allocator.free(output);
+        return null;
+    }
     if (!applyRuntimeLinearBiasHost(self, slot, output, rows, out_dim)) {
         std.heap.c_allocator.free(output);
         return null;
@@ -13347,7 +21139,10 @@ pub fn tryApplyQuantizedRuntimeLinearScratch(
     const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
     var output = MetalTensor.deviceBorrowed(@ptrCast(runtime), handle, 0, rows * out_dim * @sizeOf(f32), &shape);
     errdefer output.deinit();
-    if (!applyRuntimeLinearBiasDevice(self, slot, &output, rows, out_dim)) return null;
+    if (!applyRuntimeLinearBiasDevice(self, slot, &output, rows, out_dim)) {
+        output.deinit();
+        return null;
+    }
     return output;
 }
 
@@ -13902,7 +21697,11 @@ pub fn tryApplyQuantizedRuntimeLinearPair(
         first_out.ptr,
         second_out.ptr,
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        std.heap.c_allocator.free(second_out);
+        std.heap.c_allocator.free(first_out);
+        return null;
+    }
     if (!applyRuntimeLinearBiasHost(self, slot_a, first_out, rows, out_dim) or
         !applyRuntimeLinearBiasHost(self, slot_b, second_out, rows, out_dim))
     {
@@ -13927,16 +21726,23 @@ pub fn tryApplyDenseRuntimeLinear(
 ) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or in_dim == 0 or out_dim == 0) return null;
+    if (rows > std.math.maxInt(i32) or in_dim > std.math.maxInt(i32) or out_dim > std.math.maxInt(i32)) return null;
+    const output_elements = std.math.mul(usize, rows, out_dim) catch return null;
+    const output_bytes = std.math.mul(usize, output_elements, @sizeOf(f32)) catch return null;
     const frame_active = hasActiveFrame(self.raw_decode_runtime);
     const trace_dense = getenvFlagEnabled("TERMITE_METAL_TRACE_DENSE_LINEAR");
     if (self.raw_linear_slot_kinds[slot] != .dense) {
         if (trace_dense) std.debug.print("dense-linear-null: slot={d} kind={s} rows={d} in={d} out={d}\n", .{ slot, @tagName(self.raw_linear_slot_kinds[slot]), rows, in_dim, out_dim });
         return null;
     }
+    if (self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return null;
+    if (input.ndim() != 2 or input.dim(0) <= 0 or input.dim(1) <= 0 or
+        @as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != in_dim) return null;
 
     if (rows == 1 and input.isDevice()) {
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-        var output_device = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
+        var output_device = try MetalTensor.deviceAllocate(runtime, output_bytes, .private, &shape);
         errdefer output_device.deinit();
         const device_rc = termite_metal_decode_runtime_apply_linear_device(
             runtime,
@@ -13956,7 +21762,7 @@ pub fn tryApplyDenseRuntimeLinear(
     }
     if (rows != 1 and input.isDevice()) {
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-        var output_device = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
+        var output_device = try MetalTensor.deviceAllocate(runtime, output_bytes, .private, &shape);
         errdefer output_device.deinit();
         const device_rc = termite_metal_decode_runtime_apply_linear_multi_row_device(
             runtime,
@@ -13975,7 +21781,7 @@ pub fn tryApplyDenseRuntimeLinear(
 
     if (frame_active) return null;
 
-    const output = try std.heap.c_allocator.alloc(f32, rows * out_dim);
+    const output = try std.heap.c_allocator.alloc(f32, output_elements);
     errdefer std.heap.c_allocator.free(output);
 
     var input_mut = input;
@@ -13988,10 +21794,8 @@ pub fn tryApplyDenseRuntimeLinear(
         out_dim,
         output.ptr,
     );
-    if (rc != 0) return null;
-
     const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn tryApplyDenseRuntimeMlp2(
@@ -14032,8 +21836,7 @@ pub fn tryApplyDenseRuntimeMlp2(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn tryApplyDenseRuntimeFfnLayerNorm(
@@ -14052,6 +21855,11 @@ pub fn tryApplyDenseRuntimeFfnLayerNorm(
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice() or !residual.isDevice()) return null;
+    if (rows == 0 or hidden_size == 0 or intermediate_size == 0 or
+        rows > std.math.maxInt(i32) or hidden_size > std.math.maxInt(i32) or intermediate_size > std.math.maxInt(i32)) return null;
+    const output_elements = std.math.mul(usize, rows, hidden_size) catch return null;
+    const output_bytes = std.math.mul(usize, output_elements, @sizeOf(f32)) catch return null;
+    _ = std.math.mul(usize, rows, intermediate_size) catch return null;
     if (first_slot >= decoder_runtime_linear_slot_capacity or
         second_slot >= decoder_runtime_linear_slot_capacity or
         layer_norm_slot >= decoder_runtime_layer_norm_slot_capacity) return null;
@@ -14060,12 +21868,12 @@ pub fn tryApplyDenseRuntimeFfnLayerNorm(
     if (self.raw_linear_slot_in_dims[first_slot] != hidden_size or self.raw_linear_slot_out_dims[first_slot] != intermediate_size) return null;
     if (self.raw_linear_slot_in_dims[second_slot] != intermediate_size or self.raw_linear_slot_out_dims[second_slot] != hidden_size) return null;
     if (self.raw_layer_norm_slot_hidden_sizes[layer_norm_slot] != hidden_size) return null;
-    if (input.ndim() != 2 or residual.ndim() != 2) return null;
+    if (input.ndim() != 2 or residual.ndim() != 2 or input.dim(0) <= 0 or input.dim(1) <= 0 or residual.dim(0) <= 0 or residual.dim(1) <= 0) return null;
     if (@as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != hidden_size) return null;
     if (@as(usize, @intCast(residual.dim(0))) != rows or @as(usize, @intCast(residual.dim(1))) != hidden_size) return null;
 
     const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
-    var output_device = try MetalTensor.deviceAllocate(runtime, rows * hidden_size * @sizeOf(f32), .private, &shape);
+    var output_device = try MetalTensor.deviceAllocate(runtime, output_bytes, .private, &shape);
     errdefer output_device.deinit();
     const rc = termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
         runtime,
@@ -14084,8 +21892,7 @@ pub fn tryApplyDenseRuntimeFfnLayerNorm(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn tryApplyDenseRuntimeLinearLayerNorm(
@@ -14102,17 +21909,22 @@ pub fn tryApplyDenseRuntimeLinearLayerNorm(
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice() or !residual.isDevice()) return null;
+    if (rows == 0 or in_dim == 0 or hidden_size == 0 or
+        rows > std.math.maxInt(i32) or in_dim > std.math.maxInt(i32) or hidden_size > std.math.maxInt(i32)) return null;
+    const output_elements = std.math.mul(usize, rows, hidden_size) catch return null;
+    const output_bytes = std.math.mul(usize, output_elements, @sizeOf(f32)) catch return null;
+    _ = std.math.mul(usize, rows, in_dim) catch return null;
     if (linear_slot >= decoder_runtime_linear_slot_capacity or layer_norm_slot >= decoder_runtime_layer_norm_slot_capacity) return null;
     if (self.raw_linear_slot_kinds[linear_slot] != .dense) return null;
     if (!self.raw_layer_norm_slots_prepared[layer_norm_slot]) return null;
     if (self.raw_linear_slot_in_dims[linear_slot] != in_dim or self.raw_linear_slot_out_dims[linear_slot] != hidden_size) return null;
     if (self.raw_layer_norm_slot_hidden_sizes[layer_norm_slot] != hidden_size) return null;
-    if (input.ndim() != 2 or residual.ndim() != 2) return null;
+    if (input.ndim() != 2 or residual.ndim() != 2 or input.dim(0) <= 0 or input.dim(1) <= 0 or residual.dim(0) <= 0 or residual.dim(1) <= 0) return null;
     if (@as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != in_dim) return null;
     if (@as(usize, @intCast(residual.dim(0))) != rows or @as(usize, @intCast(residual.dim(1))) != hidden_size) return null;
 
     const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
-    var output_device = try MetalTensor.deviceAllocate(runtime, rows * hidden_size * @sizeOf(f32), .private, &shape);
+    var output_device = try MetalTensor.deviceAllocate(runtime, output_bytes, .private, &shape);
     errdefer output_device.deinit();
     const rc = termite_metal_decode_runtime_apply_dense_linear_layer_norm_device(
         runtime,
@@ -14129,8 +21941,7 @@ pub fn tryApplyDenseRuntimeLinearLayerNorm(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn tryApplyQuantizedRuntimeLinearLayerNorm(
@@ -14184,8 +21995,7 @@ pub fn tryApplyQuantizedRuntimeLinearLayerNorm(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn tryApplyQuantizedRuntimeFfnLayerNorm(
@@ -14217,16 +22027,19 @@ pub fn tryApplyQuantizedRuntimeFfnLayerNorm(
     if (@as(usize, @intCast(residual.dim(0))) != rows or @as(usize, @intCast(residual.dim(1))) != hidden_size) return null;
     const first_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, first_slot, hidden_size, intermediate_size);
     const second_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, second_slot, intermediate_size, hidden_size);
-    if (first_kind != second_kind) return null;
-    if (!quantizedRuntimeLinearKindHasSingleStageDeviceKernel(first_kind)) return null;
-    const format = metalQuantFormatForKind(first_kind);
-    if (format == .unsupported) return null;
+    if (!quantizedRuntimeLinearKindHasSingleStageDeviceKernel(first_kind) or
+        !quantizedRuntimeLinearKindHasSingleStageDeviceKernel(second_kind)) return null;
+    const first_format = metalQuantFormatForKind(first_kind);
+    const second_format = metalQuantFormatForKind(second_kind);
+    if (first_format == .unsupported or second_format == .unsupported) return null;
     if (first_kind != .tl1 and first_kind != .tl2) {
         const first_storage = self.raw_linear_slot_quantized_storage[first_slot] orelse return null;
-        const first_descriptor = packedWeightDescriptorForMatrix(first_storage, hidden_size, intermediate_size, format) orelse return null;
+        const first_descriptor = packedWeightDescriptorForMatrix(first_storage, hidden_size, intermediate_size, first_format) orelse return null;
         if (!first_descriptor.supported()) return null;
+    }
+    if (second_kind != .tl1 and second_kind != .tl2) {
         const second_storage = self.raw_linear_slot_quantized_storage[second_slot] orelse return null;
-        const second_descriptor = packedWeightDescriptorForMatrix(second_storage, intermediate_size, hidden_size, format) orelse return null;
+        const second_descriptor = packedWeightDescriptorForMatrix(second_storage, intermediate_size, hidden_size, second_format) orelse return null;
         if (!second_descriptor.supported()) return null;
     }
 
@@ -14235,7 +22048,8 @@ pub fn tryApplyQuantizedRuntimeFfnLayerNorm(
     errdefer output_device.deinit();
     const rc = termite_metal_decode_runtime_apply_quantized_ffn_layer_norm_device(
         runtime,
-        @intFromEnum(format),
+        @intFromEnum(first_format),
+        @intFromEnum(second_format),
         first_slot,
         second_slot,
         layer_norm_slot,
@@ -14251,8 +22065,7 @@ pub fn tryApplyQuantizedRuntimeFfnLayerNorm(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn tryApplyDenseRuntimeLinearPair(
@@ -14289,7 +22102,11 @@ pub fn tryApplyDenseRuntimeLinearPair(
                 const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
                 var first = MetalTensor.deviceBorrowed(@ptrCast(runtime), first_handle orelse return null, 0, rows * out_dim * @sizeOf(f32), &shape);
                 errdefer first.deinit();
-                var second = MetalTensor.deviceBorrowed(@ptrCast(runtime), second_handle orelse return null, 0, rows * out_dim * @sizeOf(f32), &shape);
+                const second_handle_value = second_handle orelse {
+                    first.deinit();
+                    return null;
+                };
+                var second = MetalTensor.deviceBorrowed(@ptrCast(runtime), second_handle_value, 0, rows * out_dim * @sizeOf(f32), &shape);
                 errdefer second.deinit();
                 return .{
                     .first = first,
@@ -14348,7 +22165,11 @@ pub fn tryApplyDenseRuntimeLinearPair(
         first_out.ptr,
         second_out.ptr,
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        std.heap.c_allocator.free(second_out);
+        std.heap.c_allocator.free(first_out);
+        return null;
+    }
 
     const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
     return .{
@@ -14370,17 +22191,29 @@ pub fn tryApplyDenseRuntimeLinearQkv(
 ) !?RuntimeLinearTripleResult {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (q_slot >= decoder_runtime_linear_slot_capacity or k_slot >= decoder_runtime_linear_slot_capacity or v_slot >= decoder_runtime_linear_slot_capacity) return null;
+    if (rows == 0 or in_dim == 0 or q_out_dim == 0 or kv_out_dim == 0 or
+        rows > std.math.maxInt(i32) or in_dim > std.math.maxInt(i32) or
+        q_out_dim > std.math.maxInt(i32) or kv_out_dim > std.math.maxInt(i32)) return null;
+    const q_elements = std.math.mul(usize, rows, q_out_dim) catch return null;
+    const kv_elements = std.math.mul(usize, rows, kv_out_dim) catch return null;
+    const q_bytes = std.math.mul(usize, q_elements, @sizeOf(f32)) catch return null;
+    const kv_bytes = std.math.mul(usize, kv_elements, @sizeOf(f32)) catch return null;
     const frame_active = hasActiveFrame(self.raw_decode_runtime);
     if (self.raw_linear_slot_kinds[q_slot] != .dense or self.raw_linear_slot_kinds[k_slot] != .dense or self.raw_linear_slot_kinds[v_slot] != .dense) return null;
+    if (self.raw_linear_slot_in_dims[q_slot] != in_dim or self.raw_linear_slot_in_dims[k_slot] != in_dim or self.raw_linear_slot_in_dims[v_slot] != in_dim or
+        self.raw_linear_slot_out_dims[q_slot] != q_out_dim or self.raw_linear_slot_out_dims[k_slot] != kv_out_dim or self.raw_linear_slot_out_dims[v_slot] != kv_out_dim) return null;
+    if (input.ndim() != 2 or input.dim(0) <= 0 or input.dim(1) <= 0 or
+        @as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != in_dim) return null;
 
     if (rows == 1 and input.isDevice()) {
         const q_shape = [_]i32{ @intCast(rows), @intCast(q_out_dim) };
         const kv_shape = [_]i32{ @intCast(rows), @intCast(kv_out_dim) };
-        var q_device = try MetalTensor.deviceAllocate(runtime, rows * q_out_dim * @sizeOf(f32), .private, &q_shape);
+        var q_device = try MetalTensor.deviceAllocate(runtime, q_bytes, .private, &q_shape);
         errdefer q_device.deinit();
-        var k_device = try MetalTensor.deviceAllocate(runtime, rows * kv_out_dim * @sizeOf(f32), .private, &kv_shape);
+        var k_device = try MetalTensor.deviceAllocate(runtime, kv_bytes, .private, &kv_shape);
         errdefer k_device.deinit();
-        var v_device = try MetalTensor.deviceAllocate(runtime, rows * kv_out_dim * @sizeOf(f32), .private, &kv_shape);
+        var v_device = try MetalTensor.deviceAllocate(runtime, kv_bytes, .private, &kv_shape);
         errdefer v_device.deinit();
         const device_rc = termite_metal_decode_runtime_apply_linear_qkv_slots_device(
             runtime,
@@ -14434,11 +22267,20 @@ pub fn tryApplyDenseRuntimeLinearQkv(
             if (scratch_rc == 0) {
                 const q_shape = [_]i32{ @intCast(rows), @intCast(q_out_dim) };
                 const kv_shape = [_]i32{ @intCast(rows), @intCast(kv_out_dim) };
-                var q = MetalTensor.deviceBorrowed(@ptrCast(runtime), q_handle orelse return null, 0, rows * q_out_dim * @sizeOf(f32), &q_shape);
+                var q = MetalTensor.deviceBorrowed(@ptrCast(runtime), q_handle orelse return null, 0, q_bytes, &q_shape);
                 errdefer q.deinit();
-                var k = MetalTensor.deviceBorrowed(@ptrCast(runtime), k_handle orelse return null, 0, rows * kv_out_dim * @sizeOf(f32), &kv_shape);
+                const k_handle_value = k_handle orelse {
+                    q.deinit();
+                    return null;
+                };
+                var k = MetalTensor.deviceBorrowed(@ptrCast(runtime), k_handle_value, 0, kv_bytes, &kv_shape);
                 errdefer k.deinit();
-                var v = MetalTensor.deviceBorrowed(@ptrCast(runtime), v_handle orelse return null, 0, rows * kv_out_dim * @sizeOf(f32), &kv_shape);
+                const v_handle_value = v_handle orelse {
+                    k.deinit();
+                    q.deinit();
+                    return null;
+                };
+                var v = MetalTensor.deviceBorrowed(@ptrCast(runtime), v_handle_value, 0, kv_bytes, &kv_shape);
                 errdefer v.deinit();
                 return .{
                     .first = q,
@@ -14471,11 +22313,11 @@ pub fn tryApplyDenseRuntimeLinearQkv(
 
     var input_mut = input;
     const input_base = try tensorHostConstPtr(&input_mut);
-    const q_out = try std.heap.c_allocator.alloc(f32, rows * q_out_dim);
+    const q_out = try std.heap.c_allocator.alloc(f32, q_elements);
     errdefer std.heap.c_allocator.free(q_out);
-    const k_out = try std.heap.c_allocator.alloc(f32, rows * kv_out_dim);
+    const k_out = try std.heap.c_allocator.alloc(f32, kv_elements);
     errdefer std.heap.c_allocator.free(k_out);
-    const v_out = try std.heap.c_allocator.alloc(f32, rows * kv_out_dim);
+    const v_out = try std.heap.c_allocator.alloc(f32, kv_elements);
     errdefer std.heap.c_allocator.free(v_out);
 
     const rc = termite_metal_decode_runtime_apply_linear_qkv_slots(
@@ -14492,7 +22334,12 @@ pub fn tryApplyDenseRuntimeLinearQkv(
         k_out.ptr,
         v_out.ptr,
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        std.heap.c_allocator.free(v_out);
+        std.heap.c_allocator.free(k_out);
+        std.heap.c_allocator.free(q_out);
+        return null;
+    }
 
     const q_shape = [_]i32{ @intCast(rows), @intCast(q_out_dim) };
     const kv_shape = [_]i32{ @intCast(rows), @intCast(kv_out_dim) };
@@ -14567,6 +22414,7 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
     }
 
     if (input.isDevice() and direct_case != null) {
+        const device_case = direct_case.?;
         const q_shape = [_]i32{ @intCast(rows), @intCast(q_out_dim) };
         const kv_shape = [_]i32{ @intCast(rows), @intCast(kv_out_dim) };
         var q_device = try MetalTensor.deviceAllocate(runtime, rows * q_out_dim * @sizeOf(f32), .private, &q_shape);
@@ -14575,7 +22423,7 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
         errdefer k_device.deinit();
         var v_device = try MetalTensor.deviceAllocate(runtime, rows * kv_out_dim * @sizeOf(f32), .private, &kv_shape);
         errdefer v_device.deinit();
-        const device_rc = switch (direct_case orelse return null) {
+        const device_rc = switch (device_case) {
             .q4_0 => termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
                 runtime,
                 @intFromEnum(MetalQuantFormat.q4_0),
@@ -14714,7 +22562,8 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
         };
     }
 
-    if (direct_case == .q8_0) return null;
+    const host_case = direct_case orelse return null;
+    if (host_case == .q8_0) return null;
     if (frame_active) return null;
 
     var input_mut = input;
@@ -14727,7 +22576,7 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
     const v_out = try std.heap.c_allocator.alloc(f32, rows * kv_out_dim);
     errdefer std.heap.c_allocator.free(v_out);
 
-    const rc = switch (direct_case orelse return null) {
+    const rc = switch (host_case) {
         .q4_0 => termite_metal_decode_runtime_apply_quantized_q_kv_pair_linear_qkv_slots(
             runtime,
             @intFromEnum(MetalQuantFormat.q4_0),
@@ -14778,7 +22627,12 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
         ),
         .q8_0 => unreachable,
     };
-    if (rc != 0) return null;
+    if (rc != 0) {
+        std.heap.c_allocator.free(v_out);
+        std.heap.c_allocator.free(k_out);
+        std.heap.c_allocator.free(q_out);
+        return null;
+    }
     if (!applyRuntimeLinearBiasHost(self, q_slot, q_out, rows, q_out_dim) or
         !applyRuntimeLinearBiasHost(self, k_slot, k_out, rows, kv_out_dim) or
         !applyRuntimeLinearBiasHost(self, v_slot, v_out, rows, kv_out_dim))
@@ -14848,13 +22702,28 @@ pub fn tryApplyQuantizedRuntimeLinearQkvScratch(
     const kv_shape = [_]i32{ @intCast(rows), @intCast(kv_out_dim) };
     var q = MetalTensor.deviceBorrowed(@ptrCast(runtime), q_handle orelse return null, 0, rows * q_out_dim * @sizeOf(f32), &q_shape);
     errdefer q.deinit();
-    var k = MetalTensor.deviceBorrowed(@ptrCast(runtime), k_handle orelse return null, 0, rows * kv_out_dim * @sizeOf(f32), &kv_shape);
+    const k_handle_value = k_handle orelse {
+        q.deinit();
+        return null;
+    };
+    var k = MetalTensor.deviceBorrowed(@ptrCast(runtime), k_handle_value, 0, rows * kv_out_dim * @sizeOf(f32), &kv_shape);
     errdefer k.deinit();
-    var v = MetalTensor.deviceBorrowed(@ptrCast(runtime), v_handle orelse return null, 0, rows * kv_out_dim * @sizeOf(f32), &kv_shape);
+    const v_handle_value = v_handle orelse {
+        k.deinit();
+        q.deinit();
+        return null;
+    };
+    var v = MetalTensor.deviceBorrowed(@ptrCast(runtime), v_handle_value, 0, rows * kv_out_dim * @sizeOf(f32), &kv_shape);
     errdefer v.deinit();
     if (!applyRuntimeLinearBiasDevice(self, q_slot, &q, rows, q_out_dim) or
         !applyRuntimeLinearBiasDevice(self, k_slot, &k, rows, kv_out_dim) or
-        !applyRuntimeLinearBiasDevice(self, v_slot, &v, rows, kv_out_dim)) return null;
+        !applyRuntimeLinearBiasDevice(self, v_slot, &v, rows, kv_out_dim))
+    {
+        v.deinit();
+        k.deinit();
+        q.deinit();
+        return null;
+    }
     return .{
         .first = q,
         .second = k,
@@ -15565,9 +23434,8 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
     );
     if (rc != 0) {
         stats.quantized_gated_ffn_runtime_failures += 1;
-        return null;
     }
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn shouldAttemptDirectQuantizedGatedFfn(
@@ -15938,6 +23806,7 @@ fn runQuantizedGatedFfnResidualMetalTensor(
         .post_down_rms_norm_slot = request.ffn_post_down_rms_norm_slot,
         .output = output.ptr,
     }, stats, logged_unsupported_type))) {
+        std.heap.c_allocator.free(output);
         return null;
     }
     stats.quantized_gated_ffn_direct_successes += 1;
@@ -16228,6 +24097,7 @@ fn runAttentionF32GatedDecoderBlockQuantizedDevice(
             );
         }
         stats.f32_kv_quant_direct_block_failures += 1;
+        device_output.deinit();
         return null;
     }
     stats.f32_kv_quant_direct_block_successes += 1;
@@ -16286,7 +24156,10 @@ fn runAttentionPagedGatedDecoderBlockQuantizedDevice(
         block_token_offsets,
         device_output,
         stats,
-    )) return null;
+    )) {
+        device_output.deinit();
+        return null;
+    }
     return device_output;
 }
 
@@ -16734,6 +24607,10 @@ fn runCompressedAttentionGatedDecoderBlockQuantizedDevice(
         if (trace) std.debug.print("metal-quant-block-skip layer={d} reason=device q={} k={} v={} residual={}\n", .{ request.layer_index, q_mt.isDevice(), k_suffix_mt.isDevice(), v_suffix_mt.isDevice(), request.residual.isDevice() });
         return null;
     }
+    if (direct_block_format.attention != .q8_0 or
+        direct_block_format.ffn_gate_up != .q8_0 or
+        direct_block_format.ffn_down != .q8_0 or
+        (direct_block_format.ple != .unsupported and direct_block_format.ple != .q8_0)) return null;
 
     const base_key_row_bytes = switch (request.format) {
         .polar4 => (@as(usize, request.num_kv_heads) * request.head_dim + 1) / 2,
@@ -16812,10 +24689,6 @@ fn runCompressedAttentionGatedDecoderBlockQuantizedDevice(
             },
         );
     }
-    if (direct_block_format.attention != .q8_0 or
-        direct_block_format.ffn_gate_up != .q8_0 or
-        direct_block_format.ffn_down != .q8_0 or
-        (direct_block_format.ple != .unsupported and direct_block_format.ple != .q8_0)) return null;
     const rc = termite_metal_decode_runtime_apply_attention_gated_block_q8_0_device_kv_device(
         runtime,
         switch (request.format) {
@@ -16880,6 +24753,7 @@ fn runCompressedAttentionGatedDecoderBlockQuantizedDevice(
         if (stats.compressed_block_gated_direct_first_failure_code == 0) {
             stats.compressed_block_gated_direct_first_failure_code = timing.failure_code;
         }
+        device_output.deinit();
         return null;
     }
     stats.compressed_block_gated_direct_successes += 1;
@@ -17257,8 +25131,7 @@ pub fn sliceLastDim2DDevice(self: anytype, tensor: MetalTensor, start: usize, st
         out.deviceHandle(),
         out.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return out;
+    return finishDeviceOutput(&out, rc);
 }
 
 fn cloneOrRetainTensor(tensor: MetalTensor) !MetalTensor {
@@ -17360,8 +25233,7 @@ fn ensureGatheredSpanEntryDevice(
 pub fn resetGatheredSpans(self: anytype) void {
     var it = self.gathered_spans.iterator();
     while (it.next()) |entry| entry.value_ptr.deinit();
-    self.gathered_spans.deinit(std.heap.c_allocator);
-    self.gathered_spans = .empty;
+    self.gathered_spans.clearAndFree(std.heap.c_allocator);
 }
 
 pub fn hasGatheredSpanCache(self: anytype, source_ptr_id: usize, sequence_id: runtime_root.kv.manager.SequenceId, layer_index: usize) bool {
@@ -18483,6 +26355,8 @@ pub fn runCompressedAttentionResidual(self: anytype, request: anytype, stats: an
         attention_output.ptr,
     ) != 0) {
         stats.compressed_attention_residual_attention_span_failures += 1;
+        std.heap.c_allocator.free(attention_output);
+        attention_output_owned = false;
         return null;
     }
     debugRuntimeSliceFinite("attention-output-host", request.layer_index, attention_output[0..attention_input_size]);
@@ -18630,7 +26504,7 @@ pub fn runCompressedAttentionDenseDecoderBlockDirect(self: anytype, request: any
         if (request.query_sequence_len != input_rows or request.kv_tokens < request.query_sequence_len) return null;
         const prefix_tokens = request.kv_tokens - request.query_sequence_len;
         var combined: ?MetalTensor = null;
-        errdefer if (combined) |*tensor| tensor.deinit();
+        defer if (combined) |*tensor| tensor.deinit();
         for (0..input_rows) |row| {
             var row_residual = try sliceRows(self, request.residual, row, 1);
             defer row_residual.deinit();
@@ -18741,7 +26615,9 @@ pub fn runCompressedAttentionDenseDecoderBlockDirect(self: anytype, request: any
                 combined = row_output;
             }
         }
-        return combined;
+        const result = combined;
+        combined = null;
+        return result;
     }
 
     var q_tensor = maybe_q orelse blk: {
@@ -18941,9 +26817,8 @@ pub fn runCompressedAttentionDenseDecoderBlockDirect(self: anytype, request: any
         output.ptr,
     );
     stats.compressed_block_apply_nanos += @intCast(monotonicNowNs() - apply_started_at);
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(request.hidden_size) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn runCompressedAttentionGatedDecoderBlockDirect(
@@ -18968,6 +26843,10 @@ pub fn runCompressedAttentionGatedDecoderBlockDirect(
     {
         return null;
     }
+    const projected_q_slot = if (selected_qkv.source == .projected_q_only_slot)
+        request.q_linear_slot orelse return null
+    else
+        0;
 
     const base_key_row_bytes = switch (request.format) {
         .polar4 => (@as(usize, request.num_kv_heads) * request.head_dim + 1) / 2,
@@ -19049,7 +26928,7 @@ pub fn runCompressedAttentionGatedDecoderBlockDirect(
                 },
                 q_handle,
                 q_offset,
-                request.q_linear_slot orelse return null,
+                projected_q_slot,
                 k_handle,
                 k_offset,
                 v_handle,
@@ -19174,7 +27053,7 @@ pub fn runCompressedAttentionGatedDecoderBlockDirect(
                 .turbo3 => 1,
             },
             q_ptr,
-            request.q_linear_slot orelse return null,
+            projected_q_slot,
             k_ptr,
             v_ptr,
             request.kv_tokens,
@@ -19264,6 +27143,7 @@ pub fn runCompressedAttentionGatedDecoderBlockDirect(
         if (stats.compressed_block_gated_direct_first_failure_code == 0) {
             stats.compressed_block_gated_direct_first_failure_code = timing.failure_code;
         }
+        std.heap.c_allocator.free(output);
         return null;
     }
     stats.compressed_block_gated_direct_successes += 1;
@@ -22787,9 +30667,7 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
     }, input, residual, &stats)) orelse return error.GatedFfnDirectNull;
     defer direct.deinit();
     const after_direct = runtimeMemorySnapshot(runtime);
-    if (q4_0F16FfnEnabled()) {
-        try std.testing.expect(after_direct.q4_0_pair_activation_reduce_f16_output > before_direct.q4_0_pair_activation_reduce_f16_output);
-    } else if (q4_0SplitGateUpReduceEnabled()) {
+    if (q4_0SplitGateUpReduceEnabled()) {
         try std.testing.expect(after_direct.q4_0_pair_reduce == before_direct.q4_0_pair_reduce);
         try std.testing.expect(after_direct.q4_0_linear_reduce >= before_direct.q4_0_linear_reduce + 3);
     } else {
@@ -22800,8 +30678,6 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
     }
     if (q4_0LinearRmsAddF16ProjectEnabled()) {
         try std.testing.expect(after_direct.q4_0_linear_reduce_f16_input_f16_output > before_direct.q4_0_linear_reduce_f16_input_f16_output);
-    } else if (q4_0F16FfnEnabled()) {
-        try std.testing.expect(after_direct.q4_0_linear_reduce_f16_input > before_direct.q4_0_linear_reduce_f16_input);
     } else {
         try std.testing.expect(after_direct.q4_0_linear_reduce > before_direct.q4_0_linear_reduce);
     }
@@ -22822,7 +30698,6 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
 test "metal native q4_0 gate up q6_k down device path matches decomposed" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
-    if (getenvBool("TERMITE_METAL_DISABLE_Q4_0_Q6K_F16_FFN")) return error.SkipZigTest;
 
     const metal_native_provider = @import("metal_native_provider.zig");
     var provider = try metal_native_provider.MetalNativeProvider.create();
@@ -23751,17 +31626,10 @@ test "metal native q4_0 attention ffn block works inside active frame" {
     } else if (!q4_0LinearRmsAddSumsqDisabled()) {
         try std.testing.expect(after_block.q4_0_linear_reduce_sumsq > before_block.q4_0_linear_reduce_sumsq);
         try std.testing.expect(after_block.rms_norm_add_sumsq > before_block.rms_norm_add_sumsq);
-    } else if (q4_0F16FfnEnabled()) {
-        try std.testing.expect(after_block.q4_0_linear_reduce_f16_input > before_block.q4_0_linear_reduce_f16_input);
     } else {
         try std.testing.expect(after_block.q4_0_linear_reduce > before_block.q4_0_linear_reduce);
     }
-    if (q4_0F16FfnEnabled()) {
-        try std.testing.expect(
-            after_block.q4_0_pair_activation_reduce_f16_output > before_block.q4_0_pair_activation_reduce_f16_output or
-                after_block.q4_0_pair_activation_rms_scale_reduce_f16_output > before_block.q4_0_pair_activation_rms_scale_reduce_f16_output,
-        );
-    } else if (q4_0SplitGateUpReduceEnabled()) {
+    if (q4_0SplitGateUpReduceEnabled()) {
         try std.testing.expect(after_block.q4_0_linear_reduce > before_block.q4_0_linear_reduce);
     } else {
         try std.testing.expect(
@@ -27214,9 +35082,235 @@ test "metal native planned q8_0 attention ffn ple block matches decomposed" {
     }
 }
 
+test "metal native flash prefill direct KV is bounded, counted, and disable-wins" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const enable_env = "TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD";
+    const disable_env = "TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD";
+    const generated_enable_env = "TERMITE_METAL_ENABLE_FLASH_PREFILL_GENERATED";
+    const generated_disable_env = "TERMITE_METAL_DISABLE_FLASH_PREFILL_GENERATED";
+    const original_enable = if (std.c.getenv(enable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    const original_disable = if (std.c.getenv(disable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    const original_generated_enable = if (std.c.getenv(generated_enable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    const original_generated_disable = if (std.c.getenv(generated_disable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (original_enable) |value| {
+            _ = setenv(enable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(enable_env);
+        }
+        if (original_disable) |value| {
+            _ = setenv(disable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(disable_env);
+        }
+        if (original_generated_enable) |value| {
+            _ = setenv(generated_enable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(generated_enable_env);
+        }
+        if (original_generated_disable) |value| {
+            _ = setenv(generated_disable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(generated_disable_env);
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), setenv(enable_env, "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(disable_env));
+    try std.testing.expectEqual(@as(c_int, 0), setenv(generated_enable_env, "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(generated_disable_env));
+
+    const Exercise = struct {
+        fn run(expect_direct: bool, output: []f32) !void {
+            const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+            defer termite_metal_decode_runtime_destroy(runtime);
+            defer _ = termite_metal_decode_runtime_reset_state(runtime);
+            if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+            const q_len: usize = 8;
+            const kv_tokens: usize = 16;
+            const num_heads: usize = 8;
+            const num_kv_heads: usize = 2;
+            const head_dim: usize = 256;
+            const sliding_window: usize = 512;
+            const kv_dim: usize = num_kv_heads * head_dim;
+            const q_dim: usize = num_heads * head_dim;
+            const page_size: usize = 16;
+            const key_row_bytes: usize = kv_dim * @sizeOf(f16);
+            try std.testing.expectEqual(q_len * q_dim, output.len);
+
+            var q_data: [q_len * q_dim]f32 = undefined;
+            var k_data: [kv_tokens * kv_dim]f32 = undefined;
+            var v_data: [kv_tokens * kv_dim]f32 = undefined;
+            for (&q_data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) * 0.03125;
+            for (&k_data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.03125;
+            for (&v_data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) * 0.03125;
+
+            var q = try testDeviceTensorFromSlice(runtime, &q_data, &[_]i32{ @intCast(q_len), @intCast(q_dim) });
+            defer q.deinit();
+            var k = try testDeviceTensorFromSlice(runtime, &k_data, &[_]i32{ @intCast(kv_tokens), @intCast(kv_dim) });
+            defer k.deinit();
+            var v = try testDeviceTensorFromSlice(runtime, &v_data, &[_]i32{ @intCast(kv_tokens), @intCast(kv_dim) });
+            defer v.deinit();
+            var out = try MetalTensor.deviceAllocate(runtime, q_len * q_dim * @sizeOf(f32), .private, &[_]i32{ @intCast(q_len), @intCast(q_dim) });
+            defer out.deinit();
+
+            // Logical token zero starts at physical token 16. Attention is
+            // deliberately given an invalid unused tail entry: only the one
+            // block needed by kv_tokens may be validated or uploaded.
+            const update_blocks = [_]u32{16};
+            const attention_blocks = [_]u32{ 16, std.math.maxInt(u32) };
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_reset_attention_span_slot(runtime, 0));
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
+                runtime,
+                0,
+                3,
+                k.deviceHandle(),
+                k.deviceByteOffset(),
+                v.deviceHandle(),
+                v.deviceByteOffset(),
+                kv_tokens,
+                kv_tokens,
+                num_kv_heads,
+                head_dim,
+                key_row_bytes,
+                key_row_bytes,
+                kv_dim,
+                0,
+                &update_blocks,
+                update_blocks.len,
+                page_size,
+            ));
+
+            const before = runtimeMemorySnapshot(runtime);
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_attention_paged_slot_device(
+                runtime,
+                0,
+                3,
+                q.deviceHandle(),
+                q.deviceByteOffset(),
+                &attention_blocks,
+                attention_blocks.len,
+                page_size,
+                q_len,
+                kv_tokens,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                key_row_bytes,
+                key_row_bytes,
+                kv_tokens - q_len,
+                0,
+                sliding_window,
+                0.0,
+                null,
+                0,
+                out.deviceHandle(),
+                out.deviceByteOffset(),
+            ));
+            const after_prefill = runtimeMemorySnapshot(runtime);
+            try std.testing.expectEqual(before.generated_attention_flash_prefill_calls + 1, after_prefill.generated_attention_flash_prefill_calls);
+            if (expect_direct) {
+                try std.testing.expectEqual(before.attention_prefill_direct_kv_calls + 1, after_prefill.attention_prefill_direct_kv_calls);
+                try std.testing.expectEqual(before.attention_prefill_paged_kv_calls, after_prefill.attention_prefill_paged_kv_calls);
+            } else {
+                try std.testing.expectEqual(before.attention_prefill_direct_kv_calls, after_prefill.attention_prefill_direct_kv_calls);
+                try std.testing.expectEqual(before.attention_prefill_paged_kv_calls + 1, after_prefill.attention_prefill_paged_kv_calls);
+            }
+            var out_mut = out;
+            const prefill_output = try tensorHostSlice(&out_mut);
+            @memcpy(output, prefill_output);
+
+            // A decode-shaped call on the same contiguous table cannot select
+            // or count either prefill K/V route.
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_attention_paged_slot_device(
+                runtime,
+                0,
+                3,
+                q.deviceHandle(),
+                q.deviceByteOffset(),
+                &attention_blocks,
+                attention_blocks.len,
+                page_size,
+                1,
+                kv_tokens,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                key_row_bytes,
+                key_row_bytes,
+                kv_tokens - 1,
+                0,
+                sliding_window,
+                0.0,
+                null,
+                0,
+                out.deviceHandle(),
+                out.deviceByteOffset(),
+            ));
+            const after_decode = runtimeMemorySnapshot(runtime);
+            try std.testing.expectEqual(after_prefill.attention_prefill_direct_kv_calls, after_decode.attention_prefill_direct_kv_calls);
+            try std.testing.expectEqual(after_prefill.attention_prefill_paged_kv_calls, after_decode.attention_prefill_paged_kv_calls);
+        }
+    };
+
+    var direct_output: [8 * 8 * 256]f32 = undefined;
+    var paged_output: [8 * 8 * 256]f32 = undefined;
+    try Exercise.run(true, &direct_output);
+    try std.testing.expectEqual(@as(c_int, 0), setenv(disable_env, "1", 1));
+    try Exercise.run(false, &paged_output);
+    try std.testing.expectEqualSlices(f32, &direct_output, &paged_output);
+}
+
 test "metal native paged attention f16 single row uses 1x kernel across pages" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    // The production GQA split route now takes precedence for this shape.
+    // Isolate the legacy 1x kernel this test names, and restore caller state.
+    const split_disable_env = "TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT";
+    const one_x_disable_env = "TERMITE_METAL_DISABLE_PAGED_ATTENTION_1X";
+    const original_split_disable = if (std.c.getenv(split_disable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    const original_one_x_disable = if (std.c.getenv(one_x_disable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (original_split_disable) |value| {
+            _ = setenv(split_disable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(split_disable_env);
+        }
+        if (original_one_x_disable) |value| {
+            _ = setenv(one_x_disable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(one_x_disable_env);
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), setenv(split_disable_env, "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(one_x_disable_env));
 
     const metal_native_provider = @import("metal_native_provider.zig");
     var provider = try metal_native_provider.MetalNativeProvider.create();
@@ -28348,6 +36442,213 @@ test "metal native decoder runtime argmax suppress stays device resident" {
     try std.testing.expectEqual(@as(usize, 1025), (try argmaxLogitsSuppressDevice(&provider, logits_tensor, out_dim, &suppress_two)) orelse return error.UnexpectedNull);
 }
 
+test "metal native top-p samplers can select the nucleus crossing token" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    // After max subtraction these logits produce weights [1, 0.5, 1/6]. At
+    // top_p=0.8 the first token is insufficient, so the second token is the
+    // nucleus crossing token and must remain selectable.
+    const logits = [_]f32{ 0.0, @log(0.5), @log(1.0 / 6.0) };
+    var logits_tensor = try testDeviceTensorFromSlice(runtime, &logits, &[_]i32{ 1, @intCast(logits.len) });
+    defer logits_tensor.deinit();
+
+    const SeedSearch = struct {
+        fn sampleFraction(raw_seed: u32) f64 {
+            var state = raw_seed ^ 0x9e3779b9;
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            return @as(f64, @floatFromInt(state)) / 4294967296.0;
+        }
+    };
+    var seed: u32 = 0;
+    while (SeedSearch.sampleFraction(seed) <= 0.75) : (seed += 1) {}
+
+    // top_k=0 exercises the bounded serial sampler; top_k=3 exercises the
+    // parallel top-k partials and reducer. With the old cutoff bug both paths
+    // could only return token 0 for this distribution.
+    for ([_]usize{ 0, logits.len }) |top_k| {
+        var sampled_token: u32 = std.math.maxInt(u32);
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_sample_from_logits_device(
+            runtime,
+            logits_tensor.deviceHandle(),
+            logits_tensor.deviceByteOffset(),
+            logits.len,
+            1.0,
+            top_k,
+            0.8,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            null,
+            null,
+            0,
+            seed,
+            &sampled_token,
+        ));
+        try std.testing.expectEqual(@as(u32, 1), sampled_token);
+    }
+}
+
+test "metal native sampling preserves penalty histories larger than setBytes" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const out_dim: usize = 1024;
+    const penalty_count: usize = 600;
+    const logits = try std.testing.allocator.alloc(f32, out_dim);
+    defer std.testing.allocator.free(logits);
+    @memset(logits, -100.0);
+    logits[900] = 10.0;
+    var logits_tensor = try testDeviceTensorFromSlice(runtime, logits, &[_]i32{ 1, @intCast(out_dim) });
+    defer logits_tensor.deinit();
+
+    const penalty_ids = try std.testing.allocator.alloc(u32, penalty_count);
+    defer std.testing.allocator.free(penalty_ids);
+    const penalty_counts = try std.testing.allocator.alloc(u32, penalty_count);
+    defer std.testing.allocator.free(penalty_counts);
+    for (0..penalty_count) |i| {
+        penalty_ids[i] = @intCast(i);
+        penalty_counts[i] = 1;
+    }
+
+    // Exercise both the parallel top-k and serial bounded samplers. A 600-entry
+    // history is 4,800 bytes and therefore must bind through an MTLBuffer.
+    for ([_]usize{ 64, 128 }) |top_k| {
+        var sampled_token: u32 = std.math.maxInt(u32);
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_sample_from_logits_device(
+            runtime,
+            logits_tensor.deviceHandle(),
+            logits_tensor.deviceByteOffset(),
+            out_dim,
+            0.0,
+            top_k,
+            1.0,
+            0.0,
+            1.1,
+            0.0,
+            0.0,
+            &penalty_ids[0],
+            &penalty_counts[0],
+            penalty_count,
+            1,
+            &sampled_token,
+        ));
+        try std.testing.expectEqual(@as(u32, 900), sampled_token);
+    }
+
+    var unsupported_token: u32 = 0;
+    try std.testing.expectEqual(@as(c_int, -3), termite_metal_decode_runtime_sample_from_logits_device(
+        runtime,
+        logits_tensor.deviceHandle(),
+        logits_tensor.deviceByteOffset(),
+        out_dim,
+        1.0,
+        257,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        null,
+        null,
+        0,
+        1,
+        &unsupported_token,
+    ));
+}
+
+test "metal native decoder runtime batched multi-row argmax matches per-row" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    // dim >= 2048 exercises the parallel partials+reduce path; each row has a
+    // distinct maximum so a scratch/token offset bug cross-contaminates rows.
+    const dim: usize = 4096;
+    const rows: usize = 5;
+    const maxima = [_]usize{ 7, 4095, 1234, 2048, 0 };
+    const logits = try std.testing.allocator.alloc(f32, rows * dim);
+    defer std.testing.allocator.free(logits);
+    for (0..rows) |row| {
+        const row_data = logits[row * dim ..][0..dim];
+        for (row_data, 0..) |*v, i| v.* = -100.0 - @as(f32, @floatFromInt(i % 97));
+        row_data[maxima[row]] = 50.0 + @as(f32, @floatFromInt(row));
+        // A decoy second-best for the suppression check.
+        row_data[(maxima[row] + 11) % dim] = 40.0;
+    }
+    var logits_tensor = try testDeviceTensorFromSlice(runtime, logits, &[_]i32{ @intCast(rows), @intCast(dim) });
+    defer logits_tensor.deinit();
+
+    // All rows, no suppression.
+    var tokens: [rows]u32 = undefined;
+    try std.testing.expect(try argmaxLogitsRowsSuppressDevice(&provider, logits_tensor, 0, dim, &.{}, tokens[0..rows]));
+    for (0..rows) |row| try std.testing.expectEqual(@as(u32, @intCast(maxima[row])), tokens[row]);
+
+    // Nonzero row_start: rows 2..5 only.
+    var tail_tokens: [3]u32 = undefined;
+    try std.testing.expect(try argmaxLogitsRowsSuppressDevice(&provider, logits_tensor, 2, dim, &.{}, tail_tokens[0..3]));
+    for (0..3) |i| try std.testing.expectEqual(@as(u32, @intCast(maxima[2 + i])), tail_tokens[i]);
+
+    // Suppression: suppress every row's max -> each row falls to its decoy.
+    const suppress = [_]i32{ 7, 4095, 1234, 2048, 0 };
+    var suppressed: [rows]u32 = undefined;
+    try std.testing.expect(try argmaxLogitsRowsSuppressDevice(&provider, logits_tensor, 0, dim, &suppress, suppressed[0..rows]));
+    for (0..rows) |row| try std.testing.expectEqual(@as(u32, @intCast((maxima[row] + 11) % dim)), suppressed[row]);
+
+    // Small dim exercises the serial single-thread kernel path.
+    const small_dim: usize = 64;
+    const small_rows: usize = 3;
+    const small_maxima = [_]usize{ 5, 63, 31 };
+    var small_logits: [small_rows * small_dim]f32 = undefined;
+    for (0..small_rows) |row| {
+        const row_data = small_logits[row * small_dim ..][0..small_dim];
+        for (row_data) |*v| v.* = -5.0;
+        row_data[small_maxima[row]] = 9.0;
+    }
+    var small_tensor = try testDeviceTensorFromSlice(runtime, &small_logits, &[_]i32{ @intCast(small_rows), @intCast(small_dim) });
+    defer small_tensor.deinit();
+    var small_tokens: [small_rows]u32 = undefined;
+    try std.testing.expect(try argmaxLogitsRowsSuppressDevice(&provider, small_tensor, 0, small_dim, &.{}, small_tokens[0..small_rows]));
+    for (0..small_rows) |row| try std.testing.expectEqual(@as(u32, @intCast(small_maxima[row])), small_tokens[row]);
+
+    // The generic helper preserves its historical frame lifecycle.
+    try std.testing.expect(reserveArgmaxRows(&provider, rows, dim));
+    try beginFrame(runtime);
+    defer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    try beginPlannedComputeScope(runtime, @intFromEnum(ComputeSource.tail), .tail);
+    var generic_frame_tokens: [rows]u32 = undefined;
+    try std.testing.expect(try argmaxLogitsRowsSuppressDevice(&provider, logits_tensor, 0, dim, &suppress, generic_frame_tokens[0..rows]));
+    for (0..rows) |row| try std.testing.expectEqual(@as(u32, @intCast((maxima[row] + 11) % dim)), generic_frame_tokens[row]);
+    try std.testing.expect(hasActiveFrame(runtime));
+    try cancelFrame(runtime);
+
+    // The explicit tail helper consumes the planned frame in one submit/wait.
+    try beginFrame(runtime);
+    try beginPlannedComputeScope(runtime, @intFromEnum(ComputeSource.tail), .tail);
+    var frame_tokens: [rows]u32 = undefined;
+    try std.testing.expect(try argmaxLogitsRowsSuppressDeviceConsumeActiveFrame(&provider, logits_tensor, 0, dim, &suppress, frame_tokens[0..rows]));
+    for (0..rows) |row| try std.testing.expectEqual(@as(u32, @intCast((maxima[row] + 11) % dim)), frame_tokens[row]);
+    try std.testing.expect(!hasActiveFrame(runtime));
+}
+
 test "metal native decoder runtime can prepare bf16 linear without copying model-owned bytes" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
@@ -28403,6 +36704,334 @@ test "metal native decoder runtime can prepare bf16 linear without copying model
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), actual[0], 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, -2.0), actual[1], 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, 1.25), actual[2], 1e-3);
+}
+
+test "metal native decoder runtime f16 linear matches host reference" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const hidden_size: usize = 32;
+    const out_dim: usize = 3;
+    var dense_weight = [_]f32{0.0} ** (hidden_size * out_dim);
+    dense_weight[0] = 1.0;
+    dense_weight[hidden_size + 1] = 1.0;
+    for (0..4) |index| dense_weight[2 * hidden_size + index] = 0.5;
+    const q4_bytes = try quant_codec.quantizeQ4_0FromF32(std.testing.allocator, &dense_weight);
+    defer std.testing.allocator.free(q4_bytes);
+    const shape = [_]i64{ @intCast(out_dim), @intCast(hidden_size) };
+    const storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = q4_bytes,
+        .shape = &shape,
+        .raw_owned = false,
+        .allocator = std.testing.allocator,
+    };
+    const bias = [_]f32{ 0.0, 0.0, 0.0 };
+    var linear_bias = try MetalTensor.ownedCloneFrom(&bias, &[_]i32{@intCast(out_dim)});
+    defer linear_bias.deinit();
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    var prep_stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = dummy_weight,
+        .bias = linear_bias,
+        .quantized_storage = @as(?*const QuantizedStorage, &storage),
+        .in_dim = hidden_size,
+        .out_dim = out_dim,
+        .retain_dense_fallback = true,
+        .dense_fallback_max_bytes = @as(?usize, 1024),
+        .allow_direct_quant_fallback = true,
+        .prefer_f16_mps_fallback = true,
+    }, &prep_stats));
+
+    var input = [_]f32{0.0} ** hidden_size;
+    input[0] = 1.0;
+    input[1] = -2.0;
+    input[2] = 0.5;
+    input[3] = 3.0;
+    var output: [out_dim]f32 = undefined;
+    try std.testing.expect(try tryRawLinearHost(
+        &provider,
+        0,
+        &input,
+        hidden_size,
+        out_dim,
+        &output,
+    ));
+    var dequantized: [hidden_size * out_dim]f32 = undefined;
+    try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, &dequantized);
+    for (0..out_dim) |row| {
+        var expected: f32 = 0.0;
+        for (0..hidden_size) |column| expected += input[column] * dequantized[row * hidden_size + column];
+        try std.testing.expectApproxEqAbs(expected, output[row], 1e-3);
+    }
+}
+
+test "metal native decoder runtime f16 BERT fused paths match decomposed device ops" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    if (getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) return error.SkipZigTest;
+    if ((getenvUsize("TERMITE_METAL_DENSE_QKV_PACK_CACHE_MAX_MB") orelse 256) == 0) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const rows: usize = 4;
+    const hidden: usize = 64;
+    const intermediate: usize = 128;
+
+    const Compare = struct {
+        fn close(label: []const u8, expected: []const f32, actual: []const f32) !void {
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, actual, 0..) |want, got, index| {
+                if (!std.math.isFinite(got) or !std.math.approxEqAbs(f32, want, got, 3e-3)) {
+                    std.debug.print("{s} mismatch index={} expected={d} actual={d}\n", .{ label, index, want, got });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+
+        fn prepareLinear(
+            p: anytype,
+            slot: usize,
+            storage: *const QuantizedStorage,
+            bias: MetalTensor,
+            in_dim: usize,
+            out_dim: usize,
+            stats: *ops.NativeQuantTimingStats,
+        ) !void {
+            var dummy_value = [_]f32{0};
+            const dummy = MetalTensor.borrowed(&dummy_value, 1, &[_]i32{0});
+            try std.testing.expect(try decoderRuntimePrepareLinear(p, .{
+                .slot = slot,
+                .weight = dummy,
+                .bias = bias,
+                .quantized_storage = @as(?*const QuantizedStorage, storage),
+                .in_dim = in_dim,
+                .out_dim = out_dim,
+                .retain_dense_fallback = true,
+                .dense_fallback_max_bytes = @as(?usize, 1024 * 1024),
+                .allow_direct_quant_fallback = true,
+                .prefer_f16_mps_fallback = true,
+            }, stats));
+        }
+    };
+
+    const identity_values = try allocator.alloc(f32, hidden * hidden);
+    defer allocator.free(identity_values);
+    @memset(identity_values, 0);
+    for (0..hidden) |index| identity_values[index * hidden + index] = 1;
+    const identity_q4 = try quant_codec.quantizeQ4_0FromF32(allocator, identity_values);
+    defer allocator.free(identity_q4);
+    const identity_shape = [_]i64{ hidden, hidden };
+    const identity_storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = identity_q4,
+        .shape = &identity_shape,
+        .raw_owned = false,
+        .allocator = allocator,
+    };
+
+    const up_values = try allocator.alloc(f32, intermediate * hidden);
+    defer allocator.free(up_values);
+    @memset(up_values, 0);
+    for (0..hidden) |index| {
+        up_values[index * hidden + index] = 1;
+        up_values[(hidden + index) * hidden + index] = -0.5;
+    }
+    const up_q4 = try quant_codec.quantizeQ4_0FromF32(allocator, up_values);
+    defer allocator.free(up_q4);
+    const up_shape = [_]i64{ intermediate, hidden };
+    const up_storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = up_q4,
+        .shape = &up_shape,
+        .raw_owned = false,
+        .allocator = allocator,
+    };
+
+    const down_values = try allocator.alloc(f32, hidden * intermediate);
+    defer allocator.free(down_values);
+    @memset(down_values, 0);
+    for (0..hidden) |index| {
+        down_values[index * intermediate + index] = 1;
+        down_values[index * intermediate + hidden + index] = 0.25;
+    }
+    const down_q4 = try quant_codec.quantizeQ4_0FromF32(allocator, down_values);
+    defer allocator.free(down_q4);
+    const down_shape = [_]i64{ hidden, intermediate };
+    const down_storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = down_q4,
+        .shape = &down_shape,
+        .raw_owned = false,
+        .allocator = allocator,
+    };
+
+    const hidden_bias_values = try allocator.alloc(f32, hidden);
+    defer allocator.free(hidden_bias_values);
+    @memset(hidden_bias_values, 0);
+    var hidden_bias = try MetalTensor.ownedCloneFrom(hidden_bias_values, &[_]i32{@intCast(hidden)});
+    defer hidden_bias.deinit();
+    const intermediate_bias_values = try allocator.alloc(f32, intermediate);
+    defer allocator.free(intermediate_bias_values);
+    @memset(intermediate_bias_values, 0);
+    var intermediate_bias = try MetalTensor.ownedCloneFrom(intermediate_bias_values, &[_]i32{@intCast(intermediate)});
+    defer intermediate_bias.deinit();
+
+    var prep_stats: ops.NativeQuantTimingStats = .{};
+    for (0..4) |slot| {
+        try Compare.prepareLinear(&provider, slot, &identity_storage, hidden_bias, hidden, hidden, &prep_stats);
+    }
+    try Compare.prepareLinear(&provider, 4, &up_storage, intermediate_bias, hidden, intermediate, &prep_stats);
+    try Compare.prepareLinear(&provider, 5, &down_storage, hidden_bias, intermediate, hidden, &prep_stats);
+
+    const norm_weight_values = try allocator.alloc(f32, hidden);
+    defer allocator.free(norm_weight_values);
+    const norm_bias_values = try allocator.alloc(f32, hidden);
+    defer allocator.free(norm_bias_values);
+    for (norm_weight_values, norm_bias_values, 0..) |*weight, *bias, index| {
+        weight.* = 0.75 + @as(f32, @floatFromInt(index % 7)) * 0.03125;
+        bias.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 5)) - 2)) * 0.01;
+    }
+    var norm_weight = try MetalTensor.ownedCloneFrom(norm_weight_values, &[_]i32{@intCast(hidden)});
+    defer norm_weight.deinit();
+    var norm_bias = try MetalTensor.ownedCloneFrom(norm_bias_values, &[_]i32{@intCast(hidden)});
+    defer norm_bias.deinit();
+    for (0..2) |slot| {
+        try std.testing.expect(try decoderRuntimePrepareLayerNorm(&provider, .{
+            .slot = slot,
+            .weight = norm_weight,
+            .bias = norm_bias,
+            .hidden_size = hidden,
+        }));
+    }
+
+    const input_values = try allocator.alloc(f32, rows * hidden);
+    defer allocator.free(input_values);
+    const residual_values = try allocator.alloc(f32, rows * hidden);
+    defer allocator.free(residual_values);
+    for (input_values, residual_values, 0..) |*input_value, *residual_value, index| {
+        input_value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 23)) - 11)) * 0.0625;
+        residual_value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 13)) - 6)) * 0.03125;
+    }
+    const input_shape = [_]i32{ @intCast(rows), @intCast(hidden) };
+    var input = try testDeviceTensorFromSlice(runtime, input_values, &input_shape);
+    defer input.deinit();
+    var residual = try testDeviceTensorFromSlice(runtime, residual_values, &input_shape);
+    defer residual.deinit();
+
+    // GLiNER2 can fall from a compiled planned region into an f16 MPS-backed
+    // linear while the coalesced encoder is still open. MPS creates its own
+    // encoder, so this transition must close the planned encoder instead of
+    // letting the driver abort the process.
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    try beginPlannedComputeScope(runtime, @intFromEnum(ComputeSource.dense_linear), .ffn);
+    var planned_mps_linear = (try tryApplyDenseRuntimeLinear(&provider, 0, input, rows, hidden, hidden)) orelse
+        return error.UnexpectedNull;
+    defer planned_mps_linear.deinit();
+    try endPlannedComputeScope(runtime);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var packed_qkv = (try tryApplyDenseRuntimeLinearQkv(&provider, 0, 1, 2, input, rows, hidden, hidden, hidden)) orelse
+        return error.UnexpectedNull;
+    defer packed_qkv.first.deinit();
+    defer packed_qkv.second.deinit();
+    defer packed_qkv.third.deinit();
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    const packed_stats = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 1), packed_stats.dense_qkv_packed_calls);
+    try std.testing.expectEqual(@as(u64, 0), packed_stats.dense_qkv_packed_fallbacks);
+    try std.testing.expectEqual(
+        @as(u64, 3 * hidden * hidden * @sizeOf(u16) + 3 * hidden * @sizeOf(f32)),
+        packed_stats.dense_qkv_packed_bytes,
+    );
+
+    var q_reference = (try tryApplyDenseRuntimeLinear(&provider, 0, input, rows, hidden, hidden)) orelse return error.UnexpectedNull;
+    defer q_reference.deinit();
+    try Compare.close("planned-mps-linear", try tensorHostSlice(&q_reference), try tensorHostSlice(&planned_mps_linear));
+    var k_reference = (try tryApplyDenseRuntimeLinear(&provider, 1, input, rows, hidden, hidden)) orelse return error.UnexpectedNull;
+    defer k_reference.deinit();
+    var v_reference = (try tryApplyDenseRuntimeLinear(&provider, 2, input, rows, hidden, hidden)) orelse return error.UnexpectedNull;
+    defer v_reference.deinit();
+    try Compare.close("packed-q", try tensorHostSlice(&q_reference), try tensorHostSlice(&packed_qkv.first));
+    try Compare.close("packed-k", try tensorHostSlice(&k_reference), try tensorHostSlice(&packed_qkv.second));
+    try Compare.close("packed-v", try tensorHostSlice(&v_reference), try tensorHostSlice(&packed_qkv.third));
+
+    var activation_stats: ops.NativeQuantTimingStats = .{};
+    var fused_attention = (try tryApplyDenseRuntimeLinearLayerNorm(&provider, 3, 0, input, residual, rows, hidden, hidden, 1e-5)) orelse
+        return error.UnexpectedNull;
+    defer fused_attention.deinit();
+    var attention_projected = (try tryApplyDenseRuntimeLinear(&provider, 3, input, rows, hidden, hidden)) orelse return error.UnexpectedNull;
+    defer attention_projected.deinit();
+    var attention_added = (try decoderRuntimeApplyAdd(&provider, .{
+        .lhs = attention_projected,
+        .rhs = residual,
+        .dim = hidden,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer attention_added.deinit();
+    var attention_reference = (try decoderRuntimeApplyLayerNorm(&provider, .{
+        .input = attention_added,
+        .slot = 0,
+        .hidden_size = hidden,
+        .eps = 1e-5,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer attention_reference.deinit();
+    try Compare.close("attention-linear-layer-norm", try tensorHostSlice(&attention_reference), try tensorHostSlice(&fused_attention));
+
+    var fused_ffn = (try tryApplyDenseRuntimeFfnLayerNorm(
+        &provider,
+        4,
+        5,
+        1,
+        input,
+        residual,
+        rows,
+        hidden,
+        intermediate,
+        1e-5,
+        .gelu,
+    )) orelse return error.UnexpectedNull;
+    defer fused_ffn.deinit();
+    var first = (try tryApplyDenseRuntimeLinear(&provider, 4, input, rows, hidden, intermediate)) orelse return error.UnexpectedNull;
+    defer first.deinit();
+    var activated = (try decoderRuntimeApplyActivation(&provider, .{
+        .kind = @as(ops.DecoderRuntimeActivationKind, .gelu),
+        .input = first,
+        .dim = intermediate,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer activated.deinit();
+    var second = (try tryApplyDenseRuntimeLinear(&provider, 5, activated, rows, intermediate, hidden)) orelse return error.UnexpectedNull;
+    defer second.deinit();
+    var ffn_added = (try decoderRuntimeApplyAdd(&provider, .{
+        .lhs = second,
+        .rhs = residual,
+        .dim = hidden,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer ffn_added.deinit();
+    var ffn_reference = (try decoderRuntimeApplyLayerNorm(&provider, .{
+        .input = ffn_added,
+        .slot = 1,
+        .hidden_size = hidden,
+        .eps = 1e-5,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer ffn_reference.deinit();
+    try Compare.close("ffn-layer-norm", try tensorHostSlice(&ffn_reference), try tensorHostSlice(&fused_ffn));
 }
 
 test "metal native decoder runtime bf16 multi-row linear matches identity projection" {
@@ -28682,6 +37311,204 @@ test "metal native decoder runtime activation scratch pool and hidden state" {
     for (handles[0..capacity]) |h| {
         if (h) |ptr| releaseScratch(runtime, ptr);
     }
+}
+
+test "metal donated KV on-frame attention executes on caller frame" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const kv_runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(kv_runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(kv_runtime);
+    const frame_runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(frame_runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(frame_runtime);
+    if (termite_metal_decode_runtime_ready(kv_runtime) == 0 or
+        termite_metal_decode_runtime_ready(frame_runtime) == 0)
+    {
+        return error.SkipZigTest;
+    }
+
+    var q = try testDeviceTensorFromSlice(frame_runtime, &[_]f32{1.0}, &[_]i32{ 1, 1 });
+    defer q.deinit();
+    var k = try testDeviceTensorFromSlice(kv_runtime, &[_]f32{2.0}, &[_]i32{ 1, 1 });
+    defer k.deinit();
+    var v = try testDeviceTensorFromSlice(kv_runtime, &[_]f32{7.0}, &[_]i32{ 1, 1 });
+    defer v.deinit();
+    var output = try MetalTensor.deviceAllocate(frame_runtime, @sizeOf(f32), .private, &[_]i32{ 1, 1 });
+    defer output.deinit();
+
+    const block_table = [_]u32{0};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_reset_attention_span_slot(kv_runtime, 0));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
+        kv_runtime,
+        0,
+        2,
+        k.deviceHandle(),
+        k.deviceByteOffset(),
+        v.deviceHandle(),
+        v.deviceByteOffset(),
+        1,
+        1,
+        1,
+        1,
+        @sizeOf(f32),
+        @sizeOf(f32),
+        1,
+        0,
+        &block_table,
+        block_table.len,
+        16,
+    ));
+
+    try beginFrame(frame_runtime);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_attention_paged_slot_device_on_frame(
+        kv_runtime,
+        frame_runtime,
+        0,
+        2,
+        q.deviceHandle(),
+        q.deviceByteOffset(),
+        &block_table,
+        block_table.len,
+        16,
+        1,
+        1,
+        1,
+        1,
+        1,
+        @sizeOf(f32),
+        @sizeOf(f32),
+        0,
+        0,
+        0,
+        0.0,
+        null,
+        0,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    ));
+    try submitFrame(frame_runtime);
+    try waitFrame(frame_runtime);
+
+    const actual = try tensorHostSlice(&output);
+    try std.testing.expectEqual(@as(usize, 1), actual.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), actual[0], 1e-6);
+}
+
+test "metal donated KV on-frame attention fails closed on unsafe runtime state" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const kv_runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(kv_runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(kv_runtime);
+    const frame_runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(frame_runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(frame_runtime);
+    if (termite_metal_decode_runtime_ready(kv_runtime) == 0 or
+        termite_metal_decode_runtime_ready(frame_runtime) == 0)
+    {
+        return error.SkipZigTest;
+    }
+
+    var q = try testDeviceTensorFromSlice(frame_runtime, &[_]f32{1.0}, &[_]i32{ 1, 1 });
+    defer q.deinit();
+    var output = try MetalTensor.deviceAllocate(frame_runtime, @sizeOf(f32), .private, &[_]i32{ 1, 1 });
+    defer output.deinit();
+    const block_table = [_]u32{0};
+
+    const GuardCall = struct {
+        fn run(
+            owner: *RawMetalDecodeRuntime,
+            frame: *RawMetalDecodeRuntime,
+            query: MetalTensor,
+            out: MetalTensor,
+            blocks: []const u32,
+        ) c_int {
+            return termite_metal_decode_runtime_attention_paged_slot_device_on_frame(
+                owner,
+                frame,
+                0,
+                3,
+                query.deviceHandle(),
+                query.deviceByteOffset(),
+                blocks.ptr,
+                blocks.len,
+                16,
+                1,
+                1,
+                1,
+                1,
+                1,
+                @sizeOf(f16),
+                @sizeOf(f16),
+                0,
+                0,
+                0,
+                0.0,
+                null,
+                0,
+                out.deviceHandle(),
+                out.deviceByteOffset(),
+            );
+        }
+    };
+
+    // The fast path must have a distinct, active caller frame.
+    try std.testing.expectEqual(@as(c_int, -4), GuardCall.run(kv_runtime, frame_runtime, q, output, &block_table));
+    try beginFrame(frame_runtime);
+    try std.testing.expectEqual(@as(c_int, -2), GuardCall.run(frame_runtime, frame_runtime, q, output, &block_table));
+
+    // Never read the owner's KV slot while its queue may still be writing it.
+    try beginFrame(kv_runtime);
+    try std.testing.expectEqual(@as(c_int, -6), GuardCall.run(kv_runtime, frame_runtime, q, output, &block_table));
+    try submitFrame(kv_runtime);
+    try std.testing.expectEqual(@as(c_int, -6), GuardCall.run(kv_runtime, frame_runtime, q, output, &block_table));
+    try waitFrame(kv_runtime);
+
+    // Opening an encoder-per-op beside a persistent planned encoder is unsafe.
+    try beginPlannedComputeScope(frame_runtime, @intFromEnum(ComputeSource.attention), .attention);
+    try std.testing.expectEqual(@as(c_int, -5), GuardCall.run(kv_runtime, frame_runtime, q, output, &block_table));
+    try submitFrame(frame_runtime);
+    try waitFrame(frame_runtime);
+}
+
+test "metal prepared frame uses the shared lifecycle and profiling forces fallback" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(runtime);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    const before = runtimeMemorySnapshot(runtime);
+    try beginPreparedFrame(runtime);
+    try std.testing.expect(hasActiveFrame(runtime));
+    try cancelFrame(runtime);
+    const after_prepared = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(
+        before.prepared_frame_fast_path_calls + before.prepared_frame_fallback_calls + 1,
+        after_prepared.prepared_frame_fast_path_calls + after_prepared.prepared_frame_fallback_calls,
+    );
+
+    // The generic entrypoint remains on the descriptor path and does not
+    // report itself as an explicit prepared-frame request.
+    try beginFrame(runtime);
+    try cancelFrame(runtime);
+    const after_generic = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(after_prepared.prepared_frame_fast_path_calls, after_generic.prepared_frame_fast_path_calls);
+    try std.testing.expectEqual(after_prepared.prepared_frame_fallback_calls, after_generic.prepared_frame_fallback_calls);
+
+    try workloadProfileBegin(runtime, .decode);
+    defer workloadProfileEnd(runtime) catch {};
+    try beginPreparedFrame(runtime);
+    try cancelFrame(runtime);
+    const after_profiled = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(after_generic.prepared_frame_fast_path_calls, after_profiled.prepared_frame_fast_path_calls);
+    try std.testing.expectEqual(after_generic.prepared_frame_fallback_calls + 1, after_profiled.prepared_frame_fallback_calls);
+    try workloadProfileEnd(runtime);
 }
 
 test "metal native decoder runtime frame API batches device ops into one command buffer" {
@@ -28980,6 +37807,45 @@ test "metal native planned compute barrier suppression skips barriers" {
     try std.testing.expectEqual(@as(u64, 1), snapshot.last_frame_compute_encoder_count);
     try std.testing.expectEqual(@as(u64, 1), snapshot.last_frame_planned_compute_scope_count);
     try std.testing.expectEqual(@as(u64, 0), snapshot.last_frame_planned_barrier_count);
+}
+
+test "metal concurrent planned dispatch policy only mutates at frame boundaries" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_set_concurrent_planned_dispatch(runtime, 0));
+    try beginFrame(runtime);
+    try std.testing.expectEqual(@as(c_int, -2), termite_metal_decode_runtime_set_concurrent_planned_dispatch(runtime, 1));
+    try cancelFrame(runtime);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_set_concurrent_planned_dispatch(runtime, 0));
+}
+
+test "metal stage timing reset only mutates at frame boundaries" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    try resetStageTiming(runtime);
+    try beginFrame(runtime);
+    try std.testing.expectError(StageTimingResetError.FrameActive, resetStageTiming(runtime));
+    try beginPlannedComputeScope(runtime, 4, .ffn);
+    try plannedComputeBarrier(runtime);
+    try submitFrame(runtime);
+    try std.testing.expectError(StageTimingResetError.FrameActive, resetStageTiming(runtime));
+    try waitFrame(runtime);
+    try resetStageTiming(runtime);
+
+    const snapshot = stageTimingSnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.barrier_sample_count);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.prefill.sampled_frames);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.decode.sampled_frames);
 }
 
 test "planned compute sequence exports active typed contract" {
@@ -29525,63 +38391,4 @@ test "metal native graph planner reserves gated ffn scratch up front" {
     try std.testing.expectEqual(snapshot.graph_plan_count, reused_snapshot.graph_plan_count);
     try std.testing.expectEqual(snapshot.graph_plan_slots, reused_snapshot.graph_plan_slots);
     try std.testing.expectEqual(snapshot.graph_plan_allocations, reused_snapshot.graph_plan_allocations);
-}
-
-test "Metal Gemma4 split GQA policy covers long-context E2B and E4B shapes" {
-    if (!build_options.enable_metal) return error.SkipZigTest;
-
-    const cases = [_]struct {
-        q_len: usize,
-        kv_tokens: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        sliding_window: usize,
-        expected_splits: c_uint,
-        expected_scratch: usize,
-    }{
-        .{ .q_len = 1, .kv_tokens = 512, .num_kv_heads = 1, .head_dim = 512, .sliding_window = 0, .expected_splits = 16, .expected_scratch = 263_168 },
-        .{ .q_len = 1, .kv_tokens = 2003, .num_kv_heads = 2, .head_dim = 512, .sliding_window = 0, .expected_splits = 32, .expected_scratch = 526_336 },
-        .{ .q_len = 2, .kv_tokens = 4096, .num_kv_heads = 1, .head_dim = 256, .sliding_window = 512, .expected_splits = 32, .expected_scratch = 528_384 },
-    };
-    for (cases) |case| {
-        var split_count: c_uint = 0;
-        var scratch_bytes: usize = 0;
-        try std.testing.expectEqual(@as(c_int, 1), termite_metal_decode_gqa_split_policy_probe(
-            case.q_len,
-            case.kv_tokens,
-            8,
-            case.num_kv_heads,
-            case.head_dim,
-            case.sliding_window,
-            &split_count,
-            &scratch_bytes,
-        ));
-        try std.testing.expectEqual(case.expected_splits, split_count);
-        try std.testing.expectEqual(case.expected_scratch, scratch_bytes);
-    }
-
-    var split_count: c_uint = 99;
-    var scratch_bytes: usize = 99;
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_gqa_split_policy_probe(
-        1,
-        511,
-        8,
-        1,
-        512,
-        0,
-        &split_count,
-        &scratch_bytes,
-    ));
-    try std.testing.expectEqual(@as(c_uint, 0), split_count);
-    try std.testing.expectEqual(@as(usize, 0), scratch_bytes);
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_gqa_split_policy_probe(
-        1,
-        512,
-        8,
-        1,
-        384,
-        0,
-        &split_count,
-        &scratch_bytes,
-    ));
 }

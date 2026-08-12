@@ -20,7 +20,7 @@ documents and runs:
 ## Run Zig
 
 ```sh
-zig build install -Dedition=full
+zig build antfly
 zig build public-query-guardrail -- \
   --mode standalone \
   --server-kind zig \

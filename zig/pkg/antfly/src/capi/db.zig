@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const antfly = @import("antfly-zig");
+const antfly = @import("antfly_storage_root");
 const capi = @import("types.zig");
 const search_wire = @import("search_wire.zig");
 

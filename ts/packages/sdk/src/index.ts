@@ -40,7 +40,11 @@ export {
   DEFAULT_WRITE_MAX_RESPONSE_BYTES,
   type RestoreOptions,
 } from "./client.js";
-export { InferenceCapacityError, InferenceClient } from "./inference-client.js";
+export {
+  InferenceAPIError,
+  InferenceCapacityError,
+  InferenceClient,
+} from "./inference-client.js";
 export { deserializeEmbeddings, serializeEmbeddings } from "./inference-codec.js";
 export type {
   Chunk,
@@ -61,8 +65,12 @@ export type {
   ExtractRelation,
   ExtractRequest,
   ExtractResponse,
+  GenerateChunk,
+  GenerateRequest,
+  GenerateResponse,
   ImageURL,
   ImageURLContentPart,
+  InferenceChatMessage,
   InferenceConfig,
   InferenceError,
   Level,

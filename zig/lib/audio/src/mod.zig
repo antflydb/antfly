@@ -161,6 +161,106 @@ pub const AudioInterleaved = struct {
     }
 };
 
+/// Maximum live decoder allocation budget used by production inference
+/// callers unless they choose a smaller capacity-aware limit.
+pub const default_decode_working_bytes: usize = 128 * 1024 * 1024;
+
+/// Bounds allocations made through a decoder's supplied allocator. A few
+/// codecs keep fixed-size shared transform plans or per-frame scratch on the
+/// page allocator; those allocations do not scale with input duration and are
+/// intentionally outside this live-byte budget.
+const DecodeMemoryLimiter = struct {
+    backing: std.mem.Allocator,
+    max_bytes: usize,
+    live_bytes: usize = 0,
+    limit_exceeded: bool = false,
+
+    fn init(backing: std.mem.Allocator, max_bytes: usize) DecodeMemoryLimiter {
+        return .{ .backing = backing, .max_bytes = max_bytes };
+    }
+
+    fn allocator(self: *DecodeMemoryLimiter) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn remaining(self: *const DecodeMemoryLimiter) usize {
+        return self.max_bytes -| self.live_bytes;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *DecodeMemoryLimiter = @ptrCast(@alignCast(ctx));
+        if (len > self.remaining()) {
+            self.limit_exceeded = true;
+            return null;
+        }
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live_bytes += len;
+        return ptr;
+    }
+
+    fn resize(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self: *DecodeMemoryLimiter = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and new_len - memory.len > self.remaining()) {
+            self.limit_exceeded = true;
+            return false;
+        }
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        if (new_len > memory.len) {
+            self.live_bytes += new_len - memory.len;
+        } else {
+            self.live_bytes -= memory.len - new_len;
+        }
+        return true;
+    }
+
+    fn remap(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *DecodeMemoryLimiter = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and new_len - memory.len > self.remaining()) {
+            self.limit_exceeded = true;
+            return null;
+        }
+        const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        if (new_len > memory.len) {
+            self.live_bytes += new_len - memory.len;
+        } else {
+            self.live_bytes -= memory.len - new_len;
+        }
+        return ptr;
+    }
+
+    fn free(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        const self: *DecodeMemoryLimiter = @ptrCast(@alignCast(ctx));
+        std.debug.assert(memory.len <= self.live_bytes);
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.live_bytes -= memory.len;
+    }
+};
+
 pub const PcmAudio = struct {
     samples: []const f32,
     sample_rate: u32,
@@ -359,150 +459,47 @@ pub fn canDecodeFilename(file_name: []const u8) bool {
 }
 
 pub fn canDecodeWithOptions(audio_bytes: []const u8, options: DecodeOptions) bool {
-    const format = options.format_hint orelse
-        detectFormat(audio_bytes) orelse
-        (if (options.mime_hint) |mime| detectFormatFromMime(mime) else null) orelse
-        (if (options.file_name_hint) |file_name| detectFormatFromFilename(file_name) else null) orelse
-        return false;
-    switch (format) {
-        .aac => {
-            var decoded_stereo = aac.decodeInterleavedStereoAdtsAlloc(std.heap.page_allocator, audio_bytes) catch |err| switch (err) {
-                error.UnsupportedAudioFormat => null,
-                else => return canDecodeFormat(format),
-            };
-            if (decoded_stereo) |*owned| {
-                owned.deinit();
-                return true;
-            }
-            var decoded_mono = aac.decodeInterleavedMonoAdtsAlloc(std.heap.page_allocator, audio_bytes) catch |err| switch (err) {
-                error.UnsupportedAudioFormat => null,
-                else => return canDecodeFormat(format),
-            };
-            if (decoded_mono) |*owned| {
-                owned.deinit();
-                return true;
-            }
-            return canDecodeFormat(format);
-        },
-        .mp4 => {
-            const demuxed = mp4.demux(std.heap.page_allocator, audio_bytes) catch return canDecodeFormat(format);
-            var owned = demuxed;
-            defer owned.deinit();
-            if (owned.codec == .aac) {
-                var decoded_stereo = aac.decodeInterleavedStereoAccessUnitsAlloc(
-                    std.heap.page_allocator,
-                    owned.sample_rate,
-                    owned.channels,
-                    owned.decoder_config,
-                    owned.access_units,
-                ) catch |err| switch (err) {
-                    error.UnsupportedAudioFormat => null,
-                    else => return canDecodeFormat(format),
-                };
-                if (decoded_stereo) |*owned_decoded| {
-                    owned_decoded.deinit();
-                    return true;
-                }
-                var decoded_mono = aac.decodeInterleavedMonoAccessUnitsAlloc(
-                    std.heap.page_allocator,
-                    owned.sample_rate,
-                    owned.channels,
-                    owned.decoder_config,
-                    owned.access_units,
-                ) catch |err| switch (err) {
-                    error.UnsupportedAudioFormat => null,
-                    else => return canDecodeFormat(format),
-                };
-                if (decoded_mono) |*owned_decoded| {
-                    owned_decoded.deinit();
-                    return true;
-                }
-            } else if (owned.codec == .alac) {
-                var decoded_alac = alac.decodeInterleavedPacketizedAlloc(
-                    std.heap.page_allocator,
-                    owned.sample_rate,
-                    owned.channels,
-                    owned.decoder_config,
-                    owned.access_units,
-                ) catch |err| switch (err) {
-                    error.UnsupportedAudioFormat => null,
-                    else => return canDecodeFormat(format),
-                };
-                if (decoded_alac) |*owned_decoded| {
-                    owned_decoded.deinit();
-                    return true;
-                }
-            }
-        },
-        .ogg => {
-            const codec = ogg.sniffCodec(std.heap.page_allocator, audio_bytes) catch return canDecodeFormat(format);
-            if (codec == .flac) {
-                var decoded_flac = ogg.decodeInterleavedFlacAlloc(std.heap.page_allocator, audio_bytes) catch |err| switch (err) {
-                    error.UnsupportedAudioFormat => null,
-                    else => return canDecodeFormat(format),
-                };
-                if (decoded_flac) |*owned| {
-                    owned.deinit();
-                    return true;
-                }
-            }
-        },
-        .caf => {
-            var decoded_lpcm = caf.decodeInterleaved(std.heap.page_allocator, audio_bytes) catch |err| switch (err) {
-                error.UnsupportedAudioFormat => null,
-                else => return canDecodeFormat(format),
-            };
-            if (decoded_lpcm) |*owned| {
-                owned.deinit();
-                return true;
-            }
-
-            const demuxed = caf.demux(std.heap.page_allocator, audio_bytes) catch return canDecodeFormat(format);
-            var owned = demuxed;
-            defer owned.deinit();
-            var decoded_alac = alac.decodeInterleavedPacketizedAlloc(
-                std.heap.page_allocator,
-                owned.sample_rate,
-                owned.channels,
-                owned.decoder_config,
-                owned.access_units,
-            ) catch |err| switch (err) {
-                error.UnsupportedAudioFormat => null,
-                else => return canDecodeFormat(format),
-            };
-            if (decoded_alac) |*owned_decoded| {
-                owned_decoded.deinit();
-                return true;
-            }
-        },
-        .aiff => {
-            var decoded = aiff.decodeInterleaved(std.heap.page_allocator, audio_bytes) catch |err| switch (err) {
-                error.UnsupportedAudioFormat => null,
-                else => return canDecodeFormat(format),
-            };
-            if (decoded) |*owned| {
-                owned.deinit();
-                return true;
-            }
-        },
-        .au => {
-            var decoded = au.decodeInterleaved(std.heap.page_allocator, audio_bytes) catch |err| switch (err) {
-                error.UnsupportedAudioFormat => null,
-                else => return canDecodeFormat(format),
-            };
-            if (decoded) |*owned| {
-                owned.deinit();
-                return true;
-            }
-        },
-        else => {},
-    }
+    const format = detectFormatWithOptions(audio_bytes, options) orelse return false;
     return canDecodeFormat(format);
 }
 
 pub fn decode(allocator: std.mem.Allocator, audio_bytes: []const u8, options: DecodeOptions) !Audio {
     var decoded = try decodeInterleaved(allocator, audio_bytes, options);
     defer decoded.deinit();
+
+    const mono = try downmixToMono(allocator, decoded.samples, decoded.channels);
+    return .{
+        .samples = mono,
+        .sample_rate = decoded.sample_rate,
+        .allocator = allocator,
+    };
+}
+
+/// Decode to parent-owned mono PCM while bounding the peak of decoder-owned
+/// interleaved state plus the returned mono allocation. No allocation retains
+/// a pointer to the stack-local limiter after this function returns.
+pub fn decodeBounded(
+    allocator: std.mem.Allocator,
+    audio_bytes: []const u8,
+    options: DecodeOptions,
+    max_working_bytes: usize,
+) !Audio {
+    var limiter = DecodeMemoryLimiter.init(allocator, max_working_bytes);
+    var decoded = decodeInterleaved(limiter.allocator(), audio_bytes, options) catch |err| {
+        if (limiter.limit_exceeded) return error.AudioTooLarge;
+        return err;
+    };
+    defer decoded.deinit();
+
+    if (decoded.sample_rate == 0 or decoded.samples.len == 0 or decoded.channels == 0) {
+        return error.UnsupportedAudioFormat;
+    }
+    const channels: usize = decoded.channels;
+    if (decoded.samples.len % channels != 0) return error.UnsupportedAudioFormat;
+    const mono_samples = decoded.samples.len / channels;
+    const mono_bytes = std.math.mul(usize, mono_samples, @sizeOf(f32)) catch
+        return error.AudioTooLarge;
+    if (mono_bytes > limiter.remaining()) return error.AudioTooLarge;
 
     const mono = try downmixToMono(allocator, decoded.samples, decoded.channels);
     return .{
@@ -972,6 +969,7 @@ pub fn downmixToMono(allocator: std.mem.Allocator, samples: []const f32, channel
 }
 
 pub fn resample(allocator: std.mem.Allocator, samples: []const f32, src_rate: u32, dst_rate: u32) ![]f32 {
+    if (src_rate == 0 or dst_rate == 0 or samples.len == 0) return error.UnsupportedAudioFormat;
     if (src_rate == dst_rate) {
         const out = try allocator.alloc(f32, samples.len);
         @memcpy(out, samples);
@@ -995,6 +993,7 @@ pub fn resample(allocator: std.mem.Allocator, samples: []const f32, src_rate: u3
 }
 
 pub fn copyOrResample(allocator: std.mem.Allocator, samples: []const f32, src_rate: u32, dst_rate: u32) ![]f32 {
+    if (src_rate == 0 or dst_rate == 0 or samples.len == 0) return error.UnsupportedAudioFormat;
     if (src_rate == dst_rate) {
         const out = try allocator.alloc(f32, samples.len);
         @memcpy(out, samples);
@@ -1654,6 +1653,15 @@ test "copy or resample copies on matching rate" {
     try std.testing.expectEqualSlices(f32, &samples, out);
 }
 
+test "resampling rejects empty input and zero rates" {
+    const samples = [_]f32{0.0};
+    try std.testing.expectError(error.UnsupportedAudioFormat, resample(std.testing.allocator, &.{}, 16_000, 16_000));
+    try std.testing.expectError(error.UnsupportedAudioFormat, resample(std.testing.allocator, &samples, 0, 16_000));
+    try std.testing.expectError(error.UnsupportedAudioFormat, resample(std.testing.allocator, &samples, 16_000, 0));
+    try std.testing.expectError(error.UnsupportedAudioFormat, copyOrResample(std.testing.allocator, &.{}, 16_000, 16_000));
+    try std.testing.expectError(error.UnsupportedAudioFormat, copyOrResample(std.testing.allocator, &samples, 0, 16_000));
+}
+
 test "detect format recognizes wav and mp3 signatures" {
     try std.testing.expectEqual(EncodedFormat.wav, detectFormat("RIFFxxxxWAVE").?);
     try std.testing.expectEqual(EncodedFormat.wav, detectFormat("RIFXxxxxWAVE").?);
@@ -1803,6 +1811,64 @@ test "decode dispatch handles wav fixture" {
 
     try std.testing.expectEqual(@as(u32, 16000), decoded.sample_rate);
     try std.testing.expectEqual(@as(usize, 16000), decoded.samples.len);
+}
+
+test "decode memory limiter accounts allocation resize remap and free" {
+    var backing_bytes: [32]u8 = undefined;
+    var backing = std.heap.FixedBufferAllocator.init(&backing_bytes);
+    var limiter = DecodeMemoryLimiter.init(backing.allocator(), 16);
+    const allocator = limiter.allocator();
+
+    var memory = try allocator.alloc(u8, 4);
+    try std.testing.expectEqual(@as(usize, 4), limiter.live_bytes);
+    memory = allocator.remap(memory, 8) orelse return error.UnexpectedRemapFailure;
+    try std.testing.expectEqual(@as(usize, 8), limiter.live_bytes);
+    try std.testing.expect(allocator.resize(memory, 12));
+    memory = memory.ptr[0..12];
+    try std.testing.expectEqual(@as(usize, 12), limiter.live_bytes);
+    try std.testing.expect(!allocator.resize(memory, 17));
+    try std.testing.expect(limiter.limit_exceeded);
+    try std.testing.expectEqual(@as(usize, 12), limiter.live_bytes);
+    try std.testing.expect(allocator.resize(memory, 6));
+    memory = memory.ptr[0..6];
+    try std.testing.expectEqual(@as(usize, 6), limiter.live_bytes);
+    allocator.free(memory);
+    try std.testing.expectEqual(@as(usize, 0), limiter.live_bytes);
+
+    var small_backing_bytes: [4]u8 = undefined;
+    var small_backing = std.heap.FixedBufferAllocator.init(&small_backing_bytes);
+    var parent_limited = DecodeMemoryLimiter.init(small_backing.allocator(), 16);
+    try std.testing.expectError(error.OutOfMemory, parent_limited.allocator().alloc(u8, 5));
+    try std.testing.expect(!parent_limited.limit_exceeded);
+}
+
+test "decodeBounded returns parent-owned mono and rejects decoder metadata expansion" {
+    const mono_bytes = 16000 * @sizeOf(f32);
+    var decoded = try decodeBounded(std.testing.allocator, tone_wav_bytes, .{}, 2 * mono_bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 16000), decoded.sample_rate);
+    try std.testing.expectEqual(@as(usize, 16000), decoded.samples.len);
+
+    try std.testing.expectError(
+        error.AudioTooLarge,
+        decodeBounded(std.testing.allocator, tone_wav_bytes, .{}, 2 * mono_bytes - 1),
+    );
+
+    // A tiny CAF packet table can claim an arbitrarily large packet count.
+    // The bounded decoder rejects the metadata-driven allocation before it
+    // reaches the backing allocator or reads the absent packet sizes.
+    const oversized_caf_packet_table = [_]u8{
+        'c',  'a',  'f',  'f',  0x00, 0x01, 0x00, 0x00,
+        'p',  'a',  'k',  't',  0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x03, 0xe8, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    try std.testing.expectError(
+        error.AudioTooLarge,
+        decodeBounded(std.testing.allocator, &oversized_caf_packet_table, .{ .format_hint = .caf }, 128),
+    );
 }
 
 test "decodeInterleaved handles wav stereo round-trip" {

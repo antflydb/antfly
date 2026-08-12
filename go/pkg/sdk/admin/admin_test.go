@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -1509,6 +1510,20 @@ func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 			}),
 		},
 		{
+			name: "capture seed artifact",
+			got:  HASeedCaptureOperation(),
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewCaptureHASeedArtifactRequest(server, oapi.CaptureHASeedArtifactJSONRequestBody{})
+			}),
+		},
+		{
+			name: "activate seeded slot",
+			got:  HAActivateSeededSlotOperation(),
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewActivateHASeededSlotRequest(server, oapi.ActivateHASeededSlotJSONRequestBody{})
+			}),
+		},
+		{
 			name: "bootstrap standby",
 			got:  HABootstrapStandbyOperation(),
 			generated: generatedHAOperation(func(server string) (*http.Request, error) {
@@ -1703,6 +1718,12 @@ func TestHAReceiptExpectationsUseAdminAPIEnums(t *testing.T) {
 			name:      "finish base backup",
 			got:       HABaseBackupFinishReceiptExpectation(),
 			wantKind:  "base_backup_finish",
+			wantState: "applied",
+		},
+		{
+			name:      "capture seed artifact",
+			got:       HASeedCaptureReceiptExpectation(),
+			wantKind:  "seed_capture",
 			wantState: "applied",
 		},
 		{
@@ -1974,6 +1995,80 @@ func TestValidateHASeedActionResponses(t *testing.T) {
 		t.Fatalf("missing end_record_lsn error = %v, want end_record_lsn error", err)
 	}
 
+	digest := strings.Repeat("a", 64)
+	capture := HASeedArtifactCaptureResponse{
+		SchemaVersion: 1,
+		Action: HAActionReceipt{
+			ActionId:   "seed_capture:seed-standby-a-7",
+			ActionKind: HAActionKindSeedCapture,
+			Target:     "seed-standby-a-7",
+			State:      HAActionStateApplied,
+			NodeId:     "primary-a",
+		},
+		SlotName:             "standby-a",
+		Generation:           "seed-standby-a-7",
+		TopologyId:           "topology-a",
+		TopologyGeneration:   7,
+		NodeId:               "standby-a",
+		TargetPvcName:        "standby-a-data",
+		TargetPvcUid:         "pvc-uid-7",
+		ClusterId:            1,
+		TimelineId:           4,
+		Epoch:                2,
+		ManifestId:           "seed-standby-a-7",
+		SourcePlanSha256:     digest,
+		BackupLsn:            7,
+		CheckpointLsn:        7,
+		EndRecordLsn:         8,
+		ManifestSha256:       digest,
+		CaptureReceiptSha256: digest,
+		FileCount:            2,
+		TotalBytes:           20,
+		GenerationRoot:       "/antflydb/ha/seed-captures/generations/seed-standby-a-7",
+		ContentRoot:          "/antflydb/ha/seed-captures/generations/seed-standby-a-7/content",
+		ManifestPath:         "/antflydb/ha/seed-captures/generations/seed-standby-a-7/manifest.afha",
+	}
+	if err := ValidateHASeedArtifactCaptureResponse(capture); err != nil {
+		t.Fatalf("ValidateHASeedArtifactCaptureResponse returned error: %v", err)
+	}
+	badCapture := capture
+	badCapture.SourcePlanSha256 = strings.ToUpper(digest)
+	if err := ValidateHASeedArtifactCaptureResponse(badCapture); err == nil || !strings.Contains(err.Error(), "digest") {
+		t.Fatalf("invalid capture digest error = %v, want digest error", err)
+	}
+
+	activation := HASeededSlotActivateResponse{
+		SchemaVersion: 1,
+		Action: HAActionReceipt{
+			ActionId:   "seeded_slot_activate:seed-standby-a-7",
+			ActionKind: HAActionKindSeededSlotActivate,
+			Target:     "seed-standby-a-7",
+			State:      HAActionStateApplied,
+			NodeId:     "primary-a",
+		},
+		SlotName:             "standby-a",
+		Generation:           "seed-standby-a-7",
+		ManifestId:           "manifest-a",
+		TimelineId:           4,
+		CheckpointLsn:        10,
+		SeedReceiptSha256:    digest,
+		CaptureReceiptSha256: digest,
+		ManifestSha256:       digest,
+		AggregateSha256:      digest,
+	}
+	if err := ValidateHASeededSlotActivateResponse(activation); err != nil {
+		t.Fatalf("ValidateHASeededSlotActivateResponse returned error: %v", err)
+	}
+	wrongActivationTarget := activation
+	wrongActivationTarget.Action.Target = "seed-standby-a-8"
+	if err := ValidateHASeededSlotActivateResponse(wrongActivationTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
+		t.Fatalf("wrong activation target error = %v, want receipt mismatch", err)
+	}
+	activation.SeedReceiptSha256 = strings.Repeat("A", 64)
+	if err := ValidateHASeededSlotActivateResponse(activation); err == nil || !strings.Contains(err.Error(), "digest") {
+		t.Fatalf("invalid activation digest error = %v, want digest error", err)
+	}
+
 	bootstrap := HAStandbyBootstrapResponse{
 		SchemaVersion: 1,
 		Action: HAActionReceipt{
@@ -2038,6 +2133,11 @@ func TestValidateHAFenceResponse(t *testing.T) {
 	}
 	if err := ValidateHAFenceResponse(response); err != nil {
 		t.Fatalf("ValidateHAFenceResponse returned error: %v", err)
+	}
+	formerPrimaryCopy := response
+	formerPrimaryCopy.Action.NodeId = "primary-a"
+	if err := ValidateHAFenceResponse(formerPrimaryCopy); err != nil {
+		t.Fatalf("ValidateHAFenceResponse rejected former-primary receipt copy: %v", err)
 	}
 	emptyReason := response
 	emptyReason.Receipt.Reason = ""
@@ -2238,6 +2338,44 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 	promotion.Promotion.SwitchLsn = 0
 	if err := ValidateHAPromotionResponse(promotion); err == nil || !strings.Contains(err.Error(), "promotion result") {
 		t.Fatalf("missing promotion result error = %v, want promotion result error", err)
+	}
+}
+
+func TestValidateHASeedLifecycleReceiptInventory(t *testing.T) {
+	t.Parallel()
+	receipt := `{"format_version":2,"generation":"seed-a-7","slot_name":"standby-a","topology_id":"topology-a","topology_generation":7,"node_id":"standby-a","target_pvc_name":"standby-a-data","target_pvc_uid":"pvc-uid-7"}`
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(receipt)))
+	response := HASeedLifecycleReceiptInventory{
+		SchemaVersion:    1,
+		FirstCursor:      4,
+		EndCursor:        4,
+		NextCursor:       4,
+		HistoryTruncated: true,
+		Entries: []HASeedLifecycleReceiptEvent{{
+			Cursor: 4, Kind: oapi.HASeedLifecycleReceiptEventKindCapture,
+			Generation: "seed-a-7", SlotName: "standby-a", TopologyId: "topology-a", TopologyGeneration: 7,
+			NodeId: "standby-a", TargetPvcName: "standby-a-data", TargetPvcUid: "pvc-uid-7",
+			ReceiptSha256: digest, ReceiptJson: receipt, RecordedAtUnixNs: 99,
+			AuthoritativeState: oapi.HASeedLifecycleReceiptEventAuthoritativeStateRetained,
+		}},
+		Runtime: HARuntimeLifecycleObservation{
+			NodeId: "primary-a", Role: oapi.HARuntimeLifecycleObservationRolePrimary,
+			PodUid: "pod-primary-a", Fenced: false, ObservedAtUnixNs: 100,
+		},
+	}
+	if err := ValidateHASeedLifecycleReceiptInventory(response); err != nil {
+		t.Fatalf("ValidateHASeedLifecycleReceiptInventory returned error: %v", err)
+	}
+	badDigest := response
+	badDigest.Entries = append([]HASeedLifecycleReceiptEvent(nil), response.Entries...)
+	badDigest.Entries[0].ReceiptJson += " "
+	if err := ValidateHASeedLifecycleReceiptInventory(badDigest); err == nil || !strings.Contains(err.Error(), "digest") {
+		t.Fatalf("receipt digest mismatch error = %v, want digest error", err)
+	}
+	badCursor := response
+	badCursor.NextCursor = 3
+	if err := ValidateHASeedLifecycleReceiptInventory(badCursor); err == nil || !strings.Contains(err.Error(), "next_cursor") {
+		t.Fatalf("cursor mismatch error = %v, want next_cursor error", err)
 	}
 }
 

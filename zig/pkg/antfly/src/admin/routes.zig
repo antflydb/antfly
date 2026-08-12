@@ -25,6 +25,7 @@ pub const maintenance_jobs = maintenance ++ "/jobs";
 pub const maintenance_jobs_prefix = maintenance_jobs ++ "/";
 pub const ha = base ++ "/ha";
 pub const ha_primary_status = ha ++ "/primary/status";
+pub const ha_watchdog_proof = ha ++ "/watchdog-proof";
 pub const ha_standby_status = ha ++ "/standby/status";
 pub const ha_commit_check = ha ++ "/commit/check";
 pub const ha_commit_append = ha ++ "/commit/append";
@@ -37,6 +38,9 @@ pub const ha_replication_slot_pause_suffix = "/pause";
 pub const ha_replication_slot_resume_suffix = "/resume";
 pub const ha_base_backups = ha ++ "/base-backups";
 pub const ha_base_backups_finish = ha_base_backups ++ "/finish";
+pub const ha_base_backups_capture = ha_base_backups ++ "/capture";
+pub const ha_base_backups_activate = ha_base_backups ++ "/activate";
+pub const ha_seed_lifecycle_receipts = ha ++ "/seed-lifecycle/receipts";
 pub const ha_standby_bootstrap = ha ++ "/standby/bootstrap";
 pub const ha_fence = ha ++ "/fence";
 pub const ha_fence_current = ha_fence ++ "/current";
@@ -146,6 +150,7 @@ fn isPathSegmentUnreserved(byte: u8) bool {
 
 test "admin routes define HA control-plane paths" {
     try std.testing.expectEqualStrings("/admin/v1/ha/primary/status", ha_primary_status);
+    try std.testing.expectEqualStrings("/admin/v1/ha/watchdog-proof", ha_watchdog_proof);
     try std.testing.expectEqualStrings("/admin/v1/ha/standby/status", ha_standby_status);
     try std.testing.expectEqualStrings("/admin/v1/ha/commit/check", ha_commit_check);
     try std.testing.expectEqualStrings("/admin/v1/ha/commit/append", ha_commit_append);
@@ -155,6 +160,8 @@ test "admin routes define HA control-plane paths" {
     try std.testing.expectEqualStrings("/admin/v1/ha/replication-slots", ha_replication_slots);
     try std.testing.expectEqualStrings("/admin/v1/ha/base-backups", ha_base_backups);
     try std.testing.expectEqualStrings("/admin/v1/ha/base-backups/finish", ha_base_backups_finish);
+    try std.testing.expectEqualStrings("/admin/v1/ha/base-backups/activate", ha_base_backups_activate);
+    try std.testing.expectEqualStrings("/admin/v1/ha/seed-lifecycle/receipts", ha_seed_lifecycle_receipts);
     try std.testing.expectEqualStrings("/admin/v1/ha/standby/bootstrap", ha_standby_bootstrap);
     try std.testing.expectEqualStrings("/admin/v1/ha/fence", ha_fence);
     try std.testing.expectEqualStrings("/admin/v1/ha/fence/current", ha_fence_current);
@@ -251,6 +258,7 @@ const ExpectedRoute = struct {
 
 const expected_ha_routes = [_]ExpectedRoute{
     .{ .operation_id = "getHAPrimaryStatus", .method = "GET", .full_path = ha_primary_status },
+    .{ .operation_id = "getHAWatchdogProof", .method = "GET", .full_path = ha_watchdog_proof },
     .{ .operation_id = "getHAStandbyStatus", .method = "GET", .full_path = ha_standby_status },
     .{ .operation_id = "checkHACommit", .method = "POST", .full_path = ha_commit_check },
     .{ .operation_id = "appendHACommit", .method = "POST", .full_path = ha_commit_append },
@@ -264,6 +272,9 @@ const expected_ha_routes = [_]ExpectedRoute{
     .{ .operation_id = "resumeHAReplicationSlot", .method = "PUT", .full_path = ha_replication_slot_prefix ++ "{slot_name}" ++ ha_replication_slot_resume_suffix },
     .{ .operation_id = "beginHABaseBackup", .method = "POST", .full_path = ha_base_backups },
     .{ .operation_id = "finishHABaseBackup", .method = "POST", .full_path = ha_base_backups_finish },
+    .{ .operation_id = "captureHASeedArtifact", .method = "POST", .full_path = ha_base_backups_capture },
+    .{ .operation_id = "activateHASeededSlot", .method = "POST", .full_path = ha_base_backups_activate },
+    .{ .operation_id = "getHASeedLifecycleReceipts", .method = "GET", .full_path = ha_seed_lifecycle_receipts },
     .{ .operation_id = "bootstrapHAStandby", .method = "POST", .full_path = ha_standby_bootstrap },
     .{ .operation_id = "acquireHAFence", .method = "POST", .full_path = ha_fence },
     .{ .operation_id = "getHACurrentFence", .method = "GET", .full_path = ha_fence_current },
