@@ -253,6 +253,11 @@ that end state:
   group control. The transaction assertions cover read-set preflight conflicts,
   stable commit replay, and terminal-record TTL cleanup instead of depending on
   the synthetic dispatcher's obsolete response lifecycle.
+- `ApiHttpServer` no longer exposes public buffered or streaming request
+  executors. The last executor-based lookup test now verifies the canonical
+  generated route through the owned `httpx` runtime, including its version
+  header. The static executor adapters and legacy A2A streaming executor entry
+  point have been deleted.
 - The former shared non-generated compatibility manifest and listener
   catch-alls are gone. Metadata has no manual dispatcher, and data and
   standalone register generated and contextual families explicitly. Unknown

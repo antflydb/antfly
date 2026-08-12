@@ -2426,24 +2426,6 @@ pub const ApiHttpServer = struct {
         return try self.ensureForeignRegistry();
     }
 
-    pub fn executor(self: *ApiHttpServer) http_common.RequestExecutor {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .execute = execute,
-            },
-        };
-    }
-
-    pub fn streamingExecutor(self: *ApiHttpServer) http_common.StreamingRequestExecutor {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .execute = executeStreaming,
-            },
-        };
-    }
-
     pub fn runSessionMaintenanceOnce(self: *ApiHttpServer) !void {
         // Durable transaction, repair, and reprocess job checkpoints are
         // primary-local. Their mutating routes are rejected in continuous HA,
@@ -8874,45 +8856,6 @@ pub const ApiHttpServer = struct {
         enriched.group_id = base.group_id;
         enriched.phase = base.phase;
         return enriched;
-    }
-
-    fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        var response = try self.handle(req);
-        if (response.owner_allocator == null) response.owner_allocator = self.alloc;
-        return response;
-    }
-
-    fn executeStreaming(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest, writer: http_common.StreamWriter) !bool {
-        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        const uri_parts = splitTarget(req.uri);
-        if (!self.cfg.experimental) return false;
-        if (!std.mem.eql(u8, uri_parts.path, routes.Routes.a2a)) return false;
-        if (!protocol_adapters.isA2aStreamingRequest(self.alloc, req)) return false;
-
-        var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(self.alloc);
-        if (self.requiresAuthentication(uri_parts.path)) {
-            authenticated_identity = self.authenticateRequest(.{
-                .authorization = req.authorization,
-                .trusted_principal = req.header(trusted_principal_header),
-            }) catch return false;
-            const identity = authenticated_identity.?;
-            if (requiresAdminPermission(uri_parts.path) and !permissionsAllow(identity.permissions, .@"*", "*", .admin)) return false;
-            if (requiredPermissionForRequest(self.alloc, req.method, uri_parts.path) catch return false) |required| {
-                defer required.deinit(self.alloc);
-                if (!permissionsAllow(identity.permissions, required.resource_type, required.resource, required.permission_type)) return false;
-            }
-        }
-
-        self.recordHandledRequest();
-        return try protocol_adapters.handleA2aStreamingRequest(
-            self,
-            req,
-            writer,
-            queryEmbeddingSecurityScope(authenticated_identity),
-            authenticated_identity,
-        );
     }
 
     pub fn tableApi(self: *ApiHttpServer) public_table_http.TableApi {
@@ -23244,16 +23187,23 @@ test "api http server serves table lookup with version header" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.executor().execute(std.heap.page_allocator, .{ .method = .GET, .uri = "/tables/docs/documents/doc:a?fields=title" });
+    defer server.deinit();
+    const http_test_runtime = @import("http_test_runtime.zig");
+    var runtime = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
+    defer runtime.deinit();
+    const base_uri = try runtime.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+    const std_http_executor = @import("../raft/transport/std_http_executor.zig");
+    const http_client = @import("http_client.zig");
+    var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
+    defer executor.deinit();
+    var client = http_client.ApiHttpClient.init(std.heap.page_allocator, executor.executor());
+    var resp = try client.fetchLookup(base_uri, "docs", "doc:a", "title");
     defer resp.deinit(std.heap.page_allocator);
-    try std.testing.expectEqual(@as(u16, 200), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
     var parsed = try std.json.parseFromSlice(LookupResponse, std.testing.allocator, resp.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
-    try std.testing.expectEqual(@as(usize, 1), resp.headers.len);
-    try std.testing.expectEqualStrings("X-Antfly-Version", resp.headers[0].name);
-    try std.testing.expectEqualStrings("4321", resp.headers[0].value);
+    try std.testing.expectEqualStrings("4321", resp.version.?);
 }
 
 test "api http server allows explicit stale table lookup consistency" {
