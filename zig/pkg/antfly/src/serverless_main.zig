@@ -137,6 +137,8 @@ pub fn runFromIterator(
         .prune_enabled = cli.prune_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_PRUNE_ENABLED", true),
         .enrichment_enabled = cli.enrichment_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_ENRICHMENT_ENABLED", true),
         .remote_content = if (remote_content) |*cfg| cfg else null,
+        .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+        .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
     };
     const listener_enabled = forced_listener orelse listenerEnabledForRole(bootstrap.role);
     const listener = if (listener_enabled) try serverless_serverConfigFromEnv(init.environ_map, cli) else null;
@@ -167,7 +169,7 @@ pub fn runFromIterator(
     var health_source = ServerlessHealthSource{ .srv = &srv, .supervisor = &supervisor };
     const health_port = cli.health_port orelse try parseEnvOptionalInt(init.environ_map, u16, "ANTFLY_SERVERLESS_HEALTH_PORT");
     const health_bind_host = cli.bind_host orelse init.environ_map.get("ANTFLY_SERVERLESS_BIND_HOST") orelse "127.0.0.1";
-    const health_server = try antfly.common.health_server.HealthServer.startIfConfiguredOnHost(
+    const health_server = try antfly.common.health_server.HealthServer.startIfConfiguredOnHostWithRuntime(
         alloc,
         init.io,
         "serverless",
@@ -175,6 +177,7 @@ pub fn runFromIterator(
         health_port,
         health_source.readiness(),
         health_source.metricsWriter(),
+        srv.httpRuntime(),
     );
     defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
 

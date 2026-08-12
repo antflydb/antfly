@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const Allocator = std.mem.Allocator;
 
 pub const SourceKind = enum {
@@ -66,7 +67,7 @@ pub const QueryParams = struct {
     order_by: []SortField = &.{},
     execution_deadline_ns: ?u64 = null,
     /// Borrowed from the HTTP request; never retained by a source.
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 
     pub fn deinit(self: *QueryParams, alloc: Allocator) void {
         alloc.free(self.table);
@@ -100,7 +101,7 @@ pub const AggregateParams = struct {
     aggregations: []NamedAggregation = &.{},
     execution_deadline_ns: ?u64 = null,
     /// Borrowed from the HTTP request; never retained by a source.
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 
     pub fn deinit(self: *AggregateParams, alloc: Allocator) void {
         alloc.free(self.table);

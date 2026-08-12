@@ -9,7 +9,6 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.inference_admission_config import InferenceAdmissionConfig
     from ..models.inference_content_security_config import InferenceContentSecurityConfig
     from ..models.inference_credentials import InferenceCredentials
     from ..models.inference_model_ref import InferenceModelRef
@@ -18,11 +17,11 @@ if TYPE_CHECKING:
     from ..models.inferenceschemas_config import InferenceschemasConfig
 
 
-T = TypeVar("T", bound="InferenceConfig")
+T = TypeVar("T", bound="InferenceRuntimeConfig")
 
 
 @_attrs_define
-class InferenceConfig:
+class InferenceRuntimeConfig:
     """
     Attributes:
         api_url (str): URL of the Antfly inference embedding/chunking service Example: http://localhost:8080.
@@ -100,7 +99,6 @@ class InferenceConfig:
              Default: True.
         log (InferenceschemasConfig | Unset): Legacy inference-local logging configuration. The current unified Zig
             runtime ignores it; configure the top-level `log` object instead.
-        admission (InferenceAdmissionConfig | Unset): Process-local foreground request admission settings.
     """
 
     api_url: str
@@ -122,7 +120,6 @@ class InferenceConfig:
     model_strategies: InferenceRuntimeConfigModelStrategies | Unset = UNSET
     allow_downloads: bool | Unset = True
     log: InferenceschemasConfig | Unset = UNSET
-    admission: InferenceAdmissionConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -181,10 +178,6 @@ class InferenceConfig:
         if not isinstance(self.log, Unset):
             log = self.log.to_dict()
 
-        admission: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.admission, Unset):
-            admission = self.admission.to_dict()
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -228,14 +221,11 @@ class InferenceConfig:
             field_dict["allow_downloads"] = allow_downloads
         if log is not UNSET:
             field_dict["log"] = log
-        if admission is not UNSET:
-            field_dict["admission"] = admission
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inference_admission_config import InferenceAdmissionConfig
         from ..models.inference_content_security_config import InferenceContentSecurityConfig
         from ..models.inference_credentials import InferenceCredentials
         from ..models.inference_model_ref import InferenceModelRef
@@ -314,14 +304,7 @@ class InferenceConfig:
         else:
             log = InferenceschemasConfig.from_dict(_log)
 
-        _admission = d.pop("admission", UNSET)
-        admission: InferenceAdmissionConfig | Unset
-        if isinstance(_admission, Unset):
-            admission = UNSET
-        else:
-            admission = InferenceAdmissionConfig.from_dict(_admission)
-
-        inference_config = cls(
+        inference_runtime_config = cls(
             api_url=api_url,
             max_concurrent_requests=max_concurrent_requests,
             api_key=api_key,
@@ -341,11 +324,10 @@ class InferenceConfig:
             model_strategies=model_strategies,
             allow_downloads=allow_downloads,
             log=log,
-            admission=admission,
         )
 
-        inference_config.additional_properties = d
-        return inference_config
+        inference_runtime_config.additional_properties = d
+        return inference_runtime_config
 
     @property
     def additional_keys(self) -> list[str]:

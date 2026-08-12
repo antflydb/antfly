@@ -36,6 +36,46 @@ import (
 	"go.uber.org/zap/zaptest"
 )
 
+func TestResolveInferenceMaxConcurrentRequests(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		got, err := resolveInferenceMaxConcurrentRequests(Config{})
+		require.NoError(t, err)
+		assert.Equal(t, defaultInferenceMaxConcurrentRequests, got)
+	})
+
+	t.Run("canonical zero disables admission", func(t *testing.T) {
+		zero := 0
+		got, err := resolveInferenceMaxConcurrentRequests(Config{
+			Admission: AdmissionConfig{Inference: RequestAdmissionConfig{MaxConcurrentRequests: &zero}},
+		})
+		require.NoError(t, err)
+		assert.Zero(t, got)
+	})
+
+	t.Run("legacy nonzero migrates", func(t *testing.T) {
+		got, err := resolveInferenceMaxConcurrentRequests(Config{MaxConcurrentRequests: 7})
+		require.NoError(t, err)
+		assert.Equal(t, 7, got)
+	})
+
+	t.Run("conflicting spellings fail", func(t *testing.T) {
+		canonical := 8
+		_, err := resolveInferenceMaxConcurrentRequests(Config{
+			Admission:             AdmissionConfig{Inference: RequestAdmissionConfig{MaxConcurrentRequests: &canonical}},
+			MaxConcurrentRequests: 7,
+		})
+		require.Error(t, err)
+	})
+
+	t.Run("negative capacity fails", func(t *testing.T) {
+		negative := -1
+		_, err := resolveInferenceMaxConcurrentRequests(Config{
+			Admission: AdmissionConfig{Inference: RequestAdmissionConfig{MaxConcurrentRequests: &negative}},
+		})
+		require.Error(t, err)
+	})
+}
+
 // MockEmbedder implements the embeddings.Embedder interface for testing
 type MockEmbedder struct {
 	embedFunc func(ctx context.Context, values []string) ([][]float32, error)

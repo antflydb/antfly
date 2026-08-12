@@ -65,6 +65,7 @@ const OpaqueApiHttpServer = struct {
     cfg: server_mod.ApiHttpServerConfig,
 
     pub const RequestStats = server_mod.ApiHttpServer.RequestStats;
+    pub const AdmissionStats = server_mod.RequestAdmission.Stats;
 
     pub fn initWithConfig(
         owner_alloc: std.mem.Allocator,
@@ -98,6 +99,18 @@ const OpaqueApiHttpServer = struct {
     pub fn requestStats(self: *OpaqueApiHttpServer) RequestStats {
         var out: RequestStats = undefined;
         callInfallible(void, RequestStats, self.functions.request_stats, self.opaque_handle, null, &out);
+        return out;
+    }
+
+    pub fn queryAdmissionStats(self: *const OpaqueApiHttpServer) AdmissionStats {
+        var out: AdmissionStats = undefined;
+        callInfallible(void, AdmissionStats, self.functions.query_admission_stats, self.opaque_handle, null, &out);
+        return out;
+    }
+
+    pub fn writeAdmissionStats(self: *const OpaqueApiHttpServer) AdmissionStats {
+        var out: AdmissionStats = undefined;
+        callInfallible(void, AdmissionStats, self.functions.write_admission_stats, self.opaque_handle, null, &out);
         return out;
     }
 
@@ -422,13 +435,18 @@ pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
 
 pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
     if (comptime direct_codegen) {
-        const query = handler.query_admission.stats();
+        const query = handler.api_server.queryAdmissionStats();
+        const write = handler.api_server.writeAdmissionStats();
         const query_body = handler.query_body_admission.stats();
         return .{
             .query_capacity = query.capacity,
             .query_in_flight = query.in_flight,
             .query_peak_in_flight = query.peak_in_flight,
             .query_rejected_total = query.rejected_total,
+            .write_capacity = write.capacity,
+            .write_in_flight = write.in_flight,
+            .write_peak_in_flight = write.peak_in_flight,
+            .write_rejected_total = write.rejected_total,
             .query_body_capacity = query_body.capacity,
             .query_body_in_flight = query_body.in_flight,
             .query_body_peak_in_flight = query_body.peak_in_flight,

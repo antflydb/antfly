@@ -75,22 +75,15 @@ pub const HttpRequestView = extern struct {
     content_type: OptionalBytes = .{},
 };
 
-/// Transport-owned request lifetime state. The callback is the semantic
-/// contract. `fast_flag` is an optional same-process optimization used by
-/// linked Zig runtimes to preserve the same request signal without polling;
-/// consumers must remain correct when it is absent.
+/// Transport-owned request lifetime state. The callback is the complete
+/// semantic contract across independently compiled runtime boundaries.
 pub const CancellationView = extern struct {
     context: ?*const anyopaque = null,
     is_cancelled: ?*const fn (?*const anyopaque) callconv(.c) u8 = null,
-    fast_flag: ?*const anyopaque = null,
 
     pub fn requested(self: CancellationView) bool {
         const callback = self.is_cancelled orelse return false;
         return callback(self.context) != 0;
-    }
-
-    pub fn fastAtomicFlag(self: CancellationView) ?*const @import("std").atomic.Value(bool) {
-        return @ptrCast(@alignCast(self.fast_flag orelse return null));
     }
 };
 

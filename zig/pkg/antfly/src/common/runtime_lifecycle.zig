@@ -279,6 +279,13 @@ pub const HttpServerLifecycle = struct {
         return server.runtimeStats();
     }
 
+    pub fn httpRuntimeStats(self: *HttpServerLifecycle) ?httpx.HttpRuntime.Stats {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const server = self.server orelse return null;
+        return server.httpRuntimeStats();
+    }
+
     pub fn stop(self: *HttpServerLifecycle) void {
         self.cancellation.cancel();
         const prior = self.state.swap(.stopping, .acq_rel);

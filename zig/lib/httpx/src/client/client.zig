@@ -112,9 +112,40 @@ pub const RequestOptions = struct {
     /// Per-request response ceiling. This may lower, but never raise, the
     /// client-wide maximum.
     max_response_size: ?usize = null,
-    /// Borrowed cancellation signal. It must remain valid until the request
-    /// method returns.
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    /// Borrowed transport-neutral cancellation source. It must remain valid
+    /// until the request method returns.
+    cancellation: ?CancellationToken = null,
+};
+
+pub const CancellationToken = struct {
+    ptr: *const anyopaque,
+    is_cancelled_fn: *const fn (*const anyopaque) bool,
+
+    pub fn fromAtomic(signal: *const std.atomic.Value(bool)) CancellationToken {
+        return .{
+            .ptr = signal,
+            .is_cancelled_fn = struct {
+                fn call(raw: *const anyopaque) bool {
+                    const value: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+                    return value.load(.acquire);
+                }
+            }.call,
+        };
+    }
+
+    pub fn fromCallback(
+        ptr: ?*const anyopaque,
+        is_cancelled_fn: ?*const fn (*const anyopaque) bool,
+    ) ?CancellationToken {
+        return .{
+            .ptr = ptr orelse return null,
+            .is_cancelled_fn = is_cancelled_fn orelse return null,
+        };
+    }
+
+    pub fn isCancelled(self: CancellationToken) bool {
+        return self.is_cancelled_fn(self.ptr);
+    }
 };
 
 const cancellation_poll_interval_ms: u64 = 25;
@@ -726,7 +757,7 @@ pub const Client = struct {
     }
 
     /// Executes the actual HTTP request.
-    fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64, cancellation: ?*const std.atomic.Value(bool)) !Response {
+    fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64, cancellation: ?CancellationToken) !Response {
         if (cancellation) |signal| return self.executeRequestCancellable(req, timeout_override_ms, signal);
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
         const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
@@ -791,9 +822,9 @@ pub const Client = struct {
         self: *Self,
         req: *Request,
         timeout_override_ms: ?u64,
-        cancellation: *const std.atomic.Value(bool),
+        cancellation: CancellationToken,
     ) !Response {
-        if (cancellation.load(.acquire)) return error.Cancelled;
+        if (cancellation.isCancelled()) return error.Cancelled;
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
         const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
         var interrupt: RequestInterrupt = .{};
@@ -809,8 +840,8 @@ pub const Client = struct {
                 return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms, request_interrupt);
             }
 
-            fn cancellationTask(io: Io, signal: *const std.atomic.Value(bool)) CancelResult {
-                while (!signal.load(.acquire)) {
+            fn cancellationTask(io: Io, signal: CancellationToken) CancelResult {
+                while (!signal.isCancelled()) {
                     try io.sleep(Io.Duration.fromMilliseconds(cancellation_poll_interval_ms), .awake);
                 }
                 return error.Cancelled;
@@ -840,7 +871,7 @@ pub const Client = struct {
             switch (first) {
                 .request => |request_result| {
                     select.cancelDiscard();
-                    if (cancellation.load(.acquire)) {
+                    if (cancellation.isCancelled()) {
                         if (request_result) |response_value| {
                             var response = response_value;
                             response.deinit();
@@ -871,7 +902,7 @@ pub const Client = struct {
         switch (first) {
             .request => |request_result| {
                 select.cancelDiscard();
-                if (cancellation.load(.acquire)) {
+                if (cancellation.isCancelled()) {
                     if (request_result) |response_value| {
                         var response = response_value;
                         response.deinit();
@@ -890,7 +921,7 @@ pub const Client = struct {
                 try timeout_result;
                 interrupt.cancel(self.io);
                 while (select.cancel()) |late| Task.drainLateResult(late);
-                if (cancellation.load(.acquire)) return error.Cancelled;
+                if (cancellation.isCancelled()) return error.Cancelled;
                 return error.Timeout;
             },
         }
@@ -943,7 +974,7 @@ pub const Client = struct {
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !Response {
         if (cancellation) |signal| return self.executeRequestToWriterCancellable(req, timeout_override_ms, writer, progress_cb, progress_ctx, signal);
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
@@ -1022,9 +1053,9 @@ pub const Client = struct {
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
-        cancellation: *const std.atomic.Value(bool),
+        cancellation: CancellationToken,
     ) !Response {
-        if (cancellation.load(.acquire)) return error.Cancelled;
+        if (cancellation.isCancelled()) return error.Cancelled;
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
         const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
         var interrupt: RequestInterrupt = .{};
@@ -1041,8 +1072,8 @@ pub const Client = struct {
                 return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context, request_interrupt);
             }
 
-            fn cancellationTask(io: Io, signal: *const std.atomic.Value(bool)) CancelResult {
-                while (!signal.load(.acquire)) {
+            fn cancellationTask(io: Io, signal: CancellationToken) CancelResult {
+                while (!signal.isCancelled()) {
                     try io.sleep(Io.Duration.fromMilliseconds(cancellation_poll_interval_ms), .awake);
                 }
                 return error.Cancelled;
@@ -1072,7 +1103,7 @@ pub const Client = struct {
             switch (first) {
                 .request => |request_result| {
                     select.cancelDiscard();
-                    if (cancellation.load(.acquire)) {
+                    if (cancellation.isCancelled()) {
                         if (request_result) |response_value| {
                             var response = response_value;
                             response.deinit();
@@ -1103,7 +1134,7 @@ pub const Client = struct {
         switch (first) {
             .request => |request_result| {
                 select.cancelDiscard();
-                if (cancellation.load(.acquire)) {
+                if (cancellation.isCancelled()) {
                     if (request_result) |response_value| {
                         var response = response_value;
                         response.deinit();
@@ -1122,7 +1153,7 @@ pub const Client = struct {
                 try timeout_result;
                 interrupt.cancel(self.io);
                 while (select.cancel()) |late| Task.drainLateResult(late);
-                if (cancellation.load(.acquire)) return error.Cancelled;
+                if (cancellation.isCancelled()) return error.Cancelled;
                 return error.Timeout;
             },
         }
@@ -3067,7 +3098,27 @@ test "Client rejects an already cancelled request" {
     var cancellation = std.atomic.Value(bool).init(true);
     try std.testing.expectError(
         error.Cancelled,
-        client.get("http://127.0.0.1:1/never", .{ .cancellation = &cancellation }),
+        client.get("http://127.0.0.1:1/never", .{ .cancellation = .fromAtomic(&cancellation) }),
+    );
+}
+
+test "Client rejects callback-backed cancellation" {
+    const State = struct {
+        canceled: bool,
+
+        fn isCancelled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.canceled;
+        }
+    };
+
+    var state = State{ .canceled = true };
+    const token = CancellationToken.fromCallback(&state, State.isCancelled).?;
+    var client = Client.init(std.testing.allocator, std.testing.io);
+    defer client.deinit();
+    try std.testing.expectError(
+        error.Cancelled,
+        client.get("http://127.0.0.1:1/never", .{ .cancellation = token }),
     );
 }
 

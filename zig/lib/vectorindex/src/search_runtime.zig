@@ -243,7 +243,7 @@ pub fn exactDistancesToStoredVectorsCancellable(
     query_measure: f32,
     candidates: []const []const f32,
     distances: []f32,
-    cancellation: ?*const std.atomic.Value(bool),
+    cancellation: ?@import("search_types.zig").CancellationToken,
 ) !void {
     return exactDistancesToStoredVectorsWithCancellationCheck(
         metric,
@@ -251,18 +251,18 @@ pub fn exactDistancesToStoredVectorsCancellable(
         query_measure,
         candidates,
         distances,
-        AtomicCancellationCheck{ .signal = cancellation },
+        CancellationCheck{ .token = cancellation },
     );
 }
 
 const exact_distance_cancellation_stride = 64;
 
-const AtomicCancellationCheck = struct {
-    signal: ?*const std.atomic.Value(bool),
+const CancellationCheck = struct {
+    token: ?@import("search_types.zig").CancellationToken,
 
     inline fn check(self: @This()) !void {
-        if (self.signal) |signal| {
-            if (signal.load(.acquire)) return error.Cancelled;
+        if (self.token) |token| {
+            if (token.isCancelled()) return error.Cancelled;
         }
     }
 };
@@ -316,7 +316,7 @@ test "cancellable exact distances honor preexisting cancellation" {
     var cancelled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(
         error.Cancelled,
-        exactDistancesToStoredVectorsCancellable(metric, &query, 0, &candidates, &distances, &cancelled),
+        exactDistancesToStoredVectorsCancellable(metric, &query, 0, &candidates, &distances, .fromAtomic(&cancelled)),
     );
 }
 

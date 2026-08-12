@@ -120,7 +120,7 @@ fn aggregationFullResultBudget() u32 {
 
 fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
     if (req.cancellation) |value| {
-        if (value.load(.acquire)) return error.Cancelled;
+        if (value.isCancelled()) return error.Cancelled;
     }
     const deadline_ns = req.execution_deadline_ns orelse return;
     if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
@@ -140,7 +140,7 @@ fn queryRemainingTimeoutMs(req: db_mod.types.SearchRequest) !?u32 {
 }
 
 fn queryRequestCancellation(req: db_mod.types.SearchRequest) http_common.RequestCancellation {
-    return .{ .borrowed = req.cancellation };
+    return if (req.cancellation) |token| .fromToken(token) else .{};
 }
 
 fn nsToUsFloat(ns: u64) f64 {
@@ -13828,8 +13828,8 @@ fn graphExpandRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const body = try distributed_graph.encodeGraphExpandRequest(alloc, req);
     defer alloc.free(body);
-    var cancellation = if (req.cancellation) |signal|
-        http_common.RequestCancellation{ .borrowed = signal }
+    var cancellation = if (req.cancellation) |token|
+        http_common.RequestCancellation.fromToken(token)
     else
         null;
     var result = try client.fetchGroupGraphExpandWithControl(
@@ -13855,8 +13855,8 @@ fn graphHydrateRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const body = try distributed_graph.encodeGraphHydrateRequest(alloc, req);
     defer alloc.free(body);
-    var cancellation = if (req.cancellation) |signal|
-        http_common.RequestCancellation{ .borrowed = signal }
+    var cancellation = if (req.cancellation) |token|
+        http_common.RequestCancellation.fromToken(token)
     else
         null;
     var result = try client.fetchGroupGraphHydrateWithControl(
@@ -13882,8 +13882,8 @@ fn graphEdgesRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const body = try distributed_graph.encodeGraphEdgesRequest(alloc, req);
     defer alloc.free(body);
-    var cancellation = if (req.cancellation) |signal|
-        http_common.RequestCancellation{ .borrowed = signal }
+    var cancellation = if (req.cancellation) |token|
+        http_common.RequestCancellation.fromToken(token)
     else
         null;
     var result = try client.fetchGroupGraphEdgesWithControl(

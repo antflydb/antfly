@@ -33,6 +33,7 @@ const prometheus = @import("prometheus.zig");
 const runtime_lifecycle = @import("runtime_lifecycle.zig");
 const metrics_cache_ttl_ms: u64 = 5 * std.time.ms_per_s;
 const graceful_shutdown_timeout_ms: u64 = 5_000;
+pub const max_connections: u32 = 16;
 
 pub const ReadinessChecker = struct {
     ptr: *anyopaque,
@@ -63,6 +64,7 @@ pub const MetricsWriter = struct {
 pub const Config = struct {
     bind_host: []const u8 = "0.0.0.0",
     bind_port: u16,
+    http_runtime: ?*httpx.HttpRuntime = null,
 };
 
 pub const HealthServer = struct {
@@ -98,7 +100,9 @@ pub const HealthServer = struct {
                 .host = cfg.bind_host,
                 .port = cfg.bind_port,
                 .reuse_address = true,
-                .max_connections = 16,
+                .max_connections = max_connections,
+                .http_runtime = cfg.http_runtime,
+                .h1_disconnect_cancellation = .disabled,
             }),
             .listener_task = undefined,
         };
@@ -184,10 +188,24 @@ pub const HealthServer = struct {
         ready: ?ReadinessChecker,
         metrics: ?MetricsWriter,
     ) !?*HealthServer {
+        return try startIfConfiguredOnHostWithRuntime(alloc, io, label, bind_host, port, ready, metrics, null);
+    }
+
+    pub fn startIfConfiguredOnHostWithRuntime(
+        alloc: std.mem.Allocator,
+        io: Io,
+        label: []const u8,
+        bind_host: ?[]const u8,
+        port: ?u16,
+        ready: ?ReadinessChecker,
+        metrics: ?MetricsWriter,
+        http_runtime: ?*httpx.HttpRuntime,
+    ) !?*HealthServer {
         const p = port orelse return null;
         const hs = try HealthServer.init(alloc, io, .{
             .bind_host = bind_host orelse "0.0.0.0",
             .bind_port = p,
+            .http_runtime = http_runtime,
         }, ready, metrics);
         errdefer hs.deinit();
         try hs.start();

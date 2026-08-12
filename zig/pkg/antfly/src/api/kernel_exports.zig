@@ -168,6 +168,18 @@ pub fn requestStats(context: *const CallContext) callconv(.c) abi.Status {
     return .ok;
 }
 
+pub fn queryAdmissionStats(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, server_mod.RequestAdmission.Stats, context)) |failure| return failure;
+    output(server_mod.RequestAdmission.Stats, context).* = serverState(context).server.queryAdmissionStats();
+    return .ok;
+}
+
+pub fn writeAdmissionStats(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, server_mod.RequestAdmission.Stats, context)) |failure| return failure;
+    output(server_mod.RequestAdmission.Stats, context).* = serverState(context).server.writeAdmissionStats();
+    return .ok;
+}
+
 pub fn setProvider(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(?managed_embedder.AntflyProvider, void, context)) |failure| return failure;
     serverState(context).server.antfly_provider = input(?managed_embedder.AntflyProvider, context).*;
@@ -277,13 +289,18 @@ pub fn handlerInit(context: *const CallContext) callconv(.c) abi.Status {
 pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, abi.HandlerStats, context)) |failure| return failure;
     const handler = &handlerState(context).handler;
-    const query = handler.query_admission.stats();
+    const query = handler.api_server.queryAdmissionStats();
+    const write = handler.api_server.writeAdmissionStats();
     const query_body = handler.query_body_admission.stats();
     output(abi.HandlerStats, context).* = .{
         .query_capacity = query.capacity,
         .query_in_flight = query.in_flight,
         .query_peak_in_flight = query.peak_in_flight,
         .query_rejected_total = query.rejected_total,
+        .write_capacity = write.capacity,
+        .write_in_flight = write.in_flight,
+        .write_peak_in_flight = write.peak_in_flight,
+        .write_rejected_total = write.rejected_total,
         .query_body_capacity = query_body.capacity,
         .query_body_in_flight = query_body.in_flight,
         .query_body_peak_in_flight = query_body.peak_in_flight,
@@ -414,6 +431,8 @@ const function_table: abi.FunctionTable = .{
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
+    .query_admission_stats = &queryAdmissionStats,
+    .write_admission_stats = &writeAdmissionStats,
     .set_provider = &setProvider,
     .set_ha_executor = &setHAExecutor,
     .attach_runtime_restore_store = &attachRuntimeRestoreStore,

@@ -132,12 +132,14 @@ def sync_detailed(
 
     Downloaded and inline encoded media is limited cumulatively across the request
     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-    `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+    `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero
+    configured
     download limit disables nonempty media. Remote URL byte potential is reserved before
     fetch; inline sources reserve their actual encoded size without adding it to the
     existing request-body reservation. Accepted image headers are then validated and
     decoded source pixels are admitted at a conservative 16 bytes per pixel against
-    the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+    the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a
+    zero
     concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
     limits each source edge. Malformed images return 400, while dimension or aggregate
     excess returns 413 before model loading. Initial capacity admission occurs before
@@ -196,12 +198,14 @@ def sync(
 
     Downloaded and inline encoded media is limited cumulatively across the request
     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-    `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+    `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero
+    configured
     download limit disables nonempty media. Remote URL byte potential is reserved before
     fetch; inline sources reserve their actual encoded size without adding it to the
     existing request-body reservation. Accepted image headers are then validated and
     decoded source pixels are admitted at a conservative 16 bytes per pixel against
-    the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+    the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a
+    zero
     concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
     limits each source edge. Malformed images return 400, while dimension or aggregate
     excess returns 413 before model loading. Initial capacity admission occurs before
@@ -255,12 +259,14 @@ async def asyncio_detailed(
 
     Downloaded and inline encoded media is limited cumulatively across the request
     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-    `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+    `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero
+    configured
     download limit disables nonempty media. Remote URL byte potential is reserved before
     fetch; inline sources reserve their actual encoded size without adding it to the
     existing request-body reservation. Accepted image headers are then validated and
     decoded source pixels are admitted at a conservative 16 bytes per pixel against
-    the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+    the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a
+    zero
     concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
     limits each source edge. Malformed images return 400, while dimension or aggregate
     excess returns 413 before model loading. Initial capacity admission occurs before
@@ -317,12 +323,14 @@ async def asyncio(
 
     Downloaded and inline encoded media is limited cumulatively across the request
     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-    `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+    `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero
+    configured
     download limit disables nonempty media. Remote URL byte potential is reserved before
     fetch; inline sources reserve their actual encoded size without adding it to the
     existing request-body reservation. Accepted image headers are then validated and
     decoded source pixels are admitted at a conservative 16 bytes per pixel against
-    the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+    the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a
+    zero
     concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
     limits each source edge. Malformed images return 400, while dimension or aggregate
     excess returns 413 before model loading. Initial capacity admission occurs before

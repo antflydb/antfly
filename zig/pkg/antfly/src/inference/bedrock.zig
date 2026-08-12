@@ -4,6 +4,7 @@
 // except in compliance with the Elastic License 2.0.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference = @import("types.zig");
@@ -287,7 +288,7 @@ pub const Options = struct {
     input_type: []const u8 = "",
     truncate: []const u8 = "",
     dimension: u32 = 0,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 };
 
 pub const Provider = struct {
@@ -386,7 +387,10 @@ pub const Provider = struct {
         var resp = try self.http.request(.POST, url, .{
             .headers = signed,
             .body = json_body,
-            .cancellation = self.options.cancellation,
+            .cancellation = if (self.options.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
         });
         defer resp.deinit();
         if (!resp.ok()) return mapStatus(resp.status.code);

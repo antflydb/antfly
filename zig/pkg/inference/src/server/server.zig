@@ -10110,6 +10110,11 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
+        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
+        self.metrics.incRequest("predict");
+        defer self.metrics.decActive();
 
         try self.discoverPredictors(ctx);
         const result = tabular_mod.http.predict(ctx.io, ctx.allocator, &self.tabular_registry, .{
@@ -17517,6 +17522,26 @@ test "admission rejection includes Retry-After" {
     );
     defer payload.deinit();
     try std.testing.expect(payload.value.retryable);
+}
+
+test "predict endpoint shares inference request admission" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    try node.request_queue.acquire();
+    defer node.request_queue.release();
+
+    var request = try httpx.Request.init(allocator, .POST, "/ml/v1/predict");
+    defer request.deinit();
+    request.body = "{\"model\":\"demo\",\"input\":[[1.0]]}";
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try node.predict(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
 }
 
 test "shared json schema validator: additionalProperties schema object" {

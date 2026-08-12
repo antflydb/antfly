@@ -570,8 +570,8 @@ const StandaloneHealthSource = struct {
                 .required_lsn = checkpoint_lsn,
             }) catch return false;
         }
-        if (self.unified_lifecycle.runtimeStats()) |http| {
-            if (http.h1_cancellation_observer_failures_total != 0) return false;
+        if (self.unified_lifecycle.httpRuntimeStats()) |http_runtime| {
+            if (!http_runtime.healthy) return false;
         }
         return standaloneReadyFromState(
             self.data_server.http_server != null,
@@ -587,10 +587,6 @@ const StandaloneHealthSource = struct {
         try antfly.common.health_server.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(self.supervisor.token().isCancelled()));
 
         const handler = antfly.public_api.kernel_bridge.handlerStats(self.handler);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_capacity", "gauge", "Maximum concurrent expensive public queries", handler.query_capacity);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_in_flight", "gauge", "Currently executing expensive public queries", handler.query_in_flight);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_peak_in_flight", "gauge", "Peak concurrent expensive public queries since process start", handler.query_peak_in_flight);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public queries rejected by admission control", handler.query_rejected_total);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", handler.query_body_capacity);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", handler.query_body_in_flight);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", handler.query_body_peak_in_flight);
@@ -604,10 +600,12 @@ const StandaloneHealthSource = struct {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_in_use_bytes", "gauge", "HTTP request-body bytes admitted across HTTP/1 and HTTP/2", http.body_buffer_in_use_bytes);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_peak_bytes", "gauge", "Peak admitted HTTP request-body bytes since process start", http.body_buffer_peak_bytes);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_rejected_total", "counter", "HTTP request bodies rejected by aggregate memory admission", http.body_buffer_rejected_total);
-            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests rejected because transport cancellation observation could not be registered", http.h1_cancellation_registration_failures_total);
-            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_disconnects_total", "counter", "Public request peer disconnects propagated to cancellation", http.h1_peer_cancellations_total);
-            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public requests cancelled after transport cancellation observation failed", http.h1_cancellation_observer_failures_total);
-            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "HTTP/1 request sockets currently watched for disconnect", http.active_h1_cancellation_observers);
+        }
+        if (self.unified_lifecycle.httpRuntimeStats()) |http_runtime| {
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests rejected because transport cancellation observation could not be registered", http_runtime.h1_cancellation_registration_failures_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_hard_disconnect_cancellations_total", "counter", "Public requests cancelled after a hard transport failure", http_runtime.h1_hard_disconnect_cancellations_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public requests cancelled after transport cancellation observation failed", http_runtime.h1_cancellation_observer_failures_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "HTTP/1 request sockets currently registered for hard-disconnect observation", http_runtime.active_h1_cancellation_observers);
         }
     }
 };
@@ -1730,7 +1728,7 @@ pub fn runFromIterator(
         cli.inference_kernel_jit_mode,
     );
     const inference_runtime_config_json = try std.json.Stringify.valueAlloc(alloc, InferenceRuntimeConfigWire{
-        .max_concurrent_requests = configured_inference.max_concurrent_requests,
+        .max_concurrent_requests = resolveInferenceMaxConcurrentRequests(loaded_cfg),
         .kernel_jit = .{
             .mode = effective_kernel_jit_mode,
             .cache_dir = configured_inference.kernel_jit.cache_dir,
@@ -1994,6 +1992,8 @@ pub fn runFromIterator(
             .ha_remote_apply_mutations_enabled = haRemoteApplyMutationsEnabled(ha_sync_policy.policy),
             .auth_enabled = auth_enabled,
             .experimental = cli.experimental,
+            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
@@ -2147,6 +2147,11 @@ pub fn runFromIterator(
     var unified_api_ready = std.atomic.Value(bool).init(false);
 
     var unified_lifecycle = UnifiedServerLifecycle{};
+    const public_http_config = publicHttpServerConfig(bind_host, bind_port);
+    var http_runtime = httpx.HttpRuntime.init(alloc, .{
+        .max_active_h1_requests = public_http_config.max_connections,
+    });
+    defer http_runtime.deinit();
     var standalone_health = StandaloneHealthSource{
         .data_server = &data_server,
         .unified_api_ready = &unified_api_ready,
@@ -2160,7 +2165,7 @@ pub fn runFromIterator(
         cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
     else
         null;
-    const health_server = antfly.common.health_server.HealthServer.startIfConfiguredOnHost(
+    const health_server = antfly.common.health_server.HealthServer.startIfConfiguredOnHostWithRuntime(
         alloc,
         control_io,
         "standalone",
@@ -2168,6 +2173,7 @@ pub fn runFromIterator(
         health_port,
         standalone_health.readiness(),
         standalone_health.metricsWriter(),
+        &http_runtime,
     ) catch |err| {
         std.log.err("standalone startup failed step=health_server err={}", .{err});
         return err;
@@ -2189,6 +2195,7 @@ pub fn runFromIterator(
             api_server,
             &unified_api_ready,
             &unified_lifecycle,
+            &http_runtime,
         })
     else
         public_io.concurrent(serveUnifiedWithLinkedInference, .{
@@ -2202,6 +2209,7 @@ pub fn runFromIterator(
             api_server,
             &unified_api_ready,
             &unified_lifecycle,
+            &http_runtime,
         })) catch |err| {
         std.log.err("standalone startup failed step=schedule_unified_http err={}", .{err});
         return err;
@@ -2339,8 +2347,9 @@ fn serveUnifiedWithInference(
     api_server: *ApiHttpServer,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
+    http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(true, alloc, io, bind_host, bind_port, cors_config, handler, antfly_node, api_server, unified_api_ready, lifecycle) catch |err| {
+    serveUnifiedInner(true, alloc, io, bind_host, bind_port, cors_config, handler, antfly_node, api_server, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2361,8 +2370,9 @@ fn serveUnifiedWithLinkedInference(
     api_server: *ApiHttpServer,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
+    http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(false, alloc, io, bind_host, bind_port, cors_config, handler, inference_handle, api_server, unified_api_ready, lifecycle) catch |err| {
+    serveUnifiedInner(false, alloc, io, bind_host, bind_port, cors_config, handler, inference_handle, api_server, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2384,13 +2394,10 @@ fn serveUnifiedInner(
     api_server: *ApiHttpServer,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
+    http_runtime: *httpx.HttpRuntime,
 ) !void {
     var server_config = publicHttpServerConfig(bind_host, bind_port);
-    var http_runtime = httpx.HttpRuntime.init(alloc, .{
-        .max_active_h1_requests = server_config.max_connections,
-    });
-    defer http_runtime.deinit();
-    server_config.http_runtime = &http_runtime;
+    server_config.http_runtime = http_runtime;
     var server = httpx.Server.initWithConfig(alloc, io, server_config);
     defer server.deinit();
     var route_context = StandaloneHttpContext{
@@ -2562,6 +2569,7 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
 }
 
 const public_http_connection_ceiling: u32 = 256;
+const public_http_max_h1_inflight_bodies: u32 = 32;
 
 fn publicHttpConnectionLimitForFdSoftLimit(fd_soft_limit: u64) u32 {
     // Public inbound sockets may use at most one quarter of the process FD
@@ -2587,10 +2595,9 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         // Four maximum-sized public requests may complete while excess uploads
         // are shed before allocator pressure becomes systemic.
         .request_body_buffer_budget_bytes = 256 * 1024 * 1024,
-        // Query execution admits 32 requests. Apply the same bound while H1
-        // bodies are still streaming so the remaining public connections can
-        // service health, control, and recovery traffic.
-        .max_h1_inflight_bodies = 32,
+        // This is a transport safeguard for every H1 request body. Keep it
+        // independent from admission.query.max_concurrent_requests.
+        .max_h1_inflight_bodies = public_http_max_h1_inflight_bodies,
         .request_timeout_ms = 300_000,
         // Keep a large process-wide FD reserve for storage, Raft, outbound
         // clients, and diagnostics. This prevents the historical 1,000-socket
@@ -4223,6 +4230,13 @@ fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.C
     if (cli.inference_models_dir) |value| return value;
     if (cfg) |loaded| return loaded.inference.models_dir;
     return null;
+}
+
+fn resolveInferenceMaxConcurrentRequests(cfg: ?*const antfly.common.config.Config) u32 {
+    return if (cfg) |config|
+        config.admission.inference.max_concurrent_requests
+    else
+        antfly.common.config.default_inference_max_concurrent_requests;
 }
 
 fn resolveInferenceMlDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
@@ -6195,6 +6209,7 @@ test "standalone public HTTP server is restart-safe and uses public API request 
     try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), cfg.request_body_buffer_budget_bytes);
     try std.testing.expect(cfg.max_connections >= 1);
     try std.testing.expect(cfg.max_connections <= public_http_connection_ceiling);
+    try std.testing.expectEqual(public_http_max_h1_inflight_bodies, cfg.max_h1_inflight_bodies);
     try std.testing.expectEqual(@as(u32, 5), cfg.accept_error_backoff_initial_ms);
     try std.testing.expectEqual(@as(u32, 1_000), cfg.accept_error_backoff_max_ms);
     try std.testing.expectEqual(@as(u32, 256), publicHttpConnectionLimitForFdSoftLimit(1024));
@@ -6345,11 +6360,13 @@ test "inference config falls back to common config" {
         .transcribers = antfly.transcribing.Registry.init(alloc),
         .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
+        .admission = .{
+            .inference = .{ .max_concurrent_requests = 0 },
+        },
         .inference = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:8089"),
             .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),
             .ml_dir = try alloc.dupe(u8, "/tmp/antfly-ml"),
-            .max_concurrent_requests = 0,
             .kernel_jit = .{
                 .mode = .shadow,
                 .cache_dir = try alloc.dupe(u8, "/tmp/antfly-jit"),
@@ -6378,6 +6395,11 @@ test "inference config falls back to common config" {
 
     try std.testing.expectEqualStrings("/tmp/antfly-models", resolveInferenceModelsDir(.{}, &cfg).?);
     try std.testing.expectEqualStrings("/tmp/antfly-ml", resolveInferenceMlDir(.{}, &cfg).?);
+    try std.testing.expectEqual(@as(u32, 0), resolveInferenceMaxConcurrentRequests(&cfg));
+    try std.testing.expectEqual(
+        antfly.common.config.default_inference_max_concurrent_requests,
+        resolveInferenceMaxConcurrentRequests(null),
+    );
     try std.testing.expectEqual(@as(usize, 1), cfg.inference.preload.len);
     try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);

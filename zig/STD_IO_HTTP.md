@@ -29,11 +29,16 @@ that end state:
   control lanes from `BackendRuntime`.
 - `HttpRuntime` is the role-owned transport service shared by `httpx`
   listeners. It owns one bounded HTTP/1 cancellation multiplexer, listener
-  leases, admission, and transport metrics; it does not own an executor lane.
+  leases, reserved observer capacity, health state, and transport metrics; it
+  does not own an executor lane.
 - Every `httpx.Context` has transport-provided cancellation. HTTP/2 uses the
   stream reset signal, while HTTP/1 registrations share the role's
   `HttpRuntime`. The linked API and inference ABIs carry the same semantic
   cancellation callback without route-specific OpenAPI policy.
+- Query and write admission are application-operation gates owned by
+  `ApiHttpServer`, not handler-local or listener-local limits. Generated HTTP,
+  MCP, A2A, extension-host, and other in-process entry points therefore share
+  the same capacity and rejection metrics.
 - Process roles share signal cancellation and one absolute shutdown deadline.
 - Listener address reuse and listener sharing are independent policies:
   `SO_REUSEADDR` supports deterministic restart, while `SO_REUSEPORT` is an
@@ -118,8 +123,8 @@ that end state:
 - The ordinary internal group batch route now decodes directly into an owned
   batch request and invokes a typed operation for schema validation, local
   group write, cancellation, and outcome classification. The explicitly
-  versioned routed-forwarding endpoint now does the same, passes the listener's
-  borrowed atomic cancellation signal to the data runtime, and preserves its
+  versioned routed-forwarding endpoint now does the same, passes the request's
+  semantic cancellation token to the data runtime, and preserves its
   outcome headers without manufacturing an `HttpRequest`. The residual
   internal dispatcher no longer receives any write route.
 - Internal transaction begin, prepare, resolve, status, and acknowledge are
@@ -579,9 +584,16 @@ Each listening server acquires a lease before bind/accept and releases it only
 after its connection group has drained. The first lease starts the HTTP/1
 cancellation service and the last lease stops and joins it. `HttpRuntime`
 cannot be destroyed while a listener lease remains. Its H1 registry is bounded;
-the configured capacity must cover the sum of simultaneously active H1 requests
-across all listeners that share it. Registration failure is fail-closed with a
-retryable 503 rather than silently running an uncancellable request.
+each listener reserves its configured maximum before startup, so the sum of
+listener reservations cannot exceed runtime capacity. A listener that cannot
+reserve its complete bound fails startup instead of discovering an undersized
+observer only under load. Per-request registration failure is still fail-closed
+with a retryable 503 rather than silently running an uncancellable request.
+The exception is an explicitly bounded health/control listener: it disables
+peer-disconnect observation, reserves zero observer slots, and retains normal
+server-shutdown cancellation. This is necessary so `/readyz` can still report
+an unhealthy shared observer rather than being rejected before route dispatch.
+Application listeners always require observation.
 
 The current `std.Io.Threaded` backend grows a worker pool as concurrency demands
 and retains those workers until executor deinitialization. Consequently, one
@@ -589,9 +601,14 @@ long-lived watcher submitted per connection or request would turn peak socket
 concurrency into retained thread stacks. The current H1 implementation instead
 uses one explicitly owned OS thread with a small configurable stack and
 multiplexes all registered sockets with `poll`/`kqueue`. It only peeks; the HTTP
-parser remains the sole consumer of socket bytes. A complete pipelined request
-takes precedence over an ambiguous orderly EOF, while reset/error conditions
-still cancel the active request.
+parser remains the sole consumer of socket bytes. An HTTP/1 peer may
+half-close its request side with FIN while legitimately awaiting the response,
+so orderly EOF is never treated as request cancellation. Only a hard socket
+failure/reset cancels an active H1 request; explicit protocol cancellation and
+deadlines remain necessary when an orderly half-close must not retain work.
+Fatal observer failures mark `HttpRuntime` unhealthy, cancel all current
+registrations, and make shared-role readiness fail until the runtime is
+restarted.
 
 This observer is intentionally not a `BackendRuntime` lane. Giving it a lane
 would mix transport lifetime with storage-executor policy and would still risk
@@ -665,6 +682,12 @@ Health capacity must remain available under API, storage, and inference
 saturation. Readiness should be dropped before ordinary ingress is stopped so
 load balancers can begin draining the process.
 
+The health listener shares the role's `HttpRuntime` for lifecycle and health
+visibility but does not depend on the H1 disconnect observer to dispatch its
+bounded handlers. Its connection/body limits and cached metrics path are the
+resource bound; its request cancellation signal is still tripped during server
+shutdown.
+
 ## Deadline-based shutdown
 
 Shutdown uses one absolute process deadline. Independent per-component timeout
@@ -709,6 +732,15 @@ All blocking loops require cancellation points. `error.Canceled` must be
 propagated or deliberately translated at a documented boundary rather than
 silently swallowed. Client disconnect and server shutdown should cancel actual
 backend work, not only stop response delivery.
+
+The universal representation is a borrowed `(context, is_cancelled)` callback.
+Atomic values are adapters used by concrete listener, lifecycle, or test
+owners; they are not an operation, storage, client, or compiled-runtime ABI.
+The callback token is preserved through distributed query/graph execution,
+storage search, vector and sparse kernels, foreign sources, managed inference,
+and outbound HTTP. This avoids the semantic hole where linked runtimes could
+observe cancellation at ingress but deep work continued unless a same-process
+atomic fast path happened to be available.
 
 Component stop signals and Future cancellation are complementary:
 
@@ -994,10 +1026,9 @@ archive reconstructs an `httpx.Context` with transport-neutral delegates, so
 an inference SSE handler can start, write, and close the original listener's
 HTTP/1 chunked stream or HTTP/2 DATA stream without sharing socket or
 connection layouts across the ABI. The same callback cancellation source is
-used by operation contexts and inference generation loops. A same-process fast
-flag may preserve the identical atomic signal for storage/search internals, but
-the callback is the ABI contract and callers remain correct when the fast path
-is absent.
+used by operation contexts, storage/search internals, inference generation,
+and outbound requests. There is no ABI fast flag or dependence on Zig atomic
+layout; the callback is the only cancellation contract.
 
 Production request accounting happens inside linked dispatch, where the API
 kernel owns the metric, rather than relying on direct-registration middleware

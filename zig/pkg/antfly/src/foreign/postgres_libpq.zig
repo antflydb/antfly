@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 const builtin = @import("builtin");
@@ -452,7 +453,7 @@ pub const Executor = struct {
             self: @This(),
             events: i16,
             deadline_ns: ?u64,
-            cancellation: ?*const std.atomic.Value(bool),
+            cancellation: ?CancellationToken,
         ) !i16 {
             const now_ns = platform_time.monotonicNs();
             const wait_deadline_ns = if (cancellation != null)
@@ -711,7 +712,7 @@ pub const Executor = struct {
         alloc.destroy(self);
     }
 
-    fn query(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
+    fn query(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) !foreign_source.QueryResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.queryPreparedAllocWithDeadline(alloc, dsn, prepared, execution_deadline_ns, cancellation);
     }
@@ -1065,9 +1066,9 @@ pub const Executor = struct {
         dsn: []const u8,
         prepared: sql.PreparedQuery,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !foreign_source.QueryResult {
-        if (cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         var owned = prepared;
         defer owned.deinit(alloc);
 
@@ -1075,7 +1076,7 @@ pub const Executor = struct {
         var lease = try self.acquireConnection(dsn, execution_deadline_ns, cancellation);
         defer lease.release();
         std.log.info("postgres libpq query connected sql_len={d}", .{owned.sql_text.len});
-        if (cancellation) |value| if (value.load(.acquire)) {
+        if (cancellation) |value| if (value.isCancelled()) {
             lease.invalidate();
             return error.Cancelled;
         };
@@ -1258,7 +1259,7 @@ pub const Executor = struct {
         self: *@This(),
         dsn: []const u8,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !*ConnectionPool {
         var reclaim_count: usize = 0;
         while (true) {
@@ -1498,7 +1499,7 @@ pub const Executor = struct {
         self: *@This(),
         count: usize,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !void {
         std.debug.assert(count > 0 and count <= max_total_connections);
         try ensureNotCancelled(cancellation);
@@ -1686,7 +1687,7 @@ pub const Executor = struct {
         self: *@This(),
         count: usize,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !PermitReclaimOutcome {
         var reclaimed: [max_total_connections]*PGconn = undefined;
         var reclaimed_count: usize = 0;
@@ -1771,7 +1772,7 @@ pub const Executor = struct {
         self: *@This(),
         dsn: []const u8,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !ConnectionLease {
         try ensureNotCancelled(cancellation);
         const pool = try self.getOrCreateConnectionPool(dsn, execution_deadline_ns, cancellation);
@@ -1905,7 +1906,7 @@ pub const Executor = struct {
         self: *@This(),
         dsn: []const u8,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !*PGconn {
         if (execution_deadline_ns == null and cancellation == null) {
             return (try self.connectFresh(self.alloc, dsn)) orelse error.ForeignConnectionFailed;
@@ -1978,7 +1979,7 @@ pub const Executor = struct {
         conn: ?*PGconn,
         events: i16,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !void {
         while (true) {
             try ensureNotCancelled(cancellation);
@@ -2054,7 +2055,7 @@ pub const Executor = struct {
         alloc: Allocator,
         prepared: sql.PreparedQuery,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !?*PGresult {
         if (execution_deadline_ns == null and cancellation == null)
             return try self.execPrepared(conn, alloc, prepared);
@@ -2085,9 +2086,9 @@ pub const Executor = struct {
         prepared: sql.PreparedQuery,
         deadline_ns: ?u64,
         allow_command_ok: bool,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !?*PGresult {
-        if (cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         if (deadline_ns) |deadline| try ensureDeadline(deadline);
         var owned_args = try OwnedArgs.init(alloc, prepared.args);
         defer owned_args.deinit(alloc);
@@ -2114,7 +2115,7 @@ pub const Executor = struct {
         conn: ?*PGconn,
         deadline_ns: ?u64,
         allow_command_ok: bool,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !?*PGresult {
         const result = try readSingleAsyncResultWithDeadline(
             AsyncResultDriver{ .executor = self, .conn = conn },
@@ -2211,7 +2212,7 @@ pub const Executor = struct {
         alloc: Allocator,
         result: ?*PGresult,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !foreign_source.QueryResult {
         try ensureNotCancelled(cancellation);
         const rows_len: usize = @intCast(self.pqntuples(result));
@@ -2908,9 +2909,9 @@ pub const Executor = struct {
 /// PQgetResult while libpq still needs socket input. In particular, flushing
 /// must service readable notices/errors as well as writable output, and every
 /// result (including the final null result) gets its own PQisBusy gate.
-fn readSingleAsyncResultWithDeadline(driver: anytype, deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) !?*PGresult {
+fn readSingleAsyncResultWithDeadline(driver: anytype, deadline_ns: ?u64, cancellation: ?CancellationToken) !?*PGresult {
     while (true) {
-        if (cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         if (deadline_ns) |deadline| try ensureDeadline(deadline);
         const flush_status = driver.flush();
         if (flush_status == 0) break;
@@ -2922,14 +2923,14 @@ fn readSingleAsyncResultWithDeadline(driver: anytype, deadline_ns: ?u64, cancell
             cancellation,
         ) catch |err| switch (err) {
             error.Timeout => {
-                if (cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+                if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
                 if (deadline_ns) |deadline| try ensureDeadline(deadline);
                 continue;
             },
             else => return err,
         };
         if (ready & std.posix.POLL.IN != 0) {
-            if (cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+            if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
             if (driver.consumeInput() != 1) return error.ForeignQueryFailed;
         }
     }
@@ -2939,17 +2940,17 @@ fn readSingleAsyncResultWithDeadline(driver: anytype, deadline_ns: ?u64, cancell
     var saw_extra_result = false;
     while (true) {
         while (driver.isBusy() != 0) {
-            if (cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+            if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
             const ready = driver.wait(std.posix.POLL.IN, deadline_ns, cancellation) catch |err| switch (err) {
                 error.Timeout => {
-                    if (cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+                    if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
                     if (deadline_ns) |deadline| try ensureDeadline(deadline);
                     continue;
                 },
                 else => return err,
             };
             if (ready & std.posix.POLL.IN == 0) continue;
-            if (cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+            if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
             if (driver.consumeInput() != 1) return error.ForeignQueryFailed;
         }
 
@@ -3028,7 +3029,7 @@ const LazyExecutor = struct {
         alloc.destroy(self);
     }
 
-    fn query(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
+    fn query(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) !foreign_source.QueryResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const executor = self.ensureExecutor(execution_deadline_ns) catch |err| {
             var owned = prepared;
@@ -3731,13 +3732,13 @@ fn invalidatesConnection(err: anyerror) bool {
         err == error.ForeignQueryFailed;
 }
 
-fn ensureNotCancelled(cancellation: ?*const std.atomic.Value(bool)) !void {
-    if (cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+fn ensureNotCancelled(cancellation: ?CancellationToken) !void {
+    if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
 }
 
 fn checkResultDecodeProgress(
     execution_deadline_ns: ?u64,
-    cancellation: ?*const std.atomic.Value(bool),
+    cancellation: ?CancellationToken,
     cells_until_check: *u8,
 ) !void {
     cells_until_check.* -|= 1;
@@ -3749,7 +3750,7 @@ fn checkResultDecodeProgress(
 
 fn boundedCancellationWaitDeadline(
     execution_deadline_ns: ?u64,
-    cancellation: ?*const std.atomic.Value(bool),
+    cancellation: ?CancellationToken,
 ) ?u64 {
     if (cancellation == null) return execution_deadline_ns;
     return @min(
@@ -3762,7 +3763,7 @@ fn waitForAvailabilityChange(
     availability: *PoolAvailability,
     observed: u64,
     execution_deadline_ns: ?u64,
-    cancellation: ?*const std.atomic.Value(bool),
+    cancellation: ?CancellationToken,
 ) !void {
     while (true) {
         try ensureNotCancelled(cancellation);
@@ -3798,7 +3799,7 @@ fn lockUntil(mutex: *Mutex, deadline_ns: ?u64) !void {
 fn lockUntilCancellable(
     mutex: *Mutex,
     deadline_ns: ?u64,
-    cancellation: ?*const std.atomic.Value(bool),
+    cancellation: ?CancellationToken,
 ) !void {
     while (!mutex.tryLock()) {
         try ensureNotCancelled(cancellation);
@@ -3847,7 +3848,7 @@ test "postgres libpq async reader services input while flushing and between resu
             return if (self.flush_calls == 0) 1 else 0;
         }
 
-        fn wait(self: *@This(), events: i16, _: ?u64, _: ?*const std.atomic.Value(bool)) !i16 {
+        fn wait(self: *@This(), events: i16, _: ?u64, _: ?CancellationToken) !i16 {
             self.wait_events[self.wait_calls] = events;
             self.wait_calls += 1;
             return std.posix.POLL.IN;
@@ -3910,7 +3911,7 @@ test "postgres libpq async reader rejects and clears additional results" {
             return 0;
         }
 
-        fn wait(_: *@This(), _: i16, _: ?u64, _: ?*const std.atomic.Value(bool)) !i16 {
+        fn wait(_: *@This(), _: i16, _: ?u64, _: ?CancellationToken) !i16 {
             unreachable;
         }
 
@@ -3970,7 +3971,7 @@ test "postgres libpq async reader observes cancellation after bounded wait befor
             self: *@This(),
             _: i16,
             deadline_ns: ?u64,
-            _: ?*const std.atomic.Value(bool),
+            _: ?CancellationToken,
         ) anyerror!i16 {
             self.wait_calls += 1;
             self.saw_no_deadline = deadline_ns == null;
@@ -4017,7 +4018,7 @@ test "postgres libpq async reader returns cancelled before waiting or consuming 
             unreachable;
         }
 
-        fn wait(_: *@This(), _: i16, _: ?u64, _: ?*const std.atomic.Value(bool)) anyerror!i16 {
+        fn wait(_: *@This(), _: i16, _: ?u64, _: ?CancellationToken) anyerror!i16 {
             unreachable;
         }
 

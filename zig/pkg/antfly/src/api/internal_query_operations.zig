@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -136,7 +137,7 @@ pub const QueryPlanningContext = struct {
     query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
     query_embedding_security_scope: []const u8 = "internal",
     query_embedding_deadline_ns: ?u64 = null,
-    query_cancellation: ?*const std.atomic.Value(bool) = null,
+    query_cancellation: ?CancellationToken = null,
 
     fn adminSnapshot(self: QueryPlanningContext) !metadata_api.AdminSnapshot {
         return try self.admin_snapshot(self.ptr);

@@ -1,14 +1,16 @@
 //! Transport-owned HTTP/1 request cancellation observation.
 //!
 //! HTTP/2 has stream-local reset state. HTTP/1 has only a connection, so one
-//! bounded listener-owned thread multiplexes peer-lifetime observation for
-//! every active H1 request. It never consumes bytes from the parser's socket.
+//! bounded listener-owned thread multiplexes hard transport-failure
+//! observation for every active H1 request. It never consumes bytes from the
+//! parser's socket. In particular, an orderly FIN is not cancellation: TCP is
+//! full-duplex and a client may half-close its request direction while still
+//! waiting for the response (RFC 9112 section 9.6).
 
 const builtin = @import("builtin");
 const std = @import("std");
 
 const observation_interval_ms: u64 = 25;
-const linux_poll_rdhup: i16 = 0x2000;
 
 fn sleepMs(ms: u64) void {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
@@ -28,11 +30,11 @@ pub const Observer = struct {
         id: u64,
         fd: std.posix.fd_t,
         cancellation: *std.atomic.Value(bool),
-        /// A FIN after pipelined input is not abandonment of the request
-        /// currently executing. Once input is known to be buffered, passive
-        /// connection observation is suppressed until this request completes.
-        observe_orderly_eof: bool,
-        unread_input: bool = false,
+        /// Once normal input or an orderly half-close is observed, passive
+        /// probing cannot establish response abandonment. Stop watching this
+        /// request and leave cancellation to deadlines, explicit application
+        /// cancellation, response-write failure, or connection shutdown.
+        watched: bool = true,
     };
 
     pub const Registration = struct {
@@ -58,6 +60,7 @@ pub const Observer = struct {
     active: std.atomic.Value(usize) = .init(0),
     cancellations_total: std.atomic.Value(u64) = .init(0),
     failures_total: std.atomic.Value(u64) = .init(0),
+    healthy: std.atomic.Value(bool) = .init(true),
 
     pub fn init(alloc: std.mem.Allocator, capacity: usize, thread_stack_size: usize) Observer {
         return .{
@@ -81,6 +84,7 @@ pub const Observer = struct {
             self.kernel_fd = null;
         };
         self.stopping.store(false, .release);
+        self.healthy.store(true, .release);
         self.thread = try std.Thread.spawn(.{ .stack_size = self.thread_stack_size }, run, .{self});
     }
 
@@ -106,13 +110,12 @@ pub const Observer = struct {
         self: *Observer,
         fd: std.posix.fd_t,
         cancellation: *std.atomic.Value(bool),
-        observe_orderly_eof: bool,
     ) !Registration {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return .{};
-        if (self.thread == null or self.stopping.load(.acquire)) return error.ObserverUnavailable;
+        if (self.thread == null or self.stopping.load(.acquire) or !self.healthy.load(.acquire)) return error.ObserverUnavailable;
         self.lock();
         defer self.mutex.unlock();
-        if (self.stopping.load(.acquire)) return error.ObserverUnavailable;
+        if (self.stopping.load(.acquire) or !self.healthy.load(.acquire)) return error.ObserverUnavailable;
         if (self.entries.items.len >= self.capacity) return error.ObserverCapacityExceeded;
         const id = self.nextId();
         if (comptime builtin.os.tag == .macos) try self.updateKqueue(fd, id, true);
@@ -120,7 +123,6 @@ pub const Observer = struct {
             .id = id,
             .fd = fd,
             .cancellation = cancellation,
-            .observe_orderly_eof = observe_orderly_eof,
         });
         _ = self.active.fetchAdd(1, .release);
         return .{ .observer = self, .id = id };
@@ -136,6 +138,10 @@ pub const Observer = struct {
 
     pub fn failures(self: *const Observer) u64 {
         return self.failures_total.load(.acquire);
+    }
+
+    pub fn isHealthy(self: *const Observer) bool {
+        return self.healthy.load(.acquire);
     }
 
     fn lock(self: *Observer) void {
@@ -180,13 +186,8 @@ pub const Observer = struct {
             fds.clearRetainingCapacity();
             ids.clearRetainingCapacity();
             for (self.entries.items) |entry| {
-                // POLLHUP is reported even when it is not requested and would
-                // make poll return continuously. Omit ambiguous pipelined
-                // registrations entirely instead of creating a hot loop.
-                if (!entry.observe_orderly_eof or entry.unread_input) continue;
-                var events: i16 = std.posix.POLL.IN;
-                if (comptime builtin.os.tag == .linux) events |= linux_poll_rdhup;
-                fds.appendAssumeCapacity(.{ .fd = entry.fd, .events = events, .revents = 0 });
+                if (!entry.watched) continue;
+                fds.appendAssumeCapacity(.{ .fd = entry.fd, .events = std.posix.POLL.IN, .revents = 0 });
                 ids.appendAssumeCapacity(entry.id);
             }
             self.mutex.unlock();
@@ -194,18 +195,12 @@ pub const Observer = struct {
                 sleepMs(observation_interval_ms);
                 continue;
             }
-            const ready = std.posix.poll(fds.items, observation_interval_ms) catch {
-                self.lock();
-                self.failAllLocked();
-                self.mutex.unlock();
-                continue;
-            };
+            const ready = std.posix.poll(fds.items, observation_interval_ms) catch return self.stopAfterFailure();
             if (ready == 0) continue;
             self.lock();
             for (fds.items, ids.items) |poll_fd, id| {
                 if (poll_fd.revents == 0) continue;
                 const index = self.indexOfLocked(id) orelse continue;
-                const entry = self.entries.items[index];
                 if (poll_fd.revents & std.posix.POLL.NVAL != 0) {
                     self.cancelLocked(index, false);
                     continue;
@@ -214,23 +209,8 @@ pub const Observer = struct {
                     self.cancelLocked(index, true);
                     continue;
                 }
-                const orderly = if (comptime builtin.os.tag == .linux)
-                    poll_fd.revents & linux_poll_rdhup != 0
-                else
-                    poll_fd.revents & std.posix.POLL.HUP != 0;
-                if (orderly and entry.observe_orderly_eof) {
-                    // A peer may pipeline another request and FIN in the same
-                    // packet. Peek before interpreting EOF so unread protocol
-                    // input wins over the ambiguous connection-level signal.
-                    if (poll_fd.revents & std.posix.POLL.IN != 0)
-                        self.peekLocked(index);
-                    const current_index = self.indexOfLocked(id) orelse continue;
-                    if (!self.entries.items[current_index].unread_input)
-                        self.cancelLocked(current_index, true);
-                    continue;
-                }
-                if (entry.observe_orderly_eof and poll_fd.revents & std.posix.POLL.IN != 0)
-                    self.peekLocked(index);
+                if (poll_fd.revents & (std.posix.POLL.IN | std.posix.POLL.HUP) != 0)
+                    self.probeLocked(index);
             }
             self.mutex.unlock();
         }
@@ -249,24 +229,15 @@ pub const Observer = struct {
             }
             const ready_raw = std.posix.system.kevent(kq, events.items.ptr, 0, events.items.ptr, @intCast(events.items.len), &timeout);
             if (std.posix.errno(ready_raw) != .SUCCESS) {
-                self.lock();
-                self.failAllLocked();
-                self.mutex.unlock();
-                continue;
+                return self.stopAfterFailure();
             }
             self.lock();
             for (events.items[0..@intCast(ready_raw)]) |event| {
                 const index = self.indexOfLocked(@intCast(event.udata)) orelse continue;
-                const entry = self.entries.items[index];
                 if (event.flags & std.c.EV.ERROR != 0) {
                     self.cancelLocked(index, false);
-                } else if (event.flags & std.c.EV.EOF != 0 and entry.observe_orderly_eof) {
-                    self.peekLocked(index);
-                    const current_index = self.indexOfLocked(@intCast(event.udata)) orelse continue;
-                    if (!self.entries.items[current_index].unread_input)
-                        self.cancelLocked(current_index, true);
-                } else if (entry.observe_orderly_eof) {
-                    self.peekLocked(index);
+                } else {
+                    self.probeLocked(index);
                 }
             }
             self.mutex.unlock();
@@ -289,13 +260,13 @@ pub const Observer = struct {
         if (std.posix.errno(rc) != .SUCCESS) return error.ObserverUnavailable;
     }
 
-    fn peekLocked(self: *Observer, index: usize) void {
+    fn probeLocked(self: *Observer, index: usize) void {
         const entry = &self.entries.items[index];
         var byte: [1]u8 = undefined;
         const n = std.c.recv(entry.fd, &byte, byte.len, @intCast(std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT));
-        if (n == 0) return self.cancelLocked(index, true);
+        if (n == 0) return self.stopWatchingLocked(index);
         if (n > 0) {
-            entry.unread_input = true;
+            self.stopWatchingLocked(index);
             return;
         }
         switch (std.posix.errno(n)) {
@@ -303,6 +274,13 @@ pub const Observer = struct {
             .CONNRESET => self.cancelLocked(index, true),
             else => self.cancelLocked(index, false),
         }
+    }
+
+    fn stopWatchingLocked(self: *Observer, index: usize) void {
+        const entry = &self.entries.items[index];
+        if (!entry.watched) return;
+        if (comptime builtin.os.tag == .macos) self.updateKqueue(entry.fd, entry.id, false) catch {};
+        entry.watched = false;
     }
 
     fn indexOfLocked(self: *Observer, id: u64) ?usize {
@@ -322,7 +300,7 @@ pub const Observer = struct {
 
     fn removeLocked(self: *Observer, index: usize) void {
         const entry = self.entries.items[index];
-        if (comptime builtin.os.tag == .macos) self.updateKqueue(entry.fd, entry.id, false) catch {};
+        if (comptime builtin.os.tag == .macos) if (entry.watched) self.updateKqueue(entry.fd, entry.id, false) catch {};
         _ = self.entries.swapRemove(index);
         _ = self.active.fetchSub(1, .release);
     }
@@ -333,6 +311,7 @@ pub const Observer = struct {
 
     fn stopAfterFailure(self: *Observer) void {
         self.lock();
+        self.healthy.store(false, .release);
         self.failAllLocked();
         self.stopping.store(true, .release);
         self.mutex.unlock();

@@ -21,6 +21,7 @@ const build_options = @import("build_options");
 const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const search_pattern_filter = @import("../search/pattern_filter.zig");
 const backups_api = @import("backups.zig");
 const restore_jobs = @import("restore_jobs.zig");
@@ -601,9 +602,17 @@ pub const RestoreExecutionGuard = struct {
     is_current: *const fn (ptr: *anyopaque, leadership_term: u64) bool,
 };
 
+/// Process-local admission shared by every protocol adapter that invokes the
+/// public application operations below.
+pub const RequestAdmission = @import("../common/request_admission.zig").RequestAdmission;
+
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     experimental: bool = false,
+    /// Node-local public database-query admission capacity. Zero is unlimited.
+    query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
+    /// Node-local foreground data-mutation admission capacity. Zero is unlimited.
+    write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     ard_base_url: ?[]const u8 = null,
     ard_publisher_domain: []const u8 = "antfly.local",
     ard_display_name: []const u8 = "Antfly",
@@ -695,7 +704,7 @@ pub const SemanticStatusResolver = struct {
     query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
     query_embedding_security_scope: []const u8 = "internal",
     query_embedding_deadline_ns: ?u64 = null,
-    query_cancellation: ?*const std.atomic.Value(bool) = null,
+    query_cancellation: ?CancellationToken = null,
 
     pub fn iface(self: *SemanticStatusResolver) query_contract.SemanticResolver {
         return .{
@@ -1696,6 +1705,8 @@ pub const ApiHttpServer = struct {
     alloc: std.mem.Allocator,
     owner_alloc: std.mem.Allocator,
     cfg: ApiHttpServerConfig,
+    query_admission: RequestAdmission,
+    write_admission: RequestAdmission,
     source: StatusSource,
     metadata_mutation_retry_policy: MetadataMutationRetryPolicy = .{},
     table_reads: ?table_reads.TableReadSource = null,
@@ -1857,6 +1868,8 @@ pub const ApiHttpServer = struct {
             .alloc = request_alloc,
             .owner_alloc = owner_alloc,
             .cfg = cfg,
+            .query_admission = RequestAdmission.init(cfg.query_max_concurrent_requests),
+            .write_admission = RequestAdmission.init(cfg.write_max_concurrent_requests),
             .source = source,
             .table_reads = table_read_source,
             .table_writes = table_write_source,
@@ -1950,6 +1963,38 @@ pub const ApiHttpServer = struct {
             .query_embedding_cache = self.query_embedding_cache.stats(self.inferenceCacheBudget()),
             .inference_cache_budget = self.inferenceCacheBudget().stats(),
         };
+    }
+
+    pub fn queryAdmissionStats(self: *const ApiHttpServer) RequestAdmission.Stats {
+        return self.query_admission.stats();
+    }
+
+    pub fn tryAcquireQuery(self: *ApiHttpServer) bool {
+        return self.query_admission.tryAcquire();
+    }
+
+    pub fn releaseQuery(self: *ApiHttpServer) void {
+        self.query_admission.release();
+    }
+
+    pub fn queryOverloadedResponse(self: *ApiHttpServer) !contextual_operations.OwnedResponse {
+        return try contextualRetryableTextResponse(self.alloc, 429, "query capacity exhausted");
+    }
+
+    pub fn writeAdmissionStats(self: *const ApiHttpServer) RequestAdmission.Stats {
+        return self.write_admission.stats();
+    }
+
+    pub fn tryAcquireWrite(self: *ApiHttpServer) bool {
+        return self.write_admission.tryAcquire();
+    }
+
+    pub fn releaseWrite(self: *ApiHttpServer) void {
+        self.write_admission.release();
+    }
+
+    pub fn writeOverloadedResponse(self: *ApiHttpServer) !contextual_operations.OwnedResponse {
+        return try contextualRetryableTextResponse(self.alloc, 429, "write capacity exhausted");
     }
 
     pub fn setHAInternalExecutor(self: *ApiHttpServer, executor_value: ?ha_http_operation.Executor) void {
@@ -2391,12 +2436,12 @@ pub const ApiHttpServer = struct {
         _ = try self.source.removeJoinShuffleLease(job_id);
     }
 
-    fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) anyerror!query_api.QueryResponse {
+    fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror!query_api.QueryResponse {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null, execution_deadline_ns, .{ .domain = .internal, .value = "" }, cancellation);
     }
 
-    fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) anyerror![]u8 {
+    fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         return try self.executePublicTableQueryDispatchWithIdentity(
             alloc,
@@ -2410,9 +2455,9 @@ pub const ApiHttpServer = struct {
         );
     }
 
-    fn joinCtxBuildOwnedSearchRequest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) anyerror!query_api.OwnedQueryRequest {
+    fn joinCtxBuildOwnedSearchRequest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror!query_api.OwnedQueryRequest {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        if (cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         return try self.buildOwnedSearchRequestFromQueryValue(
             alloc,
             table_name,
@@ -4245,6 +4290,11 @@ pub const ApiHttpServer = struct {
             try queue.status(alloc, task_id, context_id, "failed", "not found");
             return;
         };
+        if (!self.tryAcquireQuery()) {
+            try queue.status(alloc, task_id, context_id, "failed", "query capacity exhausted");
+            return;
+        }
+        defer self.releaseQuery();
 
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
@@ -7135,7 +7185,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) ![]u8 {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
@@ -7186,7 +7236,7 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         request_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) ![]u8 {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
@@ -7412,7 +7462,7 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         request_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) anyerror!?[]u8 {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
@@ -7466,7 +7516,7 @@ pub const ApiHttpServer = struct {
         request: anytype,
         foreign_source: foreign_mod.PostgresConfig,
         request_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) ![]u8 {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
@@ -7594,7 +7644,7 @@ pub const ApiHttpServer = struct {
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
         request_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) anyerror![]u8 {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
@@ -7716,7 +7766,7 @@ pub const ApiHttpServer = struct {
         foreign_source: foreign_mod.PostgresConfig,
         rows: []const std.json.Value,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) ![]db_mod.types.SearchHit {
         if (rows.len == 0) return &.{};
 
@@ -7765,7 +7815,7 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         request_deadline_ns: ?u64,
         query_embedding_security_scope: QueryEmbeddingSecurityScope,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !query_api.QueryResponse {
         try ensureRequestActive(cancellation);
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
@@ -7921,7 +7971,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         query_value: std.json.Value,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !query_api.OwnedQueryRequest {
         try ensureRequestActive(cancellation);
         const query_body = try stringifyJsonValueAlloc(alloc, query_value);
@@ -9283,6 +9333,8 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
     ) ![]u8 {
+        if (!self.tryAcquireWrite()) return error.RequestAdmissionExhausted;
+        defer self.releaseWrite();
         var response = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi());
         defer response.deinit(self.alloc);
         if (response.status < 200 or response.status >= 300) return error.ExtensionHostApiFailed;
@@ -9296,6 +9348,8 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) ![]u8 {
+        if (!self.tryAcquireQuery()) return error.RequestAdmissionExhausted;
+        defer self.releaseQuery();
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
         const source = self.table_reads orelse return error.TableNotFound;
@@ -9386,6 +9440,8 @@ pub const ApiHttpServer = struct {
                 return try cloneContextualResponse(self.alloc, response);
             },
             .batch => |request| {
+                if (!self.tryAcquireWrite()) return try self.writeOverloadedResponse();
+                defer self.releaseWrite();
                 var response = try public_table_http.handleTableBatch(self.alloc, request.table_name, request.body, self.tableApi());
                 defer response.deinit(self.alloc);
                 return try contextualResponseFromPublicTable(self.alloc, response);
@@ -9564,6 +9620,28 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
+        if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
+        defer self.releaseQuery();
+        return try self.handleAdmittedPublicTableQueryWithContentTypeCancellation(
+            table_name,
+            body,
+            content_type,
+            authenticated_identity,
+            cancellation,
+        );
+    }
+
+    /// Execute while the caller holds this server's query permit. Transport
+    /// adapters use this to retain protocol-specific overload responses
+    /// without double-counting application admission.
+    pub fn handleAdmittedPublicTableQueryWithContentTypeCancellation(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        content_type: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !contextual_operations.OwnedResponse {
         if (isNdjsonContentType(content_type)) {
             return try self.handlePublicTableMultiQueryWithCancellation(table_name, body, authenticated_identity, cancellation);
         }
@@ -9578,6 +9656,17 @@ pub const ApiHttpServer = struct {
     /// Keep the cancellation-aware variant public so alternate listeners do
     /// not silently lose the public query cancellation contract.
     pub fn handlePublicGlobalMultiQueryWithCancellation(
+        self: *ApiHttpServer,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !contextual_operations.OwnedResponse {
+        if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
+        defer self.releaseQuery();
+        return try self.handleAdmittedPublicGlobalMultiQueryWithCancellation(body, authenticated_identity, cancellation);
+    }
+
+    pub fn handleAdmittedPublicGlobalMultiQueryWithCancellation(
         self: *ApiHttpServer,
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
@@ -9645,7 +9734,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !contextual_operations.OwnedResponse {
-        return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, null);
+        return try self.handlePublicTableQueryWithContentTypeCancellation(table_name, body, null, authenticated_identity, null);
     }
 
     fn handlePublicTableQueryWithCancellation(
@@ -9667,7 +9756,7 @@ pub const ApiHttpServer = struct {
             body,
             row_filter_json,
             authenticated_identity,
-            if (cancellation) |value| value.signal() else null,
+            if (cancellation) |value| value.token() else null,
         ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, body, err);
         return contextual_operations.json(response_body, false);
     }
@@ -9734,7 +9823,7 @@ pub const ApiHttpServer = struct {
                 line,
                 row_filter_json,
                 authenticated_identity,
-                if (cancellation) |value| value.signal() else null,
+                if (cancellation) |value| value.token() else null,
             ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
             defer self.alloc.free(response_body);
 
@@ -11317,13 +11406,13 @@ fn ensureRequestDeadline(deadline_ns: ?u64) !void {
     if (retryDeadlineExpired(deadline_ns, platform_time.monotonicNs())) return error.Timeout;
 }
 
-fn ensureRequestActive(cancellation: ?*const std.atomic.Value(bool)) !void {
+fn ensureRequestActive(cancellation: ?CancellationToken) !void {
     if (cancellation) |value| {
-        if (value.load(.acquire)) return error.Cancelled;
+        if (value.isCancelled()) return error.Cancelled;
     }
 }
 
-fn sleepNsCancellable(duration_ns: u64, cancellation: ?*const std.atomic.Value(bool)) !void {
+fn sleepNsCancellable(duration_ns: u64, cancellation: ?CancellationToken) !void {
     // Retry sleeps are deliberately broken into short slices so a vanished
     // peer does not occupy an expensive query slot for the full backoff.
     var remaining = duration_ns;
@@ -25323,6 +25412,51 @@ test "api http server preserves public query availability errors" {
         try std.testing.expectEqualStrings(case.body, multi_resp.body);
         try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", multi_resp.content_type);
     }
+}
+
+test "shared application admission covers MCP query and write operations" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var server = ApiHttpServer.init(
+        alloc,
+        .{ .query_max_concurrent_requests = 1, .write_max_concurrent_requests = 1 },
+        FakeSource.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+    try std.testing.expect(server.tryAcquireQuery());
+    defer server.releaseQuery();
+    try std.testing.expect(server.tryAcquireWrite());
+    defer server.releaseWrite();
+
+    var query = try server.executeMcpApplicationOperation(.{ .query = .{
+        .table_name = "docs",
+        .body = "{\"limit\":1}",
+    } }, null);
+    defer query.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), query.status);
+    try std.testing.expectEqualStrings("query capacity exhausted", query.body);
+    try std.testing.expectEqualStrings("1", query.headers[0].value);
+
+    var write = try server.executeMcpApplicationOperation(.{ .batch = .{
+        .table_name = "docs",
+        .body = "{\"inserts\":{}}",
+    } }, null);
+    defer write.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), write.status);
+    try std.testing.expectEqualStrings("write capacity exhausted", write.body);
+    try std.testing.expectEqual(@as(u64, 1), server.queryAdmissionStats().rejected_total);
+    try std.testing.expectEqual(@as(u64, 1), server.writeAdmissionStats().rejected_total);
 }
 
 test "api http server maps cancelled NDJSON multi-query to client closed response" {

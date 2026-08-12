@@ -19,6 +19,7 @@ const serverless_http_server = @import("../serverless_http_server.zig");
 const raft_transport = @import("../raft/transport/mod.zig");
 const test_backend = @import("test_backend.zig");
 const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
+const health_server = @import("../common/health_server.zig");
 
 pub const ServerlessServerConfig = struct {
     bootstrap: runtime_mod.BootstrapConfig,
@@ -37,6 +38,7 @@ pub const ServerlessServer = struct {
     alloc: std.mem.Allocator,
     stack: *runtime_mod.OwnedStack,
     owned_http_server: *serverless_http_server.ServerlessHttpServer,
+    owned_http_runtime: *httpx.HttpRuntime,
     owned_listener: ?*httpx.Server = null,
     listener_task: ?httpx.ListenerTask = null,
 
@@ -49,6 +51,14 @@ pub const ServerlessServer = struct {
         const http_server = try alloc.create(serverless_http_server.ServerlessHttpServer);
         errdefer alloc.destroy(http_server);
         http_server.* = serverless_http_server.ServerlessHttpServer.init(alloc, cfg.http, &stack.handler);
+
+        const http_runtime = try alloc.create(httpx.HttpRuntime);
+        errdefer alloc.destroy(http_runtime);
+        const public_capacity: usize = if (cfg.listener) |listener_cfg| listener_cfg.max_connections else 0;
+        http_runtime.* = httpx.HttpRuntime.init(alloc, .{
+            .max_active_h1_requests = public_capacity,
+        });
+        errdefer http_runtime.deinit();
 
         var owned_listener: ?*httpx.Server = null;
         errdefer if (owned_listener) |listener| {
@@ -64,6 +74,7 @@ pub const ServerlessServer = struct {
                 .max_body_size = listener_cfg.max_request_bytes,
                 .request_body_buffer_budget_bytes = listener_cfg.max_request_bytes,
                 .max_connections = listener_cfg.max_connections,
+                .http_runtime = http_runtime,
             });
             listener.global(httpx.Handler.bind(http_server, serverless_http_server.ServerlessHttpServer.handleHttpx));
             owned_listener = listener;
@@ -73,6 +84,7 @@ pub const ServerlessServer = struct {
             .alloc = alloc,
             .stack = stack,
             .owned_http_server = http_server,
+            .owned_http_runtime = http_runtime,
             .owned_listener = owned_listener,
             .listener_task = if (owned_listener) |listener| httpx.ListenerTask.init(listener) else null,
         };
@@ -89,6 +101,8 @@ pub const ServerlessServer = struct {
             self.alloc.destroy(listener);
         }
         self.alloc.destroy(self.owned_http_server);
+        self.owned_http_runtime.deinit();
+        self.alloc.destroy(self.owned_http_runtime);
         self.stack.deinit();
         self.alloc.destroy(self.stack);
         self.* = undefined;
@@ -142,6 +156,10 @@ pub const ServerlessServer = struct {
 
     pub fn listenerFailure(self: *const ServerlessServer) ?anyerror {
         return if (self.listener_task) |*task| task.runtimeFailure() else null;
+    }
+
+    pub fn httpRuntime(self: *ServerlessServer) *httpx.HttpRuntime {
+        return self.owned_http_runtime;
     }
 };
 

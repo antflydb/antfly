@@ -939,6 +939,8 @@ pub fn runFromIterator(
             .remote_content = remote_content,
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
             .extension_package_store_dir = resolved.extension_package_store_dir,
+            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
     });
@@ -979,13 +981,15 @@ pub fn runFromIterator(
     const metadata_backend_runtime = try server.server.svc.ensureBackendRuntime();
     var control_lane_lease = try metadata_backend_runtime.acquireControlLane();
     defer control_lane_lease.release();
-    const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
+    const health_server = try antfly.common.health_server.HealthServer.startIfConfiguredOnHostWithRuntime(
         alloc,
         control_lane_lease.io(),
         "metadata",
+        null,
         health_port,
         metadata_health.readiness(),
         metadata_health.metricsWriter(),
+        server.server.httpRuntime(),
     );
     defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
 

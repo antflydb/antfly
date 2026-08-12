@@ -733,6 +733,10 @@ const DataPublicHttpRuntime = struct {
         active_requests: usize,
         peak_active_requests: usize,
         rejected_requests_total: u64,
+        max_active_writes: usize,
+        active_writes: usize,
+        peak_active_writes: usize,
+        rejected_writes_total: u64,
         accept_errors_total: u64,
         cancellation_watcher_start_failures_total: u64,
         peer_observer_failures_total: u64,
@@ -802,6 +806,7 @@ const DataPublicHttpRuntime = struct {
 
     fn runtimeStats(self: *const DataPublicHttpRuntime) RuntimeStats {
         const transport = self.server.runtimeStats();
+        const http_runtime = self.server.httpRuntimeStats();
         const application = antfly.public_api.kernel_bridge.handlerStats(&self.handler);
         return .{
             // Preserve the established metric schema during the transport
@@ -814,13 +819,17 @@ const DataPublicHttpRuntime = struct {
             .active_requests = application.query_in_flight,
             .peak_active_requests = application.query_peak_in_flight,
             .rejected_requests_total = application.query_rejected_total,
+            .max_active_writes = application.write_capacity,
+            .active_writes = application.write_in_flight,
+            .peak_active_writes = application.write_peak_in_flight,
+            .rejected_writes_total = application.write_rejected_total,
             .accept_errors_total = transport.accept_errors_total,
-            .cancellation_watcher_start_failures_total = transport.h1_cancellation_registration_failures_total,
-            .peer_observer_failures_total = transport.h1_cancellation_observer_failures_total,
+            .cancellation_watcher_start_failures_total = http_runtime.h1_cancellation_registration_failures_total,
+            .peer_observer_failures_total = http_runtime.h1_cancellation_observer_failures_total,
             .deadline_observer_failures_total = 0,
             .deadline_expirations_total = transport.connection_timeouts_total,
-            .peer_disconnects_total = transport.h1_peer_cancellations_total,
-            .active_peer_observers = transport.active_h1_cancellation_observers,
+            .peer_disconnects_total = http_runtime.h1_hard_disconnect_cancellations_total,
+            .active_peer_observers = http_runtime.active_h1_cancellation_observers,
             .active_deadline_observers = 0,
         };
     }
@@ -830,7 +839,7 @@ const DataPublicHttpRuntime = struct {
     }
 
     fn healthy(self: *const DataPublicHttpRuntime) bool {
-        return self.server.runtimeStats().h1_cancellation_observer_failures_total == 0;
+        return self.server.httpRuntimeStats().healthy;
     }
 };
 
@@ -1264,14 +1273,18 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_query_in_flight", "gauge", "Currently executing expensive public queries", http.active_requests);
             try health_metrics.appendPromMetric(writer, "antfly_query_peak_in_flight", "gauge", "Peak concurrent expensive public queries since process start", http.peak_active_requests);
             try health_metrics.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public queries rejected by admission control", http.rejected_requests_total);
+            try health_metrics.appendPromMetric(writer, "antfly_write_capacity", "gauge", "Maximum concurrent foreground data mutations", http.max_active_writes);
+            try health_metrics.appendPromMetric(writer, "antfly_write_in_flight", "gauge", "Currently executing foreground data mutations", http.active_writes);
+            try health_metrics.appendPromMetric(writer, "antfly_write_peak_in_flight", "gauge", "Peak concurrent foreground data mutations since process start", http.peak_active_writes);
+            try health_metrics.appendPromMetric(writer, "antfly_write_rejected_total", "counter", "Foreground data mutations rejected by admission control", http.rejected_writes_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests cancelled because peer observation could not be scheduled", http.cancellation_watcher_start_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public requests cancelled after transport cancellation observation failed", http.peer_observer_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_deadline_observer_failures_total", "counter", "Public requests closed because deadline observation could not be scheduled", http.deadline_observer_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_deadline_expirations_total", "counter", "Public request sockets closed after header or body deadlines", http.deadline_expirations_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_deadline_observers", "gauge", "Public request sockets currently watched for header or body deadlines", http.active_deadline_observers);
-            try health_metrics.appendPromMetric(writer, "antfly_http_peer_disconnects_total", "counter", "Public request peer disconnects propagated to cancellation", http.peer_disconnects_total);
-            try health_metrics.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "Public request sockets currently watched for disconnect", http.active_peer_observers);
+            try health_metrics.appendPromMetric(writer, "antfly_http_hard_disconnect_cancellations_total", "counter", "Public requests cancelled after a hard transport failure", http.peer_disconnects_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "Public request sockets registered for hard-disconnect observation", http.active_peer_observers);
         }
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_hits_total", "counter", "Query embedding cache hits", api_request_stats.query_embedding_cache.hits);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_misses_total", "counter", "Query embedding cache producer misses", api_request_stats.query_embedding_cache.misses);
@@ -6604,10 +6617,10 @@ pub const DataServer = struct {
         table_name: []const u8,
         req: antfly.db.types.BatchRequest,
         forwarding: antfly.public_api.internal_batch_forwarding.Context,
-        cancellation_signal: ?*const std.atomic.Value(bool),
+        cancellation_token: antfly.public_api.operation.CancellationToken,
     ) !?void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const cancellation = antfly.raft.transport.http_common.RequestCancellation{ .borrowed = cancellation_signal };
+        var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(cancellation_token);
         const leader_wait_ns = dataRaftForwardedLeaderWaitNs(forwarding);
         if (leader_wait_ns == 0) return error.LeaderUnavailable;
         try self.proposeRaftBatchGroupWithLeaderWait(
@@ -6619,7 +6632,7 @@ pub const DataServer = struct {
                 .refresh_metadata = false,
                 .campaign_allowed = forwarding.campaign_allowed,
                 .forwards_remaining = forwarding.forwards_remaining,
-                .cancellation = if (cancellation_signal != null) &cancellation else null,
+                .cancellation = if (cancellation_token.ptr != null) &cancellation else null,
             },
             leader_wait_ns,
         );
@@ -16128,6 +16141,8 @@ pub fn runFromIterator(
         .api_server_cfg = .{
             .auth_enabled = effective_auth_enabled,
             .experimental = cli.experimental,
+            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
             .ard_base_url = cli.ard_base_url,
@@ -16172,13 +16187,15 @@ pub fn runFromIterator(
         null;
     var control_lane_lease = try data_server.backend_runtime.?.acquireControlLane();
     defer control_lane_lease.release();
-    const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
+    const health_server = try antfly.common.health_server.HealthServer.startIfConfiguredOnHostWithRuntime(
         alloc,
         control_lane_lease.io(),
         "data",
+        null,
         health_port,
         data_health.readiness(),
         data_health.metricsWriter(),
+        try data_server.ensureHttpRuntime(),
     );
     defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
 

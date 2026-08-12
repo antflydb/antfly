@@ -30,33 +30,7 @@ pub const ApiError = error{
 /// Borrowed cancellation source. The owner must keep `ptr` alive for the
 /// complete operation call. A callback keeps the kernel independent of the
 /// transport's concrete cancellation representation.
-pub const CancellationToken = struct {
-    ptr: ?*const anyopaque = null,
-    is_cancelled_fn: ?*const fn (*const anyopaque) bool = null,
-
-    pub const none: CancellationToken = .{};
-
-    pub fn fromAtomic(signal: *const std.atomic.Value(bool)) CancellationToken {
-        return .{
-            .ptr = signal,
-            .is_cancelled_fn = struct {
-                fn call(ptr: *const anyopaque) bool {
-                    const value: *const std.atomic.Value(bool) = @ptrCast(@alignCast(ptr));
-                    return value.load(.acquire);
-                }
-            }.call,
-        };
-    }
-
-    pub fn isCancelled(self: CancellationToken) bool {
-        const ptr = self.ptr orelse return false;
-        return self.is_cancelled_fn.?(ptr);
-    }
-
-    pub fn check(self: CancellationToken) ApiError!void {
-        if (self.isCancelled()) return error.Canceled;
-    }
-};
+pub const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 
 /// Authenticated identity projected into an operation. Permissions stay in
 /// the authorization policy layer; operations receive only the identity they
@@ -99,7 +73,7 @@ pub const RequestContext = struct {
     admission: ?*AdmissionReservation = null,
 
     pub fn ensureActive(self: RequestContext) ApiError!void {
-        try self.cancellation.check();
+        if (self.cancellation.isCancelled()) return error.Canceled;
         if (self.deadline_ns) |deadline| {
             if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         }

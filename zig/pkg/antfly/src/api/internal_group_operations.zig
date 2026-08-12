@@ -6,6 +6,7 @@
 //! Transport-neutral operations for internal group coordination.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const batch_api = @import("batch.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const distributed_graph = @import("distributed_graph.zig");
@@ -52,10 +53,10 @@ pub const RoutedRaftBatchWriter = struct {
         []const u8,
         db_mod.types.BatchRequest,
         internal_batch_forwarding.Context,
-        ?*const std.atomic.Value(bool),
+        CancellationToken,
     ) anyerror!?void,
 
-    fn write(self: @This(), alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, cancellation: ?*const std.atomic.Value(bool)) !?void {
+    fn write(self: @This(), alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, cancellation: CancellationToken) !?void {
         return self.write_fn(self.ptr, alloc, group_id, table_name, input, forwarding, cancellation);
     }
 };
@@ -235,7 +236,6 @@ pub const Operations = struct {
         table_name: []const u8,
         input: db_mod.types.BatchRequest,
         forwarding: internal_batch_forwarding.Context,
-        cancellation_signal: ?*const std.atomic.Value(bool),
     ) Error!batch_api.BatchResult {
         try request.ensureActive();
         const validator = self.batch_validator orelse return error.Unavailable;
@@ -244,7 +244,7 @@ pub const Operations = struct {
             else => return error.Internal,
         };
         const writer = self.routed_raft_batch_writer orelse return error.Unavailable;
-        _ = (writer.write(alloc, group_id, table_name, input, forwarding, cancellation_signal) catch |err| switch (err) {
+        _ = (writer.write(alloc, group_id, table_name, input, forwarding, request.cancellation) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,

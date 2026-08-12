@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
@@ -62,10 +63,10 @@ pub const ProviderKind = enum {
 pub const EmbeddingRequestContext = struct {
     io: std.Io,
     deadline_ns: ?u64,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 
     pub fn check(self: EmbeddingRequestContext) !void {
-        if (self.cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+        if (self.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         const deadline = self.deadline_ns orelse return;
         if (monotonicNowNs() >= deadline) return error.Timeout;
     }
@@ -173,7 +174,7 @@ pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
     io: ?std.Io = null,
     deadline_ns: ?u64 = null,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
@@ -389,7 +390,7 @@ pub const ManagedEmbeddingEntry = struct {
     alloc: std.mem.Allocator,
     io: ?std.Io = null,
     deadline_ns: ?u64 = null,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
     index_name: []u8,
     embedding_name: []u8 = "",
     provider: ProviderKind,
@@ -912,7 +913,7 @@ fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry) EmbeddingRequest
 }
 
 fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
-    if (entry.cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+    if (entry.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
     const deadline = entry.deadline_ns orelse return;
     if (monotonicNowNs() >= deadline) return error.Timeout;
 }
@@ -2416,7 +2417,10 @@ fn embedBatchWithOpenAiCompatible(
     var response = try client.post(url, .{
         .json = json_body,
         .headers = headers_buf[0..header_count],
-        .cancellation = entry.cancellation,
+        .cancellation = if (entry.cancellation) |token|
+            httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+        else
+            null,
     });
     defer response.deinit();
     if (!response.ok()) return mapEmbedStatus(response.status.code);

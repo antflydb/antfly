@@ -340,7 +340,11 @@ pub const MetadataServer = struct {
 
     pub fn adminListenerHealthy(self: *const MetadataServer) bool {
         const listener = self.owned_admin_listener orelse return false;
-        return listener.server.runtimeStats().h1_cancellation_observer_failures_total == 0;
+        return listener.server.httpRuntimeStats().healthy;
+    }
+
+    pub fn httpRuntime(self: *MetadataServer) ?*httpx.HttpRuntime {
+        return self.owned_http_runtime;
     }
 
     fn restoreSupervisorRun(ptr: *anyopaque) !void {

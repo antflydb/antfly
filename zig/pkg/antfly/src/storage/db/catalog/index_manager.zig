@@ -111,7 +111,7 @@ fn checkRepairCancelled(cancel_check: ?types.RepairCancelCheck) !void {
 
 inline fn checkDenseSearchCancelled(req: hbc_mod.SearchRequest) !void {
     if (req.cancellation) |cancellation| {
-        if (cancellation.load(.acquire)) return error.Cancelled;
+        if (cancellation.isCancelled()) return error.Cancelled;
     }
 }
 const repair_shadow_root_prefix = ".repair-shadow-";

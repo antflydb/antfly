@@ -59,6 +59,7 @@ const stream_mod = @import("../protocol/stream.zig");
 const Stream = stream_mod.Stream;
 const SharedBodyBudget = @import("../protocol/body_budget.zig").SharedBodyBudget;
 const HttpRuntime = @import("http_runtime.zig").HttpRuntime;
+const CancellationObserver = @import("cancellation_observer.zig").Observer;
 
 pub const CookieOptions = common.CookieOptions;
 pub const SameSite = common.SameSite;
@@ -74,6 +75,16 @@ pub const SseEvent = struct {
 /// Pre-route hook called after parsing the request and before route matching.
 pub const PreRouteHook = *const fn (*Context) anyerror!void;
 
+pub const H1DisconnectCancellation = enum {
+    /// Every active HTTP/1 request must be registered with HttpRuntime. If the
+    /// observer is unavailable, fail the request closed before dispatch.
+    required,
+    /// Retain shutdown cancellation but do not observe peer disconnects.
+    /// Intended only for bounded control listeners such as health/readiness,
+    /// which must remain able to report an unhealthy shared HttpRuntime.
+    disabled,
+};
+
 /// Server configuration.
 pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
@@ -87,6 +98,7 @@ pub const ServerConfig = struct {
     /// Optional transport runtime shared by multiple listeners. When absent,
     /// the Server owns a private runtime sized to its connection limit.
     http_runtime: ?*HttpRuntime = null,
+    h1_disconnect_cancellation: H1DisconnectCancellation = .required,
     /// Maximum H1 requests allowed to wait for a body after headers have been
     /// parsed. 0 inherits max_connections. This preserves connection capacity
     /// for control/recovery traffic during slow uploads.
@@ -902,10 +914,6 @@ pub const Server = struct {
         body_buffer_in_use_bytes: usize,
         body_buffer_peak_bytes: usize,
         body_buffer_rejected_total: u64,
-        active_h1_cancellation_observers: usize,
-        h1_peer_cancellations_total: u64,
-        h1_cancellation_observer_failures_total: u64,
-        h1_cancellation_registration_failures_total: u64,
     };
 
     allocator: Allocator,
@@ -1124,7 +1132,6 @@ pub const Server = struct {
     /// fields are atomically maintained by the accept/request paths.
     pub fn runtimeStats(self: *const Self) RuntimeStats {
         const body = self.body_budget.stats();
-        const http_runtime_stats = (self.config.http_runtime orelse @constCast(&self.owned_http_runtime)).stats();
         return .{
             .max_connections = self.config.max_connections,
             .active_connections = self.active_connections.load(.acquire),
@@ -1137,11 +1144,14 @@ pub const Server = struct {
             .body_buffer_in_use_bytes = body.in_use,
             .body_buffer_peak_bytes = body.peak_in_use,
             .body_buffer_rejected_total = body.rejected_total,
-            .active_h1_cancellation_observers = http_runtime_stats.active_h1_cancellation_observers,
-            .h1_peer_cancellations_total = http_runtime_stats.h1_peer_cancellations_total,
-            .h1_cancellation_observer_failures_total = http_runtime_stats.h1_cancellation_observer_failures_total,
-            .h1_cancellation_registration_failures_total = http_runtime_stats.h1_cancellation_registration_failures_total,
         };
+    }
+
+    /// Process/runtime-scoped transport statistics. Unlike `runtimeStats`,
+    /// these values are shared by every Server injected with the same
+    /// HttpRuntime and must be exported exactly once by that runtime's owner.
+    pub fn httpRuntimeStats(self: *const Self) HttpRuntime.Stats {
+        return (self.config.http_runtime orelse @constCast(&self.owned_http_runtime)).stats();
     }
 
     /// Releases all server resources.
@@ -1264,7 +1274,11 @@ pub const Server = struct {
         // startup/shutdown race re-bind a listener after its owner has begun
         // tearing down the handler state referenced by this server.
         if (self.shutdown_mode.load(.acquire) != 0) return;
-        var http_runtime_lease = try (self.config.http_runtime orelse &self.owned_http_runtime).acquireListener();
+        const observer_capacity = if (self.config.h1_disconnect_cancellation == .required)
+            self.config.max_connections
+        else
+            0;
+        var http_runtime_lease = try (self.config.http_runtime orelse &self.owned_http_runtime).acquireListener(observer_capacity);
         defer http_runtime_lease.release();
         if (self.listener == null) try self.bind();
         if (self.shutdown_mode.load(.acquire) != 0) return;
@@ -1652,20 +1666,21 @@ pub const Server = struct {
             ctx.max_file_size = self.config.max_file_size;
             ctx.h1_sock = &sock;
             // A non-empty suffix is not necessarily a pipelined request: it
-            // can be a partial or malformed request line. Only suppress a
-            // peer-FIN cancellation when a fresh parser can complete the
-            // following request without changing the live parser or buffer.
+            // can be a partial or malformed request line. Preserve this fact
+            // for handlers without mutating the live parser or buffer.
             ctx.h1_has_buffered_input = hasCompleteBufferedH1Request(self.allocator, buffer[0..leftover], self.config);
             connection.h1_request_cancellation.store(false, .release);
             ctx.cancellation = &connection.h1_request_cancellation;
-            var cancellation_registration = (self.config.http_runtime orelse &self.owned_http_runtime).registerH1Request(
-                sock.handle,
-                &connection.h1_request_cancellation,
-                !ctx.h1_has_buffered_input,
-            ) catch {
-                try self.sendError(&sock, 503);
-                return;
-            };
+            var cancellation_registration: CancellationObserver.Registration = .{};
+            if (self.config.h1_disconnect_cancellation == .required) {
+                cancellation_registration = (self.config.http_runtime orelse &self.owned_http_runtime).registerH1Request(
+                    sock.handle,
+                    &connection.h1_request_cancellation,
+                ) catch {
+                    try self.sendError(&sock, 503);
+                    return;
+                };
+            }
             defer cancellation_registration.deinit();
             defer ctx.deinit();
 
@@ -3659,6 +3674,52 @@ test "multiple listeners share one HTTP runtime lifecycle" {
     try std.testing.expectEqual(@as(usize, 0), http_runtime.stats().active_listener_leases);
 }
 
+test "bounded control listener serves without H1 observer capacity" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var http_runtime = HttpRuntime.init(allocator, .{ .max_active_h1_requests = 0 });
+    defer http_runtime.deinit();
+
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 1,
+        .http_runtime = &http_runtime,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    try server.get("/readyz", struct {
+        fn handle(ctx: *Context) anyerror!Response {
+            return ctx.status(503).text("not ready");
+        }
+    }.handle);
+    try server.bind();
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("control listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll("GET /readyz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    var response: [1024]u8 = undefined;
+    const response_len = try client.recv(&response);
+    try std.testing.expect(mem.indexOf(u8, response[0..response_len], "503") != null);
+    try std.testing.expectEqual(@as(usize, 0), http_runtime.stats().reserved_h1_request_capacity);
+}
+
 test "listener task binds synchronously and joins before executor teardown" {
     const allocator = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(allocator, .{});
@@ -3899,6 +3960,61 @@ test "H1 context preserves buffered pipeline input across client SHUT_WR" {
     try std.testing.expect(mem.indexOf(u8, response[0..response_len], "\r\n\r\nB") != null);
 }
 
+test "H1 orderly half close does not cancel an active response" {
+    if (builtin.os.tag == .windows) return;
+
+    const State = struct {
+        var canceled = std.atomic.Value(bool).init(true);
+
+        fn handler(ctx: *Context) anyerror!Response {
+            try ctx.io.sleep(Io.Duration.fromMilliseconds(100), .awake);
+            canceled.store(ctx.isCancellationRequested(), .release);
+            return ctx.text("complete");
+        }
+    };
+    State.canceled.store(true, .release);
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
+    defer server.deinit();
+    try server.get("/slow", State.handler);
+    try server.bind();
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("half-close listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll("GET /slow HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    try client_io.vtable.netShutdown(client_io.userdata, client.handle, .send);
+
+    var response: [1024]u8 = undefined;
+    var response_len: usize = 0;
+    while (true) {
+        const n = try client.recv(response[response_len..]);
+        if (n == 0) break;
+        response_len += n;
+    }
+    try std.testing.expect(mem.indexOf(u8, response[0..response_len], "complete") != null);
+    try std.testing.expect(!State.canceled.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), server.httpRuntimeStats().h1_hard_disconnect_cancellations_total);
+}
+
 test "H1 context does not treat a partial pipeline suffix as buffered input" {
     if (builtin.os.tag == .windows) return;
 
@@ -3939,9 +4055,9 @@ test "H1 context does not treat a partial pipeline suffix as buffered input" {
     var client = try Socket.connect(address, client_io);
     defer client.close();
     try client.setRecvTimeout(5_000);
-    // The trailing G starts a second request but cannot complete one. A FIN
-    // after it must remain observable as cancellation of A, rather than being
-    // suppressed as though a valid pipelined request were buffered.
+    // The trailing G starts a second request but cannot complete one. The
+    // parser must report that distinction even though an orderly FIN remains
+    // non-cancelling for the response already in progress.
     try client.sendAll("GET /a HTTP/1.1\r\nHost: test\r\n\r\nG");
     try client_io.vtable.netShutdown(client_io.userdata, client.handle, .send);
 

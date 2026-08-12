@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const raft_mod = struct {
     pub const ReadConsistency = @import("../raft/read_gate.zig").ReadConsistency;
 };
@@ -47,7 +48,7 @@ pub const Worker = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     execution_deadline_ns: ?u64 = null,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 
     pub const VTable = struct {
         execute_graph_expand: *const fn (
@@ -145,7 +146,7 @@ pub const Worker = struct {
 
     fn ensureActive(self: Worker) !void {
         if (self.cancellation) |value| {
-            if (value.load(.acquire)) return error.Cancelled;
+            if (value.isCancelled()) return error.Cancelled;
         }
         if (self.execution_deadline_ns) |deadline_ns| {
             if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
@@ -323,7 +324,7 @@ pub const GraphExpandRequest = struct {
     /// JSON contract; remote workers receive the deadline as their transport
     /// timeout and cancellation by connection interruption.
     timeout_ms: ?u32 = null,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 
     pub fn deinit(self: *GraphExpandRequest, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -427,7 +428,7 @@ pub const GraphHydrateRequest = struct {
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext = null,
     timeout_ms: ?u32 = null,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 
     pub fn deinit(self: *GraphHydrateRequest, alloc: std.mem.Allocator) void {
         for (self.keys) |key| alloc.free(key);
@@ -469,7 +470,7 @@ pub const GraphEdgesRequest = struct {
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
     timeout_ms: ?u32 = null,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 
     pub fn deinit(self: *GraphEdgesRequest, alloc: std.mem.Allocator) void {
         alloc.free(self.index_name);

@@ -55,6 +55,7 @@ pub const internal_group_operations = @import("internal_group_operations.zig");
 pub const internal_query_operations = @import("internal_query_operations.zig");
 pub const internal_transition_wire = @import("internal_transition_wire.zig");
 pub const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
+pub const operation = @import("operation.zig");
 pub const http_server = @import("http_server.zig");
 pub const kernel_bridge = @import("kernel_bridge.zig");
 pub const kernel_abi = @import("kernel_abi.zig");
