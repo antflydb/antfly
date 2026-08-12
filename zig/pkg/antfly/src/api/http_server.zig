@@ -3753,15 +3753,25 @@ pub const ApiHttpServer = struct {
             defer query_arena_impl.deinit();
             const options = parseRestoreJobListOptions(query_arena_impl.allocator(), uri_parts.query) catch
                 return try textResponse(self.alloc, 400, "invalid restore job list parameters");
-            return try self.handlePublicListRestoreJobs(authenticated_identity, options);
+            var response = try self.handlePublicListRestoreJobs(authenticated_identity, options);
+            defer response.deinit(self.alloc);
+            return try legacyResponseFromContextualOperation(self.alloc, response);
         }
         if (restoreJobIdFromPath(uri_parts.path)) |job_id| {
             if (authenticated_identity) |identity| {
                 if (!(try self.restoreJobAllowed(self.alloc, identity, job_id))) return try textResponse(self.alloc, 404, "not found");
             }
             return switch (req.method) {
-                .GET => try self.handlePublicRestoreJob(job_id, false),
-                .DELETE => try self.handlePublicRestoreJob(job_id, true),
+                .GET => blk: {
+                    var response = try self.handlePublicRestoreJob(job_id, false);
+                    defer response.deinit(self.alloc);
+                    break :blk try legacyResponseFromContextualOperation(self.alloc, response);
+                },
+                .DELETE => blk: {
+                    var response = try self.handlePublicRestoreJob(job_id, true);
+                    defer response.deinit(self.alloc);
+                    break :blk try legacyResponseFromContextualOperation(self.alloc, response);
+                },
                 else => try textResponse(self.alloc, 405, "method not allowed"),
             };
         }
@@ -5989,11 +5999,13 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .POST) {
             if (std.mem.eql(u8, uri_parts.path, routes.Routes.restore)) {
-                return try self.handlePublicClusterRestore(
+                var response = try self.handlePublicClusterRestore(
                     req.body,
                     req.header("idempotency-key"),
                     if (authenticated_identity) |identity| identity.username else null,
                 );
+                defer response.deinit(self.alloc);
+                return try legacyResponseFromContextualOperation(self.alloc, response);
             }
         }
         if (req.method == .POST) {
@@ -6007,12 +6019,14 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTableRestore(uri_parts.path)) |table_restore| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, table_restore.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicTableRestore(
+                var response = try self.handlePublicTableRestore(
                     table_name,
                     req.body,
                     req.header("idempotency-key"),
                     if (authenticated_identity) |identity| identity.username else null,
                 );
+                defer response.deinit(self.alloc);
+                return try legacyResponseFromContextualOperation(self.alloc, response);
             }
         }
         if (req.method == .POST) {
@@ -11363,7 +11377,7 @@ pub const ApiHttpServer = struct {
                     if (authenticated_identity) |identity| identity.username else null,
                 );
                 defer response.deinit(self.alloc);
-                return try contextualResponseFromLegacy(self.alloc, response);
+                return try cloneContextualResponse(self.alloc, response);
             },
             .batch => |request| {
                 var response = try self.handlePublicTableBatch(request.table_name, request.body);
@@ -12577,10 +12591,10 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         idempotency_key: ?[]const u8,
         principal: ?[]const u8,
-    ) !http_common.HttpResponse {
-        const parsed = backups_api.parseRestoreRequest(self.alloc, body) catch return try jsonErrorResponse(self.alloc, 400, "invalid restore request");
+    ) !contextual_operations.OwnedResponse {
+        const parsed = backups_api.parseRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer parsed.deinit();
-        backups_api.validateBackupId(parsed.value.backup_id) catch return try jsonErrorResponse(self.alloc, 400, "invalid backup id");
+        backups_api.validateBackupId(parsed.value.backup_id) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup id");
         self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
         const connection = parsed.value.connection;
         var location = backups_api.openBackupLocationWithOptions(self.alloc, parsed.value.location, .{
@@ -12589,7 +12603,7 @@ pub const ApiHttpServer = struct {
             .connection = connection,
             .required_capability = "restore.read",
             .io = self.sharedApiIo(),
-        }) catch |err| return try jsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
+        }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         location.deinit(self.alloc);
         const idempotency_namespace = try restoreIdempotencyNamespaceAlloc(self.alloc, principal, .table, table_name);
         defer self.alloc.free(idempotency_namespace);
@@ -12638,11 +12652,11 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         idempotency_key: ?[]const u8,
         principal: ?[]const u8,
-    ) !http_common.HttpResponse {
-        var req = backups_api.parseClusterRestoreRequest(self.alloc, body) catch return try jsonErrorResponse(self.alloc, 400, "invalid restore request");
+    ) !contextual_operations.OwnedResponse {
+        var req = backups_api.parseClusterRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer backups_api.freeClusterRestoreRequest(self.alloc, &req);
-        const connection = req.connection orelse return try jsonErrorResponse(self.alloc, 400, "restore requires a named external_io connection");
-        const restore_mode = backups_api.validateClusterRestoreMode(req.restore_mode) catch return try jsonErrorResponse(self.alloc, 400, "invalid restore mode");
+        const connection = req.connection orelse return try contextualJsonErrorResponse(self.alloc, 400, "restore requires a named external_io connection");
+        const restore_mode = backups_api.validateClusterRestoreMode(req.restore_mode) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore mode");
         self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
         var location = backups_api.openBackupLocationWithOptions(self.alloc, req.location, .{
             .secret_store = self.cfg.secret_store,
@@ -12650,7 +12664,7 @@ pub const ApiHttpServer = struct {
             .connection = connection,
             .required_capability = "restore.read",
             .io = self.sharedApiIo(),
-        }) catch |err| return try jsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
+        }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         location.deinit(self.alloc);
         const idempotency_namespace = try restoreIdempotencyNamespaceAlloc(self.alloc, principal, .cluster, null);
         defer self.alloc.free(idempotency_namespace);
@@ -12992,13 +13006,13 @@ pub const ApiHttpServer = struct {
         self.alloc.free(finished);
     }
 
-    pub fn handlePublicRestoreJob(self: *ApiHttpServer, job_id: u64, cancel: bool) !http_common.HttpResponse {
+    pub fn handlePublicRestoreJob(self: *ApiHttpServer, job_id: u64, cancel: bool) !contextual_operations.OwnedResponse {
         const encoded = if (cancel) blk: {
             const cancelled = (try self.restore_job_store.cancel(self.alloc, job_id)) orelse
-                return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
             self.signalRestoreRetryWakeup();
             break :blk cancelled;
-        } else (try self.restore_job_store.load(self.alloc, job_id)) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+        } else (try self.restore_job_store.load(self.alloc, job_id)) orelse return try contextualJsonErrorResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         return try self.restoreJobResponse(200, encoded);
     }
@@ -13017,8 +13031,8 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         identity: ?AuthenticatedIdentity,
         options: RestoreJobListOptions,
-    ) !http_common.HttpResponse {
-        if (options.limit == 0 or options.limit > 100) return try jsonErrorResponse(self.alloc, 400, "invalid restore job list limit");
+    ) !contextual_operations.OwnedResponse {
+        if (options.limit == 0 or options.limit > 100) return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore job list limit");
 
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
@@ -13069,7 +13083,7 @@ pub const ApiHttpServer = struct {
         }
 
         const next_cursor = if (continuation_cursor) |value| try std.fmt.allocPrint(arena, "{d}", .{value}) else null;
-        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 200, .{
+        return try contextualJsonResponseOmitNullOptionals(self.alloc, 200, .{
             .jobs = jobs.items,
             .next_cursor = next_cursor,
         });
@@ -13140,14 +13154,14 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn restoreJobResponse(self: *ApiHttpServer, status: u16, encoded: []const u8) !http_common.HttpResponse {
+    fn restoreJobResponse(self: *ApiHttpServer, status: u16, encoded: []const u8) !contextual_operations.OwnedResponse {
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
         const view = try restoreJobViewAlloc(arena, encoded);
-        var response = try jsonResponseWithStatusOmitNullOptionals(self.alloc, status, view);
+        var response = try contextualJsonResponseOmitNullOptionals(self.alloc, status, view);
         if (status == 202) {
-            response.headers = try self.alloc.alloc(http_common.Header, 2);
+            response.headers = try self.alloc.alloc(contextual_operations.Header, 2);
             var initialized: usize = 0;
             errdefer {
                 for (response.headers[0..initialized]) |*header| header.deinit(self.alloc);
@@ -13157,9 +13171,9 @@ pub const ApiHttpServer = struct {
             }
             const location_value = try std.fmt.allocPrint(self.alloc, "/db/v1/restore/jobs/{s}", .{view.job_id});
             defer self.alloc.free(location_value);
-            response.headers[0] = try ownedHeader(self.alloc, "Location", location_value);
+            response.headers[0] = try ownedContextualHeader(self.alloc, "Location", location_value);
             initialized += 1;
-            response.headers[1] = try ownedHeader(self.alloc, "Retry-After", "1");
+            response.headers[1] = try ownedContextualHeader(self.alloc, "Retry-After", "1");
         }
         return response;
     }
@@ -13304,17 +13318,17 @@ fn restoreJobIdFromPath(path: []const u8) ?u64 {
     return std.fmt.parseUnsigned(u64, raw, 10) catch null;
 }
 
-fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
-    if (metadata_authority.isRetryableError(err)) return try metadataNotLeaderResponse(alloc);
+fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
+    if (metadata_authority.isRetryableError(err)) return try contextualRetryableJsonErrorResponse(alloc, 503, "metadata leader unavailable");
     return switch (err) {
-        error.InvalidIdempotencyKey => try jsonErrorResponse(alloc, 400, "invalid idempotency key"),
-        error.IdempotencyConflict => try jsonErrorResponse(alloc, 409, "idempotency key reused for a different restore"),
-        error.AsyncRestoreUnavailable => try jsonErrorResponse(alloc, 503, "asynchronous restore worker unavailable"),
-        error.RestoreJobPersistenceUnavailable => try jsonErrorResponse(alloc, 503, "durable restore store unavailable"),
-        error.RestoreJobCapacityExceeded => try jsonErrorResponse(alloc, 503, "restore job history is at capacity"),
-        error.RestoreJobRecordTooLarge, error.TooManyRestoreTables => try jsonErrorResponse(alloc, 400, "restore request is too large"),
-        error.DuplicateRestoreTableName => try jsonErrorResponse(alloc, 400, "restore request contains duplicate table names"),
-        else => try jsonErrorResponse(alloc, 500, "failed to create restore job"),
+        error.InvalidIdempotencyKey => try contextualJsonErrorResponse(alloc, 400, "invalid idempotency key"),
+        error.IdempotencyConflict => try contextualJsonErrorResponse(alloc, 409, "idempotency key reused for a different restore"),
+        error.AsyncRestoreUnavailable => try contextualJsonErrorResponse(alloc, 503, "asynchronous restore worker unavailable"),
+        error.RestoreJobPersistenceUnavailable => try contextualJsonErrorResponse(alloc, 503, "durable restore store unavailable"),
+        error.RestoreJobCapacityExceeded => try contextualJsonErrorResponse(alloc, 503, "restore job history is at capacity"),
+        error.RestoreJobRecordTooLarge, error.TooManyRestoreTables => try contextualJsonErrorResponse(alloc, 400, "restore request is too large"),
+        error.DuplicateRestoreTableName => try contextualJsonErrorResponse(alloc, 400, "restore request contains duplicate table names"),
+        else => try contextualJsonErrorResponse(alloc, 500, "failed to create restore job"),
     };
 }
 
@@ -14245,8 +14259,56 @@ fn contextualJsonResponse(alloc: std.mem.Allocator, status: u16, value: anytype)
     };
 }
 
+fn contextualJsonResponseOmitNullOptionals(alloc: std.mem.Allocator, status: u16, value: anytype) !contextual_operations.OwnedResponse {
+    return .{
+        .status = status,
+        .content_type = "application/json",
+        .body = try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false }),
+    };
+}
+
 fn contextualJsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8) !contextual_operations.OwnedResponse {
     return try contextualJsonResponse(alloc, status, .{ .@"error" = message });
+}
+
+fn ownedContextualHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !contextual_operations.Header {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    return .{ .name = owned_name, .value = try alloc.dupe(u8, value) };
+}
+
+fn contextualRetryableJsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8) !contextual_operations.OwnedResponse {
+    var response = try contextualJsonErrorResponse(alloc, status, message);
+    errdefer response.deinit(alloc);
+    response.headers = try alloc.alloc(contextual_operations.Header, 2);
+    var initialized: usize = 0;
+    errdefer {
+        for (response.headers[0..initialized]) |*header| header.deinit(alloc);
+        alloc.free(response.headers);
+        response.headers = &.{};
+    }
+    response.headers[0] = try ownedContextualHeader(alloc, "Retry-After", "1");
+    initialized += 1;
+    response.headers[1] = try ownedContextualHeader(alloc, http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
+    return response;
+}
+
+fn cloneContextualResponse(alloc: std.mem.Allocator, response: contextual_operations.OwnedResponse) !contextual_operations.OwnedResponse {
+    const headers = try alloc.alloc(contextual_operations.Header, response.headers.len);
+    errdefer alloc.free(headers);
+    var initialized: usize = 0;
+    errdefer for (headers[0..initialized]) |*header| header.deinit(alloc);
+    for (response.headers, headers) |source, *target| {
+        target.* = try ownedContextualHeader(alloc, source.name, source.value);
+        initialized += 1;
+    }
+    return .{
+        .status = response.status,
+        .content_type = response.content_type,
+        .body = try alloc.dupe(u8, response.body),
+        .public_cors = response.public_cors,
+        .headers = headers,
+    };
 }
 
 fn contextualResponseFromLegacy(alloc: std.mem.Allocator, response: http_common.HttpResponse) !contextual_operations.OwnedResponse {
@@ -15667,6 +15729,30 @@ fn legacyResponseFromPublicOperation(
         const value = try std.fmt.bufPrint(&value_buf, "{d}", .{seconds});
         headers[0] = try ownedHeader(alloc, "Retry-After", value);
         errdefer headers[0].deinit(alloc);
+    }
+    return .{
+        .status = response.status,
+        .content_type = content_type,
+        .headers = headers,
+        .body = body,
+    };
+}
+
+fn legacyResponseFromContextualOperation(
+    alloc: std.mem.Allocator,
+    response: contextual_operations.OwnedResponse,
+) !http_common.HttpResponse {
+    const content_type = try alloc.dupe(u8, response.content_type);
+    errdefer alloc.free(content_type);
+    const body = try alloc.dupe(u8, response.body);
+    errdefer alloc.free(body);
+    const headers = try alloc.alloc(http_common.Header, response.headers.len);
+    errdefer alloc.free(headers);
+    var initialized: usize = 0;
+    errdefer for (headers[0..initialized]) |*header| header.deinit(alloc);
+    for (response.headers, headers) |source, *target| {
+        target.* = try ownedHeader(alloc, source.name, source.value);
+        initialized += 1;
     }
     return .{
         .status = response.status,
@@ -32573,7 +32659,7 @@ test "api http server rejects restore before persistence without an asynchronous
     );
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 503), response.status);
-    try std.testing.expectEqualStrings("application/json", response.content_type.?);
+    try std.testing.expectEqualStrings("application/json", response.content_type);
     try std.testing.expectEqualStrings("{\"error\":\"asynchronous restore worker unavailable\"}", response.body);
     try std.testing.expectEqual(@as(usize, 0), server.restore_job_store.jobs.count());
 

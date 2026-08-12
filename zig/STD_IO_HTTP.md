@@ -223,6 +223,11 @@ that end state:
   residual synthetic public dispatcher has a temporary one-way adapter for
   its test and compatibility callers; production ingress does not allocate a
   legacy `HttpResponse` for these route families.
+- Cluster/table restore submission and restore-job list/get/cancel operations
+  now return the shared owned contextual response directly to generated
+  `httpx` handlers. Location, retry, and metadata-authority headers are owned by
+  that result contract; only the residual synthetic dispatcher clones it into
+  a legacy response for compatibility tests.
 - The former shared non-generated compatibility manifest and listener
   catch-alls are gone. Metadata has no manual dispatcher, and data and
   standalone register generated and contextual families explicitly. Unknown

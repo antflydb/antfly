@@ -436,6 +436,20 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn respondOwnedContextualResponse(
+        ctx: *httpx.Context,
+        resp: *contextual_operations.OwnedResponse,
+        alloc: std.mem.Allocator,
+    ) !httpx.Response {
+        defer resp.deinit(alloc);
+        _ = ctx.status(resp.status);
+        try ctx.setHeader("content-type", resp.content_type);
+        for (resp.headers) |header| try ctx.setHeader(header.name, header.value);
+        if (resp.public_cors) try ctx.setHeader("Access-Control-Allow-Origin", "*");
+        _ = ctx.response.body(resp.body);
+        return ctx.response.build();
+    }
+
     fn respondApiResponseBody(ctx: *httpx.Context, status: u16, body: []const u8) !httpx.Response {
         _ = ctx.status(status);
         if (status >= 200 and status < 300) {
@@ -3201,7 +3215,7 @@ pub const AntflyApiHandler = struct {
             ctx.header("idempotency-key"),
             if (authenticated_identity) |identity| identity.username else null,
         );
-        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+        return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 
     pub fn getRestoreJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id_raw: []const u8) !httpx.Response {
@@ -3240,7 +3254,7 @@ pub const AntflyApiHandler = struct {
             .phase = phase,
             .scope = scope,
         });
-        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+        return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 
     fn restoreJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id_raw: []const u8, cancel: bool) !httpx.Response {
@@ -3252,7 +3266,7 @@ pub const AntflyApiHandler = struct {
             if (!(try self.api_server.restoreJobAllowed(ctx.allocator, identity, job_id))) return try textResponse(ctx, 404, "not found");
         }
         var resp = try self.api_server.handlePublicRestoreJob(job_id, cancel);
-        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+        return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 
     pub fn listBackups(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListBackupsParams) !httpx.Response {
@@ -3937,7 +3951,7 @@ pub const AntflyApiHandler = struct {
             ctx.header("idempotency-key"),
             if (authenticated_identity) |identity| identity.username else null,
         );
-        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+        return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 
     pub fn updateSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
