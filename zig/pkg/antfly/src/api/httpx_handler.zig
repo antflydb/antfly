@@ -21,7 +21,6 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const http_common = @import("../raft/transport/http_common.zig");
-pub const PeerObserver = @import("../common/http/peer_disconnect_observer.zig").Observer;
 const http_route_helpers = @import("http_route_helpers.zig");
 const http_server_mod = @import("http_server.zig");
 const operation_contract = @import("operation.zig");
@@ -165,39 +164,10 @@ pub const AntflyApiHandler = struct {
     /// Separate phase admission for H2 query bodies. Slow uploads must not
     /// consume execution permits, but still need a global waiter bound.
     query_body_admission: QueryAdmission = .{},
-    peer_observer: ?PeerObserver = null,
-    cancellation_watcher_start_failures_total: std.atomic.Value(u64) = .init(0),
-    peer_disconnect_cancellations_total: std.atomic.Value(u64) = .init(0),
-    peer_observer_failures_total: std.atomic.Value(u64) = .init(0),
 
-    pub const RuntimeStats = struct {
-        cancellation_watcher_start_failures_total: u64,
-        peer_disconnect_cancellations_total: u64,
-        peer_observer_failures_total: u64,
-        active_peer_observers: usize,
-    };
-
-    pub fn runtimeStats(self: *const AntflyApiHandler) RuntimeStats {
-        return .{
-            .cancellation_watcher_start_failures_total = self.cancellation_watcher_start_failures_total.load(.acquire),
-            .peer_disconnect_cancellations_total = self.peer_disconnect_cancellations_total.load(.acquire),
-            .peer_observer_failures_total = self.peer_observer_failures_total.load(.acquire),
-            .active_peer_observers = if (self.peer_observer) |*observer| observer.activeCount() else 0,
-        };
-    }
-
-    /// Starts the one-thread, multiplexed H1 cancellation observer after the
-    /// handler has reached its stable address. Query handlers fail closed if
-    /// this runtime is unavailable.
-    pub fn initRuntime(self: *AntflyApiHandler, alloc: std.mem.Allocator) !void {
-        if (self.peer_observer != null) return error.AlreadyStarted;
-        self.peer_observer = PeerObserver.init(alloc, self.query_admission.capacity);
-        self.peer_observer.?.start() catch |err| {
-            self.peer_observer.?.deinit();
-            self.peer_observer = null;
-            return err;
-        };
-    }
+    /// Cancellation observation is owned by httpx. Retain this lifecycle hook
+    /// while direct and linked handler construction share one interface.
+    pub fn initRuntime(_: *AntflyApiHandler, _: std.mem.Allocator) !void {}
 
     /// Register the complete generated public surface for one handler
     /// instance. Runtime roles call this common registrar instead of carrying
@@ -392,8 +362,7 @@ pub const AntflyApiHandler = struct {
     }
 
     pub fn deinitRuntime(self: *AntflyApiHandler) void {
-        if (self.peer_observer) |*observer| observer.deinit();
-        self.peer_observer = null;
+        _ = self;
     }
 
     fn respondOwnedApiResponse(ctx: *httpx.Context, resp: anytype) !httpx.Response {
@@ -817,31 +786,6 @@ pub const AntflyApiHandler = struct {
                 }
             }.call else null,
         };
-    }
-
-    /// Linked adapters expose cancellation as an ABI callback. Mirror that
-    /// callback through the existing multiplexed observer so older storage and
-    /// search internals that borrow an atomic signal retain cancellation too.
-    pub fn installLinkedCancellationMirror(
-        self: *AntflyApiHandler,
-        ctx: *httpx.Context,
-        cancellation: *http_common.RequestCancellation,
-        registration: *PeerObserver.Registration,
-    ) !void {
-        if (ctx.cancellation_probe == null) return;
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
-        const observer = if (self.peer_observer) |*value| value else return error.ObserverUnavailable;
-        registration.* = try observer.registerProbe(
-            cancellation,
-            ctx,
-            struct {
-                fn call(raw: *const anyopaque) bool {
-                    const context: *const httpx.Context = @ptrCast(@alignCast(raw));
-                    return context.isCancellationRequested();
-                }
-            }.call,
-        );
-        ctx.cancellation = cancellation.signal();
     }
 
     fn probeOperations(self: *AntflyApiHandler) probe_operations.Operations {
@@ -2063,35 +2007,6 @@ pub const AntflyApiHandler = struct {
     fn queryBodyOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
         try ctx.setHeader("Retry-After", "1");
         return textResponse(ctx, 429, "query body capacity exhausted");
-    }
-
-    fn queryCancellationUnavailableResponse(ctx: *httpx.Context) !httpx.Response {
-        try ctx.setHeader("Retry-After", "1");
-        if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
-        return textResponse(ctx, 503, "query cancellation capacity unavailable");
-    }
-
-    fn startPeerCancellationWatcher(self: *AntflyApiHandler, ctx: *httpx.Context, cancellation: *http_common.RequestCancellation, registration: *PeerObserver.Registration) !void {
-        const socket = ctx.h1_sock orelse return;
-        // Once a following request has been read into the connection parser,
-        // the kernel can no longer distinguish an intentional SHUT_WR after a
-        // valid pipeline from a client that abandoned both requests. Never run
-        // expensive work without a trustworthy cancellation source: reject
-        // this request and make the client retry it on an unpipelined socket.
-        if (ctx.h1_has_buffered_input) {
-            _ = self.cancellation_watcher_start_failures_total.fetchAdd(1, .monotonic);
-            return error.PipelinedQueryCancellationUnsafe;
-        }
-        const observer = if (self.peer_observer) |*value| value else return error.ObserverUnavailable;
-        registration.* = observer.register(
-            socket.handle,
-            cancellation,
-            &self.peer_disconnect_cancellations_total,
-            &self.peer_observer_failures_total,
-        ) catch |err| {
-            _ = self.cancellation_watcher_start_failures_total.fetchAdd(1, .monotonic);
-            return err;
-        };
     }
 
     fn unauthorizedResponse(ctx: *httpx.Context) !httpx.Response {
@@ -3337,10 +3252,6 @@ pub const AntflyApiHandler = struct {
         if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
         defer self.query_admission.release();
         var cancellation = requestCancellation(ctx);
-        var peer_registration: PeerObserver.Registration = .{};
-        self.startPeerCancellationWatcher(ctx, &cancellation, &peer_registration) catch
-            return queryCancellationUnavailableResponse(ctx);
-        defer peer_registration.deinit();
         if (isNdjsonContentType(ctx.header("content-type"))) {
             var resp = try self.api_server.handlePublicGlobalMultiQueryWithCancellation(
                 body_data,
@@ -3873,10 +3784,6 @@ pub const AntflyApiHandler = struct {
         if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
         defer self.query_admission.release();
         var cancellation = requestCancellation(ctx);
-        var peer_registration: PeerObserver.Registration = .{};
-        self.startPeerCancellationWatcher(ctx, &cancellation, &peer_registration) catch
-            return queryCancellationUnavailableResponse(ctx);
-        defer peer_registration.deinit();
         var resp = try self.api_server.handlePublicTableQueryWithContentTypeCancellation(
             decoded_table_name,
             body_data,
@@ -6419,34 +6326,6 @@ test "httpx query admission releases a cancelled query slot" {
     admission.release();
 }
 
-test "httpx rejects pipelined H1 query work when disconnect ownership is ambiguous" {
-    const alloc = std.testing.allocator;
-    var source = AuthStatusSource{};
-    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
-    var handler = AntflyApiHandler{ .api_server = &api_server };
-
-    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
-    defer request.deinit();
-    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
-    defer ctx.deinit();
-    var socket = httpx.Socket{ .handle = 0, .io = std.testing.io };
-    ctx.h1_sock = &socket;
-    ctx.h1_has_buffered_input = true;
-
-    var cancellation = http_common.RequestCancellation{};
-    var registration: PeerObserver.Registration = .{};
-    try std.testing.expectError(
-        error.PipelinedQueryCancellationUnsafe,
-        handler.startPeerCancellationWatcher(&ctx, &cancellation, &registration),
-    );
-    try std.testing.expectEqual(
-        @as(u64, 1),
-        handler.runtimeStats().cancellation_watcher_start_failures_total,
-    );
-    try std.testing.expect(!cancellation.isCancelled());
-    try std.testing.expect(registration.observer == null);
-}
-
 test "httpx production path sheds 128 abandoned queries and preserves control recovery" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
@@ -6557,7 +6436,15 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
     try std.testing.expectEqual(@as(u64, 120), saturated.rejected_total);
     try std.testing.expectEqual(@as(u32, 8), reads.started.load(.acquire));
     try std.testing.expect(e2e_server.server.runtimeStats().active_connections <= 32);
-    try std.testing.expectEqual(@as(usize, 8), e2e_server.handler.runtimeStats().active_peer_observers);
+    // Cancellation observation is universal, so rejected requests may still
+    // be unwinding briefly after admission reaches its steady state. Wait
+    // until only the eight deliberately blocked requests remain.
+    for (0..10_000) |_| {
+        if (e2e_server.server.runtimeStats().active_h1_cancellation_observers == 8) break;
+        var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.posix.system.nanosleep(&delay, &delay);
+    }
+    try std.testing.expectEqual(@as(usize, 8), e2e_server.server.runtimeStats().active_h1_cancellation_observers);
 
     // Rejected keep-alive clients must not retain all connection permits. The
     // real status route remains reachable while every expensive slot is held.
@@ -6581,13 +6468,13 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
     }
     for (0..10_000) |_| {
         const admission = e2e_server.handler.query_admission.stats();
-        const runtime = e2e_server.handler.runtimeStats();
-        if (admission.in_flight == 0 and runtime.active_peer_observers == 0 and reads.cancelled.load(.acquire) == 8) break;
+        const runtime = e2e_server.server.runtimeStats();
+        if (admission.in_flight == 0 and runtime.active_h1_cancellation_observers == 0 and reads.cancelled.load(.acquire) == 8) break;
         var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
         _ = std.posix.system.nanosleep(&delay, &delay);
     }
     try std.testing.expectEqual(@as(usize, 0), e2e_server.handler.query_admission.stats().in_flight);
-    try std.testing.expectEqual(@as(usize, 0), e2e_server.handler.runtimeStats().active_peer_observers);
+    try std.testing.expectEqual(@as(usize, 0), e2e_server.server.runtimeStats().active_h1_cancellation_observers);
     try std.testing.expectEqual(@as(u32, 8), reads.cancelled.load(.acquire));
 
     reads.release.store(true, .release);

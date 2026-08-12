@@ -61,6 +61,7 @@ pub const MetadataServer = struct {
     owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
     owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
+    owned_http_runtime: ?*httpx.HttpRuntime = null,
     owned_admin_listener: ?*MetadataAdminHttpRuntime = null,
     restore_supervisor_owner_id: u64 = 0,
     restore_supervisor_stop: std.atomic.Value(bool) = .init(false),
@@ -127,6 +128,11 @@ pub const MetadataServer = struct {
         };
         var owned_admin_mux: ?*MetadataAdminMux = null;
         errdefer if (owned_admin_mux) |mux| alloc.destroy(mux);
+        var owned_http_runtime: ?*httpx.HttpRuntime = null;
+        errdefer if (owned_http_runtime) |http_runtime| {
+            http_runtime.deinit();
+            alloc.destroy(http_runtime);
+        };
         var owned_admin_listener: ?*MetadataAdminHttpRuntime = null;
         errdefer if (owned_admin_listener) |listener| {
             listener.deinit();
@@ -203,9 +209,20 @@ pub const MetadataServer = struct {
             };
             owned_admin_mux = mux;
 
+            const max_connections: usize = @intCast(if (listener_cfg.max_connection_threads == 0)
+                256
+            else
+                listener_cfg.max_connection_threads);
+            const http_runtime = try alloc.create(httpx.HttpRuntime);
+            http_runtime.* = httpx.HttpRuntime.init(alloc, .{
+                .max_active_h1_requests = max_connections,
+            });
+            owned_http_runtime = http_runtime;
+
             owned_admin_listener = try MetadataAdminHttpRuntime.init(
                 alloc,
                 try svc.ensureBackendRuntime(),
+                http_runtime,
                 listener_cfg,
                 mux,
                 public_http_server,
@@ -224,6 +241,7 @@ pub const MetadataServer = struct {
             .owned_public_write_source = owned_public_write_source,
             .owned_public_http_server = owned_public_http_server,
             .owned_admin_mux = owned_admin_mux,
+            .owned_http_runtime = owned_http_runtime,
             .owned_admin_listener = owned_admin_listener,
         };
     }
@@ -246,6 +264,10 @@ pub const MetadataServer = struct {
         self.transition_ops_registration = null;
         if (self.owned_admin_listener) |listener| {
             listener.deinitWithDeadline(deadline);
+        }
+        if (self.owned_http_runtime) |http_runtime| {
+            http_runtime.deinit();
+            self.alloc.destroy(http_runtime);
         }
         if (self.owned_admin_mux) |mux| {
             self.alloc.destroy(mux);
@@ -318,7 +340,7 @@ pub const MetadataServer = struct {
 
     pub fn adminListenerHealthy(self: *const MetadataServer) bool {
         const listener = self.owned_admin_listener orelse return false;
-        return public_api_kernel.handlerStats(&listener.handler).peer_observer_failures_total == 0;
+        return listener.server.runtimeStats().h1_cancellation_observer_failures_total == 0;
     }
 
     fn restoreSupervisorRun(ptr: *anyopaque) !void {
@@ -465,6 +487,7 @@ const MetadataAdminHttpRuntime = struct {
     fn init(
         alloc: std.mem.Allocator,
         backend_runtime: *@import("../storage/background_runtime.zig").BackendRuntime,
+        http_runtime: *httpx.HttpRuntime,
         cfg: raft_transport.StdHttpListenerConfig,
         mux: *MetadataAdminMux,
         public_api: *public_api_kernel.ApiHttpServer,
@@ -490,14 +513,13 @@ const MetadataAdminHttpRuntime = struct {
                 .accept_error_backoff_initial_ms = cfg.accept_error_backoff_initial_ms,
                 .accept_error_backoff_max_ms = cfg.accept_error_backoff_max_ms,
                 .reuse_address = cfg.reuse_address,
+                .http_runtime = http_runtime,
             }),
             .listener_task = undefined,
             .api_lane_lease = api_lane_lease,
         };
         errdefer public_api_kernel.deinitHandler(&runtime.handler);
         errdefer runtime.server.deinit();
-        // The direct handler's observer receives `self`; start it only after
-        // the handler is resident at its final heap address.
         try runtime.handler.initRuntime(alloc);
         runtime.listener_task = httpx.ListenerTask.init(&runtime.server);
         try runtime.server.use(httpx.Middleware.bind("metadata-authority", runtime, authorityMiddleware));

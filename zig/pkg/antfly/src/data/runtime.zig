@@ -695,7 +695,10 @@ fn publicApiListenerConfig(bind_host: []const u8, bind_port: u16) antfly.raft.tr
     };
 }
 
-fn publicApiHttpxConfig(cfg: antfly.raft.transport.StdHttpListenerConfig) httpx.ServerConfig {
+fn publicApiHttpxConfig(
+    cfg: antfly.raft.transport.StdHttpListenerConfig,
+    http_runtime: *httpx.HttpRuntime,
+) httpx.ServerConfig {
     return .{
         .host = cfg.bind_host,
         .port = cfg.bind_port,
@@ -706,6 +709,7 @@ fn publicApiHttpxConfig(cfg: antfly.raft.transport.StdHttpListenerConfig) httpx.
         .accept_error_backoff_initial_ms = cfg.accept_error_backoff_initial_ms,
         .accept_error_backoff_max_ms = cfg.accept_error_backoff_max_ms,
         .reuse_address = cfg.reuse_address,
+        .http_runtime = http_runtime,
     };
 }
 
@@ -731,6 +735,7 @@ const DataPublicHttpRuntime = struct {
         rejected_requests_total: u64,
         accept_errors_total: u64,
         cancellation_watcher_start_failures_total: u64,
+        peer_observer_failures_total: u64,
         deadline_observer_failures_total: u64,
         deadline_expirations_total: u64,
         peer_disconnects_total: u64,
@@ -741,6 +746,7 @@ const DataPublicHttpRuntime = struct {
     fn start(
         alloc: std.mem.Allocator,
         backend_runtime: *backend_runtime_mod.BackendRuntime,
+        http_runtime: *httpx.HttpRuntime,
         cfg: antfly.raft.transport.StdHttpListenerConfig,
         api_server: *antfly.public_api.kernel_bridge.ApiHttpServer,
     ) !*DataPublicHttpRuntime {
@@ -752,16 +758,17 @@ const DataPublicHttpRuntime = struct {
             .alloc = alloc,
             .api_server = api_server,
             .handler = try antfly.public_api.kernel_bridge.createHandler(api_server),
-            .server = httpx.Server.initWithConfig(alloc, api_lane_lease.io(), publicApiHttpxConfig(cfg)),
+            .server = httpx.Server.initWithConfig(
+                alloc,
+                api_lane_lease.io(),
+                publicApiHttpxConfig(cfg, http_runtime),
+            ),
             .listener_task = undefined,
             .api_lane_lease = api_lane_lease,
         };
         errdefer antfly.public_api.kernel_bridge.deinitHandler(&runtime.handler);
         errdefer runtime.server.deinit();
 
-        // Direct-codegen handlers own a peer-observer thread whose argument is
-        // `self`; initialize only after the handler has reached its final
-        // address inside the heap-owned runtime.
         try runtime.handler.initRuntime(alloc);
         runtime.listener_task = httpx.ListenerTask.init(&runtime.server);
         try runtime.handler.registerRoutes(&runtime.server);
@@ -808,11 +815,12 @@ const DataPublicHttpRuntime = struct {
             .peak_active_requests = application.query_peak_in_flight,
             .rejected_requests_total = application.query_rejected_total,
             .accept_errors_total = transport.accept_errors_total,
-            .cancellation_watcher_start_failures_total = application.cancellation_watcher_start_failures_total,
+            .cancellation_watcher_start_failures_total = transport.h1_cancellation_registration_failures_total,
+            .peer_observer_failures_total = transport.h1_cancellation_observer_failures_total,
             .deadline_observer_failures_total = 0,
             .deadline_expirations_total = transport.connection_timeouts_total,
-            .peer_disconnects_total = application.peer_disconnect_cancellations_total,
-            .active_peer_observers = application.active_peer_observers,
+            .peer_disconnects_total = transport.h1_peer_cancellations_total,
+            .active_peer_observers = transport.active_h1_cancellation_observers,
             .active_deadline_observers = 0,
         };
     }
@@ -822,7 +830,7 @@ const DataPublicHttpRuntime = struct {
     }
 
     fn healthy(self: *const DataPublicHttpRuntime) bool {
-        return antfly.public_api.kernel_bridge.handlerStats(&self.handler).peer_observer_failures_total == 0;
+        return self.server.runtimeStats().h1_cancellation_observer_failures_total == 0;
     }
 };
 
@@ -1258,6 +1266,7 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public queries rejected by admission control", http.rejected_requests_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests cancelled because peer observation could not be scheduled", http.cancellation_watcher_start_failures_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public requests cancelled after transport cancellation observation failed", http.peer_observer_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_deadline_observer_failures_total", "counter", "Public requests closed because deadline observation could not be scheduled", http.deadline_observer_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_deadline_expirations_total", "counter", "Public request sockets closed after header or body deadlines", http.deadline_expirations_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_deadline_observers", "gauge", "Public request sockets currently watched for header or body deadlines", http.active_deadline_observers);
@@ -4201,6 +4210,9 @@ pub const DataServer = struct {
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
+    /// Process-role HTTP transport services are distinct from storage/API
+    /// executor lanes and may be shared by every httpx listener in this role.
+    owned_http_runtime: ?*httpx.HttpRuntime = null,
     listener_cfg: antfly.raft.transport.std_http_listener.StdHttpListenerConfig,
     listener: ?*DataPublicHttpRuntime = null,
     query_io_impl: ?std.Io.Threaded = null,
@@ -5742,9 +5754,11 @@ pub const DataServer = struct {
         }
         if (self.listener == null) {
             const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+            const http_runtime = try self.ensureHttpRuntime();
             self.listener = try DataPublicHttpRuntime.start(
                 self.alloc,
                 runtime,
+                http_runtime,
                 self.listener_cfg,
                 &self.http_server.?,
             );
@@ -6005,6 +6019,11 @@ pub const DataServer = struct {
         self.clearProvisionedStartupCatchUpTarget();
         if (self.listener) |listener| listener.deinitWithDeadline(deadline);
         self.listener = null;
+        if (self.owned_http_runtime) |http_runtime| {
+            http_runtime.deinit();
+            self.alloc.destroy(http_runtime);
+            self.owned_http_runtime = null;
+        }
         if (self.http_server) |*http_server| http_server.deinit();
         self.http_server = null;
         _ = self.read_source.withAntflyProvider(null);
@@ -6089,6 +6108,21 @@ pub const DataServer = struct {
         self.owned_backend_runtime = null;
         self.backend_runtime = null;
         self.query_io_impl = null;
+    }
+
+    fn ensureHttpRuntime(self: *DataServer) !*httpx.HttpRuntime {
+        if (self.owned_http_runtime) |runtime| return runtime;
+        const runtime = try self.alloc.create(httpx.HttpRuntime);
+        errdefer self.alloc.destroy(runtime);
+        const capacity: usize = @intCast(if (self.listener_cfg.max_connection_threads == 0)
+            public_api_max_connection_threads
+        else
+            self.listener_cfg.max_connection_threads);
+        runtime.* = httpx.HttpRuntime.init(self.alloc, .{
+            .max_active_h1_requests = capacity,
+        });
+        self.owned_http_runtime = runtime;
+        return runtime;
     }
 
     fn ensureBackendRuntime(self: *DataServer) !*backend_runtime_mod.BackendRuntime {

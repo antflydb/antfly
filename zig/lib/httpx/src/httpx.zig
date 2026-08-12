@@ -95,6 +95,7 @@ pub const client_mod = @import("client/client.zig");
 pub const pool = @import("client/pool.zig");
 
 pub const server_mod = @import("server/server.zig");
+pub const http_runtime = @import("server/http_runtime.zig");
 pub const router = @import("server/router.zig");
 pub const middleware = @import("server/middleware.zig");
 
@@ -212,6 +213,7 @@ pub const PoolStats = pool.PoolStats;
 pub const Server = server_mod.Server;
 pub const ListenerTask = server_mod.Server.ListenerTask;
 pub const ServerConfig = server_mod.ServerConfig;
+pub const HttpRuntime = http_runtime.HttpRuntime;
 pub const Context = server_mod.Context;
 pub const Handler = server_mod.Handler;
 pub const RouteParam = router.RouteParam;

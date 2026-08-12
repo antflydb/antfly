@@ -570,8 +570,9 @@ const StandaloneHealthSource = struct {
                 .required_lsn = checkpoint_lsn,
             }) catch return false;
         }
-        if (antfly.public_api.kernel_bridge.handlerStats(self.handler).peer_observer_failures_total != 0)
-            return false;
+        if (self.unified_lifecycle.runtimeStats()) |http| {
+            if (http.h1_cancellation_observer_failures_total != 0) return false;
+        }
         return standaloneReadyFromState(
             self.data_server.http_server != null,
             self.unified_api_ready.load(.acquire),
@@ -594,11 +595,6 @@ const StandaloneHealthSource = struct {
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", handler.query_body_in_flight);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", handler.query_body_peak_in_flight);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_rejected_total", "counter", "Streaming H2 query bodies rejected by admission control", handler.query_body_rejected_total);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public queries rejected because peer observation could not be scheduled", handler.cancellation_watcher_start_failures_total);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_disconnects_total", "counter", "Public query peer disconnects propagated to cancellation", handler.peer_disconnect_cancellations_total);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public queries cancelled after peer observation failed", handler.peer_observer_failures_total);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "Public query sockets currently watched for disconnect", handler.active_peer_observers);
-
         if (self.unified_lifecycle.runtimeStats()) |http| {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_connection_limit", "gauge", "Maximum concurrent public HTTP connections", http.max_connections);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_connections", "gauge", "Currently active public HTTP connections", http.active_connections);
@@ -608,6 +604,10 @@ const StandaloneHealthSource = struct {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_in_use_bytes", "gauge", "HTTP request-body bytes admitted across HTTP/1 and HTTP/2", http.body_buffer_in_use_bytes);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_peak_bytes", "gauge", "Peak admitted HTTP request-body bytes since process start", http.body_buffer_peak_bytes);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_rejected_total", "counter", "HTTP request bodies rejected by aggregate memory admission", http.body_buffer_rejected_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests rejected because transport cancellation observation could not be registered", http.h1_cancellation_registration_failures_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_disconnects_total", "counter", "Public request peer disconnects propagated to cancellation", http.h1_peer_cancellations_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public requests cancelled after transport cancellation observation failed", http.h1_cancellation_observer_failures_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "HTTP/1 request sockets currently watched for disconnect", http.active_h1_cancellation_observers);
         }
     }
 };
@@ -2385,7 +2385,13 @@ fn serveUnifiedInner(
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
 ) !void {
-    var server = httpx.Server.initWithConfig(alloc, io, publicHttpServerConfig(bind_host, bind_port));
+    var server_config = publicHttpServerConfig(bind_host, bind_port);
+    var http_runtime = httpx.HttpRuntime.init(alloc, .{
+        .max_active_h1_requests = server_config.max_connections,
+    });
+    defer http_runtime.deinit();
+    server_config.http_runtime = &http_runtime;
+    var server = httpx.Server.initWithConfig(alloc, io, server_config);
     defer server.deinit();
     var route_context = StandaloneHttpContext{
         .api_server = api_server,

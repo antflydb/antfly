@@ -27,6 +27,13 @@ that end state:
 - Data, metadata, standalone, serverless, inference, and health listeners use
   the common ownership pattern; storage-backed roles borrow leased API or
   control lanes from `BackendRuntime`.
+- `HttpRuntime` is the role-owned transport service shared by `httpx`
+  listeners. It owns one bounded HTTP/1 cancellation multiplexer, listener
+  leases, admission, and transport metrics; it does not own an executor lane.
+- Every `httpx.Context` has transport-provided cancellation. HTTP/2 uses the
+  stream reset signal, while HTTP/1 registrations share the role's
+  `HttpRuntime`. The linked API and inference ABIs carry the same semantic
+  cancellation callback without route-specific OpenAPI policy.
 - Process roles share signal cancellation and one absolute shutdown deadline.
 - Listener address reuse and listener sharing are independent policies:
   `SO_REUSEADDR` supports deterministic restart, while `SO_REUSEPORT` is an
@@ -326,6 +333,10 @@ Process Runtime Supervisor
 │   ├── Raft inbound lane
 │   ├── Raft outbound lane
 │   └── inference CPU lane
+├── HTTP Runtime
+│   ├── listener leases
+│   ├── bounded HTTP/1 cancellation registry
+│   └── one multiplexed observer thread
 ├── Data/Metadata/Standalone Server
 │   ├── httpx listener Future
 │   ├── connection task Group
@@ -555,6 +566,53 @@ const io = lease.io();
 Debug and test builds should assert that no leases or registered tasks remain
 when `BackendRuntime` is deinitialized. The component remains responsible for
 stopping and awaiting its tasks before releasing the lease.
+
+## HTTP transport runtime
+
+`HttpRuntime` and `BackendRuntime` solve different ownership problems.
+`BackendRuntime` owns execution capacity; `HttpRuntime` owns shared transport
+state for one process role. Data, metadata, and standalone construct one
+`HttpRuntime` and inject it into each `httpx.Server` they compose. A standalone
+library `Server` creates a private fallback runtime for convenience.
+
+Each listening server acquires a lease before bind/accept and releases it only
+after its connection group has drained. The first lease starts the HTTP/1
+cancellation service and the last lease stops and joins it. `HttpRuntime`
+cannot be destroyed while a listener lease remains. Its H1 registry is bounded;
+the configured capacity must cover the sum of simultaneously active H1 requests
+across all listeners that share it. Registration failure is fail-closed with a
+retryable 503 rather than silently running an uncancellable request.
+
+The current `std.Io.Threaded` backend grows a worker pool as concurrency demands
+and retains those workers until executor deinitialization. Consequently, one
+long-lived watcher submitted per connection or request would turn peak socket
+concurrency into retained thread stacks. The current H1 implementation instead
+uses one explicitly owned OS thread with a small configurable stack and
+multiplexes all registered sockets with `poll`/`kqueue`. It only peeks; the HTTP
+parser remains the sole consumer of socket bytes. A complete pipelined request
+takes precedence over an ambiguous orderly EOF, while reset/error conditions
+still cancel the active request.
+
+This observer is intentionally not a `BackendRuntime` lane. Giving it a lane
+would mix transport lifetime with storage-executor policy and would still risk
+pool growth on `Io.Threaded`. When Zig provides a production evented `std.Io`
+backend suitable for socket readiness, `HttpRuntime` may replace its private
+multiplexer internally. The `Server`, handler, and linked-runtime cancellation
+contracts do not change.
+
+Shutdown order is:
+
+```text
+drop readiness
+→ request listener stop
+→ interrupt active connection/request cancellation signals
+→ join listener and connection tasks
+→ release the listener's HttpRuntime lease
+→ destroy servers and handlers
+→ deinitialize HttpRuntime
+→ release BackendRuntime API-lane leases
+→ deinitialize BackendRuntime
+```
 
 ## Runtime-specific integration
 
@@ -926,21 +984,28 @@ The API-kernel archive owns operation implementation. This keeps
 `httpx.Server`, Zig error sets, and unstable Zig layouts out of the ABI while
 preserving the compiler-memory benefit of independent code generation.
 
-The linked API and inference manifests now carry buffered-body and streaming-
-response policy. Before crossing the archive boundary, the listener buffers a
+The linked API and inference manifests carry buffered-body and streaming-
+response policy. Cancellation is deliberately absent from route manifests and
+OpenAPI extensions because it is a universal request-lifetime property, not an
+operation opt-in. Before crossing the archive boundary, the listener buffers a
 deferred HTTP/2 body only when the matched route requires it. Each dispatch
 also receives request-scoped cancellation and streaming callback views. The
 archive reconstructs an `httpx.Context` with transport-neutral delegates, so
 an inference SSE handler can start, write, and close the original listener's
 HTTP/1 chunked stream or HTTP/2 DATA stream without sharing socket or
 connection layouts across the ABI. The same callback cancellation source is
-used by operation contexts and inference generation loops.
+used by operation contexts and inference generation loops. A same-process fast
+flag may preserve the identical atomic signal for storage/search internals, but
+the callback is the ABI contract and callers remain correct when the fast path
+is absent.
 
 Production request accounting happens inside linked dispatch, where the API
 kernel owns the metric, rather than relying on direct-registration middleware
 that is absent from opaque builds. ABI versions were advanced with these
 layout changes; old callers fail prefix validation rather than interpreting a
-new structure with an old layout.
+new structure with an old layout. Cancellation metrics are owned and exported
+by `HttpRuntime`; kernel handler statistics retain only application admission
+state, avoiding duplicated or partially observed transport counters.
 
 Passing an opaque server pointer may remain as a same-toolchain migration step,
 but it is not the final ABI contract. Kernel-created objects must still be
@@ -1023,6 +1088,13 @@ The CI matrix should include sanitizer and stress coverage, supported operating
 systems and architectures, and the real ARM64 `ReleaseFast` linked build. The
 linked-runtime bridge needs both ABI-focused tests and an executable smoke test;
 a host Debug build alone does not validate the original compiler-memory issue.
+
+API HTTP and linked-boundary tests use the focused `api-http-runtime-test`
+discovery root. They are also part of `root-test` and `unit-test`, but no longer
+force transport-specific test code through the monolithic library test root.
+This keeps the existing 7 GiB aggregate compiler reservation honest instead of
+raising it whenever the HTTP boundary grows; further growth should be handled
+by another cohesive test shard, not by increasing the repository-wide default.
 
 ## Implemented migration sequence
 

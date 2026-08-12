@@ -27,7 +27,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 8;
+pub const abi_version: u32 = 9;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -136,10 +136,6 @@ pub const HandlerStats = extern struct {
     query_body_in_flight: usize,
     query_body_peak_in_flight: usize,
     query_body_rejected_total: u64,
-    cancellation_watcher_start_failures_total: u64,
-    peer_disconnect_cancellations_total: u64,
-    peer_observer_failures_total: u64,
-    active_peer_observers: usize,
 };
 
 /// Features exposed by the independently code-generated API-kernel archive.

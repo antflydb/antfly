@@ -29,8 +29,6 @@ const managed_embedder = @import("../inference/managed_embedder.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const ha_http_operation = @import("../storage/ha/http_operation.zig");
 const httpx = @import("httpx");
-const http_common = @import("../common/http/http_common.zig");
-const PeerObserver = @import("../common/http/peer_disconnect_observer.zig").Observer;
 
 const CreateContext = abi.CreateContext;
 const CallContext = abi.CallContext;
@@ -258,16 +256,10 @@ const OpaqueHttpxHandler = struct {
     functions: *const abi.FunctionTable,
     alloc: ?std.mem.Allocator = null,
     runtime_routes: std.ArrayListUnmanaged(*RuntimeRoute) = .empty,
-    peer_observer: ?PeerObserver = null,
 
     pub fn initRuntime(self: *OpaqueHttpxHandler, alloc: std.mem.Allocator) !void {
         try callFallible(void, void, self.functions.handler_init, self.handle, null, null);
         self.alloc = alloc;
-        // The opaque runtime side owns the real H1 socket. Observe it here and
-        // project cancellation through the ABI instead of exposing a handle to
-        // the independently generated kernel archive.
-        self.peer_observer = PeerObserver.init(alloc, 4096);
-        try self.peer_observer.?.start();
     }
 
     pub fn stats(self: *const OpaqueHttpxHandler) HandlerStats {
@@ -316,7 +308,6 @@ const OpaqueHttpxHandler = struct {
             const route = try alloc.create(RuntimeRoute);
             errdefer alloc.destroy(route);
             route.* = .{
-                .owner = self,
                 .functions = self.functions,
                 .kernel_route_handle = entry.route_handle,
                 .request_body = entry.request_body,
@@ -338,14 +329,12 @@ const OpaqueHttpxHandler = struct {
             for (self.runtime_routes.items) |route| alloc.destroy(route);
             self.runtime_routes.deinit(alloc);
         }
-        if (self.peer_observer) |*observer| observer.deinit();
         self.functions.handler_destroy(self.handle);
         self.* = undefined;
     }
 };
 
 const RuntimeRoute = struct {
-    owner: *OpaqueHttpxHandler,
     functions: *const abi.FunctionTable,
     kernel_route_handle: *anyopaque,
     request_body: abi.RequestBodyMode,
@@ -388,29 +377,11 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .content_type = abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
     };
     var transport = runtime_http_bridge.Outbound{ .context = context };
-    var cancellation: http_common.RequestCancellation = .{ .borrowed = context.cancellation };
-    var cancellation_registration: PeerObserver.Registration = .{};
-    if (context.h1_sock) |socket| {
-        if (context.h1_has_buffered_input)
-            return context.status(503).text("request cancellation unavailable for pipelined request");
-        const observer = &(route.owner.peer_observer orelse return error.ObserverUnavailable);
-        cancellation_registration = try observer.register(socket.handle, &cancellation, null, null);
-    }
-    defer cancellation_registration.deinit();
-    const cancellation_view: abi.CancellationView = .{
-        .context = &cancellation,
-        .is_cancelled = struct {
-            fn call(raw: ?*const anyopaque) callconv(.c) u8 {
-                const value: *const http_common.RequestCancellation = @ptrCast(@alignCast(raw orelse return 0));
-                return @intFromBool(value.isCancelled());
-            }
-        }.call,
-    };
     try callError(route.functions.handler_handle_http(&.{
         .abi_version = abi.abi_version,
         .route_handle = route.kernel_route_handle,
         .request = &request_view,
-        .cancellation = cancellation_view,
+        .cancellation = transport.cancellation(),
         .stream = if (route.streaming_response) transport.stream() else .{},
         .out_response_handle = &response_handle,
         .out_response = &response_view,
@@ -453,7 +424,6 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
     if (comptime direct_codegen) {
         const query = handler.query_admission.stats();
         const query_body = handler.query_body_admission.stats();
-        const runtime = handler.runtimeStats();
         return .{
             .query_capacity = query.capacity,
             .query_in_flight = query.in_flight,
@@ -463,10 +433,6 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
             .query_body_in_flight = query_body.in_flight,
             .query_body_peak_in_flight = query_body.peak_in_flight,
             .query_body_rejected_total = query_body.rejected_total,
-            .cancellation_watcher_start_failures_total = runtime.cancellation_watcher_start_failures_total,
-            .peer_disconnect_cancellations_total = runtime.peer_disconnect_cancellations_total,
-            .peer_observer_failures_total = runtime.peer_observer_failures_total,
-            .active_peer_observers = runtime.active_peer_observers,
         };
     }
     return handler.stats();
@@ -481,4 +447,46 @@ pub fn setAntflyProvider(server: *ApiHttpServer, provider: ?managed_embedder.Ant
         server.antfly_provider = provider
     else
         server.setAntflyProvider(provider);
+}
+
+test "linked transport projects the universal request cancellation callback" {
+    const FakeKernel = struct {
+        var saw_cancellation = false;
+
+        fn handle(context: *const abi.HttpHandleContext) callconv(.c) abi.Status {
+            saw_cancellation = context.cancellation.requested();
+            context.out_response_handle.* = @ptrFromInt(1);
+            context.out_response.* = .{
+                .status = 200,
+                .body = abi.Bytes.init("ok"),
+            };
+            return .ok;
+        }
+
+        fn destroy(_: *anyopaque) callconv(.c) void {}
+    };
+
+    var functions: abi.FunctionTable = undefined;
+    functions.handler_handle_http = FakeKernel.handle;
+    functions.handler_destroy_http_response = FakeKernel.destroy;
+    var route = RuntimeRoute{
+        .functions = &functions,
+        .kernel_route_handle = @ptrFromInt(1),
+        .request_body = .none,
+        .streaming_response = false,
+    };
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "http://127.0.0.1/healthz");
+    defer request.deinit();
+    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    var cancellation = std.atomic.Value(bool).init(true);
+    context.cancellation = &cancellation;
+    context.h1_has_buffered_input = true;
+    context.route_data = &route;
+
+    var response = try runtimeApiHttpHandler(&context);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqualStrings("ok", response.body.?);
+    try std.testing.expect(FakeKernel.saw_cancellation);
 }

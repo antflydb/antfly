@@ -1908,6 +1908,13 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, lib_test_mod, true, true);
 
+    const api_http_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_http_runtime_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_http_runtime_test_mod, true, true);
+
     const metadata_unit_test_root_paths = [_][]const u8{
         "pkg/antfly/src/metadata_reconciler_test_root.zig",
         "pkg/antfly/src/metadata_service_http_test_root.zig",
@@ -3332,8 +3339,6 @@ pub fn build(b: *std.Build) void {
         "query embedding cache keys isolate security domains",
         "managed embedder deadlines bound provider pacing and transport",
         "managed embedder rejects malformed provider vectors",
-        "api http retryable embedding failures provide retry guidance",
-        "api http server obtains query embedding policy from resource manager",
         "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
@@ -3381,8 +3386,6 @@ pub fn build(b: *std.Build) void {
         "inference run recognizes help before server startup",
         "inference pull classifies order independent value flags",
         "inference pull rejects flags from the other model domain",
-        "api http public sort capability gate validates mapped sortable fields",
-        "api http public sort capability gate fails closed for uncovered observed dynamic fields",
         "metadata.table generated field capabilities include schema dynamic templates",
         "metadata.table status exposes stable field capabilities",
         "metadata.table status promotes schema capability when runtime coverage is complete",
@@ -3524,6 +3527,36 @@ pub fn build(b: *std.Build) void {
     }
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
+
+    const api_http_runtime_default_filters = [_][]const u8{
+        "api http retryable embedding failures provide retry guidance",
+        "api http server obtains query embedding policy from resource manager",
+        "api http public sort capability gate validates mapped sortable fields",
+        "api http public sort capability gate fails closed for uncovered observed dynamic fields",
+        "generated route policy inventory is unique and describes wire modes",
+        "linked transport projects the universal request cancellation callback",
+        "linked callbacks preserve streaming and cancellation semantics",
+        "httpx production path sheds 128 abandoned queries and preserves control recovery",
+        "API kernel ABI rejects mismatched context and function-table prefixes",
+        "runtime HTTP values retain C layout",
+    };
+    const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
+    const api_http_runtime_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = api_http_runtime_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_api_http_runtime_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        api_http_runtime_tests,
+        api_http_runtime_filters,
+    );
+    const api_http_runtime_test_step = b.step("api-http-runtime-test", "Run focused API HTTP and linked-boundary tests");
+    api_http_runtime_test_step.dependOn(&run_api_http_runtime_tests.step);
+    root_test_step.dependOn(&run_api_http_runtime_tests.step);
 
     const introducer_tests = b.addTest(.{
         .root_module = introducer_test_mod,
@@ -4730,8 +4763,6 @@ pub fn build(b: *std.Build) void {
         "distributed join applies auth row filter to right table filter query",
         "distributed join preserves native public filters when adding join predicates",
         "scan request errors map to stable client responses",
-        "generated route policy inventory is unique and describes wire modes",
-        "API kernel ABI rejects mismatched context and function-table prefixes",
         "httpx antfly reads map missing table errors to not found",
         "httpx antfly scan honors optional body and documented bad requests",
         "httpx multi batch route uses the batch commit hook and public response contract",
@@ -4747,8 +4778,6 @@ pub fn build(b: *std.Build) void {
         "httpx owned response preserves retryable JSON metadata",
         "httpx query admission rejects saturated queries without blocking control routes",
         "httpx query admission releases a cancelled query slot",
-        "httpx rejects pipelined H1 query work when disconnect ownership is ambiguous",
-        "httpx production path sheds 128 abandoned queries and preserves control recovery",
         "compiled stored filters honor canonical JSON pointer fields and escapes",
         "jsonDocMatchesPatternFilter supports stored structured filters",
         "stored term filters preserve JSON scalar kinds",
@@ -6339,6 +6368,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_httpx_transport_regression_tests.step);
+    unit_test_step.dependOn(&run_api_http_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_casbin_tests.step);
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);
     unit_test_step.dependOn(&run_embedded_tests.step);

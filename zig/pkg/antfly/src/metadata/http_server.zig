@@ -1129,10 +1129,15 @@ pub const MetadataHttpServer = struct {
 
     fn requestContext(ctx: *httpx.Context) operation.RequestContext {
         return .{
-            .cancellation = if (ctx.cancellation) |signal|
-                operation.CancellationToken.fromAtomic(signal)
-            else
-                .none,
+            .cancellation = if (ctx.cancellation != null or ctx.cancellation_probe != null) .{
+                .ptr = ctx,
+                .is_cancelled_fn = struct {
+                    fn call(raw: *const anyopaque) bool {
+                        const context: *const httpx.Context = @ptrCast(@alignCast(raw));
+                        return context.isCancellationRequested();
+                    }
+                }.call,
+            } else .none,
             .request_id = ctx.header("x-request-id") orelse "",
         };
     }

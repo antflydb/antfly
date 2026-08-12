@@ -27,7 +27,6 @@ const platform_sync = @import("antfly_platform").sync;
 const runtime_http_bridge = @import("../runtime_http_bridge.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
-const http_common = @import("../common/http/http_common.zig");
 
 pub const CreateContext = abi.CreateContext;
 pub const CallContext = abi.CallContext;
@@ -53,7 +52,6 @@ const HandlerState = struct {
 const RouteState = struct {
     owner: *HandlerState,
     handler: httpx.Handler,
-    requires_cancellation_signal: bool,
 };
 
 const HttpResponseState = struct {
@@ -281,7 +279,6 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
     const handler = &handlerState(context).handler;
     const query = handler.query_admission.stats();
     const query_body = handler.query_body_admission.stats();
-    const runtime = handler.runtimeStats();
     output(abi.HandlerStats, context).* = .{
         .query_capacity = query.capacity,
         .query_in_flight = query.in_flight,
@@ -291,10 +288,6 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
         .query_body_in_flight = query_body.in_flight,
         .query_body_peak_in_flight = query_body.peak_in_flight,
         .query_body_rejected_total = query_body.rejected_total,
-        .cancellation_watcher_start_failures_total = runtime.cancellation_watcher_start_failures_total,
-        .peer_disconnect_cancellations_total = runtime.peer_disconnect_cancellations_total,
-        .peer_observer_failures_total = runtime.peer_observer_failures_total,
-        .active_peer_observers = runtime.active_peer_observers,
     };
     return .ok;
 }
@@ -363,12 +356,6 @@ pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi
     defer http_context.deinit();
     http_context.params = params;
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.stream);
-    var cancellation: http_common.RequestCancellation = .{};
-    var cancellation_registration: handler_mod.PeerObserver.Registration = .{};
-    if (route.requires_cancellation_signal) {
-        state.handler.installLinkedCancellationMirror(&http_context, &cancellation, &cancellation_registration) catch |err| return fail(err);
-    }
-    defer cancellation_registration.deinit();
     state.handler.api_server.recordHandledRequest();
     var response = route.handler.invoke(&http_context) catch |err| return fail(err);
     errdefer response.deinit();
@@ -475,12 +462,6 @@ fn ManifestServer(comptime prefix: []const u8) type {
             route.* = .{
                 .owner = self.owner,
                 .handler = handler,
-                .requires_cancellation_signal = metadata.streaming_response or
-                    std.mem.eql(u8, path, "/query") or
-                    std.mem.endsWith(u8, path, "/query") or
-                    std.mem.indexOf(u8, path, "/query-") != null or
-                    std.mem.indexOf(u8, path, "/vector-worker") != null or
-                    std.mem.indexOf(u8, path, "/graph-") != null,
             };
             try self.owner.routes.append(self.owner.alloc, route);
             errdefer _ = self.owner.routes.pop();

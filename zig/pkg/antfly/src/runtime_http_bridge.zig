@@ -14,7 +14,11 @@ pub const Outbound = struct {
     started: bool = false,
 
     pub fn cancellation(self: *Outbound) abi.CancellationView {
-        return .{ .context = self.context, .is_cancelled = isCancelled };
+        return .{
+            .context = self.context,
+            .is_cancelled = isCancelled,
+            .fast_flag = if (self.context.cancellation) |signal| signal else null,
+        };
     }
 
     pub fn stream(self: *Outbound) abi.StreamSink {
@@ -60,6 +64,7 @@ pub fn installInbound(
     cancellation: *const abi.CancellationView,
     stream: *const abi.StreamSink,
 ) void {
+    context.cancellation = cancellation.fastAtomicFlag();
     if (cancellation.is_cancelled != null) {
         context.cancellation_probe = .{
             .ptr = cancellation,

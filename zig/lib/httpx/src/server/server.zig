@@ -58,6 +58,7 @@ const hpack = @import("../protocol/hpack.zig");
 const stream_mod = @import("../protocol/stream.zig");
 const Stream = stream_mod.Stream;
 const SharedBodyBudget = @import("../protocol/body_budget.zig").SharedBodyBudget;
+const HttpRuntime = @import("http_runtime.zig").HttpRuntime;
 
 pub const CookieOptions = common.CookieOptions;
 pub const SameSite = common.SameSite;
@@ -83,6 +84,9 @@ pub const ServerConfig = struct {
     request_timeout_ms: u64 = 30_000,
     keep_alive_timeout_ms: u64 = 60_000,
     max_connections: u32 = 1000,
+    /// Optional transport runtime shared by multiple listeners. When absent,
+    /// the Server owns a private runtime sized to its connection limit.
+    http_runtime: ?*HttpRuntime = null,
     /// Maximum H1 requests allowed to wait for a body after headers have been
     /// parsed. 0 inherits max_connections. This preserves connection capacity
     /// for control/recovery traffic during slow uploads.
@@ -229,8 +233,8 @@ pub const Context = struct {
     h2_sock: ?*Socket = null,
     h2_stream_id: u31 = 0,
     h2_stream_sent: bool = false,
-    /// Borrowed stream-local peer-cancellation signal for HTTP/2. Null for
-    /// HTTP/1 where adapters may install their own socket watcher.
+    /// Borrowed transport-owned cancellation signal. HTTP/2 supplies the
+    /// stream reset state; HTTP/1 supplies the active connection request state.
     cancellation: ?*const std.atomic.Value(bool) = null,
     /// Optional transport-neutral cancellation source installed by adapters
     /// that cannot expose their concrete listener state to the handler.
@@ -898,6 +902,10 @@ pub const Server = struct {
         body_buffer_in_use_bytes: usize,
         body_buffer_peak_bytes: usize,
         body_buffer_rejected_total: u64,
+        active_h1_cancellation_observers: usize,
+        h1_peer_cancellations_total: u64,
+        h1_cancellation_observer_failures_total: u64,
+        h1_cancellation_registration_failures_total: u64,
     };
 
     allocator: Allocator,
@@ -933,6 +941,7 @@ pub const Server = struct {
     h1_body_budget: SharedBodyBudget,
     waiting_for_connection_permit: std.atomic.Value(bool) = .init(false),
     body_budget: SharedBodyBudget,
+    owned_http_runtime: HttpRuntime,
 
     const Self = @This();
 
@@ -1054,6 +1063,7 @@ pub const Server = struct {
 
     const ConnectionControl = struct {
         socket: *Socket,
+        h1_request_cancellation: *std.atomic.Value(bool),
         h2: ?*H2Connection = null,
         interrupted: std.atomic.Value(bool) = .init(false),
 
@@ -1061,6 +1071,7 @@ pub const Server = struct {
         /// connection fiber is the sole descriptor owner and closes it after
         /// its handler has unwound.
         fn interrupt(self: *@This(), graceful: bool) void {
+            self.h1_request_cancellation.store(true, .release);
             if (graceful) {
                 if (self.h2) |h2| {
                     h2.write_mutex.lockUncancelable(h2.io);
@@ -1077,6 +1088,7 @@ pub const Server = struct {
     const ConnectionContext = struct {
         socket: Socket,
         control: ConnectionControl,
+        h1_request_cancellation: std.atomic.Value(bool) = .init(false),
     };
 
     /// Creates a server with default configuration.
@@ -1103,6 +1115,7 @@ pub const Server = struct {
             .conn_semaphore = .{ .permits = cfg.max_connections },
             .h1_body_budget = SharedBodyBudget.init(if (cfg.max_h1_inflight_bodies == 0) cfg.max_connections else cfg.max_h1_inflight_bodies),
             .body_budget = SharedBodyBudget.init(cfg.request_body_buffer_budget_bytes),
+            .owned_http_runtime = HttpRuntime.init(allocator, .{ .max_active_h1_requests = cfg.max_connections }),
         };
     }
 
@@ -1111,6 +1124,7 @@ pub const Server = struct {
     /// fields are atomically maintained by the accept/request paths.
     pub fn runtimeStats(self: *const Self) RuntimeStats {
         const body = self.body_budget.stats();
+        const http_runtime_stats = (self.config.http_runtime orelse @constCast(&self.owned_http_runtime)).stats();
         return .{
             .max_connections = self.config.max_connections,
             .active_connections = self.active_connections.load(.acquire),
@@ -1123,11 +1137,16 @@ pub const Server = struct {
             .body_buffer_in_use_bytes = body.in_use,
             .body_buffer_peak_bytes = body.peak_in_use,
             .body_buffer_rejected_total = body.rejected_total,
+            .active_h1_cancellation_observers = http_runtime_stats.active_h1_cancellation_observers,
+            .h1_peer_cancellations_total = http_runtime_stats.h1_peer_cancellations_total,
+            .h1_cancellation_observer_failures_total = http_runtime_stats.h1_cancellation_observer_failures_total,
+            .h1_cancellation_registration_failures_total = http_runtime_stats.h1_cancellation_registration_failures_total,
         };
     }
 
     /// Releases all server resources.
     pub fn deinit(self: *Self) void {
+        self.owned_http_runtime.deinit();
         self.router.deinit();
         self.middleware.deinit(self.allocator);
         self.pre_route_hooks.deinit(self.allocator);
@@ -1245,6 +1264,8 @@ pub const Server = struct {
         // startup/shutdown race re-bind a listener after its owner has begun
         // tearing down the handler state referenced by this server.
         if (self.shutdown_mode.load(.acquire) != 0) return;
+        var http_runtime_lease = try (self.config.http_runtime orelse &self.owned_http_runtime).acquireListener();
+        defer http_runtime_lease.release();
         if (self.listener == null) try self.bind();
         if (self.shutdown_mode.load(.acquire) != 0) return;
         self.running = true;
@@ -1308,8 +1329,13 @@ pub const Server = struct {
                 self.conn_semaphore.post(self.io);
                 continue;
             };
-            connection.socket = conn.socket;
-            connection.control = .{ .socket = &connection.socket };
+            connection.* = .{
+                .socket = conn.socket,
+                .control = .{
+                    .socket = &connection.socket,
+                    .h1_request_cancellation = &connection.h1_request_cancellation,
+                },
+            };
             self.registerConnection(&connection.control) catch {
                 connection.socket.close();
                 self.allocator.destroy(connection);
@@ -1630,6 +1656,17 @@ pub const Server = struct {
             // peer-FIN cancellation when a fresh parser can complete the
             // following request without changing the live parser or buffer.
             ctx.h1_has_buffered_input = hasCompleteBufferedH1Request(self.allocator, buffer[0..leftover], self.config);
+            connection.h1_request_cancellation.store(false, .release);
+            ctx.cancellation = &connection.h1_request_cancellation;
+            var cancellation_registration = (self.config.http_runtime orelse &self.owned_http_runtime).registerH1Request(
+                sock.handle,
+                &connection.h1_request_cancellation,
+                !ctx.h1_has_buffered_input,
+            ) catch {
+                try self.sendError(&sock, 503);
+                return;
+            };
+            defer cancellation_registration.deinit();
             defer ctx.deinit();
 
             for (self.pre_route_hooks.items) |hook| {
@@ -3577,6 +3614,51 @@ test "cross-thread stop wakes an ephemeral listener" {
     try std.testing.expect(!server.running);
 }
 
+test "multiple listeners share one HTTP runtime lifecycle" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var http_runtime = HttpRuntime.init(allocator, .{ .max_active_h1_requests = 8 });
+    defer http_runtime.deinit();
+
+    var first = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 4,
+        .http_runtime = &http_runtime,
+    });
+    defer first.deinit();
+    var second = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 4,
+        .http_runtime = &http_runtime,
+    });
+    defer second.deinit();
+
+    const first_thread = try std.Thread.spawn(.{}, struct {
+        fn run(server: *Server) void {
+            server.listen() catch |err| std.debug.panic("first shared-runtime listener failed: {}", .{err});
+        }
+    }.run, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, struct {
+        fn run(server: *Server) void {
+            server.listen() catch |err| std.debug.panic("second shared-runtime listener failed: {}", .{err});
+        }
+    }.run, .{&second});
+    while (!first.listen_started.load(.acquire) or !second.listen_started.load(.acquire))
+        std.Thread.yield() catch {};
+
+    try std.testing.expectEqual(@as(usize, 2), http_runtime.stats().active_listener_leases);
+    first.stop();
+    second.stop();
+    first_thread.join();
+    second_thread.join();
+    try std.testing.expectEqual(@as(usize, 0), http_runtime.stats().active_listener_leases);
+}
+
 test "listener task binds synchronously and joins before executor teardown" {
     const allocator = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(allocator, .{});
@@ -3882,7 +3964,11 @@ test "connection interruption preserves the fiber-owned descriptor" {
     var accepted = try listener.accept();
     defer accepted.socket.close();
 
-    var control = Server.ConnectionControl{ .socket = &accepted.socket };
+    var h1_request_cancellation = std.atomic.Value(bool).init(false);
+    var control = Server.ConnectionControl{
+        .socket = &accepted.socket,
+        .h1_request_cancellation = &h1_request_cancellation,
+    };
     control.interrupt(false);
 
     const rc = posix.system.fcntl(accepted.socket.handle, posix.F.GETFD, @as(usize, 0));
