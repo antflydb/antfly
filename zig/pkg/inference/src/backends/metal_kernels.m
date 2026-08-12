@@ -1696,14 +1696,6 @@ static void termite_metal_jit_exact_dispatch_stats_init(
     }
 }
 
-static void termite_metal_paged_kv_slot_leases_init(
-    termite_metal_decode_runtime *runtime
-) {
-    for (size_t slot = 0; slot < TERMITE_METAL_PAGED_KV_SLOT_CAPACITY; ++slot) {
-        atomic_init(&runtime->attention_span_paged_slot_leased[slot], 0);
-    }
-}
-
 int termite_metal_decode_runtime_jit_exact_dispatch_stats_snapshot(
     const termite_metal_decode_runtime *runtime,
     termite_metal_jit_exact_dispatch_stats *stats
@@ -19210,6 +19202,14 @@ void termite_metal_provider_destroy(termite_metal_provider *provider) {
         provider->queue = nil;
         provider->device = nil;
         free(provider);
+    }
+}
+
+static void termite_metal_paged_kv_slot_leases_init(
+    termite_metal_decode_runtime *runtime
+) {
+    for (size_t slot = 0; slot < TERMITE_METAL_PAGED_KV_SLOT_CAPACITY; ++slot) {
+        atomic_init(&runtime->attention_span_paged_slot_leased[slot], 0);
     }
 }
 

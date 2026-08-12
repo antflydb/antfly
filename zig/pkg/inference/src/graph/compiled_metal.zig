@@ -198,6 +198,12 @@ fn ensureModelExecutor(
     return &cached.executor;
 }
 
+fn resetRuntimeAtPrefillStart(runtime: *model_runtime.ModelRuntime, request: model_runtime.PrefillRequest) !void {
+    // A fresh prompt starts at position zero. Later chunks must retain the
+    // runtime-owned KV written by earlier chunks.
+    if (request.seq_len == request.query_seq_len) try runtime.reset();
+}
+
 fn executeModelForward(
     allocator: std.mem.Allocator,
     cache: *cache_mod.GraphCache,
@@ -224,7 +230,7 @@ fn executeModelForward(
 
     var output = switch (request) {
         .prefill => |prefill_request| blk: {
-            try runtime.reset();
+            try resetRuntimeAtPrefillStart(runtime, prefill_request);
             break :blk runtime.prefill(allocator, prefill_request) catch |err| switch (err) {
                 error.UnsupportedShape,
                 error.UnsupportedDecode,
@@ -262,7 +268,7 @@ fn executeRuntimeOutput(
 ) !?model_runtime.ModelOutput {
     const output = switch (request) {
         .prefill => |prefill_request| blk: {
-            try runtime.reset();
+            try resetRuntimeAtPrefillStart(runtime, prefill_request);
             break :blk runtime.prefill(allocator, prefill_request) catch |err| switch (err) {
                 error.UnsupportedShape,
                 error.UnsupportedDecode,

@@ -73,14 +73,7 @@ const RuntimeContext = struct {
             .wasm => return error.UnexpectedWasmBackend,
         };
         const kv_dtype = kv_dtype_override orelse session_factory.recommendedKvDTypeForSession(session, backend_kind);
-        const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-            null
-        else if (gpt_config.sliding_window > 0)
-            gpt_config.sliding_window
-        else if (gpt_config.max_position_embeddings > 0)
-            gpt_config.max_position_embeddings
-        else
-            null;
+        const sliding_window_size = gpt_config.kvPoolSlidingWindowSize(false);
 
         const pool_id = try kv_manager.addPool(.{
             .backend = backend_kind,
