@@ -31,6 +31,7 @@ const storage_maintenance_operations = @import("storage_maintenance_operations.z
 const internal_group_operations = @import("internal_group_operations.zig");
 const internal_query_operations = @import("internal_query_operations.zig");
 const contextual_operations = @import("contextual_operations.zig");
+const protocol_adapters = @import("protocol_adapters.zig");
 const internal_join_operations = @import("internal_join_operations.zig");
 const internal_repair_operations = @import("internal_repair_operations.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
@@ -268,8 +269,9 @@ pub const AntflyApiHandler = struct {
         }
         if (self.api_server.cfg.experimental) {
             try server.post(routes.a2a, handler);
-            try server.get(routes.agent_card, handler);
-            try server.get(routes.agent_card_legacy, handler);
+            const a2a_card_handler = httpx.Handler.bind(self, a2aCardRoute);
+            try server.get(routes.agent_card, a2a_card_handler);
+            try server.get(routes.agent_card_legacy, a2a_card_handler);
         }
 
         const ard_handler = httpx.Handler.bind(self, ardRoute);
@@ -656,6 +658,16 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("content-type", response.content_type);
         _ = ctx.response.body(response.body);
         return ctx.response.build();
+    }
+
+    fn a2aCardRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const body = try protocol_adapters.a2aCardJsonAlloc(
+            self.api_server,
+            ApiHttpServer.queryEmbeddingSecurityScope(null),
+            @as(?AuthenticatedIdentity, null),
+        );
+        defer self.api_server.alloc.free(body);
+        return jsonResponse(ctx, 200, body);
     }
 
     fn authorizeStorageMaintenance(
@@ -6114,6 +6126,7 @@ test "httpx ARD routes call typed contextual operations directly" {
     const alloc = std.testing.allocator;
     var source = AuthStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{
+        .experimental = true,
         .ard_public_catalog_enabled = true,
         .ard_publisher_domain = "tenant.example.com",
         .ard_display_name = "Tenant Antfly",
@@ -6144,6 +6157,13 @@ test "httpx ARD routes call typed contextual operations directly" {
     try std.testing.expectEqual(@as(u16, 200), public_catalog.status.code);
     try std.testing.expectEqualStrings("*", public_catalog.header("Access-Control-Allow-Origin").?);
     try std.testing.expect(std.mem.indexOf(u8, public_catalog.body.?, "application/ai-registry+json") != null);
+
+    const card_url = try std.fmt.allocPrint(alloc, "{s}/.well-known/agent-card.json", .{base_url});
+    defer alloc.free(card_url);
+    var card = try getWithRetry(&client, client_io.io(), card_url, null, 20);
+    defer card.deinit();
+    try std.testing.expectEqual(@as(u16, 200), card.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, card.body.?, "\"skills\"") != null);
 }
 
 test "httpx storage maintenance routes call typed operations directly" {

@@ -3877,13 +3877,6 @@ pub const ApiHttpServer = struct {
                 authenticated_identity,
             );
         }
-        if (req.method == .GET and (std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card_legacy) or std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card))) {
-            return try protocol_adapters.handleA2aCard(
-                self,
-                queryEmbeddingSecurityScope(null),
-                @as(?AuthenticatedIdentity, null),
-            );
-        }
         return null;
     }
 

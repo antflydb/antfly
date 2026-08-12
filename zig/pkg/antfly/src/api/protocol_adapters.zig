@@ -1423,11 +1423,14 @@ const A2aLiveSseSink = struct {
     }
 };
 
-pub fn handleA2aCard(
+/// Build the A2A card as an owned application result without allocating a
+/// legacy HTTP response. The caller owns the returned JSON with
+/// `server_ptr.alloc`.
+pub fn a2aCardJsonAlloc(
     server_ptr: anytype,
     query_embedding_security_scope: anytype,
     authenticated_identity: anytype,
-) !http_common.HttpResponse {
+) ![]u8 {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
     var dispatcher = try buildA2aDispatcher(
@@ -1438,9 +1441,7 @@ pub fn handleA2aCard(
         authenticated_identity,
     );
     const card = try dispatcher.agentCard(arena_impl.allocator());
-    const body = try stringifyJsonValue(server_ptr.alloc, card);
-    defer server_ptr.alloc.free(body);
-    return try jsonBodyResponseWithStatus(server_ptr.alloc, 200, body);
+    return stringifyJsonValue(server_ptr.alloc, card);
 }
 
 fn buildA2aDispatcher(

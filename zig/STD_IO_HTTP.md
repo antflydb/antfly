@@ -172,6 +172,10 @@ that end state:
   parsing and visibility checks receive typed method/path/query values; JSON
   and event-stream adaptation is performed by `httpx`. Their legacy dispatcher
   branch and response-conversion helper have been removed.
+- Canonical and legacy-location A2A agent-card reads now use a direct `httpx`
+  handler over an owned JSON builder. Card generation no longer constructs a
+  request or response compatibility object; the session-oriented A2A POST
+  transport remains a separate pending slice.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those
