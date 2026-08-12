@@ -4384,13 +4384,94 @@ The executable is static AArch64, has no dynamic section, and contains no LMDB
 entry-point strings. The shared library exports no private runtime, API,
 inference, storage-owner, snapshot, restore, or data-apply symbols.
 
-Decision: **keep as the next normal-runner candidate**. It repairs the concrete
+The exact pushed tree then passed normal-runner run `31636098096`, job
+`94246658560`, at commit `8704c80a4`. All 39 build steps, compiler-report
+collection, graph/error gates, artifact checks, and upload succeeded on the
+unchanged 24,000 MiB ARC runner request:
+
+| Unit | Runner time | LLVM | Zig MaxRSS |
+|---|---:|---:|---:|
+| Storage + local query | 556.232 s | 544.154 s | 8 GiB |
+| Distributed/API control | 536.737 s | 524.059 s | 8 GiB |
+| Serverless + remote CLI | 260.539 s | 253.022 s | 4 GiB |
+| Inference | 544.578 s | 482.710 s | 7 GiB |
+| Enrichment compute | 39.345 s | 37.031 s | 1 GiB |
+
+Storage improved 81.312 seconds from the Phase 4y 637.544-second runner
+baseline. The complete cold archive improved from 19:22.35 to 18:44.76. GNU
+time reported 8,469,864 KiB maximum process-tree RSS and zero swap. The runner
+reproduced the local graph exactly at 2,037 file instances, 1,257 unique files,
+and 780 duplicate instances. Its static executable was 69,385,592 B and C API
+was 18,910,408 B, matching the local artifacts.
+
+Decision: **keep and continue the goal loop**. It repairs the concrete
 post-main source leak, crosses only an existing coarse identity-preserving ABI,
 and produces a material local critical-path reduction without merging
 inference into application code. The 5.90% executable increase is a measured
-tradeoff, not an unnoticed regression. Acceptance still requires a clean
-normal-runner build proving timing, RSS admission, artifact size, and graph
-gates on the exact tree.
+tradeoff, not an unnoticed regression. Normal-runner reliability, RSS,
+artifact, and graph gates now pass, but storage, distributed, and inference
+remain above the 380-second gate. Another source/ownership cut is required;
+runner size, swap, cache priming, serialized compilation, or merging inference
+back into application code are not acceptable substitutes.
+
+### Phase 4ab: independent API and runtime/standalone control units
+
+Normal-runner scaling showed that the 536.737-second combined distributed/API
+unit also needed a real source split. Measurement-only roots first tested the
+ownership choices on fresh ARM64 musl `ReleaseFast` caches:
+
+| Probe | Local time | LLVM | Result |
+|---|---:|---:|---|
+| API + data + metadata + HA, no standalone | about 4 m | — | Too large; standalone alone is not the retaining root |
+| Data + metadata + HA | 163.208 s | 158.803 s | Small enough, but a three-way split repeats runtime code |
+| API + standalone | 229.878 s | 224.191 s | Too large and still emits `data.runtime` |
+| API only | 154.016 s | 149.887 s | Viable |
+| Standalone only | 130.011 s | 126.283 s | Viable but requires a large lifecycle ABI to be truly thin |
+| Data + metadata + HA + standalone | 172.123 s | 167.481 s | Viable without changing runtime ownership |
+
+The naive API/standalone/runtime three-way split was rejected despite its
+individual times. Standalone directly owns `DataServer`, local metadata,
+schema progress, HA hooks, and unified startup/shutdown; pretending it was
+thin composition repeated 4.29 MB of named text across the three objects. A
+new lifecycle ABI would be a substantial semantic migration, not a build-file
+cleanup.
+
+The retained experiment instead reuses the already-established compiled API
+kernel boundary and keeps data, metadata, HA, and standalone together. No new
+domain ABI is introduced. The API archive continues to use its opaque provider
+and route-registration contracts, including exact status/error behavior. A
+cold full production build measured:
+
+| Unit | Local time | LLVM | Files | Declarations |
+|---|---:|---:|---:|---:|
+| Storage + local query | 273.725 s | 267.435 s | 668 | 30,625 |
+| Data/metadata/HA + standalone | 172.827 s | 167.917 s | 668 | 23,959 |
+| API kernel | 152.371 s | 148.069 s | 518 | 19,425 |
+| Serverless + remote CLI | 128.988 s | 125.293 s | 565 | 15,196 |
+| Inference | 250.276 s | 239.176 s | 712 | 26,645 |
+| Enrichment compute | 19.081 s | 18.076 s | 132 | 3,510 |
+
+All 43 build steps succeeded. Distributed/standalone fell 90.442 seconds from
+the Phase 4aa 263.269-second local unit. API, distributed, and serverless each
+pass the authoritative physical-storage compiler gate. The scheduler starts
+storage with distributed/standalone, starts inference after distributed, and
+starts the three shorter units after storage. Thus API cannot steal the claim
+needed to begin inference, while all later work remains normally concurrent.
+
+The six reports contain 2,305 repository-file instances, 1,257 unique files,
+and 1,048 duplicate instances. Repeated named text is 3,607,360 B. The stripped
+static executable is 72,995,680 B, 5.20% larger than Phase 4aa and 11.40% above
+Phase 4y. CAPI remains exactly 18,910,424 B because it does not link either
+control archive. The executable remains static AArch64 with no dynamic section
+or LMDB entry-point strings; the CAPI still exposes no private runtime symbols.
+
+Decision: **runner trial required**. The executable/overlap cost is material,
+but bounded to the static executable and buys a 34.4% reduction in the combined
+control compiler. Keep only if the normal runner brings both API and
+distributed below 380 seconds and materially shortens the inference-start
+chain. This does not complete the architecture goal: storage and inference
+remain the next heavy roots, and neither may be hidden with more RAM, swap,
+cache priming, or serialization.
 
 ## Holistic target architecture
 
@@ -4405,9 +4486,9 @@ normal Linux runner
 measured 599.665 seconds for storage/query, versus 664.411 seconds for the
 immediately preceding matched six-unit repeat. The topology therefore has
 runner reliability evidence and a controlled 64.746-second improvement. The
-Phase 4y source-selection repair has now passed on that runner. It is the
-ownership/reliability baseline; Phase 4aa still needs exact normal-runner proof
-against the 380-second gate.
+Phase 4y source-selection repair and Phase 4aa product split have now passed on
+that runner. They are the ownership/reliability baseline, but all three heavy
+units still miss the 380-second gate.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:

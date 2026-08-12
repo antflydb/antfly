@@ -158,6 +158,10 @@ jobs:
             "$RUNNER_TEMP/linked-runtime-reports/distributed.json" 30 &
           distributed_report_pid=$!
           "$node_bin" tools/capture_zig_time_report.mjs \
+            ws://127.0.0.1:19125/ antfly-runtime-api_kernel \
+            "$RUNNER_TEMP/linked-runtime-reports/api.json" 30 &
+          api_report_pid=$!
+          "$node_bin" tools/capture_zig_time_report.mjs \
             ws://127.0.0.1:19125/ antfly-runtime-serverless \
             "$RUNNER_TEMP/linked-runtime-reports/serverless.json" 5 &
           serverless_report_pid=$!
@@ -174,6 +178,7 @@ jobs:
           for report_pid in \
             "$storage_report_pid" \
             "$distributed_report_pid" \
+            "$api_report_pid" \
             "$serverless_report_pid" \
             "$enrichment_report_pid" \
             "$inference_report_pid"; do
@@ -213,10 +218,11 @@ jobs:
 
           storage_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-storage-kernel_zcu.o' -print -quit)"
           distributed_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-distributed_zcu.o' -print -quit)"
+          api_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-api_kernel_zcu.o' -print -quit)"
           serverless_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-serverless_zcu.o' -print -quit)"
           enrichment_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-enrichment_compute_zcu.o' -print -quit)"
           inference_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-inference_zcu.o' -print -quit)"
-          if [ -z "$storage_object" ] || [ -z "$distributed_object" ] || [ -z "$serverless_object" ] || [ -z "$enrichment_object" ] || [ -z "$inference_object" ]; then
+          if [ -z "$storage_object" ] || [ -z "$distributed_object" ] || [ -z "$api_object" ] || [ -z "$serverless_object" ] || [ -z "$enrichment_object" ] || [ -z "$inference_object" ]; then
             echo "Zig runtime objects were not found for emitted-overlap analysis" >&2
             exit 1
           fi
@@ -224,11 +230,13 @@ jobs:
           python3 tools/analyze_zig_import_graph.py \
             --time-report "storage=$RUNNER_TEMP/linked-runtime-reports/storage.json" \
             --time-report "distributed=$RUNNER_TEMP/linked-runtime-reports/distributed.json" \
+            --time-report "api=$RUNNER_TEMP/linked-runtime-reports/api.json" \
             --time-report "serverless=$RUNNER_TEMP/linked-runtime-reports/serverless.json" \
             --time-report "enrichment=$RUNNER_TEMP/linked-runtime-reports/enrichment.json" \
             --time-report "inference=$RUNNER_TEMP/linked-runtime-reports/inference.json" \
             --object "storage=$storage_object" \
             --object "distributed=$distributed_object" \
+            --object "api=$api_object" \
             --object "serverless=$serverless_object" \
             --object "enrichment=$enrichment_object" \
             --object "inference=$inference_object" \

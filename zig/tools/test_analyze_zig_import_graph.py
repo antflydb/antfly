@@ -157,10 +157,17 @@ class ImportGraphTest(unittest.TestCase):
             frozenset({control}),
             True,
         )
+        api = analyzer.TimeReport(
+            "api",
+            self.root / "api.json",
+            {},
+            frozenset({control}),
+            True,
+        )
 
         self.assertTrue(
             analyzer.check_compiled_storage_boundary(
-                {"distributed": distributed, "serverless": serverless}, self.root
+                {"distributed": distributed, "api": api, "serverless": serverless}, self.root
             )
         )
 
@@ -207,6 +214,24 @@ class ImportGraphTest(unittest.TestCase):
 
         self.assertFalse(clean)
         self.assertIn("serverless analyzes storage/db/db.zig", diagnostics.getvalue())
+
+    def test_compiled_storage_boundary_rejects_physical_api_report(self):
+        control = self.write("storage/db/control_root.zig", "pub const value = 1;\n")
+        physical = self.write("storage/db/db.zig", "pub const value = 1;\n")
+        reports = {
+            "distributed": analyzer.TimeReport(
+                "distributed", self.root / "distributed.json", {}, frozenset({control}), True
+            ),
+            "api": analyzer.TimeReport(
+                "api", self.root / "api.json", {}, frozenset({physical}), True
+            ),
+        }
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            clean = analyzer.check_compiled_storage_boundary(reports, self.root)
+
+        self.assertFalse(clean)
+        self.assertIn("api analyzes storage/db/db.zig", diagnostics.getvalue())
 
     def write_ha_seed_failure_fixture(self, registry: str, activation: str) -> None:
         self.write("runtime_failure_identity.zig", registry)

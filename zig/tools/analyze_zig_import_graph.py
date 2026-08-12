@@ -1066,8 +1066,9 @@ def check_compiled_storage_boundary(
         )
         return False
     candidates = [distributed]
-    if serverless := reports.get("serverless"):
-        candidates.append(serverless)
+    for name in ("api", "serverless"):
+        if report := reports.get(name):
+            candidates.append(report)
     for report in candidates:
         if report.has_file_list:
             continue

@@ -9235,7 +9235,6 @@ pub fn build(b: *std.Build) void {
                 unit != .cli_pic_probe and unit != .control_api_probe and
                 unit != .local_query and
                 (unit != .cli or !storage_kernel_experiment) and
-                (unit != .api_kernel or !storage_kernel_experiment) and
                 (unit != .storage_kernel or storage_kernel_experiment) and
                 (unit != .enrichment_compute or storage_kernel_experiment);
             const owns_storage_kernel = unit == .storage_kernel or unit == .data_pic_probe or
@@ -9337,12 +9336,11 @@ pub fn build(b: *std.Build) void {
             // short or later unit from consuming the claim needed by a
             // critical unit and accidentally serializing the long path.
             switch (unit) {
-                .api_kernel => if (!storage_kernel_experiment) {
+                .api_kernel => {
                     api_runtime_artifact = role_artifact;
                 },
                 .distributed => {
                     application_runtime_artifact = role_artifact;
-                    if (storage_kernel_experiment) api_runtime_artifact = role_artifact;
                 },
                 .enrichment_compute => {
                     enrichment_compute_artifact = role_artifact;
@@ -9583,7 +9581,7 @@ pub fn build(b: *std.Build) void {
                 );
                 metadata_runtime_owner_test_step.dependOn(&run_metadata_runtime_owner_tests.step);
             }
-            if (owns_storage_kernel or unit == .serverless or unit == .enrichment_compute or unit == .local_query or
+            if (owns_storage_kernel or unit == .api_kernel or unit == .serverless or unit == .enrichment_compute or unit == .local_query or
                 unit == .control_api_probe or
                 (storage_kernel_experiment and unit == .distributed))
             {
@@ -9620,6 +9618,14 @@ pub fn build(b: *std.Build) void {
             }
         }
 
+        if (storage_kernel_experiment) {
+            // Storage and the smaller distributed/standalone runtime form the
+            // initial 19.25 GiB group. The API unit starts after storage and
+            // overlaps inference, avoiding a third initial LLVM compiler while
+            // retaining normal parallel code generation.
+            api_runtime_artifact.?.step.dependOn(&storage_runtime_artifact.?.step);
+        }
+
         // These focused suites exercise the storage archive exactly as it is
         // composed into the final executable. Their intentionally external API,
         // product-edge, and embedded-inference entry points are supplied by
@@ -9632,6 +9638,7 @@ pub fn build(b: *std.Build) void {
         }) |maybe_tests| {
             const tests = maybe_tests orelse continue;
             tests.root_module.linkLibrary(api_runtime_artifact.?);
+            tests.root_module.linkLibrary(application_runtime_artifact.?);
             tests.root_module.linkLibrary(inference_runtime_artifact.?);
             tests.root_module.linkLibrary(enrichment_compute_artifact.?);
         }

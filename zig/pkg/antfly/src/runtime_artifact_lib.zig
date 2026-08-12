@@ -395,7 +395,6 @@ comptime {
             exportInternal(&haEntry, "antfly_runtime_ha");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
             if (unit_options.storage_kernel_experiment) {
-                exportApiKernel();
                 exportInternal(&distributedHttpxRegister, "antfly_distributed_httpx_register");
             }
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
