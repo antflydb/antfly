@@ -3930,6 +3930,69 @@ container crosses the compiled boundary. This is both an identity-correctness
 requirement and the architectural cut needed to remove inference implementation
 roots from distributed control.
 
+### Phase 4w: total-order aggregation sort specialization
+
+The first post-boundary compiler profile showed that the critical
+storage/query unit was already below the preferred local gate but still spent
+98% of its time in LLVM. `std.sort.block` was the second-largest reported
+generic family: 143 stable-sort specializations, with 556 ms of aggregate
+front-end/codegen attribution. This is not another archive boundary, but it is
+a bounded way to reduce the LLVM input inside the existing physical owner.
+
+An audit found 28 stable sorts in `storage/db/aggregations.zig`. Twenty-seven
+sort bucket collections whose keys are unique or whose comparators include an
+explicit deterministic tie-breaker. Stability therefore carries no semantic
+information. Those calls now use `std.mem.sortUnstable`, Zig's PDQ sort. The
+percentile value sort remains stable because IEEE NaN values compare
+equivalent under its current comparator and changing their relative order was
+not part of this experiment.
+
+Matched cold Apple-Silicon cross-builds used Zig 0.16.0, fresh local/global
+caches, ARM64 Linux musl `ReleaseFast`, production LSM-only mode, stripping,
+the opt-in five-unit topology, and normal concurrency:
+
+| Metric | ABI-34 baseline | Total-order PDQ candidate | Change |
+|---|---:|---:|---:|
+| Storage/query compiler | 327.342 s | 302.038 s | -25.304 s (-7.7%) |
+| LLVM emission | 320.798 s | 295.722 s | -25.076 s |
+| Generic instances | 18,211 | 18,136 | -75 |
+| Stable block-sort instances | 143 | 119 | -24 |
+| Storage object | 31,374,888 B | 31,337,648 B | -37,240 B |
+| `libantfly.so` | 18,462,032 B | 18,438,256 B | -23,776 B |
+| Reported storage MaxRSS | 5 GiB | 5 GiB | unchanged |
+
+The authoritative graph is unchanged at 771 imported files, 592 repository
+files, 919,313 repository lines, and 33,479 declarations. This is expected:
+the gain removes generic specializations rather than dependency edges. The
+aggregate emitted `aggregations.zig` attribution grows from 399,498 B to
+462,734 B because the PDQ implementations are attributed to their callers,
+while unassigned standard-library sort code falls enough for the complete
+storage object and final CAPI to shrink. Object totals, rather than per-module
+attribution alone, are the artifact gate.
+
+All 56 focused aggregation tests pass with zero leaks, including deterministic
+terms, composite, histogram, date, range, nested-cardinality, and distributed
+merge ordering. The storage-owner, CAPI, and enrichment cross-archive suites
+also pass; graph gates remain green and the analyzer is 17/17. A temporary
+ReleaseFast benchmark over 20 rounds of 100,000 representative total-order
+buckets verified identical sorted keys and measured PDQ at 0.767 times the
+stable-sort duration, so the compile win does not trade away the relevant
+runtime path.
+
+The focused DB suite initially could not compile because its physical-storage
+root lacked the canonical `storage_source_options` and `kernel_owner_abi`
+modules introduced by the owner cut. The build now injects those exact shared
+modules explicitly. This is a test-composition repair, not a duplicate ABI:
+focused DB tests exercise the same source-selection and stable owner contract
+as the linked storage artifact, including its failure/status identities.
+
+Decision: **keep the total-order sort specialization and test-root repair**.
+It is a material, behavior-preserving 25-second reduction inside the local
+critical unit and leaves memory, graph, artifact, and boundary identity gates
+green. It does not complete the main goal by itself and does not supersede the
+required `AntflyProvider` replacement described in Phase 4v. Normal-runner
+evidence is still required before attributing the same reduction to Linux.
+
 ## Holistic target architecture
 
 The current structural candidate is the opt-in five-unit source-selected topology above:

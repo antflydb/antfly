@@ -6651,6 +6651,14 @@ pub fn build(b: *std.Build) void {
     index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
     const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    // The DB test root owns physical storage directly, just like the storage
+    // runtime artifact. Keep its compile-time source selection and opaque
+    // owner ABI imports explicit so focused DB tests exercise the same
+    // boundary contracts instead of depending on a parent module's imports.
+    const db_test_storage_source_options = b.addOptions();
+    db_test_storage_source_options.addOption(bool, "control_only", false);
+    db_test_mod.addOptions("storage_source_options", db_test_storage_source_options);
+    db_test_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
     const transcribing_db_test_stub_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/testing/transcribing_stub.zig"),
         .target = target,

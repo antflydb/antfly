@@ -1736,7 +1736,7 @@ fn computeAlgebraicTermsAggregation(
         kept_idx += 1;
     }
 
-    std.mem.sort(TermsBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(TermsBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
             if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             return lhs.count > rhs.count;
@@ -1853,7 +1853,7 @@ fn computeAlgebraicTermsFromVisibleDocFactsAlloc(
     }
 
     if (exceedsAlgebraicResultBucketLimit(index, buckets_accum.items.len)) return error.AlgebraicResultBucketLimit;
-    std.mem.sort(TermsBucketAccum, buckets_accum.items, {}, struct {
+    std.mem.sortUnstable(TermsBucketAccum, buckets_accum.items, {}, struct {
         fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
             if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             return lhs.count > rhs.count;
@@ -2008,7 +2008,7 @@ fn computeAlgebraicCompositeTermsAggregation(
         candidates_filled += 1;
     }
 
-    std.mem.sort(CompositeTermsCandidate, candidates, {}, struct {
+    std.mem.sortUnstable(CompositeTermsCandidate, candidates, {}, struct {
         fn lessThan(_: void, lhs: CompositeTermsCandidate, rhs: CompositeTermsCandidate) bool {
             if (lhs.bucket.count == rhs.bucket.count) return std.mem.order(u8, lhs.key_json, rhs.key_json) == .lt;
             return lhs.bucket.count > rhs.bucket.count;
@@ -2159,7 +2159,7 @@ fn computeAlgebraicPathFactTermsAggregation(
         kept_idx += 1;
     }
 
-    std.mem.sort(TermsBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(TermsBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
             if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             return lhs.count > rhs.count;
@@ -2285,7 +2285,7 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
         candidates[kept_idx] = bucket;
         kept_idx += 1;
     }
-    std.mem.sort(TermsCardinalityBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(TermsCardinalityBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: TermsCardinalityBucketAccum, rhs: TermsCardinalityBucketAccum) bool {
             if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             return lhs.count > rhs.count;
@@ -2464,7 +2464,7 @@ fn computeDerivedJoinTermsAggregation(
         kept_idx += 1;
     }
 
-    std.mem.sort(TermsBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(TermsBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
             if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             return lhs.count > rhs.count;
@@ -2582,7 +2582,7 @@ pub fn algebraicTermsAggregationFromDistributedPartialsAlloc(
         kept_idx += 1;
     }
 
-    std.mem.sort(TermsBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(TermsBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
             if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             return lhs.count > rhs.count;
@@ -2664,7 +2664,7 @@ pub fn algebraicTermsCardinalityAggregationFromDistributedPartialsAlloc(
         candidates[kept_idx] = bucket;
         kept_idx += 1;
     }
-    std.mem.sort(TermsCardinalityBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(TermsCardinalityBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: TermsCardinalityBucketAccum, rhs: TermsCardinalityBucketAccum) bool {
             if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             return lhs.count > rhs.count;
@@ -2763,7 +2763,7 @@ fn algebraicPathFactTermsCardinalityAggregationFromDistributedPartialsAlloc(
         candidates[kept_idx] = bucket;
         kept_idx += 1;
     }
-    std.mem.sort(TermsCardinalityBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(TermsCardinalityBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: TermsCardinalityBucketAccum, rhs: TermsCardinalityBucketAccum) bool {
             if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             return lhs.count > rhs.count;
@@ -2873,7 +2873,7 @@ fn algebraicPathFactTermsAggregationFromDistributedPartialsAlloc(
         kept_idx += 1;
     }
 
-    std.mem.sort(TermsBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(TermsBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
             if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             return lhs.count > rhs.count;
@@ -3242,7 +3242,7 @@ pub fn algebraicDateHistogramAggregationFromDistributedPartialsAlloc(
         kept_idx += 1;
     }
 
-    std.mem.sort(DateBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(DateBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: DateBucketAccum, rhs: DateBucketAccum) bool {
             return std.mem.order(u8, lhs.bucket_start, rhs.bucket_start) == .lt;
         }
@@ -3587,7 +3587,7 @@ pub fn algebraicHistogramAggregationFromDistributedPartialsAlloc(
         kept_idx += 1;
     }
 
-    std.mem.sort(HistogramBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(HistogramBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: HistogramBucketAccum, rhs: HistogramBucketAccum) bool {
             return lhs.bucket_index < rhs.bucket_index;
         }
@@ -3689,7 +3689,7 @@ fn algebraicDocFactHistogramAggregationFromDistributedPartialsAlloc(
         kept_idx += 1;
     }
 
-    std.mem.sort(HistogramBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(HistogramBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: HistogramBucketAccum, rhs: HistogramBucketAccum) bool {
             return lhs.bucket_index < rhs.bucket_index;
         }
@@ -4116,13 +4116,13 @@ fn algebraicHistogramCardinalityAggregationFromDistributedPartialsAlloc(
     }
 
     if (date) {
-        std.mem.sort(HistogramCardinalityBucketAccum, candidates, {}, struct {
+        std.mem.sortUnstable(HistogramCardinalityBucketAccum, candidates, {}, struct {
             fn lessThan(_: void, lhs: HistogramCardinalityBucketAccum, rhs: HistogramCardinalityBucketAccum) bool {
                 return std.mem.order(u8, lhs.axis, rhs.axis) == .lt;
             }
         }.lessThan);
     } else {
-        std.mem.sort(HistogramCardinalityBucketAccum, candidates, {}, struct {
+        std.mem.sortUnstable(HistogramCardinalityBucketAccum, candidates, {}, struct {
             fn lessThan(_: void, lhs: HistogramCardinalityBucketAccum, rhs: HistogramCardinalityBucketAccum) bool {
                 const left = std.fmt.parseInt(i64, lhs.axis, 10) catch 0;
                 const right = std.fmt.parseInt(i64, rhs.axis, 10) catch 0;
@@ -4448,7 +4448,7 @@ fn computeAdaptiveTermsAggregation(
         candidates[kept_idx] = bucket;
         kept_idx += 1;
     }
-    std.mem.sort(TermsBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(TermsBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
             if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             return lhs.count > rhs.count;
@@ -5053,7 +5053,7 @@ fn computeDerivedJoinHistogramAggregation(
         kept_idx += 1;
     }
 
-    std.mem.sort(HistogramBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(HistogramBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: HistogramBucketAccum, rhs: HistogramBucketAccum) bool {
             return lhs.bucket_index < rhs.bucket_index;
         }
@@ -5238,7 +5238,7 @@ fn computeAlgebraicHistogramAggregation(
     }
     if (exceedsAlgebraicResultBucketLimit(index, candidates.items.len)) return error.AlgebraicResultBucketLimit;
 
-    std.mem.sort(HistogramBucketAccum, candidates.items, {}, struct {
+    std.mem.sortUnstable(HistogramBucketAccum, candidates.items, {}, struct {
         fn lessThan(_: void, lhs: HistogramBucketAccum, rhs: HistogramBucketAccum) bool {
             return lhs.bucket_index < rhs.bucket_index;
         }
@@ -5739,7 +5739,7 @@ fn computeAlgebraicDateHistogramAggregation(
         kept_idx += 1;
     }
 
-    std.mem.sort(DateBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(DateBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: DateBucketAccum, rhs: DateBucketAccum) bool {
             return std.mem.order(u8, lhs.bucket_start, rhs.bucket_start) == .lt;
         }
@@ -5843,7 +5843,7 @@ fn computeAlgebraicDateHistogramFromVisibleDocFactsAlloc(
         if (request.min_doc_count > 0 and count < request.min_doc_count) continue;
         try present_keys.append(alloc, entry.key_ptr.*);
     }
-    std.mem.sort(u64, present_keys.items, {}, struct {
+    std.mem.sortUnstable(u64, present_keys.items, {}, struct {
         fn lessThan(_: void, lhs: u64, rhs: u64) bool {
             return lhs < rhs;
         }
@@ -5984,7 +5984,7 @@ fn computeDerivedJoinDateHistogramAggregation(
         candidates[kept_idx] = bucket;
         kept_idx += 1;
     }
-    std.mem.sort(DateBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(DateBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: DateBucketAccum, rhs: DateBucketAccum) bool {
             return std.mem.order(u8, lhs.bucket_start, rhs.bucket_start) == .lt;
         }
@@ -6123,7 +6123,7 @@ fn computeAdaptiveDateHistogramAggregation(
         candidates[kept_idx] = bucket;
         kept_idx += 1;
     }
-    std.mem.sort(DateBucketAccum, candidates, {}, struct {
+    std.mem.sortUnstable(DateBucketAccum, candidates, {}, struct {
         fn lessThan(_: void, lhs: DateBucketAccum, rhs: DateBucketAccum) bool {
             return std.mem.order(u8, lhs.bucket_start, rhs.bucket_start) == .lt;
         }
@@ -6422,7 +6422,7 @@ fn computeTermsAggregation(
         if (request.min_doc_count > 0 and count < request.min_doc_count) continue;
         try entries.append(alloc, .{ .key = key, .count = count });
     }
-    std.mem.sort(@TypeOf(entries.items[0]), entries.items, {}, struct {
+    std.mem.sortUnstable(@TypeOf(entries.items[0]), entries.items, {}, struct {
         fn lessThan(_: void, lhs: @TypeOf(entries.items[0]), rhs: @TypeOf(entries.items[0])) bool {
             if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             return lhs.count > rhs.count;
@@ -6533,7 +6533,7 @@ fn computeCompositeTermsAggregation(
         if (request.min_doc_count > 0 and count < request.min_doc_count) continue;
         try entries.append(alloc, .{ .key = key, .count = count });
     }
-    std.mem.sort(@TypeOf(entries.items[0]), entries.items, {}, struct {
+    std.mem.sortUnstable(@TypeOf(entries.items[0]), entries.items, {}, struct {
         fn lessThan(_: void, lhs: @TypeOf(entries.items[0]), rhs: @TypeOf(entries.items[0])) bool {
             if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             return lhs.count > rhs.count;
@@ -6766,7 +6766,7 @@ fn computeSignificantTermsAggregation(
         });
     }
 
-    std.mem.sort(ScoredTerm, scored.items, {}, struct {
+    std.mem.sortUnstable(ScoredTerm, scored.items, {}, struct {
         fn lessThan(_: void, lhs: ScoredTerm, rhs: ScoredTerm) bool {
             if (lhs.score == rhs.score) {
                 if (lhs.fg_count == rhs.fg_count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
@@ -6972,7 +6972,7 @@ fn computeHistogramAggregation(
         present_keys[present_count] = entry.key_ptr.*;
         present_count += 1;
     }
-    std.mem.sort(i64, present_keys[0..present_count], {}, struct {
+    std.mem.sortUnstable(i64, present_keys[0..present_count], {}, struct {
         fn lessThan(_: void, lhs: i64, rhs: i64) bool {
             return lhs < rhs;
         }
@@ -7667,7 +7667,7 @@ fn applyBucketSort(
     const permutation = try alloc.alloc(usize, buckets_ptr.*.len);
     defer alloc.free(permutation);
     for (permutation, 0..) |*entry, i| entry.* = i;
-    std.mem.sort(usize, permutation, SortContext{
+    std.mem.sortUnstable(usize, permutation, SortContext{
         .descending = descending,
         .sort_values = sort_values,
         .buckets = buckets_ptr.*,
