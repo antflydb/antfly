@@ -201,6 +201,7 @@ the same host, target, cache state, and report set.
 | Experimental control-only provisioned write vtable | Application 366.523 s, 41,591 declarations, and only 703 KB less allocatable object data while adding a 216.358 s storage unit | Rejected; the vtable shell is small and direct runtime storage ownership remains |
 | Atomic control-only physical-source cut | Focused distributed control 236 s; full cold archive 509 s -> 458 s; storage 316 s / 4.03 GiB and distributed 233 s / 2.98 GiB; executable 71.79 MB -> 65.27 MB | Keep behind the experiment; production enablement remains pending repeated normal-runner proof |
 | First normal-runner physical-source cut | Storage 11 m / 10 GB, distributed 8 m / 8 GB, inference 7 m / 6 GB; complete archive 16:25.14; executable 65.27 MB; C API 16.68 MB | Reliable and structurally valid, but both critical units miss 380 s; revise using authoritative Linux time reports |
+| Atomic local-query cut, normal runner | 43/43 steps; storage 590.707 s, distributed 482.636 s, local query 127.258 s, inference 528.849 s; complete build 19:23.59; executable 63.312 MB; C API 20.495 MB | Keep the identity-safe boundary opt-in; source ownership and artifacts pass, but reject the current six-unit schedule as the production performance solution |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -3721,18 +3722,60 @@ ReleaseFast reliability, time/RSS, archive shape, and representative runtime
 behavior. Do not raise runner cost or enable the experiment by default based
 only on the local result.
 
+The authoritative normal-runner build then passed in GitHub Actions run
+`31547528877`, job `93963102627`, at commit `e931ad3af`. All 43 build steps,
+artifact and private-symbol checks, and artifact upload succeeded with normal
+concurrency on the unchanged 24,000 MiB ARC runner request. The release
+remained one stripped, statically linked ARM64 musl executable. The compiler
+reported zero swap and no `bad_alloc`; the largest individual GNU-time RSS was
+8,251,228 KiB. This workflow did not sample cgroup-wide peak or event counters,
+so the earlier cgroup measurements must not be attributed to this run.
+
+| Unit | Compiler time | LLVM emission | Repository graph | Declarations | Zig MaxRSS |
+|---|---:|---:|---:|---:|---:|
+| Storage kernel | 590.707 s | 579.024 s | 580 files / 905,892 lines | 31,433 | 8 GiB |
+| Distributed/API control | 482.636 s | 471.354 s | 542 files / 763,766 lines | 28,521 | 7 GiB |
+| Local query | 127.258 s | 123.090 s | 215 files / 460,659 lines | 10,290 | 3 GiB |
+| Inference | 528.849 s | 473.900 s | 524 files / 580,424 lines | 24,994 | 7 GiB |
+| Remote CLI | 75.569 s | 71.049 s | 53 files / 39,138 lines | 5,804 | 2 GiB |
+| Enrichment compute | 35.579 s | 34.298 s | 34 files / 55,942 lines | 3,276 | 1 GiB |
+
+The complete build command took 19:23.59 and the Actions job took 20:24. The
+storage-then-local-query compiler chain was 717.965 seconds, while distributed
+and inference independently remained above 380 seconds. The runner result
+therefore confirms reliability and the intended source cut, but rejects the
+current six-unit schedule as a solution to the performance goal. Linux CPU
+contention, not memory admission, remains the dominant discrepancy from the
+340.020-second local chain.
+
+The final executable was 63,312,024 B and `libantfly.so` was 20,495,352 B,
+consistent with the local artifacts and below the 20 MiB CAPI gate. The graph
+report contained 1,948 compiler file instances, 1,221 unique files, and 727
+duplicate instances. Production storage still emits no
+`storage.db.query.search_exec`, so this is not a regression to duplicate local
+search implementation.
+
+Revised decision: **keep the identity-safe local-query boundary opt-in, reject
+the measured scheduling/composition as the final production build, and
+continue the goal loop**. Do not enable the experiment by default or increase
+runner cost. The next experiment must reduce or avoid competing LLVM-heavy
+units on this two-vCPU runner while preserving normal concurrency; merely
+rescheduling the same 590-second storage and 529-second inference work cannot
+satisfy the compiler-time gate.
+
 ## Holistic target architecture
 
-The current candidate is the opt-in six-unit source-selected topology above:
+The current structural candidate is the opt-in six-unit source-selected topology above:
 storage, distributed/API control, local query, enrichment compute, inference,
 and remote CLI. Unlike the rejected source-only coalescing probes, it gives the
 distributed/API unit only control sources, removes composed local-query
 execution from storage, and keeps compute-heavy inference/enrichment isolated.
 The local cold storage-plus-local-query chain is now 340.020 seconds, below the
-350-second preferred gate. It is not yet the production baseline because the
-normal Linux runner has measured only the earlier topology, where storage and
-distributed still exceeded 380 seconds under contention; the new cut requires
-its own runner evidence.
+350-second preferred gate. It is not yet the production baseline: the normal
+Linux runner measured the same chain at 717.965 seconds and every large unit
+except local query above 380 seconds under contention. The topology therefore
+passes the ownership and reliability questions but not the production
+performance gate.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:
