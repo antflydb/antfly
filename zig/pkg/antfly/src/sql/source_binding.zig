@@ -14,8 +14,8 @@
 
 const std = @import("std");
 
-const metadata_table_manager = @import("../metadata/table_manager.zig");
-const query_contract = @import("../query/contract.zig");
+const table_record = @import("../metadata/catalog/table_record.zig");
+const semantic_resolver_mod = @import("../query/semantic_resolver.zig");
 const runtime_schema = @import("../storage/schema.zig");
 
 pub const SqlSourceFamily = enum {
@@ -25,8 +25,8 @@ pub const SqlSourceFamily = enum {
 };
 
 pub const CatalogTableRef = struct {
-    database_name: []const u8 = metadata_table_manager.default_database_name,
-    namespace_name: []const u8 = metadata_table_manager.default_namespace_name,
+    database_name: []const u8 = table_record.default_database_name,
+    namespace_name: []const u8 = table_record.default_namespace_name,
     table_name: []const u8,
 };
 
@@ -114,7 +114,7 @@ pub const DocumentSqlCapabilities = struct {
     semantic_filters: bool = false,
     semantic_index_names: []const []const u8 = &.{},
     owns_semantic_index_names: bool = false,
-    semantic_resolver: ?query_contract.SemanticResolver = null,
+    semantic_resolver: ?semantic_resolver_mod.SemanticResolver = null,
     vector_filters: bool = false,
     vector_index_names: []const []const u8 = &.{},
     owns_vector_index_names: bool = false,

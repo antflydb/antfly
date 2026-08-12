@@ -2316,8 +2316,8 @@ pub fn build(b: *std.Build) void {
                 .linkage = .static,
                 .max_rss = switch (unit) {
                     .application => 18 * 1024 * 1024 * 1024,
-                    .api_kernel => 6 * 1024 * 1024 * 1024,
-                    .distributed => 10 * 1024 * 1024 * 1024,
+                    .api_kernel => 7 * 1024 * 1024 * 1024,
+                    .distributed => 11 * 1024 * 1024 * 1024,
                     .inference => 6 * 1024 * 1024 * 1024,
                     .cli => 2 * 1024 * 1024 * 1024,
                 },

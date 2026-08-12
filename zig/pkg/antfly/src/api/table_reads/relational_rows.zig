@@ -22,6 +22,7 @@ const db_relational_rows = @import("../../storage/db/relational_rows.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const document_sql_runtime = @import("../../sql/document_runtime.zig");
 const sql_adapter = @import("../../sql/mod.zig");
+const sql_catalog_source = @import("../../sql/catalog_source.zig");
 const platform_time = @import("antfly_platform").time;
 const raft_mod = @import("../../raft/domain.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
@@ -38,7 +39,6 @@ const TableReadSource = core.TableReadSource;
 const LookupResponse = core.LookupResponse;
 const ScanResponse = core.ScanResponse;
 const appendScanLine = core.appendScanLine;
-const nativeCatalogTableNameAlloc = table_catalog.nativeTableNameForCatalogTargetAlloc;
 
 fn uniqueTestTmpPathAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
@@ -337,7 +337,7 @@ pub const RecursiveCteMaterializedRows = struct {
 pub fn executeLoweredSqlReadPlanAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     default_table_name: []const u8,
     default_schema: storage_schema.TableSchema,
     plan: sql_adapter.LoweredReadPlan,
@@ -358,7 +358,7 @@ pub fn executeLoweredSqlReadPlanAlloc(
 pub fn executeLoweredSqlReadPlanWithSessionAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     default_table_name: []const u8,
     default_schema: storage_schema.TableSchema,
@@ -397,7 +397,7 @@ pub fn executeLoweredSqlReadPlanWithSessionAlloc(
                 errdefer owned_result.deinit(alloc);
                 break :blk .{ .query = owned_result };
             }
-            const native_table_name = try nativeCatalogTableNameAlloc(alloc, catalog, target);
+            const native_table_name = try nativeSqlCatalogTableNameAlloc(alloc, catalog, target);
             defer alloc.free(native_table_name);
             var adapter = document_sql.RuntimeSourceAdapter{
                 .source = source,
@@ -423,7 +423,7 @@ pub fn executeLoweredSqlReadPlanWithSessionAlloc(
         },
         .document_aggregate => |lowered| blk: {
             const target = try catalogTargetForLoweredSqlTable(session, default_table_name, lowered.table_name);
-            const native_table_name = try nativeCatalogTableNameAlloc(alloc, catalog, target);
+            const native_table_name = try nativeSqlCatalogTableNameAlloc(alloc, catalog, target);
             defer alloc.free(native_table_name);
             var adapter = document_sql.RuntimeSourceAdapter{
                 .source = source,
@@ -846,7 +846,7 @@ test "relational full text document read lowers to rows query request" {
 pub fn executeLoweredRelationPopulationPlanAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     default_table_name: []const u8,
     default_schema: storage_schema.TableSchema,
     plan: sql_adapter.LoweredRelationPopulationPlan,
@@ -888,7 +888,7 @@ pub fn executeLoweredRelationPopulationPlanAlloc(
 fn executeLoweredSqlSetOperationPlanAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     default_table_name: []const u8,
     default_schema: storage_schema.TableSchema,
@@ -1066,7 +1066,7 @@ fn executeLoweredSqlSetOperationPlanAlloc(
 fn executeLoweredSqlSetOperationPlanWithRoutedCtesAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     default_table_name: []const u8,
     default_schema: storage_schema.TableSchema,
     left_schema: storage_schema.TableSchema,
@@ -1162,7 +1162,7 @@ fn executeLoweredSqlSetOperationPlanWithRoutedCtesAlloc(
 fn appendRoutedSetOperationCteSourceIfNeededAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     default_table_name: []const u8,
     default_schema: storage_schema.TableSchema,
     table_name: []const u8,
@@ -1374,7 +1374,7 @@ test "lowered sql insert source plans build batches from routed scans" {
         target_schema,
         &.{},
         .{ .unique_resolver = NoConflictResolver.resolver(), .sync_level = .full_index },
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered.deinit(alloc);
 
@@ -1886,7 +1886,7 @@ test "lowered sql merge mutation plans build batches from routed scans" {
         target_schema,
         &.{},
         .{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered.deinit(alloc);
 
@@ -1931,7 +1931,7 @@ test "lowered sql merge mutation plans build batches from routed scans" {
                 target_schema,
                 &.{},
                 .{},
-                catalog.iface(),
+                catalog.iface().sqlSource(),
             );
             defer cte_lowered.deinit(alloc);
             switch (cte_lowered) {
@@ -2495,7 +2495,7 @@ test "lowered sql recursive merge mutation plans build batches from routed scans
             try std.testing.expectError(error.UnsupportedRowsQuery, rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAlloc(
                 alloc,
                 read_source.source(),
-                catalog.iface(),
+                catalog.iface().sqlSource(),
                 "usage_records",
                 "usage_records",
                 schema,
@@ -2524,7 +2524,7 @@ test "lowered sql recursive merge mutation plans build batches from routed scans
             var batch = (try rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAlloc(
                 alloc,
                 read_source.source(),
-                catalog.iface(),
+                catalog.iface().sqlSource(),
                 "usage_records",
                 "usage_records",
                 schema,
@@ -2555,7 +2555,7 @@ test "lowered sql recursive merge mutation plans build batches from routed scans
             var tenant_batch = (try rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAlloc(
                 alloc,
                 tenant_read_source.source(),
-                catalog.iface(),
+                catalog.iface().sqlSource(),
                 tenant_session,
                 "usage_records",
                 "usage_records",
@@ -2727,7 +2727,7 @@ test "lowered sql recursive cte plans execute bounded materialization" {
     var materialized = (try materializeLoweredRecursiveCteRowsAlloc(
         alloc,
         materialized_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "nodes",
         schema,
         switch (lowered) {
@@ -2753,7 +2753,7 @@ test "lowered sql recursive cte plans execute bounded materialization" {
     var spill_materialized = (try materializeLoweredRecursiveCteRowsAlloc(
         alloc,
         spill_materialized_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "nodes",
         schema,
         spill_recursive_plan,
@@ -2777,7 +2777,7 @@ test "lowered sql recursive cte plans execute bounded materialization" {
     var tenant_materialized = (try materializeLoweredRecursiveCteRowsWithSessionAlloc(
         alloc,
         tenant_materialized_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         tenant_session,
         "nodes",
         schema,
@@ -2795,7 +2795,7 @@ test "lowered sql recursive cte plans execute bounded materialization" {
     var result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "nodes",
         schema,
         lowered,
@@ -2821,7 +2821,7 @@ test "lowered sql recursive cte plans execute bounded materialization" {
     var tenant_result = (try executeLoweredSqlReadPlanWithSessionAlloc(
         alloc,
         tenant_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         tenant_session,
         "nodes",
         schema,
@@ -2862,7 +2862,7 @@ test "lowered sql recursive cte plans execute bounded materialization" {
     try std.testing.expectError(error.UnsupportedRowsQuery, rowsInsertSourceBatchFromRecursiveCtePlanAlloc(
         alloc,
         claimed_insert_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "nodes",
         schema,
         "walk_copies",
@@ -2887,7 +2887,7 @@ test "lowered sql recursive cte plans execute bounded materialization" {
     var batch = (try rowsInsertSourceBatchFromRecursiveCtePlanAlloc(
         alloc,
         insert_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "nodes",
         schema,
         "walk_copies",
@@ -2916,7 +2916,7 @@ test "lowered sql recursive cte plans execute bounded materialization" {
     var tenant_batch = (try rowsInsertSourceBatchFromRecursiveCtePlanWithSessionAlloc(
         alloc,
         tenant_insert_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         tenant_session,
         "nodes",
         schema,
@@ -3079,14 +3079,14 @@ test "lowered relation population plans execute routed typed read sources" {
         "CREATE TABLE order_archive AS SELECT o.id AS order_id, c.name AS customer_name FROM orders AS o LEFT JOIN customers AS c ON o.status = c.status ORDER BY order_id ASC",
         orders_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered.deinit(alloc);
 
     var result = (try executeLoweredRelationPopulationPlanAlloc(
         alloc,
         fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "orders",
         orders_schema,
         lowered,
@@ -3107,7 +3107,7 @@ test "lowered relation population plans execute routed typed read sources" {
         "CREATE TABLE order_archive_empty AS SELECT o.id AS order_id, c.name AS customer_name FROM orders AS o LEFT JOIN customers AS c ON o.status = c.status WITH NO DATA",
         orders_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered_no_data.deinit(alloc);
     try std.testing.expect(!lowered_no_data.populate);
@@ -3115,7 +3115,7 @@ test "lowered relation population plans execute routed typed read sources" {
     var no_data_result = (try executeLoweredRelationPopulationPlanAlloc(
         alloc,
         fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "orders",
         orders_schema,
         lowered_no_data,
@@ -3157,7 +3157,7 @@ test "lowered relation population row transfer empties source result" {
 pub fn executeLoweredRecursiveCtePlanAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     default_table_name: []const u8,
     default_schema: storage_schema.TableSchema,
@@ -3187,7 +3187,7 @@ pub fn executeLoweredRecursiveCtePlanAlloc(
 pub fn materializeLoweredRecursiveCteRowsAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     default_table_name: []const u8,
     default_schema: storage_schema.TableSchema,
     lowered: sql_adapter.LoweredRecursiveCtePlan,
@@ -3208,7 +3208,7 @@ pub fn materializeLoweredRecursiveCteRowsAlloc(
 pub fn materializeLoweredRecursiveCteRowsWithSessionAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     default_table_name: []const u8,
     default_schema: storage_schema.TableSchema,
@@ -3406,14 +3406,29 @@ pub fn catalogTargetForLoweredSqlTable(
     return try session.tableTargetFromObjectName(table_name);
 }
 
+fn nativeSqlCatalogTableNameAlloc(
+    alloc: std.mem.Allocator,
+    catalog: sql_catalog_source.SqlCatalogSource,
+    target: catalog_resources.TableTarget,
+) ![]u8 {
+    if (!try sql_catalog_source.qualifiedTableExists(
+        alloc,
+        catalog,
+        target.database_name,
+        target.namespace_name,
+        target.table_name,
+    )) return error.TableNotFound;
+    return try catalog_resources.storageTableNameForTargetAlloc(alloc, target);
+}
+
 pub fn catalogRuntimeSchemaUnlessDefaultAlloc(
     alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     default_table_name: []const u8,
     table_name: []const u8,
 ) !?storage_schema.TableSchema {
     if (std.mem.eql(u8, default_table_name, table_name)) return null;
-    const schema_json = (try table_catalog.tableSchemaJsonAlloc(alloc, catalog, table_name)) orelse return error.TableNotFound;
+    const schema_json = (try sql_catalog_source.tableSchemaJsonAlloc(alloc, catalog, table_name)) orelse return error.TableNotFound;
     defer alloc.free(schema_json);
     var parsed_schema = schema_api.parseValidatedTableSchema(alloc, schema_json) catch return error.InvalidRowsRequest;
     defer parsed_schema.deinit(alloc);
@@ -3517,7 +3532,7 @@ pub fn rowsInsertSourceBatchFromRoutedScansWithSchemasAlloc(
 pub fn rowsInsertSourceBatchFromRecursiveCtePlanAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     default_table_name: []const u8,
     default_schema: storage_schema.TableSchema,
     target_table_name: []const u8,
@@ -3546,7 +3561,7 @@ pub fn rowsInsertSourceBatchFromRecursiveCtePlanAlloc(
 pub fn rowsInsertSourceBatchFromRecursiveCtePlanWithSessionAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     default_table_name: []const u8,
     default_schema: storage_schema.TableSchema,
@@ -3629,6 +3644,30 @@ pub fn rowsLoweredInsertSourceBatchFromRoutedScansWithSchemasAlloc(
     consistency: raft_mod.ReadConsistency,
     conflict_resolver: ?relational_rows_api.UniqueSelectorResolver,
 ) !?relational_rows_api.OwnedRowsBatchRequest {
+    return try rowsLoweredInsertSourceBatchFromRoutedScansWithSchemasAndDefaultContextAlloc(
+        alloc,
+        source,
+        source_table_name,
+        target_schema,
+        source_schema,
+        lowered,
+        consistency,
+        conflict_resolver,
+        .{},
+    );
+}
+
+pub fn rowsLoweredInsertSourceBatchFromRoutedScansWithSchemasAndDefaultContextAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    source_table_name: []const u8,
+    target_schema: storage_schema.TableSchema,
+    source_schema: storage_schema.TableSchema,
+    lowered: sql_adapter.LoweredInsertSource,
+    consistency: raft_mod.ReadConsistency,
+    conflict_resolver: ?relational_rows_api.UniqueSelectorResolver,
+    default_context: relational_rows_api.DefaultValueContext,
+) !?relational_rows_api.OwnedRowsBatchRequest {
     if (lowered.insert_source.req.source_table.len > 0 and !std.mem.eql(u8, lowered.insert_source.req.source_table, source_table_name)) {
         return error.InvalidRowsRequest;
     }
@@ -3666,7 +3705,7 @@ pub fn rowsLoweredInsertSourceBatchFromRoutedScansWithSchemasAlloc(
     );
     defer freeOwnedRows(alloc, materialized_rows);
 
-    var batch = try relational_rows_api.buildRowsInsertSourceBatchWithSchemasAlloc(
+    var batch = try relational_rows_api.buildRowsInsertSourceBatchWithSchemasAndDefaultContextAlloc(
         alloc,
         lowered.table_name,
         target_schema,
@@ -3674,6 +3713,7 @@ pub fn rowsLoweredInsertSourceBatchFromRoutedScansWithSchemasAlloc(
         lowered.insert_source.req,
         materialized_rows,
         conflict_resolver,
+        default_context,
     );
     batch.req.sync_level = lowered.sync_level;
     return batch;
@@ -4018,7 +4058,7 @@ pub fn rowsMergeMutationBatchFromRoutedScansWithSchemasAndDefaultContextAlloc(
 pub fn rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     default_table_name: []const u8,
     target_table_name: []const u8,
     target_schema: storage_schema.TableSchema,
@@ -4047,7 +4087,7 @@ pub fn rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAlloc(
 pub fn rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     default_table_name: []const u8,
     target_table_name: []const u8,
@@ -4078,7 +4118,7 @@ pub fn rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAlloc(
 pub fn rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAndDefaultContextAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
-    catalog: table_catalog.CatalogSource,
+    catalog: sql_catalog_source.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     default_table_name: []const u8,
     target_table_name: []const u8,
@@ -9008,14 +9048,14 @@ test "lowered sql cross-table read plans execute through routed scans" {
         "SELECT o.id AS order_id, c.name AS customer_name FROM orders AS o LEFT JOIN customers AS c ON o.status = c.status ORDER BY order_id ASC",
         orders_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered.deinit(alloc);
 
     var result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "orders",
         orders_schema,
         lowered,
@@ -9214,7 +9254,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     var result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         schema,
         lowered,
@@ -9239,7 +9279,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     try std.testing.expectError(error.TopologyChanged, executeLoweredSqlReadPlanAlloc(
         alloc,
         changed_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         schema,
         lowered,
@@ -9250,7 +9290,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     try std.testing.expectError(error.TopologyChanged, executeLoweredSqlReadPlanAlloc(
         alloc,
         version_changed_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         schema,
         lowered,
@@ -9277,7 +9317,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     var distinct_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         fake_distinct.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         schema,
         lowered_distinct,
@@ -9366,7 +9406,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     var intersect_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         fake_intersect.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         schema,
         lowered_intersect,
@@ -9476,7 +9516,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     var tail_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         fake_tail.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         schema,
         lowered_tail,
@@ -9516,7 +9556,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     var cte_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         fake_cte.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         schema,
         lowered_cte,
@@ -10004,7 +10044,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM archived_records WHERE enabled IS TRUE",
         usage_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered.deinit(alloc);
     switch (lowered) {
@@ -10016,7 +10056,7 @@ test "lowered sql set operation plans route cross table branches through catalog
     var result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         usage_schema,
         lowered,
@@ -10045,7 +10085,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         "WITH open_usage AS (SELECT id, status, enabled FROM usage_records WHERE status = 'open') SELECT id FROM open_usage UNION ALL SELECT id FROM archived_records WHERE enabled IS TRUE",
         usage_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered_cte.deinit(alloc);
     switch (lowered_cte) {
@@ -10064,7 +10104,7 @@ test "lowered sql set operation plans route cross table branches through catalog
     var cte_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         cte_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         usage_schema,
         lowered_cte,
@@ -10093,7 +10133,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         "SELECT id FROM usage_records FOR SYSTEM_TIME AS OF 42 WHERE status = 'open' UNION ALL SELECT id FROM archived_records FOR SYSTEM_TIME AS OF 42 WHERE enabled IS TRUE",
         usage_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered_as_of.deinit(alloc);
     switch (lowered_as_of) {
@@ -10110,7 +10150,7 @@ test "lowered sql set operation plans route cross table branches through catalog
     var as_of_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         as_of_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         usage_schema,
         lowered_as_of,
@@ -10138,7 +10178,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         "WITH open_usage AS (SELECT id, status, enabled FROM usage_records WHERE status = 'open') SELECT id FROM open_usage FOR SYSTEM_TIME AS OF 42 UNION ALL SELECT id FROM archived_records FOR SYSTEM_TIME AS OF 42 WHERE enabled IS TRUE",
         usage_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered_cte_as_of.deinit(alloc);
     switch (lowered_cte_as_of) {
@@ -10159,7 +10199,7 @@ test "lowered sql set operation plans route cross table branches through catalog
     var cte_as_of_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         cte_as_of_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         usage_schema,
         lowered_cte_as_of,
@@ -10211,7 +10251,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         "SELECT id FROM usage_records FOR SYSTEM_TIME AS OF 42 WHERE status = 'open' UNION ALL SELECT id FROM usage_records FOR SYSTEM_TIME AS OF 42 WHERE enabled IS TRUE",
         usage_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered_same_table_as_of.deinit(alloc);
     var same_left_ranges = try TestRanges.single(alloc, "", "u2");
@@ -10231,7 +10271,7 @@ test "lowered sql set operation plans route cross table branches through catalog
     var same_as_of_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         same_as_of_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         usage_schema,
         lowered_same_table_as_of,
@@ -10255,7 +10295,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         "SELECT id FROM usage_records FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000055Z' WHERE status = 'open' UNION ALL SELECT id FROM archived_records FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000055Z' WHERE enabled IS TRUE",
         usage_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered_as_of_timestamp.deinit(alloc);
     switch (lowered_as_of_timestamp) {
@@ -10272,7 +10312,7 @@ test "lowered sql set operation plans route cross table branches through catalog
     var as_of_timestamp_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         as_of_timestamp_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         usage_schema,
         lowered_as_of_timestamp,
@@ -10300,14 +10340,14 @@ test "lowered sql set operation plans route cross table branches through catalog
         "SELECT id FROM usage_records FOR SYSTEM_TIME AS OF 42 WHERE status = 'open' UNION ALL SELECT id FROM archived_records FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000055Z' WHERE enabled IS TRUE",
         usage_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     ));
     try std.testing.expectError(error.UnsupportedSqlShape, sql_adapter.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT id FROM usage_records FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000055Z' WHERE status = 'open' UNION ALL SELECT id FROM archived_records FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000056Z' WHERE enabled IS TRUE",
         usage_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     ));
 
     var tenant_fake = FakeSource{
@@ -10321,7 +10361,7 @@ test "lowered sql set operation plans route cross table branches through catalog
     var tenant_result = (try executeLoweredSqlReadPlanWithSessionAlloc(
         alloc,
         tenant_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         tenant_session,
         "usage_records",
         usage_schema,
@@ -10344,7 +10384,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         "SELECT id FROM usage_records WHERE status = 'open' EXCEPT SELECT id FROM archived_records WHERE status = 'deleted'",
         usage_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered_except.deinit(alloc);
     switch (lowered_except) {
@@ -10356,7 +10396,7 @@ test "lowered sql set operation plans route cross table branches through catalog
     var except_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         fake_except.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         usage_schema,
         lowered_except,
@@ -10382,7 +10422,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         "SELECT id FROM usage_records WHERE status = 'open' INTERSECT SELECT id FROM archived_records WHERE status = 'deleted'",
         usage_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered_intersect.deinit(alloc);
     switch (lowered_intersect) {
@@ -10394,7 +10434,7 @@ test "lowered sql set operation plans route cross table branches through catalog
     var intersect_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         fake_intersect.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         usage_schema,
         lowered_intersect,
@@ -10651,7 +10691,7 @@ test "lowered sql set operation RHS multi-join CTEs route incompatible side sche
         "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT tenant_records.tenant_ref AS id FROM usage_records JOIN archived_records ON usage_records.id = archived_records.id JOIN tenant_records ON archived_records.tenant_ref = tenant_records.tenant_ref",
         usage_schema,
         &.{},
-        catalog.iface(),
+        catalog.iface().sqlSource(),
     );
     defer lowered_generated.deinit(alloc);
     switch (lowered_generated) {
@@ -10670,7 +10710,7 @@ test "lowered sql set operation RHS multi-join CTEs route incompatible side sche
     var generated_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         generated_fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         usage_schema,
         lowered_generated,
@@ -10696,7 +10736,7 @@ test "lowered sql set operation RHS multi-join CTEs route incompatible side sche
     var result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "usage_records",
         usage_schema,
         lowered,

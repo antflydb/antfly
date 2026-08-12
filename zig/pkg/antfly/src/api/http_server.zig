@@ -4250,7 +4250,7 @@ test "api http server applies SQL ALTER COLUMN USING through durable schema rewr
     var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
         alloc,
         &parsed,
-        service.catalogSource(),
+        service.catalogSource().sqlSource(),
         catalog_resources.SqlCatalogSession.default(),
         .{},
     );
@@ -6940,7 +6940,7 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
         var logical_plan = sql_adapter.planParsedSqlWithSessionAlloc(self.alloc, parsed_sql, .{
-            .catalog = self.catalogSource(),
+            .catalog = self.catalogSource().sqlSource(),
             .session = session.session(),
             .function_bindings = function_bindings,
         }) catch |err| switch (err) {
@@ -7452,7 +7452,7 @@ pub const ApiHttpServer = struct {
         };
         const schema = sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
             self.alloc,
-            self.catalogSource(),
+            self.catalogSource().sqlSource(),
             create_view.source_table_name,
             session,
         ) catch |err| switch (err) {
@@ -9477,7 +9477,7 @@ pub const ApiHttpServer = struct {
         }
         defer if (table_name_owned) self.alloc.free(table_name);
 
-        const schema = sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(self.alloc, self.catalogSource(), table_name, session) catch |err| switch (err) {
+        const schema = sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(self.alloc, self.catalogSource().sqlSource(), table_name, session) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => return null,
             else => return err,
         };
@@ -9525,7 +9525,7 @@ pub const ApiHttpServer = struct {
         }
         defer if (table_name_owned) self.alloc.free(table_name);
 
-        const schema = sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(self.alloc, self.catalogSource(), table_name, session) catch |err| switch (err) {
+        const schema = sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(self.alloc, self.catalogSource().sqlSource(), table_name, session) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => return null,
             else => return err,
         };
@@ -10053,7 +10053,7 @@ pub const ApiHttpServer = struct {
         var batch = (table_reads.rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAndDefaultContextAlloc(
             self.alloc,
             read_source,
-            self.catalogSource(),
+            self.catalogSource().sqlSource(),
             session,
             target.table_name,
             target.table_name,
@@ -10642,7 +10642,7 @@ pub const ApiHttpServer = struct {
         const result = (table_reads.executeLoweredSqlReadPlanWithSessionAlloc(
             self.alloc,
             read_source,
-            self.catalogSource(),
+            self.catalogSource().sqlSource(),
             session.session(),
             target_table_name,
             schema,
@@ -11015,7 +11015,7 @@ pub const ApiHttpServer = struct {
         var authorization_options = try self.sqlBoundAuthorizationOptionsForIdentityAlloc(authenticated_identity);
         defer authorization_options.deinit(self.alloc);
         var logical_plan = sql_adapter.planParsedSqlWithSessionAlloc(self.alloc, parsed_sql, .{
-            .catalog = self.catalogSource(),
+            .catalog = self.catalogSource().sqlSource(),
             .session = session.session(),
             .authorization = authorization_options.value,
         }) catch |err| switch (err) {
@@ -11269,7 +11269,7 @@ pub const ApiHttpServer = struct {
         if (std.mem.eql(u8, effective_source_table, target_table_name)) return null;
         return try sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
             self.alloc,
-            self.catalogSource(),
+            self.catalogSource().sqlSource(),
             effective_source_table,
             session,
         );
@@ -11286,7 +11286,7 @@ pub const ApiHttpServer = struct {
         if (std.mem.eql(u8, default_table_name, table_name)) return null;
         return sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
             self.alloc,
-            self.catalogSource(),
+            self.catalogSource().sqlSource(),
             table_name,
             session,
         ) catch |err| switch (err) {
@@ -13293,7 +13293,7 @@ pub const ApiHttpServer = struct {
         defer authorization_options.deinit(self.alloc);
 
         var logical_plan = sql_adapter.planParsedSqlWithSessionAlloc(self.alloc, parsed_sql, .{
-            .catalog = self.catalogSource(),
+            .catalog = self.catalogSource().sqlSource(),
             .session = session.session(),
             .write_options = write_options,
             .function_bindings = function_bindings,
@@ -13876,7 +13876,7 @@ pub const ApiHttpServer = struct {
         defer parsed_sql.deinit(alloc);
         if (catalog) |source_catalog| {
             var logical_plan = try sql_adapter.planParsedSqlWithSessionAlloc(alloc, &parsed_sql, .{
-                .catalog = source_catalog,
+                .catalog = source_catalog.sqlSource(),
                 .session = session,
                 .function_bindings = function_bindings,
             });
@@ -13896,7 +13896,7 @@ pub const ApiHttpServer = struct {
         defer authorization_options.deinit(self.alloc);
 
         var planned_statement = try sql_adapter.planDurableDdlSqlWithSessionAuthorizationEvidenceAlloc(self.alloc, parsed_sql, .{
-            .catalog = self.catalogSource(),
+            .catalog = self.catalogSource().sqlSource(),
             .session = session,
             .authorization = authorization_options.value,
         });

@@ -15,7 +15,7 @@
 const std = @import("std");
 
 const catalog_resources = @import("catalog_resources.zig");
-const table_catalog = @import("../metadata/catalog/source.zig");
+const table_catalog = @import("catalog_source.zig");
 const binder = @import("binder.zig");
 const lower_ddl = @import("lower_ddl.zig");
 const lower_expr = @import("lower_expr.zig");
@@ -26,7 +26,7 @@ const tokenized = @import("tokenized.zig");
 pub const SqlExecutionPlan = binder.LogicalSqlPlan;
 
 pub const PlanParsedSqlOptions = struct {
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession = catalog_resources.SqlCatalogSession.default(),
     write_options: plan_mod.LowerWritePlanOptions = .{},
     function_bindings: expr_row_parse.SqlFunctionBindings = .{},
@@ -127,7 +127,7 @@ test "sql executor owns ddl logical plans" {
     var ddl_sql = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_records (id text PRIMARY KEY)");
     defer ddl_sql.deinit(alloc);
     var ddl_logical = try planParsedSqlWithSessionAlloc(alloc, &ddl_sql, .{
-        .catalog = table_catalog.unavailableCatalogSource(),
+        .catalog = table_catalog.unavailableSqlCatalogSource(),
         .function_bindings = .{},
     });
     defer ddl_logical.deinit(alloc);
@@ -136,7 +136,7 @@ test "sql executor owns ddl logical plans" {
     var bound_ddl = try binder.bindDdlStatementWithCatalogSessionAlloc(
         alloc,
         &ddl_sql,
-        table_catalog.unavailableCatalogSource(),
+        table_catalog.unavailableSqlCatalogSource(),
         catalog_resources.SqlCatalogSession.default(),
     );
     defer bound_ddl.deinit(alloc);

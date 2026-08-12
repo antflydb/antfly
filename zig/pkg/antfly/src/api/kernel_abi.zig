@@ -45,6 +45,29 @@ pub const HandlerCreateContext = extern struct {
     error_code: *ErrorInt,
 };
 
+pub const LiteSqlSessionCreateContext = extern struct {
+    owner_alloc: *const anyopaque,
+    options: *const anyopaque,
+    out_handle: *?*anyopaque,
+    error_code: *ErrorInt,
+};
+
+pub const LiteSqlClassifyContext = extern struct {
+    alloc: *const anyopaque,
+    sql: *const anyopaque,
+    out_read_only: *bool,
+    error_code: *ErrorInt,
+};
+
+pub const LiteSqlExecuteContext = extern struct {
+    handle: *anyopaque,
+    alloc: *const anyopaque,
+    source: *const anyopaque,
+    sql: *const anyopaque,
+    out_json: *anyopaque,
+    error_code: *ErrorInt,
+};
+
 pub const HandlerStats = extern struct {
     query_capacity: usize,
     query_in_flight: usize,

@@ -213,6 +213,32 @@ class ImportGraphTest(unittest.TestCase):
             diagnostics.getvalue(),
         )
 
+    def test_api_kernel_boundary_rejects_lite_source_mixed_executor_import(self):
+        self.write_api_kernel_boundaries()
+        self.write("api/lite_sql_source.zig", 'const impl = @import("../sql/relational_rows.zig");\n')
+        graph = analyzer.ImportGraph(self.root)
+
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            self.assertFalse(analyzer.check_api_kernel_boundary(graph))
+        self.assertIn(
+            "api/lite_sql_source.zig directly imports sql/relational_rows.zig",
+            diagnostics.getvalue(),
+        )
+
+    def test_api_kernel_boundary_rejects_lite_source_db_payload_import(self):
+        self.write_api_kernel_boundaries()
+        self.write("api/lite_sql_source.zig", 'const types = @import("../storage/db/types.zig");\n')
+        graph = analyzer.ImportGraph(self.root)
+
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            self.assertFalse(analyzer.check_api_kernel_boundary(graph))
+        self.assertIn(
+            "api/lite_sql_source.zig directly imports storage/db/types.zig",
+            diagnostics.getvalue(),
+        )
+
     def test_api_kernel_boundary_skips_absent_contracts(self):
         graph = analyzer.ImportGraph(self.root)
 

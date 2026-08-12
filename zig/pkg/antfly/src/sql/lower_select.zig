@@ -29,7 +29,7 @@ const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const source_binding = @import("source_binding.zig");
 const sql_statement_kind = @import("statement_kind.zig");
-const table_catalog = @import("../metadata/catalog/source.zig");
+const table_catalog = @import("catalog_source.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
@@ -602,7 +602,7 @@ pub fn lowerReadPlanWithCatalogAlloc(
     sql: []const u8,
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
 ) !LoweredReadPlan {
     return try lowerReadPlanWithCatalogAndExtensionFunctionsAlloc(alloc, sql, schema, params, catalog, &.{});
 }
@@ -612,7 +612,7 @@ pub fn lowerReadPlanWithCatalogAndExtensionFunctionsAlloc(
     sql: []const u8,
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     extension_function_bindings: []const ExtensionFunctionBinding,
 ) !LoweredReadPlan {
     return try lowerReadPlanWithCatalogAndFunctionBindingsAlloc(alloc, sql, schema, params, catalog, .{ .extension_functions = extension_function_bindings });
@@ -623,7 +623,7 @@ pub fn lowerReadPlanWithCatalogAndFunctionBindingsAlloc(
     sql: []const u8,
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     function_bindings: SqlFunctionBindings,
 ) !LoweredReadPlan {
     return try lowerReadPlanWithCatalogSessionAndFunctionBindingsAlloc(alloc, sql, schema, params, catalog, catalog_resources.SqlCatalogSession.default(), function_bindings);
@@ -634,7 +634,7 @@ pub fn lowerReadPlanWithCatalogSessionAndFunctionBindingsAlloc(
     sql: []const u8,
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     function_bindings: SqlFunctionBindings,
 ) !LoweredReadPlan {
@@ -648,7 +648,7 @@ pub fn lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     function_bindings: SqlFunctionBindings,
 ) !LoweredReadPlan {
     return try lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, schema, params, catalog, catalog_resources.SqlCatalogSession.default(), function_bindings);
@@ -659,7 +659,7 @@ pub fn lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     function_bindings: SqlFunctionBindings,
 ) !LoweredReadPlan {
@@ -683,7 +683,7 @@ pub fn lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc(
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
     options: LowerWritePlanOptions,
-    catalog: ?table_catalog.CatalogSource,
+    catalog: ?table_catalog.SqlCatalogSource,
     function_bindings: SqlFunctionBindings,
 ) !LoweredExplainPlan {
     var context = lowering_context.ExplainPlanLoweringContext{
@@ -708,7 +708,7 @@ pub fn lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
-    catalog: ?table_catalog.CatalogSource,
+    catalog: ?table_catalog.SqlCatalogSource,
     function_bindings: SqlFunctionBindings,
 ) !LoweredRelationPopulationPlan {
     var context = lowering_context.RelationPopulationLoweringContext{
@@ -730,7 +730,7 @@ pub fn lowerRelationPopulationPlanWithCatalogAndFunctionBindingsAlloc(
     sql: []const u8,
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
-    catalog: ?table_catalog.CatalogSource,
+    catalog: ?table_catalog.SqlCatalogSource,
     function_bindings: SqlFunctionBindings,
 ) !LoweredRelationPopulationPlan {
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
@@ -750,7 +750,7 @@ pub fn lowerRelationPopulationPlanWithCatalogAlloc(
     sql: []const u8,
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
-    catalog: ?table_catalog.CatalogSource,
+    catalog: ?table_catalog.SqlCatalogSource,
 ) !LoweredRelationPopulationPlan {
     return try lowerRelationPopulationPlanWithCatalogAndFunctionBindingsAlloc(alloc, sql, schema, params, catalog, .{});
 }

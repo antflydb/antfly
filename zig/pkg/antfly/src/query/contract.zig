@@ -26,6 +26,7 @@ const public_search_request_mod = @import("public_search_request.zig");
 const public_text_query_mod = @import("public_text_query.zig");
 const public_query_string_mod = @import("public_query_string.zig");
 const public_limits = @import("../api/public_limits.zig");
+const semantic_resolver_mod = @import("semantic_resolver.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const query_openapi = @import("antfly_query_openapi");
@@ -1734,34 +1735,7 @@ const NamedVectorQueries = struct {
     }
 };
 
-pub const SemanticResolver = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        resolve_dense_query: *const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            index_name: []const u8,
-            semantic_search: []const u8,
-            embedding_template: ?[]const u8,
-            limit: u32,
-        ) anyerror!db_mod.types.DenseKnnQuery,
-    };
-
-    pub fn resolveDenseQuery(
-        self: SemanticResolver,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        index_name: []const u8,
-        semantic_search: []const u8,
-        embedding_template: ?[]const u8,
-        limit: u32,
-    ) !db_mod.types.DenseKnnQuery {
-        return try self.vtable.resolve_dense_query(self.ptr, alloc, table_name, index_name, semantic_search, embedding_template, limit);
-    }
-};
+pub const SemanticResolver = semantic_resolver_mod.SemanticResolver;
 
 fn applyCommonSearchRequestOptions(
     alloc: std.mem.Allocator,

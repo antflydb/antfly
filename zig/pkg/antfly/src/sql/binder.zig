@@ -14,10 +14,7 @@
 
 const std = @import("std");
 
-const metadata_api = @import("../metadata/api.zig");
-const metadata_table_manager = @import("../metadata/table_manager.zig");
-const metadata_transition_state = @import("../metadata/transition_state.zig");
-const raft_reconciler = @import("../raft/reconciler.zig");
+const table_record = @import("../metadata/catalog/table_record.zig");
 const db_mod = struct {
     pub const types = @import("../storage/db/types.zig");
 };
@@ -26,7 +23,7 @@ const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const generated_parser = @import("generated_parser.zig");
-const table_catalog = @import("../metadata/catalog/source.zig");
+const table_catalog = @import("catalog_source.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const grammar = @import("grammar.zig");
 const lexer = @import("lexer.zig");
@@ -663,7 +660,7 @@ pub fn foreignKeyActionSupportsTemporalUpdate(action: runtime_schema.ForeignKeyA
 
 pub fn runtimeSchemaForCatalogTableAlloc(
     alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     table_name: []const u8,
 ) !runtime_schema.TableSchema {
     return try runtimeSchemaForCatalogTableWithSessionAlloc(alloc, catalog, table_name, catalog_resources.SqlCatalogSession.default());
@@ -671,12 +668,12 @@ pub fn runtimeSchemaForCatalogTableAlloc(
 
 pub fn runtimeSchemaForCatalogTableWithSessionAlloc(
     alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     table_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !runtime_schema.TableSchema {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
+    var snapshot = try catalog.snapshotAlloc(alloc);
+    defer catalog.freeSnapshot(alloc, &snapshot);
     const resolved = try resolvedExistingCatalogTableForObjectNameAlloc(alloc, &snapshot, table_name, session) orelse return error.InvalidSqlCatalog;
     defer deinitCatalogTableRef(alloc, resolved.target);
     if (resolved.table.schema_json.len == 0) return error.InvalidSqlCatalog;
@@ -712,12 +709,12 @@ fn deinitCatalogTableRef(alloc: std.mem.Allocator, target: source_binding.Catalo
 
 const ResolvedCatalogTable = struct {
     target: source_binding.CatalogTableRef,
-    table: metadata_table_manager.TableRecord,
+    table: table_record.TableRecord,
 };
 
 fn resolvedExistingCatalogTableForObjectNameAlloc(
     alloc: std.mem.Allocator,
-    snapshot: *const metadata_api.AdminSnapshot,
+    snapshot: *const table_catalog.SqlCatalogSnapshot,
     table_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !?ResolvedCatalogTable {
@@ -939,12 +936,12 @@ fn boundCatalogObjectForBindingAlloc(
 fn boundCatalogObjectForCatalogTableAlloc(
     alloc: std.mem.Allocator,
     role: BoundCatalogObjectRole,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     table_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !BoundCatalogObject {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
+    var snapshot = try catalog.snapshotAlloc(alloc);
+    defer catalog.freeSnapshot(alloc, &snapshot);
     const resolved = try resolvedExistingCatalogTableForObjectNameAlloc(alloc, &snapshot, table_name, session) orelse return error.TableNotFound;
     errdefer deinitCatalogTableRef(alloc, resolved.target);
     if (resolved.table.schema_json.len == 0) return error.InvalidSqlCatalog;
@@ -955,14 +952,14 @@ fn boundCatalogObjectForCatalogTableAlloc(
         .family = schema_info.family,
         .schema_version = schema_info.version,
         .table_id = resolved.table.table_id,
-        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(resolved.table.schema_json),
+        .schema_generation = table_record.schemaRewriteGenerationForSchemaJson(resolved.table.schema_json),
     };
 }
 
 fn boundCatalogObjectForTableRecordAlloc(
     alloc: std.mem.Allocator,
     role: BoundCatalogObjectRole,
-    table: metadata_table_manager.TableRecord,
+    table: table_record.TableRecord,
 ) !BoundCatalogObject {
     if (table.schema_json.len == 0) return error.InvalidSqlCatalog;
     const database_name = try alloc.dupe(u8, table.database_name);
@@ -982,7 +979,7 @@ fn boundCatalogObjectForTableRecordAlloc(
         .family = schema_info.family,
         .schema_version = schema_info.version,
         .table_id = table.table_id,
-        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json),
+        .schema_generation = table_record.schemaRewriteGenerationForSchemaJson(table.schema_json),
     };
 }
 
@@ -1023,23 +1020,23 @@ fn catalogSchemaInfoFromJsonAlloc(alloc: std.mem.Allocator, schema_json: []const
 fn boundCatalogObjectForCatalogIndexAlloc(
     alloc: std.mem.Allocator,
     role: BoundCatalogObjectRole,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     index_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !BoundCatalogObject {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
+    var snapshot = try catalog.snapshotAlloc(alloc);
+    defer catalog.freeSnapshot(alloc, &snapshot);
     const table = try catalogTableForIndexNameAlloc(alloc, &snapshot, index_name, session);
     return try boundCatalogObjectForTableRecordAlloc(alloc, role, table);
 }
 
 fn catalogTableForIndexNameAlloc(
     alloc: std.mem.Allocator,
-    snapshot: *const metadata_api.AdminSnapshot,
+    snapshot: *const table_catalog.SqlCatalogSnapshot,
     index_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
-) !metadata_table_manager.TableRecord {
-    var found: ?metadata_table_manager.TableRecord = null;
+) !table_record.TableRecord {
+    var found: ?table_record.TableRecord = null;
     for (snapshot.tables) |table| {
         if (!std.mem.eql(u8, table.database_name, session.currentDatabase())) continue;
         if (!sqlSessionSearchPathContainsNamespace(session, table.namespace_name)) continue;
@@ -1061,7 +1058,7 @@ fn sqlSessionSearchPathContainsNamespace(session: catalog_resources.SqlCatalogSe
 
 fn catalogTableRecordHasIndexNameAlloc(
     alloc: std.mem.Allocator,
-    table: metadata_table_manager.TableRecord,
+    table: table_record.TableRecord,
     index_name: []const u8,
 ) !bool {
     if (try catalogTableSchemaHasIndexNameAlloc(alloc, table.schema_json, index_name)) return true;
@@ -1147,7 +1144,7 @@ fn appendBoundCatalogObjectForCatalogTableAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
     role: BoundCatalogObjectRole,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     table_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !void {
@@ -1160,16 +1157,16 @@ fn appendBoundCatalogObjectsForCatalogSchemaTablesAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
     role: BoundCatalogObjectRole,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     schema_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !void {
     const target = try session.namespaceTargetFromSchemaName(schema_name);
-    var snapshot = catalog.adminSnapshot() catch |err| switch (err) {
+    var snapshot = catalog.snapshotAlloc(alloc) catch |err| switch (err) {
         error.UnsupportedOperation => return error.UnsupportedSqlShape,
         else => return err,
     };
-    defer catalog.freeAdminSnapshot(&snapshot);
+    defer catalog.freeSnapshot(alloc, &snapshot);
 
     var matched: usize = 0;
     for (snapshot.tables) |table| {
@@ -1189,15 +1186,15 @@ fn appendBoundCatalogObjectsForCatalogDatabaseTablesAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
     role: BoundCatalogObjectRole,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     database_name: []const u8,
 ) !void {
     if (database_name.len == 0) return error.UnsupportedSqlShape;
-    var snapshot = catalog.adminSnapshot() catch |err| switch (err) {
+    var snapshot = catalog.snapshotAlloc(alloc) catch |err| switch (err) {
         error.UnsupportedOperation => return error.UnsupportedSqlShape,
         else => return err,
     };
-    defer catalog.freeAdminSnapshot(&snapshot);
+    defer catalog.freeSnapshot(alloc, &snapshot);
 
     var matched: usize = 0;
     for (snapshot.tables) |table| {
@@ -1216,7 +1213,7 @@ fn appendBoundCatalogObjectForCatalogIndexAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
     role: BoundCatalogObjectRole,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     index_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !void {
@@ -1229,7 +1226,7 @@ fn appendOptionalBoundCatalogObjectForCatalogIndexAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
     role: BoundCatalogObjectRole,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     index_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
     missing_ok: bool,
@@ -1243,13 +1240,13 @@ fn appendOptionalBoundCatalogObjectForCatalogIndexAlloc(
 
 fn sourceBindingForCatalogTableWithSessionAlloc(
     alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     table_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
     allow_document_view: bool,
 ) !source_binding.SqlSourceBinding {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
+    var snapshot = try catalog.snapshotAlloc(alloc);
+    defer catalog.freeSnapshot(alloc, &snapshot);
     if (try resolvedExistingCatalogTableForObjectNameAlloc(alloc, &snapshot, table_name, session)) |resolved| {
         errdefer deinitCatalogTableRef(alloc, resolved.target);
         return try sourceBindingForCatalogTableRecordAlloc(alloc, resolved.target, resolved.table);
@@ -1264,7 +1261,7 @@ fn sourceBindingForCatalogTableWithSessionAlloc(
 fn sourceBindingForCatalogTableRecordAlloc(
     alloc: std.mem.Allocator,
     target: source_binding.CatalogTableRef,
-    table: metadata_table_manager.TableRecord,
+    table: table_record.TableRecord,
 ) !source_binding.SqlSourceBinding {
     if (table.schema_json.len == 0) return error.InvalidSqlCatalog;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, table.schema_json);
@@ -1275,11 +1272,11 @@ fn sourceBindingForCatalogTableRecordAlloc(
     switch (binding) {
         .relational => |*relational| {
             relational.table_id = table.table_id;
-            relational.schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
+            relational.schema_generation = table_record.schemaRewriteGenerationForSchemaJson(table.schema_json);
         },
         .document => |*document| {
             document.table_id = table.table_id;
-            const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
+            const schema_generation = table_record.schemaRewriteGenerationForSchemaJson(table.schema_json);
             document.schema_generation = schema_generation;
             document.indexes_json = try alloc.dupe(u8, table.indexes_json);
             errdefer if (document.indexes_json) |indexes_json| alloc.free(@constCast(indexes_json));
@@ -1291,7 +1288,7 @@ fn sourceBindingForCatalogTableRecordAlloc(
         },
         .lake => |*lake| {
             lake.table_id = table.table_id;
-            lake.schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
+            lake.schema_generation = table_record.schemaRewriteGenerationForSchemaJson(table.schema_json);
         },
     }
     return binding;
@@ -1299,9 +1296,9 @@ fn sourceBindingForCatalogTableRecordAlloc(
 
 fn documentSqlViewSourceTableRecordAlloc(
     alloc: std.mem.Allocator,
-    snapshot: *const metadata_api.AdminSnapshot,
+    snapshot: *const table_catalog.SqlCatalogSnapshot,
     requested_target: source_binding.CatalogTableRef,
-) !?metadata_table_manager.TableRecord {
+) !?table_record.TableRecord {
     for (snapshot.tables) |table| {
         if (!std.mem.eql(u8, table.database_name, requested_target.database_name)) continue;
         if (!std.mem.eql(u8, table.namespace_name, requested_target.namespace_name)) continue;
@@ -1314,10 +1311,10 @@ fn documentSqlViewSourceTableRecordAlloc(
 
 fn documentSqlViewSourceTableRecordForObjectNameAlloc(
     alloc: std.mem.Allocator,
-    snapshot: *const metadata_api.AdminSnapshot,
+    snapshot: *const table_catalog.SqlCatalogSnapshot,
     table_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
-) !?metadata_table_manager.TableRecord {
+) !?table_record.TableRecord {
     const parsed_target = try session.tableTargetFromObjectName(table_name);
     if (std.mem.indexOfScalar(u8, table_name, '.') != null) {
         return try documentSqlViewSourceTableRecordAlloc(alloc, snapshot, .{
@@ -1342,12 +1339,12 @@ fn documentSqlViewSourceTableRecordForObjectNameAlloc(
 
 fn rejectDocumentSqlViewWriteTargetAlloc(
     alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     table_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !void {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
+    var snapshot = try catalog.snapshotAlloc(alloc);
+    defer catalog.freeSnapshot(alloc, &snapshot);
     if (try resolvedExistingCatalogTableForObjectNameAlloc(alloc, &snapshot, table_name, session)) |resolved| {
         deinitCatalogTableRef(alloc, resolved.target);
         return;
@@ -1355,7 +1352,7 @@ fn rejectDocumentSqlViewWriteTargetAlloc(
     if (try documentSqlViewSourceTableRecordForObjectNameAlloc(alloc, &snapshot, table_name, session) != null) return error.DocumentSqlWriteUnsupported;
 }
 
-fn catalogTableRefForTableRecordAlloc(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord) !source_binding.CatalogTableRef {
+fn catalogTableRefForTableRecordAlloc(alloc: std.mem.Allocator, table: table_record.TableRecord) !source_binding.CatalogTableRef {
     const database_name = try alloc.dupe(u8, table.database_name);
     errdefer alloc.free(database_name);
     const namespace_name = try alloc.dupe(u8, table.namespace_name);
@@ -1394,13 +1391,13 @@ fn deinitSqlSourceBinding(alloc: std.mem.Allocator, binding: *source_binding.Sql
 
 pub fn runtimeSchemaForQualifiedCatalogTableAlloc(
     alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     database_name: []const u8,
     namespace_name: []const u8,
     table_name: []const u8,
 ) !runtime_schema.TableSchema {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
+    var snapshot = try catalog.snapshotAlloc(alloc);
+    defer catalog.freeSnapshot(alloc, &snapshot);
     const schema_json = qualifiedTableSchemaJson(&snapshot, database_name, namespace_name, table_name) orelse return error.InvalidSqlCatalog;
     if (schema_json.len == 0) return error.InvalidSqlCatalog;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
@@ -1408,17 +1405,17 @@ pub fn runtimeSchemaForQualifiedCatalogTableAlloc(
     return try schema_api.deriveRuntimeTableSchema(alloc, parsed);
 }
 
-pub fn tableSchemaJson(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) ?[]const u8 {
+pub fn tableSchemaJson(snapshot: *const table_catalog.SqlCatalogSnapshot, table_name: []const u8) ?[]const u8 {
     return qualifiedTableSchemaJson(
         snapshot,
-        metadata_table_manager.default_database_name,
-        metadata_table_manager.default_namespace_name,
+        table_record.default_database_name,
+        table_record.default_namespace_name,
         table_name,
     );
 }
 
 pub fn qualifiedTableSchemaJson(
-    snapshot: *const metadata_api.AdminSnapshot,
+    snapshot: *const table_catalog.SqlCatalogSnapshot,
     database_name: []const u8,
     namespace_name: []const u8,
     table_name: []const u8,
@@ -1432,11 +1429,11 @@ pub fn qualifiedTableSchemaJson(
 }
 
 pub fn qualifiedTableRecord(
-    snapshot: *const metadata_api.AdminSnapshot,
+    snapshot: *const table_catalog.SqlCatalogSnapshot,
     database_name: []const u8,
     namespace_name: []const u8,
     table_name: []const u8,
-) ?metadata_table_manager.TableRecord {
+) ?table_record.TableRecord {
     for (snapshot.tables) |table| {
         if (!std.mem.eql(u8, table.database_name, database_name)) continue;
         if (!std.mem.eql(u8, table.namespace_name, namespace_name)) continue;
@@ -2500,7 +2497,7 @@ pub fn bindWritePlanCatalogStatementAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
 ) !BoundSqlStatement {
     return try bindWritePlanCatalogStatementWithSessionAlloc(alloc, parsed_sql, options, catalog, catalog_resources.SqlCatalogSession.default());
 }
@@ -2509,7 +2506,7 @@ pub fn bindWritePlanCatalogStatementWithSessionAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !BoundSqlStatement {
     return try bindWritePlanCatalogStatementWithSessionAndAuthorizationAlloc(alloc, parsed_sql, options, catalog, session, .{});
@@ -2519,7 +2516,7 @@ pub fn bindWritePlanCatalogStatementWithSessionAndAuthorizationAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     authorization_options: BoundSqlAuthorizationOptions,
 ) !BoundSqlStatement {
@@ -2540,7 +2537,7 @@ fn resolveWritePlanCatalogOptionsParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
 ) !CatalogBoundWritePlanOptions {
     return try resolveWritePlanCatalogOptionsParsedSqlWithSessionAlloc(alloc, parsed_sql, options, catalog, catalog_resources.SqlCatalogSession.default());
 }
@@ -2549,7 +2546,7 @@ fn resolveWritePlanCatalogOptionsParsedSqlWithSessionAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !CatalogBoundWritePlanOptions {
     try requireParsedCatalogWriteStatementIncludingGeneratedAst(parsed_sql);
@@ -2560,7 +2557,7 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !CatalogBoundWritePlanOptions {
     return try resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAndAuthorizationAlloc(alloc, parsed_sql, options, catalog, session, .{});
@@ -2570,7 +2567,7 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAndAuthorizationAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     authorization_options: BoundSqlAuthorizationOptions,
 ) !CatalogBoundWritePlanOptions {
@@ -2645,7 +2642,7 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAndAuthorizationAlloc(
 fn resolveReadPlanCatalogSourceSchemaParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
 ) !CatalogBoundReadPlanSourceSchema {
     return try resolveReadPlanCatalogSourceSchemaParsedSqlWithSessionAlloc(alloc, parsed_sql, catalog, catalog_resources.SqlCatalogSession.default());
 }
@@ -2653,7 +2650,7 @@ fn resolveReadPlanCatalogSourceSchemaParsedSqlAlloc(
 fn resolveReadPlanCatalogSourceSchemaParsedSqlWithSessionAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !CatalogBoundReadPlanSourceSchema {
     try requireParsedCatalogReadStatementIncludingGeneratedAst(parsed_sql);
@@ -2663,7 +2660,7 @@ fn resolveReadPlanCatalogSourceSchemaParsedSqlWithSessionAlloc(
 fn resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !CatalogBoundReadPlanSourceSchema {
     return try resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAndAuthorizationAlloc(alloc, parsed_sql, catalog, session, .{});
@@ -2672,7 +2669,7 @@ fn resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAlloc(
 fn resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAndAuthorizationAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     authorization_options: BoundSqlAuthorizationOptions,
 ) !CatalogBoundReadPlanSourceSchema {
@@ -2825,7 +2822,7 @@ fn appendOptionalBoundCatalogObjectForCatalogTableAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
     role: BoundCatalogObjectRole,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     table_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
     missing_ok: bool,
@@ -2840,7 +2837,7 @@ fn appendOptionalBoundCatalogObjectForCatalogTableAlloc(
 fn appendExistingCreateTargetIfPresentAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     table_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !void {
@@ -2854,7 +2851,7 @@ fn foreignKeyReferencesSelf(child_table_name: []const u8, foreign_key: runtime_s
 fn appendBoundCatalogObjectsForForeignKeysAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     child_table_name: []const u8,
     foreign_keys: []const runtime_schema.ForeignKey,
     session: catalog_resources.SqlCatalogSession,
@@ -2868,7 +2865,7 @@ fn appendBoundCatalogObjectsForForeignKeysAlloc(
 fn appendBoundCatalogObjectsForAlterTableForeignKeysAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     plan: ddl_plan.AlterTablePlan,
     session: catalog_resources.SqlCatalogSession,
 ) !void {
@@ -2884,7 +2881,7 @@ fn appendBoundCatalogObjectsForAlterTableForeignKeysAlloc(
 fn collectTableDdlBoundCatalogObjectsAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     plan: TableDdlLogicalPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !void {
@@ -2946,7 +2943,7 @@ fn collectTableDdlBoundCatalogObjectsAlloc(
 fn collectAuthDdlBoundCatalogObjectsAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     plan: AuthorizationLogicalPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !void {
@@ -2980,7 +2977,7 @@ fn collectAuthDdlBoundCatalogObjectsAlloc(
 fn collectRoutineDdlBoundCatalogObjectsAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     plan: RoutineLogicalPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !void {
@@ -2996,7 +2993,7 @@ fn collectRoutineDdlBoundCatalogObjectsAlloc(
 fn collectBulkIoDdlBoundCatalogObjectsAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     plan: ddl_plan.BulkIoPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !void {
@@ -3006,7 +3003,7 @@ fn collectBulkIoDdlBoundCatalogObjectsAlloc(
 fn collectMaintenanceDdlBoundCatalogObjectsAlloc(
     alloc: std.mem.Allocator,
     objects: *std.ArrayListUnmanaged(BoundCatalogObject),
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     plan: ddl_plan.MaintenanceJobPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !void {
@@ -3029,13 +3026,13 @@ fn collectMaintenanceDdlBoundCatalogObjectsAlloc(
 
 fn validateMaintenanceClusterIndexAlloc(
     alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     cluster: ddl_plan.ClusterMaintenancePlan,
     session: catalog_resources.SqlCatalogSession,
 ) !void {
     const index_name = cluster.index_name orelse return;
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
+    var snapshot = try catalog.snapshotAlloc(alloc);
+    defer catalog.freeSnapshot(alloc, &snapshot);
     const resolved = try resolvedExistingCatalogTableForObjectNameAlloc(alloc, &snapshot, cluster.table_name, session) orelse return error.InvalidSqlCatalog;
     defer deinitCatalogTableRef(alloc, resolved.target);
     const table = resolved.table;
@@ -3051,7 +3048,7 @@ fn validateMaintenanceClusterIndexAlloc(
 
 fn collectDdlBoundCatalogObjectsAlloc(
     alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     logical_plan: LogicalSqlPlan,
     session: catalog_resources.SqlCatalogSession,
 ) ![]BoundCatalogObject {
@@ -3089,7 +3086,7 @@ fn ddlAuthorizationDefaultPermission(logical_plan: LogicalSqlPlan) BoundSqlAutho
 fn resolveDdlCatalogFactsFromParsedSqlWithSessionAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !CatalogBoundDdlPlanFacts {
@@ -3099,7 +3096,7 @@ fn resolveDdlCatalogFactsFromParsedSqlWithSessionAlloc(
 fn resolveDdlCatalogFactsFromParsedSqlWithSessionAndAuthorizationAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     function_bindings: expr_row_parse.SqlFunctionBindings,
     authorization_options: BoundSqlAuthorizationOptions,
@@ -3120,7 +3117,7 @@ fn resolveDdlCatalogFactsFromParsedSqlWithSessionAndAuthorizationAlloc(
 pub fn bindReadPlanCatalogStatementAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
 ) !BoundSqlStatement {
     return try bindReadPlanCatalogStatementWithSessionAlloc(alloc, parsed_sql, catalog, catalog_resources.SqlCatalogSession.default());
 }
@@ -3128,7 +3125,7 @@ pub fn bindReadPlanCatalogStatementAlloc(
 pub fn bindReadPlanCatalogStatementWithSessionAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !BoundSqlStatement {
     return try bindReadPlanCatalogStatementWithSessionAndAuthorizationAlloc(alloc, parsed_sql, catalog, session, .{});
@@ -3137,7 +3134,7 @@ pub fn bindReadPlanCatalogStatementWithSessionAlloc(
 pub fn bindReadPlanCatalogStatementWithSessionAndAuthorizationAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     authorization_options: BoundSqlAuthorizationOptions,
 ) !BoundSqlStatement {
@@ -3173,7 +3170,7 @@ pub fn bindDdlStatementWithSessionAlloc(
 pub fn bindDdlStatementWithCatalogSessionAndFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !BoundSqlStatement {
@@ -3183,7 +3180,7 @@ pub fn bindDdlStatementWithCatalogSessionAndFunctionBindingsAlloc(
 pub fn bindDdlStatementWithCatalogSessionFunctionBindingsAndAuthorizationAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     function_bindings: expr_row_parse.SqlFunctionBindings,
     authorization_options: BoundSqlAuthorizationOptions,
@@ -3204,7 +3201,7 @@ pub fn bindDdlStatementWithCatalogSessionFunctionBindingsAndAuthorizationAlloc(
 pub fn bindDdlStatementWithCatalogSessionAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !BoundSqlStatement {
     return try bindDdlStatementWithCatalogSessionAndFunctionBindingsAlloc(alloc, parsed_sql, catalog, session, .{});
@@ -3213,7 +3210,7 @@ pub fn bindDdlStatementWithCatalogSessionAlloc(
 pub fn bindDdlStatementWithCatalogAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
 ) !BoundSqlStatement {
     return try bindDdlStatementWithCatalogSessionAlloc(alloc, parsed_sql, catalog, catalog_resources.SqlCatalogSession.default());
 }
@@ -4218,7 +4215,7 @@ test "sql adapter binder source table helpers validate parsed statement family" 
 }
 
 const MultiTableTestCatalog = struct {
-    tables: [2]metadata_table_manager.TableRecord,
+    tables: [2]table_record.TableRecord,
 
     fn init(
         left_table_name: []const u8,
@@ -4227,8 +4224,8 @@ const MultiTableTestCatalog = struct {
         source_schema_json: []const u8,
     ) @This() {
         return initInNamespace(
-            metadata_table_manager.default_database_name,
-            metadata_table_manager.default_namespace_name,
+            table_record.default_database_name,
+            table_record.default_namespace_name,
             left_table_name,
             left_schema_json,
             source_table_name,
@@ -4264,30 +4261,24 @@ const MultiTableTestCatalog = struct {
         } };
     }
 
-    fn iface(self: *@This()) table_catalog.CatalogSource {
+    fn iface(self: *@This()) table_catalog.SqlCatalogSource {
         return .{
             .ptr = self,
             .vtable = &.{
-                .admin_snapshot = adminSnapshot,
-                .free_admin_snapshot = freeAdminSnapshot,
+                .snapshot_alloc = snapshotAlloc,
+                .free_snapshot = freeSnapshot,
             },
         };
     }
 
-    fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+    fn snapshotAlloc(ptr: *anyopaque, _: ?*const anyopaque, _: std.mem.Allocator) !table_catalog.SqlCatalogSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .status = .{ .metadata_group_id = 1, .metrics = .{} },
-            .tables = self.tables[0..],
-            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-        };
+        return .{ .tables = self.tables[0..] };
     }
 
-    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    fn freeSnapshot(_: *anyopaque, _: ?*const anyopaque, _: std.mem.Allocator, snapshot: *table_catalog.SqlCatalogSnapshot) void {
+        snapshot.* = undefined;
+    }
 };
 
 test "sql adapter binder produces bound sql statements for catalog read and write" {
@@ -4298,8 +4289,8 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     const incoming_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"source":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
-    const usage_schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(usage_schema_json);
-    const incoming_schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(incoming_schema_json);
+    const usage_schema_generation = table_record.schemaRewriteGenerationForSchemaJson(usage_schema_json);
+    const incoming_schema_generation = table_record.schemaRewriteGenerationForSchemaJson(incoming_schema_json);
     var catalog = MultiTableTestCatalog.init("usage_records", usage_schema_json, "incoming_usage", incoming_schema_json);
     catalog.tables[0].indexes_json = "{\"usage_status_idx\":{}}";
     catalog.tables[1].indexes_json = "{\"incoming_status_idx\":{}}";
@@ -4371,7 +4362,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     const document_schema_json =
         \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}}},"additionalProperties":true}}}}
     ;
-    const document_schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(document_schema_json);
+    const document_schema_generation = table_record.schemaRewriteGenerationForSchemaJson(document_schema_json);
     var document_catalog = MultiTableTestCatalog.init("docs", document_schema_json, "incoming_usage", incoming_schema_json);
     var parsed_document_read = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -4670,7 +4661,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
         try std.testing.expectEqual(usage_schema_generation, maintenance_ddl.bound_objects[0].schema_generation);
     }
 
-    const reindex_schema_sql = try std.fmt.allocPrint(alloc, "REINDEX SCHEMA {s}", .{metadata_table_manager.default_namespace_name});
+    const reindex_schema_sql = try std.fmt.allocPrint(alloc, "REINDEX SCHEMA {s}", .{table_record.default_namespace_name});
     defer alloc.free(reindex_schema_sql);
     var parsed_reindex_schema = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -4690,7 +4681,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     try std.testing.expectEqual(@as(u64, 2), reindex_schema_ddl.bound_objects[1].table_id);
     try std.testing.expectEqual(incoming_schema_generation, reindex_schema_ddl.bound_objects[1].schema_generation);
 
-    const reindex_database_sql = try std.fmt.allocPrint(alloc, "REINDEX DATABASE {s}", .{metadata_table_manager.default_database_name});
+    const reindex_database_sql = try std.fmt.allocPrint(alloc, "REINDEX DATABASE {s}", .{table_record.default_database_name});
     defer alloc.free(reindex_database_sql);
     var parsed_reindex_database = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -4990,7 +4981,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     try std.testing.expectError(error.PermissionDenied, enforceBoundSqlStatementAuthorization(&denied_auth_bound_read));
 
     const ddl_auth_grants = [_]BoundSqlAuthorizationGrant{
-        .{ .resource_kind = .database, .resource = metadata_table_manager.default_database_name, .permission = .admin },
+        .{ .resource_kind = .database, .resource = table_record.default_database_name, .permission = .admin },
     };
     var auth_bound_ddl = try bindDdlStatementWithCatalogSessionFunctionBindingsAndAuthorizationAlloc(alloc, &parsed_alter, catalog.iface(), catalog_resources.SqlCatalogSession.default(), .{}, .{
         .principal_name = "admin",
@@ -5285,7 +5276,7 @@ test "sql adapter binder resolves join projection bindings" {
 }
 
 const TestCatalog = struct {
-    tables: [2]metadata_table_manager.TableRecord,
+    tables: [2]table_record.TableRecord,
 
     fn init(table_name: []const u8, schema_json: []const u8, tenant_schema_json: []const u8) @This() {
         return .{ .tables = .{
@@ -5300,36 +5291,30 @@ const TestCatalog = struct {
             .{
                 .table_id = 1,
                 .name = table_name,
-                .database_name = metadata_table_manager.default_database_name,
-                .namespace_name = metadata_table_manager.default_namespace_name,
+                .database_name = table_record.default_database_name,
+                .namespace_name = table_record.default_namespace_name,
                 .placement_role = "data",
                 .schema_json = schema_json,
             },
         } };
     }
 
-    fn iface(self: *@This()) table_catalog.CatalogSource {
+    fn iface(self: *@This()) table_catalog.SqlCatalogSource {
         return .{
             .ptr = self,
             .vtable = &.{
-                .admin_snapshot = adminSnapshot,
-                .free_admin_snapshot = freeAdminSnapshot,
+                .snapshot_alloc = snapshotAlloc,
+                .free_snapshot = freeSnapshot,
             },
         };
     }
 
-    fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+    fn snapshotAlloc(ptr: *anyopaque, _: ?*const anyopaque, _: std.mem.Allocator) !table_catalog.SqlCatalogSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .status = .{ .metadata_group_id = 1, .metrics = .{} },
-            .tables = self.tables[0..],
-            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-        };
+        return .{ .tables = self.tables[0..] };
     }
 
-    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    fn freeSnapshot(_: *anyopaque, _: ?*const anyopaque, _: std.mem.Allocator, snapshot: *table_catalog.SqlCatalogSnapshot) void {
+        snapshot.* = undefined;
+    }
 };

@@ -15,6 +15,7 @@
 const std = @import("std");
 const metadata_api = @import("../api.zig");
 const metadata_table_manager = @import("../table_manager.zig");
+const sql_catalog_source = @import("../../sql/catalog_source.zig");
 
 pub const CatalogSource = struct {
     ptr: *anyopaque,
@@ -160,6 +161,17 @@ pub const CatalogSource = struct {
 
     pub fn freeAdminSnapshot(self: CatalogSource, snapshot: *metadata_api.AdminSnapshot) void {
         self.vtable.free_admin_snapshot(self.ptr, snapshot);
+    }
+
+    pub fn sqlSource(self: CatalogSource) sql_catalog_source.SqlCatalogSource {
+        return .{
+            .ptr = self.ptr,
+            .context = self.vtable,
+            .vtable = &.{
+                .snapshot_alloc = sqlSnapshotAlloc,
+                .free_snapshot = freeSqlSnapshot,
+            },
+        };
     }
 
     pub fn validatePublication(
@@ -412,6 +424,34 @@ pub const CatalogSource = struct {
         return try fn_ptr(self.ptr, request);
     }
 };
+
+fn sqlSnapshotAlloc(
+    ptr: *anyopaque,
+    context: ?*const anyopaque,
+    alloc: std.mem.Allocator,
+) !sql_catalog_source.SqlCatalogSnapshot {
+    const vtable: *const CatalogSource.VTable = @ptrCast(@alignCast(context orelse return error.CatalogSnapshotUnavailable));
+    const owner = try alloc.create(metadata_api.AdminSnapshot);
+    errdefer alloc.destroy(owner);
+    owner.* = try vtable.admin_snapshot(ptr);
+    return .{
+        .tables = owner.tables,
+        .owner = owner,
+    };
+}
+
+fn freeSqlSnapshot(
+    ptr: *anyopaque,
+    context: ?*const anyopaque,
+    alloc: std.mem.Allocator,
+    snapshot: *sql_catalog_source.SqlCatalogSnapshot,
+) void {
+    const vtable: *const CatalogSource.VTable = @ptrCast(@alignCast(context orelse unreachable));
+    const owner: *metadata_api.AdminSnapshot = @ptrCast(@alignCast(snapshot.owner orelse unreachable));
+    vtable.free_admin_snapshot(ptr, owner);
+    alloc.destroy(owner);
+    snapshot.* = undefined;
+}
 
 pub fn emptyCatalogSource() CatalogSource {
     return .{

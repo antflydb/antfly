@@ -15,7 +15,7 @@
 const std = @import("std");
 
 const catalog_resources = @import("catalog_resources.zig");
-const table_catalog = @import("../metadata/catalog/source.zig");
+const table_catalog = @import("catalog_source.zig");
 const binder = @import("binder.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const executor = @import("executor.zig");
@@ -104,7 +104,7 @@ pub fn planDurableSqlPlanOrAdapterNoopParsedSqlWithFunctionBindingsAlloc(
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !DurableSqlPlanOrAdapterNoop {
     var logical_plan = try executor.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
-        .catalog = table_catalog.unavailableCatalogSource(),
+        .catalog = table_catalog.unavailableSqlCatalogSource(),
         .function_bindings = function_bindings,
     });
     errdefer logical_plan.deinit(alloc);
@@ -163,7 +163,7 @@ pub fn planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !DurableSqlPlan {
     var logical_plan = try executor.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
-        .catalog = table_catalog.unavailableCatalogSource(),
+        .catalog = table_catalog.unavailableSqlCatalogSource(),
         .function_bindings = function_bindings,
     });
     errdefer logical_plan.deinit(alloc);
@@ -173,7 +173,7 @@ pub fn planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(
 pub fn planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !DurableSqlPlan {

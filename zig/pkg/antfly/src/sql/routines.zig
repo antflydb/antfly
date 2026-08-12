@@ -24,7 +24,7 @@ const relational_row_runtime = @import("../storage/db/relational_rows.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const sql_value = @import("value.zig");
-const table_catalog = if (builtin.is_test) @import("../metadata/catalog/source.zig") else struct {};
+const table_catalog = if (builtin.is_test) @import("catalog_source.zig") else struct {};
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 
@@ -1328,7 +1328,7 @@ fn routineLogicalPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !sq
         .ddl, .explain, .transaction, .prepared, .session, .unsupported, .unknown => {},
     }
     return try sql_adapter.planParsedSqlWithSessionAlloc(alloc, &parsed_sql, .{
-        .catalog = table_catalog.unavailableCatalogSource(),
+        .catalog = table_catalog.unavailableSqlCatalogSource(),
         .function_bindings = .{},
     });
 }

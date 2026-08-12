@@ -301,7 +301,7 @@ pub fn executeRelationalSqlDdlParsedSqlOnUserManagerWithCatalogAndFunctionBindin
     var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
         alloc,
         parsed_sql,
-        catalog_source,
+        catalog_source.sqlSource(),
         catalog.session(),
         function_bindings,
     );
@@ -1120,7 +1120,7 @@ test "sql auth catalog builder shares live catalog tables for table-aware auth p
     var grant_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
         alloc,
         &grant_sql,
-        source.iface(),
+        source.iface().sqlSource(),
         session,
         .{},
     );
@@ -1147,7 +1147,7 @@ test "sql auth catalog builder shares live catalog tables for table-aware auth p
     var row_security_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
         alloc,
         &row_security_sql,
-        source.iface(),
+        source.iface().sqlSource(),
         session,
         .{},
     );

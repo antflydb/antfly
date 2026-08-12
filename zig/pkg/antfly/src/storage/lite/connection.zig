@@ -107,6 +107,9 @@ fn openWithBackend(
 ) !Connection {
     var opts = db_mod.OpenOptions{
         .open_mode = open_mode,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
         .external_derived_checkpoints = false,
         .identity_namespace = embeddedRootIdentity(),
     };
@@ -149,6 +152,19 @@ test "lite connection write modes sync on close" {
     try std.testing.expect(openModeCanWrite(.writer_no_replay));
     try std.testing.expect(!openModeCanWrite(.query_readonly));
     try std.testing.expect(!openModeCanWrite(.status_only));
+}
+
+test "lite connection keeps movable DB values free of self-referential workers" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/movable.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var connection = try Connection.create(allocator, path, true);
+    defer connection.close();
+    try std.testing.expect(!connection.db.start_index_workers);
+    try std.testing.expect(connection.db.artifact_repair_metadata_future == null);
 }
 
 test "lite connection propagates fsync policy to native file" {

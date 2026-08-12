@@ -29,19 +29,16 @@ const expr_projection = @import("expr/projection.zig");
 const expr_window = @import("expr/window.zig");
 const lower_ddl = @import("lower_ddl.zig");
 const lower_expr = @import("lower_expr.zig");
-const metadata_api = @import("../metadata/api.zig");
-const metadata_table_manager = @import("../metadata/table_manager.zig");
-const metadata_transition_state = @import("../metadata/transition_state.zig");
+const table_record = @import("../metadata/catalog/table_record.zig");
 const parser = @import("parser.zig");
 const plan_mod = @import("plan.zig");
 const query_contract = @import("../query/contract.zig");
-const raft_reconciler = @import("../raft/reconciler.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const row_claim = @import("row_claim.zig");
 const select_set = @import("select_set.zig");
 const schema_api = @import("../schema/mod.zig");
 const source_binding = @import("source_binding.zig");
-const table_catalog = @import("../metadata/catalog/source.zig");
+const table_catalog = @import("catalog_source.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 const generated_parser = @import("generated_parser.zig");
@@ -1361,8 +1358,8 @@ pub const AppParityCatalogTable = struct {
 };
 
 pub const AppParitySourceSchemaCatalog = struct {
-    single_table: [1]metadata_table_manager.TableRecord = undefined,
-    owned_tables: []metadata_table_manager.TableRecord = &.{},
+    single_table: [1]table_record.TableRecord = undefined,
+    owned_tables: []table_record.TableRecord = &.{},
     owned_table_names: [][]u8 = &.{},
     owned_source_table_name: []u8 = &.{},
     table_count: usize = 0,
@@ -1387,7 +1384,7 @@ pub const AppParitySourceSchemaCatalog = struct {
 
     pub fn initCatalogTablesAlloc(alloc: std.mem.Allocator, catalog_tables: []const AppParityCatalogTable) !@This() {
         if (catalog_tables.len == 0) return error.InvalidSqlCatalog;
-        var records = try alloc.alloc(metadata_table_manager.TableRecord, catalog_tables.len);
+        var records = try alloc.alloc(table_record.TableRecord, catalog_tables.len);
         errdefer alloc.free(records);
         var names = try alloc.alloc([]u8, catalog_tables.len);
         errdefer alloc.free(names);
@@ -1420,32 +1417,26 @@ pub const AppParitySourceSchemaCatalog = struct {
         self.* = undefined;
     }
 
-    pub fn iface(self: *@This()) table_catalog.CatalogSource {
+    pub fn iface(self: *@This()) table_catalog.SqlCatalogSource {
         return .{
             .ptr = self,
             .vtable = &.{
-                .admin_snapshot = adminSnapshot,
-                .free_admin_snapshot = freeAdminSnapshot,
+                .snapshot_alloc = snapshotAlloc,
+                .free_snapshot = freeSnapshot,
             },
         };
     }
 
-    fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+    fn snapshotAlloc(ptr: *anyopaque, _: ?*const anyopaque, _: std.mem.Allocator) !table_catalog.SqlCatalogSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .status = .{ .metadata_group_id = 1, .metrics = .{} },
-            .tables = self.tables(),
-            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-        };
+        return .{ .tables = self.tables() };
     }
 
-    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    fn freeSnapshot(_: *anyopaque, _: ?*const anyopaque, _: std.mem.Allocator, snapshot: *table_catalog.SqlCatalogSnapshot) void {
+        snapshot.* = undefined;
+    }
 
-    fn tables(self: *@This()) []metadata_table_manager.TableRecord {
+    fn tables(self: *@This()) []table_record.TableRecord {
         if (self.owned_tables.len > 0) return self.owned_tables;
         return self.single_table[0..self.table_count];
     }

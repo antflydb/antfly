@@ -68,17 +68,25 @@ CODEGEN_BOUNDARIES = (
 # is performed against an API compiler time report when one is supplied.
 API_KERNEL_CONTRACTS = (
     "api/kernel_exports.zig",
+    "api/lite_sql_source.zig",
     "api/table_read_source.zig",
     "api/table_write_source.zig",
 )
 API_KERNEL_IMPLEMENTATIONS = (
     "api/table_reads.zig",
     "api/table_writes.zig",
+    "sql/ddl_plan.zig",
+    "sql/plan.zig",
+    "sql/relational_rows.zig",
+    "query/row_execution_contract.zig",
     "storage/db/mod.zig",
     "storage/db/db.zig",
+    "storage/db/types.zig",
     "storage/docstore.zig",
+    "storage/lite/sql_source.zig",
     "storage/lmdb.zig",
     "storage/lmdb_backend.zig",
+    "storage/schema.zig",
 )
 SQL_STORAGE_RUNTIME_IMPORT_ALLOWLIST = frozenset(
     {

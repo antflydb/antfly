@@ -20,7 +20,7 @@ const metadata_catalog_lookup = @import("lookup.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 const metadata_transition_state = @import("../transition_state.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
-const db_mod = @import("../../storage/db/mod.zig");
+const db_types = @import("../../storage/db/types.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const schema_openapi = @import("antfly_schema_openapi");
@@ -34,6 +34,7 @@ const indexes_api = @import("../../api/indexes.zig");
 const json_helpers = @import("../../common/json_helpers.zig");
 const catalog_resources = @import("resources.zig");
 const sql_adapter = @import("../../sql/mod.zig");
+const ddl_result = @import("../../sql/ddl_result.zig");
 const sql_schema_mutation = @import("../../sql/schema_mutation.zig");
 const table_reads = @import("../../api/table_read_source.zig");
 const coverage_policy_mod = @import("../../api/coverage_policy.zig");
@@ -124,48 +125,8 @@ pub fn effectiveSchemaJson(schema_json: ?[]const u8) []const u8 {
 }
 
 pub const ParsedTableSchema = schema_mod.ParsedTableSchema;
-pub const AppliedRelationalSqlDdlRecord = struct {
-    table: metadata_table_manager.TableRecord,
-    created_table: bool = false,
-    dropped_table: bool = false,
-    created_database: bool = false,
-    dropped_database: bool = false,
-    created_namespace: bool = false,
-    renamed_namespace: bool = false,
-    dropped_namespace: bool = false,
-    created_tablespace: bool = false,
-    renamed_tablespace: bool = false,
-    dropped_tablespace: bool = false,
-    created_sequence: bool = false,
-    altered_sequence: bool = false,
-    dropped_sequence: bool = false,
-    noop: bool = false,
-    requires_rebuild: bool = false,
-    validation_required: bool = false,
-    rewrite_required: bool = false,
-    work_items: []const sql_adapter.AppliedDdlWorkItem = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        metadata_table_manager.freeTable(alloc, self.table);
-        if (self.work_items.len > 0) {
-            for (self.work_items) |item| {
-                var mutable = item;
-                mutable.deinit(alloc);
-            }
-            alloc.free(self.work_items);
-        }
-        self.* = undefined;
-    }
-};
-
-pub fn emptyAppliedRelationalSqlDdlRecordAlloc(alloc: std.mem.Allocator) !AppliedRelationalSqlDdlRecord {
-    return .{
-        .table = try metadata_table_manager.cloneTable(alloc, .{
-            .table_id = 0,
-            .name = "",
-        }),
-    };
-}
+pub const AppliedRelationalSqlDdlRecord = ddl_result.AppliedRelationalSqlDdlRecord;
+pub const emptyAppliedRelationalSqlDdlRecordAlloc = ddl_result.emptyAppliedRelationalSqlDdlRecordAlloc;
 
 pub const RelationalSqlDdlAction = enum {
     create_table,
@@ -1701,7 +1662,7 @@ pub fn parseValidatedTableSchema(alloc: std.mem.Allocator, schema_json: []const 
 pub fn validateBatchWritesAgainstTableSchema(
     alloc: std.mem.Allocator,
     schema: ParsedTableSchema,
-    writes: []const db_mod.types.BatchWrite,
+    writes: []const db_types.BatchWrite,
 ) !void {
     try schema_mod.validateBatchWritesAgainstTableSchema(alloc, schema, writes);
 }
@@ -3078,7 +3039,7 @@ fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
 pub fn routeQueryRequestToActiveReadIndex(
     alloc: std.mem.Allocator,
     table: *const metadata_table_manager.TableRecord,
-    req: *db_mod.types.SearchRequest,
+    req: *db_types.SearchRequest,
 ) !void {
     if (!queryNeedsPrimaryTextIndex(req.*)) return;
 
@@ -4708,7 +4669,7 @@ fn antflyTypeName(value: runtime_schema_mod.AntflyType) []const u8 {
     };
 }
 
-fn queryNeedsPrimaryTextIndex(req: db_mod.types.SearchRequest) bool {
+fn queryNeedsPrimaryTextIndex(req: db_types.SearchRequest) bool {
     if (req.full_text != null) return true;
     if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) return true;
     if (req.full_text_queries.len > 0) return false;
@@ -5306,7 +5267,7 @@ pub fn applyRelationalCatalogDdlParsedSqlOnServiceWithSessionAndFunctionBindings
     var durable_plan = sql_adapter.planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
         alloc,
         parsed_sql,
-        catalog_source.iface(),
+        catalog_source.iface().sqlSource(),
         session,
         function_bindings,
     ) catch |err| switch (err) {
@@ -9766,7 +9727,7 @@ test "metadata.query routing selects read schema full text index" {
         .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v3\":{\"type\":\"full_text\"}}",
         .placement_role = "data",
     };
-    var req: db_mod.types.SearchRequest = .{
+    var req: db_types.SearchRequest = .{
         .query = .{ .match = .{ .field = "body", .text = "hello" } },
     };
     defer if (req.index_name) |index_name| std.testing.allocator.free(index_name);
@@ -9791,7 +9752,7 @@ test "metadata.query routing selects current versioned full text index" {
         .indexes_json = "{\"default\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
         .placement_role = "data",
     };
-    var req: db_mod.types.SearchRequest = .{
+    var req: db_types.SearchRequest = .{
         .full_text = .{ .match = .{ .field = try std.testing.allocator.dupe(u8, "body"), .text = try std.testing.allocator.dupe(u8, "hello") } },
     };
     defer if (req.index_name) |index_name| std.testing.allocator.free(index_name);
@@ -9815,7 +9776,7 @@ test "metadata.query routing preserves vector index and records read schema text
         .indexes_json = "{\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v3\":{\"type\":\"full_text\"}}",
         .placement_role = "data",
     };
-    var req: db_mod.types.SearchRequest = .{
+    var req: db_types.SearchRequest = .{
         .index_name = try std.testing.allocator.dupe(u8, "dense_idx"),
         .full_text = .{ .match_all = {} },
         .filter_query_json = try std.testing.allocator.dupe(u8, "{\"term\":{\"status\":\"active\"}}"),
@@ -9838,7 +9799,7 @@ test "metadata.query routing selects read schema text index for vector-only stru
         .indexes_json = "{\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v3\":{\"type\":\"full_text\"}}",
         .placement_role = "data",
     };
-    var req: db_mod.types.SearchRequest = .{
+    var req: db_types.SearchRequest = .{
         .query = .{ .dense_knn = .{
             .vector = try std.testing.allocator.dupe(f32, &.{ 1, 2, 3 }),
             .k = 10,

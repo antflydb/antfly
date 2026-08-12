@@ -9501,7 +9501,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
     var result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         versioned_schema,
         lowered,
@@ -9528,7 +9528,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
     var timestamp_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         versioned_schema,
         lowered_timestamp,
@@ -9631,7 +9631,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
     var set_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         versioned_schema,
         lowered_set,
@@ -9657,7 +9657,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
     var timestamp_set_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         versioned_schema,
         lowered_timestamp_set,
@@ -9720,7 +9720,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
     try std.testing.expectError(error.SystemVersionedHistoryPruned, executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         versioned_schema,
         lowered_timestamp,
@@ -10879,7 +10879,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var lookup_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         lookup_plan,
@@ -10905,7 +10905,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var doc_projection_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         doc_projection_plan,
@@ -10939,7 +10939,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var scalar_filter_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         scalar_filter_plan,
@@ -10972,7 +10972,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var json_path_filter_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         json_path_filter_plan,
@@ -11005,7 +11005,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var scan_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         scan_plan,
@@ -11046,7 +11046,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var star_scan_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         star_scan_plan,
@@ -11086,7 +11086,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var virtual_projection_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         virtual_projection_plan,
@@ -11119,7 +11119,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var virtual_star_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         virtual_star_plan,
@@ -11151,7 +11151,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var ordered_scan_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         ordered_scan_plan,
@@ -11182,7 +11182,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         executeLoweredSqlReadPlanAlloc(
             alloc,
             source.source(),
-            catalog.iface(),
+            catalog.iface().sqlSource(),
             "docs",
             schema,
             capped_ordered_scan_plan,
@@ -11203,7 +11203,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         executeLoweredSqlReadPlanAlloc(
             alloc,
             source.source(),
-            catalog.iface(),
+            catalog.iface().sqlSource(),
             "docs",
             schema,
             byte_capped_ordered_scan_plan,
@@ -11221,7 +11221,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var full_text_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         full_text_plan,
@@ -11247,7 +11247,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var full_text_parity_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         full_text_parity_plan,
@@ -11288,7 +11288,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var ordered_full_text_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         ordered_full_text_plan,
@@ -11321,7 +11321,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         executeLoweredSqlReadPlanAlloc(
             alloc,
             source.source(),
-            catalog.iface(),
+            catalog.iface().sqlSource(),
             "docs",
             schema,
             capped_ordered_full_text_plan,
@@ -11339,7 +11339,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var like_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         like_plan,
@@ -11392,7 +11392,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var full_text_count_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         full_text_count_plan,
@@ -11424,7 +11424,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var full_text_grouped_count_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         full_text_grouped_count_plan,
@@ -11451,7 +11451,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var full_text_grouped_having_order_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         full_text_grouped_having_order_plan,
@@ -11496,7 +11496,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     var scalar_count_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         scalar_count_plan,
@@ -11592,7 +11592,7 @@ test "api.table_reads.docid lowered document sql unnest read plan matches native
     var result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         plan,
@@ -12449,7 +12449,7 @@ test "api.table_reads.docid document sql catalog read producers treat catalog mi
     var lookup_result = (try executeLoweredSqlReadPlanWithSessionAlloc(
         alloc,
         lookup_source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         tenant_session,
         "docs",
         schema,
@@ -12481,7 +12481,7 @@ test "api.table_reads.docid document sql catalog read producers treat catalog mi
     try std.testing.expect((try executeLoweredSqlReadPlanWithSessionAlloc(
         alloc,
         query_source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         tenant_session,
         "docs",
         schema,
@@ -12505,7 +12505,7 @@ test "api.table_reads.docid document sql catalog read producers treat catalog mi
     try std.testing.expect((try executeLoweredSqlReadPlanWithSessionAlloc(
         alloc,
         scan_source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         tenant_session,
         "docs",
         schema,
@@ -12612,7 +12612,7 @@ test "api.table_reads.docid lowered document sql aggregate executes native group
     var result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         "docs",
         schema,
         plan,
@@ -12765,7 +12765,7 @@ test "api.table_reads.docid lowered document sql aggregate uses catalog target f
     var result = (try executeLoweredSqlReadPlanWithSessionAlloc(
         alloc,
         fake.source(),
-        catalog.iface(),
+        catalog.iface().sqlSource(),
         tenant_session,
         "docs",
         schema,

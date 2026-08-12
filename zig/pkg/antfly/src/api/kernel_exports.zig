@@ -25,6 +25,8 @@ const http_common = @import("../raft/transport/http_common.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 const httpx = @import("httpx");
+const lite_sql_runtime = @import("lite_sql_runtime.zig");
+const lite_sql_source = @import("lite_sql_source.zig");
 
 const ErrorInt = abi.ErrorInt;
 pub const CreateContext = abi.CreateContext;
@@ -39,6 +41,11 @@ const ServerState = struct {
 const HandlerState = struct {
     alloc: std.mem.Allocator,
     handler: handler_mod.AntflyApiHandler,
+};
+
+const LiteSqlSessionState = struct {
+    alloc: std.mem.Allocator,
+    session: lite_sql_runtime.Session,
 };
 
 fn fail(error_code: *ErrorInt, err: anyerror) c_int {
@@ -222,6 +229,46 @@ pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
     const alloc = state.alloc;
     state.handler.deinitRuntime();
     alloc.destroy(state);
+}
+
+pub fn liteSqlSessionCreate(context: *const abi.LiteSqlSessionCreateContext) callconv(.c) c_int {
+    const alloc_ptr: *const std.mem.Allocator = @ptrCast(@alignCast(context.owner_alloc));
+    const options: *const lite_sql_runtime.CatalogOptions = @ptrCast(@alignCast(context.options));
+    const alloc = alloc_ptr.*;
+    const state = alloc.create(LiteSqlSessionState) catch |err| return fail(context.error_code, err);
+    errdefer alloc.destroy(state);
+    state.* = .{
+        .alloc = alloc,
+        .session = lite_sql_runtime.Session.init(alloc, options.*) catch |err| return fail(context.error_code, err),
+    };
+    context.out_handle.* = state;
+    return 0;
+}
+
+pub fn liteSqlSessionDestroy(opaque_handle: *anyopaque) callconv(.c) void {
+    const state: *LiteSqlSessionState = @ptrCast(@alignCast(opaque_handle));
+    const alloc = state.alloc;
+    state.session.deinit(alloc);
+    alloc.destroy(state);
+}
+
+pub fn liteSqlClassify(context: *const abi.LiteSqlClassifyContext) callconv(.c) c_int {
+    const alloc: *const std.mem.Allocator = @ptrCast(@alignCast(context.alloc));
+    const sql: *const []const u8 = @ptrCast(@alignCast(context.sql));
+    context.out_read_only.* = lite_sql_runtime.statementIsReadOnly(alloc.*, sql.*) catch |err|
+        return fail(context.error_code, err);
+    return 0;
+}
+
+pub fn liteSqlExecute(context: *const abi.LiteSqlExecuteContext) callconv(.c) c_int {
+    const state: *LiteSqlSessionState = @ptrCast(@alignCast(context.handle));
+    const alloc: *const std.mem.Allocator = @ptrCast(@alignCast(context.alloc));
+    const source: *const lite_sql_source.Source = @ptrCast(@alignCast(context.source));
+    const sql: *const []const u8 = @ptrCast(@alignCast(context.sql));
+    const out_json: *[]u8 = @ptrCast(@alignCast(context.out_json));
+    out_json.* = lite_sql_runtime.executeOneWithSourceJsonAlloc(alloc.*, source.*, &state.session, sql.*) catch |err|
+        return fail(context.error_code, err);
+    return 0;
 }
 
 fn PrefixedServer(comptime prefix: []const u8, comptime ServerType: type) type {

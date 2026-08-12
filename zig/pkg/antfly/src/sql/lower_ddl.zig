@@ -19,7 +19,7 @@ const catalog_resources = @import("catalog_resources.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const lower_expr = @import("lower_expr.zig");
 const expr_row_parse = @import("expr/row_parse.zig");
-const table_catalog = @import("../metadata/catalog/source.zig");
+const table_catalog = @import("catalog_source.zig");
 const tokenized = @import("tokenized.zig");
 
 pub fn logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(
@@ -50,7 +50,7 @@ test "bound ddl planner consumes binder-owned logical plan without parsed fallba
     var bound = try binder.bindDdlStatementWithCatalogSessionAlloc(
         alloc,
         &parsed,
-        table_catalog.unavailableCatalogSource(),
+        table_catalog.unavailableSqlCatalogSource(),
         catalog_resources.SqlCatalogSession.default(),
     );
     defer bound.deinit(alloc);

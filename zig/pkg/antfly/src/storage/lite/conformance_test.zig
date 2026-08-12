@@ -201,6 +201,7 @@ test "storage.lite relational ordered tuple doc range cleanup survives reopen" {
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
     const policy = relational_store.ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
 
@@ -329,6 +330,7 @@ test "storage.lite relational ordered tuple repair survives reopen" {
             .lifecycle = .ready,
             .generation = 7,
             .schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
+            .generation_record = .{ .generation = 7, .lifecycle = .ready },
         },
         .{
             .name = "amount",

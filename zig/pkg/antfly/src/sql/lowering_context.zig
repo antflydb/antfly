@@ -24,16 +24,13 @@ const generated_parser = @import("generated_parser.zig");
 const generated_read_validate = @import("generated_read_validate.zig");
 const lower_expr = @import("lower_expr.zig");
 const expr_row_parse = @import("expr/row_parse.zig");
-const metadata_api = @import("../metadata/api.zig");
-const metadata_table_manager = @import("../metadata/table_manager.zig");
-const metadata_transition_state = @import("../metadata/transition_state.zig");
+const table_record = @import("../metadata/catalog/table_record.zig");
 const parser_mod = @import("parser.zig");
 const parser_context = @import("parser_context.zig");
 const plan = @import("plan.zig");
 const query_function = @import("query_function.zig");
-const raft_reconciler = @import("../raft/reconciler.zig");
 const relational_rows = @import("relational_rows.zig");
-const table_catalog = @import("../metadata/catalog/source.zig");
+const table_catalog = @import("catalog_source.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const source_binding = @import("source_binding.zig");
@@ -5463,7 +5460,7 @@ pub const CatalogReadPlanLoweringContext = struct {
 
     pub fn lower(
         self: *@This(),
-        catalog: table_catalog.CatalogSource,
+        catalog: table_catalog.SqlCatalogSource,
     ) !plan.LoweredReadPlan {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(self.alloc, self.sql);
         defer parsed_sql.deinit(self.alloc);
@@ -5473,7 +5470,7 @@ pub const CatalogReadPlanLoweringContext = struct {
     pub fn lowerParsed(
         self: *@This(),
         parsed_sql: *const tokenized.ParsedSql,
-        catalog: table_catalog.CatalogSource,
+        catalog: table_catalog.SqlCatalogSource,
     ) !plan.LoweredReadPlan {
         return try self.lowerParsedWithSession(parsed_sql, catalog, catalog_resources.SqlCatalogSession.default());
     }
@@ -5481,7 +5478,7 @@ pub const CatalogReadPlanLoweringContext = struct {
     pub fn lowerParsedWithSession(
         self: *@This(),
         parsed_sql: *const tokenized.ParsedSql,
-        catalog: table_catalog.CatalogSource,
+        catalog: table_catalog.SqlCatalogSource,
         session: catalog_resources.SqlCatalogSession,
     ) !plan.LoweredReadPlan {
         var bound = try binder.bindReadPlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, catalog, session);
@@ -5547,7 +5544,7 @@ fn lowerReadPlanWithCatalogForLoweringContextTestAlloc(
     sql: []const u8,
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
 ) !plan.LoweredReadPlan {
     var context = CatalogReadPlanLoweringContext{
         .alloc = alloc,
@@ -9681,20 +9678,19 @@ test "sql adapter lowering context derives document virtual fields from typed pa
     defer runtime_schema.freeSchema(alloc, schema);
 
     const Catalog = struct {
-        fn iface() table_catalog.CatalogSource {
+        fn iface() table_catalog.SqlCatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
+                    .snapshot_alloc = snapshotAlloc,
+                    .free_snapshot = freeSnapshot,
                 },
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn snapshotAlloc(_: *anyopaque, _: ?*const anyopaque, _: std.mem.Allocator) !table_catalog.SqlCatalogSnapshot {
             return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                .tables = @constCast((&[_]table_record.TableRecord{
                     .{
                         .table_id = 31,
                         .name = "docs",
@@ -9703,15 +9699,12 @@ test "sql adapter lowering context derives document virtual fields from typed pa
                         .indexes_json = "{\"body_fts\":{\"type\":\"full_text\",\"field\":\"body\"},\"category_fts\":{\"type\":\"full_text\",\"field\":\"category\"},\"typed_paths\":{\"keyword\":[\"metadata.plan\"]}}",
                     },
                 })[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
             };
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn freeSnapshot(_: *anyopaque, _: ?*const anyopaque, _: std.mem.Allocator, snapshot: *table_catalog.SqlCatalogSnapshot) void {
+            snapshot.* = undefined;
+        }
     };
 
     var covered = try lowerReadPlanWithCatalogForLoweringContextTestAlloc(
@@ -9815,20 +9808,19 @@ test "sql adapter lowering context lowers catalog-backed equality join read plan
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"name":{"type":"keyword"},"enabled":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const Catalog = struct {
-        fn iface() table_catalog.CatalogSource {
+        fn iface() table_catalog.SqlCatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
+                    .snapshot_alloc = snapshotAlloc,
+                    .free_snapshot = freeSnapshot,
                 },
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn snapshotAlloc(_: *anyopaque, _: ?*const anyopaque, _: std.mem.Allocator) !table_catalog.SqlCatalogSnapshot {
             return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                .tables = @constCast((&[_]table_record.TableRecord{
                     .{
                         .table_id = 11,
                         .name = "usage_records",
@@ -9842,15 +9834,12 @@ test "sql adapter lowering context lowers catalog-backed equality join read plan
                         .schema_json = customer_schema_json,
                     },
                 })[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
             };
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn freeSnapshot(_: *anyopaque, _: ?*const anyopaque, _: std.mem.Allocator, snapshot: *table_catalog.SqlCatalogSnapshot) void {
+            snapshot.* = undefined;
+        }
     };
 
     var catalog_plan = try lowerReadPlanWithCatalogForLoweringContextTestAlloc(
@@ -9888,20 +9877,19 @@ test "sql adapter lowering context lowers catalog-backed bounded left join later
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"organization_id":{"type":"keyword"},"kind":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["id","organization_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const Catalog = struct {
-        fn iface() table_catalog.CatalogSource {
+        fn iface() table_catalog.SqlCatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
+                    .snapshot_alloc = snapshotAlloc,
+                    .free_snapshot = freeSnapshot,
                 },
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn snapshotAlloc(_: *anyopaque, _: ?*const anyopaque, _: std.mem.Allocator) !table_catalog.SqlCatalogSnapshot {
             return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                .tables = @constCast((&[_]table_record.TableRecord{
                     .{
                         .table_id = 21,
                         .name = "usage_records",
@@ -9915,15 +9903,12 @@ test "sql adapter lowering context lowers catalog-backed bounded left join later
                         .schema_json = balance_schema_json,
                     },
                 })[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
             };
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn freeSnapshot(_: *anyopaque, _: ?*const anyopaque, _: std.mem.Allocator, snapshot: *table_catalog.SqlCatalogSnapshot) void {
+            snapshot.* = undefined;
+        }
     };
 
     var catalog_plan = try lowerReadPlanWithCatalogForLoweringContextTestAlloc(
@@ -9973,7 +9958,7 @@ pub const CatalogWritePlanLoweringContext = struct {
     pub fn lower(
         self: *@This(),
         options: plan.LowerWritePlanOptions,
-        catalog: table_catalog.CatalogSource,
+        catalog: table_catalog.SqlCatalogSource,
     ) !plan.LoweredWritePlan {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(self.alloc, self.sql);
         defer parsed_sql.deinit(self.alloc);
@@ -9984,7 +9969,7 @@ pub const CatalogWritePlanLoweringContext = struct {
         self: *@This(),
         parsed_sql: *const tokenized.ParsedSql,
         options: plan.LowerWritePlanOptions,
-        catalog: table_catalog.CatalogSource,
+        catalog: table_catalog.SqlCatalogSource,
     ) !plan.LoweredWritePlan {
         return try self.lowerParsedWithSession(parsed_sql, options, catalog, catalog_resources.SqlCatalogSession.default());
     }
@@ -9993,7 +9978,7 @@ pub const CatalogWritePlanLoweringContext = struct {
         self: *@This(),
         parsed_sql: *const tokenized.ParsedSql,
         options: plan.LowerWritePlanOptions,
-        catalog: table_catalog.CatalogSource,
+        catalog: table_catalog.SqlCatalogSource,
         session: catalog_resources.SqlCatalogSession,
     ) !plan.LoweredWritePlan {
         var bound = try binder.bindWritePlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, options, catalog, session);
@@ -10168,7 +10153,7 @@ pub const ExplainPlanLoweringCallbacks = struct {
         *const tokenized.ParsedSql,
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
-        table_catalog.CatalogSource,
+        table_catalog.SqlCatalogSource,
         expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredReadPlan,
     lower_read_without_catalog: *const fn (
@@ -10184,7 +10169,7 @@ pub const ExplainPlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         plan.LowerWritePlanOptions,
-        table_catalog.CatalogSource,
+        table_catalog.SqlCatalogSource,
     ) anyerror!plan.LoweredWritePlan,
     lower_write_without_catalog: *const fn (
         std.mem.Allocator,
@@ -10200,7 +10185,7 @@ pub const ExplainPlanLoweringContext = struct {
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
     options: plan.LowerWritePlanOptions,
-    catalog: ?table_catalog.CatalogSource,
+    catalog: ?table_catalog.SqlCatalogSource,
     function_bindings: expr_row_parse.SqlFunctionBindings,
     callbacks: ExplainPlanLoweringCallbacks,
 
@@ -10245,7 +10230,7 @@ pub const RelationPopulationLoweringCallbacks = struct {
         *const tokenized.ParsedSql,
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
-        table_catalog.CatalogSource,
+        table_catalog.SqlCatalogSource,
         expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredReadPlan,
     lower_read_without_catalog: *const fn (
@@ -10261,7 +10246,7 @@ pub const RelationPopulationLoweringContext = struct {
     alloc: std.mem.Allocator,
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    catalog: ?table_catalog.CatalogSource,
+    catalog: ?table_catalog.SqlCatalogSource,
     function_bindings: expr_row_parse.SqlFunctionBindings,
     callbacks: RelationPopulationLoweringCallbacks,
 

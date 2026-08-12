@@ -216,7 +216,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc(
     var materialized = (try table_read_relational_rows.materializeLoweredRecursiveCteRowsWithSessionAlloc(
         alloc,
         read_source,
-        catalog,
+        catalog.sqlSource(),
         session,
         default_table_name,
         recursive_source_schema,
@@ -288,7 +288,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc(
     var materialized = (try table_read_relational_rows.materializeLoweredRecursiveCteRowsWithSessionAlloc(
         alloc,
         read_source,
-        catalog,
+        catalog.sqlSource(),
         session,
         default_table_name,
         recursive_source_schema,
@@ -360,7 +360,7 @@ pub fn mergeRowsFromRecursiveCtePlanWithSessionAlloc(
     var materialized = (try table_read_relational_rows.materializeLoweredRecursiveCteRowsWithSessionAlloc(
         alloc,
         read_source,
-        catalog,
+        catalog.sqlSource(),
         session,
         default_table_name,
         recursive_source_schema,

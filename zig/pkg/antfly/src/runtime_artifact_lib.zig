@@ -212,6 +212,10 @@ comptime {
         exportInternal(&api_kernel_exports.handlerStats, "antfly_api_kernel_handler_stats");
         exportInternal(&api_kernel_exports.handlerRegisterRoutes, "antfly_api_kernel_handler_register_routes");
         exportInternal(&api_kernel_exports.handlerDestroy, "antfly_api_kernel_handler_destroy");
+        exportInternal(&api_kernel_exports.liteSqlSessionCreate, "antfly_api_kernel_lite_sql_session_create");
+        exportInternal(&api_kernel_exports.liteSqlSessionDestroy, "antfly_api_kernel_lite_sql_session_destroy");
+        exportInternal(&api_kernel_exports.liteSqlClassify, "antfly_api_kernel_lite_sql_classify");
+        exportInternal(&api_kernel_exports.liteSqlExecute, "antfly_api_kernel_lite_sql_execute");
     }
     if (owns_application_runtime) {
         if (unit_options.unit == .distributed) _ = storage_kernel_exports;

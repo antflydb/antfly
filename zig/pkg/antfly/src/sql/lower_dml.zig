@@ -60,7 +60,7 @@ const row_claim_mod = @import("row_claim.zig");
 const source_binding = @import("source_binding.zig");
 const strings = @import("strings.zig");
 const test_support = @import("test_support.zig");
-const table_catalog = @import("../metadata/catalog/source.zig");
+const table_catalog = @import("catalog_source.zig");
 const sql_value = @import("value.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
@@ -26827,7 +26827,7 @@ fn lowerWritePlanWithCatalogForDmlTestAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
 ) !plan_mod.LoweredWritePlan {
     return try lowerWritePlanWithCatalogAlloc(alloc, sql, schema, params, options, catalog);
 }
@@ -26838,7 +26838,7 @@ pub fn lowerWritePlanWithCatalogAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
 ) !plan_mod.LoweredWritePlan {
     return try lowerWritePlanWithCatalogSessionAlloc(alloc, sql, schema, params, options, catalog, catalog_resources.SqlCatalogSession.default());
 }
@@ -26849,7 +26849,7 @@ fn lowerWritePlanWithCatalogSessionForDmlTestAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !plan_mod.LoweredWritePlan {
     return try lowerWritePlanWithCatalogSessionAlloc(alloc, sql, schema, params, options, catalog, session);
@@ -26861,7 +26861,7 @@ pub fn lowerWritePlanWithCatalogSessionAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !plan_mod.LoweredWritePlan {
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
@@ -26875,7 +26875,7 @@ fn lowerWritePlanWithCatalogParsedSqlForDmlTestAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
 ) !plan_mod.LoweredWritePlan {
     return try lowerWritePlanWithCatalogParsedSqlAlloc(alloc, parsed_sql, schema, params, options, catalog);
 }
@@ -26886,7 +26886,7 @@ pub fn lowerWritePlanWithCatalogParsedSqlAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
 ) !plan_mod.LoweredWritePlan {
     return try lowerWritePlanWithCatalogSessionParsedSqlAlloc(alloc, parsed_sql, schema, params, options, catalog, catalog_resources.SqlCatalogSession.default());
 }
@@ -26897,7 +26897,7 @@ fn lowerWritePlanWithCatalogSessionParsedSqlForDmlTestAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !plan_mod.LoweredWritePlan {
     return try lowerWritePlanWithCatalogSessionParsedSqlAlloc(alloc, parsed_sql, schema, params, options, catalog, session);
@@ -26909,7 +26909,7 @@ pub fn lowerWritePlanWithCatalogSessionParsedSqlAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !plan_mod.LoweredWritePlan {
     if (schema.storage_mode == .document) {
@@ -26932,7 +26932,7 @@ pub fn lowerWritePlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    catalog: table_catalog.SqlCatalogSource,
     session: catalog_resources.SqlCatalogSession,
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {

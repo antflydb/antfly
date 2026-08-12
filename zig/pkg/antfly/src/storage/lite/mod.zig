@@ -20,6 +20,7 @@ pub const index_storage = @import("index_storage.zig");
 pub const native = @import("native.zig");
 pub const paths = @import("paths.zig");
 pub const restore_staging = @import("restore_staging.zig");
+pub const sql_source = @import("sql_source.zig");
 
 test {
     _ = backend;
@@ -31,4 +32,5 @@ test {
     _ = native;
     _ = paths;
     _ = restore_staging;
+    _ = sql_source;
 }

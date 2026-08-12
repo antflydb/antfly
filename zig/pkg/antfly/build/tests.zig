@@ -5077,6 +5077,14 @@ pub fn addMainCaptureTestSteps(ctx: anytype) MainCaptureTestRuns {
         "lite-cmd-test",
         "Run command tests owned by Antfly Lite profiles",
     );
+    const run_lite_sql_runtime_tests = addNamedFilteredTest(
+        b,
+        makeConfiguredTestModule(ctx, "pkg/antfly/src/lite_sql_runtime_test_root.zig"),
+        &.{"lite sql"},
+        "lite-sql-runtime-test",
+        "Run Lite SQL parser, planner, and execution tests",
+    );
+    run_lite_cmd_tests.step.dependOn(&run_lite_sql_runtime_tests.step);
 
     const raft_library_tests = b.addTest(.{ .root_module = ctx.raft_engine_mod });
     const run_raft_library_tests = b.addRunArtifact(raft_library_tests);

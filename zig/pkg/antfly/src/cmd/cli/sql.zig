@@ -63,7 +63,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
             // The thin dispatcher sends this form to the storage-owning Lite runtime.
             return error.InvalidArguments;
         } else {
-            var session = try lite_sql.Session.init(allocator, opts.catalog);
+            var session = try lite_sql.Session.init(allocator, .{
+                .database = opts.catalog.database,
+                .namespace = opts.catalog.namespace,
+            });
             defer session.deinit(allocator);
 
             if (opts.command) |sql| {
