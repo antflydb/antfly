@@ -534,6 +534,51 @@ pub const Operations = struct {
         return result orelse error.NotFound;
     }
 
+    /// The returned manifest owns its nested allocations and must be
+    /// deinitialized with the same allocator by the caller.
+    pub fn documentArtifactManifest(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) Error!db_mod.types.DocumentArtifactManifest {
+        try request.ensureActive();
+        const reads = self.reads orelse return error.NotFound;
+        return (reads.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .read_index) catch |err| switch (err) {
+            error.TopologyChanged => return error.TopologyChanged,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
+    /// The returned list owns its nested allocations and must be
+    /// deinitialized with the same allocator by the caller.
+    pub fn documentArtifactManifests(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+    ) Error!db_mod.types.DocumentArtifactManifestList {
+        try request.ensureActive();
+        const reads = self.reads orelse return error.NotFound;
+        return (reads.documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, .read_index) catch |err| switch (err) {
+            error.TopologyChanged => return error.TopologyChanged,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
     /// The returned key, when present, is owned by `alloc`.
     pub fn medianKey(
         self: Operations,

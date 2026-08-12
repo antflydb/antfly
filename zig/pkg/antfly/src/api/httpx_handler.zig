@@ -315,8 +315,8 @@ pub const AntflyApiHandler = struct {
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
-        try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_suffix, handler);
-        try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ "*", handler);
+        try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_suffix, httpx.Handler.bind(self, internalDocumentArtifactManifests));
+        try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ ":artifact_name", httpx.Handler.bind(self, internalDocumentArtifactManifest));
         try server.get(internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix, httpx.Handler.bind(self, internalRepairCancelState));
         try server.post(table_prefix ++ routes.join_job_state_suffix, httpx.Handler.bind(self, internalJoinJobState));
         try server.post(table_prefix ++ routes.join_finalize_suffix, httpx.Handler.bind(self, internalJoinFinalize));
@@ -1119,6 +1119,40 @@ pub const AntflyApiHandler = struct {
             input.value,
         ) catch |err| return internalArtifactWriteErrorResponse(ctx, err, "invalid document artifact placement request");
         return ctx.json(.{ .placement = "updated" });
+    }
+
+    fn internalDocumentArtifactManifests(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const group_id = (try internalGroupId(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        const table_name = (try decodePathParamOrBadRequest(ctx, ctx.param("table_name") orelse return textResponse(ctx, 400, "invalid path parameter"))) orelse
+            return textResponse(ctx, 400, "invalid path parameter");
+        defer ctx.allocator.free(table_name);
+        const key = (try decodePathParamOrBadRequest(ctx, ctx.param("key") orelse return textResponse(ctx, 400, "invalid path parameter"))) orelse
+            return textResponse(ctx, 400, "invalid path parameter");
+        defer ctx.allocator.free(key);
+        var result = self.internalGroupOperations().documentArtifactManifests(
+            ctx.allocator,
+            operationContext(ctx, null),
+            group_id,
+            table_name,
+            key,
+        ) catch |err| return internalGroupErrorResponse(ctx, err);
+        defer result.deinit(ctx.allocator);
+        return ctx.json(result);
+    }
+
+    fn internalDocumentArtifactManifest(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalDocumentArtifactParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        var result = self.internalGroupOperations().documentArtifactManifest(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            params.key,
+            params.artifact_name,
+        ) catch |err| return internalGroupErrorResponse(ctx, err);
+        defer result.deinit(ctx.allocator);
+        return ctx.json(result);
     }
 
     fn internalDocumentArtifactChildRangeBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

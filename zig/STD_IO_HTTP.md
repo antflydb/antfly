@@ -134,6 +134,9 @@ that end state:
   JSON ownership is isolated in `internal_transition_wire.zig`; it contains no
   route matching, HTTP request/response conversion, or runtime capability
   context.
+- Single and list document-artifact reads now use concrete `httpx` handlers
+  over typed operations returning owned storage-domain manifests. Their legacy
+  GET branches and duplicate response-projection structs have been removed.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those
