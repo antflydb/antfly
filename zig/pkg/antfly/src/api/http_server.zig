@@ -2799,6 +2799,24 @@ pub const ApiHttpServer = struct {
         snapshot: ?*const metadata_api.AdminSnapshot,
         snapshot_index: ?*const RuntimeStatusSnapshotIndex,
     ) !?runtime_status.LocalTableRuntimeStatuses {
+        return try self.localTableRuntimeStatusesWithSnapshotIndexOptions(table_name, snapshot, snapshot_index, false);
+    }
+
+    fn lifecycleTableRuntimeStatusesWithSnapshot(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        snapshot: *const metadata_api.AdminSnapshot,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        return try self.localTableRuntimeStatusesWithSnapshotIndexOptions(table_name, snapshot, null, true);
+    }
+
+    fn localTableRuntimeStatusesWithSnapshotIndexOptions(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        snapshot: ?*const metadata_api.AdminSnapshot,
+        snapshot_index: ?*const RuntimeStatusSnapshotIndex,
+        force_write_refresh: bool,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
         var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
         var item_indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
         defer item_indexes.deinit(self.alloc);
@@ -2829,7 +2847,7 @@ pub const ApiHttpServer = struct {
                 try self.appendRemoteRuntimeStatusesFromSnapshot(&items, &item_indexes, table_name, admin_snapshot);
             }
         }
-        const should_query_writes = if (snapshot == null)
+        const should_query_writes = force_write_refresh or if (snapshot == null)
             self.table_reads == null or !read_statuses_present or read_needs_refresh
         else
             items.items.len == 0 or !read_statuses_present or read_needs_refresh;
@@ -2843,7 +2861,17 @@ pub const ApiHttpServer = struct {
             if (write_statuses) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
-                try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, &items, &item_indexes, &owned);
+                if (force_write_refresh) {
+                    // Lifecycle classification needs the writer observation in
+                    // addition to the best read/remote observation. A read DB
+                    // can legitimately be fresh for its retained generation
+                    // while the writer is catching up a newly admitted index;
+                    // coalescing those by group would discard the only proof
+                    // that IndexNotFound is a retryable publication window.
+                    try self.appendLocalRuntimeStatusCandidates(table_name, snapshot, snapshot_index, &items, &owned);
+                } else {
+                    try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, &items, &item_indexes, &owned);
+                }
             }
         }
         if (items.items.len == 0) {
@@ -2912,6 +2940,35 @@ pub const ApiHttpServer = struct {
             }
             var candidate = item;
             try upsertRuntimeStatus(self.alloc, items, item_indexes, &candidate);
+        }
+        if (owned.items.len > 0) self.alloc.free(owned.items);
+        owned.items = &.{};
+    }
+
+    fn appendLocalRuntimeStatusCandidates(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        snapshot: ?*const metadata_api.AdminSnapshot,
+        snapshot_index: ?*const RuntimeStatusSnapshotIndex,
+        items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
+        owned: *runtime_status.LocalTableRuntimeStatuses,
+    ) !void {
+        try items.ensureUnusedCapacity(self.alloc, owned.items.len);
+        for (owned.items) |item| {
+            const allowed = if (snapshot_index) |index|
+                index.statusAllowed(
+                    table_name,
+                    item,
+                    if (self.cfg.session_router) |router| router.localNodeId() else 0,
+                )
+            else
+                self.localRuntimeStatusAllowedBySnapshot(table_name, snapshot, item);
+            if (!allowed) {
+                var discard = item;
+                discard.deinit(self.alloc);
+                continue;
+            }
+            items.appendAssumeCapacity(item);
         }
         if (owned.items.len > 0) self.alloc.free(owned.items);
         owned.items = &.{};
@@ -9930,6 +9987,7 @@ pub const ApiHttpServer = struct {
             table_name,
             query_req.req,
             .read_index,
+            .{ .resolve = self },
         ) catch |err| switch (err) {
             // Public filter syntax is validated and attributed during request
             // normalization. A later InvalidArgument can originate from any
@@ -9967,12 +10025,170 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    fn tableConfigContainsIndex(alloc: std.mem.Allocator, indexes_json: []const u8, index_name: []const u8) !bool {
+        if (index_name.len == 0) return false;
+        var lookup = (try indexes_api.lookupSingleIndexConfig(alloc, indexes_json, index_name)) orelse return false;
+        lookup.deinit();
+        return true;
+    }
+
+    const RuntimeIndexLifecycle = enum {
+        healthy,
+        rebuilding,
+        unavailable,
+    };
+
+    fn runtimeStatusHasCurrentLifecycleEvidence(metadata: runtime_status.RuntimeStatusMetadata) bool {
+        return metadata.freshness == .fresh or metadata.freshness == .catching_up;
+    }
+
+    fn runtimeIndexLifecycle(
+        statuses: []const runtime_status.LocalTableRuntimeStatus,
+        expected_group_ids: []const u64,
+        index_name: []const u8,
+    ) RuntimeIndexLifecycle {
+        if (expected_group_ids.len == 0) return .unavailable;
+        var observed_active_build = false;
+        for (expected_group_ids) |group_id| {
+            var observed_group_index = false;
+            var group_active_build = false;
+            for (statuses) |status| {
+                if (status.group_id != group_id) continue;
+                // Quarantine is an explicit fail-closed owner observation and
+                // must dominate healthy or rebuilding candidates retained by
+                // another cache generation.
+                if (status.metadata.source == .rebuild_state_quarantine) return .unavailable;
+                if (!runtimeStatusHasCurrentLifecycleEvidence(status.metadata)) continue;
+                const index = for (status.stats.indexes) |item| {
+                    if (std.mem.eql(u8, item.name, index_name)) break item;
+                } else continue;
+                observed_group_index = true;
+                if (index.load_error != null) return .unavailable;
+                // Terminal and operator-paused repairs are actionable failures,
+                // not retryable publication windows.
+                if (std.mem.eql(u8, index.index_repair_phase, "terminal") or
+                    std.mem.eql(u8, index.index_repair_automation, "paused")) return .unavailable;
+                if (index.backfill_active or
+                    index.replay_catch_up_required or
+                    index.catch_up_active or
+                    index.index_repair_id != null or
+                    index.replay_applied_sequence < index.replay_target_sequence or
+                    index.catch_up_applied_sequence < index.catch_up_target_sequence)
+                {
+                    group_active_build = true;
+                } else if (index.repair_degraded) {
+                    return .unavailable;
+                }
+            }
+            if (!observed_group_index) return .unavailable;
+            observed_active_build = observed_active_build or group_active_build;
+        }
+        return if (observed_active_build) .rebuilding else .healthy;
+    }
+
+    fn observeRuntimeIndexLifecycle(
+        statuses: []const runtime_status.LocalTableRuntimeStatus,
+        expected_group_ids: []const u64,
+        index_name: []const u8,
+        observed_rebuilding: *bool,
+    ) bool {
+        return switch (runtimeIndexLifecycle(statuses, expected_group_ids, index_name)) {
+            .healthy => true,
+            .rebuilding => blk: {
+                observed_rebuilding.* = true;
+                break :blk true;
+            },
+            .unavailable => false,
+        };
+    }
+
+    fn queryHasRebuildingCatalogIndex(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+    ) !bool {
+        var snapshot = (try self.source.adminSnapshot()) orelse return false;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return false;
+
+        // Validate every explicit index first. If any name is absent from the
+        // catalog, IndexNotFound belongs to the request rather than an online
+        // build lifecycle and must not be rewritten as retryable.
+        var referenced = false;
+        if (req.index_name) |name| {
+            referenced = true;
+            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, name)) return false;
+        }
+        for (req.full_text_queries) |query| {
+            referenced = true;
+            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.index_name)) return false;
+        }
+        for (req.dense_queries) |query| {
+            referenced = true;
+            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.index_name)) return false;
+        }
+        for (req.sparse_queries) |query| {
+            referenced = true;
+            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.index_name)) return false;
+        }
+        for (req.graph_queries) |query| {
+            referenced = true;
+            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.query.index_name)) return false;
+        }
+        if (!referenced) return false;
+
+        // Unknown or partial runtime state is not proof of an active build.
+        // Merge local and remotely published observations, then require one
+        // current lifecycle fact for every catalog group below.
+        const expected_group_ids = try indexes_api.expectedTableGroupIds(self.alloc, &snapshot, table.table_id);
+        defer if (expected_group_ids.len > 0) self.alloc.free(expected_group_ids);
+        if (expected_group_ids.len == 0) return false;
+        var statuses = (try self.lifecycleTableRuntimeStatusesWithSnapshot(table_name, &snapshot)) orelse return false;
+        defer statuses.deinit(self.alloc);
+
+        // IndexNotFound is retryable only when every referenced catalog index
+        // has usable runtime state and at least one is actively rebuilding. A
+        // failed or missing sibling must retain the actionable original error.
+        var observed_rebuilding = false;
+        if (req.index_name) |name| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, name, &observed_rebuilding)) return false;
+        }
+        for (req.full_text_queries) |query| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.index_name, &observed_rebuilding)) return false;
+        }
+        for (req.dense_queries) |query| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.index_name, &observed_rebuilding)) return false;
+        }
+        for (req.sparse_queries) |query| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.index_name, &observed_rebuilding)) return false;
+        }
+        for (req.graph_queries) |query| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.query.index_name, &observed_rebuilding)) return false;
+        }
+        return observed_rebuilding;
+    }
+
+    const MissingIndexLifecycle = union(enum) {
+        none,
+        rebuilding,
+        resolve: *ApiHttpServer,
+
+        fn isRebuilding(self: @This(), table_name: []const u8, req: db_mod.types.SearchRequest) !bool {
+            return switch (self) {
+                .none => false,
+                .rebuilding => true,
+                .resolve => |server| try server.queryHasRebuildingCatalogIndex(table_name, req),
+            };
+        }
+    };
+
     fn queryWithTransientReadRetry(
         alloc: std.mem.Allocator,
         source: table_reads.TableReadSource,
         table_name: []const u8,
         req: db_mod.types.SearchRequest,
         consistency: raft_mod.ReadConsistency,
+        missing_index_lifecycle: MissingIndexLifecycle,
     ) !?query_api.QueryResponse {
         const retry_timeout_ns = 5 * std.time.ns_per_s;
         const retry_poll_ns = 25 * std.time.ns_per_ms;
@@ -10001,6 +10217,12 @@ pub const ApiHttpServer = struct {
                     try sleepNsCancellable(sleep_ns, req.cancellation);
                     continue;
                 },
+                // Only translate a missing physical index when catalog and
+                // runtime lifecycle observations prove that a requested index
+                // is still being published. A genuinely unknown index, or a
+                // supposedly-ready index that disappeared, retains its
+                // diagnostic instead of being masked as transient readiness.
+                error.IndexNotFound => if (try missing_index_lifecycle.isRebuilding(table_name, req)) return error.IndexRebuilding else return err,
                 error.Timeout, error.Cancelled => return err,
                 else => {
                     std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
@@ -10332,24 +10554,37 @@ pub const ApiHttpServer = struct {
             return error.InternalFailure;
         };
         if (self.table_writes) |table_writes_source| {
-            const scheduled = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| {
-                std.log.err("public create index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, err });
-                return error.InternalFailure;
-            };
-            // Embedded/direct DB sources have no serving reconciliation queue.
-            // Preserve their synchronous contract while provisioned serving
-            // performs potentially corpus-sized backfill in the background.
-            if (scheduled == null) {
-                _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
+            // Install the local write capability before the create request
+            // returns. Provisioned sources make this an O(groups) online-DDL
+            // barrier; embedded sources preserve their synchronous contract.
+            // Generic reconciliation is separate because the same queue also
+            // repairs index deletion.
+            _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| {
+                // The catalog mutation is already committed. Even if this
+                // synchronous O(groups) barrier only reached a prefix of local
+                // shards, hand the exact desired-state edge to the bounded
+                // reconciler before preserving the admission error for the
+                // caller.
+                _ = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |reconcile_err| {
+                    std.log.warn("public create index structural reconcile enqueue after admission failure deferred table={s} index={s} err={}", .{ table_name, index_name, reconcile_err });
+                };
+                switch (err) {
                     error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
                     error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
                     error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded => return error.Backpressured,
                     else => {
-                        std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                        std.log.err("public create index local admission failed table={s} index={s} err={}", .{ table_name, index_name, err });
                         return error.InternalFailure;
                     },
-                };
-            }
+                }
+            };
+            // Local write capability is the request's commit boundary. Queue
+            // insertion is an idempotent repair accelerator, so queue pressure
+            // after successful admission must not turn a committed create into
+            // a false HTTP failure that invites ambiguous client retries.
+            _ = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| {
+                std.log.warn("public create index structural reconcile enqueue deferred table={s} index={s} err={}", .{ table_name, index_name, err });
+            };
         }
     }
 
@@ -17972,6 +18207,7 @@ test "api http transient read retry honors expired request deadline before sourc
         "docs",
         .{ .execution_deadline_ns = 0 },
         .read_index,
+        .none,
     ));
     try std.testing.expectEqual(@as(u32, 0), reads.attempts);
 }
@@ -18004,6 +18240,7 @@ test "api http transient read retry stops before source query when client cancel
         "docs",
         .{ .cancellation = &cancelled },
         .read_index,
+        .none,
     ));
     try std.testing.expectEqual(@as(u32, 0), reads.attempts);
 }
@@ -18067,10 +18304,315 @@ test "api http retries identity generation churn from a fresh query snapshot" {
         "docs",
         .{},
         .read_index,
+        .none,
     )).?;
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 2), reads.attempts);
     try std.testing.expectEqualStrings("{\"responses\":[]}", response.json);
+}
+
+test "api http maps missing physical index only for rebuilding lifecycle" {
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = query,
+            } };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            return error.IndexNotFound;
+        }
+    };
+
+    try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
+        std.testing.allocator,
+        FakeReads.source(),
+        "docs",
+        .{},
+        .read_index,
+        .rebuilding,
+    ));
+    try std.testing.expectError(error.IndexNotFound, ApiHttpServer.queryWithTransientReadRetry(
+        std.testing.allocator,
+        FakeReads.source(),
+        "docs",
+        .{},
+        .read_index,
+        .none,
+    ));
+}
+
+test "api http missing index classification requires active rebuild evidence" {
+    const active_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .index_repair_id = 42,
+        .index_repair_phase = "building",
+    }};
+    const active_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .indexes = @constCast(active_indexes[0..]) },
+    }};
+    const expected_group_ids = [_]u64{10};
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.rebuilding,
+        ApiHttpServer.runtimeIndexLifecycle(active_statuses[0..], &expected_group_ids, "semantic_idx"),
+    );
+
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(&.{}, &expected_group_ids, "semantic_idx"),
+    );
+
+    const fresh_missing_and_active = [_]runtime_status.LocalTableRuntimeStatus{
+        .{
+            .group_id = 10,
+            .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+            .stats = .{},
+        },
+        active_statuses[0],
+    };
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.rebuilding,
+        ApiHttpServer.runtimeIndexLifecycle(fresh_missing_and_active[0..], &expected_group_ids, "semantic_idx"),
+    );
+
+    const two_group_ids = [_]u64{ 10, 11 };
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(active_statuses[0..], &two_group_ids, "semantic_idx"),
+    );
+    var stale_statuses = active_statuses;
+    stale_statuses[0].metadata.freshness = .stale;
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(stale_statuses[0..], &expected_group_ids, "semantic_idx"),
+    );
+
+    const terminal_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .repair_degraded = true,
+        .index_repair_id = 42,
+        .index_repair_phase = "terminal",
+    }};
+    const terminal_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .indexes = @constCast(terminal_indexes[0..]) },
+    }};
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(terminal_statuses[0..], &expected_group_ids, "semantic_idx"),
+    );
+
+    const paused_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .index_repair_id = 42,
+        .index_repair_phase = "building",
+        .index_repair_automation = "paused",
+    }};
+    const paused_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .indexes = @constCast(paused_indexes[0..]) },
+    }};
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(paused_statuses[0..], &expected_group_ids, "semantic_idx"),
+    );
+
+    const degraded_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .repair_degraded = true,
+    }};
+    const degraded_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .indexes = @constCast(degraded_indexes[0..]) },
+    }};
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(degraded_statuses[0..], &expected_group_ids, "semantic_idx"),
+    );
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(degraded_statuses[0..], &expected_group_ids, "missing_idx"),
+    );
+
+    // An active build cannot mask an actionable failure from another index in
+    // the same query, regardless of reference order.
+    const mixed_indexes = [_]db_mod.types.DBIndexStats{
+        .{
+            .name = "building_idx",
+            .kind = .dense_vector,
+            .index_repair_id = 43,
+            .index_repair_phase = "building",
+        },
+        .{
+            .name = "failed_idx",
+            .kind = .dense_vector,
+            .repair_degraded = true,
+            .index_repair_id = 44,
+            .index_repair_phase = "terminal",
+        },
+    };
+    const mixed_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .indexes = @constCast(mixed_indexes[0..]) },
+    }};
+    var observed_rebuilding = false;
+    try std.testing.expect(ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], &expected_group_ids, "building_idx", &observed_rebuilding));
+    try std.testing.expect(observed_rebuilding);
+    try std.testing.expect(!ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], &expected_group_ids, "failed_idx", &observed_rebuilding));
+}
+
+test "api http lifecycle classification preserves catching-up writer beside fresh read snapshot" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 10,
+                    .table_id = 1,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .local_runtime_statuses = localRuntimeStatuses,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.IndexNotFound;
+        }
+
+        fn localRuntimeStatuses(_: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+            const items = try inner_alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            items[0] = .{
+                .group_id = 10,
+                .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+                // The retained read generation is internally fresh but predates
+                // physical publication of the catalog-visible index.
+                .stats = .{},
+            };
+            return .{ .items = items };
+        }
+    };
+
+    const FakeWrites = struct {
+        fn source() table_writes.TableWriteSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .batch = batch,
+                    .local_runtime_statuses = localRuntimeStatuses,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return;
+        }
+
+        fn localRuntimeStatuses(_: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+            const indexes = try inner_alloc.alloc(db_mod.types.DBIndexStats, 1);
+            errdefer inner_alloc.free(indexes);
+            indexes[0] = .{
+                .name = try inner_alloc.dupe(u8, "semantic_idx"),
+                .kind = .dense_vector,
+                .index_repair_id = 42,
+                .index_repair_phase = "building",
+            };
+            const items = try inner_alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            errdefer {
+                db_mod.types.freeDBStats(inner_alloc, .{
+                    .index_count = 1,
+                    .indexes = indexes,
+                });
+                inner_alloc.free(items);
+            }
+            items[0] = .{
+                .group_id = 10,
+                .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up },
+                .stats = .{
+                    .index_count = 1,
+                    .indexes = indexes,
+                },
+            };
+            return .{ .items = items };
+        }
+    };
+
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), FakeWrites.source());
+    defer server.deinit();
+
+    try std.testing.expect(try server.queryHasRebuildingCatalogIndex("docs", .{
+        .index_name = "semantic_idx",
+    }));
 }
 
 test "api http plain public query preserves outer absolute request deadline" {
@@ -28854,12 +29396,18 @@ test "api http server create index waits for exact target config projection" {
     };
 
     const FakeWrites = struct {
+        create_error: ?anyerror = null,
+        enqueue_error: ?anyerror = null,
+        create_calls: usize = 0,
+        enqueue_calls: usize = 0,
+
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
                     .batch = batch,
                     .create_index = createIndex,
+                    .request_table_index_structural_reconcile = requestTableIndexStructuralReconcile,
                 },
             };
         }
@@ -28868,7 +29416,22 @@ test "api http server create index waits for exact target config projection" {
             return error.UnsupportedOperation;
         }
 
-        fn createIndex(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!?void {}
+        fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.create_calls += 1;
+            if (self.create_error) |err| return err;
+        }
+
+        fn requestTableIndexStructuralReconcile(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.enqueue_calls += 1;
+            if (self.enqueue_error) |err| return err;
+        }
     };
 
     var source = FakeSource{};
@@ -28907,6 +29470,36 @@ test "api http server create index waits for exact target config projection" {
     var retry_lookup = (try indexes_api.lookupSingleIndexConfig(alloc, source.indexes_json, "embed_idx")).?;
     defer retry_lookup.deinit();
     try std.testing.expectEqual(first_incarnation, coverage_policy.incarnation(retry_lookup.config).?);
+    try std.testing.expectEqual(@as(usize, 2), writes.create_calls);
+    try std.testing.expectEqual(@as(usize, 2), writes.enqueue_calls);
+
+    // Metadata is already committed when local capacity rejects the barrier.
+    // The response preserves backpressure, while convergence is still handed
+    // off for any shards admitted before the failure.
+    writes.create_error = error.ResourceBudgetExceeded;
+    var backpressured_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/embed_idx",
+        .content_type = "application/json",
+        .body = create_index_body,
+    });
+    defer backpressured_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), backpressured_resp.status);
+    try std.testing.expectEqual(@as(usize, 3), writes.enqueue_calls);
+
+    // Queue pressure after the local capability barrier is not a false create
+    // failure: durable state and foreground write admission have both won.
+    writes.create_error = null;
+    writes.enqueue_error = error.ResourceBudgetExceeded;
+    var enqueue_deferred_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/embed_idx",
+        .content_type = "application/json",
+        .body = create_index_body,
+    });
+    defer enqueue_deferred_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), enqueue_deferred_resp.status);
+    try std.testing.expectEqual(@as(usize, 4), writes.enqueue_calls);
 }
 
 test "api http server create index expands schema-derived algebraic config" {

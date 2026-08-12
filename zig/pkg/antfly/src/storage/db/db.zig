@@ -883,6 +883,7 @@ const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const graph_repair_rebuild_batch_size: usize = 2048;
 var test_graph_repair_stream_flushes: std.atomic.Value(u64) = .init(0);
 var test_dense_repair_rebuild_batch_size: ?usize = null;
+var test_algebraic_repair_rebuild_batch_size: ?usize = null;
 var test_index_repair_catch_up_max_records_per_window: ?usize = null;
 var test_quarantine_publication_fence_entered: std.atomic.Value(bool) = .init(false);
 var test_block_match_all_ordinal_lookup: std.atomic.Value(bool) = .init(false);
@@ -6469,13 +6470,59 @@ pub const DB = struct {
 
     const RepairShadowCleanupWork = struct {
         manager: *index_manager_mod.IndexManager,
+        lane: background_runtime_mod.DurableJobLane,
+        owner_id: u64,
+
+        const pages_per_job: usize = 8;
+        const retries_per_job: usize = 8;
+        const retry_initial_ms: i64 = 25;
+        const retry_max_ms: i64 = 1000;
 
         fn run(ptr: *anyopaque) anyerror!void {
             const work: *@This() = @ptrCast(@alignCast(ptr));
+            var pages: usize = 0;
+            var retries: usize = 0;
             while (true) {
-                work.manager.cleanupInactiveRepairShadowRoots();
+                const progressed = work.manager.cleanupInactiveRepairShadowRootsPage() catch |err| {
+                    retries += 1;
+                    if (retries == 1 or std.math.isPowerOfTwo(retries))
+                        std.log.warn("repair-generation cleanup retry attempt={} err={s}", .{ retries, @errorName(err) });
+                    const shift: u6 = @intCast(@min(retries - 1, 5));
+                    const delay_ms = if (builtin.is_test) 1 else @min(retry_initial_ms << shift, retry_max_ms);
+                    work.manager.checkpointIo().sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
+                    if (retries >= retries_per_job) {
+                        work.manager.repair_cleanup_state.store(0, .release);
+                        // Manual lanes run `submit` synchronously. Propagate the
+                        // failure to that caller and leave the filesystem/key
+                        // namespace as the durable retry marker; resubmitting
+                        // here would recurse forever on a persistent error.
+                        if (work.lane.executesInline()) return err;
+                        scheduleInactiveRepairShadowCleanupContext(work.manager, work.lane, work.owner_id);
+                        return;
+                    }
+                    continue;
+                };
+                retries = 0;
+                if (progressed) {
+                    pages += 1;
+                    if (pages < pages_per_job) continue;
+                    // Orphaned key deletion is itself durable. Yield the shared
+                    // cleanup lane between bounded slices and rediscover the
+                    // first remaining namespace on the next job.
+                    work.manager.repair_cleanup_state.store(0, .release);
+                    // A manual runtime has no autonomous queue. Bound the
+                    // foreground call and let the next maintenance request or
+                    // reopen rediscover the durable orphan marker.
+                    if (work.lane.executesInline()) return;
+                    scheduleInactiveRepairShadowCleanupContext(work.manager, work.lane, work.owner_id);
+                    return;
+                }
                 if (work.manager.repair_cleanup_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-                if (work.manager.repair_cleanup_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) continue;
+                if (work.manager.repair_cleanup_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
+                    pages = 0;
+                    continue;
+                }
+                return;
             }
         }
 
@@ -6486,24 +6533,36 @@ pub const DB = struct {
     };
 
     fn scheduleInactiveRepairShadowCleanup(self: *DB) void {
-        if (self.core.index_manager.repair_cleanup_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
-            _ = self.core.index_manager.repair_cleanup_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
+        scheduleInactiveRepairShadowCleanupContext(
+            self.core.index_manager,
+            self.backend_runtime.durable_jobs,
+            self.repair_cleanup_owner_id,
+        );
+    }
+
+    fn scheduleInactiveRepairShadowCleanupContext(
+        manager: *index_manager_mod.IndexManager,
+        lane: background_runtime_mod.DurableJobLane,
+        owner_id: u64,
+    ) void {
+        if (manager.repair_cleanup_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
+            _ = manager.repair_cleanup_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
             return;
         }
         const work = std.heap.page_allocator.create(RepairShadowCleanupWork) catch {
-            self.core.index_manager.repair_cleanup_state.store(0, .release);
+            manager.repair_cleanup_state.store(0, .release);
             return;
         };
-        work.* = .{ .manager = self.core.index_manager };
-        self.backend_runtime.durable_jobs.submit(.{
-            .owner_id = self.repair_cleanup_owner_id,
+        work.* = .{ .manager = manager, .lane = lane, .owner_id = owner_id };
+        lane.submit(.{
+            .owner_id = owner_id,
             .class = .cleanup,
             .ptr = work,
             .run = RepairShadowCleanupWork.run,
             .deinit = RepairShadowCleanupWork.deinit,
         }) catch |err| {
             std.heap.page_allocator.destroy(work);
-            self.core.index_manager.repair_cleanup_state.store(0, .release);
+            manager.repair_cleanup_state.store(0, .release);
             std.log.warn("deferred index-generation cleanup was not scheduled err={s}", .{@errorName(err)});
         };
     }
@@ -6596,6 +6655,7 @@ pub const DB = struct {
                 // Yield the durable-job lane between bounded slices. The
                 // outbox cursor makes resubmission idempotent across failures.
                 work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
+                if (work.lane.executesInline()) return;
                 scheduleGeneratedArtifactCleanupContext(work.ctx, work.lane, work.owner_id);
                 return;
             }
@@ -8510,7 +8570,11 @@ pub const DB = struct {
 
         const key = try self.repairIssueKeyForIssueAlloc(alloc, issue);
         defer alloc.free(key);
-        const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return false;
+        // Successful replay can retire this exact diagnosis at its publication
+        // boundary before the request that initiated replay reaches completion.
+        // Absence is therefore an idempotent success; a present, newer revision
+        // remains a conflict and must not be cleared below.
+        const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return true;
         var current = existing;
         defer current.deinit(alloc);
         if (!revision.matches(current)) return false;
@@ -8562,7 +8626,11 @@ pub const DB = struct {
 
         const key = try self.repairIssueKeyForIssueAlloc(alloc, issue);
         defer alloc.free(key);
-        const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return .stale;
+        // Publication owns the authoritative resolution boundary and may have
+        // already removed this exact issue while the initiating repair request
+        // was replaying it. Treat absence as idempotent completion, but retain
+        // the revision and completion-epoch fences for every present record.
+        const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return .completed;
         var current = existing;
         defer current.deinit(alloc);
         if (!revision.matches(current)) return .stale;
@@ -9191,10 +9259,10 @@ pub const DB = struct {
                 .artifact_kind = artifact_kind,
                 .index_name = try alloc.dupe(u8, cfg.name),
                 .artifact_name = try alloc.dupe(u8, cfg.name),
-                .repairable = artifact_kind != .algebraic,
-                .unsupported_reason = if (artifact_kind == .algebraic) try alloc.dupe(u8, artifactRepairUnsupportedReason(.algebraic)) else "",
+                .repairable = true,
+                .unsupported_reason = "",
                 .reason = if (load_error != null) .unreadable_artifact else .missing_artifact,
-                .last_error = if (load_error) |err_name| try alloc.dupe(u8, err_name) else try alloc.dupe(u8, if (artifact_kind == .algebraic) artifactRepairUnsupportedReason(.algebraic) else "index_repair_required"),
+                .last_error = if (load_error) |err_name| try alloc.dupe(u8, err_name) else try alloc.dupe(u8, "index_repair_required"),
             });
             last_returned = cfg.name;
         }
@@ -10241,16 +10309,17 @@ pub const DB = struct {
         return repair_id;
     }
 
-    /// Materializes one catalog admission outbox row into the generation repair
-    /// checkpoint. The marker remains authoritative until clean shadow
-    /// activation; writable reopen uses it to suppress synchronous in-place
-    /// backfill while the owner scheduler resumes the bounded rebuild.
+    /// Materializes one catalog admission outbox row into a durable generation
+    /// repair. Until that repair activates, the marker remains the fail-closed
+    /// admission authority for every index kind, including algebraic.
     pub fn materializeManagedIndexAdmission(
         self: *DB,
         alloc: Allocator,
         index_name: []const u8,
     ) !?u128 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var structural_guard = self.beginIndexStructuralMutation("managed index admission materialization", index_name);
+        defer structural_guard.deinit();
         // Catalog entries are owned by the apply lifecycle. Hold its exclusive
         // lock through marker validation and checkpoint publication so deletion or
         // replacement cannot free the config or commit absence in between.
@@ -10287,8 +10356,7 @@ pub const DB = struct {
         }
         if (types.indexConfigHash(cfg.*) != marker.config_hash)
             return error.InvalidManagedIndexAdmission;
-        if (marker.disposition == .managed_rebuild and
-            (cfg.kind != .full_text or marker.source_doc_count == 0))
+        if (marker.disposition == .managed_rebuild and marker.source_doc_count == 0)
             return error.InvalidManagedIndexAdmission;
         const summary = try self.managedAdmissionVisibilitySummary();
         const current_identity_generation = @max(
@@ -10298,6 +10366,8 @@ pub const DB = struct {
         if (current_identity_generation < marker.identity_generation)
             return error.InvalidDocIdentity;
 
+        if (!indexKindSupportsManagedGenerationRepair(cfg.kind))
+            return error.InvalidManagedIndexAdmission;
         return try self.createGenerationRepairIntentAtTarget(
             alloc,
             cfg.*,
@@ -10323,6 +10393,13 @@ pub const DB = struct {
     /// completed generation advances only to the snapshot owned by one
     /// successful pass, so a concurrent commit necessarily forces another.
     fn drainManagedIndexAdmissions(self: *DB, alloc: Allocator) !void {
+        var structural_guard = self.beginIndexStructuralMutation("managed index admission drain", "*");
+        defer structural_guard.deinit();
+        try self.drainManagedIndexAdmissionsUnderStructuralGuard(alloc);
+    }
+
+    /// The caller already owns index structural serialization.
+    fn drainManagedIndexAdmissionsUnderStructuralGuard(self: *DB, alloc: Allocator) !void {
         lockAtomicWithBackoff(&self.managed_admission_materialization_mutex);
         defer self.managed_admission_materialization_mutex.unlock();
 
@@ -10879,12 +10956,20 @@ pub const DB = struct {
         const separator = std.mem.indexOfScalar(u8, candidate, '/') orelse return error.InvalidRepairCandidatePath;
         const shadow_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate[0..separator] });
         defer alloc.free(shadow_root);
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        // `deleteTree` is idempotent for an absent root. A cancelled
-        // pre-checkpoint build may already have removed its non-reopenable
-        // shadow in the unwind path.
-        try std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_root);
+        if (entry.intent.kind == .algebraic) {
+            // Algebraic generations live in the primary store and may be much
+            // larger than a scheduler turn. The directory is their durable
+            // namespace marker: clear only the writer marker here, detach the
+            // intent below, then let paged orphan collection drain the keys.
+            try index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_root);
+        } else {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            // `deleteTree` is idempotent for an absent root. A cancelled
+            // pre-checkpoint build may already have removed its non-reopenable
+            // shadow in the unwind path.
+            try std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_root);
+        }
         try self.updateIndexRepairIntent(alloc, repair_id, .{
             .phase = .preflight,
             .replace_candidate_path = true,
@@ -10896,6 +10981,7 @@ pub const DB = struct {
             .next_retry_at_ms = 0,
             .replace_last_error = true,
         });
+        if (entry.intent.kind == .algebraic) self.scheduleInactiveRepairShadowCleanup();
     }
 
     /// Completes the idempotent half of activation recovery. Returns false
@@ -11506,9 +11592,19 @@ pub const DB = struct {
         if (entry.intent.candidate_relative_path) |candidate| {
             try index_repair_state.validateCandidateRelativePath(entry.intent.index_name, candidate);
             const separator = std.mem.indexOfScalar(u8, candidate, '/') orelse return error.InvalidRepairCandidatePath;
-            const candidate_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate[0..separator] });
-            defer alloc.free(candidate_root);
-            candidate_bytes = directoryUsageBytes(alloc, candidate_root) catch 0;
+            if (entry.intent.kind == .algebraic) {
+                const storage_namespace = try std.fmt.allocPrint(
+                    alloc,
+                    "{s}/{s}",
+                    .{ candidate[0..separator], entry.intent.index_name },
+                );
+                defer alloc.free(storage_namespace);
+                candidate_bytes = self.core.index_manager.algebraicStorageNamespaceBytes(storage_namespace) catch 0;
+            } else {
+                const candidate_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate[0..separator] });
+                defer alloc.free(candidate_root);
+                candidate_bytes = directoryUsageBytes(alloc, candidate_root) catch 0;
+            }
         }
         const remaining_disk_claim = planned_disk_bytes -| @min(planned_disk_bytes, candidate_bytes);
         const manager = self.core.index_manager.resource_manager orelse return error.ResourceManagerUnavailable;
@@ -12053,7 +12149,7 @@ pub const DB = struct {
                 classification.trigger,
                 classification.last_error,
             );
-        } else if (durable_repair_id == null and cfg.kind != .algebraic) {
+        } else if (durable_repair_id == null) {
             durable_repair_id = try self.createOperatorGenerationRepairIntent(
                 alloc,
                 cfg,
@@ -12150,7 +12246,8 @@ pub const DB = struct {
             var durable_entry = try self.loadIndexRepairEntryById(alloc, repair_id);
             defer durable_entry.deinit(alloc);
             const resumable = durable_entry.intent.candidate_relative_path != null and switch (durable_entry.intent.phase) {
-                .building => durable_entry.intent.build_resume_key != null and cfg.kind == .dense_vector,
+                .building => durable_entry.intent.build_resume_key != null and
+                    (cfg.kind == .dense_vector or cfg.kind == .algebraic),
                 .catching_up, .ready, .waiting_for_convergence => true,
                 else => false,
             };
@@ -12229,12 +12326,6 @@ pub const DB = struct {
             return result;
         }
 
-        if (cfg.kind == .algebraic) {
-            result.unsupported += 1;
-            result.unresolved += 1;
-            result.debt_remaining = true;
-            return result;
-        }
         const rebuilt = self.rebuildIndexWithShadowReplacement(alloc, cfg, options, durable_repair_id) catch |err| switch (err) {
             error.Canceled => {
                 result.unresolved += 1;
@@ -12323,7 +12414,8 @@ pub const DB = struct {
             var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
             defer entry.deinit(alloc);
             const resumable_phase = switch (entry.intent.phase) {
-                .building => entry.intent.build_resume_key != null and cfg.kind == .dense_vector,
+                .building => entry.intent.build_resume_key != null and
+                    (cfg.kind == .dense_vector or cfg.kind == .algebraic),
                 .catching_up, .ready, .waiting_for_convergence => true,
                 else => false,
             };
@@ -12352,8 +12444,16 @@ pub const DB = struct {
             var io_impl = threadedIo();
             defer io_impl.deinit();
             if (!shadow_installed and !candidate_reopenable) {
-                index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch {};
-                std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_base) catch {};
+                if (cfg.kind == .algebraic) {
+                    // Leave the index directory as a durable namespace marker.
+                    // Once the in-progress marker is cleared, paged orphan
+                    // cleanup can resume after failure or process restart.
+                    index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch {};
+                    self.scheduleInactiveRepairShadowCleanup();
+                } else {
+                    index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch {};
+                    std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_base) catch {};
+                }
             }
             alloc.free(shadow_base);
         }
@@ -12363,6 +12463,7 @@ pub const DB = struct {
 
         const shadow_index_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_indexes_path, cfg.name });
         defer alloc.free(shadow_index_path);
+        if (!resume_candidate and cfg.kind == .algebraic) try ensureDirPath(shadow_index_path);
         const shadow_checkpoint_path = try std.fmt.allocPrint(alloc, "{s}/applied-sequences", .{shadow_base});
         defer alloc.free(shadow_checkpoint_path);
         if (options.capacity_check) |check| try check.bindCandidateRoot(shadow_base);
@@ -12421,7 +12522,9 @@ pub const DB = struct {
         // mistake; otherwise they could repeatedly discard partial shadows.
         var effective_options = options;
         if (durable_repair_id == null) effective_options.yield_check = null;
-        const cooperative_dense_build = cfg.kind == .dense_vector and effective_options.yield_check != null;
+        const cooperative_snapshot_build =
+            (cfg.kind == .dense_vector or cfg.kind == .algebraic) and
+            effective_options.yield_check != null;
         var repair_issue_counter: AtomicU64 = .init(0);
         var shadow_ctx = AsyncContext{
             .alloc = alloc,
@@ -12453,7 +12556,7 @@ pub const DB = struct {
         var expected_snapshot_coverage: ?u64 = null;
         const completed_snapshot_build = !resume_candidate or resume_building;
         const rebuilt: u64 = if (resume_candidate and !resume_building) 0 else switch (cfg.kind) {
-            .dense_vector, .sparse_vector, .graph, .full_text => rebuilt_blk: {
+            .dense_vector, .sparse_vector, .graph, .full_text, .algebraic => rebuilt_blk: {
                 try checkArtifactRepairCancelled(options);
                 var pinned_snapshot: ?PinnedIndexRepairSnapshot = if (!resume_building) if (durable_repair_id) |repair_id|
                     try self.beginPinnedIndexRepairSnapshot(alloc, repair_id)
@@ -12506,7 +12609,7 @@ pub const DB = struct {
                             candidate_reopenable = durable_repair_id != null;
                             return .{ .reprocessed = @intCast(slice.rebuilt), .yielded = true };
                         }
-                        if (cooperative_dense_build) {
+                        if (cooperative_snapshot_build) {
                             // A count observed between slices is not a stable
                             // coverage assertion. Require the durable,
                             // generation-scoped outcome tuple when available;
@@ -12535,17 +12638,45 @@ pub const DB = struct {
                         options.cancel_check,
                         options.capacity_check,
                     ),
-                    else => unreachable,
+                    .algebraic => count_blk: {
+                        var slice = try rebuildAlgebraicIndexFromSnapshotSliceContext(
+                            &shadow_ctx,
+                            cfg.name,
+                            if (comptime builtin.is_test)
+                                test_algebraic_repair_rebuild_batch_size orelse 256
+                            else
+                                256,
+                            build_resume_key,
+                        );
+                        defer slice.deinit(alloc);
+                        const count = persisted_build_reprocessed +| @as(u64, @intCast(slice.rebuilt));
+                        if (!slice.complete()) {
+                            if (durable_repair_id) |repair_id| {
+                                try self.updateIndexRepairIntent(alloc, repair_id, .{
+                                    .phase = .building,
+                                    .build_resume_key = slice.resume_key.?,
+                                    .replace_build_resume_key = true,
+                                    .build_reprocessed = count,
+                                    .failure_streak = 0,
+                                    .next_retry_at_ms = 0,
+                                    .replace_last_error = true,
+                                });
+                            }
+                            candidate_reopenable = durable_repair_id != null;
+                            return .{ .reprocessed = @intCast(slice.rebuilt), .yielded = true };
+                        }
+                        break :count_blk count;
+                    },
                 };
                 break :rebuilt_blk count;
             },
-            .algebraic => return error.UnsupportedOperation,
         };
         // Durable intent progress is cumulative, while the public/run result
         // reports work performed by this scheduler turn. Keeping those two
         // meanings separate prevents the final resumed slice from recounting
         // every vector processed by earlier turns.
-        const reprocessed_this_pass = if (resume_building and cfg.kind == .dense_vector)
+        const reprocessed_this_pass = if (resume_building and
+            (cfg.kind == .dense_vector or cfg.kind == .algebraic))
             rebuilt -| persisted_build_reprocessed
         else
             rebuilt;
@@ -12559,7 +12690,7 @@ pub const DB = struct {
             if (completed_snapshot_build and denseIndexIsArtifactBacked(built_entry) and expected_snapshot_coverage == null) {
                 return error.RepairSourceCoverageIncomplete;
             }
-            if (!cooperative_dense_build) {
+            if (!cooperative_snapshot_build) {
                 if (expected_snapshot_coverage) |expected| {
                     if (!denseCoverageMatchesTarget(built_entry.index.stats().active_count, expected)) {
                         return error.RepairSourceCoverageIncomplete;
@@ -12571,7 +12702,7 @@ pub const DB = struct {
             try checkArtifactRepairCancelled(options);
             try self.saveShadowReplacementAppliedSequence(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, build_floor_sequence);
             if (options.capacity_check) |check| {
-                try check.current(try directoryUsageBytes(alloc, shadow_base));
+                try check.current(try repairCandidateStorageBytes(alloc, cfg, &shadow_manager, shadow_base));
             }
             if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
                 .phase = .catching_up,
@@ -12606,7 +12737,7 @@ pub const DB = struct {
         );
         var converged_sequence = initial_catch_up.applied_sequence;
         if (options.capacity_check) |check| {
-            try check.current(try directoryUsageBytes(alloc, shadow_base));
+            try check.current(try repairCandidateStorageBytes(alloc, cfg, &shadow_manager, shadow_base));
         }
         observed_ns_per_sequence = observeRepairCatchUpCost(
             observed_ns_per_sequence,
@@ -12681,7 +12812,7 @@ pub const DB = struct {
             );
             converged_sequence = convergence_catch_up.applied_sequence;
             if (options.capacity_check) |check| {
-                try check.current(try directoryUsageBytes(alloc, shadow_base));
+                try check.current(try repairCandidateStorageBytes(alloc, cfg, &shadow_manager, shadow_base));
             }
             observed_ns_per_sequence = observeRepairCatchUpCost(
                 observed_ns_per_sequence,
@@ -12985,6 +13116,11 @@ pub const DB = struct {
         );
         while (applied < target_sequence) {
             try checkArtifactRepairCancelled(options);
+            if (index_ref.kind == .algebraic) {
+                if (options.capacity_check) |check| {
+                    try check.current(try shadow_manager.activeIndexStorageBytes(index_ref.name));
+                }
+            }
             if (deadline_ns) |deadline| {
                 if (monotonicTimeNs() >= deadline) return error.ShadowIndexCatchUpIncomplete;
             }
@@ -13035,6 +13171,11 @@ pub const DB = struct {
                     .deadline_ns = deadline_ns,
                 },
             );
+            if (index_ref.kind == .algebraic) {
+                if (options.capacity_check) |check| {
+                    try check.current(try shadow_manager.activeIndexStorageBytes(index_ref.name));
+                }
+            }
             const advanced = catch_up_stats.appliedSequenceAdvance(applied) orelse blk: {
                 if (catch_up_stats.shouldTryTargetAdvance(applied, target_sequence) and
                     try canAdvanceDerivedReplayTargetContext(&batch_ctx, index_ref, applied, target_sequence))
@@ -15154,8 +15295,14 @@ pub const DB = struct {
 
     const IndexAdmissionMode = enum {
         ordinary,
-        managed_full_text,
+        managed,
     };
+
+    pub fn indexKindSupportsManagedGenerationRepair(kind: types.IndexKind) bool {
+        return switch (kind) {
+            .dense_vector, .sparse_vector, .graph, .full_text, .algebraic => true,
+        };
+    }
 
     const managed_index_admission_magic: u64 = 0x324d444154584449; // "IDXTADM2"
     const managed_index_admission_encoded_len = 48;
@@ -15237,10 +15384,11 @@ pub const DB = struct {
     ) !InstalledIndex {
         lockApply(self);
         defer self.core.unlockApply();
+        if (admission_mode == .managed and !indexKindSupportsManagedGenerationRepair(cfg.kind))
+            return error.UnsupportedOperation;
         try self.removeOrphanedIndexRepairIntentForFreshAdmission(self.alloc, cfg.name);
-        if (admission_mode == .managed_full_text and cfg.kind != .full_text) return error.InvalidArgument;
         const summary = try self.managedAdmissionVisibilitySummary();
-        const disposition: IndexAdmissionDisposition = if (admission_mode == .managed_full_text and summary.live_ordinals != 0)
+        const disposition: IndexAdmissionDisposition = if (admission_mode == .managed and summary.live_ordinals != 0)
             .managed_rebuild
         else
             .activation_fence;
@@ -15271,7 +15419,7 @@ pub const DB = struct {
         // generation at the current replay head without scanning tombstones.
         var applied = switch (admission_mode) {
             .ordinary => try self.core.addIndex(cfg, admission_write),
-            .managed_full_text => try self.core.addManagedIndex(cfg, admission_write),
+            .managed => try self.core.addManagedIndex(cfg, admission_write),
         };
         catalog_committed = true;
         // Publish outbox work only after the catalog/marker transaction is
@@ -15283,7 +15431,7 @@ pub const DB = struct {
             error.TestPostCommitIndexActivation
         else
             null;
-        if (admission_mode == .managed_full_text and disposition == .activation_fence) {
+        if (admission_mode == .managed and disposition == .activation_fence) {
             applied = self.core.nextDerivedSequence();
         }
         if (post_commit_error == null) {
@@ -15351,6 +15499,11 @@ pub const DB = struct {
         defer self.core.unlockApply();
         const key = try internal_keys.managedIndexAdmissionKeyAlloc(self.alloc, index_name);
         defer self.alloc.free(key);
+        try self.finalizeCompletedIndexAdmissionLocked(index_name, key);
+    }
+
+    /// Requires the DB apply lock.
+    fn finalizeCompletedIndexAdmissionLocked(self: *DB, index_name: []const u8, key: []const u8) !void {
         self.core.store.delete(key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
@@ -15360,21 +15513,22 @@ pub const DB = struct {
         notifyQueryVisibilityHook(self.async_context, .index_repair_cleared);
     }
 
-    fn recoverCommittedIndexAdmission(self: *DB, cfg: types.IndexConfig, activation_err: anyerror) ?u128 {
+    fn recoverCommittedIndexAdmission(self: *DB, cfg: types.IndexConfig, activation_err: anyerror) !?u128 {
         // Admission remains fail-closed until the durable repair marker is
         // materialized, so this is degraded-but-recoverable state.
         std.log.warn("index catalog admission committed with pending activation index={s} err={s}", .{ cfg.name, @errorName(activation_err) });
         self.requestManagedAdmissionMaterialization();
-        self.drainManagedIndexAdmissions(self.alloc) catch |materialize_err| {
+        self.drainManagedIndexAdmissionsUnderStructuralGuard(self.alloc) catch |materialize_err| {
             // The primary-store marker remains authoritative and startup will
             // retry projection into the repair scheduler.
             std.log.err("committed index activation marker remains pending index={s} err={s}", .{ cfg.name, @errorName(materialize_err) });
             return null;
         };
-        return self.indexRepairIdForIndex(self.alloc, cfg.name) catch |lookup_err| {
+        const repair_id = self.indexRepairIdForIndex(self.alloc, cfg.name) catch |lookup_err| {
             std.log.err("committed index activation repair lookup failed index={s} err={s}", .{ cfg.name, @errorName(lookup_err) });
             return null;
         };
+        return repair_id;
     }
 
     fn completeInstalledIndexAdmission(
@@ -15386,31 +15540,38 @@ pub const DB = struct {
         const repair_id = if (installed.managed_admission_pending) repair_blk: {
             // Drain the complete outbox, not only this index. A prior admission
             // may have committed before a transient checkpoint failure.
-            try self.drainManagedIndexAdmissions(self.alloc);
+            try self.drainManagedIndexAdmissionsUnderStructuralGuard(self.alloc);
             break :repair_blk try self.indexRepairIdForIndex(self.alloc, cfg.name);
         } else null;
 
         var worker_applied = installed.applied;
         if (installed.needs_enrichment_replay) {
-            // A newly admitted index owns a fresh coverage generation. Establish
-            // its worker baseline only after current artifact reconstruction.
-            const rebuilt = switch (cfg.kind) {
-                .dense_vector => try rebuildDenseIndexForTargetCoverageContext(self.async_context, cfg.name, 2048),
-                .sparse_vector => try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, cfg.name, 2048),
-                else => 0,
-            };
-            const generation_baseline = self.core.nextDerivedSequence();
-            if (rebuilt > 0 or generation_baseline > worker_applied) {
-                worker_applied = generation_baseline;
-                try self.core.saveAppliedSequence(cfg.name, worker_applied);
-                try saveIndexStatusSnapshots(self.alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
-                    .index_name = cfg.name,
-                    .sequence = worker_applied,
-                }});
+            if (!installed.managed_admission_pending) {
+                // Ordinary admission can seed its serving generation directly
+                // from retained artifacts before the worker begins replay.
+                const rebuilt = switch (cfg.kind) {
+                    .dense_vector => try rebuildDenseIndexForTargetCoverageContext(self.async_context, cfg.name, 2048),
+                    .sparse_vector => try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, cfg.name, 2048),
+                    else => 0,
+                };
+                const generation_baseline = self.core.nextDerivedSequence();
+                if (rebuilt > 0 or generation_baseline > worker_applied) {
+                    worker_applied = generation_baseline;
+                    try self.core.saveAppliedSequence(cfg.name, worker_applied);
+                    try saveIndexStatusSnapshots(self.alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
+                        .index_name = cfg.name,
+                        .sequence = worker_applied,
+                    }});
+                }
             }
             if (self.enrichment_runtime != null) {
+                // Managed admission deliberately leaves the serving generation
+                // empty and fail-closed while its shadow repair runs. It still
+                // must append source-document enrichment work: the shadow
+                // generation consumes those durable artifacts, and deletion
+                // may have retired every artifact from the prior incarnation.
                 const refs = try self.replayGeneratedEnrichmentsFromStoredDocs(self.alloc);
-                if (refs == 0) {
+                if (refs == 0 and !installed.managed_admission_pending) {
                     const target_sequence = self.core.nextDerivedSequence();
                     try self.core.saveAppliedSequence(cfg.name, target_sequence);
                     try self.markEnrichmentAppliedIfNoPendingThrough(target_sequence);
@@ -15453,13 +15614,13 @@ pub const DB = struct {
         if (installed.post_commit_error) |activation_err| {
             if (restart_enrichment) self.restartEnrichmentAfterStructuralMutation("pending index activation", cfg.name) catch {};
             enrichment_restarted = true;
-            return self.recoverCommittedIndexAdmission(cfg, activation_err);
+            return try self.recoverCommittedIndexAdmission(cfg, activation_err);
         }
 
         const repair_id = self.completeInstalledIndexAdmission(cfg, installed, restart_enrichment) catch |activation_err| {
             if (restart_enrichment) self.restartEnrichmentAfterStructuralMutation("pending index activation", cfg.name) catch {};
             enrichment_restarted = true;
-            return self.recoverCommittedIndexAdmission(cfg, activation_err);
+            return try self.recoverCommittedIndexAdmission(cfg, activation_err);
         };
         enrichment_restarted = true;
         return repair_id;
@@ -15470,11 +15631,19 @@ pub const DB = struct {
     }
 
     /// Managed table reconciliation uses a crash-consistent catalog/outbox
-    /// admission. Corpus reconstruction remains asynchronous and bounded by
-    /// the owner-side generation repair scheduler.
+    /// admission backed by shadow generation repair for every index kind.
+    /// Corpus reconstruction remains asynchronous and bounded by the
+    /// owner-side generation repair scheduler, while replay records writes
+    /// after the admission fence.
+    pub fn admitManagedIndex(self: *DB, cfg: types.IndexConfig) !?u128 {
+        return try self.addIndexWithAdmission(cfg, .managed);
+    }
+
+    /// Compatibility wrapper for callers that specifically admit full-text
+    /// indexes. New managed-table code should use admitManagedIndex.
     pub fn admitManagedFullTextIndex(self: *DB, cfg: types.IndexConfig) !?u128 {
         if (cfg.kind != .full_text) return error.InvalidArgument;
-        return try self.addIndexWithAdmission(cfg, .managed_full_text);
+        return try self.admitManagedIndex(cfg);
     }
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
@@ -34002,7 +34171,7 @@ fn artifactRepairUnsupportedReason(kind: types.ArtifactRepairKind) []const u8 {
         .embedding, .asset, .chunk => "",
         .graph => "graph_reprocessor_unavailable",
         .full_text => "full_text_reprocessor_unavailable",
-        .algebraic => "algebraic_index_rebuild_unavailable",
+        .algebraic => "algebraic_artifact_reprocessor_unavailable",
     };
 }
 
@@ -34353,6 +34522,102 @@ fn recordEmbeddingArtifactRepairIssueContext(
         &.{completion_key},
     );
     if (ctx.repair_issue_counter) |counter| _ = counter.fetchAdd(1, .monotonic);
+}
+
+/// Successful index publication is the authoritative resolution boundary for
+/// artifact diagnoses. Retire only diagnoses that are no newer than the batch
+/// which proved the artifact readable and consumable. Provider failures also
+/// require produced/skipped coverage and settle their shared completion fence
+/// in the same metadata transaction.
+fn clearPublishedEmbeddingArtifactRepairIssueContext(
+    ctx: *const AsyncContext,
+    index_name: []const u8,
+    artifact_key: []const u8,
+    published_sequence: u64,
+) !void {
+    const artifact_key_hex = try bytesToHexAlloc(ctx.alloc, artifact_key);
+    defer ctx.alloc.free(artifact_key_hex);
+    const issue_key = try internal_keys.artifactRepairIssueKeyAlloc(ctx.alloc, index_name, "embedding", artifact_key_hex);
+    defer ctx.alloc.free(issue_key);
+
+    const mutable_ctx = @constCast(ctx);
+    lockAtomicWithBackoff(&mutable_ctx.artifact_repair_issue_mutex);
+    defer mutable_ctx.artifact_repair_issue_mutex.unlock();
+
+    const loaded = (try loadArtifactRepairIssueFromStoreByKey(ctx.alloc, ctx.store, issue_key)) orelse return;
+    var issue = loaded;
+    defer issue.deinit(ctx.alloc);
+    if (issue.sequence > published_sequence) return;
+
+    var completion_key: ?[]u8 = null;
+    defer if (completion_key) |key| ctx.alloc.free(key);
+    var completion: ArtifactRepairCompletionState = .{};
+    var encoded_completion: [artifact_repair_completion_state_len]u8 = undefined;
+    if (issue.reason == .enrichment_failed) {
+        if (ctx.index_manager.denseIndex(index_name) == null and
+            ctx.index_manager.sparseIndex(index_name) == null)
+        {
+            return;
+        }
+        const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return;
+        const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(ctx.alloc, index_name, generation, issue.doc_key);
+        defer ctx.alloc.free(marker_key);
+        const raw_outcome = ctx.store.get(ctx.alloc, marker_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        defer ctx.alloc.free(raw_outcome);
+        const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, raw_outcome) orelse
+            return error.InvalidDerivedCoverageOutcome;
+        if (outcome != .produced and outcome != .skipped) return;
+
+        completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(ctx.alloc, "embedding", artifact_key_hex);
+        completion = (try loadArtifactRepairCompletionStateFromStore(ctx.alloc, ctx.store, completion_key.?)) orelse .{};
+        completion.completed_sequence = @max(completion.completed_sequence, published_sequence);
+        completion.pending_issues -|= 1;
+    }
+
+    const kind_key = try artifactRepairIssueKindKeyForIssueAlloc(ctx.alloc, issue);
+    defer ctx.alloc.free(kind_key);
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    var borrowed_write_count: usize = 0;
+    defer {
+        for (writes.items[borrowed_write_count..]) |write| ctx.alloc.free(@constCast(write.value));
+        writes.deinit(ctx.alloc);
+    }
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(ctx.alloc);
+    var owned_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (owned_delete_keys.items) |key| ctx.alloc.free(@constCast(key));
+        owned_delete_keys.deinit(ctx.alloc);
+    }
+
+    try deletes.append(ctx.alloc, issue_key);
+    try deletes.append(ctx.alloc, kind_key);
+    if (completion_key) |key| {
+        if (completion.pending_issues == 0) {
+            try deletes.append(ctx.alloc, key);
+        } else {
+            encodeArtifactRepairCompletionState(&encoded_completion, completion);
+            try writes.append(ctx.alloc, .{ .key = key, .value = &encoded_completion });
+        }
+    }
+    borrowed_write_count = writes.items.len;
+    try appendArtifactRepairSummaryDirtyForStore(ctx.alloc, ctx.store, &writes, &deletes, &owned_delete_keys);
+    try ctx.store.putBatch(writes.items, deletes.items);
+}
+
+fn clearPublishedEmbeddingArtifactRepairIssuesContext(
+    ctx: *const AsyncContext,
+    index_name: []const u8,
+    writes: anytype,
+    published_sequence: u64,
+) !void {
+    for (writes) |write| {
+        const artifact_key = write.artifact_key orelse continue;
+        try clearPublishedEmbeddingArtifactRepairIssueContext(ctx, index_name, artifact_key, published_sequence);
+    }
 }
 
 fn repairKindFromArtifactKind(kind: types.ArtifactKind) types.ArtifactRepairKind {
@@ -34929,6 +35194,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 try ctx.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, dense_finish_options);
                 dense_streaming_session_open = false;
             }
+            try clearPublishedEmbeddingArtifactRepairIssuesContext(ctx, index_ref.name, dense_embeddings.writes, batch.sequence);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_apply_ns, dense_apply_start_ns);
         },
         .sparse_vector => {
@@ -34990,6 +35256,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             const sparse_embedding_apply_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
             try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, sparse_embeddings.writes, batch_options);
             try accountSparseCoverage(ctx, index_ref.name, batch, sparse_embeddings.writes);
+            try clearPublishedEmbeddingArtifactRepairIssuesContext(ctx, index_ref.name, sparse_embeddings.writes, batch.sequence);
             if (emit_sparse_write_profile) sparse_embedding_apply_ns = monotonicTimeNs() - sparse_embedding_apply_start_ns;
             if (before_sparse_profile) |before| {
                 if (ctx.index_manager.sparseWriteProfileByName(index_ref.name)) |after| {
@@ -39054,6 +39321,16 @@ fn directoryUsageBytes(alloc: Allocator, path: []const u8) !u64 {
     return total;
 }
 
+fn repairCandidateStorageBytes(
+    alloc: Allocator,
+    cfg: types.IndexConfig,
+    manager: *index_manager_mod.IndexManager,
+    shadow_base: []const u8,
+) !u64 {
+    if (cfg.kind == .algebraic) return try manager.activeIndexStorageBytes(cfg.name);
+    return try directoryUsageBytes(alloc, shadow_base);
+}
+
 fn createUniqueRepairShadowBase(alloc: Allocator, base_path: []const u8) ![]u8 {
     var io_impl = threadedIo();
     defer io_impl.deinit();
@@ -39499,6 +39776,110 @@ fn freePrimaryVectorRebuildWrites(alloc: Allocator, writes: *std.ArrayListUnmana
         alloc.free(@constCast(write.value));
     }
     writes.clearRetainingCapacity();
+}
+
+const AlgebraicRebuildSliceResult = struct {
+    rebuilt: usize = 0,
+    resume_key: ?[]u8 = null,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.resume_key) |key| alloc.free(key);
+        self.* = undefined;
+    }
+
+    fn complete(self: @This()) bool {
+        return self.resume_key == null;
+    }
+};
+
+fn rebuildAlgebraicIndexFromSnapshotSliceContext(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    rebuild_batch_size: usize,
+    resume_key: ?[]const u8,
+) !AlgebraicRebuildSliceResult {
+    if (rebuild_batch_size == 0) return error.InvalidArgument;
+    const upper = (try documentRangeUpperAlloc(ctx.alloc, "")) orelse return error.InvalidAppliedDataRange;
+    defer ctx.alloc.free(upper);
+    var lower = if (resume_key) |key| try ctx.alloc.dupe(u8, key) else try documentRangeLowerAlloc(ctx.alloc, "");
+    defer ctx.alloc.free(lower);
+    var lower_exclusive = resume_key != null;
+    var rebuilt: usize = 0;
+    const cooperative = ctx.repair_options.yield_check != null;
+
+    while (true) {
+        const ScanState = struct {
+            alloc: Allocator,
+            batch_size: usize,
+            documents: std.ArrayListUnmanaged(derived_types.DerivedDocument) = .empty,
+            resume_key: ?[]u8 = null,
+
+            fn deinit(state: *@This()) void {
+                for (state.documents.items) |doc| derived_types.deinitDerivedDocument(state.alloc, doc);
+                state.documents.deinit(state.alloc);
+                if (state.resume_key) |key| state.alloc.free(key);
+            }
+
+            fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
+                const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.alloc, key)) orelse
+                    return .@"continue";
+                errdefer state.alloc.free(logical_key);
+                const cleaned_value = try state.alloc.dupe(u8, value);
+                errdefer state.alloc.free(cleaned_value);
+                try state.documents.append(state.alloc, .{
+                    .key = logical_key,
+                    .cleaned_value = cleaned_value,
+                });
+                if (state.documents.items.len < state.batch_size) return .@"continue";
+                state.resume_key = try state.alloc.dupe(u8, key);
+                return .stop;
+            }
+        };
+
+        var state = ScanState{
+            .alloc = ctx.alloc,
+            .batch_size = rebuild_batch_size,
+        };
+        defer state.deinit();
+        try scanStoreForRebuildContext(
+            ctx,
+            lower,
+            upper,
+            .{ .lower_exclusive = lower_exclusive },
+            &state,
+            ScanState.scanEntry,
+        );
+        if (state.documents.items.len > 0) {
+            try checkAsyncRepairCancelled(ctx);
+            if (ctx.repair_options.capacity_check) |check| {
+                try check.current(try ctx.index_manager.activeIndexStorageBytes(index_name));
+            }
+            try applyDerivedBatchToIndexContext(ctx, .{
+                .sequence = ctx.repair_sequence,
+                .documents = state.documents.items,
+            }, .{ .name = index_name, .kind = .algebraic });
+            if (ctx.repair_options.capacity_check) |check| {
+                // Algebraic generations materialize in the primary store, not
+                // beneath the shadow marker directory. Reconcile the exact
+                // transaction-maintained namespace counter after every batch.
+                try check.current(try ctx.index_manager.activeIndexStorageBytes(index_name));
+            }
+            rebuilt += state.documents.items.len;
+        }
+        const next_resume_key = state.resume_key orelse break;
+        if (cooperative and ctx.repair_options.yield_check.?.requested()) {
+            return .{
+                .rebuilt = rebuilt,
+                .resume_key = try ctx.alloc.dupe(u8, next_resume_key),
+            };
+        }
+        const next_lower = try ctx.alloc.dupe(u8, next_resume_key);
+        ctx.alloc.free(lower);
+        lower = next_lower;
+        lower_exclusive = true;
+    }
+    return .{ .rebuilt = rebuilt };
 }
 
 fn flushDensePrimaryVectorRebuildChunkContext(
@@ -51953,6 +52334,74 @@ test "db repair completion cannot clear debt behind terminal coverage" {
     const remaining = try db.listArtifactRepairIssues(alloc, .embedding, "semantic", 1);
     defer types.freeArtifactRepairIssues(alloc, remaining);
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
+
+    // The replay publication path owns ledger retirement. A request resuming
+    // after that boundary must observe idempotent success rather than report
+    // the repair it initiated as unresolved.
+    try std.testing.expectEqual(
+        DB.ArtifactRepairCompletionDisposition.completed,
+        try db.completeArtifactRepairIssueIfCurrent(
+            alloc,
+            pending[0],
+            revision,
+            completion_key,
+            completion.epoch,
+            false,
+        ),
+    );
+    try std.testing.expect(try db.clearArtifactRepairIssueIfCurrent(alloc, pending[0], revision));
+}
+
+test "db successful embedding publication retires covered provider failure debt" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    });
+
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "semantic");
+    defer alloc.free(artifact_key);
+    var issue = types.ArtifactRepairIssue{
+        .artifact_kind = .embedding,
+        .index_name = try alloc.dupe(u8, "semantic"),
+        .doc_key = try alloc.dupe(u8, "doc:a"),
+        .artifact_name = try alloc.dupe(u8, "semantic"),
+        .artifact_key = try bytesToHexAlloc(alloc, artifact_key),
+        .reason = .enrichment_failed,
+        .sequence = 7,
+    };
+    defer issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    const generation = db.core.index_manager.coverageGenerationForIndex("semantic") orelse return error.TestUnexpectedResult;
+    const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "semantic", generation, "doc:a");
+    defer alloc.free(marker_key);
+    try db.core.store.put(marker_key, "produced");
+
+    // An older successful replay cannot discharge a newer provider failure.
+    try clearPublishedEmbeddingArtifactRepairIssueContext(db.async_context, "semantic", artifact_key, 6);
+    {
+        const pending = try db.listArtifactRepairIssues(alloc, .embedding, "semantic", 1);
+        defer types.freeArtifactRepairIssues(alloc, pending);
+        try std.testing.expectEqual(@as(usize, 1), pending.len);
+    }
+
+    try clearPublishedEmbeddingArtifactRepairIssueContext(db.async_context, "semantic", artifact_key, 7);
+    const remaining = try db.listArtifactRepairIssues(alloc, .embedding, "semantic", 1);
+    defer types.freeArtifactRepairIssues(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+
+    const completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(alloc, "embedding", issue.artifact_key);
+    defer alloc.free(completion_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, completion_key));
 }
 
 test "db shared repair completion reprocesses consumer with terminal coverage" {
@@ -53414,7 +53863,7 @@ test "db graph generation repair preserves corrupt artifact debt after rebuild" 
     try std.testing.expectEqualStrings("bad-graph-artifact", raw_artifact);
 }
 
-test "db repair issue list reports algebraic index debt as unsupported" {
+test "db repair issue list exposes algebraic generation debt as repairable" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -53436,6 +53885,10 @@ test "db repair issue list reports algebraic index debt as unsupported" {
         ,
     };
     try db.addIndex(cfg);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"category\":\"tools\"}" }},
+        .sync_level = .full_index,
+    });
     try db.core.saveProjectionCheckpoint("alg_v1", .{
         .applied_sequence = 0,
         .status = .repair_required,
@@ -53451,9 +53904,9 @@ test "db repair issue list reports algebraic index debt as unsupported" {
     defer page.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), page.issues.len);
     try std.testing.expectEqual(types.ArtifactRepairKind.algebraic, page.issues[0].artifact_kind);
-    try std.testing.expect(!page.issues[0].repairable);
-    try std.testing.expectEqualStrings("algebraic_index_rebuild_unavailable", page.issues[0].unsupported_reason);
-    try std.testing.expectEqualStrings("algebraic_index_rebuild_unavailable", page.issues[0].last_error);
+    try std.testing.expect(page.issues[0].repairable);
+    try std.testing.expectEqualStrings("", page.issues[0].unsupported_reason);
+    try std.testing.expectEqualStrings("index_repair_required", page.issues[0].last_error);
 
     var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
         .target = .index,
@@ -53463,9 +53916,18 @@ test "db repair issue list reports algebraic index debt as unsupported" {
     });
     defer repair.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), repair.scanned);
-    try std.testing.expectEqual(@as(u64, 1), repair.unsupported);
-    try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
-    try std.testing.expect(repair.debt_remaining);
+    try std.testing.expectEqual(@as(u64, 0), repair.unsupported);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 0), repair.unresolved);
+    try std.testing.expect(!repair.debt_remaining);
+
+    while (try db.core.index_manager.cleanupInactiveRepairShadowRootsPage()) {}
+    const canonical_prefix = try algebraic_mod.index.storagePrefixAlloc(alloc, "canonical/alg_v1");
+    defer alloc.free(canonical_prefix);
+    const canonical_rows = try db.core.store.scanPrefix(alloc, canonical_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, canonical_rows);
+    try std.testing.expectEqual(@as(usize, 0), canonical_rows.len);
 }
 
 test "db index repair serializes duplicate repairs for one index" {
@@ -57853,9 +58315,12 @@ test "db shared enrichment repair regenerates one physical artifact once" {
     try std.testing.expectEqual(@as(u64, 1), first.reprocessed);
     try std.testing.expectEqual(@as(u64, 1), first.repaired);
     try std.testing.expect(first.debt_remaining);
-    try std.testing.expectEqual(@as(u64, 1), second.scanned);
+    // The first replay publishes the shared artifact to every consumer and
+    // atomically retires their debt. The cursor came from the pre-repair page,
+    // so following it is valid but must not rediscover already-retired work.
+    try std.testing.expectEqual(@as(u64, 0), second.scanned);
     try std.testing.expectEqual(@as(u64, 0), second.reprocessed);
-    try std.testing.expectEqual(@as(u64, 1), second.repaired);
+    try std.testing.expectEqual(@as(u64, 0), second.repaired);
     try std.testing.expect(!second.debt_remaining);
     try std.testing.expectEqual(@as(usize, 1), after.total_requests - before.total_requests);
     try std.testing.expectEqual(@as(usize, 1), after.successful_requests - before.successful_requests);
@@ -67904,6 +68369,413 @@ test "db dense repair durably yields and resumes a reopenable building candidate
     try std.testing.expect(found_replayed_insert);
 }
 
+test "db managed vector admission captures writes while durable repair is pending" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"before admission\"}" }},
+        .sync_level = .write,
+    });
+
+    _ = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+    try std.testing.expectError(error.IndexRebuilding, db.search(alloc, .{
+        .index_name = cfg.name,
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } },
+    }));
+
+    // A post-admission write is allowed to commit while the corpus rebuild is
+    // pending. With workers disabled, its target watermark is durable proof
+    // that catch-up owns the write instead of silently dropping the vector.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:new",
+            .value = "{\"body\":\"after admission\",\"_embeddings\":{\"semantic_idx\":[1,0,0]}}",
+        }},
+        .sync_level = .write,
+    });
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    const target = for (stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, cfg.name)) break item;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), target.doc_count);
+    try std.testing.expect(target.replay_target_sequence > target.replay_applied_sequence);
+}
+
+test "db managed vector admission durably seeds missing enrichment artifacts" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"before admission\"}" }},
+        .sync_level = .write,
+    });
+    try db.addEnrichment(.{
+        .name = "semantic_embedding",
+        .kind = .embedding,
+        .field = "body",
+        .expected_dims = 3,
+    });
+
+    const before_admission = db.core.nextDerivedSequence();
+    const repair_id = (try db.admitManagedIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"semantic_embedding\"}",
+    })) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(repair_id != 0);
+
+    // Artifact production is a durable replay record owned by the enrichment
+    // worker, while the canonical serving generation remains empty and gated.
+    // The generation repair will consume the produced artifact in its shadow.
+    try std.testing.expect(db.core.nextDerivedSequence() > before_admission);
+    const canonical = db.core.denseIndex("semantic_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), canonical.index.stats().active_count);
+    try std.testing.expect(db.core.index_manager.repairUnavailable("semantic_idx"));
+}
+
+test "db managed algebraic admission builds and reopens an isolated generation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "analytics_idx",
+        .kind = .algebraic,
+        .config_json =
+        \\{"version":1,"table":"docs","group_fields":[{"name":"category","path":"category","type":"string"}],"materializations":[]}
+        ,
+    };
+    var active_namespace: []u8 = undefined;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:old", .value = "{\"category\":\"tools\"}" }},
+            .sync_level = .write,
+        });
+
+        const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(db.core.index_manager.repairUnavailable(cfg.name));
+        try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+        const canonical = db.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("canonical/analytics_idx", canonical.index.storageNamespace());
+
+        var repaired = false;
+        for (0..16) |_| {
+            const step = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+            if (step.repaired) {
+                repaired = true;
+                break;
+            }
+            try std.testing.expect(!step.terminal);
+        }
+        try std.testing.expect(repaired);
+        try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
+        try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+
+        const active = db.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.startsWith(u8, active.index.storageNamespace(), ".repair-shadow-"));
+        active_namespace = try alloc.dupe(u8, active.index.storageNamespace());
+        var resolved = (try active.index.resolvedDocFilterForFilterJsonAlloc(
+            db.core.store,
+            "{\"term\":{\"category\":\"tools\"}}",
+        )) orelse return error.TestUnexpectedResult;
+        defer resolved.deinit(alloc);
+        switch (resolved.include) {
+            .ordinals => |ordinals| try std.testing.expectEqual(@as(usize, 1), ordinals.len),
+            else => return error.ExpectedOrdinalDocSet,
+        }
+    }
+    defer alloc.free(active_namespace);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    const active = reopened.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(active_namespace, active.index.storageNamespace());
+    var resolved = (try active.index.resolvedDocFilterForFilterJsonAlloc(
+        reopened.core.store,
+        "{\"term\":{\"category\":\"tools\"}}",
+    )) orelse return error.TestUnexpectedResult;
+    defer resolved.deinit(alloc);
+    switch (resolved.include) {
+        .ordinals => |ordinals| try std.testing.expectEqual(@as(usize, 1), ordinals.len),
+        else => return error.ExpectedOrdinalDocSet,
+    }
+}
+
+test "db algebraic generation build yields and resumes from its durable source cursor" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "analytics_idx",
+        .kind = .algebraic,
+        .config_json =
+        \\{"version":1,"table":"docs","group_fields":[{"name":"category","path":"category","type":"string"}],"materializations":[]}
+        ,
+    };
+    test_algebraic_repair_rebuild_batch_size = 1;
+    defer test_algebraic_repair_rebuild_batch_size = null;
+    const Yield = struct {
+        fn requested(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var yield_token: u8 = 0;
+    var repair_id: u128 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"category\":\"tools\"}" },
+                .{ .key = "doc:b", .value = "{\"category\":\"books\"}" },
+            },
+            .sync_level = .write,
+        });
+        repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+        const first = try db.advanceIndexRepairIntent(alloc, repair_id, .{
+            .yield_check = .{ .ptr = &yield_token, .is_requested = Yield.requested },
+        });
+        try std.testing.expect(first.attempted);
+        try std.testing.expect(first.busy);
+        try std.testing.expect(!first.repaired);
+        try std.testing.expectEqual(@as(u64, 1), first.documents_reprocessed);
+
+        var state = try db.loadIndexRepairState(alloc);
+        defer state.deinit(alloc);
+        const intent = state.entries.items[0].intent;
+        try std.testing.expectEqual(index_repair_state.Phase.building, intent.phase);
+        try std.testing.expect(intent.build_resume_key != null);
+        try std.testing.expectEqual(@as(u64, 1), intent.build_reprocessed);
+        const candidate = intent.candidate_relative_path orelse return error.TestUnexpectedResult;
+        const separator = std.mem.indexOfScalar(u8, candidate, '/') orelse return error.TestUnexpectedResult;
+        const storage_namespace = try std.fmt.allocPrint(
+            alloc,
+            "{s}/{s}",
+            .{ candidate[0..separator], cfg.name },
+        );
+        defer alloc.free(storage_namespace);
+        try std.testing.expect((try db.core.index_manager.algebraicStorageNamespaceBytes(storage_namespace)) > 0);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    try std.testing.expectEqual(repair_id, (try reopened.indexRepairIdForIndex(alloc, cfg.name)).?);
+    var repaired = false;
+    for (0..16) |_| {
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+        if (step.repaired) {
+            repaired = true;
+            break;
+        }
+        try std.testing.expect(!step.terminal);
+    }
+    try std.testing.expect(repaired);
+    const active = reopened.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    var tools = (try active.index.resolvedDocFilterForFilterJsonAlloc(
+        reopened.core.store,
+        "{\"term\":{\"category\":\"tools\"}}",
+    )) orelse return error.TestUnexpectedResult;
+    defer tools.deinit(alloc);
+    var books = (try active.index.resolvedDocFilterForFilterJsonAlloc(
+        reopened.core.store,
+        "{\"term\":{\"category\":\"books\"}}",
+    )) orelse return error.TestUnexpectedResult;
+    defer books.deinit(alloc);
+    switch (tools.include) {
+        .ordinals => |ordinals| try std.testing.expectEqual(@as(usize, 1), ordinals.len),
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    switch (books.include) {
+        .ordinals => |ordinals| try std.testing.expectEqual(@as(usize, 1), ordinals.len),
+        else => return error.ExpectedOrdinalDocSet,
+    }
+}
+
+test "db forced algebraic repair persists an operator generation intent before execution" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const cfg = types.IndexConfig{
+        .name = "analytics_idx",
+        .kind = .algebraic,
+        .config_json =
+        \\{"version":1,"table":"docs","group_fields":[{"name":"category","path":"category","type":"string"}],"materializations":[]}
+        ,
+    };
+    var repair_id: u128 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(cfg);
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"category\":\"tools\"}" }},
+            .sync_level = .full_index,
+        });
+        var deferred = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
+            .target = .index,
+            .artifact_kind = .algebraic,
+            .index_name = cfg.name,
+            .limit = 1,
+            .force = true,
+            .repair_job_id = 77,
+            .repair_job_created_at_ms = 88,
+        }, .{ .defer_durable_index_repair_execution = true });
+        defer deferred.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 1), deferred.in_progress);
+        try std.testing.expectEqual(@as(u64, 0), deferred.indexes_rebuilt);
+        repair_id = (try db.indexRepairIdForIndex(alloc, cfg.name)) orelse return error.TestUnexpectedResult;
+        var entry = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer entry.deinit(alloc);
+        try std.testing.expectEqual(index_repair_state.Trigger.operator_generation_rebuild, entry.intent.trigger);
+        try std.testing.expectEqual(@as(u64, 77), entry.intent.operator_job_id);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    try std.testing.expectEqual(repair_id, (try reopened.indexRepairIdForIndex(alloc, cfg.name)).?);
+    var repaired = false;
+    for (0..16) |_| {
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+        if (step.repaired) {
+            repaired = true;
+            break;
+        }
+        try std.testing.expect(!step.terminal);
+    }
+    try std.testing.expect(repaired);
+    try std.testing.expect((try reopened.indexRepairIdForIndex(alloc, cfg.name)) == null);
+}
+
+test "db algebraic post-commit activation crash recovers through generation repair" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "analytics_idx",
+        .kind = .algebraic,
+        .config_json =
+        \\{"version":1,"table":"docs","group_fields":[{"name":"category","path":"category","type":"string"}],"materializations":[]}
+        ,
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:old", .value = "{\"category\":\"tools\"}" }},
+            .sync_level = .write,
+        });
+
+        DB.test_fail_index_activation_after_catalog_commit = true;
+        defer DB.test_fail_index_activation_after_catalog_commit = false;
+        const installed = try db.installIndexWhileEnrichmentQuiesced(cfg, .ordinary);
+        DB.test_fail_index_activation_after_catalog_commit = false;
+        const post_commit_error = installed.post_commit_error orelse return error.TestUnexpectedResult;
+        try std.testing.expect(post_commit_error == error.TestPostCommitIndexActivation);
+
+        const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, cfg.name);
+        defer alloc.free(admission_key);
+        const raw = try db.core.store.get(alloc, admission_key);
+        defer alloc.free(raw);
+        const marker = try DB.decodeManagedIndexAdmissionMarker(raw);
+        try std.testing.expectEqual(DB.IndexAdmissionDisposition.activation_fence, marker.disposition);
+        try std.testing.expect(db.core.index_manager.repairUnavailable(cfg.name));
+    }
+
+    // Writable startup reconstructs durable repair debt from the admission
+    // marker. The canonical generation stays gated until snapshot build,
+    // replay, and root-pointer activation all finish.
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    try std.testing.expect(reopened.core.index_manager.algebraicIndex(cfg.name) != null);
+    try std.testing.expect(reopened.core.index_manager.repairUnavailable(cfg.name));
+    try std.testing.expect(try reopened.hasPendingIndexRepairIntents(alloc));
+    const repair_id = (try reopened.materializeManagedIndexAdmission(alloc, cfg.name)) orelse
+        return error.TestUnexpectedResult;
+    var repaired = false;
+    for (0..16) |_| {
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+        if (step.repaired) {
+            repaired = true;
+            break;
+        }
+        try std.testing.expect(!step.terminal);
+    }
+    try std.testing.expect(repaired);
+    try std.testing.expect(!reopened.core.index_manager.repairUnavailable(cfg.name));
+    try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));
+    const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, cfg.name);
+    defer alloc.free(admission_key);
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, admission_key));
+    const active = reopened.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.startsWith(u8, active.index.storageNamespace(), ".repair-shadow-"));
+}
+
 test "db managed full text admission survives restart without in-place backfill" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -68416,7 +69288,7 @@ test "db managed admission materialization serializes with index deletion" {
         .name = index_name,
         .kind = .full_text,
         .config_json = "{}",
-    }, .managed_full_text);
+    }, .managed);
 
     const Race = struct {
         db: *DB,

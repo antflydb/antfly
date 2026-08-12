@@ -5187,6 +5187,14 @@ pub const ProvisionedTableWriteSource = struct {
             if (index_name == null) return false;
             return std.mem.eql(u8, self.index_name.?, index_name.?);
         }
+
+        fn reservesWriteAdmission(self: @This()) bool {
+            // Whole-table/schema reconciliation can change the contract seen
+            // by a write and therefore retains the exclusive reservation.
+            // Index-targeted work runs only after request-time managed
+            // admission has installed the index writer in every local group.
+            return self.index_name == null;
+        }
     };
 
     const StructuralReconcileGroup = struct {
@@ -6952,12 +6960,27 @@ pub const ProvisionedTableWriteSource = struct {
         self.endStructuralTableActivity(table_name);
     }
 
-    fn abortLocalStructuralIndexCacheUpdate(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    fn abortLocalStructuralIndexCacheUpdate(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) void {
         self.invalidateWriteCache(table_name);
         self.invalidateReadCache(table_name);
         self.invalidateRuntimeStatusCache(table_name);
         self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
         self.endStructuralTableActivity(table_name);
+        // Some groups may already have committed the target mutation. Hand
+        // that exact desired-state edge to the bounded reconciler before the
+        // synchronous caller observes the failure.
+        self.enqueueTableIndexStructuralReconcile(table_name, index_name) catch |err| {
+            std.log.err("failed to enqueue targeted structural recovery after index mutation failure table={s} index={s} err={s}", .{
+                table_name,
+                index_name,
+                @errorName(err),
+            });
+        };
     }
 
     fn abortLocalStructuralCacheUpdate(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -11309,7 +11332,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.structural_reconcile_mutex.lockUncancelable(io);
         defer self.structural_reconcile_mutex.unlock(io);
         for (self.structural_reconcile_tables.items) |*request| {
-            self.cancelStructuralReconcileReservation(request.table_name);
+            if (request.reservesWriteAdmission()) self.cancelStructuralReconcileReservation(request.table_name);
             request.deinit(alloc);
         }
         self.structural_reconcile_tables.deinit(alloc);
@@ -11349,7 +11372,7 @@ pub const ProvisionedTableWriteSource = struct {
             while (i < self.structural_reconcile_tables.items.len) {
                 if (std.mem.eql(u8, self.structural_reconcile_tables.items[i].table_name, table_name)) {
                     var removed = self.structural_reconcile_tables.orderedRemove(i);
-                    self.cancelStructuralReconcileReservation(removed.table_name);
+                    if (removed.reservesWriteAdmission()) self.cancelStructuralReconcileReservation(removed.table_name);
                     removed.deinit(alloc);
                     continue;
                 }
@@ -11369,12 +11392,12 @@ pub const ProvisionedTableWriteSource = struct {
             .table_name = owned_table_name,
             .index_name = owned_index_name,
         });
-        self.reserveStructuralReconcileActivity(table_name);
+        if (index_name == null) self.reserveStructuralReconcileActivity(table_name);
 
         if (self.structural_reconcile_scheduled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         self.restore_repair_work_group.concurrent(io, drainStructuralReconcileTask, .{self}) catch |err| {
             var removed = self.structural_reconcile_tables.orderedRemove(appended_index);
-            self.cancelStructuralReconcileReservation(removed.table_name);
+            if (removed.reservesWriteAdmission()) self.cancelStructuralReconcileReservation(removed.table_name);
             removed.deinit(alloc);
             self.structural_reconcile_scheduled.store(false, .release);
             return err;
@@ -11413,7 +11436,7 @@ pub const ProvisionedTableWriteSource = struct {
             var request = self.structural_reconcile_tables.orderedRemove(ready_index.?);
             self.structural_reconcile_mutex.unlock(io);
 
-            self.beginReservedStructuralReconcileActivity(request.table_name);
+            if (request.reservesWriteAdmission()) self.beginReservedStructuralReconcileActivity(request.table_name);
             request.attempt_count +|= 1;
             var reconcile_outcome: StructuralReconcileOutcome = .complete;
             const reconcile_error: ?anyerror = blk: {
@@ -11462,7 +11485,7 @@ pub const ProvisionedTableWriteSource = struct {
                 continue;
             }
             if (reconcile_outcome == .discarded) {
-                self.endStructuralReconcileActivity(request.table_name);
+                if (request.reservesWriteAdmission()) self.endStructuralReconcileActivity(request.table_name);
                 request.publishDeferredRepairDebt(self);
                 request.deinit(alloc);
                 continue;
@@ -11473,7 +11496,7 @@ pub const ProvisionedTableWriteSource = struct {
             } else {
                 std.log.info("structural reconcile complete table={s} attempts={d}", .{ request.table_name, request.attempt_count });
             }
-            self.endStructuralReconcileActivity(request.table_name);
+            if (request.reservesWriteAdmission()) self.endStructuralReconcileActivity(request.table_name);
             request.publishDeferredRepairDebt(self);
             request.deinit(alloc);
         }
@@ -11485,8 +11508,9 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
     ) void {
         const io = self.table_activity_threaded.io();
-        // Keep the reservation continuous across retries: a write admitted
-        // between the active pass and requeue could use stale schema.
+        // Whole-table reconciliation keeps its reservation continuous across
+        // retries. Index-targeted work has already installed write capability
+        // and can retry without holding foreground admission.
         self.structural_reconcile_mutex.lockUncancelable(io);
         var covered = false;
         for (self.structural_reconcile_tables.items) |candidate| {
@@ -11497,11 +11521,11 @@ pub const ProvisionedTableWriteSource = struct {
         }
         var requeued = false;
         if (!covered and !self.restore_repair_shutdown.load(.acquire)) {
-            self.reserveStructuralReconcileActivity(request.table_name);
+            if (request.reservesWriteAdmission()) self.reserveStructuralReconcileActivity(request.table_name);
             self.structural_reconcile_tables.appendAssumeCapacity(request.*);
             requeued = true;
         }
-        self.endStructuralReconcileActivity(request.table_name);
+        if (request.reservesWriteAdmission()) self.endStructuralReconcileActivity(request.table_name);
         self.structural_reconcile_mutex.unlock(io);
         if (!requeued) {
             request.publishDeferredRepairDebt(self);
@@ -11520,11 +11544,9 @@ pub const ProvisionedTableWriteSource = struct {
         } else {
             std.log.info("structural reconcile begin table={s}", .{table_name});
         }
-        // The structural reservation has already drained foreground writes.
-        // Keep the current generation owner resident: reconciliation mutates
-        // only unpublished schema/index state and readers safely lease this DB
-        // until activation. Retiring it here creates a writerless handoff in
-        // which both repair and reads race to reopen the same physical root.
+        // Whole-table work has already drained foreground writes. Targeted
+        // index work instead owns only its per-group compatible operation and
+        // is constrained below to that one index's desired state.
     }
 
     fn reconcileTableStructureStep(
@@ -11772,6 +11794,7 @@ pub const ProvisionedTableWriteSource = struct {
         const lsm_root_generation = self.visibleRootGeneration(group_id);
         const identity_namespace = metadata.identity_namespace orelse
             try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+        const target_index_name = metadata.target_index_name;
 
         var configured_indexes_storage: ?StartupConfiguredIndexes = null;
         if (metadata.indexes_json) |value| configured_indexes_storage = try parseStartupConfiguredIndexes(alloc, value);
@@ -11780,9 +11803,11 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, .{
                 .indexes_json = metadata.indexes_json,
-                .schema_json = metadata.schema_json,
+                .schema_json = if (target_index_name == null) metadata.schema_json else null,
                 .identity_namespace = identity_namespace,
-            }, .{}) catch |err| {
+            }, .{
+                .reconcile_target_index_name = target_index_name,
+            }) catch |err| {
                 if (isTransientWriterOpenConflict(err)) return .busy;
                 return err;
             };
@@ -11795,7 +11820,9 @@ pub const ProvisionedTableWriteSource = struct {
                 cached_active = false;
             };
 
-            if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+            if (target_index_name == null) {
+                if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+            }
             if (metadata.indexes_json) |indexes_json| {
                 const managed_config_matches = matches: {
                     lockAtomic(&self.local_db_mutex);
@@ -11803,7 +11830,7 @@ pub const ProvisionedTableWriteSource = struct {
                     break :matches ProvisionedTableWriteCache.entryManagedConfigMatches(cached.entry.?, indexes_json);
                 };
                 if (!managed_config_matches) {
-                    try reconfigureManagedDbEnrichments(
+                    try reconfigureManagedDbEnrichmentRuntime(
                         alloc,
                         cached.db,
                         indexes_json,
@@ -11817,21 +11844,26 @@ pub const ProvisionedTableWriteSource = struct {
                     ProvisionedTableWriteCache.publishEntryManagedConfig(cached.entry.?, indexes_json);
                     self.local_db_mutex.unlock();
                 }
-                if (metadata.schema_json) |schema_json| {
-                    lockAtomic(&self.local_db_mutex);
-                    defer self.local_db_mutex.unlock();
-                    try cache.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
-                    try cache.replaceEntrySchemaLocked(cached.entry.?, schema_json);
-                    cached.schema_json = cached.entry.?.schema_json;
+                if (target_index_name == null) {
+                    if (metadata.schema_json) |schema_json| {
+                        lockAtomic(&self.local_db_mutex);
+                        defer self.local_db_mutex.unlock();
+                        try cache.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
+                        try cache.replaceEntrySchemaLocked(cached.entry.?, schema_json);
+                        cached.schema_json = cached.entry.?.schema_json;
+                    }
                 }
             }
             if (metadata.indexes_json) |indexes_json| {
                 // Reconciliation owns the desired-state diff. Pre-deleting
                 // configured names would turn an unchanged generation into a
                 // destructive rebuild and race its durable cleanup fence.
-                const reconcile_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
-                    .drain_resolver_backfill = false,
-                });
+                const reconcile_summary = if (target_index_name) |target|
+                    try metadata_table_provisioner.reconcileDbIndexTarget(alloc, cached.db, indexes_json, target)
+                else
+                    try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
+                        .drain_resolver_backfill = false,
+                    });
                 if (reconcile_summary.indexes_pending != 0) {
                     _ = try cached.db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
                     if (try cached.db.hasPendingIndexRepairIntents(alloc)) {
@@ -11865,8 +11897,8 @@ pub const ProvisionedTableWriteSource = struct {
             }
             if (configured_indexes_storage) |configured_indexes| {
                 for (configured_indexes.items) |item| {
-                    if (metadata.target_index_name) |target_index_name| {
-                        if (!std.mem.eql(u8, item.name, target_index_name)) continue;
+                    if (metadata.target_index_name) |target| {
+                        if (!std.mem.eql(u8, item.name, target)) continue;
                     }
                     const catch_up = catchUpManagedIndexCreate(
                         alloc,
@@ -11955,6 +11987,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .ha_async_effect_mirror = self.ha_async_mirror,
                     .ha_async_batch_mirror = self.ha_async_mirror,
                     .ha_async_metadata_mirror = self.ha_async_mirror,
+                    .reconcile_target_index_name = target_index_name,
                 },
             ) catch |err| {
                 if (isTransientWriterOpenConflict(err)) return .busy;
@@ -11977,13 +12010,18 @@ pub const ProvisionedTableWriteSource = struct {
             };
         defer db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
-        if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, &db, schema_json);
+        if (target_index_name == null) {
+            if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, &db, schema_json);
+        }
         if (metadata.indexes_json) |indexes_json| {
             // Preserve matching generations and let the provisioner retire
             // only definitions whose desired configuration actually changed.
-            const reconcile_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
-                .drain_resolver_backfill = false,
-            });
+            const reconcile_summary = if (target_index_name) |target|
+                try metadata_table_provisioner.reconcileDbIndexTarget(alloc, &db, indexes_json, target)
+            else
+                try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
+                    .drain_resolver_backfill = false,
+                });
             if (reconcile_summary.indexes_pending != 0) {
                 _ = try db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
                 if (try db.hasPendingIndexRepairIntents(alloc)) {
@@ -12007,8 +12045,8 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (configured_indexes_storage) |configured_indexes| {
             for (configured_indexes.items) |item| {
-                if (metadata.target_index_name) |target_index_name| {
-                    if (!std.mem.eql(u8, item.name, target_index_name)) continue;
+                if (metadata.target_index_name) |target| {
+                    if (!std.mem.eql(u8, item.name, target)) continue;
                 }
                 switch (try catchUpManagedIndexCreate(
                     alloc,
@@ -12068,6 +12106,9 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.requestTableIndexStructuralReconcile(std.heap.page_allocator, table_name, index_name);
+        // This queue reconciles desired state in either direction. Create
+        // admission is a separate synchronous operation so a delete retry can
+        // enqueue after the catalog has intentionally removed the target.
         try self.enqueueTableIndexStructuralReconcile(table_name, index_name);
         return {};
     }
@@ -12720,6 +12761,24 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .structural);
     }
 
+    fn installLocalIndexWriteCapability(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) !void {
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        self.beginLocalStructuralIndexCacheUpdate(table_name);
+        errdefer self.abortLocalStructuralIndexCacheUpdate(table_name, index_name);
+        const managed_visibility_changed = try reconcileLocalTableIndexCreate(self, alloc, table_name, index_name);
+        self.finishLocalStructuralCacheUpdate(table_name);
+        self.notifyLocalChange(table_name, .structural);
+        if (managed_visibility_changed) {
+            self.publishWriteCacheRuntimeStatusesForTableBestEffort(alloc, table_name);
+            self.notifyLocalChange(table_name, .data);
+        }
+    }
+
     fn createIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -12729,16 +12788,10 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.createIndex(alloc, table_name, index_name, index_json);
-        try enforceHAWriteGateOptional(self.ha_write_gate);
-        self.beginLocalStructuralIndexCacheUpdate(table_name);
-        errdefer self.abortLocalStructuralIndexCacheUpdate(table_name);
-        const managed_visibility_changed = try reconcileLocalTableIndexCreate(self, alloc, table_name, index_name);
-        self.finishLocalStructuralCacheUpdate(table_name);
-        self.notifyLocalChange(table_name, .structural);
-        if (managed_visibility_changed) {
-            self.publishWriteCacheRuntimeStatusesForTableBestEffort(alloc, table_name);
-            self.notifyLocalChange(table_name, .data);
-        }
+        // This is the synchronous write-capability barrier for create. Generic
+        // desired-state reconciliation is intentionally enqueue-only because
+        // the same API is also used to retry catalog-driven deletion.
+        try self.installLocalIndexWriteCapability(alloc, table_name, index_name);
     }
 
     fn dropIndex(
@@ -12751,7 +12804,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.localWriteOwnerSource()) |owner| return try owner.dropIndex(alloc, table_name, index_name);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralIndexCacheUpdate(table_name);
-        errdefer self.abortLocalStructuralIndexCacheUpdate(table_name);
+        errdefer self.abortLocalStructuralIndexCacheUpdate(table_name, index_name);
         runTestBeforeDropIndexWorkHook();
         if (self.write_cache) |cache| {
             _ = try reconcileCachedLocalTableIndexDrop(self, alloc, cache, table_name, index_name);
@@ -17724,16 +17777,7 @@ fn applyIndexCreateToCachedDb(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
-    var lookup = (try indexes_api.lookupSingleIndexConfig(alloc, indexes_json, index_name)) orelse return error.InvalidTableIndexMetadata;
-    defer lookup.deinit();
-
-    const kind = try parseIndexKind(lookup.config);
-    const config_json = try extractIndexConfigJson(alloc, index_name, lookup.config);
-    defer alloc.free(config_json);
-
-    const owned_name = try alloc.dupe(u8, index_name);
-    defer alloc.free(owned_name);
-    try reconfigureManagedDbEnrichments(
+    try reconfigureManagedDbEnrichmentRuntime(
         alloc,
         db,
         indexes_json,
@@ -17743,15 +17787,7 @@ fn applyIndexCreateToCachedDb(
         secret_store,
         remote_content,
     );
-    db.addIndex(.{
-        .name = owned_name,
-        .kind = kind,
-        .config_json = config_json,
-        .coverage_generation = coverage_policy_mod.incarnation(lookup.config) orelse 0,
-    }) catch |err| switch (err) {
-        error.IndexAlreadyExists => {},
-        else => return err,
-    };
+    _ = try metadata_table_provisioner.reconcileDbIndexTarget(alloc, db, indexes_json, index_name);
 }
 
 fn reconcileDbArtifactEnrichmentsFromIndexesJson(
@@ -17896,15 +17932,7 @@ fn reconcileCachedLocalTableIndexDrop(
         defer if (cached_active) cached.deinit(alloc);
         cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
 
-        _ = cached.db.deleteIndex(index_name) catch |err| switch (err) {
-            error.IndexNotFound => {},
-            else => {
-                cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
-                cached_active = false;
-                return err;
-            },
-        };
-        reconfigureManagedDbEnrichments(
+        reconfigureManagedDbEnrichmentRuntime(
             alloc,
             cached.db,
             metadata.indexes_json,
@@ -17913,6 +17941,16 @@ fn reconcileCachedLocalTableIndexDrop(
             self.inference_api_url,
             self.secret_store,
             self.remote_content,
+        ) catch |err| {
+            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+            cached_active = false;
+            return err;
+        };
+        _ = metadata_table_provisioner.reconcileDbIndexTarget(
+            alloc,
+            cached.db,
+            metadata.indexes_json,
+            index_name,
         ) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
             cached_active = false;
@@ -18095,7 +18133,8 @@ fn reconcileUncachedLocalTableIndexCreate(
     table_name: []const u8,
     index_name: []const u8,
 ) !bool {
-    _ = index_name;
+    const indexes_json = (try loadTableIndexesJson(alloc, self.catalog, table_name)) orelse return error.TableNotFound;
+    defer alloc.free(indexes_json);
     const group_ids = try table_catalog.resolveGroupsForSpanEventually(
         alloc,
         self.catalog,
@@ -18112,8 +18151,19 @@ fn reconcileUncachedLocalTableIndexCreate(
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
 
-        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+        const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+        var db = try db_mod.DB.open(alloc, path, .{
+            .backend_runtime = self.backend_runtime,
+            .identity_namespace = identity_namespace,
+            .prefer_existing_identity_namespace = identity_namespace != null,
+            .ha_write_gate = self.ha_write_gate,
+            .ha_async_effect_mirror = self.ha_async_mirror,
+            .ha_async_batch_mirror = self.ha_async_mirror,
+            .ha_async_metadata_mirror = self.ha_async_mirror,
+        });
         defer db.close();
+        try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
+        _ = try metadata_table_provisioner.reconcileDbIndexTarget(alloc, &db, indexes_json, index_name);
 
         try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, &db);
         managed_visibility_changed = true;
@@ -18141,6 +18191,8 @@ fn dropLocalTableIndex(
     table_name: []const u8,
     index_name: []const u8,
 ) !void {
+    const indexes_json = (try loadTableIndexesJson(alloc, catalog, table_name)) orelse return error.TableNotFound;
+    defer alloc.free(indexes_json);
     const group_ids = try table_catalog.resolveGroupsForSpanEventually(
         alloc,
         catalog,
@@ -18160,10 +18212,7 @@ fn dropLocalTableIndex(
             .backend_runtime = backend_runtime,
         });
         defer db.close();
-        _ = db.deleteIndex(index_name) catch |err| switch (err) {
-            error.IndexNotFound => {},
-            else => return err,
-        };
+        _ = try metadata_table_provisioner.reconcileDbIndexTarget(alloc, &db, indexes_json, index_name);
     }
 }
 
@@ -18928,6 +18977,10 @@ const ManagedDbOpenOptions = struct {
     staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration = null,
     identity_validation: StartupCatchUpMetadata.IdentityValidation = .exact,
     transaction_recovery: db_mod.transaction_runtime.Config = .{},
+    /// Restrict metadata reconciliation during a cold open to one index. The
+    /// full JSON remains available to construct managed producer runtimes, but
+    /// sibling index and resolver catalogs are left untouched.
+    reconcile_target_index_name: ?[]const u8 = null,
 };
 
 const ManagedDbEnrichmentSet = struct {
@@ -19010,6 +19063,29 @@ fn reconfigureManagedDbEnrichments(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
+    try reconfigureManagedDbEnrichmentRuntime(
+        alloc,
+        db,
+        indexes_json,
+        backend_runtime,
+        antfly_provider,
+        inference_api_url,
+        secret_store,
+        remote_content,
+    );
+    try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json);
+}
+
+fn reconfigureManagedDbEnrichmentRuntime(
+    _: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    antfly_provider: ?managed_embedder.AntflyProvider,
+    inference_api_url: ?[]const u8,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+) !void {
     var enrichments = try createManagedDbEnrichments(
         db.runtime_alloc,
         indexes_json,
@@ -19023,7 +19099,6 @@ fn reconfigureManagedDbEnrichments(
     // An empty replacement is meaningful: dropping the last managed producer
     // must retire the old provider instead of leaving an unused runtime alive.
     try db.reconfigureEnrichmentRuntime(enrichments.takeConfig());
-    try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json);
 }
 
 pub const StartupCatchUpMetadata = struct {
@@ -19362,9 +19437,12 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
         return db;
     }
 
-    const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
-        .drain_resolver_backfill = options.drain_resolver_backfill,
-    });
+    const summary = if (options.reconcile_target_index_name) |target_index_name|
+        try metadata_table_provisioner.reconcileDbIndexTarget(alloc, &db, indexes_json, target_index_name)
+    else
+        try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
+            .drain_resolver_backfill = options.drain_resolver_backfill,
+        });
     if (summary.indexManagerCatalogChanged() or options.reconcile_for_replicated_apply) {
         // First-open provisioning can mutate the live index manager. Reopen so
         // request work runs against the stabilized post-reconcile state.
@@ -20240,14 +20318,43 @@ fn overlayRuntimeStatusReplayTargetFromDb(
 
 fn runtimeStatusHasNonReplayBackfillSignal(item: db_mod.types.DBIndexStats) bool {
     if (!item.backfill_active) return false;
-    if (item.load_error != null) return true;
-    if (item.enrichment_failed) return true;
-    if (item.repair_degraded or item.repair_issue_count != 0) return true;
-    if (!item.repair_summary_ready) return true;
-    if (!std.mem.eql(u8, item.projection_checkpoint_status, "clean")) return true;
+    // Health and activity are independent axes. Load failures, terminal
+    // coverage gaps, and incomplete repair summaries are degraded states, but
+    // none proves that a worker is still making progress. Preserve the bit
+    // only when a durable build/checkpoint or algebraic runtime explicitly
+    // reports active work.
+    if (std.mem.eql(u8, item.projection_checkpoint_status, "rebuilding")) return true;
+    if (item.index_repair_id != null and
+        !std.mem.eql(u8, item.index_repair_phase, "terminal") and
+        !std.mem.eql(u8, item.index_repair_automation, "paused")) return true;
     if (item.algebraic_active_progress != null) return true;
     if (item.algebraic_adaptive_backfilling_count != 0) return true;
     return false;
+}
+
+test "runtime status distinguishes degraded health from active generation work" {
+    var degraded = db_mod.types.DBIndexStats{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .backfill_active = true,
+        .repair_degraded = true,
+        .repair_issue_count = 3,
+        .repair_summary_ready = false,
+        .projection_checkpoint_status = "degraded",
+    };
+    try std.testing.expect(!runtimeStatusHasNonReplayBackfillSignal(degraded));
+
+    degraded.projection_checkpoint_status = "rebuilding";
+    try std.testing.expect(runtimeStatusHasNonReplayBackfillSignal(degraded));
+
+    degraded.projection_checkpoint_status = "degraded";
+    degraded.index_repair_id = 42;
+    degraded.index_repair_phase = "building";
+    degraded.index_repair_automation = "enabled";
+    try std.testing.expect(runtimeStatusHasNonReplayBackfillSignal(degraded));
+
+    degraded.index_repair_automation = "paused";
+    try std.testing.expect(!runtimeStatusHasNonReplayBackfillSignal(degraded));
 }
 
 fn startupCatchUpStatsForPhase(
@@ -31320,7 +31427,7 @@ test "queued structural reconcile reserves write admission before its worker sta
     source.beginTableRequest("docs");
     var request_active = true;
     defer if (request_active) source.endTableRequest("docs");
-    try source.enqueueTableIndexStructuralReconcile("docs", "semantic_idx");
+    try source.enqueueTableStructuralReconcile("docs");
 
     try std.testing.expect(!source.tryBeginTableRequest("docs"));
 
@@ -31329,6 +31436,48 @@ test "queued structural reconcile reserves write admission before its worker sta
     source.waitForNoStructuralActivity("docs");
     try std.testing.expect(source.tryBeginTableRequest("docs"));
     source.endTableRequest("docs");
+}
+
+test "queued index catch-up does not reserve table write admission" {
+    var catalog = StructuralReconcileTestCatalog{ .mode = .vanish };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-online-index-reconcile-admission",
+        catalog.iface(),
+    );
+    defer source.deinit();
+
+    source.beginTableRequest("docs");
+    defer source.endTableRequest("docs");
+    try source.enqueueTableIndexStructuralReconcile("docs", "semantic_idx");
+
+    try std.testing.expect(source.tryBeginTableRequest("docs"));
+    source.endTableRequest("docs");
+}
+
+test "index reconciliation request enqueues a catalog-deleted target without create admission" {
+    var catalog = StructuralReconcileTestCatalog{ .mode = .stable };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-deleted-index-reconcile",
+        catalog.iface(),
+    );
+    defer source.deinit();
+
+    // Keep the worker parked so the queue is directly observable. The target
+    // is deliberately absent from the catalog: a deletion retry must not run
+    // the create-only lookup/admission path before enqueueing desired state.
+    source.structural_reconcile_scheduled.store(true, .release);
+    const requested = try source.source().requestTableIndexStructuralReconcile(
+        std.testing.allocator,
+        "docs",
+        "removed_idx",
+    );
+    try std.testing.expect(requested != null);
+
+    const io = source.table_activity_threaded.io();
+    source.structural_reconcile_mutex.lockUncancelable(io);
+    defer source.structural_reconcile_mutex.unlock(io);
+    try std.testing.expectEqual(@as(usize, 1), source.structural_reconcile_tables.items.len);
+    try std.testing.expectEqualStrings("removed_idx", source.structural_reconcile_tables.items[0].index_name.?);
 }
 
 test "structural reconcile retry backoff is bounded" {
@@ -31359,7 +31508,7 @@ test "structural reconcile retries a transient worker failure" {
     );
     defer source.deinit();
 
-    try source.enqueueTableIndexStructuralReconcile("docs", "semantic_idx");
+    try source.enqueueTableStructuralReconcile("docs");
     source.waitForNoStructuralActivity("docs");
     try std.testing.expect(catalog.calls.load(.monotonic) >= 4);
 }
