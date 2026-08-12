@@ -3224,6 +3224,19 @@ pub const Node = struct {
             .pjrt, .onnx, .wasm => return error.UnsupportedGeneratorProvider,
         };
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
+        const use_metal_whole_model = build_options.enable_metal and
+            model.session.backend() == .metal and
+            graph_mod.metal_executor.supportsSession(model.session) and
+            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
+        var generation_config = generation.GenerationConfig{
+            .max_tokens = max_tokens,
+        };
+        const kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
+            if (use_metal_whole_model) .metal_whole_model else .standard,
+            gpt_config,
+            generation_config,
+            kv_dtype,
+        );
         const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
             .native => .cpu,
             .metal, .cuda => .gpu,
@@ -3235,7 +3248,12 @@ pub const Node = struct {
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const prompt_tokens = try countPromptTokens(allocator, model, gpt_config, messages, max_tokens);
         const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
-            .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config },
+            .{
+                .backend = backend_kind,
+                .kv_dtype = kv_dtype,
+                .config = gpt_config,
+                .kv_capacity_policy = kv_capacity_policy,
+            },
         };
         const direct_prefill_ceiling = @min(
             prompt_tokens,
@@ -3261,13 +3279,15 @@ pub const Node = struct {
             }
             return err;
         };
-        const resource_estimate = try runtime.tier.memory.estimateGptGeneration(
+        generation_config.prefill_chunk_size = admitted_prefill_chunk;
+        const resource_estimate = try runtime.tier.memory.estimateGptGenerationForKvPolicy(
             backend_kind,
             kv_dtype,
             gpt_config,
             prompt_tokens,
             @intCast(@max(max_tokens, 1)),
             admitted_prefill_chunk,
+            kv_capacity_policy,
         );
         var admission_lease = try self.model_manager.acquireRunResources(
             budget_backend_class,
@@ -3298,11 +3318,6 @@ pub const Node = struct {
         var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
         decode_state.kv_storage = &kv_storage;
         defer decode_state.deinit();
-
-        const use_metal_whole_model = build_options.enable_metal and
-            model.session.backend() == .metal and
-            graph_mod.metal_executor.supportsSession(model.session) and
-            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
 
         var pipeline = generation.NativeGenerationPipeline{
             .allocator = allocator,
@@ -3336,7 +3351,7 @@ pub const Node = struct {
                 (if (session_factory.cudaOpProfileLoggingEnabled()) session_factory.getCudaRuntimeStats(model.session) else null)
             else
                 null;
-        var result = pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = admitted_prefill_chunk }) catch |err| {
+        var result = pipeline.generate(messages, generation_config) catch |err| {
             if (comptime build_options.enable_cuda) session_factory.drainCudaProfile(model.session);
             std.log.err("direct generator generation failed model={s} backend={s}: {s}", .{
                 model_name,
@@ -4577,6 +4592,7 @@ pub const Node = struct {
     fn estimateNativePromptTokens(
         self: *Node,
         allocator: std.mem.Allocator,
+        model_dir: []const u8,
         model: *model_manager_mod.LoadedModel,
         gpt_config: gpt_model_mod.Config,
         messages: []const generation.Message,
@@ -4590,13 +4606,19 @@ pub const Node = struct {
         else
             try generation.formatMessages(allocator, messages);
         defer allocator.free(prompt);
-        const media_allowance = generation.nativeGenerationMediaTokenAllowance(messages, gpt_config);
+        const media_allowance = try generation.nativeGenerationAdmissionMediaTokenAllowance(
+            allocator,
+            model_dir,
+            messages,
+            gpt_config,
+        );
+        const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(messages, gpt_config);
         const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
             gpt_config,
             null,
             @intCast(@max(max_tokens, 1)),
             speculative_bonus_tokens,
-            media_allowance,
+            preliminary_media_allowance,
         );
         var encoded = try generation.encodeNativeGenerationPrompt(
             model.getTokenizer(),
@@ -5576,7 +5598,7 @@ pub const Node = struct {
             }
 
             var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                return generationErrorResponse(ctx, err);
             defer result.deinit();
 
             var response_text = result.text;
@@ -5714,7 +5736,7 @@ pub const Node = struct {
                 }
 
                 var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    return generationErrorResponse(ctx, err);
                 defer result.deinit();
 
                 var response_text = result.text;
@@ -5817,9 +5839,24 @@ pub const Node = struct {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid cache_dtype value" })
         else
             session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
+        const target_kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
+            if (build_options.enable_metal and
+                model.session.backend() == .metal and
+                effective_compiled_partition_backend == .metal and
+                effective_compiled_attachment_target == .whole_model and
+                graph_mod.metal_executor.supportsSession(model.session) and
+                !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config))
+                .metal_whole_model
+            else
+                .standard,
+            gpt_config,
+            config,
+            kv_dtype,
+        );
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
         const prompt_tokens = self.estimateNativePromptTokens(
             ctx.allocator,
+            model_path,
             model,
             gpt_config,
             messages.items,
@@ -5986,7 +6023,10 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "requested output leaves no prompt capacity in the target or draft model context window",
             });
-            if (prompt_tokens > shared_prompt_limit) {
+            // Qwen visual spans are dynamic. `prompt_tokens` deliberately uses
+            // the conservative maximum for admission, so only the pipeline's
+            // post-preprocessing exact count may enforce its context limit.
+            if (gpt_config.family != .qwen3_5 and prompt_tokens > shared_prompt_limit) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
                     .message = "prompt exceeds the target or draft model context window",
@@ -5995,7 +6035,12 @@ pub const Node = struct {
         }
 
         var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
-        budget_components[0] = .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config };
+        budget_components[0] = .{
+            .backend = backend_kind,
+            .kv_dtype = kv_dtype,
+            .config = gpt_config,
+            .kv_capacity_policy = target_kv_capacity_policy,
+        };
         var budget_component_count: usize = 1;
         if (draft_model_for_generation != null) {
             budget_components[1] = .{
@@ -6077,13 +6122,14 @@ pub const Node = struct {
             }
             logAdmittedPrefillChunkPlan(config.prefill_chunk_plan.?);
         }
-        const resource_estimate = try runtime.tier.memory.estimateGptGeneration(
+        const resource_estimate = try runtime.tier.memory.estimateGptGenerationForKvPolicy(
             backend_kind,
             kv_dtype,
             gpt_config,
             prompt_tokens,
             budget_max_tokens,
             config.prefill_chunk_size,
+            target_kv_capacity_policy,
         );
         if (draft_model_for_generation != null) {
             draft_resource_estimate = try runtime.tier.memory.estimateGptGeneration(
@@ -6349,7 +6395,7 @@ pub const Node = struct {
         }
 
         var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+            return generationErrorResponse(ctx, err);
         defer result.deinit();
         if (debug_metal_timing) {
             if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
@@ -6857,18 +6903,7 @@ pub const Node = struct {
 
         fn run(self: *@This()) std.Io.Cancelable!void {
             self.runInner() catch |err| {
-                self.out.@"error" = switch (err) {
-                    error.InvalidStructuredOutput => .{
-                        .code = "STRUCTURED_OUTPUT_INVALID",
-                        .message = @errorName(err),
-                        .retryable = true,
-                    },
-                    else => .{
-                        .code = "GENERATION_FAILED",
-                        .message = @errorName(err),
-                        .retryable = true,
-                    },
-                };
+                self.out.@"error" = batchGenerationError(err);
             };
         }
 
@@ -7194,6 +7229,7 @@ pub const Node = struct {
                     };
                     prompt_tokens[pos] = self.estimateNativePromptTokens(
                         ctx.allocator,
+                        model_path,
                         model,
                         gpt_config,
                         owned_messages[idx].messages,
@@ -8129,7 +8165,7 @@ pub const Node = struct {
                 if (cuda_profile_session) |sess| session_factory.drainCudaProfile(sess);
             }
             // Try to send an error event before closing
-            writeInternalStreamError(&writer, "GENERATION_FAILED", err);
+            writeGenerationStreamError(&writer, err);
             writer.close() catch {};
             return ctx.response.build();
         };
@@ -13622,6 +13658,25 @@ test "internal error response hides implementation error names" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "SecretModelFilesystemFailure") == null);
 }
 
+test "post-preprocessing prompt overflow remains a client generation error" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try generationErrorResponse(&ctx, error.PromptTooLong);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"error\":\"INVALID_REQUEST\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "prompt exceeds the model context window") != null);
+
+    const batch_error = batchGenerationError(error.PromptTooLong);
+    try std.testing.expectEqualStrings("INVALID_REQUEST", batch_error.code);
+    try std.testing.expect(!batch_error.retryable);
+}
+
 test "registerRoutesOn supports alternate prefixes through the shared router" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
@@ -16891,6 +16946,25 @@ fn isRemoteContentRequestError(err: anyerror) bool {
 
 const internal_error_message = "internal inference error";
 
+const GenerationRequestFailure = struct {
+    status: u16,
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
+fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
+    return switch (err) {
+        error.PromptTooLong => .{
+            .status = 400,
+            .code = "INVALID_REQUEST",
+            .message = "prompt exceeds the model context window after reserving output tokens",
+            .retryable = false,
+        },
+        else => null,
+    };
+}
+
 fn internalErrorMessage(code: []const u8, err: anyerror) []const u8 {
     if (!builtin.is_test) std.log.err("inference request failed code={s}: {s}", .{ code, @errorName(err) });
     return internal_error_message;
@@ -16903,12 +16977,53 @@ fn internalErrorResponse(ctx: *httpx.Context, code: []const u8, err: anyerror) !
     });
 }
 
+fn generationErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (generationRequestFailure(err)) |failure| {
+        return ctx.status(failure.status).json(.{
+            .@"error" = failure.code,
+            .message = failure.message,
+            .retryable = failure.retryable,
+        });
+    }
+    return internalErrorResponse(ctx, "GENERATION_FAILED", err);
+}
+
+fn batchGenerationError(err: anyerror) api.GenerateBatchError {
+    if (generationRequestFailure(err)) |failure| {
+        return .{
+            .code = failure.code,
+            .message = failure.message,
+            .retryable = failure.retryable,
+        };
+    }
+    if (err == error.InvalidStructuredOutput) {
+        return .{
+            .code = "STRUCTURED_OUTPUT_INVALID",
+            .message = @errorName(err),
+            .retryable = true,
+        };
+    }
+    return .{
+        .code = "GENERATION_FAILED",
+        .message = @errorName(err),
+        .retryable = true,
+    };
+}
+
 fn writeInternalStreamError(
     writer: *httpx.Context.StreamWriter,
     stage: []const u8,
     err: anyerror,
 ) void {
     writer.writeEvent("error", internalErrorMessage(stage, err)) catch {};
+}
+
+fn writeGenerationStreamError(writer: *httpx.Context.StreamWriter, err: anyerror) void {
+    if (generationRequestFailure(err)) |failure| {
+        writer.writeEvent("error", failure.message) catch {};
+        return;
+    }
+    writeInternalStreamError(writer, "GENERATION_FAILED", err);
 }
 
 fn remoteContentErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {

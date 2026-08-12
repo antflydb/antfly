@@ -376,7 +376,16 @@ pub const ResizeDims = struct { width: u32, height: u32 };
 
 pub fn smartResize(width: u32, height: u32, config: PreprocessorConfig) !ResizeDims {
     if (width == 0 or height == 0) return error.InvalidImageSize;
-    const factor = @max(config.patch_size * config.merge_size, 1);
+    if (config.patch_size == 0 or config.merge_size == 0 or
+        config.max_pixels == 0 or config.min_pixels > config.max_pixels)
+    {
+        return error.InvalidPreprocessorConfig;
+    }
+    const factor = std.math.mul(u32, config.patch_size, config.merge_size) catch
+        return error.InvalidPreprocessorConfig;
+    const factor_pixels = std.math.mul(u64, factor, factor) catch
+        return error.InvalidPreprocessorConfig;
+    if (factor_pixels > config.max_pixels) return error.InvalidPreprocessorConfig;
     var target_w = alignNearest(width, factor);
     var target_h = alignNearest(height, factor);
     const aspect = @as(f64, @floatFromInt(width)) / @as(f64, @floatFromInt(height));
@@ -404,19 +413,62 @@ pub fn smartResize(width: u32, height: u32, config: PreprocessorConfig) !ResizeD
         target_w = alignNearest(@max(factor, @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(target_h)) * aspect)))), factor);
     }
 
-    while (@as(u64, target_w) * target_h > config.max_pixels and target_w > factor and target_h > factor) {
-        if (target_w >= target_h) target_w -= factor else target_h -= factor;
+    pixels = @as(u64, target_w) * target_h;
+    if (pixels > config.max_pixels) {
+        if (target_w >= target_h) {
+            const units = @as(u64, config.max_pixels) / target_h / factor;
+            if (units == 0) return error.InvalidPreprocessorConfig;
+            target_w = @intCast(units * factor);
+        } else {
+            const units = @as(u64, config.max_pixels) / target_w / factor;
+            if (units == 0) return error.InvalidPreprocessorConfig;
+            target_h = @intCast(units * factor);
+        }
     }
-    while (@as(u64, target_w) * target_h < config.min_pixels) {
-        if (aspect >= 1.0) target_w += factor else target_h += factor;
+
+    pixels = @as(u64, target_w) * target_h;
+    if (pixels < config.min_pixels) {
+        if (aspect >= 1.0) {
+            const required = std.math.divCeil(u64, config.min_pixels, target_h) catch
+                return error.InvalidPreprocessorConfig;
+            const units = std.math.divCeil(u64, required, factor) catch
+                return error.InvalidPreprocessorConfig;
+            target_w = std.math.cast(u32, units * factor) orelse return error.InvalidPreprocessorConfig;
+        } else {
+            const required = std.math.divCeil(u64, config.min_pixels, target_w) catch
+                return error.InvalidPreprocessorConfig;
+            const units = std.math.divCeil(u64, required, factor) catch
+                return error.InvalidPreprocessorConfig;
+            target_h = std.math.cast(u32, units * factor) orelse return error.InvalidPreprocessorConfig;
+        }
     }
+
+    pixels = @as(u64, target_w) * target_h;
+    if (pixels < config.min_pixels or pixels > config.max_pixels) return error.InvalidPreprocessorConfig;
 
     return .{ .width = target_w, .height = target_h };
 }
 
+/// Exact upper bound for admission before image dimensions are known.
+pub fn maxImageTokenCount(config: PreprocessorConfig) !usize {
+    if (config.patch_size == 0 or config.merge_size == 0 or
+        config.max_pixels == 0 or config.min_pixels > config.max_pixels)
+    {
+        return error.InvalidPreprocessorConfig;
+    }
+    const factor = std.math.mul(usize, config.patch_size, config.merge_size) catch
+        return error.InvalidPreprocessorConfig;
+    const pixels_per_token = std.math.mul(usize, factor, factor) catch
+        return error.InvalidPreprocessorConfig;
+    const token_count = config.max_pixels / pixels_per_token;
+    if (token_count == 0) return error.InvalidPreprocessorConfig;
+    return token_count;
+}
+
 fn alignNearest(value: u32, factor: u32) u32 {
-    const rounded = ((value + factor / 2) / factor) * factor;
-    return @max(factor, rounded);
+    const rounded = ((@as(u64, value) + factor / 2) / factor) * factor;
+    const max_aligned = (std.math.maxInt(u32) / factor) * factor;
+    return @max(factor, @as(u32, @intCast(@min(rounded, max_aligned))));
 }
 
 fn alignFloor(value: u32, factor: u32) u32 {
@@ -677,4 +729,25 @@ test "expand qwen prompt tokens uses dynamic prepared image token counts" {
     try std.testing.expectEqual(@as(usize, 201), expanded.image_offsets[1]);
     try std.testing.expectEqual(@as(i64, 248056), expanded.token_ids[expanded.image_offsets[0]]);
     try std.testing.expectEqual(@as(i64, 248056), expanded.token_ids[expanded.image_offsets[1] + 97]);
+}
+
+test "qwen admission image-token bound covers aligned preprocessing" {
+    const cfg = PreprocessorConfig{
+        .min_pixels = 3136,
+        .max_pixels = 1_003_520,
+        .patch_size = 14,
+        .merge_size = 2,
+    };
+    const bound = try maxImageTokenCount(cfg);
+    try std.testing.expectEqual(@as(usize, 1280), bound);
+    for ([_][2]u32{ .{ 224, 448 }, .{ 4096, 4096 }, .{ 1, std.math.maxInt(u32) }, .{ std.math.maxInt(u32), 1 } }) |shape| {
+        const dims = try smartResize(shape[0], shape[1], cfg);
+        const factor = cfg.patch_size * cfg.merge_size;
+        try std.testing.expect(@as(u64, dims.width) * dims.height <= cfg.max_pixels);
+        try std.testing.expect((dims.width / factor) * (dims.height / factor) <= bound);
+    }
+    try std.testing.expectError(
+        error.InvalidPreprocessorConfig,
+        maxImageTokenCount(.{ .min_pixels = 2, .max_pixels = 1 }),
+    );
 }

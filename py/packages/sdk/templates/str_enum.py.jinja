@@ -7,6 +7,7 @@ from enum import Enum
     "$inc": "INC",
     "$push": "PUSH",
     "$addToSet": "ADD_TO_SET",
+    "$min": "MIN",
     "$max": "MAX",
 } %}
 class {{ enum.class_info.name }}(str, Enum):

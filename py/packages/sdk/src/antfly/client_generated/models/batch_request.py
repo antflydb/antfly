@@ -77,7 +77,7 @@ class BatchRequest:
                 Transform operations allow you to modify documents without read-modify-write races:
                 - Operations are applied atomically on the server
                 - Multiple operations per document are applied in sequence
-                - Supports numeric and set-like operations ($inc, $max, $addToSet)
+                - Supports numeric and set-like operations ($inc, $min, $max, $addToSet)
 
                 Common use cases:
                 - Increment counters (views, likes, votes)

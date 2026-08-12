@@ -362,6 +362,10 @@ fn enableContiguousSliceDeviceView() bool {
     return !getenvBool("TERMITE_METAL_DISABLE_CONTIGUOUS_SLICE_DEVICE_VIEW");
 }
 
+fn decoderRuntimeLayerRopeTheta(layer: *const ops.DecoderRuntimeLayerSpec) f32 {
+    return layer.rope_theta;
+}
+
 pub const MetalCompute = if (build_options.enable_metal) struct {
     const mlx_quant = struct {
         pub const Provider = void;
@@ -12504,7 +12508,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (trace_gather) std.debug.print("kv-gather-null: no device_write_hook layer={d}\n", .{attention.layer_index});
             return null;
         };
-        const gather = runtime_root.kv.storage_runtime.KvLayerGather{
+        const gather = runtime_root.kv.storage_runtime.DeviceKvLayerGather{
             .sequence_id = kv.sequence_id,
             .layer_index = attention.layer_index,
             .token_count = attention.kv_sequence_len,
@@ -12523,7 +12527,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 defer storage.allocator.free(k_rows);
                 const v_rows = try storage.allocator.alloc(f32, elem_count);
                 defer storage.allocator.free(v_rows);
-                hook.gatherLayerKv(gather, k_rows, v_rows) catch |host_err| switch (host_err) {
+                hook.gatherLayerKv(.{
+                    .sequence_id = gather.sequence_id,
+                    .layer_index = gather.layer_index,
+                    .token_count = gather.token_count,
+                    .num_kv_heads = gather.num_kv_heads,
+                    .head_dim = gather.head_dim,
+                }, k_rows, v_rows) catch |host_err| switch (host_err) {
                     error.DeviceReadUnsupported, error.DeviceReadFallback => return null,
                     else => return host_err,
                 };
@@ -12561,6 +12571,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         num_kv_heads: usize,
         head_dim: usize,
     ) !?runtime_root.kv.storage_runtime.DevicePagedKvLayer {
+        return pagedKvLayerFromDeviceHookWithPendingSuffix(attention, num_kv_heads, head_dim, 0);
+    }
+
+    fn pagedKvLayerFromDeviceHookWithPendingSuffix(
+        attention: ops.AttentionContext,
+        num_kv_heads: usize,
+        head_dim: usize,
+        pending_suffix_token_count: usize,
+    ) !?runtime_root.kv.storage_runtime.DevicePagedKvLayer {
         const kv = attention.kv_cache orelse return null;
         const storage = attention.kv_storage orelse return null;
         const hook = storage.device_write_hook orelse return null;
@@ -12570,6 +12589,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .token_count = attention.kv_sequence_len,
             .num_kv_heads = @intCast(num_kv_heads),
             .head_dim = @intCast(head_dim),
+            .pending_suffix_token_count = pending_suffix_token_count,
         }) catch |err| switch (err) {
             error.DeviceReadUnsupported, error.DeviceReadFallback => {
                 if (traceQuantBlockRequested()) std.debug.print(
@@ -12595,6 +12615,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return null;
         }
         return layer;
+    }
+
+    fn commitPagedKvLayerDeviceWrite(attention: ops.AttentionContext) !void {
+        if (attention.skip_kv_write) return;
+        const kv = attention.kv_cache orelse return error.DeviceWriteUnsupported;
+        const storage = attention.kv_storage orelse return error.DeviceWriteUnsupported;
+        try storage.commitLayerKvDeviceWrite(
+            kv.sequence_id,
+            attention.layer_index,
+            attention.kv_sequence_len,
+            attention.kv_position_offset,
+        );
     }
 
     fn pagedSlotAttentionSupported(paged_layer: runtime_root.kv.storage_runtime.DevicePagedKvLayer) bool {
@@ -15503,7 +15535,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     else => return err,
                 };
             }
-            const paged_layer = (try pagedKvLayerFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) orelse {
+            const paged_layer = (try pagedKvLayerFromDeviceHookWithPendingSuffix(
+                attention,
+                request.num_kv_heads,
+                request.head_dim,
+                if (attention.skip_kv_write) 0 else attention.query_sequence_len,
+            )) orelse {
                 if (trace_quant) std.debug.print(
                     "metal-prefill-frame-layer-direct-null layer={d} rows={d} reason=no-paged-layer shares_kv={}\n",
                     .{ attention.layer_index, rows, attention.skip_kv_write },
@@ -15611,6 +15648,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 self.timing_stats.prefill_frame_executor_layer_block_nanos += direct_finished_at - direct_started_at;
             }
             if (direct_tensor) |tensor| {
+                try commitPagedKvLayerDeviceWrite(attention);
                 layer_runtime_success = true;
                 self.timing_stats.prefill_frame_executor_layer_runtime_successes += 1;
                 return tensor;
@@ -16670,7 +16708,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .ple_hidden_size = request.ple_hidden_size,
             };
             if (use_active_paged_block and metal_runtime.supportsDirectPagedGatedDecoderBlockDevice(self.provider_impl, direct_paged_request)) {
-                const paged_layer = (try pagedKvLayerFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) orelse {
+                const paged_layer = (try pagedKvLayerFromDeviceHookWithPendingSuffix(
+                    attention,
+                    request.num_kv_heads,
+                    request.head_dim,
+                    if (attention.skip_kv_write) 0 else attention.query_sequence_len,
+                )) orelse {
                     if (traceQuantBlockRequested()) std.debug.print(
                         "metal-prefill-planned-quant-null layer={d} rows={d} reason=no-paged-layer shares_kv={}\n",
                         .{ attention.layer_index, attention.query_sequence_len, attention.skip_kv_write },
@@ -16768,6 +16811,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         out,
                         &self.timing_stats,
                     )) {
+                        try commitPagedKvLayerDeviceWrite(attention);
                         try self.comparePagedDirectBlockWithStagedMt(
                             request,
                             attention,
@@ -16831,6 +16875,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     block_offsets,
                     &self.timing_stats,
                 )) |tensor| {
+                    try commitPagedKvLayerDeviceWrite(attention);
                     try self.comparePagedDirectBlockWithStagedMt(
                         request,
                         attention,
@@ -19581,7 +19626,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             attention.query_sequence_len,
             layer.head_dim,
             layer.rope_active_dim,
-            layer.rope_theta,
+            decoderRuntimeLayerRopeTheta(layer),
             request.rope_freq_scale,
             position_offset,
             request.rope_consecutive_pairs,
@@ -22736,6 +22781,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_deberta_attention_gemm_fallbacks = runtime_stats.deberta_attention_gemm_fallbacks;
         stats.metal_runtime_paged_attention_1x_calls = runtime_stats.paged_attention_1x_calls;
         stats.metal_runtime_decode_gqa_split_calls = runtime_stats.decode_gqa_split_calls;
+        if (metal_runtime.decodeGqaSplitScheduleSnapshot(self.provider_impl.raw_decode_runtime)) |schedule_stats| {
+            stats.metal_runtime_decode_gqa_split_fallback_calls = schedule_stats.fallback_calls;
+        } else |_| {}
         stats.metal_runtime_generated_attention_decode_1x_calls = runtime_stats.generated_attention_decode_1x_calls;
         stats.metal_runtime_generated_attention_flash_prefill_calls = runtime_stats.generated_attention_flash_prefill_calls;
         stats.metal_runtime_generated_attention_flash_prefill_hd512_calls = runtime_stats.generated_attention_flash_prefill_hd512_calls;
@@ -30927,4 +30975,12 @@ test "metal_compute: primitive tanh saturates large finite inputs" {
         try std.testing.expect(std.math.isFinite(actual_value));
         try std.testing.expectApproxEqAbs(expected_value, actual_value, 1e-5);
     }
+}
+
+test "metal decoder runtime consumes effective RoPE theta once" {
+    var layer = std.mem.zeroes(ops.DecoderRuntimeLayerSpec);
+    layer.rope_dim = 512;
+    layer.rope_active_dim = 128;
+    layer.rope_theta = std.math.pow(f32, 1_000_000.0, 0.25);
+    try std.testing.expectApproxEqAbs(layer.rope_theta, decoderRuntimeLayerRopeTheta(&layer), 1e-6);
 }

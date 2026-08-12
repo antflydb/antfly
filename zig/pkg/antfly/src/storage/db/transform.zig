@@ -52,7 +52,7 @@ pub fn validateDocumentTransform(alloc: Allocator, transform: types.DocumentTran
 
 pub fn validateTransformOpType(op: types.TransformOpType) !void {
     switch (op) {
-        .set, .set_on_insert, .unset, .inc, .push, .add_to_set, .max => {},
+        .set, .set_on_insert, .unset, .inc, .push, .add_to_set, .min, .max => {},
         else => return error.UnsupportedTransformOperation,
     }
 }
@@ -78,7 +78,37 @@ pub fn transformOpText(op: types.TransformOpType) []const u8 {
 const PreparedValue = union(enum) {
     none,
     json: std.json.Value,
-    number: f64,
+    number: NumericValue,
+};
+
+const NumericValue = union(enum) {
+    integer: i64,
+    float: f64,
+
+    fn fromJson(value: std.json.Value) !NumericValue {
+        return switch (value) {
+            .integer => |number| .{ .integer = number },
+            .float => |number| if (std.math.isFinite(number))
+                .{ .float = number }
+            else
+                error.InvalidArgument,
+            else => error.InvalidArgument,
+        };
+    }
+
+    fn asFloat(self: NumericValue) f64 {
+        return switch (self) {
+            .integer => |number| @floatFromInt(number),
+            .float => |number| number,
+        };
+    }
+
+    fn toJson(self: NumericValue) std.json.Value {
+        return switch (self) {
+            .integer => |number| .{ .integer = number },
+            .float => |number| .{ .float = number },
+        };
+    }
 };
 
 const PreparedTransformOp = struct {
@@ -100,7 +130,7 @@ const PreparedTransformOp = struct {
         return value;
     }
 
-    fn number(self: PreparedTransformOp) !f64 {
+    fn number(self: PreparedTransformOp) !NumericValue {
         return switch (self.value) {
             .number => |value| value,
             else => error.InvalidArgument,
@@ -167,7 +197,7 @@ fn prepareTransformOp(
                 prepared.value = .{ .json = try cloneJsonValue(alloc, parsed.value) };
             }
         },
-        .inc, .max => {
+        .inc, .min, .max => {
             const value_json = op.value_json orelse return error.InvalidArgument;
             var parsed = std.json.parseFromSlice(
                 std.json.Value,
@@ -179,7 +209,7 @@ fn prepareTransformOp(
                 else => return error.InvalidArgument,
             };
             defer parsed.deinit();
-            prepared.value = .{ .number = try jsonNumberFromValue(parsed.value) };
+            prepared.value = .{ .number = try NumericValue.fromJson(parsed.value) };
         },
         else => unreachable,
     }
@@ -215,6 +245,7 @@ fn applyPreparedTransformOp(
             var value = try op.takeJson();
             try addPreparedValueToSet(alloc, &root.object, path, &value);
         },
+        .min => try applyNumericOp(alloc, &root.object, path, try op.number(), .min),
         .max => try applyNumericOp(alloc, &root.object, path, try op.number(), .max),
         else => return error.UnsupportedTransformOperation,
     }
@@ -301,27 +332,69 @@ pub fn graphProjectionPath(path: []const u8) !?GraphProjectionPath {
     };
 }
 
-const NumericTransform = enum { add, max };
+const NumericTransform = enum { add, min, max };
 
 fn applyNumericOp(
     alloc: Allocator,
     obj: *std.json.ObjectMap,
     parts: []const []const u8,
-    operand: f64,
+    operand: NumericValue,
     operation: NumericTransform,
 ) !void {
     if (parts.len == 0) return error.InvalidArgument;
     if (getNestedValue(obj, parts)) |current| {
-        const current_num = try jsonNumberFromValue(current.*);
+        const current_num = try NumericValue.fromJson(current.*);
         const next = switch (operation) {
-            .add => current_num + operand,
-            .max => if (operand > current_num) operand else return,
+            .add => try addNumericValues(current_num, operand),
+            .min => if (compareNumericValues(operand, current_num) == .lt) operand else return,
+            .max => if (compareNumericValues(operand, current_num) == .gt) operand else return,
         };
-        if (!std.math.isFinite(next)) return error.InvalidArgument;
-        try setNestedValue(alloc, obj, parts, .{ .float = next });
+        try setNestedValue(alloc, obj, parts, next.toJson());
         return;
     }
-    try setNestedValue(alloc, obj, parts, .{ .float = operand });
+    try setNestedValue(alloc, obj, parts, operand.toJson());
+}
+
+fn addNumericValues(left: NumericValue, right: NumericValue) !NumericValue {
+    if (left == .integer and right == .integer) {
+        return .{ .integer = std.math.add(i64, left.integer, right.integer) catch return error.InvalidArgument };
+    }
+    const sum = left.asFloat() + right.asFloat();
+    if (!std.math.isFinite(sum)) return error.InvalidArgument;
+    return .{ .float = sum };
+}
+
+fn compareNumericValues(left: NumericValue, right: NumericValue) std.math.Order {
+    return switch (left) {
+        .integer => |left_integer| switch (right) {
+            .integer => |right_integer| std.math.order(left_integer, right_integer),
+            .float => |right_float| compareIntegerToFloat(left_integer, right_float),
+        },
+        .float => |left_float| switch (right) {
+            .integer => |right_integer| reverseOrder(compareIntegerToFloat(right_integer, left_float)),
+            .float => |right_float| std.math.order(left_float, right_float),
+        },
+    };
+}
+
+fn compareIntegerToFloat(left: i64, right: f64) std.math.Order {
+    const lower_bound: f64 = @floatFromInt(std.math.minInt(i64));
+    const upper_bound_exclusive = -lower_bound;
+    if (right < lower_bound) return .gt;
+    if (right >= upper_bound_exclusive) return .lt;
+
+    const truncated: i64 = @intFromFloat(right);
+    const integer_order = std.math.order(left, truncated);
+    if (integer_order != .eq) return integer_order;
+    return std.math.order(@as(f64, @floatFromInt(truncated)), right);
+}
+
+fn reverseOrder(order: std.math.Order) std.math.Order {
+    return switch (order) {
+        .lt => .gt,
+        .eq => .eq,
+        .gt => .lt,
+    };
 }
 
 fn addPreparedValueToSet(
@@ -443,13 +516,7 @@ fn removeNestedValue(alloc: Allocator, obj: *std.json.ObjectMap, parts: []const 
 }
 
 fn jsonNumberFromValue(value: std.json.Value) !f64 {
-    const number: f64 = switch (value) {
-        .integer => |number| @floatFromInt(number),
-        .float => |number| number,
-        else => return error.InvalidArgument,
-    };
-    if (!std.math.isFinite(number)) return error.InvalidArgument;
-    return number;
+    return (try NumericValue.fromJson(value)).asFloat();
 }
 
 fn jsonValuesEqual(left: std.json.Value, right: std.json.Value) bool {
@@ -535,7 +602,7 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
     }
 }
 
-test "resolve document transform supports set setOnInsert max inc push and addToSet" {
+test "resolve document transform supports set setOnInsert min max inc push and addToSet" {
     const alloc = std.testing.allocator;
 
     const transform: types.DocumentTransform = .{
@@ -543,6 +610,7 @@ test "resolve document transform supports set setOnInsert max inc push and addTo
         .upsert = false,
         .operations = &.{
             .{ .op = .set_on_insert, .path = "owner", .value_json = "\"system\"" },
+            .{ .op = .min, .path = "priority", .value_json = "3" },
             .{ .op = .max, .path = "version", .value_json = "10" },
             .{ .op = .set, .path = "status", .value_json = "\"updated\"" },
             .{ .op = .inc, .path = "views", .value_json = "2" },
@@ -553,13 +621,14 @@ test "resolve document transform supports set setOnInsert max inc push and addTo
 
     const resolved = try resolveDocumentTransform(
         alloc,
-        "{\"version\":5,\"views\":1,\"tags\":[\"db\"]}",
+        "{\"priority\":5,\"version\":5,\"views\":1,\"tags\":[\"db\"]}",
         transform,
     );
     defer alloc.free(resolved.?);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, resolved.?, .{});
     defer parsed.deinit();
+    try std.testing.expectEqual(@as(f64, 3), try jsonNumberFromValue(parsed.value.object.get("priority").?));
     try std.testing.expectEqual(@as(f64, 10), try jsonNumberFromValue(parsed.value.object.get("version").?));
     try std.testing.expectEqual(@as(f64, 3), try jsonNumberFromValue(parsed.value.object.get("views").?));
     try std.testing.expectEqualStrings("updated", parsed.value.object.get("status").?.string);
@@ -567,6 +636,76 @@ test "resolve document transform supports set setOnInsert max inc push and addTo
     try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("tags").?.array.items.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("events").?.array.items.len);
     try std.testing.expectEqualStrings("published", parsed.value.object.get("events").?.array.items[0].object.get("type").?.string);
+}
+
+test "min only lowers numeric values and follows missing document semantics" {
+    const alloc = std.testing.allocator;
+    const lower = [_]types.TransformOp{
+        .{ .op = .min, .path = "score", .value_json = "5" },
+        .{ .op = .min, .path = "unchanged", .value_json = "12" },
+        .{ .op = .min, .path = "missing", .value_json = "7" },
+    };
+    const resolved = (try resolveDocumentTransform(alloc, "{\"score\":10,\"unchanged\":8}", .{
+        .key = "doc:existing",
+        .operations = &lower,
+    })).?;
+    defer alloc.free(resolved);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, resolved, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(f64, 5), try jsonNumberFromValue(parsed.value.object.get("score").?));
+    try std.testing.expectEqual(@as(f64, 8), try jsonNumberFromValue(parsed.value.object.get("unchanged").?));
+    try std.testing.expectEqual(@as(f64, 7), try jsonNumberFromValue(parsed.value.object.get("missing").?));
+
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(alloc, "{\"score\":\"high\"}", .{
+            .key = "doc:non-numeric",
+            .operations = lower[0..1],
+        }),
+    );
+
+    try std.testing.expect((try resolveDocumentTransform(alloc, null, .{
+        .key = "doc:missing",
+        .operations = lower[0..1],
+    })) == null);
+
+    const upserted = (try resolveDocumentTransform(alloc, null, .{
+        .key = "doc:new",
+        .operations = lower[0..1],
+        .upsert = true,
+    })).?;
+    defer alloc.free(upserted);
+    var upserted_parsed = try std.json.parseFromSlice(std.json.Value, alloc, upserted, .{});
+    defer upserted_parsed.deinit();
+    try std.testing.expectEqual(@as(f64, 5), try jsonNumberFromValue(upserted_parsed.value.object.get("score").?));
+}
+
+test "numeric transforms preserve integers exactly beyond f64 precision" {
+    const alloc = std.testing.allocator;
+    const operations = [_]types.TransformOp{
+        .{ .op = .min, .path = "lowered", .value_json = "9007199254740992" },
+        .{ .op = .min, .path = "unchanged", .value_json = "9007199254740993" },
+        .{ .op = .max, .path = "raised", .value_json = "9007199254740993" },
+        .{ .op = .inc, .path = "incremented", .value_json = "1" },
+    };
+    const resolved = (try resolveDocumentTransform(
+        alloc,
+        "{\"lowered\":9007199254740993,\"unchanged\":9007199254740992,\"raised\":9007199254740992,\"incremented\":9007199254740992}",
+        .{ .key = "doc:large-integers", .operations = &operations },
+    )).?;
+    defer alloc.free(resolved);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, resolved, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 9007199254740992), parsed.value.object.get("lowered").?.integer);
+    try std.testing.expectEqual(@as(i64, 9007199254740992), parsed.value.object.get("unchanged").?.integer);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), parsed.value.object.get("raised").?.integer);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), parsed.value.object.get("incremented").?.integer);
+
+    try std.testing.expectEqual(
+        std.math.Order.gt,
+        compareNumericValues(.{ .integer = 9007199254740993 }, .{ .float = 9007199254740992.0 }),
+    );
 }
 
 test "push appends to existing arrays and rejects non-array targets" {
@@ -627,7 +766,7 @@ test "resolve document transform skips missing document without upsert" {
 test "unsupported transforms fail atomically instead of reporting success" {
     const alloc = std.testing.allocator;
     const unsupported = [_]types.TransformOpType{
-        .pull, .pop, .mul, .min, .current_date, .rename,
+        .pull, .pop, .mul, .current_date, .rename,
     };
     for (unsupported) |op| {
         const operations = [_]types.TransformOp{
@@ -712,6 +851,17 @@ test "invalid transform operands are rejected before missing-document no-op reso
         }),
     );
 
+    const non_numeric_min = [_]types.TransformOp{
+        .{ .op = .min, .path = "count", .value_json = "\"one\"" },
+    };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(std.testing.allocator, null, .{
+            .key = "doc:missing",
+            .operations = &non_numeric_min,
+        }),
+    );
+
     const overflowing_increment = [_]types.TransformOp{
         .{ .op = .inc, .path = "count", .value_json = "1e308" },
     };
@@ -720,6 +870,17 @@ test "invalid transform operands are rejected before missing-document no-op reso
         resolveDocumentTransform(std.testing.allocator, "{\"count\":1e308}", .{
             .key = "doc:overflow",
             .operations = &overflowing_increment,
+        }),
+    );
+
+    const overflowing_integer_increment = [_]types.TransformOp{
+        .{ .op = .inc, .path = "count", .value_json = "1" },
+    };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(std.testing.allocator, "{\"count\":9223372036854775807}", .{
+            .key = "doc:integer-overflow",
+            .operations = &overflowing_integer_increment,
         }),
     );
 }
