@@ -396,21 +396,6 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
-    pub fn respondWithAllocator(ctx: *httpx.Context, resp: *http_common.HttpResponse, alloc: std.mem.Allocator) !httpx.Response {
-        defer resp.deinit(alloc);
-        _ = ctx.status(resp.status);
-        if (resp.content_type) |ct| {
-            try ctx.setHeader("content-type", ct);
-        } else if (resp.status >= 200 and resp.status < 300) {
-            try ctx.setHeader("content-type", "application/json");
-        }
-        for (resp.headers) |hdr| {
-            try ctx.setHeader(hdr.name, hdr.value);
-        }
-        _ = ctx.response.body(resp.body);
-        return ctx.response.build();
-    }
-
     fn respondOwnedApiResponse(ctx: *httpx.Context, resp: anytype) !httpx.Response {
         return respondOwnedApiResponseWithAllocator(ctx, resp, ctx.allocator);
     }
@@ -3315,7 +3300,7 @@ pub const AntflyApiHandler = struct {
                 authenticated_identity,
                 &cancellation,
             );
-            return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+            return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
         }
         var parsed_table = parseGlobalQueryTable(ctx.allocator, body_data) catch {
             _ = ctx.status(400);
@@ -3329,7 +3314,7 @@ pub const AntflyApiHandler = struct {
             authenticated_identity,
             &cancellation,
         );
-        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+        return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 
     pub fn evaluate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3849,7 +3834,7 @@ pub const AntflyApiHandler = struct {
             authenticated_identity,
             &cancellation,
         );
-        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+        return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 
     pub fn batchWrite(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {

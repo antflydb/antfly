@@ -215,10 +215,10 @@ that end state:
   been deleted. Built-in MCP tools now submit an explicit
   `McpApplicationOperation` union with the authenticated identity instead of
   manufacturing REST requests and calling the public dispatcher. Several
-  operation arms now call typed table index, backup, restore, and batch
-  operations directly. Query is the remaining arm that delegates to a legacy
-  response-returning application helper; extracting that result is the last
-  MCP application boundary, rather than retaining an HTTP fallback.
+  operation arms now call typed table index, backup, restore, batch, and query
+  operations directly. Query success and operational-error results use the
+  owned contextual contract, so MCP no longer contains a legacy application
+  response conversion.
 - Public table-repair and document-artifact reprocess job handlers now return
   owned typed responses directly to their concrete `httpx` routes. The
   residual synthetic public dispatcher has a temporary one-way adapter for
@@ -229,6 +229,12 @@ that end state:
   `httpx` handlers. Location, retry, and metadata-authority headers are owned by
   that result contract; only the residual synthetic dispatcher clones it into
   a legacy response for compatibility tests.
+- Public single-query and NDJSON multi-query execution now return owned
+  contextual results for success, cancellation, validation, retryable, and
+  storage-error outcomes. Generated `httpx` handlers and MCP consume those
+  results directly; the listener-side `respondWithAllocator` and the last
+  legacy-to-contextual response converter have been deleted. The residual
+  synthetic dispatcher has the only typed-to-legacy query adapter.
 - The former shared non-generated compatibility manifest and listener
   catch-alls are gone. Metadata has no manual dispatcher, and data and
   standalone register generated and contextual families explicitly. Unknown

@@ -6556,7 +6556,9 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTableQuery(uri_parts.path)) |query_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, query_route.table_name);
                 defer self.alloc.free(table_name);
-                return try self.handlePublicTableQueryWithContentTypeCancellation(table_name, req.body, req.content_type, authenticated_identity, req.cancellation);
+                var response = try self.handlePublicTableQueryWithContentTypeCancellation(table_name, req.body, req.content_type, authenticated_identity, req.cancellation);
+                defer response.deinit(self.alloc);
+                return try legacyResponseFromContextualOperation(self.alloc, response);
             }
         }
         if (req.method == .POST) {
@@ -11362,7 +11364,7 @@ pub const ApiHttpServer = struct {
             .query => |request| {
                 var response = try self.handlePublicTableQuery(request.table_name, request.body, authenticated_identity);
                 defer response.deinit(self.alloc);
-                return try contextualResponseFromLegacy(self.alloc, response);
+                return try cloneContextualResponse(self.alloc, response);
             },
             .backup => |request| {
                 var response = try public_table_http.handleTableBackup(
@@ -11554,7 +11556,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         content_type: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
         return try self.handlePublicTableQueryWithContentTypeCancellation(table_name, body, content_type, authenticated_identity, null);
     }
 
@@ -11565,14 +11567,14 @@ pub const ApiHttpServer = struct {
         content_type: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
         if (isNdjsonContentType(content_type)) {
             return try self.handlePublicTableMultiQueryWithCancellation(table_name, body, authenticated_identity, cancellation);
         }
         return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, cancellation);
     }
 
-    pub fn handlePublicGlobalMultiQuery(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+    pub fn handlePublicGlobalMultiQuery(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !contextual_operations.OwnedResponse {
         return try self.handlePublicGlobalMultiQueryWithCancellation(body, authenticated_identity, null);
     }
 
@@ -11584,86 +11586,69 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
         return try self.handlePublicTableMultiQueryWithCancellation(null, body, authenticated_identity, cancellation);
     }
 
-    fn publicQueryDispatchErrorResponse(
+    fn publicQueryOperationErrorResponse(
         self: *ApiHttpServer,
         table_name: []const u8,
         body: []const u8,
         err: anyerror,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
         return switch (err) {
-            error.InvalidQueryRequest => try invalidPublicQueryRequestResponse(self.alloc),
-            error.InvalidFilterQueryRequest => try publicFilterQueryErrorResponseForBody(
-                self.alloc,
-                body,
-                "filter_query",
-                .invalid,
-            ),
-            error.InvalidExclusionQueryRequest => try publicFilterQueryErrorResponseForBody(
-                self.alloc,
-                body,
-                "exclusion_query",
-                .invalid,
-            ),
-            error.UnsupportedFilterQueryRequest => try publicFilterQueryErrorResponseForBody(
-                self.alloc,
-                body,
-                "filter_query",
-                .unsupported,
-            ),
-            error.UnsupportedExclusionQueryRequest => try publicFilterQueryErrorResponseForBody(
-                self.alloc,
-                body,
-                "exclusion_query",
-                .unsupported,
-            ),
-            error.UnsupportedExactSort => try unsupportedExactSortResponse(self.alloc),
-            error.UnsupportedQueryRequest => try unsupportedPublicQueryResponse(self.alloc, body),
-            error.IdentityReadGenerationChanged => try retryableTextResponse(self.alloc, 409, "identity read generation changed"),
-            error.QueryCandidateBudgetExceeded => try queryCandidateBudgetExceededResponse(self.alloc),
-            error.QueryEmbeddingInputTooLarge => try textResponse(self.alloc, 413, "query embedding input too large"),
-            error.QueryEmbeddingOverloaded => try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
-            error.EmbedRateLimited => try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
-            error.EmbedTransientFailure => try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
-            error.EmbedUpstreamFailure => try textResponse(self.alloc, 502, "query embedding provider failed"),
-            error.Timeout => try textResponse(self.alloc, 504, "query timed out"),
-            // A peer disconnect is expected control flow. The listener will
-            // discard this response when the socket is already gone.
-            error.Cancelled => try textResponse(self.alloc, 499, "client closed request"),
-            error.NotFound, error.TableNotFound => try textResponse(self.alloc, 404, "not found"),
-            error.ModelNotFound => try modelNotFoundResponse(self.alloc),
-            error.DocIdentityNamespaceMismatch => try textResponse(self.alloc, 503, "doc identity unavailable"),
-            error.IndexRebuilding => try indexRebuildingResponse(self.alloc),
-            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try textResponse(self.alloc, 503, "read requires primary"),
-            error.HAReadWaitForApply,
-            error.HAReadWaitForMetadata,
-            error.ReadUnavailable,
-            => try textResponse(self.alloc, 503, "standby read unavailable"),
-            error.PersistentDescriptorAdmissionExhausted,
-            error.StorageReadTemporarilyUnavailable,
-            => try storageReadTemporarilyUnavailableResponse(self.alloc),
+            error.InvalidQueryRequest => if (db_mod.peekLastSortRejectionDiagnostic() != null)
+                try contextualUnsupportedExactSortResponse(self.alloc)
+            else
+                try contextual_operations.textAlloc(self.alloc, 400, "invalid query request"),
+            error.InvalidFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .invalid),
+            error.InvalidExclusionQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "exclusion_query", .invalid),
+            error.UnsupportedFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .unsupported),
+            error.UnsupportedExclusionQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "exclusion_query", .unsupported),
+            error.UnsupportedExactSort => try contextualUnsupportedExactSortResponse(self.alloc),
+            error.UnsupportedQueryRequest => if (queryBodyHasSortPageControls(self.alloc, body))
+                try contextualUnsupportedExactSortResponse(self.alloc)
+            else
+                try contextual_operations.textAlloc(self.alloc, 422, "unsupported query request"),
+            error.IdentityReadGenerationChanged => try contextualRetryableTextResponse(self.alloc, 409, "identity read generation changed"),
+            error.QueryCandidateBudgetExceeded => try contextualQueryCandidateBudgetExceededResponse(self.alloc),
+            error.QueryEmbeddingInputTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "query embedding input too large"),
+            error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(self.alloc, 429, "query embedding overloaded"),
+            error.EmbedRateLimited => try contextualRetryableTextResponse(self.alloc, 429, "query embedding rate limited"),
+            error.EmbedTransientFailure => try contextualRetryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
+            error.EmbedUpstreamFailure => try contextual_operations.textAlloc(self.alloc, 502, "query embedding provider failed"),
+            error.Timeout => try contextual_operations.textAlloc(self.alloc, 504, "query timed out"),
+            error.Cancelled => try contextual_operations.textAlloc(self.alloc, 499, "client closed request"),
+            error.NotFound, error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
+            error.ModelNotFound => contextual_operations.json(try self.alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"), false),
+            error.DocIdentityNamespaceMismatch => try contextual_operations.textAlloc(self.alloc, 503, "doc identity unavailable"),
+            error.IndexRebuilding => try contextualJsonResponse(self.alloc, 503, .{
+                .code = "index_rebuilding",
+                .message = "required index is rebuilding",
+                .retryable = true,
+            }),
+            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextual_operations.textAlloc(self.alloc, 503, "read requires primary"),
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextual_operations.textAlloc(self.alloc, 503, "standby read unavailable"),
+            error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable => blk: {
+                var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(self.alloc);
+                defer response.deinit(self.alloc);
+                break :blk try contextualResponseFromPublicTable(self.alloc, response);
+            },
             error.InvalidManifest,
             error.InvalidTableFile,
             error.TableBlockChecksumMismatch,
             error.CorruptInput,
             error.UnsupportedVersion,
             error.Corrupted,
-            => .{
-                .status = 500,
-                .content_type = try self.alloc.dupe(u8, "application/json"),
-                .body = try public_table_http.tableStorageUnreadableBody(self.alloc, err),
-            },
+            => contextual_operations.json(try public_table_http.tableStorageUnreadableBody(self.alloc, err), false),
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
-                return try textResponse(self.alloc, 500, "query failed");
+                return try contextual_operations.textAlloc(self.alloc, 500, "query failed");
             },
         };
     }
 
-    pub fn handlePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+    pub fn handlePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !contextual_operations.OwnedResponse {
         return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, null);
     }
 
@@ -11673,11 +11658,11 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
 
-        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
         db_mod.resetLastSortRejectionDiagnostic();
         const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
@@ -11687,13 +11672,8 @@ pub const ApiHttpServer = struct {
             row_filter_json,
             authenticated_identity,
             if (cancellation) |value| value.signal() else null,
-        ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, body, err);
-        defer self.alloc.free(response_body);
-
-        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_impl.deinit();
-        const parsed = try parseJsonResponseBody(metadata_openapi.QueryResponses, arena_impl.allocator(), response_body);
-        return try jsonResponse(self.alloc, parsed);
+        ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, body, err);
+        return contextual_operations.json(response_body, false);
     }
 
     fn handlePublicTableMultiQuery(
@@ -11701,7 +11681,7 @@ pub const ApiHttpServer = struct {
         route_table_name: ?[]const u8,
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
         return try self.handlePublicTableMultiQueryWithCancellation(route_table_name, body, authenticated_identity, null);
     }
 
@@ -11711,7 +11691,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
@@ -11725,7 +11705,7 @@ pub const ApiHttpServer = struct {
         while (lines.next()) |raw_line| {
             if (cancellation) |value| {
                 if (value.isCancelled()) {
-                    return try self.publicQueryDispatchErrorResponse(
+                    return try self.publicQueryOperationErrorResponse(
                         route_table_name orelse "",
                         raw_line,
                         error.Cancelled,
@@ -11737,11 +11717,11 @@ pub const ApiHttpServer = struct {
 
             const table_name = if (route_table_name) |name| name else blk: {
                 var parsed_table = parseGlobalQueryTable(arena, line) catch {
-                    return try textResponse(self.alloc, 400, "invalid query request");
+                    return try contextual_operations.textAlloc(self.alloc, 400, "invalid query request");
                 };
                 defer parsed_table.deinit();
                 if (parsed_table.table_name.len == 0) {
-                    return try textResponse(self.alloc, 400, "invalid query request");
+                    return try contextual_operations.textAlloc(self.alloc, 400, "invalid query request");
                 }
                 break :blk parsed_table.table_name;
             };
@@ -11749,7 +11729,7 @@ pub const ApiHttpServer = struct {
             const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
             defer if (row_filter_json) |value| self.alloc.free(value);
 
-            const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+            const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
             db_mod.resetLastSortRejectionDiagnostic();
             const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
                 self.alloc,
@@ -11759,21 +11739,21 @@ pub const ApiHttpServer = struct {
                 row_filter_json,
                 authenticated_identity,
                 if (cancellation) |value| value.signal() else null,
-            ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, line, err);
+            ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
             defer self.alloc.free(response_body);
 
             var parsed = std.json.parseFromSlice(std.json.Value, arena, response_body, .{
                 .allocate = .alloc_always,
-            }) catch return try textResponse(self.alloc, 500, "query failed");
+            }) catch return try contextual_operations.textAlloc(self.alloc, 500, "query failed");
             defer parsed.deinit();
             const object = switch (parsed.value) {
                 .object => |object| object,
-                else => return try textResponse(self.alloc, 500, "query failed"),
+                else => return try contextual_operations.textAlloc(self.alloc, 500, "query failed"),
             };
-            const responses_value = object.get("responses") orelse return try textResponse(self.alloc, 500, "query failed");
+            const responses_value = object.get("responses") orelse return try contextual_operations.textAlloc(self.alloc, 500, "query failed");
             const responses = switch (responses_value) {
                 .array => |array| array.items,
-                else => return try textResponse(self.alloc, 500, "query failed"),
+                else => return try contextual_operations.textAlloc(self.alloc, 500, "query failed"),
             };
             for (responses) |response_value| {
                 if (emitted > 0) try out.writer.writeByte(',');
@@ -11782,9 +11762,9 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        if (emitted == 0) return try textResponse(self.alloc, 400, "invalid query request");
+        if (emitted == 0) return try contextual_operations.textAlloc(self.alloc, 400, "invalid query request");
         try out.writer.writeAll("]}");
-        return try jsonBodyResponseWithStatus(self.alloc, 200, out.written());
+        return contextual_operations.json(try self.alloc.dupe(u8, out.written()), false);
     }
 
     pub fn handlePublicTableListIndexes(self: *ApiHttpServer, table_name: []const u8) !http_common.HttpResponse {
@@ -14279,6 +14259,51 @@ fn contextualJsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: [
     return try contextualJsonResponse(alloc, status, .{ .@"error" = message });
 }
 
+fn contextualPublicFilterQueryErrorResponseForBody(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    field: []const u8,
+    kind: query_api.PublicFilterQueryErrorKind,
+) !contextual_operations.OwnedResponse {
+    return .{
+        .status = query_api.publicFilterQueryErrorStatus(kind),
+        .content_type = "application/json",
+        .body = try query_api.encodePublicFilterQueryErrorBodyAlloc(alloc, body, field, kind),
+    };
+}
+
+fn contextualUnsupportedExactSortResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{};
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
+    return try contextualJsonResponse(alloc, 422, .{
+        .status = 422,
+        .@"error" = "unsupported_exact_sort",
+        .message = "exact sort is unsupported for this query",
+        .reason = public_rejection.reason,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
+        .sort_rejection_field = diagnostic.field,
+    });
+}
+
+fn contextualQueryCandidateBudgetExceededResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{
+        .reason = "candidate_budget_exceeded",
+        .detail = "candidate_budget_exceeded",
+    };
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
+    return try contextualJsonResponse(alloc, 422, .{
+        .status = 422,
+        .@"error" = "query_candidate_budget_exceeded",
+        .message = "query candidate budget exceeded",
+        .reason = public_rejection.reason,
+        .budget_rejection_reason = diagnostic.detail,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
+        .sort_rejection_field = diagnostic.field,
+    });
+}
+
 fn ownedContextualHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !contextual_operations.Header {
     const owned_name = try alloc.dupe(u8, name);
     errdefer alloc.free(owned_name);
@@ -14340,26 +14365,6 @@ fn contextualResponseFromPublicTable(
         };
     }
     return result;
-}
-
-fn contextualResponseFromLegacy(alloc: std.mem.Allocator, response: http_common.HttpResponse) !contextual_operations.OwnedResponse {
-    const content_type = response.content_type orelse if (response.status >= 200 and response.status < 300)
-        "application/json"
-    else
-        "text/plain";
-    const stable_content_type = if (std.mem.indexOf(u8, content_type, "json") != null)
-        "application/json"
-    else if (std.mem.indexOf(u8, content_type, "ndjson") != null)
-        "application/x-ndjson"
-    else if (std.mem.indexOf(u8, content_type, "event-stream") != null)
-        "text/event-stream"
-    else
-        "text/plain";
-    return .{
-        .status = response.status,
-        .content_type = stable_content_type,
-        .body = try alloc.dupe(u8, response.body),
-    };
 }
 
 fn haOperationTextResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !ha_http_operation.OwnedResponse {
@@ -15568,14 +15573,6 @@ fn queryCandidateBudgetExceededResponse(alloc: std.mem.Allocator) !http_common.H
         .sort_rejection_reason = public_rejection.reason,
         .sort_rejection_detail = public_rejection.detail,
         .sort_rejection_field = diagnostic.field,
-    });
-}
-
-fn indexRebuildingResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    return try jsonResponseWithStatus(alloc, 503, .{
-        .code = "index_rebuilding",
-        .message = "required index is rebuilding",
-        .retryable = true,
     });
 }
 
