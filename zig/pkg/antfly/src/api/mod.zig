@@ -16,6 +16,9 @@ const std = @import("std");
 const document_mapper = @import("../storage/db/document_mapper.zig");
 
 pub const cluster = @import("cluster.zig");
+pub const operation = @import("operation.zig");
+pub const probe_operations = @import("probe_operations.zig");
+pub const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
 pub const linear_merge = @import("linear_merge.zig");

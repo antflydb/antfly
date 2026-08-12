@@ -41,6 +41,12 @@ that end state:
   adaptation on both boundaries.
 - Generated route inventories include operation ID, request-body mode, and
   streaming-response metadata, with uniqueness/contract tests.
+- The transport-neutral operation layer now defines request identity,
+  principal, cancellation, absolute deadline, admission-reservation, typed
+  result, and backpressured streaming contracts. Root Kubernetes probes and
+  storage-maintenance jobs are the first completed vertical slices: their
+  concrete `httpx` handlers call typed operations directly and no longer enter
+  `ApiHttpServer.handle()`.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those
@@ -578,9 +584,10 @@ and removed alias paths are rejected by the router before application code.
 That boundary cleanup must not be confused with completion of the operation
 extraction. The remaining contextual adapters must be reduced in this order:
 
-1. Give MCP, A2A, ARD, extensions, HA, storage maintenance, health, and
-   readiness shared contextual registrars, with runtime-specific dependencies
-   supplied explicitly.
+1. Give MCP, A2A, ARD, extensions, and HA shared contextual registrars, with
+   runtime-specific dependencies supplied explicitly. Storage maintenance and
+   the root health/readiness probes have already crossed this boundary and
+   must remain direct typed-operation routes.
 2. Split metadata administration into typed operations and bind each concrete
    route directly to its operation; remove the method/path dispatcher.
 3. Convert internal group and table modules to typed inputs and results, then

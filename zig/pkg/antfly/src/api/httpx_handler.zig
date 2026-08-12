@@ -25,6 +25,9 @@ const http_common = @import("../raft/transport/http_common.zig");
 const PeerObserver = @import("../common/http/peer_disconnect_observer.zig").Observer;
 const http_route_helpers = @import("http_route_helpers.zig");
 const http_server_mod = @import("http_server.zig");
+const operation_contract = @import("operation.zig");
+const probe_operations = @import("probe_operations.zig");
+const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 const ApiHttpServer = http_server_mod.ApiHttpServer;
 const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
 
@@ -232,9 +235,7 @@ pub const AntflyApiHandler = struct {
         if (include_contextual) {
             try self.registerContextualRoutes(root_server, include_probes);
         } else if (include_probes) {
-            const handler = httpx.Handler.bind(self, contextualRoute);
-            try root_server.get(routes.healthz, handler);
-            try root_server.get(routes.readyz, handler);
+            try self.registerProbes(root_server);
         }
     }
 
@@ -243,12 +244,11 @@ pub const AntflyApiHandler = struct {
     /// API remains available only below `/db/v1`; historical root aliases are
     /// intentionally not registered.
     fn registerContextualRoutes(self: *AntflyApiHandler, server: anytype, include_probes: bool) !void {
-        const handler = httpx.Handler.bind(self, contextualRoute);
-
         if (include_probes) {
-            try server.get(routes.healthz, handler);
-            try server.get(routes.readyz, handler);
+            try self.registerProbes(server);
         }
+
+        const handler = httpx.Handler.bind(self, contextualRoute);
 
         const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*" };
         inline for (mcp_paths) |path| {
@@ -289,11 +289,11 @@ pub const AntflyApiHandler = struct {
             try server.put(path, handler);
             try server.delete(path, handler);
         }
-        try server.post(admin_routes.maintenance_check, handler);
-        try server.post(admin_routes.maintenance_compact, handler);
-        try server.post(admin_routes.maintenance_vacuum, handler);
-        try server.get(admin_routes.maintenance_jobs_prefix ++ "*", handler);
-        try server.delete(admin_routes.maintenance_jobs_prefix ++ "*", handler);
+        try server.post(admin_routes.maintenance_check, httpx.Handler.bind(self, checkStorage));
+        try server.post(admin_routes.maintenance_compact, httpx.Handler.bind(self, compactStorage));
+        try server.post(admin_routes.maintenance_vacuum, httpx.Handler.bind(self, vacuumStorage));
+        try server.get(admin_routes.maintenance_jobs_prefix ++ "*", httpx.Handler.bind(self, getStorageMaintenanceJob));
+        try server.delete(admin_routes.maintenance_jobs_prefix ++ "*", httpx.Handler.bind(self, cancelStorageMaintenanceJob));
 
         const ha_internal_paths = [_][]const u8{ internal_routes.ha, internal_routes.ha ++ "/*" };
         inline for (ha_internal_paths) |path| {
@@ -331,6 +331,11 @@ pub const AntflyApiHandler = struct {
             table_prefix ++ routes.txn_status_suffix,
         };
         inline for (internal_posts) |path| try server.post(path, handler);
+    }
+
+    fn registerProbes(self: *AntflyApiHandler, server: anytype) !void {
+        try server.get(routes.healthz, httpx.Handler.bind(self, healthz));
+        try server.get(routes.readyz, httpx.Handler.bind(self, readyz));
     }
 
     pub fn deinitRuntime(self: *AntflyApiHandler) void {
@@ -560,6 +565,180 @@ pub const AntflyApiHandler = struct {
         var response = try self.api_server.handle(request.value);
         const response_alloc = response.owner_allocator orelse self.api_server.alloc;
         return respondWithAllocator(ctx, &response, response_alloc);
+    }
+
+    fn authorizeStorageMaintenance(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        identity: *?AuthenticatedIdentity,
+    ) !?httpx.Response {
+        const native_auth_available =
+            (self.api_server.cfg.auth_enabled or self.api_server.cfg.trusted_principal_secret != null) and
+            (self.api_server.cfg.user_manager != null or self.api_server.cfg.trusted_principal_secret != null);
+        if (native_auth_available) return try self.authorizeRequest(ctx, identity);
+
+        const expected = self.api_server.cfg.admin_bearer_token orelse
+            return try textResponse(ctx, 403, "admin API disabled without authentication");
+        if (expected.len == 0)
+            return try textResponse(ctx, 403, "admin API disabled without authentication");
+        const authorization = ctx.header("authorization") orelse
+            return try unauthorizedResponse(ctx);
+        if (!std.mem.startsWith(u8, authorization, "Bearer ") or
+            !http_server_mod.constantTimeEql(expected, authorization["Bearer ".len..]))
+        {
+            return try unauthorizedResponse(ctx);
+        }
+        return null;
+    }
+
+    fn operationContext(ctx: *httpx.Context, identity: ?AuthenticatedIdentity) operation_contract.RequestContext {
+        return .{
+            .cancellation = if (ctx.cancellation) |signal|
+                operation_contract.CancellationToken.fromAtomic(signal)
+            else
+                .none,
+            .request_id = ctx.header("x-request-id") orelse "",
+            .principal = if (identity) |authenticated| .{
+                .kind = .user,
+                .subject = authenticated.username,
+            } else null,
+        };
+    }
+
+    fn probeOperations(self: *AntflyApiHandler) probe_operations.Operations {
+        return .{ .readiness = .{
+            .ptr = self.api_server,
+            .check_fn = struct {
+                fn call(ptr: *anyopaque) !void {
+                    const server: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+                    try server.checkReady();
+                }
+            }.call,
+        } };
+    }
+
+    fn healthz(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const status = self.probeOperations().health(operationContext(ctx, null)) catch |err| switch (err) {
+            error.Canceled => return textResponse(ctx, 408, "request canceled"),
+            error.DeadlineExceeded => return textResponse(ctx, 504, "request deadline exceeded"),
+            else => return err,
+        };
+        return ctx.json(.{ .status = @tagName(status) });
+    }
+
+    fn readyz(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const status = self.probeOperations().ready(operationContext(ctx, null)) catch |err| switch (err) {
+            error.Canceled => return textResponse(ctx, 408, "request canceled"),
+            error.DeadlineExceeded => return textResponse(ctx, 504, "request deadline exceeded"),
+            else => return err,
+        };
+        if (status == .not_ready) _ = ctx.status(503);
+        return ctx.json(.{ .status = @tagName(status) });
+    }
+
+    fn storageMaintenanceErrorResponse(ctx: *httpx.Context, err: storage_maintenance_operations.Error) !httpx.Response {
+        return switch (err) {
+            error.Unsupported => textResponse(ctx, 422, "storage maintenance unsupported"),
+            error.OperationUnsupported => textResponse(ctx, 422, "storage maintenance operation unsupported"),
+            error.MaintenanceBusy => textResponse(ctx, 409, "storage maintenance already running"),
+            error.IdempotencyConflict => textResponse(ctx, 409, "idempotency key reused for another operation"),
+            error.InvalidIdempotencyKey, error.InvalidArgument => textResponse(ctx, 400, "invalid idempotency key"),
+            error.MaintenanceHistoryFull, error.CapacityExhausted => blk: {
+                try ctx.setHeader("Retry-After", "1");
+                break :blk textResponse(ctx, 429, "maintenance job history is full; retry after retained job records expire");
+            },
+            error.MaintenanceJobIdExhausted => textResponse(ctx, 503, "maintenance job namespace exhausted; restart the server before submitting more maintenance work"),
+            error.NotFound => textResponse(ctx, 404, "not found"),
+            error.Canceled => textResponse(ctx, 408, "request canceled"),
+            error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            error.Unavailable => textResponse(ctx, 503, "storage maintenance unavailable"),
+            error.Unauthorized => unauthorizedResponse(ctx),
+            error.Forbidden => textResponse(ctx, 403, "forbidden"),
+            error.Conflict => textResponse(ctx, 409, "conflict"),
+            error.Internal => textResponse(ctx, 500, "internal server error"),
+        };
+    }
+
+    fn storageMaintenanceJobResponse(
+        ctx: *httpx.Context,
+        status: u16,
+        snapshot: @import("../storage/maintenance.zig").Coordinator.Snapshot,
+    ) !httpx.Response {
+        _ = ctx.status(status);
+        return ctx.json(.{
+            .job_id = snapshot.job_id,
+            .operation = snapshot.operation,
+            .state = snapshot.state,
+            .created_at_ms = snapshot.created_at_ms,
+            .started_at_ms = snapshot.started_at_ms,
+            .completed_at_ms = snapshot.completed_at_ms,
+            .result = snapshot.result,
+            .@"error" = snapshot.error_name,
+        });
+    }
+
+    fn startStorageMaintenance(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        maintenance_operation: @import("../storage/maintenance.zig").Operation,
+    ) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeStorageMaintenance(ctx, &identity)) |response| return response;
+
+        const operations = storage_maintenance_operations.Operations.init(self.api_server.cfg.storage_maintenance);
+        const snapshot = operations.start(operationContext(ctx, identity), .{
+            .operation = maintenance_operation,
+            .idempotency_key = ctx.header("Idempotency-Key"),
+        }) catch |err| return storageMaintenanceErrorResponse(ctx, err);
+        return storageMaintenanceJobResponse(ctx, 202, snapshot);
+    }
+
+    fn checkStorage(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.startStorageMaintenance(ctx, .check);
+    }
+
+    fn compactStorage(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.startStorageMaintenance(ctx, .compact);
+    }
+
+    fn vacuumStorage(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.startStorageMaintenance(ctx, .vacuum);
+    }
+
+    fn storageMaintenanceJobId(ctx: *httpx.Context) !?u64 {
+        const path = ctx.request.uri.path;
+        if (!std.mem.startsWith(u8, path, admin_routes.maintenance_jobs_prefix)) return null;
+        const raw_id = path[admin_routes.maintenance_jobs_prefix.len..];
+        if (raw_id.len == 0 or std.mem.indexOfScalar(u8, raw_id, '/') != null) return null;
+        return std.fmt.parseUnsigned(u64, raw_id, 10) catch null;
+    }
+
+    fn readStorageMaintenanceJob(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        cancel: bool,
+    ) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeStorageMaintenance(ctx, &identity)) |response| return response;
+        const job_id = (try storageMaintenanceJobId(ctx)) orelse return textResponse(ctx, 404, "not found");
+
+        const operations = storage_maintenance_operations.Operations.init(self.api_server.cfg.storage_maintenance);
+        const request = operationContext(ctx, identity);
+        const snapshot = if (cancel)
+            operations.cancel(request, .{ .job_id = job_id }) catch |err| return storageMaintenanceErrorResponse(ctx, err)
+        else
+            operations.get(request, .{ .job_id = job_id }) catch |err| return storageMaintenanceErrorResponse(ctx, err);
+        return storageMaintenanceJobResponse(ctx, if (cancel) 202 else 200, snapshot);
+    }
+
+    fn getStorageMaintenanceJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.readStorageMaintenanceJob(ctx, false);
+    }
+
+    fn cancelStorageMaintenanceJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.readStorageMaintenanceJob(ctx, true);
     }
 
     // ---------------------------------------------------------------
@@ -4582,6 +4761,135 @@ test "httpx shared registrar keeps root probes and rejects removed data aliases"
     }
 }
 
+test "httpx storage maintenance routes call typed operations directly" {
+    const alloc = std.testing.allocator;
+    const maintenance_mod = @import("../storage/maintenance.zig");
+    const FakeMaintenance = struct {
+        fn source(self: *@This()) maintenance_mod.Source {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .run = run } };
+        }
+
+        fn status(_: *anyopaque) maintenance_mod.Status {
+            return .{
+                .engine = "lite",
+                .format = "aflite",
+                .fsync = true,
+                .maintenance = .{
+                    .check = true,
+                    .compact = true,
+                    .vacuum = true,
+                    .online = true,
+                },
+            };
+        }
+
+        fn run(
+            _: *anyopaque,
+            maintenance_operation: maintenance_mod.Operation,
+            cancel: *const maintenance_mod.CancelToken,
+        ) anyerror!maintenance_mod.Result {
+            try cancel.check();
+            return switch (maintenance_operation) {
+                .check => .{ .valid = true, .file_size = 4096 },
+                .compact, .vacuum => .{
+                    .before_size = 8192,
+                    .after_size = 4096,
+                    .reclaimed_bytes = 4096,
+                },
+            };
+        }
+    };
+
+    var status_source = AuthStatusSource{};
+    var maintenance_source = FakeMaintenance{};
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var coordinator = try maintenance_mod.Coordinator.init(alloc, maintenance_source.source(), backend_runtime.ptr());
+    defer coordinator.deinit();
+    var api_server = ApiHttpServer.init(alloc, .{
+        .storage_maintenance = &coordinator,
+        .admin_bearer_token = "maintenance-secret",
+    }, status_source.iface(), null, null);
+    defer api_server.deinit();
+
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+
+    inline for (.{ "/healthz", "/readyz" }) |probe_path| {
+        const probe_url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, probe_path });
+        defer alloc.free(probe_url);
+        var probe = try getWithRetry(&client, client_io.io(), probe_url, null, 20);
+        defer probe.deinit();
+        try std.testing.expectEqual(@as(u16, 200), probe.status.code);
+    }
+
+    const status_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/status", .{base_url});
+    defer alloc.free(status_url);
+    var status_response = try getWithRetry(&client, client_io.io(), status_url, null, 20);
+    defer status_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), status_response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, status_response.body.?, "\"engine\":\"lite\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_response.body.?, "\"vacuum\":true") != null);
+
+    const check_url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, admin_routes.maintenance_check });
+    defer alloc.free(check_url);
+    var unauthorized = try requestWithRetry(&client, client_io.io(), .POST, check_url, null, null, 20);
+    defer unauthorized.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status.code);
+
+    const start_headers = [_][2][]const u8{
+        .{ "authorization", "Bearer maintenance-secret" },
+        .{ "Idempotency-Key", "check-1" },
+    };
+    var started = try requestWithRetry(&client, client_io.io(), .POST, check_url, null, &start_headers, 20);
+    defer started.deinit();
+    try std.testing.expectEqual(@as(u16, 202), started.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, started.body.?, "\"operation\":\"check\"") != null);
+    const MaintenanceStart = struct { job_id: u64 };
+    var parsed_started = try std.json.parseFromSlice(MaintenanceStart, alloc, started.body.?, .{ .ignore_unknown_fields = true });
+    defer parsed_started.deinit();
+    const job_id = parsed_started.value.job_id;
+
+    var replay = try requestWithRetry(&client, client_io.io(), .POST, check_url, null, &start_headers, 20);
+    defer replay.deinit();
+    try std.testing.expectEqual(@as(u16, 202), replay.status.code);
+    var parsed_replay = try std.json.parseFromSlice(MaintenanceStart, alloc, replay.body.?, .{ .ignore_unknown_fields = true });
+    defer parsed_replay.deinit();
+    try std.testing.expectEqual(job_id, parsed_replay.value.job_id);
+
+    var completed = false;
+    for (0..1_000) |_| {
+        const snapshot = coordinator.get(job_id) orelse return error.MissingMaintenanceJob;
+        if (snapshot.state == .succeeded) {
+            completed = true;
+            break;
+        }
+        try client_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(completed);
+
+    const job_url = try std.fmt.allocPrint(alloc, "{s}{s}{d}", .{ base_url, admin_routes.maintenance_jobs_prefix, job_id });
+    defer alloc.free(job_url);
+    const auth_headers = [_][2][]const u8{.{ "authorization", "Bearer maintenance-secret" }};
+    var fetched = try getWithRetry(&client, client_io.io(), job_url, &auth_headers, 20);
+    defer fetched.deinit();
+    try std.testing.expectEqual(@as(u16, 200), fetched.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, fetched.body.?, "\"valid\":true") != null);
+
+    var canceled = try requestWithRetry(&client, client_io.io(), .DELETE, job_url, null, &auth_headers, 20);
+    defer canceled.deinit();
+    try std.testing.expectEqual(@as(u16, 202), canceled.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, canceled.body.?, "\"state\":\"succeeded\"") != null);
+}
+
 test "httpx owned response preserves retryable JSON metadata" {
     const alloc = std.testing.allocator;
     var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/tables/docs/doc:a");
@@ -4895,6 +5203,7 @@ test "httpx antfly routes require auth and enforce admin middleware" {
         .secret_store = &secret_store,
         .user_manager = &auth.manager,
     }, source.iface(), null, null);
+    defer api_server.deinit();
 
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);
@@ -4907,6 +5216,14 @@ test "httpx antfly routes require auth and enforce admin middleware" {
 
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
+
+    inline for (.{ "/healthz", "/readyz" }) |probe_path| {
+        const probe_url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, probe_path });
+        defer alloc.free(probe_url);
+        var probe = try getWithRetry(&client, client_io.io(), probe_url, null, 20);
+        defer probe.deinit();
+        try std.testing.expectEqual(@as(u16, 200), probe.status.code);
+    }
 
     const status_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/status", .{base_url});
     defer alloc.free(status_url);
@@ -4961,7 +5278,7 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     defer me_resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), me_resp.status.code);
     try std.testing.expectEqualStrings("application/json", me_resp.contentType().?);
-    var me_body = try std.json.parseFromSlice(struct { username: []const u8 }, alloc, me_resp.body.?, .{});
+    var me_body = try std.json.parseFromSlice(struct { username: []const u8 }, alloc, me_resp.body.?, .{ .ignore_unknown_fields = true });
     defer me_body.deinit();
     try std.testing.expectEqualStrings("admin", me_body.value.username);
 }

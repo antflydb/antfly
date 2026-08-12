@@ -3689,20 +3689,10 @@ pub const ApiHttpServer = struct {
     /// registered and therefore cannot enter this operation surface.
     pub fn handle(self: *ApiHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
         self.recordHandledRequest();
-        const raw_path = rawPathOnly(req.uri);
         const uri_parts = splitTarget(req.uri);
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.alloc);
 
-        if (req.method == .GET and std.mem.eql(u8, raw_path, routes.Routes.healthz)) {
-            return try jsonResponse(self.alloc, .{ .status = "ok" });
-        }
-        if (req.method == .GET and std.mem.eql(u8, raw_path, routes.Routes.readyz)) {
-            self.checkReady() catch {
-                return try jsonResponseWithStatus(self.alloc, 503, .{ .status = "not_ready" });
-            };
-            return try jsonResponse(self.alloc, .{ .status = "ready" });
-        }
         if (!self.cfg.experimental and isA2aProtocolPath(uri_parts.path)) {
             return try jsonErrorResponse(self.alloc, 404, "not found");
         }
@@ -3755,7 +3745,6 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        if (try self.dispatchStorageMaintenanceRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchHaRoutes(req, uri_parts)) |resp| return resp;
         try self.resumeRestoreJobsOnce();
         if (std.mem.eql(u8, uri_parts.path, "/restore/jobs")) {
@@ -3867,53 +3856,6 @@ pub const ApiHttpServer = struct {
             return try ha_exec.execute(self.alloc, req);
         }
         return null;
-    }
-
-    fn dispatchStorageMaintenanceRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
-        if (!isStorageMaintenancePath(uri_parts.path)) return null;
-        if (!self.requiresAuthentication(uri_parts.path)) {
-            const expected = self.cfg.admin_bearer_token orelse return try textResponse(self.alloc, 403, "admin API disabled without authentication");
-            const authorization = req.authorization orelse return try unauthorizedResponse(self.alloc);
-            if (!std.mem.startsWith(u8, authorization, "Bearer ") or
-                !constantTimeEql(expected, authorization["Bearer ".len..]))
-            {
-                return try unauthorizedResponse(self.alloc);
-            }
-        }
-        const coordinator = self.cfg.storage_maintenance orelse return try textResponse(self.alloc, 422, "storage maintenance unsupported");
-        if (std.mem.startsWith(u8, uri_parts.path, admin_routes.maintenance_jobs_prefix)) {
-            if (req.method != .GET and req.method != .DELETE) return try textResponse(self.alloc, 405, "method not allowed");
-            const raw_id = uri_parts.path[admin_routes.maintenance_jobs_prefix.len..];
-            if (raw_id.len == 0 or std.mem.indexOfScalar(u8, raw_id, '/') != null) return try textResponse(self.alloc, 404, "not found");
-            const job_id = std.fmt.parseUnsigned(u64, raw_id, 10) catch return try textResponse(self.alloc, 404, "not found");
-            const snapshot = if (req.method == .DELETE) coordinator.cancel(job_id) else coordinator.get(job_id);
-            return try storageMaintenanceJobResponse(self.alloc, if (req.method == .DELETE) 202 else 200, snapshot orelse return try textResponse(self.alloc, 404, "not found"));
-        }
-        if (req.method != .POST) return try textResponse(self.alloc, 405, "method not allowed");
-        const operation: @import("../storage/maintenance.zig").Operation = if (std.mem.eql(u8, uri_parts.path, admin_routes.maintenance_check))
-            .check
-        else if (std.mem.eql(u8, uri_parts.path, admin_routes.maintenance_compact))
-            .compact
-        else if (std.mem.eql(u8, uri_parts.path, admin_routes.maintenance_vacuum))
-            .vacuum
-        else
-            return try textResponse(self.alloc, 404, "not found");
-        const capabilities = coordinator.status().maintenance;
-        const supported = switch (operation) {
-            .check => capabilities.check,
-            .compact => capabilities.compact,
-            .vacuum => capabilities.vacuum,
-        };
-        if (!supported) return try textResponse(self.alloc, 422, "storage maintenance operation unsupported");
-        const snapshot = coordinator.start(operation, req.header("Idempotency-Key")) catch |err| switch (err) {
-            error.MaintenanceBusy => return try textResponse(self.alloc, 409, "storage maintenance already running"),
-            error.IdempotencyConflict => return try textResponse(self.alloc, 409, "idempotency key reused for another operation"),
-            error.InvalidIdempotencyKey => return try textResponse(self.alloc, 400, "invalid idempotency key"),
-            error.MaintenanceHistoryFull => return try textResponse(self.alloc, 429, "maintenance job history is full; retry after retained job records expire"),
-            error.MaintenanceJobIdExhausted => return try textResponse(self.alloc, 503, "maintenance job namespace exhausted; restart the server before submitting more maintenance work"),
-            else => return err,
-        };
-        return try storageMaintenanceJobResponse(self.alloc, 202, snapshot);
     }
 
     fn dispatchProtocolRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
@@ -14707,23 +14649,6 @@ fn storageRuntimeStatus(status: @import("../storage/maintenance.zig").Status) me
     };
 }
 
-fn storageMaintenanceJobResponse(
-    alloc: std.mem.Allocator,
-    status_code: u16,
-    snapshot: @import("../storage/maintenance.zig").Coordinator.Snapshot,
-) !http_common.HttpResponse {
-    return try jsonResponseWithStatus(alloc, status_code, .{
-        .job_id = snapshot.job_id,
-        .operation = snapshot.operation,
-        .state = snapshot.state,
-        .created_at_ms = snapshot.created_at_ms,
-        .started_at_ms = snapshot.started_at_ms,
-        .completed_at_ms = snapshot.completed_at_ms,
-        .result = snapshot.result,
-        .@"error" = snapshot.error_name,
-    });
-}
-
 fn isHaInternalPath(path: []const u8) bool {
     return std.mem.eql(u8, path, internal_api_routes.ha) or std.mem.startsWith(u8, path, internal_api_routes.ha ++ "/");
 }
@@ -15161,7 +15086,7 @@ fn base64UrlDecodeAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
     return out;
 }
 
-fn constantTimeEql(lhs: []const u8, rhs: []const u8) bool {
+pub fn constantTimeEql(lhs: []const u8, rhs: []const u8) bool {
     if (lhs.len != rhs.len) return false;
     var diff: u8 = 0;
     for (lhs, rhs) |left, right| diff |= left ^ right;
@@ -17625,28 +17550,8 @@ test "api http server serves status" {
     try std.testing.expectEqual(cluster.ClusterHealth.healthy, parsed_cluster.value.health);
     try std.testing.expectEqual(@as(usize, 0), parsed_cluster.value.data.nodes.len);
 
-    var healthz = try server.handle(.{ .method = .GET, .uri = routes.Routes.healthz });
-    defer healthz.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), healthz.status);
-    try std.testing.expectEqualStrings("application/json", healthz.content_type.?);
-    try std.testing.expect(std.mem.indexOf(u8, healthz.body, "\"status\":\"ok\"") != null);
-
-    var readyz = try server.handle(.{ .method = .GET, .uri = routes.Routes.readyz });
-    defer readyz.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), readyz.status);
-    try std.testing.expectEqualStrings("application/json", readyz.content_type.?);
-    try std.testing.expect(std.mem.indexOf(u8, readyz.body, "\"status\":\"ready\"") != null);
-
-    var prefixed_healthz = try server.handle(.{ .method = .GET, .uri = "/db/v1/healthz" });
-    defer prefixed_healthz.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 404), prefixed_healthz.status);
-
-    var prefixed_readyz = try server.handle(.{ .method = .GET, .uri = "/db/v1/readyz" });
-    defer prefixed_readyz.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 404), prefixed_readyz.status);
-
     const request_stats = server.requestStats();
-    try std.testing.expectEqual(@as(u64, 6), request_stats.request_count);
+    try std.testing.expectEqual(@as(u64, 2), request_stats.request_count);
     try std.testing.expect(request_stats.first_request_started_at_ns >= server.created_at_ns);
 }
 
@@ -18823,103 +18728,6 @@ test "api http server validates writes against extension data shape members" {
     });
     defer invalid_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
-}
-
-test "api http server exposes storage status and asynchronous maintenance jobs" {
-    const maintenance_mod = @import("../storage/maintenance.zig");
-    const FakeStatus = struct {
-        fn iface(self: *@This()) StatusSource {
-            return .{ .ptr = self, .vtable = &.{ .status = status } };
-        }
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 1, .metrics = .{} };
-        }
-    };
-    const FakeMaintenance = struct {
-        fn source(self: *@This()) maintenance_mod.Source {
-            return .{ .ptr = self, .vtable = &.{ .status = status, .run = run } };
-        }
-        fn status(_: *anyopaque) maintenance_mod.Status {
-            return .{ .engine = "lite", .format = "aflite", .fsync = true, .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = true } };
-        }
-        fn run(_: *anyopaque, operation: maintenance_mod.Operation, cancel: *const maintenance_mod.CancelToken) anyerror!maintenance_mod.Result {
-            try cancel.check();
-            return switch (operation) {
-                .check => .{ .valid = true, .file_size = 4096 },
-                .compact, .vacuum => .{ .before_size = 8192, .after_size = 4096, .reclaimed_bytes = 4096 },
-            };
-        }
-    };
-
-    var status_source = FakeStatus{};
-    var maintenance_source = FakeMaintenance{};
-    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
-    defer backend_runtime.deinit();
-    var coordinator = try maintenance_mod.Coordinator.init(std.testing.allocator, maintenance_source.source(), backend_runtime.ptr());
-    defer coordinator.deinit();
-    var server = ApiHttpServer.init(std.testing.allocator, .{
-        .storage_maintenance = &coordinator,
-        .admin_bearer_token = "maintenance-secret",
-    }, status_source.iface(), null, null);
-    defer server.deinit();
-
-    var status_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.status });
-    defer status_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), status_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, status_resp.body, "\"engine\":\"lite\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_resp.body, "\"vacuum\":true") != null);
-
-    const headers = [_]http_common.RequestHeader{.{ .name = "Idempotency-Key", .value = "check-1" }};
-    var unauthorized_resp = try server.handle(.{ .method = .POST, .uri = admin_routes.maintenance_check, .headers = &headers });
-    defer unauthorized_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 401), unauthorized_resp.status);
-
-    var start_resp = try server.handle(.{
-        .method = .POST,
-        .uri = admin_routes.maintenance_check,
-        .headers = &headers,
-        .authorization = "Bearer maintenance-secret",
-    });
-    defer start_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), start_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, start_resp.body, "\"operation\":\"check\"") != null);
-    const MaintenanceStart = struct { job_id: u64 };
-    var parsed_start = try std.json.parseFromSlice(MaintenanceStart, std.testing.allocator, start_resp.body, .{ .ignore_unknown_fields = true });
-    defer parsed_start.deinit();
-    const maintenance_job_id = parsed_start.value.job_id;
-    const maintenance_job_path = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}", .{ admin_routes.maintenance_jobs_prefix, maintenance_job_id });
-    defer std.testing.allocator.free(maintenance_job_path);
-
-    var replay_resp = try server.handle(.{
-        .method = .POST,
-        .uri = admin_routes.maintenance_check,
-        .headers = &headers,
-        .authorization = "Bearer maintenance-secret",
-    });
-    defer replay_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), replay_resp.status);
-    const expected_job_id = try std.fmt.allocPrint(std.testing.allocator, "\"job_id\":{d}", .{maintenance_job_id});
-    defer std.testing.allocator.free(expected_job_id);
-    try std.testing.expect(std.mem.indexOf(u8, replay_resp.body, expected_job_id) != null);
-
-    while (coordinator.get(maintenance_job_id).?.state != .succeeded) std.Thread.yield() catch {};
-    var get_resp = try server.handle(.{
-        .method = .GET,
-        .uri = maintenance_job_path,
-        .authorization = "Bearer maintenance-secret",
-    });
-    defer get_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), get_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, get_resp.body, "\"valid\":true") != null);
-
-    var cancel_resp = try server.handle(.{
-        .method = .DELETE,
-        .uri = maintenance_job_path,
-        .authorization = "Bearer maintenance-secret",
-    });
-    defer cancel_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), cancel_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, cancel_resp.body, "\"state\":\"succeeded\"") != null);
 }
 
 test "api http server dispatches extension lifecycle mutations" {
@@ -21350,14 +21158,6 @@ test "api http server requires auth on public routes when enabled" {
     });
     defer authorized.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), authorized.status);
-
-    var healthz = try server.handle(.{ .method = .GET, .uri = routes.Routes.healthz });
-    defer healthz.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), healthz.status);
-
-    var readyz = try server.handle(.{ .method = .GET, .uri = routes.Routes.readyz });
-    defer readyz.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), readyz.status);
 }
 
 test "continuous HA rejects non-replicated public mutations before handlers" {
@@ -21519,9 +21319,7 @@ test "continuous HA rejects non-replicated public mutations before handlers" {
     try std.testing.expectEqual(@as(usize, 0), users.len);
 
     // Read availability is unchanged by the mutation policy.
-    var health = try server.handle(.{ .method = .GET, .uri = routes.Routes.healthz });
-    defer health.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), health.status);
+    try server.checkReady();
 }
 
 test "continuous HA freezes pre-existing restore workers and resumption" {
