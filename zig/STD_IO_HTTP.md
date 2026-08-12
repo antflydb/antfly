@@ -127,8 +127,8 @@ that end state:
 - Artifact-repair execution now enters through a concrete `httpx` handler and
   typed operation. Cancellation probing is expressed as an injected lookup
   capability, keeping local job-state and remote HTTP details out of the
-  operation; deletion of the now-unreachable compatibility branch is the next
-  extraction step.
+  operation. The old repair branch, probes, and compatibility-context fields
+  have been deleted.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those
