@@ -33,6 +33,7 @@ pub const Operation = enum(u32) {
     list_models_json = 7,
     generate_text = 8,
     generate_messages = 9,
+    embed_dense_parts = 10,
 };
 
 pub const String = extern struct {
@@ -203,6 +204,32 @@ pub const JsonOperationRequest = extern struct {
     payload_json: String,
 };
 
+pub const ContentPartTag = enum(u32) {
+    text = 1,
+    media_url = 2,
+    binary = 3,
+};
+
+pub const ContentPart = extern struct {
+    tag: ContentPartTag,
+    _reserved0: u32 = 0,
+    value: String,
+    mime_type: String,
+};
+
+pub const DensePartsRequest = extern struct {
+    version: u32 = abi_version,
+    has_deadline: u8 = 0,
+    _reserved0: [3]u8 = @splat(0),
+    handle: ?*anyopaque = null,
+    model: String,
+    parts: ?[*]const ContentPart = null,
+    part_count: usize = 0,
+    deadline_ns: u64 = 0,
+    cancellation_ctx: ?*const anyopaque = null,
+    cancellation_probe: ?CancellationProbeFn = null,
+};
+
 pub const RoutesContext = extern struct {
     handle: *anyopaque,
     server: *anyopaque,
@@ -252,6 +279,11 @@ pub extern fn antfly_standalone_inference_generate_text(
 pub extern fn antfly_standalone_inference_generate_messages(
     request: *const JsonOperationRequest,
     out_result: *BytesResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub extern fn antfly_standalone_inference_embed_dense_parts(
+    request: *const DensePartsRequest,
+    out_result: *DenseEmbeddingResult,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 pub extern fn antfly_standalone_inference_register_routes(context: *const RoutesContext) callconv(.c) Status;

@@ -19,6 +19,7 @@
 const std = @import("std");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const inference_types = @import("../inference/types.zig");
+const template = @import("../template.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const bridge = @import("inference_bridge.zig");
 const failure_identity = @import("runtime_failure_identity");
@@ -72,6 +73,8 @@ pub fn installProviderAdapters(provider: *managed_embedder.AntflyProvider) void 
     provider.embed_dense_texts = embedDenseTexts;
     provider.embed_dense_texts_with_context = embedDenseTextsWithContext;
     provider.embed_sparse_texts = embedSparseTexts;
+    provider.embed_dense_parts = embedDenseParts;
+    provider.embed_dense_parts_with_context = embedDensePartsWithContext;
     provider.rerank_texts = rerankTexts;
     provider.list_models_json = listModelsJson;
     provider.generate_text = generateText;
@@ -200,6 +203,77 @@ fn embedSparseTexts(
             alloc.free(vectors[i].indices);
             return err;
         };
+        initialized += 1;
+    }
+    return vectors;
+}
+
+fn embedDenseParts(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const template.ContentPart,
+) anyerror![][]f32 {
+    return embedDensePartsInner(handle, alloc, model, parts, null);
+}
+
+fn embedDensePartsWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const template.ContentPart,
+    context: managed_embedder.EmbeddingRequestContext,
+) anyerror![][]f32 {
+    try context.check();
+    const vectors = try embedDensePartsInner(handle, alloc, model, parts, context);
+    context.check() catch |err| {
+        freeDenseBatch(alloc, vectors);
+        return err;
+    };
+    return vectors;
+}
+
+fn embedDensePartsInner(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const template.ContentPart,
+    context: ?managed_embedder.EmbeddingRequestContext,
+) ![][]f32 {
+    const wire = try alloc.alloc(bridge.ContentPart, parts.len);
+    defer alloc.free(wire);
+    for (parts, 0..) |part, i| {
+        wire[i] = switch (part) {
+            .text => |value| .{ .tag = .text, .value = .init(value), .mime_type = .init("") },
+            .media_url => |value| .{ .tag = .media_url, .value = .init(value), .mime_type = .init("") },
+            .binary => |value| .{ .tag = .binary, .value = .init(value.data), .mime_type = .init(value.mime_type) },
+        };
+    }
+    const cancellation = if (context) |ctx| ctx.cancellation else null;
+    var result: bridge.DenseEmbeddingResult = .{};
+    defer bridge.antfly_standalone_inference_dense_result_destroy(&result);
+    var failure: bridge.FailureIdentity = .{};
+    const status = bridge.antfly_standalone_inference_embed_dense_parts(&.{
+        .handle = handle,
+        .model = .init(model),
+        .parts = if (wire.len == 0) null else wire.ptr,
+        .part_count = wire.len,
+        .has_deadline = @intFromBool(if (context) |ctx| ctx.deadline_ns != null else false),
+        .deadline_ns = if (context) |ctx| ctx.deadline_ns orelse 0 else 0,
+        .cancellation_ctx = if (cancellation) |flag| flag else null,
+        .cancellation_probe = if (cancellation != null) cancellationProbe else null,
+    }, &result, &failure);
+    try acceptFailure(status, &failure, .embed_dense_parts);
+    try validateDenseResult(result);
+    const descriptors = if (result.vector_count == 0) &.{} else result.vectors.?[0..result.vector_count];
+    const vectors = try alloc.alloc([]f32, descriptors.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (vectors[0..initialized]) |vector| alloc.free(vector);
+        alloc.free(vectors);
+    }
+    for (descriptors, 0..) |descriptor, i| {
+        vectors[i] = try alloc.dupe(f32, descriptor.slice());
         initialized += 1;
     }
     return vectors;
@@ -540,6 +614,7 @@ test "simple inference operations retain their distinct failure origins" {
         bridge.Operation.list_models_json,
         bridge.Operation.generate_text,
         bridge.Operation.generate_messages,
+        bridge.Operation.embed_dense_parts,
     }) |operation| {
         const failure = failure_identity.failureFromError(
             error.ModelNotFound,

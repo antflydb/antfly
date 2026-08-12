@@ -514,6 +514,7 @@ comptime {
             exportInternal(&standaloneInferenceBytesResultDestroy, "antfly_standalone_inference_bytes_result_destroy");
             exportInternal(&standaloneInferenceGenerateText, "antfly_standalone_inference_generate_text");
             exportInternal(&standaloneInferenceGenerateMessages, "antfly_standalone_inference_generate_messages");
+            exportInternal(&standaloneInferenceEmbedDenseParts, "antfly_standalone_inference_embed_dense_parts");
             exportInternal(&standaloneInferenceRegisterRoutes, "antfly_standalone_inference_register_routes");
             exportInternal(&standaloneInferenceDestroy, "antfly_standalone_inference_destroy");
         },
@@ -639,6 +640,19 @@ fn standaloneInferenceGenerateMessages(
     out_failure.* = .{};
     standalone_inference_host.linkedInferenceGenerateMessages(request, out_result) catch |err| {
         return reportStandaloneInferenceFailure(out_failure, .generate_messages, err);
+    };
+    return .ok;
+}
+
+fn standaloneInferenceEmbedDenseParts(
+    request: *const standalone_inference_bridge.DensePartsRequest,
+    out_result: *standalone_inference_bridge.DenseEmbeddingResult,
+    out_failure: *standalone_inference_bridge.FailureIdentity,
+) callconv(.c) standalone_inference_bridge.Status {
+    out_result.* = .{};
+    out_failure.* = .{};
+    standalone_inference_host.linkedInferenceEmbedDenseParts(request, out_result) catch |err| {
+        return reportStandaloneInferenceFailure(out_failure, .embed_dense_parts, err);
     };
     return .ok;
 }

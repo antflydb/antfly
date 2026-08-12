@@ -272,12 +272,13 @@ pub fn linkedInferenceEmbedDense(
         request.model.slice(),
         texts,
     );
-    errdefer {
-        for (vectors) |vector| alloc.free(vector);
-        alloc.free(vectors);
-    }
+    errdefer freeDenseVectors(vectors);
     if (isDenseRequestCancelled(request)) return error.Cancelled;
+    try publishDenseResult(vectors, out_result);
+}
 
+fn publishDenseResult(vectors: [][]f32, out_result: *inference_bridge.DenseEmbeddingResult) !void {
+    const alloc = std.heap.c_allocator;
     const descriptors = try alloc.alloc(inference_bridge.DenseVector, vectors.len);
     errdefer alloc.free(descriptors);
     for (vectors, 0..) |vector, i| {
@@ -295,6 +296,58 @@ pub fn linkedInferenceEmbedDense(
     };
 }
 
+fn freeDenseVectors(vectors: [][]f32) void {
+    const alloc = std.heap.c_allocator;
+    for (vectors) |vector| alloc.free(vector);
+    alloc.free(vectors);
+}
+
+pub fn linkedInferenceEmbedDenseParts(
+    request: *const inference_bridge.DensePartsRequest,
+    out_result: *inference_bridge.DenseEmbeddingResult,
+) !void {
+    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
+    if (request.handle == null or request.has_deadline > 1 or
+        !std.mem.eql(u8, &request._reserved0, &@as([3]u8, @splat(0))) or
+        request.part_count > 1_000_000 or
+        (request.part_count == 0 and request.parts != null) or
+        (request.part_count != 0 and request.parts == null) or
+        (request.cancellation_ctx == null) != (request.cancellation_probe == null))
+    {
+        return error.InvalidArgument;
+    }
+    if (isCancelled(request.cancellation_probe, request.cancellation_ctx)) return error.Cancelled;
+    const alloc = std.heap.c_allocator;
+    const wire_parts = if (request.part_count == 0) &.{} else request.parts.?[0..request.part_count];
+    const parts = try alloc.alloc(antfly.template.ContentPart, wire_parts.len);
+    defer alloc.free(parts);
+    for (wire_parts, 0..) |part, i| {
+        if (part._reserved0 != 0) return error.InvalidArgument;
+        parts[i] = switch (part.tag) {
+            .text => .{ .text = part.value.slice() },
+            .media_url => .{ .media_url = part.value.slice() },
+            .binary => .{ .binary = .{
+                .data = part.value.slice(),
+                .mime_type = part.mime_type.slice(),
+            } },
+        };
+    }
+    const node: *inference.server.Node = @ptrCast(@alignCast(request.handle.?));
+    const io = node.session_manager.io orelse std.Io.Threaded.global_single_threaded.io();
+    const deadline_ns: ?u64 = if (request.has_deadline != 0) request.deadline_ns else null;
+    const vectors = try localAntflyEmbedDensePartsWithExecutionContext(
+        node,
+        alloc,
+        request.model.slice(),
+        parts,
+        io,
+        deadline_ns,
+    );
+    errdefer freeDenseVectors(vectors);
+    if (isCancelled(request.cancellation_probe, request.cancellation_ctx)) return error.Cancelled;
+    try publishDenseResult(vectors, out_result);
+}
+
 fn validateDenseEmbeddingRequest(request: *const inference_bridge.DenseEmbeddingRequest) !void {
     if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
     if (request.handle == null or
@@ -310,8 +363,12 @@ fn validateDenseEmbeddingRequest(request: *const inference_bridge.DenseEmbedding
 }
 
 fn isDenseRequestCancelled(request: *const inference_bridge.DenseEmbeddingRequest) bool {
-    const probe = request.cancellation_probe orelse return false;
-    return probe(request.cancellation_ctx) != 0;
+    return isCancelled(request.cancellation_probe, request.cancellation_ctx);
+}
+
+fn isCancelled(probe_optional: ?inference_bridge.CancellationProbeFn, context: ?*const anyopaque) bool {
+    const probe = probe_optional orelse return false;
+    return probe(context) != 0;
 }
 
 test "dense inference request validation preserves protocol error identity" {

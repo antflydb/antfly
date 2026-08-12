@@ -4068,9 +4068,18 @@ The focused suite is 50/50 with zero leaks, including rich-message JSON
 round-trip and generation-origin tests; the full linked build and the 92-case
 exhaustive status/owner suite also pass at ABI 36.
 
+Multipart dense embedding now uses the same coarse result ABI without
+serializing binary media. A tagged descriptor carries text, media URLs, or raw
+binary bytes plus MIME type; deadline and cancellation remain explicit request
+channels. The provider converts the complete part batch into its existing model
+input and returns provider-owned dense vectors. Both source-level multipart
+callbacks are consumer-local shims, and failures are attributed to the distinct
+`embed_dense_parts` operation. The linked build, 50 focused tests, and graph
+boundary gates pass with this typed cut.
+
 Decision: **keep this as the identity and ownership template for the remaining
 coarse inference operations**. It is a prerequisite slice, not yet a compiler
-graph win: multipart embedding, media, and extraction still come
+graph win: media and extraction still come
 from the transitional raw Zig provider table. Because that table still exists,
 a cold `ReleaseFast` compiler comparison would not measure the intended root
 removal. Migrate the remaining callbacks using the same status/envelope and
