@@ -203,6 +203,7 @@ the same host, target, cache state, and report set.
 | First normal-runner physical-source cut | Storage 11 m / 10 GB, distributed 8 m / 8 GB, inference 7 m / 6 GB; complete archive 16:25.14; executable 65.27 MB; C API 16.68 MB | Reliable and structurally valid, but both critical units miss 380 s; revise using authoritative Linux time reports |
 | Atomic local-query cut, normal runner | 43/43 steps; storage 590.707 s, distributed 482.636 s, local query 127.258 s, inference 528.849 s; complete build 19:23.59; executable 63.312 MB; C API 20.495 MB | Keep the identity-safe boundary opt-in; source ownership and artifacts pass, but reject the current six-unit schedule as the production performance solution |
 | Co-generated storage/local query, local cold ARM64 | Combined unit 313.334 s; duplicate instances 727 -> 523; emitted overlap 3.553 MB -> 1.948 MB; executable 61.400 MB; C API 18.461 MB | Keep as the five-unit runner candidate; same opaque/error ABI with one fewer LLVM unit, pending normal-runner proof |
+| Co-generated storage/local query, normal runner | 39/39 steps; matched-control storage/query chain 664.411 s -> 599.665 s; duplicate instances 523; executable 61.399 MB; C API 18.461 MB; build 17:21.73 | Keep opt-in; all structural gates pass, but distributed -> inference now controls wall time and storage/query still misses 380 s |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -3822,6 +3823,52 @@ both analyzed and emitted duplication, and reverses the CAPI size growth while
 preserving the designed ABI. It remains opt-in pending normal-runner timing,
 RSS, artifact, and repeated reliability evidence; do not enable it by default
 or raise runner cost based on the local result.
+
+The first normal-runner candidate build then passed in GitHub Actions run
+`31550210130`, job `93971084675`, at commit `8a21611c5`. All 39 build steps,
+artifact/private-symbol checks, graph analysis, memory report, and upload
+succeeded with normal concurrency on the unchanged 24,000 MiB ARC request.
+The immediately preceding documentation-only run `31549077822` rebuilt the
+six-unit commit on the same runner class, giving a closely matched cold control:
+
+| Unit | Six-unit repeat | Five-unit co-generation | Change |
+|---|---:|---:|---:|
+| Storage / storage+query | 546.593 s + 117.818 s | 599.665 s | -64.746 s chain |
+| Distributed/API control | 447.855 s | 445.754 s | -2.101 s |
+| Inference | 486.614 s | 485.749 s | -0.865 s |
+| Remote CLI | 69.741 s | 69.454 s | -0.287 s |
+| Enrichment compute | 33.479 s | 33.347 s | -0.132 s |
+
+The unchanged units are within 2.1 seconds of the repeat control, isolating the
+64.746-second improvement to co-generation rather than runner variance. The
+combined unit spent 587.510 of 599.665 seconds (98.0%) in LLVM emission and
+reported 9 GiB MaxRSS, within its unchanged 10.25 GiB claim. Whole-build GNU
+time reported 8,906,344 KiB maximum RSS and zero swap. As with Phase 4t, this
+workflow did not sample cgroup-wide peak or event counters.
+
+The build command took 17:21.73 versus 17:23.92 for the repeat control. The
+improved storage/query path does not reduce end-to-end wall time yet because
+the 445.754-second distributed unit followed by 485.749-second inference unit
+is now the critical scheduled path. Co-generation nevertheless removes a real
+compiler unit and 204 duplicate file instances rather than moving time between
+unrelated units.
+
+The runner reproduced the local graph exactly: 1,744 file instances, 1,221
+unique files, 523 duplicate instances, and 1,947,522 B conservative emitted
+overlap. The final executable was 61,399,488 B and `libantfly.so` was
+18,460,688 B. Both retained the expected ARM64 artifact shape, the executable
+was one stripped static musl binary, no private local-query/storage symbols or
+LMDB implementation leaked, and the CAPI remained below its size budget.
+
+Revised decision: **keep co-generation as the current opt-in architecture, but
+continue the goal loop**. It passes the ownership, identity, graph, artifact,
+memory-claim, and first-run reliability gates. It does not complete the main
+goal because the 599.665-second storage/query unit still exceeds 380 seconds
+and overall wall time is now governed by distributed followed by inference.
+The next substantial experiment should remove inference implementation roots
+that remain in distributed control while preserving inference as its own
+compiled safety boundary; rescheduling the same units cannot remove the
+measured LLVM work.
 
 ## Holistic target architecture
 
