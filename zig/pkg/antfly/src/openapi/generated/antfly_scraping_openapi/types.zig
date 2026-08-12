@@ -3,18 +3,21 @@
 
 const std = @import("std");
 
+/// Low-level content download policy. In the generic scraper, omitted `allowed_hosts` and `allowed_paths` fields do not restrict those sources; explicit empty lists deny them. Consumers may merge this object over a stricter baseline before downloading. Antfly inference does so: omitted or empty inference policies, and omitted inference allowlists, deny HTTP(S), file, and S3 content until explicit allowlists are configured. Do not assume omission has identical policy semantics across consumers.
 pub const ContentSecurityConfig = struct {
-    /// Whitelist of allowed hostnames/IPs for link downloads. If empty, all hosts are allowed (except private IPs if block_private_ips is true).
+    /// Whitelist for HTTP(S) downloads. With block_private_ips enabled (the default), IP literals and every address resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address. Set block_private_ips to false only to opt into private or special destinations. The generic scraper treats omission as unrestricted subject to that policy and an explicit empty list as deny-all; Antfly inference requires an explicit allowlist.
     allowed_hosts: ?[]const []const u8 = null,
-    /// Block requests to private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)
+    /// Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special destinations.
     block_private_ips: ?bool = null,
+    /// RFC 6052 network-specific NAT64 prefixes used by this deployment. Resolved IPv6 addresses under these prefixes are decoded and checked against the private IPv4 policy. Prefix length must be 32, 40, 48, 56, 64, or 96.
+    nat64_prefixes: ?[]const []const u8 = null,
     /// Maximum size of downloaded content in bytes
     max_download_size_bytes: ?i64 = null,
-    /// Timeout for individual download operations in seconds
+    /// Maximum HTTP(S) and S3 download duration in seconds. Defaults to 30. Zero disables this configured ceiling, but a caller-supplied request deadline still applies. A deadline-bound file:// fetch fails closed because portable filesystem I/O does not expose a preemptive timeout.
     download_timeout_seconds: ?i64 = null,
-    /// Maximum image width/height in pixels (images will be resized)
+    /// Maximum source-image width or height enforced for accepted inference image inputs, including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Images are rejected rather than resized. Batch generation rejects multimodal content before fetch; non-inference scraping consumers do not enforce this setting.
     max_image_dimension: ?i64 = null,
-    /// Whitelist of allowed path prefixes for file:// and s3:// URLs. If empty, all paths are allowed. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
+    /// Whitelist of allowed path prefixes for file:// and s3:// URLs. The generic scraper treats omission as unrestricted and an explicit empty list as deny-all. Consumers may impose stricter defaults; Antfly inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
     allowed_paths: ?[]const []const u8 = null,
     /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
     user_agent: ?[]const u8 = null,
@@ -22,7 +25,7 @@ pub const ContentSecurityConfig = struct {
 
 /// HTTP credential for authenticated endpoints.
 pub const HTTPCredentialConfig = struct {
-    /// Base URL prefix this credential applies to.
+    /// Exact HTTP(S) origin and optional path scope for this credential. Matching requires the same scheme, host, and effective port plus a path-segment boundary; automatic selection uses the longest matching scope. An explicitly named credential must exist and match this scope or the fetch fails closed.
     base_url: ?[]const u8 = null,
     /// HTTP headers to include. Supports secret-store references (e.g., "${secret:token}").
     headers: ?std.json.ArrayHashMap([]const u8) = null,

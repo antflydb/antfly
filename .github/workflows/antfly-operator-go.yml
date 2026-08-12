@@ -11,7 +11,7 @@ on:
       - 'go/pkg/sdk/admin/**'
       - 'go/pkg/sdk/go.mod'
       - 'go/pkg/sdk/go.sum'
-      - 'specs/openapi/antfly/admin.yaml'
+      - 'specs/openapi/**'
       - '.github/workflows/antfly-operator-go.yml'
   pull_request:
     branches: ["main"]
@@ -20,7 +20,7 @@ on:
       - 'go/pkg/sdk/admin/**'
       - 'go/pkg/sdk/go.mod'
       - 'go/pkg/sdk/go.sum'
-      - 'specs/openapi/antfly/admin.yaml'
+      - 'specs/openapi/**'
       - '.github/workflows/antfly-operator-go.yml'
   workflow_dispatch:
 
@@ -51,7 +51,7 @@ jobs:
           cache: false
 
       - name: Set Go experiment
-        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
+        run: echo "GOEXPERIMENT=simd" >> "$GITHUB_ENV"
 
       - name: Verify Go version
         run: go version

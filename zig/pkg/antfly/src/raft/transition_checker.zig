@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const data = @import("../data/mod.zig");
+const data = @import("../data/domain.zig");
 
 pub const MergePairObservation = struct {
     donor_node_id: ?u64 = null,

@@ -74,7 +74,7 @@ components:
               provider: openai
               model: whisper-1
         cors:
-          $ref: "../../../go/pkg/antfly/lib/middleware/openapi.yaml#/components/schemas/CORSConfig"
+          $ref: "../shared/middleware.yaml#/components/schemas/CORSConfig"
         replication_factor:
           type: integer
           description: "How many replicas of each shard should be maintained."
@@ -85,7 +85,7 @@ components:
           x-go-type: uint64
         enable_auth:
           type: boolean
-          description: "Enables authentication and authorization (RBAC) for the API."
+          description: "Enables authentication for the unified API and authorization on routes with defined RBAC policies. Inference routes require a valid principal when enabled, but do not currently enforce per-model or per-operation inference RBAC."
           default: false
         disable_shard_alloc:
           type: boolean
@@ -792,14 +792,20 @@ components:
 
     TLSInfo:
       type: object
+      deprecated: true
+      description: |
+        Unsupported by the built-in Zig server. Any non-null `tls` object causes
+        startup to fail closed. Terminate TLS at a trusted reverse proxy or load balancer.
       properties:
         cert:
           type: string
-          description: "Path to TLS certificate file"
+          deprecated: true
+          description: "Legacy certificate path; rejected by the current Zig server."
           example: "/path/to/cert.pem"
         key:
           type: string
-          description: "Path to TLS key file"
+          deprecated: true
+          description: "Legacy private-key path; rejected by the current Zig server."
           example: "/path/to/key.pem"
 
     LocalStorageConfig:

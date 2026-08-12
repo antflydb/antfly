@@ -74,6 +74,17 @@ pub const ProvenanceOptions = struct {
     extraction_status: ?[]const u8 = null,
     confidence: ?f64 = null,
     ocr_used: bool = false,
+    ocr_attempted: bool = false,
+    ocr_render_dpi: ?u16 = null,
+    ocr_effective_render_dpi: ?u16 = null,
+    ocr_rendered_width: ?u32 = null,
+    ocr_rendered_height: ?u32 = null,
+    ocr_rendered_bytes: ?u64 = null,
+    ocr_failure_stage: ?[]const u8 = null,
+    ocr_failure_retryable: ?bool = null,
+    ocr_trigger_reasons: ?[]const u8 = null,
+    ocr_embedded_quality: ?[]const u8 = null,
+    ocr_output_quality: ?[]const u8 = null,
     ocr_confidence: ?f64 = null,
     ocr_bbox: ?[4]f64 = null,
     transcript_used: bool = false,
@@ -153,6 +164,17 @@ fn appendProvenanceFields(
     if (options.extraction_status) |value| try putString(alloc, &provenance, "extraction_status", value);
     if (options.confidence) |value| try provenance.put(alloc, try alloc.dupe(u8, "confidence"), .{ .float = value });
     try provenance.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
+    try provenance.put(alloc, try alloc.dupe(u8, "ocr_attempted"), .{ .bool = options.ocr_attempted });
+    if (options.ocr_render_dpi) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_render_dpi"), .{ .integer = value });
+    if (options.ocr_effective_render_dpi) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_effective_render_dpi"), .{ .integer = value });
+    if (options.ocr_rendered_width) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_rendered_width"), .{ .integer = value });
+    if (options.ocr_rendered_height) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_rendered_height"), .{ .integer = value });
+    if (options.ocr_rendered_bytes) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_rendered_bytes"), .{ .integer = @intCast(value) });
+    if (options.ocr_failure_stage) |value| try putString(alloc, &provenance, "ocr_failure_stage", value);
+    if (options.ocr_failure_retryable) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_failure_retryable"), .{ .bool = value });
+    if (options.ocr_trigger_reasons) |value| try putString(alloc, &provenance, "ocr_trigger_reasons", value);
+    if (options.ocr_embedded_quality) |value| try putString(alloc, &provenance, "ocr_embedded_quality", value);
+    if (options.ocr_output_quality) |value| try putString(alloc, &provenance, "ocr_output_quality", value);
     if (options.ocr_confidence) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_confidence"), .{ .float = value });
     if (options.ocr_bbox) |bbox| try provenance.put(alloc, try alloc.dupe(u8, "ocr_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
     try provenance.put(alloc, try alloc.dupe(u8, "transcript_used"), .{ .bool = options.transcript_used });
@@ -193,7 +215,7 @@ fn appendFormatProvenance(
     provenance: *std.json.ObjectMap,
     options: ProvenanceOptions,
 ) !void {
-    if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null and options.extraction_status == null and options.confidence == null and !options.ocr_used and options.ocr_confidence == null and options.ocr_bbox == null and !options.transcript_used and options.transcript_confidence == null and options.extraction_warning == null) return;
+    if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null and options.extraction_status == null and options.confidence == null and !options.ocr_used and !options.ocr_attempted and options.ocr_confidence == null and options.ocr_bbox == null and options.ocr_failure_stage == null and options.ocr_failure_retryable == null and !options.transcript_used and options.transcript_confidence == null and options.extraction_warning == null) return;
 
     var format = std.json.ObjectMap.empty;
     errdefer {
@@ -211,6 +233,17 @@ fn appendFormatProvenance(
     if (options.extraction_status) |value| try putString(alloc, &format, "extraction_status", value);
     if (options.confidence) |value| try format.put(alloc, try alloc.dupe(u8, "confidence"), .{ .float = value });
     try format.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
+    try format.put(alloc, try alloc.dupe(u8, "ocr_attempted"), .{ .bool = options.ocr_attempted });
+    if (options.ocr_render_dpi) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_render_dpi"), .{ .integer = value });
+    if (options.ocr_effective_render_dpi) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_effective_render_dpi"), .{ .integer = value });
+    if (options.ocr_rendered_width) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_rendered_width"), .{ .integer = value });
+    if (options.ocr_rendered_height) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_rendered_height"), .{ .integer = value });
+    if (options.ocr_rendered_bytes) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_rendered_bytes"), .{ .integer = @intCast(value) });
+    if (options.ocr_failure_stage) |value| try putString(alloc, &format, "ocr_failure_stage", value);
+    if (options.ocr_failure_retryable) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_failure_retryable"), .{ .bool = value });
+    if (options.ocr_trigger_reasons) |value| try putString(alloc, &format, "ocr_trigger_reasons", value);
+    if (options.ocr_embedded_quality) |value| try putString(alloc, &format, "ocr_embedded_quality", value);
+    if (options.ocr_output_quality) |value| try putString(alloc, &format, "ocr_output_quality", value);
     if (options.ocr_confidence) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_confidence"), .{ .float = value });
     if (options.ocr_bbox) |bbox| try format.put(alloc, try alloc.dupe(u8, "ocr_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
     try format.put(alloc, try alloc.dupe(u8, "transcript_used"), .{ .bool = options.transcript_used });

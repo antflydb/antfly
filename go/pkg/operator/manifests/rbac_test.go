@@ -55,6 +55,36 @@ func TestClusterRoleGrantsLeasePermissionsForHAFencing(t *testing.T) {
 	t.Fatal("ClusterRole must grant coordination.k8s.io leases permissions for HA KubernetesLease fencing")
 }
 
+func TestClusterRoleGrantsHARuntimeRBACReconciliationPermissions(t *testing.T) {
+	role := ClusterRole()
+	requiredVerbs := []string{"create", "get", "list", "update", "watch"}
+	required := map[string][]string{
+		"":                          {"serviceaccounts"},
+		"rbac.authorization.k8s.io": {"roles", "rolebindings"},
+	}
+
+	for apiGroup, resources := range required {
+		for _, resource := range resources {
+			var matchingRuleFound bool
+			for _, rule := range role.Rules {
+				if !containsString(rule.APIGroups, apiGroup) || !containsString(rule.Resources, resource) {
+					continue
+				}
+				matchingRuleFound = true
+				for _, verb := range requiredVerbs {
+					if !containsString(rule.Verbs, verb) {
+						t.Fatalf("ClusterRole %s rule missing verb %q: %#v", resource, verb, rule.Verbs)
+					}
+				}
+				break
+			}
+			if !matchingRuleFound {
+				t.Fatalf("ClusterRole must grant %s permissions needed to reconcile HA runtime RBAC", resource)
+			}
+		}
+	}
+}
+
 func TestHAAdminTokenSecretInjectionManifestsAreAligned(t *testing.T) {
 	rawDeployment, err := os.ReadFile("../config/manager/deployment.yaml")
 	if err != nil {
@@ -66,9 +96,6 @@ func TestHAAdminTokenSecretInjectionManifestsAreAligned(t *testing.T) {
 	}
 	if deployment.Namespace != OperatorNamespace {
 		t.Fatalf("deployment namespace = %q, want %q", deployment.Namespace, OperatorNamespace)
-	}
-	if !containerHasArg(deployment.Spec.Template.Spec.Containers, "antfly-operator-manager", "--enable-hot-standby-ha=false") {
-		t.Fatal("deployment must keep hot-standby HA release-gated off by default")
 	}
 
 	tokenEnv, ok := findContainerEnv(deployment.Spec.Template.Spec.Containers, "antfly-operator-manager", "ANTFLY_HA_ADMIN_TOKEN")
@@ -140,15 +167,6 @@ func TestStorageAutoGrowRBACGrantsNodeProxyOnly(t *testing.T) {
 	if subject.Kind != "ServiceAccount" || subject.Name != ServiceAccountName || subject.Namespace != OperatorNamespace {
 		t.Fatalf("StorageAutoGrowClusterRoleBinding subject = %#v", subject)
 	}
-}
-
-func containerHasArg(containers []corev1.Container, containerName, arg string) bool {
-	for _, container := range containers {
-		if container.Name == containerName && containsString(container.Args, arg) {
-			return true
-		}
-	}
-	return false
 }
 
 func findContainerEnv(containers []corev1.Container, containerName string, envName string) (corev1.EnvVar, bool) {

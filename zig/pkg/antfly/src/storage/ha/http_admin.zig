@@ -20,26 +20,34 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const platform_sync = @import("antfly_platform").sync;
 const admin_api = @import("../../admin/mod.zig");
 const http_common = @import("../../common/http/http_common.zig");
 const ha_admin = @import("admin.zig");
+const http_internal = @import("http_internal.zig");
+const internal_api = @import("../../internal/mod.zig");
 const admin_cli = @import("admin_cli.zig");
 const admin_exec = @import("admin_exec.zig");
 const backup_manifest = @import("backup_manifest.zig");
 const commit_gate = @import("commit_gate.zig");
 const fencing = @import("fencing.zig");
+const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
+const mutation_barrier = @import("mutation_barrier.zig");
 const owner_job_gate = @import("owner_job_gate.zig");
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const rejoin = @import("rejoin.zig");
+const seed_artifact = @import("seed_artifact.zig");
+const seed_capture = @import("seed_capture.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 const status_mod = @import("status.zig");
 const validation = @import("validation.zig");
 const write_gate = @import("write_gate.zig");
+const wal_mod = @import("../wal.zig");
 
 var test_path_counter: u64 = 0;
 
@@ -91,10 +99,79 @@ pub const Server = struct {
         }
     };
 
+    /// Runtime-owned capture deliberately bypasses the generic state-mutex
+    /// wrapper below. Its callback acquires the mutation barrier first and the
+    /// HA state mutex second, preserving the process-wide lock order.
+    pub const SeedCaptureResult = struct {
+        capture: seed_capture.CaptureResult,
+        node_id: []u8,
+
+        pub fn deinit(self: *SeedCaptureResult, alloc: Allocator) void {
+            self.capture.deinit(alloc);
+            alloc.free(self.node_id);
+            self.* = undefined;
+        }
+    };
+
+    pub const SeedCaptureHook = struct {
+        ptr: *anyopaque,
+        run_fn: *const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            slot_name: []const u8,
+            generation: []const u8,
+            binding: seed_artifact.LifecycleBinding,
+        ) anyerror!SeedCaptureResult,
+
+        pub fn run(
+            self: SeedCaptureHook,
+            alloc: Allocator,
+            slot_name: []const u8,
+            generation: []const u8,
+            binding: seed_artifact.LifecycleBinding,
+        ) !SeedCaptureResult {
+            return self.run_fn(self.ptr, alloc, slot_name, generation, binding);
+        }
+    };
+
     pub const AuthOptions = struct {
+        pub const LeaseWatchdogProofSource = struct {
+            ptr: *const anyopaque,
+            snapshot_fn: *const fn (ptr: *const anyopaque, alloc: Allocator) anyerror!?admin_api.HALeaseWatchdogProof,
+
+            pub fn snapshot(self: LeaseWatchdogProofSource, alloc: Allocator) !?admin_api.HALeaseWatchdogProof {
+                return self.snapshot_fn(self.ptr, alloc);
+            }
+        };
+
+        pub const RepairReceiptSink = struct {
+            ptr: *anyopaque,
+            record_fn: *const fn (ptr: *anyopaque, result: rejoin.RewindResult) anyerror!void,
+
+            pub fn record(self: RepairReceiptSink, result: rejoin.RewindResult) !void {
+                return self.record_fn(self.ptr, result);
+            }
+        };
+
+        pub const LifecycleReceipts = struct {
+            capture_root: ?[]const u8 = null,
+            activation_root: ?[]const u8 = null,
+            wal_options: wal_mod.WalOptions = .{},
+            node_id: ?[]const u8 = null,
+            role: lifecycle_receipt_ledger.RuntimeRole = .unknown,
+            pod_uid: ?[]const u8 = null,
+        };
+
         bearer_token: ?[]const u8 = null,
+        require_bearer_token: bool = false,
         standby_status_extras: ?StandbyStatusExtras = null,
         state_mutex: ?*std.atomic.Mutex = null,
+        seed_capture: ?SeedCaptureHook = null,
+        lifecycle_receipts: ?LifecycleReceipts = null,
+        lease_watchdog_proof: ?LeaseWatchdogProofSource = null,
+        repair_receipt: ?RepairReceiptSink = null,
+        primary_fence_barrier: ?*mutation_barrier.MutationBarrier = null,
+        primary_fence_started: ?StateChangedHook = null,
         state_changed: ?StateChangedHook = null,
     };
 
@@ -131,6 +208,25 @@ pub const Server = struct {
         if (req.method == .GET and std.mem.eql(u8, path, Routes.health)) {
             return try textResponse(self.alloc, 200, "ok");
         }
+        if (req.method == .POST and std.mem.eql(u8, path, admin_api.routes.ha_base_backups_capture)) {
+            defer if (self.auth.state_changed) |hook| hook.run();
+            return try self.handleAdminCaptureSeedArtifact(req);
+        }
+        if (std.mem.eql(u8, path, admin_api.routes.ha_seed_lifecycle_receipts)) {
+            if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
+            return try self.handleAdminLifecycleReceipts(req);
+        }
+        if (std.mem.eql(u8, path, admin_api.routes.ha_watchdog_proof)) {
+            if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
+            return try self.handleAdminWatchdogProof();
+        }
+        var primary_fence_lease: ?mutation_barrier.MutationBarrier.ExclusiveLease = null;
+        if (req.method == .POST and std.mem.eql(u8, path, admin_api.routes.ha_fence)) {
+            if (self.auth.primary_fence_barrier) |barrier| {
+                primary_fence_lease = barrier.acquireExclusive();
+            }
+        }
+        defer if (primary_fence_lease) |*lease| lease.release();
         const state_mutex = self.auth.state_mutex;
         if (state_mutex) |mutex| {
             platform_sync.lockYielding(mutex);
@@ -187,6 +283,9 @@ pub const Server = struct {
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_base_backups_finish)) {
                     return try self.handleAdminFinishBaseBackup(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_base_backups_activate)) {
+                    return try self.handleAdminActivateSeededSlot(req);
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_standby_bootstrap)) {
                     return try self.handleAdminBootstrapStandby(req);
@@ -245,7 +344,7 @@ pub const Server = struct {
     }
 
     fn authorized(self: *const Server, req: http_common.HttpRequest) bool {
-        const raw_token = self.auth.bearer_token orelse return true;
+        const raw_token = self.auth.bearer_token orelse return !self.auth.require_bearer_token;
         const token = std.mem.trim(u8, raw_token, " \t\r\n");
         if (token.len == 0) return false;
         const authorization = req.authorization orelse req.header("authorization") orelse return false;
@@ -285,12 +384,30 @@ pub const Server = struct {
         };
         defer snapshot.deinit(self.alloc);
         const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
+        const watchdog_proof = if (self.auth.lease_watchdog_proof) |source| try source.snapshot(self.alloc) else null;
+        defer if (watchdog_proof) |proof| self.alloc.free(proof.observed_holder_node_id);
         const response = admin_api.HAPrimaryStatusResponse{
             .schema_version = 1,
-            .snapshot = try adminPrimarySnapshot(self.alloc, snapshot, node_id),
+            .snapshot = blk: {
+                var result = try adminPrimarySnapshot(self.alloc, snapshot, node_id);
+                result.lease_watchdog = watchdog_proof;
+                break :blk result;
+            },
         };
         defer self.alloc.free(response.snapshot.slots);
         return try self.handleTypedJson(response);
+    }
+
+    fn handleAdminWatchdogProof(self: *Server) !http_common.HttpResponse {
+        const source = self.auth.lease_watchdog_proof orelse
+            return try textResponse(self.alloc, 409, "WatchdogProofUnavailable");
+        const proof = try source.snapshot(self.alloc) orelse
+            return try textResponse(self.alloc, 409, "WatchdogProofUnavailable");
+        defer self.alloc.free(proof.observed_holder_node_id);
+        return try self.handleTypedJson(admin_api.HAWatchdogProofResponse{
+            .schema_version = 1,
+            .proof = proof,
+        });
     }
 
     fn handleAdminStandbyStatus(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -309,10 +426,14 @@ pub const Server = struct {
             snapshot.last_success_ns = extras.lastSuccessNs();
             snapshot.replication_failures_total = extras.replicationFailuresTotal();
         }
-        return try self.handleTypedJson(admin_api.HAStandbyStatusResponse{
+        var response = admin_api.HAStandbyStatusResponse{
             .schema_version = 1,
             .snapshot = try adminStandbySnapshot(snapshot, node_id),
-        });
+        };
+        const watchdog_proof = if (self.auth.lease_watchdog_proof) |source| try source.snapshot(self.alloc) else null;
+        defer if (watchdog_proof) |proof| self.alloc.free(proof.observed_holder_node_id);
+        response.snapshot.lease_watchdog = watchdog_proof;
+        return try self.handleTypedJson(response);
     }
 
     fn handleAdminReplicationSlots(self: *Server) !http_common.HttpResponse {
@@ -640,6 +761,240 @@ pub const Server = struct {
         };
     }
 
+    fn handleAdminCaptureSeedArtifact(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const hook = self.auth.seed_capture orelse return try textResponse(self.alloc, 409, "SeedCaptureUnavailable");
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA seed capture request");
+        var parsed = admin_api.server.parseCaptureHASeedArtifactBody(
+            self.alloc,
+            req.body,
+        ) catch return try textResponse(self.alloc, 400, "invalid HA seed capture request");
+        defer parsed.deinit();
+        if (!validation.isIdentifier(parsed.value.slot_name) or
+            !validation.isIdentifier(parsed.value.generation) or
+            !validation.isIdentifier(parsed.value.topology_id) or
+            !validation.isIdentifier(parsed.value.node_id) or
+            !validation.isIdentifier(parsed.value.target_pvc_name) or
+            !validation.isIdentifier(parsed.value.target_pvc_uid))
+        {
+            return try textResponse(self.alloc, 400, "invalid HA seed capture identity");
+        }
+        const topology_generation = positiveUint64FromJson(parsed.value.topology_generation) catch
+            return try textResponse(self.alloc, 400, "invalid HA seed capture topology generation");
+        const binding = seed_artifact.LifecycleBinding{
+            .topology_id = parsed.value.topology_id,
+            .topology_generation = topology_generation,
+            .node_id = parsed.value.node_id,
+            .target_pvc_name = parsed.value.target_pvc_name,
+            .target_pvc_uid = parsed.value.target_pvc_uid,
+        };
+
+        var result = hook.run(
+            self.alloc,
+            parsed.value.slot_name,
+            parsed.value.generation,
+            binding,
+        ) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+        };
+        defer result.deinit(self.alloc);
+        var receipt = std.json.parseFromSlice(
+            seed_capture.CaptureReceipt,
+            self.alloc,
+            result.capture.receipt_json,
+            .{ .ignore_unknown_fields = true },
+        ) catch return try textResponse(self.alloc, 500, "InvalidSeedCaptureReceipt");
+        defer receipt.deinit();
+        const value = receipt.value;
+        if (!std.mem.eql(u8, value.slot_name, parsed.value.slot_name) or
+            !std.mem.eql(u8, value.generation, parsed.value.generation) or
+            !std.mem.eql(u8, value.topology_id, binding.topology_id) or
+            value.topology_generation != binding.topology_generation or
+            !std.mem.eql(u8, value.node_id, binding.node_id) or
+            !std.mem.eql(u8, value.target_pvc_name, binding.target_pvc_name) or
+            !std.mem.eql(u8, value.target_pvc_uid, binding.target_pvc_uid) or
+            !validSha256Hex(value.source_plan_sha256) or
+            !validSha256Hex(value.manifest_sha256))
+        {
+            return try textResponse(self.alloc, 500, "InvalidSeedCaptureReceipt");
+        }
+
+        var capture_receipt_digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(result.capture.receipt_json, &capture_receipt_digest, .{});
+        var capture_receipt_sha256: [Sha256.digest_length * 2]u8 = undefined;
+        encodeSha256Hex(&capture_receipt_sha256, &capture_receipt_digest);
+
+        const action_id = try std.fmt.allocPrint(self.alloc, "seed_capture:{s}", .{value.generation});
+        defer self.alloc.free(action_id);
+        return try self.handleTypedJson(admin_api.HASeedArtifactCaptureResponse{
+            .schema_version = 1,
+            .action = .{
+                .action_id = action_id,
+                .action_kind = "seed_capture",
+                .target = value.generation,
+                .state = if (result.capture.already_captured) "already_applied" else "applied",
+                .node_id = result.node_id,
+            },
+            .slot_name = value.slot_name,
+            .generation = value.generation,
+            .topology_id = value.topology_id,
+            .topology_generation = try adminI64(value.topology_generation),
+            .node_id = value.node_id,
+            .target_pvc_name = value.target_pvc_name,
+            .target_pvc_uid = value.target_pvc_uid,
+            .cluster_id = try adminI64(value.cluster_id),
+            .shard_id = try adminI64(value.shard_id),
+            .table_id = try adminI64(value.table_id),
+            .timeline_id = try adminI64(value.timeline_id),
+            .epoch = try adminI64(value.epoch),
+            .manifest_id = value.manifest_id,
+            .source_plan_sha256 = value.source_plan_sha256,
+            .backup_lsn = try adminI64(value.backup_lsn),
+            .checkpoint_lsn = try adminI64(value.checkpoint_lsn),
+            .end_record_lsn = try adminI64(value.end_record_lsn),
+            .manifest_sha256 = value.manifest_sha256,
+            .capture_receipt_sha256 = &capture_receipt_sha256,
+            .file_count = try adminI64(@intCast(value.file_count)),
+            .total_bytes = try adminI64(value.total_bytes),
+            .generation_root = result.capture.generation_root,
+            .content_root = result.capture.content_root,
+            .manifest_path = result.capture.manifest_path,
+            .already_captured = result.capture.already_captured,
+        });
+    }
+
+    fn handleAdminLifecycleReceipts(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const config = self.auth.lifecycle_receipts orelse
+            return try textResponse(self.alloc, 409, "LifecycleReceiptLedgerUnavailable");
+        const query = parseLifecycleReceiptQuery(requestQuery(req.uri)) catch
+            return try textResponse(self.alloc, 400, "invalid lifecycle receipt query");
+        const authoritative_root = switch (query.kind) {
+            .capture => config.capture_root,
+            .activation => config.activation_root,
+        } orelse return try textResponse(self.alloc, 409, "LifecycleReceiptLedgerUnavailable");
+
+        var wal_options = config.wal_options;
+        wal_options.read_only = true;
+        var ledger = lifecycle_receipt_ledger.Ledger.open(self.alloc, authoritative_root, .{
+            .wal_options = wal_options,
+        }) catch |err| return try textResponse(self.alloc, 500, @errorName(err));
+        defer ledger.close();
+
+        const fenced = if (config.node_id) |node_id| blk: {
+            const store = self.ctx.fence_store orelse break :blk false;
+            const receipt = store.currentBorrowed() orelse break :blk false;
+            break :blk std.mem.eql(u8, receipt.old_primary_id, node_id);
+        } else false;
+        var page = ledger.readPage(self.alloc, query.kind, .{
+            .after = query.after,
+            .limit = query.limit,
+        }, .{
+            .authoritative_root = authoritative_root,
+            .runtime = .{
+                .node_id = config.node_id,
+                .role = config.role,
+                .pod_uid = config.pod_uid,
+                .fenced = fenced,
+                .observed_at_unix_ns = @import("antfly_platform").time.realtimeNs(),
+            },
+        }) catch |err| return try textResponse(self.alloc, 500, @errorName(err));
+        defer page.deinit(self.alloc);
+
+        const entries = try self.alloc.alloc(admin_api.HASeedLifecycleReceiptEvent, page.entries.len);
+        defer self.alloc.free(entries);
+        for (page.entries, 0..) |entry, index| {
+            entries[index] = .{
+                .cursor = try adminI64(entry.cursor),
+                .kind = @tagName(entry.kind),
+                .generation = entry.generation,
+                .slot_name = entry.slot_name,
+                .topology_id = entry.topology_id,
+                .topology_generation = try adminI64(entry.topology_generation),
+                .node_id = entry.node_id,
+                .target_pvc_name = entry.target_pvc_name,
+                .target_pvc_uid = entry.target_pvc_uid,
+                .receipt_sha256 = entry.receipt_sha256,
+                .receipt_json = entry.receipt_json,
+                .recorded_at_unix_ns = try adminI64(entry.recorded_at_unix_ns),
+                .pod_uid = entry.pod_uid,
+                .authoritative_state = @tagName(entry.authoritative_state),
+            };
+        }
+        return try self.handleTypedJson(admin_api.HASeedLifecycleReceiptInventoryResponse{
+            .schema_version = 1,
+            .entries = entries,
+            .first_cursor = try adminI64(page.first_cursor),
+            .end_cursor = try adminI64(page.end_cursor),
+            .next_cursor = try adminI64(page.next_cursor),
+            .history_truncated = page.history_truncated,
+            .gap = page.gap,
+            .has_more = page.has_more,
+            .runtime = .{
+                .node_id = page.runtime.node_id,
+                .role = @tagName(page.runtime.role),
+                .pod_uid = page.runtime.pod_uid,
+                .fenced = page.runtime.fenced,
+                .observed_at_unix_ns = try adminI64(page.runtime.observed_at_unix_ns),
+            },
+        });
+    }
+
+    fn handleAdminActivateSeededSlot(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA seeded slot activation request");
+        var parsed = admin_api.server.parseActivateHASeededSlotBody(
+            self.alloc,
+            req.body,
+        ) catch return try textResponse(self.alloc, 400, "invalid HA seeded slot activation request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        if (!validation.isIdentifier(request.slot_name) or
+            !validation.isIdentifier(request.generation) or
+            request.manifest_id.len == 0 or
+            !validSha256Hex(request.seed_receipt_sha256) or
+            !validSha256Hex(request.capture_receipt_sha256) or
+            !validSha256Hex(request.manifest_sha256) or
+            !validSha256Hex(request.aggregate_sha256))
+        {
+            return try textResponse(self.alloc, 400, "invalid HA seeded slot activation evidence");
+        }
+        const timeline_id = positiveUint64FromJson(request.timeline_id) catch
+            return try textResponse(self.alloc, 400, "invalid HA seeded slot activation timeline");
+        const checkpoint_lsn = positiveUint64FromJson(request.checkpoint_lsn) catch
+            return try textResponse(self.alloc, 400, "invalid HA seeded slot activation checkpoint");
+        const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
+        const already_applied = if (primary.slot(request.slot_name)) |slot|
+            slot.lifecycle == .streaming and slot.active and !slot.reseed_required and
+                slot.timeline_id == timeline_id and slot.received_lsn >= checkpoint_lsn and
+                slot.applied_lsn >= checkpoint_lsn and slot.safe_read_lsn >= checkpoint_lsn
+        else
+            false;
+
+        ha_admin.activateSeededSlot(primary, request.slot_name, timeline_id, checkpoint_lsn) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+        };
+        const action_id = try std.fmt.allocPrint(self.alloc, "seeded_slot_activate:{s}", .{request.generation});
+        defer self.alloc.free(action_id);
+        return try self.handleTypedJson(admin_api.HASeededSlotActivateResponse{
+            .schema_version = 1,
+            .action = .{
+                .action_id = action_id,
+                .action_kind = "seeded_slot_activate",
+                .target = request.generation,
+                .state = if (already_applied) "already_applied" else "applied",
+                .node_id = node_id,
+            },
+            .slot_name = request.slot_name,
+            .generation = request.generation,
+            .manifest_id = request.manifest_id,
+            .timeline_id = request.timeline_id,
+            .checkpoint_lsn = request.checkpoint_lsn,
+            .seed_receipt_sha256 = request.seed_receipt_sha256,
+            .capture_receipt_sha256 = request.capture_receipt_sha256,
+            .manifest_sha256 = request.manifest_sha256,
+            .aggregate_sha256 = request.aggregate_sha256,
+        });
+    }
+
     fn handleAdminBootstrapStandby(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA standby bootstrap request");
         var parsed = admin_api.server.parseBootstrapHAStandbyBody(
@@ -715,15 +1070,38 @@ pub const Server = struct {
 
     fn handleAdminAcquireFence(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
-        const fence = self.parseAcquireFenceRequest(req) catch {
+        var fence = self.parseAcquireFenceRequest(req) catch {
             return try textResponse(self.alloc, 400, "invalid HA fence request");
         };
+        if (self.ctx.primary) |primary| {
+            const primary_node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
+            if (std.mem.eql(u8, primary_node_id, fence.old_primary_id) and
+                primary.identity.cluster_id == fence.identity.cluster_id and
+                primary.identity.shard_id == fence.identity.shard_id and
+                primary.identity.table_id == fence.identity.table_id and
+                primary.identity.timeline_id == fence.identity.timeline_id and
+                primary.identity.epoch == fence.identity.epoch)
+            {
+                // The caller-provided LSN is only the last control-plane
+                // observation. Freeze the live writer under the same mutex used
+                // by final HA WAL append/ack, then bind the receipt to the
+                // former primary's actual durable tail.
+                if (self.auth.primary_fence_started) |hook| hook.run();
+                const durable_tail = primary.lastLsn();
+                if (durable_tail < fence.required_lsn) {
+                    return try textResponse(self.alloc, 409, "FormerPrimaryBehindFenceBoundary");
+                }
+                fence.required_lsn = durable_tail;
+                fence.observed_lsn = durable_tail;
+            }
+        }
         var result = ha_admin.acquirePromotionFence(self.alloc, fence_store, fence) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
         const action_id = try std.fmt.allocPrint(self.alloc, "fence_acquire:{s}", .{result.receipt.promoted_node_id});
         defer self.alloc.free(action_id);
+        const action_node_id = self.primaryNodeID() orelse self.standbyNodeID() orelse result.receipt.promoted_node_id;
         return try self.handleTypedJson(admin_api.HAFenceResponse{
             .schema_version = 1,
             .action = .{
@@ -731,7 +1109,7 @@ pub const Server = struct {
                 .action_kind = "fence_acquire",
                 .target = result.receipt.promoted_node_id,
                 .state = "applied",
-                .node_id = result.receipt.promoted_node_id,
+                .node_id = action_node_id,
             },
             .receipt = try adminFenceReceipt(result.receipt),
         });
@@ -852,10 +1230,10 @@ pub const Server = struct {
         else
             null;
 
-        if (expected_action != null and expected_action.? == .rewind and self.ctx.former_primary_log == null) {
-            const log = self.rejoinRewindLog() orelse
-                return try textResponse(self.alloc, 409, "FormerPrimaryLogUnavailable");
+        if (self.localFormerPrimaryLog(parsed.value.node_id)) |log| {
             last_lsn = log.lastLsn();
+        } else if (expected_action != null and expected_action.? == .rewind) {
+            return try textResponse(self.alloc, 409, "FormerPrimaryLogUnavailable");
         }
 
         if (expected_action != null) {
@@ -885,18 +1263,25 @@ pub const Server = struct {
                 return try textResponse(self.alloc, 409, message);
             }
 
-            if (receipt) |fence| {
-                self.recordVerifiedLocalRejoinReceipt(parsed.value.node_id, identity, fence) catch |err| {
-                    return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
-                };
-            }
-
             if (expected == .rewind) {
                 const log = self.rejoinRewindLog() orelse
                     return try textResponse(self.alloc, 409, "FormerPrimaryLogUnavailable");
                 const rewind = ha_admin.rewindFormerPrimaryReplicationLog(self.alloc, log, assessment) catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
+                // The rewind log append is durable before either receipt is
+                // published. A crash before this point leaves the sentinel latched;
+                // only this exact post-success repair record can authorize restart.
+                if (receipt) |fence| {
+                    self.recordVerifiedLocalRejoinReceipt(parsed.value.node_id, identity, fence) catch |err| {
+                        return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                    };
+                }
+                if (self.auth.repair_receipt) |sink| {
+                    sink.record(rewind) catch |err| {
+                        return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                    };
+                }
                 const action_id = try std.fmt.allocPrint(self.alloc, "rejoin_rewind:{s}", .{assessment.former_node_id});
                 defer self.alloc.free(action_id);
                 return try self.handleTypedJson(admin_api.HARejoinAssessResponse{
@@ -919,6 +1304,11 @@ pub const Server = struct {
                 const reseed = ha_admin.markFormerPrimaryForReseed(primary, assessment) catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
+                if (receipt) |fence| {
+                    self.recordVerifiedLocalRejoinReceipt(parsed.value.node_id, identity, fence) catch |err| {
+                        return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                    };
+                }
                 const action_id = try std.fmt.allocPrint(self.alloc, "rejoin_reseed:{s}", .{assessment.former_node_id});
                 defer self.alloc.free(action_id);
                 return try self.handleTypedJson(admin_api.HARejoinAssessResponse{
@@ -973,6 +1363,12 @@ pub const Server = struct {
         if (self.ctx.former_primary_log) |log| return log;
         if (self.ctx.primary) |primary| return &primary.log;
         return null;
+    }
+
+    fn localFormerPrimaryLog(self: *Server, node_id: []const u8) ?*replication_log.ReplicationLog {
+        const local_node_id = self.ctx.primary_node_id orelse return null;
+        if (!std.mem.eql(u8, local_node_id, node_id)) return null;
+        return self.rejoinRewindLog();
     }
 
     fn parseAcquireFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
@@ -1490,11 +1886,66 @@ fn requestQuery(uri: []const u8) []const u8 {
     return uri[query_index + 1 .. fragment_index];
 }
 
+const LifecycleReceiptQuery = struct {
+    kind: lifecycle_receipt_ledger.Kind,
+    after: u64 = 0,
+    limit: usize = 100,
+};
+
+fn parseLifecycleReceiptQuery(query: []const u8) !LifecycleReceiptQuery {
+    if (query.len == 0 or std.mem.indexOfScalar(u8, query, '%') != null) return error.InvalidLifecycleReceiptQuery;
+    var kind: ?lifecycle_receipt_ledger.Kind = null;
+    var after: ?u64 = null;
+    var limit: ?usize = null;
+    var fields = std.mem.splitScalar(u8, query, '&');
+    while (fields.next()) |field| {
+        if (field.len == 0) return error.InvalidLifecycleReceiptQuery;
+        const separator = std.mem.indexOfScalar(u8, field, '=') orelse return error.InvalidLifecycleReceiptQuery;
+        if (separator == 0 or separator + 1 >= field.len or
+            std.mem.indexOfScalarPos(u8, field, separator + 1, '=') != null)
+            return error.InvalidLifecycleReceiptQuery;
+        const key = field[0..separator];
+        const value = field[separator + 1 ..];
+        if (std.mem.eql(u8, key, "kind")) {
+            if (kind != null) return error.InvalidLifecycleReceiptQuery;
+            kind = if (std.mem.eql(u8, value, "capture"))
+                .capture
+            else if (std.mem.eql(u8, value, "activation"))
+                .activation
+            else
+                return error.InvalidLifecycleReceiptQuery;
+        } else if (std.mem.eql(u8, key, "after")) {
+            if (after != null) return error.InvalidLifecycleReceiptQuery;
+            after = try parseUnsignedQueryValue(u64, value);
+        } else if (std.mem.eql(u8, key, "limit")) {
+            if (limit != null) return error.InvalidLifecycleReceiptQuery;
+            const parsed = try parseUnsignedQueryValue(usize, value);
+            if (parsed == 0 or parsed > lifecycle_receipt_ledger.max_page_limit)
+                return error.InvalidLifecycleReceiptQuery;
+            limit = parsed;
+        } else {
+            return error.InvalidLifecycleReceiptQuery;
+        }
+    }
+    return .{
+        .kind = kind orelse return error.InvalidLifecycleReceiptQuery,
+        .after = after orelse 0,
+        .limit = limit orelse 100,
+    };
+}
+
+fn parseUnsignedQueryValue(comptime T: type, value: []const u8) !T {
+    if (value.len == 0) return error.InvalidLifecycleReceiptQuery;
+    for (value) |byte| if (byte < '0' or byte > '9') return error.InvalidLifecycleReceiptQuery;
+    return std.fmt.parseInt(T, value, 10) catch return error.InvalidLifecycleReceiptQuery;
+}
+
 fn knownFixedRoute(path: []const u8) bool {
     return std.mem.eql(u8, path, Routes.health) or
         std.mem.eql(u8, path, Routes.ready) or
         std.mem.eql(u8, path, Routes.command) or
         std.mem.eql(u8, path, admin_api.routes.ha_primary_status) or
+        std.mem.eql(u8, path, admin_api.routes.ha_watchdog_proof) or
         std.mem.eql(u8, path, admin_api.routes.ha_standby_status) or
         std.mem.eql(u8, path, admin_api.routes.ha_commit_check) or
         std.mem.eql(u8, path, admin_api.routes.ha_commit_append) or
@@ -1504,6 +1955,9 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, admin_api.routes.ha_replication_slots) or
         std.mem.eql(u8, path, admin_api.routes.ha_base_backups) or
         std.mem.eql(u8, path, admin_api.routes.ha_base_backups_finish) or
+        std.mem.eql(u8, path, admin_api.routes.ha_base_backups_capture) or
+        std.mem.eql(u8, path, admin_api.routes.ha_base_backups_activate) or
+        std.mem.eql(u8, path, admin_api.routes.ha_seed_lifecycle_receipts) or
         std.mem.eql(u8, path, admin_api.routes.ha_standby_bootstrap) or
         std.mem.eql(u8, path, admin_api.routes.ha_fence) or
         std.mem.eql(u8, path, admin_api.routes.ha_fence_current) or
@@ -1845,6 +2299,21 @@ fn hexValue(byte: u8) ?u8 {
     };
 }
 
+fn validSha256Hex(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |byte| {
+        if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return false;
+    }
+    return true;
+}
+
+fn encodeSha256Hex(out: *[Sha256.digest_length * 2]u8, digest: *const [Sha256.digest_length]u8) void {
+    for (digest, 0..) |byte, index| {
+        out[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+}
+
 fn uint64Text(raw: []const u8) !u64 {
     if (raw.len == 0) return error.InvalidAdminRequest;
     return std.fmt.parseUnsigned(u64, raw, 10) catch error.InvalidAdminRequest;
@@ -2115,6 +2584,17 @@ fn writeTestFile(path: []const u8, bytes: []const u8) !void {
     });
 }
 
+const RewindReceiptOrderProbe = struct {
+    log: *replication_log.ReplicationLog,
+    called: bool = false,
+
+    fn record(ptr: *anyopaque, result: rejoin.RewindResult) !void {
+        const self: *RewindReceiptOrderProbe = @ptrCast(@alignCast(ptr));
+        try std.testing.expectEqual(result.current_last_lsn, self.log.lastLsn());
+        self.called = true;
+    }
+};
+
 test "storage.ha http admin executes typed former primary log rewind when configured" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "rejoin-rewind");
@@ -2125,20 +2605,20 @@ test "storage.ha http admin executes typed former primary log rewind when config
     defer former_log.close();
     _ = try former_log.append(alloc, baseRecord(identity, 1, "one"));
     _ = try former_log.append(alloc, baseRecord(identity, 2, "two"));
-    _ = try former_log.append(alloc, baseRecord(identity, 3, "diverged"));
 
     var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
     defer fence_store.close();
 
-    var server = Server.init(alloc, .{
+    var receipt_probe = RewindReceiptOrderProbe{ .log = &former_log };
+    var server = Server.initWithOptions(alloc, .{
         .primary_node_id = "primary-a",
         .fence_store = &fence_store,
         .former_primary_log = &former_log,
-    });
+    }, .{ .repair_receipt = .{ .ptr = &receipt_probe, .record_fn = RewindReceiptOrderProbe.record } });
     defer server.deinit();
 
     const body =
-        "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}";
+        "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}";
     var rewind = try server.handle(.{
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_rewind,
@@ -2154,8 +2634,11 @@ test "storage.ha http admin executes typed former primary log rewind when config
     try expectContains(rewind.body, "\"assessment\"");
     try expectContains(rewind.body, "\"rewind\"");
     try expectContains(rewind.body, "\"node_id\":\"primary-a\"");
-    try expectContains(rewind.body, "\"discarded_lsn_count\":1");
-    try std.testing.expectEqual(@as(u64, 2), former_log.lastLsn());
+    try expectContains(rewind.body, "\"discarded_lsn_count\":0");
+    try expectContains(rewind.body, "\"current_last_lsn\":3");
+    try expectContains(rewind.body, "\"next_lsn\":4");
+    try std.testing.expectEqual(@as(u64, 3), former_log.lastLsn());
+    try std.testing.expect(receipt_probe.called);
     const current_receipt = (try fence_store.current(alloc)) orelse return error.TestExpectedEqual;
     defer fencing.freeReceipt(alloc, current_receipt);
     try std.testing.expectEqualStrings("primary-a", current_receipt.old_primary_id);
@@ -2169,7 +2652,7 @@ test "storage.ha http admin executes typed former primary log rewind when config
     });
     defer stale.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), stale.status);
-    try expectContains(stale.body, "RejoinAssessmentStale");
+    try std.testing.expectEqual(@as(u64, 3), former_log.lastLsn());
 }
 
 test "storage.ha http admin rejects typed former primary rewind on node without local log" {
@@ -2181,7 +2664,7 @@ test "storage.ha http admin rejects typed former primary rewind on node without 
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_rewind,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), response.status);
@@ -2205,13 +2688,47 @@ test "storage.ha http admin does not persist rejoin assess receipts" {
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_assess,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), response.status);
     try expectContains(response.body, "\"action_kind\":\"rejoin_assess\"");
     try expectContains(response.body, "\"action\":\"rewind\"");
     try std.testing.expect((try fence_store.current(alloc)) == null);
+}
+
+test "storage.ha http admin assesses the local former primary durable tail" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "rejoin-assess-local-tail");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var former_log = try replication_log.ReplicationLog.open(paths.primary_log.ptr, .{});
+    defer former_log.close();
+    _ = try former_log.append(alloc, baseRecord(identity, 1, "one"));
+    _ = try former_log.append(alloc, baseRecord(identity, 2, "two"));
+    _ = try former_log.append(alloc, baseRecord(identity, 3, "divergent-local-write"));
+
+    var server = Server.init(alloc, .{
+        .primary_node_id = "primary-a",
+        .former_primary_log = &former_log,
+    });
+    defer server.deinit();
+
+    // The controller's last_lsn=2 was captured at promotion time and is stale.
+    // The old node must assess its own durable LSN=3 or it can misclassify an
+    // applied divergent write as safe to rewind.
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_assess,
+        .content_type = "application/json",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try expectContains(response.body, "\"action\":\"reseed\"");
+    try expectContains(response.body, "\"former_last_lsn\":3");
 }
 
 test "storage.ha http admin rejects unbound rejoin receipts before persisting" {
@@ -2276,6 +2793,128 @@ test "storage.ha http admin marks former primary slot for typed reseed" {
 
     const slot = primary.slot("primary-a") orelse return error.TestExpectedEqual;
     try std.testing.expect(slot.reseed_required);
+}
+
+test "storage.ha reseed serialization survives a concurrent admitted status update and replay" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "rejoin-reseed-status-race");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+    const reseed_body =
+        "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":3,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}";
+
+    const InterleaveProbe = struct {
+        mutex: *std.atomic.Mutex,
+        admin_server: ?*Server = null,
+        reseed_body: []const u8,
+        internal_saw_lock: bool = false,
+        admin_saw_lock: bool = false,
+        admin_called: bool = false,
+        admin_status: u16 = 0,
+        admin_reported_reseed: bool = false,
+
+        fn runReseed(self: *@This()) !void {
+            const server = self.admin_server orelse return error.TestExpectedEqual;
+            var response = try server.handle(.{
+                .method = .POST,
+                .uri = admin_api.routes.ha_rejoin_reseed,
+                .content_type = "application/json",
+                .body = self.reseed_body,
+            });
+            defer response.deinit(server.alloc);
+            self.admin_called = true;
+            self.admin_status = response.status;
+            self.admin_reported_reseed = std.mem.indexOf(u8, response.body, "\"reseed_required\":true") != null;
+        }
+
+        fn beforeProgressRead(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const acquired = self.mutex.tryLock();
+            self.internal_saw_lock = !acquired;
+            if (!acquired) return;
+            self.mutex.unlock();
+
+            // Reproduce the E2E ordering deterministically: the standby status
+            // request was admitted while the slot was healthy, then reseed is
+            // durably marked before that admitted progress update reads and
+            // rewrites the full slot state.
+            try self.runReseed();
+        }
+
+        fn stateChanged(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const acquired = self.mutex.tryLock();
+            self.admin_saw_lock = !acquired;
+            if (acquired) self.mutex.unlock();
+        }
+    };
+
+    var state_mutex: std.atomic.Mutex = .unlocked;
+    var probe = InterleaveProbe{
+        .mutex = &state_mutex,
+        .reseed_body = reseed_body,
+    };
+    var live_reseed_required = false;
+    var status_reported_reseed = false;
+    {
+        var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{
+            .slot_store_options = .{
+                .update_progress_before_read_hook = .{
+                    .ptr = &probe,
+                    .run_fn = InterleaveProbe.beforeProgressRead,
+                },
+            },
+        });
+        defer primary.close();
+        try primary.createSlot("primary-a", 0);
+
+        var admin_server = Server.initWithOptions(alloc, .{
+            .primary = &primary,
+            .primary_node_id = "standby-a",
+        }, .{
+            .state_mutex = &state_mutex,
+            .state_changed = .{
+                .ptr = &probe,
+                .run_fn = InterleaveProbe.stateChanged,
+            },
+        });
+        defer admin_server.deinit();
+        probe.admin_server = &admin_server;
+
+        var internal_server = http_internal.Server.initWithOptions(alloc, &primary, .{ .state_mutex = &state_mutex });
+        var status_update = try internal_server.handle(.{
+            .method = .POST,
+            .uri = internal_api.routes.ha_replication_status,
+            .body = "{\"slot_name\":\"primary-a\",\"timeline_id\":1,\"received_lsn\":0,\"applied_lsn\":0,\"safe_read_lsn\":0}",
+        });
+        defer status_update.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), status_update.status);
+
+        // With correct serialization the hook cannot re-enter the admin route;
+        // apply the reseed after the status request releases the mutex.
+        if (!probe.admin_called) try probe.runReseed();
+
+        try std.testing.expectEqual(@as(u16, 200), probe.admin_status);
+        try std.testing.expect(probe.admin_reported_reseed);
+        live_reseed_required = (primary.slot("primary-a") orelse return error.TestExpectedEqual).reseed_required;
+
+        var status = try admin_server.handle(.{
+            .method = .GET,
+            .uri = admin_api.routes.ha_primary_status,
+        });
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), status.status);
+        status_reported_reseed = std.mem.indexOf(u8, status.body, "\"reseed_required\":true") != null;
+    }
+
+    var reopened = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer reopened.close();
+    const replay_reseed_required = (reopened.slot("primary-a") orelse return error.TestExpectedEqual).reseed_required;
+    try std.testing.expect(replay_reseed_required);
+    try std.testing.expect(live_reseed_required);
+    try std.testing.expect(status_reported_reseed);
+    try std.testing.expect(probe.internal_saw_lock);
+    try std.testing.expect(probe.admin_saw_lock);
 }
 
 test "storage.ha http admin rejects typed former primary reseed on node without primary context" {
@@ -2630,6 +3269,16 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(identity.shard_id, appended_entry.record.shard_id);
     try std.testing.expectEqual(identity.table_id, appended_entry.record.table_id);
 
+    var final_boundary_catchup = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"--table\",\"stream\",\"once\",\"--slot\",\"standby-a\"]}",
+    });
+    defer final_boundary_catchup.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), final_boundary_catchup.status);
+    try expectContains(final_boundary_catchup.body, "applied_lsn=2\n");
+
     var unfenced_promote = try server.handle(.{
         .method = .POST,
         .uri = admin_api.routes.ha_promotion_current_fence,
@@ -2652,7 +3301,7 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_fence.body, "\"schema_version\":1");
     try expectContains(typed_fence.body, "\"action_kind\":\"fence_acquire\"");
     try expectContains(typed_fence.body, "\"action_id\":\"fence_acquire:standby-a\"");
-    try expectContains(typed_fence.body, "\"node_id\":\"standby-a\"");
+    try expectContains(typed_fence.body, "\"node_id\":\"primary-a\"");
     try expectContains(typed_fence.body, "\"receipt\"");
     try expectContains(typed_fence.body, "\"promoted_node_id\":\"standby-a\"");
 
@@ -2693,7 +3342,7 @@ test "storage.ha http admin serves health and command endpoint" {
 
     const typed_rejoin_fenced_body = try std.fmt.allocPrint(
         alloc,
-        "{{\"node_id\":\"primary-a\",\"identity\":{{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1}},\"last_lsn\":2,\"retained_from_lsn\":0,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{s}}}",
+        "{{\"node_id\":\"primary-a\",\"identity\":{{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1}},\"last_lsn\":2,\"retained_from_lsn\":3,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{s}}}",
         .{typed_fence_receipt_json},
     );
     defer alloc.free(typed_rejoin_fenced_body);
@@ -2708,7 +3357,7 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), typed_rejoin_fenced.status);
     try std.testing.expectEqualStrings("application/json", typed_rejoin_fenced.content_type.?);
     try expectContains(typed_rejoin_fenced.body, "\"assessment\"");
-    try expectContains(typed_rejoin_fenced.body, "\"action\":\"rewind\"");
+    try expectContains(typed_rejoin_fenced.body, "\"action\":\"reseed\"");
     try expectContains(typed_rejoin_fenced.body, "\"target_timeline_id\":2");
 
     var typed_rejoin_rewind = try server.handle(.{
@@ -2718,9 +3367,8 @@ test "storage.ha http admin serves health and command endpoint" {
         .body = typed_rejoin_fenced_body,
     });
     defer typed_rejoin_rewind.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), typed_rejoin_rewind.status);
-    try expectContains(typed_rejoin_rewind.body, "\"action_kind\":\"rejoin_rewind\"");
-    try expectContains(typed_rejoin_rewind.body, "\"state\":\"applied\"");
+    try std.testing.expectEqual(@as(u16, 409), typed_rejoin_rewind.status);
+    try expectContains(typed_rejoin_rewind.body, "does not allow rewind");
 
     var typed_rejoin_reseed_mismatch = try server.handle(.{
         .method = .POST,
@@ -2729,8 +3377,9 @@ test "storage.ha http admin serves health and command endpoint" {
         .body = typed_rejoin_fenced_body,
     });
     defer typed_rejoin_reseed_mismatch.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 409), typed_rejoin_reseed_mismatch.status);
-    try expectContains(typed_rejoin_reseed_mismatch.body, "does not allow reseed");
+    try std.testing.expectEqual(@as(u16, 200), typed_rejoin_reseed_mismatch.status);
+    try expectContains(typed_rejoin_reseed_mismatch.body, "\"action_kind\":\"rejoin_reseed\"");
+    try expectContains(typed_rejoin_reseed_mismatch.body, "\"state\":\"applied\"");
 
     var typed_promote_assess = try server.handle(.{
         .method = .POST,
@@ -2953,6 +3602,60 @@ test "storage.ha http admin bearer authorization requires exact token" {
     try std.testing.expect(!bearerAuthorizationMatches("secret-token", "Bearer secret-token-extra"));
 }
 
+test "storage.ha watchdog proof remains available outside HA state mutex" {
+    const alloc = std.testing.allocator;
+    const ProofSource = struct {
+        state_mutex: *std.atomic.Mutex,
+        observed_locked: bool = false,
+
+        fn snapshot(ptr: *const anyopaque, proof_alloc: Allocator) !?admin_api.HALeaseWatchdogProof {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            const acquired = self.state_mutex.tryLock();
+            self.observed_locked = !acquired;
+            if (acquired) self.state_mutex.unlock();
+            return .{
+                .capability_version = 1,
+                .active = true,
+                .authority_granted = true,
+                .authority_remaining_ms = 5000,
+                .lease_name = "lease-a",
+                .lease_namespace = "default",
+                .stable_topology_id = "topology-a",
+                .local_node_id = "primary-a",
+                .observed_holder_node_id = try proof_alloc.dupe(u8, "primary-a"),
+                .pod_uid = "pod-a",
+                .process_boot_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                .observed_lease_transitions = 1,
+                .max_fence_latency_ms = 10000,
+            };
+        }
+    };
+
+    var state_mutex: std.atomic.Mutex = .unlocked;
+    var source = ProofSource{ .state_mutex = &state_mutex };
+    var server = Server.initWithOptions(alloc, .{}, .{
+        .bearer_token = "secret-token",
+        .require_bearer_token = true,
+        .state_mutex = &state_mutex,
+        .lease_watchdog_proof = .{ .ptr = &source, .snapshot_fn = ProofSource.snapshot },
+    });
+    defer server.deinit();
+
+    platform_sync.lockYielding(&state_mutex);
+    defer state_mutex.unlock();
+    var response = try server.handle(.{
+        .method = .GET,
+        .uri = admin_api.routes.ha_watchdog_proof,
+        .authorization = "Bearer secret-token",
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expect(source.observed_locked);
+    try expectContains(response.body, "\"schema_version\":1");
+    try expectContains(response.body, "\"authority_granted\":true");
+}
+
 test "storage.ha http admin empty configured bearer token fails closed" {
     const alloc = std.testing.allocator;
     for ([_][]const u8{ "", " \t\r\n " }) |configured_token| {
@@ -2976,6 +3679,20 @@ test "storage.ha http admin empty configured bearer token fails closed" {
         defer command.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 401), command.status);
     }
+}
+
+test "storage.ha http admin required bearer token fails closed when unconfigured" {
+    const alloc = std.testing.allocator;
+    var server = Server.initWithOptions(alloc, .{}, .{ .require_bearer_token = true });
+    defer server.deinit();
+
+    var health = try server.handle(.{ .method = .GET, .uri = Routes.health });
+    defer health.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), health.status);
+
+    var admin = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
+    defer admin.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), admin.status);
 }
 
 test "storage.ha http admin trims configured bearer token before comparing" {
@@ -3179,6 +3896,41 @@ test "storage.ha http admin serves typed base backup seed endpoints" {
     try expectContains(typed_finish.body, "\"action_id\":\"base_backup_finish:base-http\"");
     try expectContains(typed_finish.body, "\"manifest_id\":\"base-http\"");
     try expectContains(typed_finish.body, "\"end_record_lsn\":3");
+
+    const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const activate_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"slot_name\":\"standby-seed\",\"generation\":\"seed-standby-seed-1\",\"manifest_id\":\"base-http\",\"timeline_id\":1,\"checkpoint_lsn\":2,\"seed_receipt_sha256\":\"{s}\",\"capture_receipt_sha256\":\"{s}\",\"manifest_sha256\":\"{s}\",\"aggregate_sha256\":\"{s}\"}}",
+        .{ digest, digest, digest, digest },
+    );
+    defer alloc.free(activate_body);
+    var typed_activate = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_base_backups_activate,
+        .content_type = "application/json",
+        .body = activate_body,
+    });
+    defer typed_activate.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_activate.status);
+    try expectContains(typed_activate.body, "\"action_kind\":\"seeded_slot_activate\"");
+    try expectContains(typed_activate.body, "\"action_id\":\"seeded_slot_activate:seed-standby-seed-1\"");
+    try expectContains(typed_activate.body, "\"target\":\"seed-standby-seed-1\"");
+    try expectContains(typed_activate.body, "\"state\":\"applied\"");
+    try expectContains(typed_activate.body, "\"checkpoint_lsn\":2");
+    try expectContains(typed_activate.body, "\"capture_receipt_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"");
+    const activated = primary.slot("standby-seed") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(slot_store.SlotLifecycle.streaming, activated.lifecycle);
+    try std.testing.expect(activated.active);
+
+    var typed_activate_retry = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_base_backups_activate,
+        .content_type = "application/json",
+        .body = activate_body,
+    });
+    defer typed_activate_retry.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_activate_retry.status);
+    try expectContains(typed_activate_retry.body, "\"state\":\"already_applied\"");
 
     const bootstrap_body = try std.fmt.allocPrint(
         alloc,

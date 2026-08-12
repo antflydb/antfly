@@ -16,25 +16,34 @@ import (
 	"github.com/getkin/kin-openapi/openapi3"
 )
 
-// ContentSecurityConfig defines model for ContentSecurityConfig.
+// ContentSecurityConfig Low-level content download policy. In the generic scraper, omitted
+// `allowed_hosts` and `allowed_paths` fields do not restrict those sources;
+// explicit empty lists deny them. Consumers may merge this object over a
+// stricter baseline before downloading. Antfly inference does so: omitted
+// or empty inference policies, and omitted inference allowlists, deny
+// HTTP(S), file, and S3 content until explicit allowlists are configured.
+// Do not assume omission has identical policy semantics across consumers.
 type ContentSecurityConfig struct {
-	// AllowedHosts Whitelist of allowed hostnames/IPs for link downloads. If empty, all hosts are allowed (except private IPs if block_private_ips is true).
+	// AllowedHosts Whitelist for HTTP(S) downloads. With block_private_ips enabled (the default), IP literals and every address resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address. Set block_private_ips to false only to opt into private or special destinations. The generic scraper treats omission as unrestricted subject to that policy and an explicit empty list as deny-all; Antfly inference requires an explicit allowlist.
 	AllowedHosts []string `json:"allowed_hosts,omitempty,omitzero"`
 
-	// AllowedPaths Whitelist of allowed path prefixes for file:// and s3:// URLs. If empty, all paths are allowed. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
+	// AllowedPaths Whitelist of allowed path prefixes for file:// and s3:// URLs. The generic scraper treats omission as unrestricted and an explicit empty list as deny-all. Consumers may impose stricter defaults; Antfly inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
 	AllowedPaths []string `json:"allowed_paths,omitempty,omitzero"`
 
-	// BlockPrivateIps Block requests to private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)
+	// BlockPrivateIps Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special destinations.
 	BlockPrivateIps bool `json:"block_private_ips,omitempty,omitzero"`
 
-	// DownloadTimeoutSeconds Timeout for individual download operations in seconds
+	// DownloadTimeoutSeconds Maximum HTTP(S) and S3 download duration in seconds. Defaults to 30. Zero disables this configured ceiling, but a caller-supplied request deadline still applies. A deadline-bound file:// fetch fails closed because portable filesystem I/O does not expose a preemptive timeout.
 	DownloadTimeoutSeconds int `json:"download_timeout_seconds,omitempty,omitzero"`
 
 	// MaxDownloadSizeBytes Maximum size of downloaded content in bytes
 	MaxDownloadSizeBytes int64 `json:"max_download_size_bytes,omitempty,omitzero"`
 
-	// MaxImageDimension Maximum image width/height in pixels (images will be resized)
+	// MaxImageDimension Maximum source-image width or height enforced for accepted inference image inputs, including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Images are rejected rather than resized. Batch generation rejects multimodal content before fetch; non-inference scraping consumers do not enforce this setting.
 	MaxImageDimension int `json:"max_image_dimension,omitempty,omitzero"`
+
+	// Nat64Prefixes RFC 6052 network-specific NAT64 prefixes used by this deployment. Resolved IPv6 addresses under these prefixes are decoded and checked against the private IPv4 policy. Prefix length must be 32, 40, 48, 56, 64, or 96.
+	Nat64Prefixes []string `json:"nat64_prefixes,omitempty,omitzero"`
 
 	// UserAgent User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
 	UserAgent string `json:"user_agent,omitempty,omitzero"`
@@ -42,11 +51,19 @@ type ContentSecurityConfig struct {
 
 // HTTPCredentialConfig HTTP credential for authenticated endpoints.
 type HTTPCredentialConfig struct {
-	// BaseUrl Base URL prefix this credential applies to.
+	// BaseUrl Exact HTTP(S) origin and optional path scope for this credential. Matching requires the same scheme, host, and effective port plus a path-segment boundary; automatic selection uses the longest matching scope. An explicitly named credential must exist and match this scope or the fetch fails closed.
 	BaseUrl string `json:"base_url,omitempty,omitzero"`
 
 	// Headers HTTP headers to include. Supports secret-store references (e.g., "${secret:token}").
-	Headers  map[string]string     `json:"headers,omitempty,omitzero"`
+	Headers map[string]string `json:"headers,omitempty,omitzero"`
+
+	// Security Low-level content download policy. In the generic scraper, omitted
+	// `allowed_hosts` and `allowed_paths` fields do not restrict those sources;
+	// explicit empty lists deny them. Consumers may merge this object over a
+	// stricter baseline before downloading. Antfly inference does so: omitted
+	// or empty inference policies, and omitted inference allowlists, deny
+	// HTTP(S), file, and S3 content until explicit allowlists are configured.
+	// Do not assume omission has identical policy semantics across consumers.
 	Security ContentSecurityConfig `json:"security,omitempty,omitzero"`
 }
 
@@ -66,8 +83,16 @@ type RemoteContentConfig struct {
 	Http map[string]HTTPCredentialConfig `json:"http,omitempty,omitzero"`
 
 	// S3 Named S3 credentials for remote content fetching.
-	S3       map[string]S3CredentialConfig `json:"s3,omitempty,omitzero"`
-	Security ContentSecurityConfig         `json:"security,omitempty,omitzero"`
+	S3 map[string]S3CredentialConfig `json:"s3,omitempty,omitzero"`
+
+	// Security Low-level content download policy. In the generic scraper, omitted
+	// `allowed_hosts` and `allowed_paths` fields do not restrict those sources;
+	// explicit empty lists deny them. Consumers may merge this object over a
+	// stricter baseline before downloading. Antfly inference does so: omitted
+	// or empty inference policies, and omitted inference allowlists, deny
+	// HTTP(S), file, and S3 content until explicit allowlists are configured.
+	// Do not assume omission has identical policy semantics across consumers.
+	Security ContentSecurityConfig `json:"security,omitempty,omitzero"`
 }
 
 // S3CredentialConfig defines model for S3CredentialConfig.
@@ -82,8 +107,16 @@ type S3CredentialConfig struct {
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
 
 	// SecretAccessKey AWS secret access key. Supports secret-store references. Falls back to AWS_SECRET_ACCESS_KEY when not set.
-	SecretAccessKey string                `json:"secret_access_key,omitempty,omitzero"`
-	Security        ContentSecurityConfig `json:"security,omitempty,omitzero"`
+	SecretAccessKey string `json:"secret_access_key,omitempty,omitzero"`
+
+	// Security Low-level content download policy. In the generic scraper, omitted
+	// `allowed_hosts` and `allowed_paths` fields do not restrict those sources;
+	// explicit empty lists deny them. Consumers may merge this object over a
+	// stricter baseline before downloading. Antfly inference does so: omitted
+	// or empty inference policies, and omitted inference allowlists, deny
+	// HTTP(S), file, and S3 content until explicit allowlists are configured.
+	// Do not assume omission has identical policy semantics across consumers.
+	Security ContentSecurityConfig `json:"security,omitempty,omitzero"`
 
 	// SessionToken Optional AWS session token for temporary credentials. Supports secret-store references.
 	SessionToken string `json:"session_token,omitempty,omitzero"`
@@ -95,37 +128,52 @@ type S3CredentialConfig struct {
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
-	"9aMhdcTw4UqVUj7/NwAA//+/9+bIHBQAAA==",
+	"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",
+	"wYlG6TAdUUUM/zlQlZRP/wsAAP//FFHzydQcAAA=",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

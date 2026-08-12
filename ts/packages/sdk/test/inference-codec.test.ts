@@ -72,6 +72,21 @@ describe("Binary Embedding Codec", () => {
       expect(view.getFloat32(20, true)).toBeCloseTo(-0.00002, 6);
       expect(view.getFloat32(24, true)).toBeCloseTo(0.00003, 6);
     });
+
+    it("rejects zero-width and ragged matrices before allocation", () => {
+      expect(() => serializeEmbeddings([[]])).toThrow("zero dimension");
+      expect(() => serializeEmbeddings([[1, 2], [3]])).toThrow(
+        "vector 1 has dimension 1, expected 2"
+      );
+    });
+
+    it("rejects unsafe buffer-size arithmetic before allocation", () => {
+      const forged = {
+        length: Number.MAX_SAFE_INTEGER,
+        0: [1, 2],
+      } as unknown as number[][];
+      expect(() => serializeEmbeddings(forged)).toThrow("too large to serialize safely");
+    });
   });
 
   describe("deserializeEmbeddings", () => {
@@ -118,6 +133,35 @@ describe("Binary Embedding Codec", () => {
       expect(result[0]).toEqual([1.0, 2.0]);
       expect(result[1]).toEqual([3.0, 4.0]);
       expect(result[2]).toEqual([5.0, 6.0]);
+    });
+
+    it("rejects malformed headers before allocating vectors", () => {
+      expect(() => deserializeEmbeddings(new ArrayBuffer(7))).toThrow("missing vector count");
+
+      const zeroDimension = new ArrayBuffer(16);
+      const zeroDimensionView = new DataView(zeroDimension);
+      zeroDimensionView.setBigUint64(0, 0xffffffffffffffffn, true);
+      zeroDimensionView.setBigUint64(8, 0n, true);
+      expect(() => deserializeEmbeddings(zeroDimension)).toThrow(
+        "non-empty response has zero dimension"
+      );
+
+      const truncated = new ArrayBuffer(16);
+      const truncatedView = new DataView(truncated);
+      truncatedView.setBigUint64(0, 1n, true);
+      truncatedView.setBigUint64(8, 1n, true);
+      expect(() => deserializeEmbeddings(truncated)).toThrow(
+        "header declares 20 bytes, received 16"
+      );
+    });
+
+    it("rejects payloads whose nested arrays would exceed the decoded memory budget", () => {
+      const vectorCount = 4_000_000;
+      const buffer = new ArrayBuffer(16 + vectorCount * 4);
+      const view = new DataView(buffer);
+      view.setBigUint64(0, BigInt(vectorCount), true);
+      view.setBigUint64(8, 1n, true);
+      expect(() => deserializeEmbeddings(buffer)).toThrow("exceeds decoded size limit");
     });
   });
 

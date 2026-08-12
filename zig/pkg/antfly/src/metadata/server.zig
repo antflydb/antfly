@@ -14,13 +14,14 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
-const metadata_mod = @import("mod.zig");
+const metadata_mod = @import("domain.zig");
 const metadata_authority = @import("authority.zig");
 const service = @import("service.zig");
 const transition_state = @import("transition_state.zig");
 const metadata_storage = @import("storage/mod.zig");
 const metadata_http_server = @import("http_server.zig");
 const public_api_http_server = @import("../api/http_server.zig");
+const public_api_kernel = @import("../api/kernel_bridge.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("../api/table_reads.zig");
 const api_table_router = @import("../api/table_router.zig");
@@ -57,7 +58,7 @@ pub const MetadataServer = struct {
     owned_admin_http_server: ?*metadata_http_server.MetadataHttpServer = null,
     owned_public_read_source: ?*api_table_reads.HostedProvisionedTableReadSource = null,
     owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
-    owned_public_http_server: ?*public_api_http_server.ApiHttpServer = null,
+    owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
     owned_admin_listener: ?*raft_transport.StdHttpListener = null,
     restore_supervisor_owner_id: u64 = 0,
@@ -118,7 +119,7 @@ pub const MetadataServer = struct {
         errdefer if (owned_public_read_source) |read_source| alloc.destroy(read_source);
         var owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null;
         errdefer if (owned_public_write_source) |write_source| alloc.destroy(write_source);
-        var owned_public_http_server: ?*public_api_http_server.ApiHttpServer = null;
+        var owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null;
         errdefer if (owned_public_http_server) |public_http_server| {
             public_http_server.deinit();
             alloc.destroy(public_http_server);
@@ -183,8 +184,8 @@ pub const MetadataServer = struct {
                 .is_current = metadataRestoreLeadershipIsCurrent,
             };
 
-            const public_http_server = try alloc.create(public_api_http_server.ApiHttpServer);
-            public_http_server.* = public_api_http_server.ApiHttpServer.initWithProcessRequestAllocator(
+            const public_http_server = try alloc.create(public_api_kernel.ApiHttpServer);
+            public_http_server.* = public_api_kernel.ApiHttpServer.initWithProcessRequestAllocator(
                 alloc,
                 api_server_cfg,
                 public_api_http_server.StatusSource.fromMetadataHttpService(svc),
@@ -437,7 +438,7 @@ pub const MetadataServer = struct {
 
 const MetadataAdminMux = struct {
     admin: *metadata_http_server.MetadataHttpServer,
-    public_api: *public_api_http_server.ApiHttpServer,
+    public_api: *public_api_kernel.ApiHttpServer,
     svc: *service.MetadataHttpService,
     restore_leadership_mutex: std.atomic.Mutex = .unlocked,
     restore_leadership_term: u64 = 0,
@@ -513,13 +514,13 @@ const MetadataAdminMux = struct {
 };
 
 fn metadataRestoreJobPersistence(svc: *service.MetadataHttpService) restore_jobs.ReplicatedPersistence {
-    return .{ .ptr = svc, .vtable = &.{
+    return restore_jobs.ReplicatedPersistence.fromLocal(svc, .{
         .load = metadataRestoreJobLoad,
         .get = metadataRestoreJobGet,
         .put = metadataRestoreJobPut,
         .delete = metadataRestoreJobDelete,
         .delete_many = metadataRestoreJobDeleteMany,
-    } };
+    });
 }
 
 fn metadataRestoreJobGet(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {

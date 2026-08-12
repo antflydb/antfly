@@ -8,7 +8,7 @@ special-purpose test tiers.
 Run the default test suite from the repository root:
 
 ```sh
-zig build test
+make zig-test
 ```
 
 `zig build test` depends on the default package aggregates:
@@ -25,8 +25,8 @@ targets.
 Pull-request CI runs fast required checks:
 
 - `zig build check-snowball`
-- `zig build unit-test`
-- `zig build -Doptimize=ReleaseFast install -Dedition=full`
+- `make zig-unit-test`
+- `zig build -Doptimize=ReleaseFast antfly`
 - shared release-binary smoke checks
 - `e2e-base`
 - TLA checks when relevant files change
@@ -34,7 +34,7 @@ Pull-request CI runs fast required checks:
 Merge queue and `main` push CI also run the default aggregate:
 
 ```sh
-zig build test
+make zig-test
 ```
 
 Nightly/manual validation should use broader checks such as `e2e-full`,
@@ -72,13 +72,19 @@ package with the root build's relevant backend options forwarded.
 Run the hermetic unit and focused integration bucket:
 
 ```sh
-zig build unit-test
+make zig-unit-test
 ```
 
 `unit-test` is where default, no-fetch Antfly, storage, and shared-library unit
 coverage belongs. Focused aliases such as `lib-json-test`, `db-test`, and
 `wal-test` remain available for narrower iteration, but broad module suites are
 wired into `unit-test` once.
+
+The aggregate Make targets reserve 20% memory headroom and use the patched Zig
+0.16 build runner so ready steps retain their declared RSS reservations. Set
+`ANTFLY_ZIG_MAX_RSS` to an explicit byte count to override the detected budget.
+From the `zig/` directory, the equivalent targets are `make test` and
+`make unit-test`.
 
 Run mocked-time and modeled simulation checks:
 
@@ -156,7 +162,7 @@ external-service, model, browser, or slow integration coverage. Run the same
 base tier locally with the release binaries:
 
 ```sh
-zig build -Doptimize=ReleaseFast install -Dedition=full
+zig build -Doptimize=ReleaseFast antfly
 
 ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest -q \
   -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not slow" \
@@ -222,7 +228,7 @@ long-running scenarios so they stay in `e2e-full`.
 Run the Antfly product E2E suite:
 
 ```sh
-zig build install -Dedition=full
+zig build antfly
 ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest -q e2e/antfly
 ```
 
@@ -275,7 +281,7 @@ export GOOGLE_CLOUD_PROJECT=my-project
 Run the inference product E2E suite:
 
 ```sh
-zig build install -Dedition=inference
+zig build antfly
 ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/inference pytest -q e2e/inference
 ```
 

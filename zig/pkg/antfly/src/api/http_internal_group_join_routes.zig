@@ -22,7 +22,7 @@ const metadata_api = @import("../metadata/api.zig");
 const query_api = @import("query.zig");
 const raft_mod = @import("../raft/mod.zig");
 const routes = @import("http_routes.zig");
-const table_reads = @import("table_reads.zig");
+const table_reads = @import("table_read_source.zig");
 
 pub const Context = struct {
     alloc: std.mem.Allocator,

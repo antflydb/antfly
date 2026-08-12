@@ -12,6 +12,8 @@ from .aggregation_bucket import AggregationBucket
 from .aggregation_bucket_sub_aggregations import AggregationBucketSubAggregations
 from .aggregation_date_range import AggregationDateRange
 from .aggregation_range import AggregationRange
+from .aggregation_request import AggregationRequest
+from .aggregation_request_sub_aggregations import AggregationRequestSubAggregations
 from .aggregation_result import AggregationResult
 from .aggregation_type import AggregationType
 from .algebraic_aggregation_join import AlgebraicAggregationJoin
@@ -27,6 +29,7 @@ from .algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverRe
 from .algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
 from .analyses import Analyses
 from .analyses_result import AnalysesResult
+from .answer_agent_request import AnswerAgentRequest
 from .answer_agent_result import AnswerAgentResult
 from .answer_agent_steps import AnswerAgentSteps
 from .antfly_chunker_config import AntflyChunkerConfig
@@ -110,6 +113,8 @@ from .connection_status import ConnectionStatus
 from .connections_response import ConnectionsResponse
 from .create_api_key_request import CreateApiKeyRequest
 from .create_api_key_request_row_filter_type_0 import CreateApiKeyRequestRowFilterType0
+from .create_table_request import CreateTableRequest
+from .create_table_request_indexes import CreateTableRequestIndexes
 from .create_user_request import CreateUserRequest
 from .create_user_request_metadata_type_0 import CreateUserRequestMetadataType0
 from .credentials import Credentials
@@ -252,7 +257,10 @@ from .geo_bounding_box_query import GeoBoundingBoxQuery
 from .geo_bounding_polygon_query import GeoBoundingPolygonQuery
 from .geo_distance_query import GeoDistanceQuery
 from .geo_point import GeoPoint
+from .geo_shape import GeoShape
+from .geo_shape_geometry import GeoShapeGeometry
 from .geo_shape_geometry_relation import GeoShapeGeometryRelation
+from .geo_shape_query import GeoShapeQuery
 from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
@@ -334,6 +342,7 @@ from .inference_generate_batch_response import InferenceGenerateBatchResponse
 from .inference_generate_batch_response_object import InferenceGenerateBatchResponseObject
 from .inference_generate_batch_result_item import InferenceGenerateBatchResultItem
 from .inference_generate_batch_summary import InferenceGenerateBatchSummary
+from .inference_generate_chat_template_kwargs import InferenceGenerateChatTemplateKwargs
 from .inference_generate_choice import InferenceGenerateChoice
 from .inference_generate_choice_logprobs_type_0 import InferenceGenerateChoiceLogprobsType0
 from .inference_generate_chunk import InferenceGenerateChunk
@@ -347,10 +356,14 @@ from .inference_generate_request import InferenceGenerateRequest
 from .inference_generate_request_cache_dtype import InferenceGenerateRequestCacheDtype
 from .inference_generate_request_compiled_target import InferenceGenerateRequestCompiledTarget
 from .inference_generate_request_mode import InferenceGenerateRequestMode
+from .inference_generate_request_speculation_calibration import InferenceGenerateRequestSpeculationCalibration
+from .inference_generate_request_speculation_policy import InferenceGenerateRequestSpeculationPolicy
 from .inference_generate_response import InferenceGenerateResponse
 from .inference_generate_response_format import InferenceGenerateResponseFormat
 from .inference_generate_response_format_type import InferenceGenerateResponseFormatType
 from .inference_generate_response_object import InferenceGenerateResponseObject
+from .inference_generate_speculation_status import InferenceGenerateSpeculationStatus
+from .inference_generate_stream_options import InferenceGenerateStreamOptions
 from .inference_generate_usage import InferenceGenerateUsage
 from .inference_image_url import InferenceImageURL
 from .inference_image_url_content_part import InferenceImageURLContentPart
@@ -416,8 +429,9 @@ from .inference_tool import InferenceTool
 from .inference_tool_call_delta import InferenceToolCallDelta
 from .inference_tool_call_delta_type import InferenceToolCallDeltaType
 from .inference_tool_call_function_delta import InferenceToolCallFunctionDelta
+from .inference_tool_choice_function import InferenceToolChoiceFunction
 from .inference_tool_choice_type_0 import InferenceToolChoiceType0
-from .inference_tool_choice_type_1_function import InferenceToolChoiceType1Function
+from .inference_tool_choice_type_1 import InferenceToolChoiceType1
 from .inference_tool_choice_type_1_type import InferenceToolChoiceType1Type
 from .inference_tool_type import InferenceToolType
 from .inference_transcribe_object import InferenceTranscribeObject
@@ -436,7 +450,9 @@ from .invoke_inference_connection_body import InvokeInferenceConnectionBody
 from .invoke_inference_connection_operation import InvokeInferenceConnectionOperation
 from .invoke_inference_connection_response_200 import InvokeInferenceConnectionResponse200
 from .ip_range_query import IPRangeQuery
+from .join_clause import JoinClause
 from .join_condition import JoinCondition
+from .join_filters import JoinFilters
 from .join_operator import JoinOperator
 from .join_profile import JoinProfile
 from .join_strategy import JoinStrategy
@@ -514,6 +530,9 @@ from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse2
 from .query_builder_request import QueryBuilderRequest
 from .query_builder_request_constraints import QueryBuilderRequestConstraints
 from .query_builder_request_example_documents_item import QueryBuilderRequestExampleDocumentsItem
+from .query_builder_result import QueryBuilderResult
+from .query_builder_result_plan import QueryBuilderResultPlan
+from .query_builder_result_query import QueryBuilderResultQuery
 from .query_hit import QueryHit
 from .query_hit_hierarchy import QueryHitHierarchy
 from .query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
@@ -526,6 +545,13 @@ from .query_hits import QueryHits
 from .query_hits_total import QueryHitsTotal
 from .query_hits_total_relation import QueryHitsTotalRelation
 from .query_profile import QueryProfile
+from .query_request import QueryRequest
+from .query_request_aggregations import QueryRequestAggregations
+from .query_request_embeddings import QueryRequestEmbeddings
+from .query_request_expand_strategy import QueryRequestExpandStrategy
+from .query_request_foreign_sources import QueryRequestForeignSources
+from .query_request_graph_searches import QueryRequestGraphSearches
+from .query_request_query import QueryRequestQuery
 from .query_responses import QueryResponses
 from .query_result import QueryResult
 from .query_result_aggregations import QueryResultAggregations
@@ -538,8 +564,11 @@ from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
 from .repair_run_request_control import RepairRunRequestControl
 from .repair_target import RepairTarget
+from .replication_route import ReplicationRoute
+from .replication_source import ReplicationSource
 from .replication_source_action_hint import ReplicationSourceActionHint
 from .replication_source_status import ReplicationSourceStatus
+from .replication_source_type import ReplicationSourceType
 from .replication_transform_op import ReplicationTransformOp
 from .reranker_config import RerankerConfig
 from .reranker_profile import RerankerProfile
@@ -555,9 +584,11 @@ from .restore_job_result_restore import RestoreJobResultRestore
 from .restore_job_result_status import RestoreJobResultStatus
 from .restore_job_scope import RestoreJobScope
 from .restore_request import RestoreRequest
+from .retrieval_agent_request import RetrievalAgentRequest
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
 from .retrieval_agent_usage import RetrievalAgentUsage
+from .retrieval_query_request import RetrievalQueryRequest
 from .retrieval_step_config import RetrievalStepConfig
 from .retrieval_strategy import RetrievalStrategy
 from .retry_config import RetryConfig
@@ -568,6 +599,7 @@ from .row_filter_entry_filter import RowFilterEntryFilter
 from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
+from .scan_keys_request import ScanKeysRequest
 from .secret_entry import SecretEntry
 from .secret_list import SecretList
 from .secret_status import SecretStatus
@@ -600,9 +632,11 @@ from .storage_runtime_status_engine import StorageRuntimeStatusEngine
 from .storage_status import StorageStatus
 from .success_message import SuccessMessage
 from .sync_level import SyncLevel
+from .table import Table
 from .table_artifact_enrichment_list import TableArtifactEnrichmentList
 from .table_backup_status import TableBackupStatus
 from .table_backup_status_status import TableBackupStatusStatus
+from .table_indexes import TableIndexes
 from .table_migration import TableMigration
 from .table_migration_state import TableMigrationState
 from .table_repair_issue import TableRepairIssue
@@ -617,8 +651,10 @@ from .table_restore_status import TableRestoreStatus
 from .table_restore_status_status import TableRestoreStatusStatus
 from .table_schema import TableSchema
 from .table_schema_document_schemas import TableSchemaDocumentSchemas
+from .table_shards import TableShards
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
+from .table_status import TableStatus
 from .table_storage_unreadable_error import TableStorageUnreadableError
 from .table_storage_unreadable_error_code import TableStorageUnreadableErrorCode
 from .tavily_search_config import TavilySearchConfig
@@ -699,6 +735,8 @@ __all__ = (
     "AggregationBucketSubAggregations",
     "AggregationDateRange",
     "AggregationRange",
+    "AggregationRequest",
+    "AggregationRequestSubAggregations",
     "AggregationResult",
     "AggregationType",
     "AlgebraicAggregationJoin",
@@ -714,6 +752,7 @@ __all__ = (
     "AlgebraicIndexStatsSourceArtifact",
     "Analyses",
     "AnalysesResult",
+    "AnswerAgentRequest",
     "AnswerAgentResult",
     "AnswerAgentSteps",
     "AntflyChunkerConfig",
@@ -797,6 +836,8 @@ __all__ = (
     "ConnectionStatus",
     "CreateApiKeyRequest",
     "CreateApiKeyRequestRowFilterType0",
+    "CreateTableRequest",
+    "CreateTableRequestIndexes",
     "CreateUserRequest",
     "CreateUserRequestMetadataType0",
     "Credentials",
@@ -937,7 +978,10 @@ __all__ = (
     "GeoBoundingPolygonQuery",
     "GeoDistanceQuery",
     "GeoPoint",
+    "GeoShape",
+    "GeoShapeGeometry",
     "GeoShapeGeometryRelation",
+    "GeoShapeQuery",
     "GetCurrentUserResponse200",
     "GetCurrentUserResponse200MetadataType0",
     "GetDocumentArtifactManifestDetail",
@@ -1019,6 +1063,7 @@ __all__ = (
     "InferenceGenerateBatchResponseObject",
     "InferenceGenerateBatchResultItem",
     "InferenceGenerateBatchSummary",
+    "InferenceGenerateChatTemplateKwargs",
     "InferenceGenerateChoice",
     "InferenceGenerateChoiceLogprobsType0",
     "InferenceGenerateChunk",
@@ -1032,10 +1077,14 @@ __all__ = (
     "InferenceGenerateRequestCacheDtype",
     "InferenceGenerateRequestCompiledTarget",
     "InferenceGenerateRequestMode",
+    "InferenceGenerateRequestSpeculationCalibration",
+    "InferenceGenerateRequestSpeculationPolicy",
     "InferenceGenerateResponse",
     "InferenceGenerateResponseFormat",
     "InferenceGenerateResponseFormatType",
     "InferenceGenerateResponseObject",
+    "InferenceGenerateSpeculationStatus",
+    "InferenceGenerateStreamOptions",
     "InferenceGenerateUsage",
     "InferenceImageURL",
     "InferenceImageURLContentPart",
@@ -1102,8 +1151,9 @@ __all__ = (
     "InferenceToolCallDelta",
     "InferenceToolCallDeltaType",
     "InferenceToolCallFunctionDelta",
+    "InferenceToolChoiceFunction",
     "InferenceToolChoiceType0",
-    "InferenceToolChoiceType1Function",
+    "InferenceToolChoiceType1",
     "InferenceToolChoiceType1Type",
     "InferenceToolType",
     "InferenceTranscribeObject",
@@ -1121,7 +1171,9 @@ __all__ = (
     "InvokeInferenceConnectionOperation",
     "InvokeInferenceConnectionResponse200",
     "IPRangeQuery",
+    "JoinClause",
     "JoinCondition",
+    "JoinFilters",
     "JoinOperator",
     "JoinProfile",
     "JoinStrategy",
@@ -1199,6 +1251,9 @@ __all__ = (
     "QueryBuilderRequest",
     "QueryBuilderRequestConstraints",
     "QueryBuilderRequestExampleDocumentsItem",
+    "QueryBuilderResult",
+    "QueryBuilderResultPlan",
+    "QueryBuilderResultQuery",
     "QueryHit",
     "QueryHitHierarchy",
     "QueryHitHierarchyAncestors",
@@ -1211,6 +1266,13 @@ __all__ = (
     "QueryHitsTotal",
     "QueryHitsTotalRelation",
     "QueryProfile",
+    "QueryRequest",
+    "QueryRequestAggregations",
+    "QueryRequestEmbeddings",
+    "QueryRequestExpandStrategy",
+    "QueryRequestForeignSources",
+    "QueryRequestGraphSearches",
+    "QueryRequestQuery",
     "QueryResponses",
     "QueryResult",
     "QueryResultAggregations",
@@ -1223,8 +1285,11 @@ __all__ = (
     "RepairRunRequest",
     "RepairRunRequestControl",
     "RepairTarget",
+    "ReplicationRoute",
+    "ReplicationSource",
     "ReplicationSourceActionHint",
     "ReplicationSourceStatus",
+    "ReplicationSourceType",
     "ReplicationTransformOp",
     "RerankerConfig",
     "RerankerProfile",
@@ -1240,9 +1305,11 @@ __all__ = (
     "RestoreJobResultStatus",
     "RestoreJobScope",
     "RestoreRequest",
+    "RetrievalAgentRequest",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
     "RetrievalAgentUsage",
+    "RetrievalQueryRequest",
     "RetrievalStepConfig",
     "RetrievalStrategy",
     "RetryConfig",
@@ -1253,6 +1320,7 @@ __all__ = (
     "RuntimeConfigStatus",
     "RuntimeDecl",
     "RuntimeDeclMode",
+    "ScanKeysRequest",
     "SecretEntry",
     "SecretList",
     "SecretStatus",
@@ -1285,9 +1353,11 @@ __all__ = (
     "StorageStatus",
     "SuccessMessage",
     "SyncLevel",
+    "Table",
     "TableArtifactEnrichmentList",
     "TableBackupStatus",
     "TableBackupStatusStatus",
+    "TableIndexes",
     "TableMigration",
     "TableMigrationState",
     "TableRepairIssue",
@@ -1302,8 +1372,10 @@ __all__ = (
     "TableRestoreStatusStatus",
     "TableSchema",
     "TableSchemaDocumentSchemas",
+    "TableShards",
     "TableStatistics",
     "TableStatisticsFieldStats",
+    "TableStatus",
     "TableStorageUnreadableError",
     "TableStorageUnreadableErrorCode",
     "TavilySearchConfig",

@@ -5,11 +5,6 @@ clusters running in Standalone mode. It is separate from the Raft metadata HA pa
 hot standby is a single-primary data-plane strategy with one or more standby
 processes receiving and applying HA WAL records.
 
-> [!IMPORTANT]
-> Hot-standby HA is release-gated off by default. The operator must be started
-> with `--enable-hot-standby-ha=true` before it will admit or reconcile an
-> `AntflyCluster` with `spec.highAvailability.mode: HotStandby`.
-
 ## Control Surfaces
 
 Use the typed admin API for normal automation:
@@ -108,7 +103,44 @@ In `status.haStatus`, check:
   `fencing.reason`;
 - `primaryRoute`;
 - `formerPrimary`;
-- `plannedActions`.
+- `plannedActions`, including `operationID`, `executionStateVersion`,
+  `attemptCount`, `retryBudgetUsed`, `inFlightAttempt`, `attemptID`,
+  `reservationExpiresAt`, `prerequisiteDeadlineAt`, `firstAttemptAt`,
+  `lastAttemptAt`, `nextRetryAt`, `completedAt`, `retryable`, and `errorClass`.
+
+Typed admin requests use a durable, bounded exponential retry policy. The
+defaults are eight retry-budget charges, a five-second initial delay, a
+two-minute maximum delay, a 30-second in-flight reservation, and a ten-minute
+prerequisite deadline. Override them with `admin.directRetryLimit`,
+`admin.directRetryBaseSeconds`, `admin.directRetryMaxSeconds`,
+`admin.directReservationSeconds`, and
+`admin.directPrerequisiteTimeoutSeconds`.
+
+Before every typed request, the operator persists an exact frozen action and
+an in-flight reservation. It sends at most one request, checkpoints the typed
+result (and promotion receipt, when applicable), and ends that reconcile. A
+restart cannot replay the request before `reservationExpiresAt`; after expiry,
+the exact request may be replayed only through the runtime's idempotent receipt
+contract. An expired uncertain request consumes retry budget. Status conflicts
+retry only the narrow checkpoint and never repeat the external request.
+
+`attemptCount` is monotonic and records every dispatched request.
+`retryBudgetUsed` records retryable request failures and expired uncertain
+reservations. A valid promotion assessment that is still behind the frozen LSN
+increments `attemptCount` but not `retryBudgetUsed`; it waits until the bounded
+`prerequisiteDeadlineAt`. Exhausting either bounded failure path produces a
+terminal `Failed` action. Ordinary LSN progress and regenerated reason text do
+not create a new operation or reset a terminal budget. After an operator has
+corrected the cause of a terminal failure, increment
+`admin.retryGeneration` to explicitly authorize one new execution identity;
+the webhook rejects decreasing this nonce.
+
+CLI-backed Jobs remain bounded by their Kubernetes Job backoff and deadline
+settings. They use `restartPolicy: Never`, and `attemptCount` is derived from
+started pods owned by the exact current Job UID, not Job counters, names, or
+labels. TTL cleanup is armed only on a later reconcile after terminal evidence
+has been checkpointed, so even `jobTTLSecondsAfterFinished: 0` cannot delete
+the only result before status is durable.
 
 ## Bootstrap and Reseed
 
@@ -128,6 +160,117 @@ A lagging standby must not pin WAL forever. If retained WAL is no longer
 sufficient, the operator should mark the standby as reseed-required and publish
 the reseed action instead of silently dropping required records or holding
 unbounded retention.
+
+### Portable seed artifacts
+
+Configure `standbys[*].seedArtifact` when the source backup and the standby do
+not share a filesystem. The same path is used for initial bootstrap and reseed:
+
+1. capture the base backup in the primary runtime and freeze its manifest boundary;
+2. publish every file and bounded chunk to an immutable object-store generation, then publish `COMPLETE.json` last;
+3. reverify the complete remote v3 generation before garbage-collecting old local source captures;
+4. restore and verify that exact topology-bound generation on the standby PVC;
+5. atomically activate the verified local generation;
+6. activate the replication slot from the target activation receipt;
+7. copy that exact raw slot receipt into an immutable, action-scoped ConfigMap and garbage-collect old target generations;
+8. only then prune older complete remote generations.
+
+```yaml
+spec:
+  highAvailability:
+    admin:
+      executePlannedActions: true
+    standbys:
+      - name: standby-a
+        slotName: standby-a
+        seedManifestPath: /source/seed/manifest.afha
+        seedContentRoot: /source/seed/content
+        seedArtifact:
+          location: s3://company-ha-seeds/my-cluster
+          generation: seed-standby-a-42
+          topologyID: production-us-west
+          topologyGeneration: 42
+          nodeID: standby-a
+          targetPVCUID: 21ea57e0-79d5-48d0-b124-ef42ed73fc3f
+          stagingRoot: /target/seed/current
+          retainGenerations: 2
+          credentialsSecretRef:
+            name: ha-seed-object-store
+          sourcePVC:
+            claimName: primary-data
+            mountPath: /source
+          targetPVC:
+            claimName: standby-a-data
+            mountPath: /target
+```
+
+Source volumes are mounted only by publish/source-GC Jobs and target volumes
+only by restore/activate/target-GC Jobs. Every Job is scoped to one PVC. Before
+dispatch the controller compares the persisted topology generation and desired
+PVC UID with the current spec and live Kubernetes PVC; the Job name and owner
+references bind that exact PVC incarnation. A replacement PVC or topology
+generation therefore cannot inherit an old action.
+
+When a live StatefulSet pod already mounts a publish-source RWO PVC, the
+operator adds required same-node pod affinity to the artifact Job using the
+stable StatefulSet pod-name label. Terminating pods remain consumers until
+deleted, preventing an attach race during shutdown. RWX sources need no
+consumer-derived placement; RWOP sources cannot be shared with any live
+non-owner pod. A restore or activation target must have no live consumer at
+all. Only pods controlled by the exact current Job owner UID are excluded; a
+same-name stale Job pod is not trusted. Multiple RWO consumers, an
+unidentifiable consumer, or an unmounted publish source that is not already
+bound to a stable PV fails closed instead of guessing placement.
+
+Legacy unbound publish and restore evidence accepts artifact receipt formats v1
+and v2. Production topology-bound transport requires v3, whose `COMPLETE.json`
+carries the exact topology ID/generation, target node, slot, target PVC name and
+UID. Restore rejects a missing or mismatched binding before writing its durable
+activation receipt. Activation, local GC, and remote-prune receipts use their
+action-specific v1 schemas. Unknown versions, scopes, fields, trailing JSON,
+or identity mismatches fail closed.
+
+The restore helper never clears an arbitrary directory. It accepts a missing or
+empty target, a partial directory carrying the matching operator staging
+marker, or an already-complete directory whose receipt and every file reverify.
+A non-empty unowned directory, wrong cluster/shard/table/timeline/epoch, stale
+checkpoint, path traversal, size mismatch, CRC mismatch, SHA-256 mismatch, or
+missing `COMPLETE.json` fails before standby bootstrap changes durable state.
+
+Use `s3://` or `gs://` in production and `file://` only for local or KinD
+fixtures. Inject credentials through `credentialsSecretRef` or workload
+identity; never place credentials in the URI. Configure provider-side TLS,
+server-side encryption/KMS, bucket versioning, lifecycle policy, and least-
+privilege access scoped to this cluster prefix. Artifact Jobs emit receipts on
+stdout, while durable action progress, retries, terminal errors, object-store
+location, generation, and retention appear in
+`status.haStatus.plannedActions`.
+
+For local KinD validation, use a filesystem-backed object-store fixture mounted
+at a `file://` URI and distinct source and target PVCs. Delete the publish or
+restore Job/pod between attempts to exercise idempotent restart behavior; never
+use `kubectl cp`, `kubectl exec`, a hostPath bridge, or a test-only catalog.
+
+### Durable seed lifecycle evidence
+
+The runtime appends the exact topology-bound receipt to a durable local ledger
+only after capture `COMPLETE.json` or target activation `ACTIVE` is fsynced.
+Retries with the same identity and digest return the original cursor; reuse of
+that identity with different bytes fails closed. The bounded payload history
+survives runtime restart and generation garbage collection, while a compact
+identity/digest index prevents old identities from being reused after history
+truncation.
+
+Controllers read the authenticated, read-only endpoint
+`GET /admin/v1/ha/seed-lifecycle/receipts`. The required `kind` query is
+`capture` or `activation`; `after` is an exclusive durable WAL cursor and
+`limit` is between 1 and 1000. Responses include `first_cursor`, `end_cursor`,
+`next_cursor`, `history_truncated`, `gap`, and `has_more`. A `gap` means the
+requested cursor predates the retained payload prefix and must never be treated
+as proof that an action completed. Each entry carries the exact receipt JSON
+and SHA-256, topology generation, node and PVC UID binding, pod UID, timestamp,
+and whether the authoritative filesystem receipt is still retained. Runtime
+observation includes the serving node, role, pod UID, and current fenced state.
 
 ## Promotion
 
@@ -186,6 +329,23 @@ Alert on:
 - stale or unsupported fences;
 - unsafe promotion requests;
 - old-primary write attempts after promotion.
+
+The operator metrics endpoint exports bounded-label HA execution telemetry:
+
+| Metric | Meaning |
+|--------|---------|
+| `antfly_operator_ha_action_attempts_total` | Actual direct API or Kubernetes Job execution attempts |
+| `antfly_operator_ha_action_retries_total` | Attempts after the first for an exact action identity |
+| `antfly_operator_ha_action_failures_total` | Retryable and terminal failures with a bounded error class |
+| `antfly_operator_ha_action_waits_total` | Successful bounded prerequisite observations, such as promotion-boundary waits |
+| `antfly_operator_ha_action_duration_seconds` | First-attempt to terminal-completion latency |
+| `antfly_operator_ha_seed_artifact_bytes` | Size distribution for successful portable seed operations |
+| `antfly_operator_ha_seed_artifact_files` | File-count distribution for successful portable seed operations |
+
+Page on terminal failures, repeated retry-budget exhaustion, and sustained
+seed-action latency. Raw Kubernetes Job reasons and response bodies remain in
+status and logs; they are deliberately collapsed into bounded metric labels to
+avoid cardinality growth.
 
 For incidents, preserve:
 

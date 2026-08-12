@@ -174,13 +174,13 @@ pub fn layerSpec(
         .sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0,
         .rope_dim = @intCast(config.layerRopeFrequencyDim(layer)),
         .rope_active_dim = @intCast(config.layerRopeActiveDim(layer)),
-        .rope_theta = config.layerRopeTheta(layer),
+        .rope_theta = config.layerRopeEffectiveTheta(layer),
         .attn_pre_norm_slot = normSlot(layer, .attn_pre),
         .attn_post_norm_slot = normSlot(layer, .attn_post),
         .ffn_pre_norm_slot = normSlot(layer, .ffn_pre),
         .ffn_post_norm_slot = normSlot(layer, .ffn_post),
         .q_head_norm_slot = qHeadNormSlot(configured_layer_count, layer),
-        .k_head_norm_slot = kHeadNormSlot(configured_layer_count, layer),
+        .k_head_norm_slot = if (!shares_kv) kHeadNormSlot(configured_layer_count, layer) else null,
         .q_linear_slot = linearSlot(layer, .attn_q),
         .k_linear_slot = linearSlot(layer, .attn_k),
         .v_linear_slot = linearSlot(layer, .attn_v),
@@ -327,4 +327,51 @@ test "gemma4 whole-frame prefill supports shared kv" {
         .ple_hidden_size = 256,
     };
     try std.testing.expect(supportsWholeFramePrefill(config, config.num_hidden_layers));
+}
+
+test "gemma4 shared kv layer spec omits k head norm slot" {
+    const config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 4,
+        .num_kv_shared_layers = 5,
+        .intermediate_size = 8960,
+        .ple_hidden_size = 256,
+    };
+    const donor = layerSpec(config, config.num_hidden_layers, 29, null);
+    const shared = layerSpec(config, config.num_hidden_layers, 30, null);
+
+    try std.testing.expect(!donor.shares_kv);
+    try std.testing.expect(donor.k_head_norm_slot != null);
+    try std.testing.expect(shared.shares_kv);
+    try std.testing.expectEqual(@as(?usize, null), shared.k_head_norm_slot);
+}
+
+test "gemma4 layer spec resolves rope factors before the backend boundary" {
+    const config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .intermediate_size = 6144,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+        .rope_theta = 1_000_000.0,
+        .rope_partial_factor = 1.0,
+        .rope_dim_override = 128,
+    };
+    const full_attention = layerSpec(config, config.num_hidden_layers, 4, null);
+
+    try std.testing.expectEqual(@as(usize, 512), full_attention.rope_dim);
+    try std.testing.expectEqual(@as(usize, 128), full_attention.rope_active_dim);
+    try std.testing.expectApproxEqRel(
+        config.layerRopeEffectiveTheta(4),
+        full_attention.rope_theta,
+        1e-6,
+    );
 }

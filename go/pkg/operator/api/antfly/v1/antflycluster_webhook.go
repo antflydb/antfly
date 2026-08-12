@@ -16,6 +16,8 @@ import (
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 )
 
+const haTopologyIDAnnotation = "antfly.io/ha-topology-id"
+
 var (
 	// irsaARNPattern matches AWS IAM Role ARNs including China and GovCloud partitions.
 	irsaARNPattern = regexp.MustCompile(`^arn:aws(-cn|-us-gov)?:iam::\d{12}:role/.+$`)
@@ -29,6 +31,7 @@ var (
 	// haIdentifierPattern matches HA node IDs and slot names accepted by the Zig
 	// HA runtime validators.
 	haIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
+	haSHA256Pattern     = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // ValidateCreate validates the cluster configuration when creating a new cluster.
@@ -53,6 +56,7 @@ func (r *AntflyCluster) ValidateUpdate(old runtime.Object) error {
 
 // Default applies admission defaults to AntflyCluster.
 func (r *AntflyCluster) Default() {
+	r.NormalizeLegacySwarm()
 	if r.Spec.Mode == "" {
 		r.Spec.Mode = ClusterModeDistributed
 	}
@@ -61,6 +65,9 @@ func (r *AntflyCluster) Default() {
 
 	if r.Spec.Mode != ClusterModeStandalone || r.Spec.Standalone == nil {
 		return
+	}
+	if r.Spec.Standalone.ResourceIdentity == "" {
+		r.Spec.Standalone.ResourceIdentity = StandaloneResourceIdentityV1
 	}
 	if r.Spec.Storage.Engine == "" {
 		r.Spec.Storage.Engine = "local"
@@ -108,6 +115,30 @@ func (r *AntflyCluster) Default() {
 	if r.Spec.Standalone.Inference.APIURL == "" {
 		r.Spec.Standalone.Inference.APIURL = "http://0.0.0.0:11433"
 	}
+}
+
+// NormalizeLegacySwarm maps the deprecated single-node wire shape onto the
+// Standalone runtime while retaining its immutable StatefulSet/PVC identity.
+// Controllers use this on a working copy; admission persists the one-way shape
+// conversion when an old object is next updated.
+func (r *AntflyCluster) NormalizeLegacySwarm() {
+	if r.Spec.Mode != ClusterModeSwarm {
+		return
+	}
+	if r.Spec.Standalone == nil && r.Spec.Swarm != nil {
+		r.Spec.Standalone = r.Spec.Swarm
+	}
+	if r.Spec.Standalone != nil {
+		r.Spec.Standalone.ResourceIdentity = StandaloneResourceIdentityLegacySwarm
+	}
+	if r.Spec.Storage.StandaloneStorage == "" {
+		r.Spec.Storage.StandaloneStorage = r.Spec.Storage.SwarmStorage
+	}
+	if r.Spec.Storage.StorageAutoGrow != nil && r.Spec.Storage.StorageAutoGrow.MaxStandaloneStorage == "" {
+		r.Spec.Storage.StorageAutoGrow.MaxStandaloneStorage = r.Spec.Storage.StorageAutoGrow.MaxSwarmStorage
+	}
+	r.Spec.Mode = ClusterModeStandalone
+	r.Spec.Swarm = nil
 }
 
 // ValidateAntflyCluster performs all validation checks
@@ -629,7 +660,9 @@ func (r *AntflyCluster) ValidateImmutability(old *AntflyCluster) error {
 
 	oldMode := old.effectiveMode()
 	newMode := r.effectiveMode()
-	if newMode != oldMode {
+	legacySwarmMigration := oldMode == ClusterModeSwarm && newMode == ClusterModeStandalone &&
+		r.Spec.Standalone != nil && r.Spec.Standalone.ResourceIdentity == StandaloneResourceIdentityLegacySwarm
+	if newMode != oldMode && !legacySwarmMigration {
 		errors = append(errors, fmt.Sprintf(
 			`field 'spec.mode' is immutable after deployment
 
@@ -640,6 +673,26 @@ Solution: Delete and recreate the cluster to change this setting.
 Current value: "%s"
 Attempted change: "%s"`,
 			oldMode, newMode))
+	}
+	if oldMode == ClusterModeStandalone && newMode == ClusterModeStandalone && old.Spec.Standalone != nil && r.Spec.Standalone != nil {
+		oldIdentity := old.Spec.Standalone.ResourceIdentity
+		if oldIdentity == "" {
+			oldIdentity = StandaloneResourceIdentityV1
+		}
+		newIdentity := r.Spec.Standalone.ResourceIdentity
+		if newIdentity == "" {
+			newIdentity = StandaloneResourceIdentityV1
+		}
+		if oldIdentity != newIdentity {
+			errors = append(errors, "field 'spec.standalone.resourceIdentity' is immutable after deployment")
+		}
+	}
+	if legacySwarmMigration && old.Spec.Storage.SwarmStorage != "" && r.Spec.Storage.StandaloneStorage != "" {
+		oldQ, oldErr := resource.ParseQuantity(old.Spec.Storage.SwarmStorage)
+		newQ, newErr := resource.ParseQuantity(r.Spec.Storage.StandaloneStorage)
+		if oldErr != nil || newErr != nil || newQ.Cmp(oldQ) < 0 {
+			errors = append(errors, "legacy Swarm to Standalone migration must not decrease storage")
+		}
 	}
 
 	oldStorageEngine := effectiveStorageEngine(old.Spec.Storage)
@@ -823,6 +876,21 @@ Problem: PVC storage size cannot be reduced. Kubernetes only supports volume exp
 Problem: PVC storage size cannot be reduced. Kubernetes only supports volume expansion, not shrinking.`,
 				old.Spec.Storage.StandaloneStorage, r.Spec.Storage.StandaloneStorage))
 		}
+	}
+	oldRetryGeneration := int64(0)
+	if old.Spec.HighAvailability != nil && old.Spec.HighAvailability.Admin != nil {
+		oldRetryGeneration = old.Spec.HighAvailability.Admin.RetryGeneration
+	}
+	newRetryGeneration := int64(0)
+	if r.Spec.HighAvailability != nil && r.Spec.HighAvailability.Admin != nil {
+		newRetryGeneration = r.Spec.HighAvailability.Admin.RetryGeneration
+	}
+	if newRetryGeneration < oldRetryGeneration {
+		errors = append(errors, fmt.Sprintf(
+			"spec.highAvailability.admin.retryGeneration cannot decrease (current: %d, attempted: %d)",
+			oldRetryGeneration,
+			newRetryGeneration,
+		))
 	}
 
 	if len(errors) > 0 {
@@ -1242,6 +1310,62 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if strings.TrimSpace(standby.SeedContentRoot) != "" && strings.TrimSpace(standby.SeedManifestPath) == "" {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath is required when seedContentRoot is set", i))
 		}
+		if artifact := standby.SeedArtifact; artifact != nil {
+			fieldPath := fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact", i)
+			errors = append(errors, validateHASeedArtifact(artifact, fieldPath)...)
+			hasManifest := strings.TrimSpace(standby.SeedManifestPath) != ""
+			hasContent := strings.TrimSpace(standby.SeedContentRoot) != ""
+			targetOnly := standbyLocalTargetOnlySeedArtifactBound(ha, standby, artifact)
+			if artifact.TargetPVC == nil {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact.targetPVC is required for executable portable seed handling", i))
+			}
+			if !targetOnly {
+				if artifact.SourcePVC == nil {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact.sourcePVC is required for executable seed publication", i))
+				}
+				hasAnyBinding := strings.TrimSpace(artifact.TopologyID) != "" || artifact.TopologyGeneration != 0 ||
+					strings.TrimSpace(artifact.NodeID) != "" || strings.TrimSpace(artifact.TargetPVCUID) != ""
+				if (hasManifest || hasContent || hasAnyBinding) &&
+					(strings.TrimSpace(artifact.TopologyID) == "" || artifact.TopologyGeneration <= 0 ||
+						strings.TrimSpace(artifact.NodeID) == "" || strings.TrimSpace(artifact.TargetPVCUID) == "") {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact requires topologyID, topologyGeneration, nodeID, and targetPVCUID for an executable seed chain", i))
+				}
+			}
+			if hasManifest != hasContent {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath and seedContentRoot must either both be set or both be omitted for runtime-owned capture", i))
+			}
+			if targetOnly {
+				if artifact.SourcePVC != nil {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact.sourcePVC must be omitted for standby-local target-only seed artifact", i))
+				}
+			} else if !hasManifest && !hasContent {
+				if ha.Runtime == nil || ha.Runtime.Role != HARuntimeRolePrimary {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d] runtime-owned seed capture requires runtime.role Primary", i))
+				}
+				if artifact.SourcePVC == nil {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact.sourcePVC is required for runtime-owned seed publication", i))
+				} else {
+					captureRoot := "/antflydb/ha/seed-captures"
+					if ha.Runtime != nil && strings.TrimSpace(ha.Runtime.SeedCaptureRoot) != "" {
+						captureRoot = ha.Runtime.SeedCaptureRoot
+					}
+					if !haPathWithinMount(captureRoot, artifact.SourcePVC.MountPath) {
+						errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d] runtime seedCaptureRoot must be within seedArtifact.sourcePVC.mountPath", i))
+					}
+				}
+			}
+			if artifact.SourcePVC != nil && hasManifest && hasContent {
+				if !haPathWithinMount(standby.SeedManifestPath, artifact.SourcePVC.MountPath) {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath must be within seedArtifact.sourcePVC.mountPath", i))
+				}
+				if !haPathWithinMount(standby.SeedContentRoot, artifact.SourcePVC.MountPath) {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedContentRoot must be within seedArtifact.sourcePVC.mountPath", i))
+				}
+			}
+			if artifact.TargetPVC != nil && !haPathWithinMount(artifact.StagingRoot, artifact.TargetPVC.MountPath) {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedArtifact.stagingRoot must be within targetPVC.mountPath", i))
+			}
+		}
 		if standby.DropSlotOnRemoval && standbyDesiredBySpec(standby) {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].dropSlotOnRemoval requires desired=false", i))
 		}
@@ -1271,6 +1395,35 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if admin.JobTTLSecondsAfterFinished != nil && *admin.JobTTLSecondsAfterFinished < 0 {
 			errors = append(errors, "spec.highAvailability.admin.jobTTLSecondsAfterFinished must not be negative")
 		}
+		if admin.DirectRetryLimit != nil && *admin.DirectRetryLimit <= 0 {
+			errors = append(errors, "spec.highAvailability.admin.directRetryLimit must be greater than 0")
+		}
+		if admin.DirectRetryBaseSeconds != nil && *admin.DirectRetryBaseSeconds <= 0 {
+			errors = append(errors, "spec.highAvailability.admin.directRetryBaseSeconds must be greater than 0")
+		}
+		if admin.DirectRetryMaxSeconds != nil && *admin.DirectRetryMaxSeconds <= 0 {
+			errors = append(errors, "spec.highAvailability.admin.directRetryMaxSeconds must be greater than 0")
+		}
+		effectiveRetryBase := int32(5)
+		if admin.DirectRetryBaseSeconds != nil {
+			effectiveRetryBase = *admin.DirectRetryBaseSeconds
+		}
+		effectiveRetryMaximum := int32(120)
+		if admin.DirectRetryMaxSeconds != nil {
+			effectiveRetryMaximum = *admin.DirectRetryMaxSeconds
+		}
+		if effectiveRetryMaximum < effectiveRetryBase {
+			errors = append(errors, "spec.highAvailability.admin.directRetryMaxSeconds must be greater than or equal to directRetryBaseSeconds")
+		}
+		if admin.DirectReservationSeconds != nil && *admin.DirectReservationSeconds <= 0 {
+			errors = append(errors, "spec.highAvailability.admin.directReservationSeconds must be greater than 0")
+		}
+		if admin.DirectPrerequisiteTimeoutSeconds != nil && *admin.DirectPrerequisiteTimeoutSeconds <= 0 {
+			errors = append(errors, "spec.highAvailability.admin.directPrerequisiteTimeoutSeconds must be greater than 0")
+		}
+		if admin.RetryGeneration < 0 {
+			errors = append(errors, "spec.highAvailability.admin.retryGeneration must not be negative")
+		}
 		errors = append(errors, validateHAAdminJobPodSpec(admin)...)
 		if admin.ExecutePlannedActions {
 			if strings.TrimSpace(admin.PrimaryURL) == "" {
@@ -1286,6 +1439,7 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		errors = append(errors, "spec.highAvailability.runtime is only supported when spec.mode=Standalone")
 	}
 	errors = append(errors, validateHARuntime(ha)...)
+	errors = append(errors, r.validateHAStartupGate(ha)...)
 	errors = append(errors, r.validateHARuntimeAdminTokenSource(ha)...)
 
 	if identity := ha.Identity; identity != nil {
@@ -1391,8 +1545,25 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if ha.Identity == nil {
 			errors = append(errors, "spec.highAvailability.automaticFailover requires spec.highAvailability.identity")
 		}
-		if failover.requireRemoteApplyOrDefault() && ha.SyncPolicy != nil && ha.SyncPolicy.modeOrDefault() == HADurabilityModeRemoteWrite {
-			errors = append(errors, "spec.highAvailability.automaticFailover.requireRemoteApply requires syncPolicy.mode RemoteApply or Async")
+		if fencingAuthority == HAFencingAuthorityKubernetesLease {
+			if ha.Runtime == nil || ha.Runtime.FencingLease == nil {
+				errors = append(errors, "spec.highAvailability.automaticFailover with KubernetesLease requires runtime.fencingLease shared by every topology member")
+			} else if strings.TrimSpace(ha.Runtime.FencingLease.Name) == "" ||
+				strings.TrimSpace(ha.Runtime.FencingLease.TopologyID) == "" {
+				errors = append(errors, "spec.highAvailability.runtime.fencingLease.name and topologyID are required")
+			} else if ha.Runtime.FencingLease.WatchdogGraceSeconds > 0 && ha.Runtime.FencingLease.WatchdogGraceSeconds < 10 {
+				errors = append(errors, "spec.highAvailability.runtime.fencingLease.watchdogGraceSeconds must be at least 10 seconds so polling and request latency fit inside the authority window")
+			} else if ha.Runtime.FencingLease.WatchdogGraceSeconds >= 30 {
+				errors = append(errors, "spec.highAvailability.runtime.fencingLease.watchdogGraceSeconds must be less than the 30 second Lease duration")
+			}
+		}
+		if !failover.requireRemoteApplyOrDefault() {
+			errors = append(errors, "spec.highAvailability.automaticFailover.requireRemoteApply must be true for no-loss automatic failover")
+		}
+		if ha.SyncPolicy == nil || ha.SyncPolicy.modeOrDefault() != HADurabilityModeRemoteApply {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires syncPolicy.mode RemoteApply")
+		} else if ha.SyncPolicy.FailurePolicy == HAFailurePolicyDegradeToAsync {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires syncPolicy.failurePolicy Block or FailClosed")
 		}
 	}
 
@@ -1400,6 +1571,216 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		return fmt.Errorf("high availability validation failed:\n  - %s", strings.Join(errors, "\n  - "))
 	}
 	return nil
+}
+
+func validateHASeedArtifact(artifact *HASeedArtifactSpec, fieldPath string) []string {
+	if artifact == nil {
+		return nil
+	}
+	var errors []string
+	hasTopologyBinding := strings.TrimSpace(artifact.TopologyID) != "" || artifact.TopologyGeneration != 0 ||
+		strings.TrimSpace(artifact.NodeID) != "" || strings.TrimSpace(artifact.TargetPVCUID) != ""
+	if hasTopologyBinding {
+		if value := strings.TrimSpace(artifact.TopologyID); value == "" || value != artifact.TopologyID || !validHAIdentifier(value) {
+			errors = append(errors, fmt.Sprintf("%s.topologyID must be a valid HA identifier when seed topology binding is configured", fieldPath))
+		}
+		if artifact.TopologyGeneration <= 0 {
+			errors = append(errors, fmt.Sprintf("%s.topologyGeneration must be greater than zero when seed topology binding is configured", fieldPath))
+		}
+		if value := strings.TrimSpace(artifact.NodeID); value == "" || value != artifact.NodeID || !validHAIdentifier(value) {
+			errors = append(errors, fmt.Sprintf("%s.nodeID must be a valid HA identifier when seed topology binding is configured", fieldPath))
+		}
+		if value := strings.TrimSpace(artifact.TargetPVCUID); value == "" || value != artifact.TargetPVCUID || containsASCIIWhitespace(value) {
+			errors = append(errors, fmt.Sprintf("%s.targetPVCUID is required without whitespace when seed topology binding is configured", fieldPath))
+		}
+	}
+	location := strings.TrimSpace(artifact.Location)
+	if location == "" {
+		errors = append(errors, fmt.Sprintf("%s.location is required", fieldPath))
+	} else if location != artifact.Location || containsASCIIWhitespace(location) {
+		errors = append(errors, fmt.Sprintf("%s.location must not contain leading, trailing, or embedded whitespace", fieldPath))
+	} else if parsed, err := url.Parse(location); err != nil || parsed.Scheme == "" ||
+		(parsed.Scheme != "s3" && parsed.Scheme != "gs" && parsed.Scheme != "file") {
+		errors = append(errors, fmt.Sprintf("%s.location must be an s3://, gs://, or file:// URI", fieldPath))
+	}
+	if prefix := strings.TrimSpace(artifact.GenerationPrefix); prefix != "" {
+		if prefix != artifact.GenerationPrefix || !validHAIdentifier(prefix) {
+			errors = append(errors, fmt.Sprintf("%s.generationPrefix must be a valid HA identifier without surrounding whitespace", fieldPath))
+		}
+	}
+	if generation := strings.TrimSpace(artifact.Generation); generation != "" {
+		if generation != artifact.Generation || !validHAIdentifier(generation) {
+			errors = append(errors, fmt.Sprintf("%s.generation must be a valid exact HA identifier without surrounding whitespace", fieldPath))
+		}
+	} else if artifact.Generation != "" {
+		errors = append(errors, fmt.Sprintf("%s.generation must not be whitespace", fieldPath))
+	}
+	errors = append(errors, validateHAOptionalPath(artifact.StagingRoot, fieldPath+".stagingRoot")...)
+	if strings.TrimSpace(artifact.StagingRoot) == "" {
+		errors = append(errors, fmt.Sprintf("%s.stagingRoot is required", fieldPath))
+	}
+	if artifact.RetainGenerations < 0 {
+		errors = append(errors, fmt.Sprintf("%s.retainGenerations must not be negative", fieldPath))
+	}
+	if ref := artifact.CredentialsSecretRef; ref != nil {
+		name := strings.TrimSpace(ref.Name)
+		if name == "" {
+			errors = append(errors, fmt.Sprintf("%s.credentialsSecretRef.name is required", fieldPath))
+		} else if name != ref.Name {
+			errors = append(errors, fmt.Sprintf("%s.credentialsSecretRef.name must not have leading or trailing whitespace", fieldPath))
+		} else if nameErrs := utilvalidation.IsDNS1123Subdomain(name); len(nameErrs) > 0 {
+			errors = append(errors, fmt.Sprintf("%s.credentialsSecretRef.name %q is invalid: %s", fieldPath, name, strings.Join(nameErrs, "; ")))
+		}
+	}
+	errors = append(errors, validateHASeedPVC(artifact.SourcePVC, fieldPath+".sourcePVC")...)
+	errors = append(errors, validateHASeedPVC(artifact.TargetPVC, fieldPath+".targetPVC")...)
+	return errors
+}
+
+func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string {
+	if ha == nil || ha.Runtime == nil || ha.Runtime.StartupGate == nil {
+		return nil
+	}
+	gate := ha.Runtime.StartupGate
+	fieldPath := "spec.highAvailability.runtime.startupGate"
+	var errors []string
+	if ha.Runtime.Role != HARuntimeRoleStandby {
+		errors = append(errors, fieldPath+" requires runtime.role Standby")
+	}
+	if gate.Policy == HAStartupGatePolicySuspend {
+		if gate.RuntimeEligible {
+			errors = append(errors, fieldPath+".policy Suspend requires runtimeEligible=false")
+		}
+		if gate.ReceiptMatchPolicy != "" {
+			errors = append(errors, fieldPath+".receiptMatchPolicy must be omitted for Suspend")
+		}
+		if gate.RequiredReceipt != nil {
+			errors = append(errors, fieldPath+".requiredReceipt must be omitted for Suspend")
+		}
+		return errors
+	}
+	if gate.Policy != HAStartupGatePolicyRequireActivatedSeed {
+		errors = append(errors, fieldPath+".policy must be Suspend or RequireActivatedSeed")
+	}
+	if gate.ReceiptMatchPolicy != HAReceiptMatchPolicyExact {
+		errors = append(errors, fieldPath+".receiptMatchPolicy must be Exact for RequireActivatedSeed")
+	}
+	if gate.RequiredReceipt == nil {
+		errors = append(errors, fieldPath+".requiredReceipt is required for RequireActivatedSeed")
+		return errors
+	}
+	required := *gate.RequiredReceipt
+
+	validateID := func(value, name string) {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			errors = append(errors, fieldPath+".requiredReceipt."+name+" is required")
+		} else if value != trimmed || !validHAIdentifier(trimmed) {
+			errors = append(errors, fieldPath+".requiredReceipt."+name+" must be a valid HA identifier without surrounding whitespace")
+		}
+	}
+	validateID(required.TopologyID, "topologyID")
+	validateID(required.NodeID, "nodeID")
+	validateID(required.SlotName, "slotName")
+	validateID(required.Generation, "generation")
+	expectedTopologyID := strings.TrimSpace(r.Name)
+	topologySource := "metadata.name"
+	if annotated, present := r.Annotations[haTopologyIDAnnotation]; present {
+		expectedTopologyID = strings.TrimSpace(annotated)
+		topologySource = "metadata.annotations[" + haTopologyIDAnnotation + "]"
+		if annotated != expectedTopologyID || !validHAIdentifier(expectedTopologyID) {
+			errors = append(errors, topologySource+" must be a valid HA identifier without surrounding whitespace")
+		}
+	}
+	if strings.TrimSpace(required.TopologyID) != expectedTopologyID {
+		errors = append(errors, fieldPath+".requiredReceipt.topologyID must match "+topologySource)
+	}
+	if required.TopologyGeneration < 0 {
+		errors = append(errors, fieldPath+".requiredReceipt.topologyGeneration must not be negative")
+	}
+	if strings.TrimSpace(required.NodeID) != strings.TrimSpace(ha.Runtime.NodeID) {
+		errors = append(errors, fieldPath+".requiredReceipt.nodeID must match runtime.nodeID")
+	}
+	if ha.Runtime.Standby == nil || strings.TrimSpace(required.SlotName) != strings.TrimSpace(ha.Runtime.Standby.SlotName) {
+		errors = append(errors, fieldPath+".requiredReceipt.slotName must match runtime.standby.slotName")
+	}
+
+	targetPVCName := strings.TrimSpace(required.TargetPVCName)
+	if targetPVCName == "" {
+		errors = append(errors, fieldPath+".requiredReceipt.targetPVCName is required")
+	} else if required.TargetPVCName != targetPVCName {
+		errors = append(errors, fieldPath+".requiredReceipt.targetPVCName must not have leading or trailing whitespace")
+	} else if nameErrs := utilvalidation.IsDNS1123Subdomain(targetPVCName); len(nameErrs) > 0 {
+		errors = append(errors, fmt.Sprintf("%s.requiredReceipt.targetPVCName %q is invalid: %s", fieldPath, targetPVCName, strings.Join(nameErrs, "; ")))
+	}
+
+	var artifact *HASeedArtifactSpec
+	for i := range ha.Standbys {
+		standby := &ha.Standbys[i]
+		slotName := strings.TrimSpace(standby.SlotName)
+		if slotName == "" {
+			slotName = strings.TrimSpace(standby.Name)
+		}
+		if slotName == strings.TrimSpace(required.SlotName) {
+			artifact = standby.SeedArtifact
+			break
+		}
+	}
+	if artifact == nil {
+		errors = append(errors, fieldPath+".requiredReceipt.slotName must reference a standby with seedArtifact")
+	} else {
+		if strings.TrimSpace(required.Generation) != strings.TrimSpace(artifact.Generation) {
+			errors = append(errors, fieldPath+".requiredReceipt.generation must match seedArtifact.generation")
+		}
+		if artifact.TargetPVC == nil || targetPVCName != strings.TrimSpace(artifact.TargetPVC.ClaimName) {
+			errors = append(errors, fieldPath+".requiredReceipt.targetPVCName must match seedArtifact.targetPVC.claimName")
+		}
+	}
+
+	for name, value := range map[string]string{
+		"manifestSHA256":    required.ManifestSHA256,
+		"aggregateSHA256":   required.AggregateSHA256,
+		"seedReceiptSHA256": required.SeedReceiptSHA256,
+	} {
+		if value != "" && !haSHA256Pattern.MatchString(value) {
+			errors = append(errors, fieldPath+".requiredReceipt."+name+" must be a lowercase SHA-256 digest")
+		}
+	}
+	if required.TargetPVCUID != "" && required.TargetPVCUID != strings.TrimSpace(required.TargetPVCUID) {
+		errors = append(errors, fieldPath+".requiredReceipt.targetPVCUID must not have leading or trailing whitespace")
+	}
+	return errors
+}
+
+func validateHASeedPVC(pvc *HASeedArtifactPVCSpec, fieldPath string) []string {
+	if pvc == nil {
+		return nil
+	}
+	var errors []string
+	claimName := strings.TrimSpace(pvc.ClaimName)
+	if claimName == "" {
+		errors = append(errors, fieldPath+".claimName is required")
+	} else if claimName != pvc.ClaimName {
+		errors = append(errors, fieldPath+".claimName must not have leading or trailing whitespace")
+	} else if nameErrs := utilvalidation.IsDNS1123Subdomain(claimName); len(nameErrs) > 0 {
+		errors = append(errors, fmt.Sprintf("%s.claimName %q is invalid: %s", fieldPath, claimName, strings.Join(nameErrs, "; ")))
+	}
+	if !filepath.IsAbs(pvc.MountPath) || filepath.Clean(pvc.MountPath) != pvc.MountPath {
+		errors = append(errors, fieldPath+".mountPath must be an absolute normalized path")
+	}
+	return errors
+}
+
+func haPathWithinMount(value, mountPath string) bool {
+	value = strings.TrimSpace(value)
+	mountPath = filepath.Clean(strings.TrimSpace(mountPath))
+	if value == "" || mountPath == "" || !filepath.IsAbs(value) || !filepath.IsAbs(mountPath) {
+		return false
+	}
+	if mountPath == string(filepath.Separator) {
+		return true
+	}
+	return value == mountPath || strings.HasPrefix(value, mountPath+string(filepath.Separator))
 }
 
 func validateHAAdminURL(raw string, fieldPath string) []string {
@@ -1442,6 +1823,7 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 	}
 	runtime := ha.Runtime
 	var errors []string
+	errors = append(errors, validateHAOptionalPath(runtime.SeedCaptureRoot, "spec.highAvailability.runtime.seedCaptureRoot")...)
 	nodeID := strings.TrimSpace(runtime.NodeID)
 	currentPrimaryID := ""
 	if ha.Identity != nil {
@@ -1562,12 +1944,15 @@ func validateHAOptionalPath(value string, fieldPath string) []string {
 }
 
 func validHAIdentifier(value string) bool {
-	return haIdentifierPattern.MatchString(value)
+	return value != "." && value != ".." && haIdentifierPattern.MatchString(value)
 }
 
 func (r *AntflyCluster) validateHARuntimeAdminTokenSource(ha *HighAvailabilitySpec) []string {
-	if ha == nil || ha.Runtime == nil || strings.TrimSpace(ha.Runtime.AdminTokenEnvVar) == "" {
+	if ha == nil || ha.Runtime == nil {
 		return nil
+	}
+	if strings.TrimSpace(ha.Runtime.AdminTokenEnvVar) == "" {
+		return []string{"spec.highAvailability.runtime.adminTokenEnvVar is required for a hot-standby runtime"}
 	}
 	if ha.Runtime.AdminTokenSecretRef != nil {
 		return nil
@@ -1637,6 +2022,35 @@ func validateHAAdminJobPodSpec(admin *HAAdminSpec) []string {
 
 func standbyDesiredBySpec(standby HAStandbySpec) bool {
 	return standby.Desired == nil || *standby.Desired
+}
+
+// standbyLocalTargetOnlySeedArtifactBound recognizes the deliberately narrow
+// seed descriptor rendered into a standby runtime CR. It is not a publication
+// source: its only purpose is to bind the startup gate to the exact generation
+// already activated on the target PVC. All other source-less artifacts retain
+// the primary-only runtime capture validation path.
+func standbyLocalTargetOnlySeedArtifactBound(ha *HighAvailabilitySpec, standby HAStandbySpec, artifact *HASeedArtifactSpec) bool {
+	if ha == nil || ha.Runtime == nil || ha.Runtime.Role != HARuntimeRoleStandby ||
+		standby.Desired == nil || *standby.Desired || artifact == nil ||
+		strings.TrimSpace(standby.SeedManifestPath) != "" || strings.TrimSpace(standby.SeedContentRoot) != "" {
+		return false
+	}
+	gate := ha.Runtime.StartupGate
+	if gate == nil || gate.Policy != HAStartupGatePolicyRequireActivatedSeed ||
+		gate.ReceiptMatchPolicy != HAReceiptMatchPolicyExact || gate.RequiredReceipt == nil {
+		return false
+	}
+	required := gate.RequiredReceipt
+	slotName := strings.TrimSpace(standby.SlotName)
+	if slotName == "" {
+		slotName = strings.TrimSpace(standby.Name)
+	}
+	return slotName != "" && slotName == strings.TrimSpace(required.SlotName) &&
+		strings.TrimSpace(artifact.Generation) != "" &&
+		strings.TrimSpace(artifact.Generation) == strings.TrimSpace(required.Generation) &&
+		artifact.TargetPVC != nil &&
+		strings.TrimSpace(artifact.TargetPVC.ClaimName) != "" &&
+		strings.TrimSpace(artifact.TargetPVC.ClaimName) == strings.TrimSpace(required.TargetPVCName)
 }
 
 func highAvailabilityHasManagedConfig(ha *HighAvailabilitySpec) bool {

@@ -25,6 +25,7 @@ else
 pub const DenseEmbedFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32;
 pub const DenseEmbedBatchFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32) anyerror![]const []const f32;
 pub const DenseEmbedPartsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, parts: []const template_mod.ContentPart, dims: u32) anyerror![]f32;
+pub const DenseMediaPartLimitFn = *const fn (ptr: *anyopaque, embedding_name: []const u8) ?usize;
 pub const DenseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) void;
 pub const SparseEmbedFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8) anyerror!SparseEmbedding;
 pub const SparseEmbedBatchFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8) anyerror![]SparseEmbedding;
@@ -46,6 +47,7 @@ pub const DenseEmbedder = struct {
     dense_embed_fn: DenseEmbedFn,
     dense_embed_batch_fn: ?DenseEmbedBatchFn = null,
     dense_embed_parts_fn: ?DenseEmbedPartsFn = null,
+    media_part_limit_fn: ?DenseMediaPartLimitFn = null,
     deinit_fn: ?DenseEmbedDeinitFn = null,
 
     pub fn embedDense(self: DenseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
@@ -70,6 +72,11 @@ pub const DenseEmbedder = struct {
 
     pub fn supportsParts(self: DenseEmbedder) bool {
         return self.dense_embed_parts_fn != null;
+    }
+
+    pub fn mediaPartLimit(self: DenseEmbedder, embedding_name: []const u8) ?usize {
+        const media_part_limit_fn = self.media_part_limit_fn orelse return null;
+        return media_part_limit_fn(self.ptr, embedding_name);
     }
 
     pub fn embedDenseParts(

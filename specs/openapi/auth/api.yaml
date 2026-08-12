@@ -71,8 +71,8 @@ components:
 
     ResourceType:
       type: string
-      enum: ["table", "user", "*"]
-      description: "Type of the resource, e.g., table, user, or global ('*')."
+      enum: ["table", "user", "inference", "*"]
+      description: "Type of resource: table, user, inference, or global ('*'). Use inference with resource '*' to grant access to unified inference routes."
       example: "table"
 
     PermissionType:
@@ -86,7 +86,7 @@ components:
       properties:
         resource:
           type: string
-          description: "Resource name (e.g., table name, target username, or '*' for global)."
+          description: "Resource name (e.g., table name, target username, or '*' for all inference operations or a global grant)."
           example: "orders_table"
         resource_type:
           $ref: "#/components/schemas/ResourceType"

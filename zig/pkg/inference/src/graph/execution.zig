@@ -57,7 +57,35 @@ fn compiledModelForwardRequest(
         .seq_len = seq_len,
         .query_seq_len = decode_context.query_sequence_len,
         .attention_mode = attention_mode,
+        .max_inflight_tokens = if (decode_context.kv_cache) |kv| kv.max_inflight_tokens else 0,
+        .allow_swa_ring = if (decode_context.kv_cache) |kv| kv.allow_swa_ring else false,
     } };
+}
+
+test "compiled prefill request preserves KV ring policy" {
+    const decode_context = gpt_arch.DecodeContext{
+        .attention_mode = .paged_prefill,
+        .total_sequence_len = 64,
+        .query_sequence_len = 64,
+        .kv_sequence_len = 64,
+        .kv_cache = .{
+            .sequence_id = 1,
+            .pool_id = 2,
+            .logical_block_count = 4,
+            .tail_tokens = 16,
+            .max_inflight_tokens = 128,
+            .allow_swa_ring = true,
+        },
+    };
+
+    const request = try compiledModelForwardRequest(&.{ 1, 2 }, 64, &decode_context, .paged_prefill);
+    switch (request) {
+        .prefill => |prefill| {
+            try std.testing.expectEqual(@as(usize, 128), prefill.max_inflight_tokens);
+            try std.testing.expect(prefill.allow_swa_ring);
+        },
+        .decode => return error.TestExpectedEqual,
+    }
 }
 
 fn compiledBackendAttachContext(

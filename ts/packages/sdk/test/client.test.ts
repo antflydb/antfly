@@ -27,9 +27,28 @@ vi.mock("openapi-fetch", () => ({
 }));
 
 // Import client after mocking
-const { AntflyClient } = await import("../src/client.js");
-const { normalizeBaseUrl } = await import("../src/client.js");
+const { AntflyClient, normalizeBaseUrl, readLimitedResponseBytes, readLimitedResponseText } =
+  await import("../src/client.js");
 const { default: createClient } = await import("openapi-fetch");
+
+describe("bounded response readers", () => {
+  it("treats a null response body as empty without invoking unbounded fallbacks", async () => {
+    const arrayBuffer = vi.fn(() => Promise.reject(new Error("must not be called")));
+    const text = vi.fn(() => Promise.reject(new Error("must not be called")));
+    const response = { body: null, arrayBuffer, text } as unknown as Response;
+
+    await expect(readLimitedResponseBytes(response, 16)).resolves.toEqual({
+      bytes: new Uint8Array(0),
+      truncated: false,
+    });
+    await expect(readLimitedResponseText(response, 16)).resolves.toEqual({
+      text: "",
+      truncated: false,
+    });
+    expect(arrayBuffer).not.toHaveBeenCalled();
+    expect(text).not.toHaveBeenCalled();
+  });
+});
 
 describe("AntflyClient", () => {
   let client: AntflyClient;

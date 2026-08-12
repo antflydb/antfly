@@ -60,9 +60,9 @@ currently live under `pkg/inference/`.
 
 ```sh
 zig build
-zig build test
-zig build install -Dedition=full
-zig build antfly -- --help
+make test
+zig build antfly
+./zig-out/bin/antfly --help
 ```
 
 The inference runtime also has a package-local build file. From the repository root, use the
@@ -90,13 +90,13 @@ The default Zig test target runs unit, simulation, chaos, and checked recall
 coverage:
 
 ```sh
-zig build test
+make test
 ```
 
 Focused targets are useful while iterating:
 
 ```sh
-zig build unit-test
+make unit-test
 zig build lib-db-test
 zig build lib-storage-test
 zig build lib-metadata-test
@@ -105,6 +105,11 @@ zig build lib-audio-test
 zig build lib-raft-sim-test
 zig build inference-test
 ```
+
+The Make targets run aggregate tests with the patched Zig 0.16 scheduler and an
+RSS budget of 80% of the detected cgroup or host memory. Set
+`ANTFLY_ZIG_MAX_RSS` to an explicit byte count when a smaller local budget is
+needed. From the repository root, use `make zig-test` or `make zig-unit-test`.
 
 The Python e2e suites are split by product:
 
@@ -117,7 +122,7 @@ Some e2e tests start local binaries from `zig-out/bin`; build the relevant
 binary first when running those tests directly:
 
 ```sh
-zig build install -Dedition=full
+zig build antfly
 (cd pkg/inference && zig build -Dshared-lib-root=../..)
 ```
 

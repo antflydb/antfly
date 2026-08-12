@@ -2,9 +2,13 @@ package controllers
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"path"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -12,37 +16,49 @@ import (
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	adminsdk "github.com/antflydb/antfly/go/pkg/sdk/admin"
 	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type haActionKind string
 
 const (
-	haActionCreateSlot           haActionKind = "CreateSlot"
-	haActionResumeSlot           haActionKind = "ResumeSlot"
-	haActionPauseSlot            haActionKind = "PauseSlot"
-	haActionDropSlot             haActionKind = "DropSlot"
-	haActionSeedStandby          haActionKind = "SeedStandby"
-	haActionFinishStandbySeed    haActionKind = "FinishStandbySeed"
-	haActionBootstrapStandbySeed haActionKind = "BootstrapStandbySeed"
-	haActionMarkReseed           haActionKind = "MarkReseed"
-	haActionAcquireFence         haActionKind = "AcquireFence"
-	haActionAssessPromotion      haActionKind = "AssessPromotion"
-	haActionPromoteStandby       haActionKind = "PromoteStandby"
-	haActionUpdatePrimaryRoute   haActionKind = "UpdatePrimaryRoute"
-	haActionDemoteFormerPrimary  haActionKind = "DemoteFormerPrimary"
-	haActionRewindFormerPrimary  haActionKind = "RewindFormerPrimary"
-	haActionReseedFormerPrimary  haActionKind = "ReseedFormerPrimary"
+	haActionCreateSlot              haActionKind = "CreateSlot"
+	haActionResumeSlot              haActionKind = "ResumeSlot"
+	haActionPauseSlot               haActionKind = "PauseSlot"
+	haActionDropSlot                haActionKind = "DropSlot"
+	haActionSeedStandby             haActionKind = "SeedStandby"
+	haActionFinishStandbySeed       haActionKind = "FinishStandbySeed"
+	haActionCaptureSeedArtifact     haActionKind = "CaptureSeedArtifact"
+	haActionPublishSeedArtifact     haActionKind = "PublishSeedArtifact"
+	haActionGCSourceSeedGenerations haActionKind = "GCSourceSeedGenerations"
+	haActionRestoreSeedArtifact     haActionKind = "RestoreSeedArtifact"
+	haActionActivateSeedArtifact    haActionKind = "ActivateSeedArtifact"
+	haActionActivateSeededSlot      haActionKind = "ActivateSeededSlot"
+	haActionGCTargetSeedGenerations haActionKind = "GCTargetSeedGenerations"
+	haActionBootstrapStandbySeed    haActionKind = "BootstrapStandbySeed"
+	haActionPruneSeedArtifacts      haActionKind = "PruneSeedArtifacts"
+	haActionMarkReseed              haActionKind = "MarkReseed"
+	haActionAcquireFence            haActionKind = "AcquireFence"
+	haActionAssessPromotion         haActionKind = "AssessPromotion"
+	haActionPromoteStandby          haActionKind = "PromoteStandby"
+	haActionUpdatePrimaryRoute      haActionKind = "UpdatePrimaryRoute"
+	haActionIsolateFormerPrimary    haActionKind = "IsolateFormerPrimary"
+	haActionFenceFormerPrimary      haActionKind = "FenceFormerPrimary"
+	haActionDemoteFormerPrimary     haActionKind = "DemoteFormerPrimary"
+	haActionRewindFormerPrimary     haActionKind = "RewindFormerPrimary"
+	haActionReseedFormerPrimary     haActionKind = "ReseedFormerPrimary"
 )
 
 type haActionPhase string
 
 const (
 	haActionPhaseReconcile haActionPhase = "Reconcile"
+	haActionPhaseSeed      haActionPhase = "Seed"
 	haActionPhaseFence     haActionPhase = "Fence"
 	haActionPhasePromote   haActionPhase = "Promote"
 	haActionPhaseRoute     haActionPhase = "Route"
@@ -61,6 +77,7 @@ const (
 	haAdminBasePath                        = adminsdk.AdminV1Path
 	haAdminHAPath                          = adminsdk.HAPath
 	haAdminPrimaryStatusPath               = adminsdk.HAPrimaryStatusPath
+	haAdminWatchdogProofPath               = adminsdk.HAWatchdogProofPath
 	haAdminStandbyStatusPath               = adminsdk.HAStandbyStatusPath
 	haAdminCommitCheckPath                 = adminsdk.HACommitCheckPath
 	haAdminCommitAppendPath                = adminsdk.HACommitAppendPath
@@ -73,6 +90,9 @@ const (
 	haAdminReplicationSlotResumePathSuffix = adminsdk.HAReplicationSlotResumePathSuffix
 	haAdminBaseBackupsPath                 = adminsdk.HABaseBackupsPath
 	haAdminBaseBackupsFinishPath           = adminsdk.HABaseBackupsFinishPath
+	haAdminBaseBackupsCapturePath          = adminsdk.HABaseBackupsCapturePath
+	haAdminBaseBackupsActivatePath         = adminsdk.HABaseBackupsActivatePath
+	haAdminSeedLifecycleReceiptsPath       = adminsdk.HASeedLifecycleReceiptsPath
 	haAdminStandbyBootstrapPath            = adminsdk.HAStandbyBootstrapPath
 	haAdminFencePath                       = adminsdk.HAFencePath
 	haAdminFenceCurrentPath                = adminsdk.HAFenceCurrentPath
@@ -86,51 +106,87 @@ const (
 
 const haFencingLeaseDefaultDurationSeconds int32 = 30
 
+const haSeededSlotActivationReceiptPath = "/var/run/antfly-ha/seeded-slot-activation/seeded-slot-activation.json"
+
 const (
-	haFencingLeaseAnnotationClusterID        = "antfly.io/ha-fence-cluster-id"
-	haFencingLeaseAnnotationShardID          = "antfly.io/ha-fence-shard-id"
-	haFencingLeaseAnnotationTableID          = "antfly.io/ha-fence-table-id"
-	haFencingLeaseAnnotationTimelineID       = "antfly.io/ha-fence-timeline-id"
-	haFencingLeaseAnnotationEpoch            = "antfly.io/ha-fence-epoch"
-	haFencingLeaseAnnotationCurrentPrimaryID = "antfly.io/ha-fence-current-primary-id"
-	haFencingLeaseAnnotationPrimaryLSN       = "antfly.io/ha-fence-primary-lsn"
+	haFencingLeaseAnnotationClusterID           = "antfly.io/ha-fence-cluster-id"
+	haFencingLeaseAnnotationShardID             = "antfly.io/ha-fence-shard-id"
+	haFencingLeaseAnnotationTableID             = "antfly.io/ha-fence-table-id"
+	haFencingLeaseAnnotationTimelineID          = "antfly.io/ha-fence-timeline-id"
+	haFencingLeaseAnnotationEpoch               = "antfly.io/ha-fence-epoch"
+	haFencingLeaseAnnotationCurrentPrimaryID    = "antfly.io/ha-fence-current-primary-id"
+	haFencingLeaseAnnotationPrimaryLSN          = "antfly.io/ha-fence-primary-lsn"
+	haFencingLeaseAnnotationTopologyID          = "antfly.io/ha-fence-topology-id"
+	haFencingLeaseAnnotationTransferCommitted   = "antfly.io/ha-fence-transfer-committed"
+	haFencingLeaseAnnotationFormerHolder        = "antfly.io/ha-fence-former-holder"
+	haFencingLeaseAnnotationTransferOriginUID   = "antfly.io/ha-fence-transfer-origin-uid"
+	haFencingLeaseAnnotationCommittedTransition = "antfly.io/ha-fence-committed-transition"
+	haFencingLeaseAnnotationBootstrapReceipt    = "antfly.io/ha-fence-bootstrap-receipt"
+	haFencingLeaseAnnotationProcessBootID       = "antfly.io/ha-fence-process-boot-id"
 )
 
-func haFencingLeaseRenewalRequeueAfter() time.Duration {
-	return time.Duration(haFencingLeaseDefaultDurationSeconds) * time.Second / 3
+type haProcessIncarnationGraceKey struct {
+	leaseUID       types.UID
+	transition     int32
+	renewUnixNS    int64
+	currentProcess string
+	candidate      string
+}
+
+func haFencingLeaseRenewalRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
+	graceSeconds := int32(10)
+	if cluster != nil && cluster.Spec.HighAvailability != nil && cluster.Spec.HighAvailability.Runtime != nil &&
+		cluster.Spec.HighAvailability.Runtime.FencingLease != nil &&
+		cluster.Spec.HighAvailability.Runtime.FencingLease.WatchdogGraceSeconds > 0 {
+		graceSeconds = cluster.Spec.HighAvailability.Runtime.FencingLease.WatchdogGraceSeconds
+	}
+	// A healthy controller must create several strictly newer Lease renewals
+	// inside the runtime's local authority window. This leaves margin for API
+	// latency, reconcile queue jitter, and controller leader handoff.
+	return time.Duration(graceSeconds) * time.Second / 3
 }
 
 func haKubernetesLeaseRenewalEnabled(cluster *antflyv1.AntflyCluster) bool {
-	if cluster == nil {
-		return false
-	}
-	ha := cluster.Spec.HighAvailability
-	return ha != nil &&
-		ha.Mode != "" &&
-		ha.Mode != antflyv1.HAModeDisabled &&
-		ha.AutomaticFailover != nil &&
-		ha.AutomaticFailover.Enabled &&
-		haAutomaticFailoverExecutionEnabled(ha) &&
-		ha.AutomaticFailover.FencingAuthority == antflyv1.HAFencingAuthorityKubernetesLease
+	// Renewal, pod watchdog configuration, and least-privilege RBAC must be
+	// controlled by exactly the same ownership predicate. Divergence here can
+	// make a healthy primary fence itself after the operator stops renewing.
+	return haRuntimeLeaseWatchdogEnabled(cluster)
 }
 
 type haPlannedAction struct {
-	Kind             haActionKind
-	DependsOn        haActionKind
-	StandbyName      string
-	SlotName         string
-	TargetLSN        uint64
-	ObservedLSN      uint64
-	RetainedFromLSN  uint64
-	RouteFrom        string
-	RouteTo          string
-	FenceAuthority   antflyv1.HAFencingAuthority
-	FenceHolder      string
-	FenceGeneration  uint64
-	FenceReason      string
-	SeedManifestPath string
-	SeedContentRoot  string
-	Reason           string
+	Kind                             haActionKind
+	DependsOn                        haActionKind
+	StandbyName                      string
+	SlotName                         string
+	TargetLSN                        uint64
+	ObservedLSN                      uint64
+	RetainedFromLSN                  uint64
+	RouteFrom                        string
+	RouteTo                          string
+	FenceAuthority                   antflyv1.HAFencingAuthority
+	FenceHolder                      string
+	FenceGeneration                  uint64
+	FenceReason                      string
+	SeedManifestPath                 string
+	SeedContentRoot                  string
+	SeedArtifactTargetRoot           string
+	SeedArtifactLocation             string
+	SeedArtifactGeneration           string
+	SeedArtifactRetention            int32
+	SeedArtifactCaptureRoot          string
+	SeedCaptureReceiptPath           string
+	SeedCaptureReceiptSHA256         string
+	SeedArtifactProtectedGenerations []string
+	TopologyID                       string
+	TopologyGeneration               int64
+	TopologyNodeID                   string
+	SourcePVCName                    string
+	SourcePVCUID                     string
+	TargetPVCName                    string
+	TargetPVCUID                     string
+	TargetLocalNodeID                uint64
+	TargetReplicaID                  uint64
+	Reason                           string
 }
 
 type haSyncEvaluation struct {
@@ -223,30 +279,78 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	if cluster.Status.HAStatus == nil {
 		return nil
 	}
+	if ha.Runtime == nil {
+		return nil
+	}
+	localNodeID := strings.TrimSpace(ha.Runtime.NodeID)
+	if localNodeID == "" {
+		return nil
+	}
+	pendingWatchdogAuthority := cluster.Status.HAStatus.PrimaryWatchdogProof != nil &&
+		cluster.Status.HAStatus.PrimaryWatchdogProof.Active &&
+		!cluster.Status.HAStatus.PrimaryWatchdogProof.AuthorityGranted
 	holder := haKubernetesLeaseFenceCandidate(ha, cluster.Status.HAStatus)
 	if holder == "" {
-		return nil
+		if !cluster.Status.HAStatus.PrimaryAdminReachable &&
+			strings.Contains(cluster.Status.HAStatus.PrimaryAdminLastError, "HA Lease watchdog") &&
+			!pendingWatchdogAuthority {
+			// Never renew authority for an authenticated runtime that reports
+			// itself inactive (or cannot prove the capability). Let the old
+			// generation remain fenced while failover debounce selects a candidate.
+			return nil
+		}
+		identity := haReplicationIdentity(ha)
+		if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) == "" {
+			return nil
+		}
+		// A fail-closed runtime must prove its normal write authority before
+		// serving. Keep the healthy primary as holder until the atomic transfer
+		// to a promotion candidate increments LeaseTransitions.
+		holder = strings.TrimSpace(identity.CurrentPrimaryID)
 	}
-	scope, ok := haCurrentFencingLeaseScope(cluster)
+	scope, ok := haFencingLeaseReconcileScope(cluster, holder)
+	bootstrapUnknownBoundary := false
 	if !ok {
-		return nil
+		identity := haReplicationIdentity(ha)
+		if identity == nil || cluster.Status.HAStatus.PrimaryLSN != 0 || holder != localNodeID ||
+			holder != strings.TrimSpace(identity.CurrentPrimaryID) {
+			return nil
+		}
+		// LSN zero is an unknown boundary, not a safe promotion boundary. It is
+		// accepted only to create the configured primary's first authority Lease.
+		// If the Lease already exists, its positive persisted boundary must be
+		// recovered below and can never be overwritten with zero.
+		scope = haFencingLeaseScopeForIdentity(identity, 0)
+		bootstrapUnknownBoundary = true
 	}
 
-	now := metav1.NowMicro()
+	now := metav1.NewMicroTime(r.haNow())
 	lease := &coordinationv1.Lease{}
-	err := r.Get(ctx, types.NamespacedName{
+	err := r.haBoundaryReader().Get(ctx, types.NamespacedName{
 		Name:      haFencingLeaseName(cluster),
 		Namespace: cluster.Namespace,
 	}, lease)
 	if apierrors.IsNotFound(err) {
+		// A missing shared Lease can only be initialized by the runtime that is
+		// itself the configured current writer. Creating it directly for a
+		// candidate would skip the compare-and-swap handoff from the old holder.
+		identity := haReplicationIdentity(ha)
+		if identity == nil || holder != localNodeID || holder != strings.TrimSpace(identity.CurrentPrimaryID) {
+			return nil
+		}
 		transitions := int32(1)
 		durationSeconds := haFencingLeaseDefaultDurationSeconds
+		annotations := scope.annotations()
+		annotations[haFencingLeaseAnnotationTopologyID] = haFencingLeaseTopologyID(cluster)
+		if pendingWatchdogAuthority {
+			annotations[haFencingLeaseAnnotationProcessBootID] = strings.TrimSpace(cluster.Status.HAStatus.PrimaryWatchdogProof.ProcessBootID)
+		}
 		lease = &coordinationv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        haFencingLeaseName(cluster),
 				Namespace:   cluster.Namespace,
 				Labels:      haFencingLeaseLabels(cluster),
-				Annotations: scope.annotations(),
+				Annotations: annotations,
 			},
 			Spec: coordinationv1.LeaseSpec{
 				HolderIdentity:       &holder,
@@ -256,12 +360,18 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 				LeaseTransitions:     &transitions,
 			},
 		}
-		if r.Scheme != nil {
-			if err := controllerutil.SetControllerReference(cluster, lease, r.Scheme); err != nil {
-				return err
-			}
+		// The shared Lease outlives any one primary AntflyCluster CR. It must not
+		// carry a controller ownerReference or garbage collection could erase the
+		// fencing authority during topology handoff.
+		if err := r.Create(ctx, lease); err != nil {
+			return err
 		}
-		return r.Create(ctx, lease)
+		if bootstrapUnknownBoundary || pendingWatchdogAuthority {
+			haRecordPendingFencingLeaseStatus(cluster, holder, transitions)
+		} else {
+			haRecordRenewedFencingLeaseStatus(cluster, holder, transitions)
+		}
+		return nil
 	}
 	if err != nil {
 		return err
@@ -275,16 +385,130 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	if lease.Spec.LeaseTransitions != nil {
 		transitions = *lease.Spec.LeaseTransitions
 	}
+	if currentHolder == "" || transitions <= 0 ||
+		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) {
+		return nil
+	}
+	if bootstrapUnknownBoundary {
+		persistedBoundary, parseErr := strconv.ParseUint(
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationPrimaryLSN]), 10, 64,
+		)
+		if parseErr != nil {
+			return nil
+		}
+		if persistedBoundary > 0 {
+			scope.primaryLSN = persistedBoundary
+		}
+		if !haLeaseFenceScopeMatches(lease, scope) {
+			return nil
+		}
+	}
+
+	// Pending authority is an explicit, terminal branch before holder changes
+	// or ordinary owner renewal. It can advance only the exact configured
+	// current owner's unchanged Lease and records a durable process/generation
+	// receipt so a fresh observation timestamp cannot reopen the exception.
+	if pendingWatchdogAuthority {
+		identity := haReplicationIdentity(ha)
+		proof := cluster.Status.HAStatus.PrimaryWatchdogProof
+		currentReceipt := haFencingLeaseBootstrapReceipt(currentHolder, transitions, proof.ProcessBootID)
+		if identity == nil || holder != currentHolder || currentHolder != localNodeID ||
+			currentHolder != strings.TrimSpace(identity.CurrentPrimaryID) ||
+			lease.Spec.RenewTime == nil || !haLeaseFenceScopeMatches(lease, scope) ||
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt]) == currentReceipt {
+			return nil
+		}
+		ready, err := r.haCurrentPrimaryRuntimeWatchdogReady(
+			ctx, cluster, currentHolder, uint64(transitions), lease.Spec.RenewTime.Time, false,
+		)
+		if err != nil || !ready {
+			return err
+		}
+		currentProcess := strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID])
+		if currentProcess == "" {
+			currentProcess = strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt])
+		}
+		unboundInitialBootstrap := currentProcess == "" && bootstrapUnknownBoundary && scope.primaryLSN == 0
+		if !unboundInitialBootstrap && currentProcess != proof.ProcessBootID && currentProcess != currentReceipt &&
+			!r.haProcessIncarnationBarrierElapsed(cluster, lease, currentProcess, proof.ProcessBootID) {
+			return nil
+		}
+		lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] = currentReceipt
+		lease.Annotations[haFencingLeaseAnnotationProcessBootID] = proof.ProcessBootID
+		lease.Spec.RenewTime = &now
+		if err := r.Update(ctx, lease); err != nil {
+			return err
+		}
+		haRecordPendingFencingLeaseStatus(cluster, currentHolder, transitions)
+		return nil
+	}
+
+	clearBootstrapReceipt := false
+	bootstrapReceipt := strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt])
+	if bootstrapReceipt != "" || (bootstrapUnknownBoundary && scope.primaryLSN == 0) {
+		if lease.Spec.RenewTime == nil || !haLeaseFenceScopeMatches(lease, scope) {
+			return nil
+		}
+		ready, err := r.haCurrentPrimaryRuntimeWatchdogReady(
+			ctx, cluster, currentHolder, uint64(transitions), lease.Spec.RenewTime.Time, true,
+		)
+		if err != nil || !ready {
+			return err
+		}
+		clearBootstrapReceipt = bootstrapReceipt != ""
+	}
+	preserveTransferredScope := false
+	if lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" && currentHolder != "" &&
+		haKubernetesLeaseFenceCandidate(ha, cluster.Status.HAStatus) == "" && holder != currentHolder {
+		// Status loss or controller restart must never hand authority back to the
+		// former writer after a committed transfer recorded on the Lease itself.
+		holder = currentHolder
+		preserveTransferredScope = true
+	}
 	holderChanged := currentHolder != holder
 	if holderChanged {
+		// Only the exact current holder controller may commit the next holder.
+		// The candidate must independently prove that its live runtime process
+		// pre-watched this exact Lease generation without write authority.
+		if localNodeID != currentHolder || cluster.UID == "" {
+			return nil
+		}
+		ready, err := r.haCandidateRuntimeWatchdogReady(ctx, cluster, holder, currentHolder, uint64(transitions))
+		if err != nil || !ready {
+			return err
+		}
 		transitions++
 		lease.Spec.LeaseTransitions = &transitions
 		lease.Spec.AcquireTime = &now
+		if lease.Annotations == nil {
+			lease.Annotations = map[string]string{}
+		}
+		lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
+		lease.Annotations[haFencingLeaseAnnotationFormerHolder] = currentHolder
+		lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(cluster.UID)
+		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = strconv.FormatInt(int64(transitions), 10)
 	} else if transitions == 0 {
 		transitions = 1
 		lease.Spec.LeaseTransitions = &transitions
 		if lease.Spec.AcquireTime == nil {
 			lease.Spec.AcquireTime = &now
+		}
+	} else {
+		ownerRenewal := localNodeID == currentHolder
+		handoffRenewal := lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" &&
+			lease.Annotations[haFencingLeaseAnnotationFormerHolder] == localNodeID &&
+			lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] == string(cluster.UID) &&
+			lease.Annotations[haFencingLeaseAnnotationCommittedTransition] == strconv.FormatInt(int64(transitions), 10)
+		if !ownerRenewal && !handoffRenewal {
+			return nil
+		}
+		if ownerRenewal {
+			// Taking over renewal closes the former controller's narrow handoff
+			// bridge. From this point only the new holder can renew or transfer.
+			delete(lease.Annotations, haFencingLeaseAnnotationTransferCommitted)
+			delete(lease.Annotations, haFencingLeaseAnnotationFormerHolder)
+			delete(lease.Annotations, haFencingLeaseAnnotationTransferOriginUID)
+			delete(lease.Annotations, haFencingLeaseAnnotationCommittedTransition)
 		}
 	}
 	durationSeconds := haFencingLeaseDefaultDurationSeconds
@@ -303,15 +527,291 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	if lease.Annotations == nil {
 		lease.Annotations = map[string]string{}
 	}
-	for key, value := range scope.annotations() {
-		lease.Annotations[key] = value
-	}
-	if r.Scheme != nil {
-		if err := controllerutil.SetControllerReference(cluster, lease, r.Scheme); err != nil {
-			return err
+	if !preserveTransferredScope {
+		for key, value := range scope.annotations() {
+			lease.Annotations[key] = value
 		}
 	}
+	if clearBootstrapReceipt {
+		delete(lease.Annotations, haFencingLeaseAnnotationBootstrapReceipt)
+	}
+	if proof := cluster.Status.HAStatus.PrimaryWatchdogProof; proof != nil && proof.AuthorityGranted &&
+		strings.TrimSpace(proof.ProcessBootID) != "" && holder == localNodeID {
+		lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.TrimSpace(proof.ProcessBootID)
+	}
+	lease.Annotations[haFencingLeaseAnnotationTopologyID] = haFencingLeaseTopologyID(cluster)
+	if err := r.Update(ctx, lease); err != nil {
+		return err
+	}
+	haRecordRenewedFencingLeaseStatus(cluster, holder, transitions)
+	return nil
+}
+
+// renewCurrentHAFencingLease advances only an unchanged current holder. It is
+// intentionally narrower than reconcileHAFencingLease: topology handoff,
+// bootstrap, and scope changes remain owned by the main cluster reconciler.
+// A dedicated controller calls this path so renewal scheduling is not queued
+// behind seed-capture reconciliation work. The runtime proof endpoint must
+// still remain responsive independently of the capture critical section.
+func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Status.HAStatus == nil {
+		return nil
+	}
+	ha := cluster.Spec.HighAvailability
+	if ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled || ha.Runtime == nil ||
+		ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled ||
+		!haAutomaticFailoverExecutionEnabled(ha) ||
+		ha.AutomaticFailover.FencingAuthority != antflyv1.HAFencingAuthorityKubernetesLease {
+		return nil
+	}
+	localNodeID := strings.TrimSpace(ha.Runtime.NodeID)
+	if localNodeID == "" {
+		return nil
+	}
+
+	lease := &coordinationv1.Lease{}
+	if err := r.haBoundaryReader().Get(ctx, types.NamespacedName{
+		Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace,
+	}, lease); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) != localNodeID ||
+		lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions <= 0 || lease.Spec.RenewTime == nil ||
+		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) {
+		return nil
+	}
+	identity := haReplicationIdentity(ha)
+	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) != localNodeID {
+		return nil
+	}
+	proof := cluster.Status.HAStatus.PrimaryWatchdogProof
+	if proof == nil || strings.TrimSpace(proof.ProcessBootID) == "" ||
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID]) != strings.TrimSpace(proof.ProcessBootID) {
+		return nil
+	}
+	identityScope := haFencingLeaseScopeForIdentity(identity, 0)
+	for key, value := range identityScope.annotations() {
+		if key == haFencingLeaseAnnotationPrimaryLSN {
+			continue
+		}
+		if lease.Annotations[key] != value {
+			return nil
+		}
+	}
+
+	ready, err := r.haCurrentPrimaryRuntimeWatchdogReady(
+		ctx,
+		cluster,
+		localNodeID,
+		uint64(*lease.Spec.LeaseTransitions),
+		lease.Spec.RenewTime.Time,
+		true,
+	)
+	if err != nil || !ready {
+		return err
+	}
+	now := metav1.NewMicroTime(r.haNow())
+	lease.Spec.RenewTime = &now
 	return r.Update(ctx, lease)
+}
+
+func (r *AntflyClusterReconciler) haProcessIncarnationBarrierElapsed(
+	cluster *antflyv1.AntflyCluster,
+	lease *coordinationv1.Lease,
+	currentProcess string,
+	candidate string,
+) bool {
+	if r == nil || cluster == nil || lease == nil || lease.Spec.RenewTime == nil ||
+		cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil ||
+		cluster.Spec.HighAvailability.Runtime.FencingLease == nil {
+		return false
+	}
+	grace := cluster.Spec.HighAvailability.Runtime.FencingLease.WatchdogGraceSeconds
+	if grace <= 0 {
+		return false
+	}
+	transition := int32(0)
+	if lease.Spec.LeaseTransitions != nil {
+		transition = *lease.Spec.LeaseTransitions
+	}
+	key := haProcessIncarnationGraceKey{
+		leaseUID: lease.UID, transition: transition, renewUnixNS: lease.Spec.RenewTime.UnixNano(),
+		currentProcess: currentProcess, candidate: candidate,
+	}
+	now := r.haMonotonicNow()
+	value, loaded := r.haProcessGraceStarts.LoadOrStore(key, now)
+	if !loaded {
+		return false
+	}
+	started, ok := value.(time.Time)
+	if !ok || now.Before(started) {
+		r.haProcessGraceStarts.Store(key, now)
+		return false
+	}
+	return now.Sub(started) >= time.Duration(grace)*time.Second
+}
+
+func haFencingLeaseBootstrapReceipt(holder string, transition int32, processBootID string) string {
+	return fmt.Sprintf("%s:%d:%s", strings.TrimSpace(holder), transition, strings.TrimSpace(processBootID))
+}
+
+func (r *AntflyClusterReconciler) haCurrentPrimaryRuntimeWatchdogReady(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	holder string,
+	transition uint64,
+	leaseRenewTime time.Time,
+	requireAuthority bool,
+) (bool, error) {
+	if cluster == nil || cluster.Status.HAStatus == nil || cluster.Status.HAStatus.PrimaryWatchdogProof == nil ||
+		cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil ||
+		cluster.Spec.HighAvailability.Runtime.FencingLease == nil {
+		return false, nil
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	proof := cluster.Status.HAStatus.PrimaryWatchdogProof
+	lease := cluster.Spec.HighAvailability.Runtime.FencingLease
+	expectedMaxFenceLatencyMS := int32(10_000)
+	if lease.WatchdogGraceSeconds > 0 {
+		expectedMaxFenceLatencyMS = lease.WatchdogGraceSeconds * 1000
+	}
+	now := r.haNow()
+	authorityReady := !proof.AuthorityGranted && proof.AuthorityRemainingMS == 0
+	if requireAuthority {
+		authorityReady = proof.AuthorityGranted && proof.AuthorityRemainingMS > 0 &&
+			now.Sub(proof.ObservedAt.Time) < time.Duration(proof.AuthorityRemainingMS)*time.Millisecond
+	}
+	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) != holder ||
+		strings.TrimSpace(cluster.Spec.HighAvailability.Runtime.NodeID) != holder ||
+		proof.ObservedAt.IsZero() || !proof.ObservedAt.Time.After(leaseRenewTime) || now.Before(proof.ObservedAt.Time) ||
+		now.Sub(proof.ObservedAt.Time) >= time.Duration(proof.MaxFenceLatencyMS)*time.Millisecond ||
+		proof.CapabilityVersion != 1 || !proof.Active || !authorityReady ||
+		proof.MaxFenceLatencyMS != expectedMaxFenceLatencyMS ||
+		proof.LocalNodeID != holder || proof.ObservedHolderNodeID != holder ||
+		proof.LeaseName != strings.TrimSpace(lease.Name) || proof.LeaseNamespace != cluster.Namespace ||
+		proof.TopologyID != strings.TrimSpace(lease.TopologyID) ||
+		proof.ObservedLeaseTransitions <= 0 || uint64(proof.ObservedLeaseTransitions) != transition ||
+		proof.PodUID == "" || !haWatchdogProcessBootIDValid(proof.ProcessBootID) {
+		return false, nil
+	}
+
+	pods := &corev1.PodList{}
+	if err := r.haBoundaryReader().List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
+		return false, err
+	}
+	matches := 0
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if string(pod.UID) != proof.PodUID || pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		for j := range pod.Status.ContainerStatuses {
+			container := &pod.Status.ContainerStatuses[j]
+			if container.Name == "antfly" && container.State.Running != nil &&
+				!proof.ObservedAt.Before(&container.State.Running.StartedAt) {
+				matches++
+				break
+			}
+		}
+	}
+	return matches == 1, nil
+}
+
+func (r *AntflyClusterReconciler) haCandidateRuntimeWatchdogReady(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	candidate string,
+	observedHolder string,
+	transition uint64,
+) (bool, error) {
+	if cluster == nil || cluster.Status.HAStatus == nil || cluster.Spec.HighAvailability == nil ||
+		cluster.Spec.HighAvailability.Runtime == nil || cluster.Spec.HighAvailability.Runtime.FencingLease == nil {
+		return false, nil
+	}
+	var proof *antflyv1.HAWatchdogProofStatus
+	for i := range cluster.Status.HAStatus.Standbys {
+		standby := &cluster.Status.HAStatus.Standbys[i]
+		if standby.Name == candidate || standby.SlotName == candidate {
+			proof = standby.WatchdogProof
+			break
+		}
+	}
+	if proof == nil {
+		return false, nil
+	}
+	lease := cluster.Spec.HighAvailability.Runtime.FencingLease
+	expectedMaxFenceLatencyMS := int32(10_000)
+	if lease.WatchdogGraceSeconds > 0 {
+		expectedMaxFenceLatencyMS = lease.WatchdogGraceSeconds * 1000
+	}
+	now := r.haNow()
+	if proof.ObservedAt.IsZero() || now.Before(proof.ObservedAt.Time) ||
+		now.Sub(proof.ObservedAt.Time) >= time.Duration(proof.MaxFenceLatencyMS)*time.Millisecond ||
+		proof.CapabilityVersion != 1 || !proof.Active || proof.AuthorityGranted || proof.AuthorityRemainingMS != 0 ||
+		proof.MaxFenceLatencyMS != expectedMaxFenceLatencyMS ||
+		proof.LocalNodeID != candidate || proof.ObservedHolderNodeID != observedHolder ||
+		proof.LeaseName != strings.TrimSpace(lease.Name) || proof.LeaseNamespace != cluster.Namespace ||
+		proof.TopologyID != strings.TrimSpace(lease.TopologyID) ||
+		proof.ObservedLeaseTransitions <= 0 || uint64(proof.ObservedLeaseTransitions) != transition ||
+		proof.PodUID == "" || !haWatchdogProcessBootIDValid(proof.ProcessBootID) {
+		return false, nil
+	}
+
+	pods := &corev1.PodList{}
+	if err := r.haBoundaryReader().List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
+		return false, err
+	}
+	matches := 0
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if string(pod.UID) != proof.PodUID || pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		for j := range pod.Status.ContainerStatuses {
+			container := &pod.Status.ContainerStatuses[j]
+			if container.Name == "antfly" && container.State.Running != nil &&
+				!proof.ObservedAt.Before(&container.State.Running.StartedAt) {
+				matches++
+				break
+			}
+		}
+	}
+	return matches == 1, nil
+}
+
+func haRecordRenewedFencingLeaseStatus(cluster *antflyv1.AntflyCluster, holder string, generation int32) {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || generation <= 0 {
+		return
+	}
+	if cluster.Status.HAStatus == nil {
+		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: cluster.Spec.HighAvailability.Mode}
+	}
+	cluster.Status.HAStatus.Fencing = antflyv1.HAFencingStatus{
+		Authority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		Ready:      true,
+		Holder:     holder,
+		Generation: uint64(generation),
+		Reason:     "LeaseHeld",
+	}
+}
+
+func haRecordPendingFencingLeaseStatus(cluster *antflyv1.AntflyCluster, holder string, generation int32) {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || generation <= 0 {
+		return
+	}
+	if cluster.Status.HAStatus == nil {
+		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: cluster.Spec.HighAvailability.Mode}
+	}
+	cluster.Status.HAStatus.Fencing = antflyv1.HAFencingStatus{
+		Authority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		Ready:      false,
+		Holder:     holder,
+		Generation: uint64(generation),
+		Reason:     "LeaseBootstrapPendingAuthority",
+	}
 }
 
 func (r *AntflyClusterReconciler) observeHAFencingStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
@@ -349,14 +849,29 @@ func (r *AntflyClusterReconciler) observeHAFencingStatus(ctx context.Context, cl
 		holder = *lease.Spec.HolderIdentity
 	}
 	ready, reason := haLeaseFenceReady(lease, generation, time.Now())
+	if strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt]) != "" {
+		ready = false
+		reason = "LeaseBootstrapPendingAuthority"
+	}
 	if ready {
 		scope, ok := haCurrentFencingLeaseScope(cluster)
 		if !ok {
 			ready = false
 			reason = "LeaseScopeMissing"
 		} else if !haLeaseFenceScopeMatches(lease, scope) {
-			ready = false
-			reason = "LeaseScopeMismatch"
+			// After the former-primary fence call has started, the Lease is
+			// intentionally bound to the election-time lower boundary. The old
+			// writer may advance while its admin transport recovers; that does not
+			// invalidate the committed ownership transfer. Only accept the older
+			// scope when every identity field and the exact recorded action
+			// boundary still match.
+			committed, committedOK := haCommittedFencingLeaseScope(cluster, holder, generation)
+			lowerBound, lowerBoundOK := haCommittedFencingLeaseLowerBoundScope(cluster, holder, generation)
+			if (!committedOK || !haLeaseFenceScopeMatches(lease, committed)) &&
+				(!lowerBoundOK || !haLeaseFenceScopeMatches(lease, lowerBound)) {
+				ready = false
+				reason = "LeaseScopeMismatch"
+			}
 		}
 	}
 	cluster.Status.HAStatus.Fencing = antflyv1.HAFencingStatus{
@@ -376,6 +891,10 @@ func (r *AntflyClusterReconciler) observeHAFormerPrimaryFenceStatus(ctx context.
 	ha := cluster.Spec.HighAvailability
 	promotion := haPromotionReceipt(cluster.Status.HAStatus)
 	if ha == nil || promotion == nil || strings.TrimSpace(promotion.OldPrimaryID) == "" {
+		return
+	}
+	if haSucceededFormerPrimaryIsolation(cluster, cluster.Status.HAStatus, promotion) != nil {
+		haSetFormerPrimaryFenceObserved(cluster.Status.HAStatus, promotion, true)
 		return
 	}
 	adminURL := haFormerPrimaryAdminURL(ha, haPlannedAction{
@@ -444,7 +963,17 @@ func haCurrentFenceMatchesPromotion(current *adminsdk.HACurrentFenceResponse, pr
 }
 
 func haFencingLeaseName(cluster *antflyv1.AntflyCluster) string {
+	if haRuntimeLeaseWatchdogEnabled(cluster) {
+		return strings.TrimSpace(cluster.Spec.HighAvailability.Runtime.FencingLease.Name)
+	}
 	return cluster.Name + "-ha-fence"
+}
+
+func haFencingLeaseTopologyID(cluster *antflyv1.AntflyCluster) string {
+	if !haRuntimeLeaseWatchdogEnabled(cluster) {
+		return ""
+	}
+	return strings.TrimSpace(cluster.Spec.HighAvailability.Runtime.FencingLease.TopologyID)
 }
 
 func haFencingLeaseLabels(cluster *antflyv1.AntflyCluster) map[string]string {
@@ -483,6 +1012,57 @@ func haCurrentFencingLeaseScope(cluster *antflyv1.AntflyCluster) (haFencingLease
 		currentPrimaryID: identity.CurrentPrimaryID,
 		primaryLSN:       cluster.Status.HAStatus.PrimaryLSN,
 	}, true
+}
+
+func haFencingLeaseReconcileScope(cluster *antflyv1.AntflyCluster, holder string) (haFencingLeaseScope, bool) {
+	if cluster != nil && cluster.Status.HAStatus != nil {
+		if scope, ok := haCommittedFencingLeaseScope(cluster, holder, cluster.Status.HAStatus.Fencing.Generation); ok {
+			return scope, true
+		}
+	}
+	return haCurrentFencingLeaseScope(cluster)
+}
+
+func haCommittedFencingLeaseScope(cluster *antflyv1.AntflyCluster, holder string, generation uint64) (haFencingLeaseScope, bool) {
+	if cluster == nil || cluster.Status.HAStatus == nil {
+		return haFencingLeaseScope{}, false
+	}
+	ha := cluster.Spec.HighAvailability
+	action := haCommittedFormerPrimaryFenceAction(ha, cluster.Status.HAStatus, holder, generation)
+	identity := haReplicationIdentity(ha)
+	if action == nil || identity == nil {
+		return haFencingLeaseScope{}, false
+	}
+	boundary := haAutomaticFailoverPromotionBoundary(cluster.Status.HAStatus, holder, action.FenceGeneration)
+	if boundary == 0 {
+		return haFencingLeaseScope{}, false
+	}
+	return haFencingLeaseScopeForIdentity(identity, boundary), true
+}
+
+func haCommittedFencingLeaseLowerBoundScope(cluster *antflyv1.AntflyCluster, holder string, generation uint64) (haFencingLeaseScope, bool) {
+	if cluster == nil || cluster.Status.HAStatus == nil {
+		return haFencingLeaseScope{}, false
+	}
+	ha := cluster.Spec.HighAvailability
+	action := haCommittedFormerPrimaryFenceAction(ha, cluster.Status.HAStatus, holder, generation)
+	identity := haReplicationIdentity(ha)
+	if action == nil || identity == nil || action.TargetLSN == 0 {
+		return haFencingLeaseScope{}, false
+	}
+	return haFencingLeaseScopeForIdentity(identity, action.TargetLSN), true
+}
+
+func haFencingLeaseScopeForIdentity(identity *antflyv1.HAReplicationIdentitySpec, boundary uint64) haFencingLeaseScope {
+	return haFencingLeaseScope{
+		clusterID:        identity.ClusterID,
+		shardID:          identity.ShardID,
+		tableID:          identity.TableID,
+		timelineID:       identity.TimelineID,
+		epoch:            identity.Epoch,
+		currentPrimaryID: identity.CurrentPrimaryID,
+		primaryLSN:       boundary,
+	}
 }
 
 func (scope haFencingLeaseScope) annotations() map[string]string {
@@ -566,8 +1146,13 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	}
 
 	var plan haPlan
+	promotedPrimaryID := haPromotedPrimaryNodeID(status)
 	for _, standby := range ha.Standbys {
 		slotName := standbySlotName(standby)
+		if promotedPrimaryID != "" &&
+			(promotedPrimaryID == strings.TrimSpace(standby.Name) || promotedPrimaryID == strings.TrimSpace(slotName)) {
+			continue
+		}
 		observed, ok := slotByName[standby.Name]
 		if !ok {
 			observed, ok = slotByName[slotName]
@@ -600,10 +1185,46 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			continue
 		}
 		plan.DesiredStandbyCount++
-		if !ok {
+		// Standby-local observation errors create a configured status entry even
+		// before the primary owns a replication slot. Runtime-owned portable
+		// seeding activates that slot only at the end of the seed chain. A typed
+		// primary slot observation with a nonzero timeline can still describe the
+		// intermediate "seeding" lifecycle, so only active runtime state or a
+		// completed, validated ActivateSeededSlot receipt proves bootstrap crossed
+		// the activation boundary.
+		runtimeOwnedSeed := haStandbyUsesRuntimeOwnedSeedCapture(standby)
+		runtimeOwnedSeedTargetLSN := uint64(0)
+		runtimeOwnedSeedActivated := false
+		runtimeOwnedSeedInFlight := false
+		runtimeOwnedSeedLifecycleCompleted := false
+		if runtimeOwnedSeed {
+			runtimeOwnedSeedTargetLSN = haRuntimeOwnedSeedTargetLSN(status, standby, slotName)
+			runtimeOwnedSeedInFlight = runtimeOwnedSeedTargetLSN > 0
+			runtimeOwnedSeedActivated = observed.Active ||
+				haRuntimeOwnedSeedActivationCompleted(status, standby, slotName, runtimeOwnedSeedTargetLSN)
+			runtimeOwnedSeedLifecycleCompleted = haRuntimeOwnedSeedLifecycleCompleted(status, standby, slotName, runtimeOwnedSeedTargetLSN)
+		}
+		if !ok || (runtimeOwnedSeed && (!runtimeOwnedSeedActivated ||
+			(runtimeOwnedSeedInFlight && !runtimeOwnedSeedLifecycleCompleted))) {
 			plan.UnhealthyStandbyCount++
 			seedTargetLSN := initialStandbyLSN(standby, status.PrimaryLSN)
+			if runtimeOwnedSeed {
+				seedTargetLSN = runtimeOwnedSeedTargetLSN
+				if seedTargetLSN == 0 {
+					seedTargetLSN = haRuntimeOwnedInitialSeedTargetLSN(status)
+				}
+			}
 			if seedTargetLSN == 0 {
+				continue
+			}
+			if runtimeOwnedSeed {
+				plan.Actions = append(plan.Actions, haSeedCompletionActions(
+					standby,
+					slotName,
+					seedTargetLSN,
+					"StandbyNeedsBaseBackup",
+					"",
+				)...)
 				continue
 			}
 			plan.Actions = append(plan.Actions, haPlannedAction{
@@ -644,6 +1265,10 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			plan.ReseedRequiredCount++
 			if status.PrimaryLSN > 0 {
 				seedTargetLSN := haSeedBeginTargetLSN(status.PrimaryLSN)
+				if haStandbyUsesRuntimeOwnedSeedCapture(standby) {
+					plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, seedTargetLSN, "SlotRequiresReseed", "")...)
+					continue
+				}
 				plan.Actions = append(plan.Actions, haPlannedAction{
 					Kind:        haActionMarkReseed,
 					StandbyName: standby.Name,
@@ -674,11 +1299,27 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	plan.AutomaticPromotionAllowed = plan.PromotionStandbyName != ""
 	if plan.AutomaticPromotionAllowed {
 		fence := status.Fencing
+		promotionBoundary := haAutomaticFailoverPromotionBoundary(status, fence.Holder, fence.Generation)
+		formerPrimaryID := haAutomaticFailoverFormerPrimaryID(ha)
+		formerPrimaryFenceAction := haActionIsolateFormerPrimary
 		plan.Actions = append(plan.Actions,
 			haPlannedAction{
+				Kind:            formerPrimaryFenceAction,
+				StandbyName:     formerPrimaryID,
+				TargetLSN:       promotionBoundary,
+				RouteFrom:       formerPrimaryID,
+				RouteTo:         plan.PromotionStandbyName,
+				FenceAuthority:  fence.Authority,
+				FenceHolder:     fence.Holder,
+				FenceGeneration: fence.Generation,
+				FenceReason:     fence.Reason,
+				Reason:          "IsolateUnreachableFormerPrimaryForPromotion",
+			},
+			haPlannedAction{
 				Kind:            haActionAcquireFence,
+				DependsOn:       formerPrimaryFenceAction,
 				StandbyName:     plan.PromotionStandbyName,
-				TargetLSN:       status.PrimaryLSN,
+				TargetLSN:       promotionBoundary,
 				FenceAuthority:  fence.Authority,
 				FenceHolder:     fence.Holder,
 				FenceGeneration: fence.Generation,
@@ -689,7 +1330,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				Kind:            haActionAssessPromotion,
 				DependsOn:       haActionAcquireFence,
 				StandbyName:     plan.PromotionStandbyName,
-				TargetLSN:       status.PrimaryLSN,
+				TargetLSN:       promotionBoundary,
 				FenceAuthority:  fence.Authority,
 				FenceHolder:     fence.Holder,
 				FenceGeneration: fence.Generation,
@@ -700,7 +1341,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				Kind:            haActionPromoteStandby,
 				DependsOn:       haActionAssessPromotion,
 				StandbyName:     plan.PromotionStandbyName,
-				TargetLSN:       status.PrimaryLSN,
+				TargetLSN:       promotionBoundary,
 				FenceAuthority:  fence.Authority,
 				FenceHolder:     fence.Holder,
 				FenceGeneration: fence.Generation,
@@ -711,7 +1352,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				Kind:            haActionUpdatePrimaryRoute,
 				DependsOn:       haActionPromoteStandby,
 				StandbyName:     plan.PromotionStandbyName,
-				TargetLSN:       status.PrimaryLSN,
+				TargetLSN:       promotionBoundary,
 				RouteFrom:       haPrimaryRouteCurrentTarget(status),
 				RouteTo:         plan.PromotionStandbyName,
 				FenceAuthority:  fence.Authority,
@@ -723,11 +1364,11 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			haPlannedAction{
 				Kind:            haActionDemoteFormerPrimary,
 				DependsOn:       haActionPromoteStandby,
-				StandbyName:     haAutomaticFailoverFormerPrimaryID(ha),
-				TargetLSN:       status.PrimaryLSN,
-				ObservedLSN:     status.PrimaryLSN,
+				StandbyName:     formerPrimaryID,
+				TargetLSN:       promotionBoundary,
+				ObservedLSN:     promotionBoundary,
 				RetainedFromLSN: status.Retention.OldestRestartLSN,
-				RouteFrom:       haAutomaticFailoverFormerPrimaryID(ha),
+				RouteFrom:       formerPrimaryID,
 				FenceAuthority:  fence.Authority,
 				FenceHolder:     fence.Holder,
 				FenceGeneration: fence.Generation,
@@ -741,7 +1382,13 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		plan.Actions = append(plan.Actions, action)
 	}
 	plan.FormerPrimary = haEvaluateFormerPrimary(status)
+	formerPrimaryFenceDependency := haActionFenceFormerPrimary
+	if action := haFormerPrimaryFencePlannedAction(cluster, status); action.Kind != "" {
+		formerPrimaryFenceDependency = action.Kind
+		plan.Actions = append(plan.Actions, action)
+	}
 	if action := haFormerPrimaryPlannedAction(plan.FormerPrimary, status); action.Kind != "" {
+		action.DependsOn = formerPrimaryFenceDependency
 		plan.Actions = append(plan.Actions, action)
 		if action.Kind == haActionReseedFormerPrimary {
 			if standby, ok := haStandbySpecByName(ha, action.StandbyName); ok {
@@ -777,11 +1424,156 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	return plan
 }
 
+func haFormerPrimaryFencePlannedAction(cluster *antflyv1.AntflyCluster, status *antflyv1.HAStatus) haPlannedAction {
+	promotion := haPromotionReceipt(status)
+	if promotion == nil {
+		return haPlannedAction{}
+	}
+	if isolated := haSucceededFormerPrimaryIsolation(cluster, status, promotion); isolated != nil {
+		return haPlannedAction{
+			Kind:            haActionIsolateFormerPrimary,
+			StandbyName:     promotion.OldPrimaryID,
+			TargetLSN:       isolated.TargetLSN,
+			ObservedLSN:     isolated.ObservedLSN,
+			RouteFrom:       promotion.OldPrimaryID,
+			RouteTo:         promotion.PromotedStandbyID,
+			FenceAuthority:  promotion.FenceAuthority,
+			FenceHolder:     promotion.PromotedStandbyID,
+			FenceGeneration: promotion.FenceGeneration,
+			FenceReason:     promotion.FenceReason,
+			Reason:          "FormerPrimaryPhysicallyIsolated",
+		}
+	}
+	return haPlannedAction{
+		Kind:            haActionFenceFormerPrimary,
+		StandbyName:     promotion.OldPrimaryID,
+		TargetLSN:       haPromotionObservedLSN(promotion),
+		RouteFrom:       promotion.OldPrimaryID,
+		RouteTo:         promotion.PromotedStandbyID,
+		FenceAuthority:  promotion.FenceAuthority,
+		FenceHolder:     promotion.PromotedStandbyID,
+		FenceGeneration: promotion.FenceGeneration,
+		FenceReason:     promotion.FenceReason,
+		Reason:          "FenceFormerPrimaryForPromotion",
+	}
+}
+
+func haSucceededFormerPrimaryIsolation(cluster *antflyv1.AntflyCluster, status *antflyv1.HAStatus, promotion *antflyv1.HAPromotionStatus) *antflyv1.HAPlannedActionStatus {
+	if status == nil || promotion == nil || promotion.FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
+		promotion.FenceGeneration == 0 || strings.TrimSpace(promotion.OldPrimaryID) == "" ||
+		strings.TrimSpace(promotion.PromotedStandbyID) == "" || haPromotionRequiredLSN(promotion) == 0 {
+		return nil
+	}
+	for i := range status.PlannedActions {
+		action := &status.PlannedActions[i]
+		if haActionKind(action.Kind) != haActionIsolateFormerPrimary ||
+			!haPhysicalIsolationSucceededWithEvidence(cluster, *action) ||
+			strings.TrimSpace(action.StandbyName) != strings.TrimSpace(promotion.OldPrimaryID) ||
+			strings.TrimSpace(action.RouteTo) != strings.TrimSpace(promotion.PromotedStandbyID) ||
+			action.FenceAuthority != promotion.FenceAuthority ||
+			action.FenceGeneration != promotion.FenceGeneration ||
+			action.TargetLSN == 0 || action.TargetLSN != haPromotionRequiredLSN(promotion) {
+			continue
+		}
+		return action
+	}
+	return nil
+}
+
 func haSeedBeginTargetLSN(primaryLSN uint64) uint64 {
 	if primaryLSN == 0 || primaryLSN == ^uint64(0) {
 		return 0
 	}
 	return primaryLSN + 1
+}
+
+func haRuntimeOwnedInitialSeedTargetLSN(status *antflyv1.HAStatus) uint64 {
+	if status == nil {
+		return 0
+	}
+	if targetLSN := haSeedBeginTargetLSN(status.PrimaryLSN); targetLSN != 0 {
+		return targetLSN
+	}
+	// A successful authenticated primary observation distinguishes a valid
+	// empty HA log from an unknown boundary. Runtime-owned capture appends the
+	// backup_start control record atomically, making LSN 1 the seed checkpoint.
+	if status.PrimaryLSN == 0 && status.PrimaryAdminReachable {
+		return 1
+	}
+	return 0
+}
+
+func haRuntimeOwnedSeedTargetLSN(status *antflyv1.HAStatus, standby antflyv1.HAStandbySpec, slotName string) uint64 {
+	if status == nil || !haStandbyUsesRuntimeOwnedSeedCapture(standby) {
+		return 0
+	}
+	explicitGeneration := ""
+	if standby.SeedArtifact != nil {
+		explicitGeneration = strings.TrimSpace(standby.SeedArtifact.Generation)
+	}
+	for _, action := range status.PlannedActions {
+		if !haPlannedActionKindIsPortableArtifact(haActionKind(action.Kind)) ||
+			strings.TrimSpace(action.StandbyName) != strings.TrimSpace(standby.Name) ||
+			strings.TrimSpace(action.SlotName) != strings.TrimSpace(slotName) ||
+			action.TargetLSN == 0 ||
+			(explicitGeneration != "" && strings.TrimSpace(action.SeedArtifactGeneration) != explicitGeneration) {
+			continue
+		}
+		return action.TargetLSN
+	}
+	return 0
+}
+
+func haRuntimeOwnedSeedActivationCompleted(
+	status *antflyv1.HAStatus,
+	standby antflyv1.HAStandbySpec,
+	slotName string,
+	targetLSN uint64,
+) bool {
+	if status == nil || targetLSN == 0 || !haStandbyUsesRuntimeOwnedSeedCapture(standby) {
+		return false
+	}
+	generation := haSeedArtifactGeneration(standby, slotName, targetLSN)
+	if generation == "" {
+		return false
+	}
+	for _, action := range status.PlannedActions {
+		if haActionKind(action.Kind) != haActionActivateSeededSlot ||
+			strings.TrimSpace(action.StandbyName) != strings.TrimSpace(standby.Name) ||
+			strings.TrimSpace(action.SlotName) != strings.TrimSpace(slotName) ||
+			action.TargetLSN != targetLSN ||
+			strings.TrimSpace(action.SeedArtifactGeneration) != generation {
+			continue
+		}
+		return haAdminActionSucceededWithEvidence(action)
+	}
+	return false
+}
+
+func haRuntimeOwnedSeedLifecycleCompleted(
+	status *antflyv1.HAStatus,
+	standby antflyv1.HAStandbySpec,
+	slotName string,
+	targetLSN uint64,
+) bool {
+	if status == nil || targetLSN == 0 || !haStandbyUsesRuntimeOwnedSeedCapture(standby) {
+		return false
+	}
+	generation := haSeedArtifactGeneration(standby, slotName, targetLSN)
+	if generation == "" {
+		return false
+	}
+	for _, action := range status.PlannedActions {
+		if haActionKind(action.Kind) != haActionPruneSeedArtifacts ||
+			strings.TrimSpace(action.StandbyName) != strings.TrimSpace(standby.Name) ||
+			strings.TrimSpace(action.SlotName) != strings.TrimSpace(slotName) ||
+			action.TargetLSN != targetLSN ||
+			strings.TrimSpace(action.SeedArtifactGeneration) != generation {
+			continue
+		}
+		return haAdminActionSucceededWithEvidence(action)
+	}
+	return false
 }
 
 func haStandbyMatchesFormerPrimary(status *antflyv1.HAStatus, standbyName string, slotName string) bool {
@@ -813,7 +1605,15 @@ func applyHAPlanStatus(cluster *antflyv1.AntflyCluster, plan haPlan) {
 	cluster.Status.HAStatus.ReadSafeStandbyCount = plan.ReadSafeStandbyCount
 	cluster.Status.HAStatus.ReseedRequiredCount = plan.ReseedRequiredCount
 	cluster.Status.HAStatus.AutomaticPromotionAllowed = plan.AutomaticPromotionAllowed
-	cluster.Status.HAStatus.PlannedActions = haPlannedActionStatuses(plan.Actions, ha, cluster.Status.HAStatus)
+	for i := range plan.Actions {
+		if plan.Actions[i].Kind != haActionActivateSeedArtifact || cluster.Spec.Standalone == nil ||
+			cluster.Spec.Standalone.NodeID <= 0 || cluster.Spec.Standalone.Replicas != 1 {
+			continue
+		}
+		plan.Actions[i].TargetLocalNodeID = uint64(cluster.Spec.Standalone.NodeID)
+		plan.Actions[i].TargetReplicaID = 1
+	}
+	cluster.Status.HAStatus.PlannedActions = haPlannedActionStatuses(plan.Actions, ha, cluster.Status.HAStatus, cluster)
 	cluster.Status.HAStatus.PrimaryRoute = haPrimaryRouteStatus(plan.PrimaryRoute)
 	cluster.Status.HAStatus.Sync = haSyncStatus(plan.SyncPolicy)
 	cluster.Status.HAStatus.FormerPrimary = haFormerPrimaryStatus(plan.FormerPrimary)
@@ -833,89 +1633,543 @@ func haSyncStatus(evaluation haSyncEvaluation) antflyv1.HASyncStatus {
 	}
 }
 
-func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) []antflyv1.HAPlannedActionStatus {
-	if len(actions) == 0 {
+func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus, clusters ...*antflyv1.AntflyCluster) []antflyv1.HAPlannedActionStatus {
+	completedRewind := haCompletedFormerPrimaryRewind(status)
+	for _, action := range actions {
+		if action.Kind == haActionRewindFormerPrimary {
+			completedRewind = nil
+			break
+		}
+	}
+	if len(actions) == 0 && completedRewind == nil {
 		return nil
 	}
-	out := make([]antflyv1.HAPlannedActionStatus, 0, len(actions))
+	retainedAssessment := haRetainedFormerPrimaryAssessment(actions, status)
+	outCapacity := len(actions)
+	if completedRewind != nil {
+		outCapacity++
+	}
+	if retainedAssessment != nil {
+		outCapacity++
+	}
+	out := make([]antflyv1.HAPlannedActionStatus, 0, outCapacity)
+	if completedRewind != nil {
+		if retainedAssessment != nil {
+			out = append(out, *retainedAssessment)
+			retainedAssessment = nil
+		}
+		out = append(out, *completedRewind)
+	}
 	for _, action := range actions {
+		if retainedAssessment != nil &&
+			(action.Kind == haActionRewindFormerPrimary || action.Kind == haActionReseedFormerPrimary) {
+			out = append(out, *retainedAssessment)
+			retainedAssessment = nil
+		}
+		haBindSeedCaptureResult(&action, status)
+		haBindSeedArtifactProtections(&action, status)
+		haBindSeedSourcePVCName(&action, ha)
+		haBindSeedTopology(&action, ha)
+		haBindFormerPrimaryTopology(&action, ha)
 		adminMethod, adminPath := haAdminOperation(action)
 		statusAction := antflyv1.HAPlannedActionStatus{
-			Kind:             string(action.Kind),
-			Phase:            string(haPlannedActionPhase(action.Kind)),
-			Executor:         string(haPlannedActionExecutor(action.Kind)),
-			DependsOn:        string(action.DependsOn),
-			StandbyName:      action.StandbyName,
-			SlotName:         action.SlotName,
-			TargetLSN:        action.TargetLSN,
-			ObservedLSN:      action.ObservedLSN,
-			RetainedFromLSN:  action.RetainedFromLSN,
-			RouteFrom:        action.RouteFrom,
-			RouteTo:          action.RouteTo,
-			FenceAuthority:   action.FenceAuthority,
-			FenceHolder:      action.FenceHolder,
-			FenceGeneration:  action.FenceGeneration,
-			FenceReason:      action.FenceReason,
-			SeedManifestPath: action.SeedManifestPath,
-			SeedContentRoot:  action.SeedContentRoot,
-			AdminCommand:     haAdminCommand(action, haReplicationIdentity(ha), status),
-			AdminURL:         haAdminURL(action, ha, status),
-			AdminNodeID:      haAdminNodeID(action, ha, status),
-			AdminMethod:      adminMethod,
-			AdminPath:        adminPath,
-			Reason:           action.Reason,
+			Kind:                             string(action.Kind),
+			Phase:                            string(haPlannedActionPhase(action.Kind)),
+			Executor:                         string(haPlannedActionExecutor(action.Kind)),
+			DependsOn:                        string(action.DependsOn),
+			StandbyName:                      action.StandbyName,
+			SlotName:                         action.SlotName,
+			TargetLSN:                        action.TargetLSN,
+			ObservedLSN:                      action.ObservedLSN,
+			RetainedFromLSN:                  action.RetainedFromLSN,
+			RouteFrom:                        action.RouteFrom,
+			RouteTo:                          action.RouteTo,
+			FenceAuthority:                   action.FenceAuthority,
+			FenceHolder:                      action.FenceHolder,
+			FenceGeneration:                  action.FenceGeneration,
+			FenceReason:                      action.FenceReason,
+			SeedManifestPath:                 action.SeedManifestPath,
+			SeedContentRoot:                  action.SeedContentRoot,
+			SeedArtifactTargetRoot:           action.SeedArtifactTargetRoot,
+			SeedArtifactLocation:             action.SeedArtifactLocation,
+			SeedArtifactGeneration:           action.SeedArtifactGeneration,
+			SeedArtifactRetainGenerations:    action.SeedArtifactRetention,
+			SeedArtifactCaptureRoot:          action.SeedArtifactCaptureRoot,
+			SeedCaptureReceiptPath:           action.SeedCaptureReceiptPath,
+			SeedCaptureReceiptSHA256:         action.SeedCaptureReceiptSHA256,
+			SeedArtifactProtectedGenerations: append([]string(nil), action.SeedArtifactProtectedGenerations...),
+			TopologyID:                       action.TopologyID,
+			TopologyGeneration:               action.TopologyGeneration,
+			TopologyNodeID:                   action.TopologyNodeID,
+			SourcePVCName:                    action.SourcePVCName,
+			SourcePVCUID:                     action.SourcePVCUID,
+			TargetPVCName:                    action.TargetPVCName,
+			TargetPVCUID:                     action.TargetPVCUID,
+			TargetLocalNodeID:                action.TargetLocalNodeID,
+			TargetReplicaID:                  action.TargetReplicaID,
+			AdminCommand:                     haAdminCommand(action, haReplicationIdentity(ha), status),
+			AdminURL:                         haAdminURL(action, ha, status),
+			AdminNodeID:                      haAdminNodeID(action, ha, status),
+			AdminMethod:                      adminMethod,
+			AdminPath:                        adminPath,
+			Reason:                           action.Reason,
 		}
-		statusAction = haPreservePlannedActionExecution(statusAction, status)
+		if ha != nil && ha.Admin != nil {
+			statusAction.RetryGeneration = ha.Admin.RetryGeneration
+		}
+		statusAction.OperationID = haPlannedActionOperationID(statusAction)
+		statusAction = haPreservePlannedActionExecution(statusAction, status, clusters...)
 		out = append(out, statusAction)
 	}
 	return out
 }
 
-func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, status *antflyv1.HAStatus) antflyv1.HAPlannedActionStatus {
+func haBindFormerPrimaryTopology(action *haPlannedAction, ha *antflyv1.HighAvailabilitySpec) {
+	if action == nil || (action.Kind != haActionRewindFormerPrimary &&
+		action.Kind != haActionReseedFormerPrimary && action.Kind != haActionDemoteFormerPrimary) {
+		return
+	}
+	standby, ok := haStandbySpecByName(ha, strings.TrimSpace(action.StandbyName))
+	if !ok || standby.SeedArtifact == nil {
+		return
+	}
+	artifact := standby.SeedArtifact
+	topologyID := strings.TrimSpace(artifact.TopologyID)
+	nodeID := strings.TrimSpace(artifact.NodeID)
+	targetPVCUID := strings.TrimSpace(artifact.TargetPVCUID)
+	if topologyID == "" || artifact.TopologyGeneration <= 0 || nodeID == "" ||
+		nodeID != strings.TrimSpace(action.StandbyName) || artifact.TargetPVC == nil ||
+		strings.TrimSpace(artifact.TargetPVC.ClaimName) == "" || targetPVCUID == "" {
+		return
+	}
+	// Rejoin execution is observed through a remote node-local admin endpoint.
+	// Freeze the declarative topology/PVC incarnation into status so a Colony
+	// controller can reject receipts and retries that belong to a replaced
+	// former-primary volume even though the admin request itself is remote.
+	action.TopologyID = topologyID
+	action.TopologyGeneration = artifact.TopologyGeneration
+	action.TopologyNodeID = nodeID
+	action.TargetPVCName = strings.TrimSpace(artifact.TargetPVC.ClaimName)
+	action.TargetPVCUID = targetPVCUID
+}
+
+func haBindSeedSourcePVCName(action *haPlannedAction, ha *antflyv1.HighAvailabilitySpec) {
+	if action == nil || ha == nil || !haPlannedActionKindUsesSeedSourceAuthority(action.Kind) {
+		return
+	}
+	standby, ok := haStandbySpecByName(ha, strings.TrimSpace(action.StandbyName))
+	if !ok || standby.SeedArtifact == nil || standby.SeedArtifact.SourcePVC == nil {
+		return
+	}
+	action.SourcePVCName = strings.TrimSpace(standby.SeedArtifact.SourcePVC.ClaimName)
+}
+
+func haBindSeedTopology(action *haPlannedAction, ha *antflyv1.HighAvailabilitySpec) {
+	if action == nil || ha == nil || ha.Runtime == nil || ha.Runtime.StartupGate == nil ||
+		ha.Runtime.StartupGate.RequiredReceipt == nil {
+		return
+	}
+	required := ha.Runtime.StartupGate.RequiredReceipt
+	if strings.TrimSpace(action.SlotName) != strings.TrimSpace(required.SlotName) ||
+		strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) {
+		return
+	}
+	action.TopologyID = strings.TrimSpace(required.TopologyID)
+	action.TopologyGeneration = required.TopologyGeneration
+	action.TopologyNodeID = strings.TrimSpace(required.NodeID)
+	action.TargetPVCName = strings.TrimSpace(required.TargetPVCName)
+	action.TargetPVCUID = strings.TrimSpace(required.TargetPVCUID)
+}
+
+func haBindSeedCaptureResult(action *haPlannedAction, status *antflyv1.HAStatus) {
+	if action == nil || status == nil ||
+		(action.Kind != haActionPublishSeedArtifact && action.Kind != haActionGCSourceSeedGenerations &&
+			action.Kind != haActionRestoreSeedArtifact && action.Kind != haActionActivateSeedArtifact) {
+		return
+	}
+	for i := range status.PlannedActions {
+		capture := status.PlannedActions[i]
+		if haActionKind(capture.Kind) != haActionCaptureSeedArtifact ||
+			strings.TrimSpace(capture.StandbyName) != strings.TrimSpace(action.StandbyName) ||
+			strings.TrimSpace(capture.SlotName) != strings.TrimSpace(action.SlotName) ||
+			strings.TrimSpace(capture.SeedArtifactGeneration) != strings.TrimSpace(action.SeedArtifactGeneration) ||
+			!haAdminActionSucceededWithEvidence(capture) || capture.AdminResult == nil {
+			continue
+		}
+		result := capture.AdminResult
+		if action.Kind == haActionGCSourceSeedGenerations {
+			action.SeedArtifactCaptureRoot = haSeedCaptureRoot(result.SeedGenerationRoot, action.SeedArtifactGeneration)
+			return
+		}
+		receiptPath := haSeedCaptureReceiptPath(result.SeedGenerationRoot, action.SeedArtifactGeneration)
+		if receiptPath == "" || !isLowerHexDigest(result.CaptureReceiptSHA256) {
+			return
+		}
+		action.SeedCaptureReceiptPath = receiptPath
+		action.SeedCaptureReceiptSHA256 = strings.TrimSpace(result.CaptureReceiptSHA256)
+		if action.Kind == haActionPublishSeedArtifact {
+			action.SeedManifestPath = result.SeedManifestPath
+			action.SeedContentRoot = result.SeedContentRoot
+		}
+		return
+	}
+}
+
+func haSeedCaptureReceiptPath(generationRoot, generation string) string {
+	if haSeedCaptureRoot(generationRoot, generation) == "" {
+		return ""
+	}
+	return path.Join(path.Clean(strings.TrimSpace(generationRoot)), "COMPLETE.json")
+}
+
+func haSeedCaptureRoot(generationRoot, generation string) string {
+	generationRoot = path.Clean(strings.TrimSpace(generationRoot))
+	generation = strings.TrimSpace(generation)
+	if generationRoot == "." || !path.IsAbs(generationRoot) || generation == "" || path.Base(generationRoot) != generation {
+		return ""
+	}
+	generationsRoot := path.Dir(generationRoot)
+	if path.Base(generationsRoot) != "generations" {
+		return ""
+	}
+	root := path.Dir(generationsRoot)
+	if root == "." || root == "/" {
+		return ""
+	}
+	return root
+}
+
+func haBindSeedArtifactProtections(action *haPlannedAction, status *antflyv1.HAStatus) {
+	if action == nil || (action.Kind != haActionGCSourceSeedGenerations && action.Kind != haActionGCTargetSeedGenerations) {
+		return
+	}
+	protected := map[string]struct{}{}
+	if generation := strings.TrimSpace(action.SeedArtifactGeneration); generation != "" {
+		protected[generation] = struct{}{}
+	}
+	if status != nil {
+		if gate := status.StartupGate; gate != nil && gate.ActivationReceipt != nil &&
+			strings.TrimSpace(gate.ActivationReceipt.SlotName) == strings.TrimSpace(action.SlotName) {
+			if generation := strings.TrimSpace(gate.ActivationReceipt.Generation); generation != "" {
+				protected[generation] = struct{}{}
+			}
+		}
+		for i := range status.PlannedActions {
+			candidate := status.PlannedActions[i]
+			if strings.TrimSpace(candidate.StandbyName) != strings.TrimSpace(action.StandbyName) ||
+				strings.TrimSpace(candidate.SlotName) != strings.TrimSpace(action.SlotName) {
+				continue
+			}
+			if generation := strings.TrimSpace(candidate.SeedArtifactGeneration); generation != "" {
+				protected[generation] = struct{}{}
+			}
+		}
+	}
+	values := make([]string, 0, len(protected))
+	for generation := range protected {
+		values = append(values, generation)
+	}
+	sort.Strings(values)
+	if len(values) > 256 {
+		values = values[:256]
+	}
+	action.SeedArtifactProtectedGenerations = values
+}
+
+func haRetainedFormerPrimaryAssessment(actions []haPlannedAction, status *antflyv1.HAStatus) *antflyv1.HAPlannedActionStatus {
+	if status == nil {
+		return nil
+	}
+	hasDisposition := haCompletedFormerPrimaryRewind(status) != nil
+	for _, action := range actions {
+		switch action.Kind {
+		case haActionDemoteFormerPrimary:
+			return nil
+		case haActionRewindFormerPrimary, haActionReseedFormerPrimary:
+			hasDisposition = true
+		}
+	}
+	if !hasDisposition {
+		return nil
+	}
+	for i := range status.PlannedActions {
+		previous := status.PlannedActions[i]
+		if haActionKind(previous.Kind) != haActionDemoteFormerPrimary ||
+			previous.AdminJobPhase != haAdminJobPhaseSucceeded ||
+			!haFormerPrimaryDemotePreserveAllowed(status, previous) ||
+			!haAdminActionSucceededWithStatusEvidence(status, previous) {
+			continue
+		}
+		return previous.DeepCopy()
+	}
+	return nil
+}
+
+func haCompletedFormerPrimaryRewind(status *antflyv1.HAStatus) *antflyv1.HAPlannedActionStatus {
+	promotion := haPromotionReceipt(status)
+	if promotion == nil || !haFormerPrimaryFenced(status, promotion) {
+		return nil
+	}
+	for i := range status.PlannedActions {
+		action := status.PlannedActions[i]
+		if haActionKind(action.Kind) != haActionRewindFormerPrimary ||
+			action.AdminJobPhase != haAdminJobPhaseSucceeded ||
+			!haFormerPrimaryActionSucceededWithPromotionEvidence(status, action) {
+			continue
+		}
+		return action.DeepCopy()
+	}
+	return nil
+}
+
+func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, status *antflyv1.HAStatus, clusters ...*antflyv1.AntflyCluster) antflyv1.HAPlannedActionStatus {
 	if status == nil {
 		return action
 	}
 	for _, previous := range status.PlannedActions {
-		if !haSamePlannedActionOperation(action, previous) {
+		if !haSamePlannedActionIdentity(action, previous) {
 			continue
+		}
+		if haPlannedActionKindUsesSeedSourceAuthority(haActionKind(action.Kind)) &&
+			strings.TrimSpace(action.SourcePVCName) != "" && action.SourcePVCName == previous.SourcePVCName &&
+			strings.TrimSpace(action.SourcePVCUID) == "" {
+			// The live Kubernetes UID is frozen at the execution boundary rather
+			// than accepted from spec. Preserve that exact incarnation across pure
+			// replans only while the declarative source claim name is unchanged.
+			action.SourcePVCUID = previous.SourcePVCUID
 		}
 		if haActionKind(previous.Kind) == haActionDemoteFormerPrimary &&
 			previous.AdminJobPhase == haAdminJobPhaseSucceeded &&
 			!haFormerPrimaryDemotePreserveAllowed(status, previous) {
 			return action
 		}
+		if haActionKind(previous.Kind) == haActionIsolateFormerPrimary && previous.AdminJobPhase == haAdminJobPhaseSucceeded {
+			valid := haPhysicalIsolationSucceededStructurallyWithEvidence(previous)
+			if len(clusters) > 0 && clusters[0] != nil {
+				valid = haPhysicalIsolationSucceededWithEvidence(clusters[0], previous)
+			}
+			if !valid {
+				return action
+			}
+		}
 		if haActionRequiresAdminResult(haActionKind(previous.Kind)) &&
 			previous.AdminJobPhase == haAdminJobPhaseSucceeded &&
 			!haAdminActionSucceededWithStatusEvidence(status, previous) {
 			return action
 		}
-		if previous.AdminJobPhase == haAdminJobPhaseFailed &&
-			previous.AdminJobName == haAdminDirectAPIName {
+		if haActionRequiresSeedArtifactReceipt(haActionKind(previous.Kind)) &&
+			previous.AdminJobPhase == haAdminJobPhaseSucceeded &&
+			!haSeedArtifactReceiptMatches(previous) {
 			return action
 		}
-		if haDirectAdminTypedEvidenceFailure(previous) {
-			return action
+		if haPlannedActionExecutionStarted(previous) {
+			// Once an external execution is possible, the entire request payload is
+			// immutable. In particular, advancing primary/standby LSN observations and
+			// regenerated Reason strings must not silently retarget a retry.
+			frozen := previous.DeepCopy()
+			if strings.TrimSpace(frozen.OperationID) == "" {
+				frozen.OperationID = haPlannedActionOperationID(action)
+			}
+			return *frozen
 		}
 		action.AdminJobName = previous.AdminJobName
 		action.AdminJobPhase = previous.AdminJobPhase
 		action.AdminError = previous.AdminError
 		action.AdminStatusCode = previous.AdminStatusCode
+		action.AttemptCount = previous.AttemptCount
+		action.RetryBudgetUsed = previous.RetryBudgetUsed
+		action.Retryable = previous.Retryable
+		action.ErrorClass = previous.ErrorClass
+		if previous.FirstAttemptAt != nil {
+			action.FirstAttemptAt = previous.FirstAttemptAt.DeepCopy()
+		}
+		if previous.LastAttemptAt != nil {
+			action.LastAttemptAt = previous.LastAttemptAt.DeepCopy()
+		}
+		if previous.NextRetryAt != nil {
+			action.NextRetryAt = previous.NextRetryAt.DeepCopy()
+		}
+		if previous.CompletedAt != nil {
+			action.CompletedAt = previous.CompletedAt.DeepCopy()
+		}
 		if previous.AdminResult != nil {
 			action.AdminResult = previous.AdminResult.DeepCopy()
+		}
+		if previous.SeedArtifactReceipt != nil {
+			action.SeedArtifactReceipt = previous.SeedArtifactReceipt.DeepCopy()
+		}
+		if previous.PhysicalIsolationReceipt != nil {
+			action.PhysicalIsolationReceipt = previous.PhysicalIsolationReceipt.DeepCopy()
 		}
 		return action
 	}
 	return action
 }
 
-func haDirectAdminTypedEvidenceFailure(action antflyv1.HAPlannedActionStatus) bool {
-	if action.AdminJobPhase != haAdminJobPhaseFailed ||
-		action.AdminJobName != haAdminDirectAPIName {
+func haPlannedActionExecutionStarted(action antflyv1.HAPlannedActionStatus) bool {
+	if strings.TrimSpace(action.AdminJobName) != "" || action.AttemptCount > 0 || action.InFlightAttempt > 0 {
+		return true
+	}
+	switch action.AdminJobPhase {
+	case haAdminJobPhaseRunning, haAdminJobPhaseSucceeded, haAdminJobPhaseFailed, haAdminJobPhaseWaitingJobFallback:
+		return true
+	default:
 		return false
 	}
-	err := strings.TrimSpace(action.AdminError)
-	return strings.Contains(err, "succeeded without typed") ||
-		strings.Contains(err, "missing typed result evidence")
+}
+
+// haPlannedActionOperationID intentionally excludes mutable observations
+// (TargetLSN, ObservedLSN, RetainedFromLSN, FenceReason, Reason, argv hints, and
+// the live-observed source PVC identity). Those values remain frozen in the
+// persisted action payload after execution begins, but they do not create an
+// unbounded stream of new retry identities. The source PVC UID is preserved
+// only while its declarative claim name remains unchanged and is revalidated at
+// the execution boundary.
+func haPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
+	if strings.TrimSpace(action.SeedArtifactCaptureRoot) == "" && strings.TrimSpace(action.TopologyID) == "" &&
+		action.TopologyGeneration == 0 && strings.TrimSpace(action.TopologyNodeID) == "" &&
+		strings.TrimSpace(action.TargetPVCName) == "" && strings.TrimSpace(action.TargetPVCUID) == "" &&
+		strings.TrimSpace(action.SeedCaptureReceiptPath) == "" && strings.TrimSpace(action.SeedCaptureReceiptSHA256) == "" &&
+		action.TargetLocalNodeID == 0 && action.TargetReplicaID == 0 {
+		return haLegacyPlannedActionOperationID(action)
+	}
+	identity := struct {
+		Version                       int    `json:"version"`
+		Kind                          string `json:"kind"`
+		Executor                      string `json:"executor"`
+		StandbyName                   string `json:"standby_name"`
+		SlotName                      string `json:"slot_name"`
+		RouteFrom                     string `json:"route_from"`
+		RouteTo                       string `json:"route_to"`
+		FenceAuthority                string `json:"fence_authority"`
+		FenceHolder                   string `json:"fence_holder"`
+		FenceGeneration               uint64 `json:"fence_generation"`
+		AdminURL                      string `json:"admin_url"`
+		AdminNodeID                   string `json:"admin_node_id"`
+		AdminMethod                   string `json:"admin_method"`
+		AdminPath                     string `json:"admin_path"`
+		SeedManifestPath              string `json:"seed_manifest_path"`
+		SeedContentRoot               string `json:"seed_content_root"`
+		SeedArtifactTargetRoot        string `json:"seed_artifact_target_root"`
+		SeedArtifactLocation          string `json:"seed_artifact_location"`
+		SeedArtifactGeneration        string `json:"seed_artifact_generation"`
+		SeedArtifactRetainGenerations int32  `json:"seed_artifact_retain_generations"`
+		SeedArtifactCaptureRoot       string `json:"seed_artifact_capture_root"`
+		SeedCaptureReceiptPath        string `json:"seed_capture_receipt_path"`
+		SeedCaptureReceiptSHA256      string `json:"seed_capture_receipt_sha256"`
+		TopologyID                    string `json:"topology_id"`
+		TopologyGeneration            int64  `json:"topology_generation"`
+		TopologyNodeID                string `json:"topology_node_id"`
+		TargetPVCName                 string `json:"target_pvc_name"`
+		TargetPVCUID                  string `json:"target_pvc_uid"`
+		TargetLocalNodeID             uint64 `json:"target_local_node_id"`
+		TargetReplicaID               uint64 `json:"target_replica_id"`
+		RetryGeneration               int64  `json:"retry_generation"`
+	}{
+		Version:                       2,
+		Kind:                          strings.TrimSpace(action.Kind),
+		Executor:                      strings.TrimSpace(action.Executor),
+		StandbyName:                   strings.TrimSpace(action.StandbyName),
+		SlotName:                      strings.TrimSpace(action.SlotName),
+		RouteFrom:                     strings.TrimSpace(action.RouteFrom),
+		RouteTo:                       strings.TrimSpace(action.RouteTo),
+		FenceAuthority:                strings.TrimSpace(string(action.FenceAuthority)),
+		FenceHolder:                   strings.TrimSpace(action.FenceHolder),
+		FenceGeneration:               action.FenceGeneration,
+		AdminURL:                      strings.TrimSpace(action.AdminURL),
+		AdminNodeID:                   strings.TrimSpace(action.AdminNodeID),
+		AdminMethod:                   strings.TrimSpace(action.AdminMethod),
+		AdminPath:                     strings.TrimSpace(action.AdminPath),
+		SeedManifestPath:              strings.TrimSpace(action.SeedManifestPath),
+		SeedContentRoot:               strings.TrimSpace(action.SeedContentRoot),
+		SeedArtifactTargetRoot:        strings.TrimSpace(action.SeedArtifactTargetRoot),
+		SeedArtifactLocation:          strings.TrimSpace(action.SeedArtifactLocation),
+		SeedArtifactGeneration:        strings.TrimSpace(action.SeedArtifactGeneration),
+		SeedArtifactRetainGenerations: action.SeedArtifactRetainGenerations,
+		SeedArtifactCaptureRoot:       strings.TrimSpace(action.SeedArtifactCaptureRoot),
+		SeedCaptureReceiptPath:        strings.TrimSpace(action.SeedCaptureReceiptPath),
+		SeedCaptureReceiptSHA256:      strings.TrimSpace(action.SeedCaptureReceiptSHA256),
+		TopologyID:                    strings.TrimSpace(action.TopologyID),
+		TopologyGeneration:            action.TopologyGeneration,
+		TopologyNodeID:                strings.TrimSpace(action.TopologyNodeID),
+		TargetPVCName:                 strings.TrimSpace(action.TargetPVCName),
+		TargetPVCUID:                  strings.TrimSpace(action.TargetPVCUID),
+		TargetLocalNodeID:             action.TargetLocalNodeID,
+		TargetReplicaID:               action.TargetReplicaID,
+		RetryGeneration:               action.RetryGeneration,
+	}
+	payload, err := json.Marshal(identity)
+	if err != nil {
+		panic(fmt.Sprintf("marshal HA operation identity: %v", err))
+	}
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("haop-v2-%x", digest[:])
+}
+
+func haLegacyPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
+	identity := struct {
+		Version                       int    `json:"version"`
+		Kind                          string `json:"kind"`
+		Executor                      string `json:"executor"`
+		StandbyName                   string `json:"standby_name"`
+		SlotName                      string `json:"slot_name"`
+		RouteFrom                     string `json:"route_from"`
+		RouteTo                       string `json:"route_to"`
+		FenceAuthority                string `json:"fence_authority"`
+		FenceHolder                   string `json:"fence_holder"`
+		FenceGeneration               uint64 `json:"fence_generation"`
+		AdminURL                      string `json:"admin_url"`
+		AdminNodeID                   string `json:"admin_node_id"`
+		AdminMethod                   string `json:"admin_method"`
+		AdminPath                     string `json:"admin_path"`
+		SeedManifestPath              string `json:"seed_manifest_path"`
+		SeedContentRoot               string `json:"seed_content_root"`
+		SeedArtifactTargetRoot        string `json:"seed_artifact_target_root"`
+		SeedArtifactLocation          string `json:"seed_artifact_location"`
+		SeedArtifactGeneration        string `json:"seed_artifact_generation"`
+		SeedArtifactRetainGenerations int32  `json:"seed_artifact_retain_generations"`
+		RetryGeneration               int64  `json:"retry_generation"`
+	}{
+		Version:                       1,
+		Kind:                          strings.TrimSpace(action.Kind),
+		Executor:                      strings.TrimSpace(action.Executor),
+		StandbyName:                   strings.TrimSpace(action.StandbyName),
+		SlotName:                      strings.TrimSpace(action.SlotName),
+		RouteFrom:                     strings.TrimSpace(action.RouteFrom),
+		RouteTo:                       strings.TrimSpace(action.RouteTo),
+		FenceAuthority:                strings.TrimSpace(string(action.FenceAuthority)),
+		FenceHolder:                   strings.TrimSpace(action.FenceHolder),
+		FenceGeneration:               action.FenceGeneration,
+		AdminURL:                      strings.TrimSpace(action.AdminURL),
+		AdminNodeID:                   strings.TrimSpace(action.AdminNodeID),
+		AdminMethod:                   strings.TrimSpace(action.AdminMethod),
+		AdminPath:                     strings.TrimSpace(action.AdminPath),
+		SeedManifestPath:              strings.TrimSpace(action.SeedManifestPath),
+		SeedContentRoot:               strings.TrimSpace(action.SeedContentRoot),
+		SeedArtifactTargetRoot:        strings.TrimSpace(action.SeedArtifactTargetRoot),
+		SeedArtifactLocation:          strings.TrimSpace(action.SeedArtifactLocation),
+		SeedArtifactGeneration:        strings.TrimSpace(action.SeedArtifactGeneration),
+		SeedArtifactRetainGenerations: action.SeedArtifactRetainGenerations,
+		RetryGeneration:               action.RetryGeneration,
+	}
+	payload, err := json.Marshal(identity)
+	if err != nil {
+		panic(fmt.Sprintf("marshal legacy HA operation identity: %v", err))
+	}
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("haop-v1-%x", digest[:])
+}
+
+func haSamePlannedActionIdentity(a antflyv1.HAPlannedActionStatus, b antflyv1.HAPlannedActionStatus) bool {
+	aID := strings.TrimSpace(a.OperationID)
+	if aID == "" {
+		aID = haPlannedActionOperationID(a)
+	}
+	bID := strings.TrimSpace(b.OperationID)
+	if bID == "" {
+		bID = haPlannedActionOperationID(b)
+	}
+	return aID == bID
 }
 
 func haFormerPrimaryDemotePreserveAllowed(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
@@ -955,6 +2209,23 @@ func haSamePlannedActionOperation(a antflyv1.HAPlannedActionStatus, b antflyv1.H
 		a.AdminPath == b.AdminPath &&
 		a.SeedManifestPath == b.SeedManifestPath &&
 		a.SeedContentRoot == b.SeedContentRoot &&
+		a.SeedArtifactTargetRoot == b.SeedArtifactTargetRoot &&
+		a.SeedArtifactLocation == b.SeedArtifactLocation &&
+		a.SeedArtifactGeneration == b.SeedArtifactGeneration &&
+		a.SeedArtifactRetainGenerations == b.SeedArtifactRetainGenerations &&
+		a.SeedArtifactCaptureRoot == b.SeedArtifactCaptureRoot &&
+		a.SeedCaptureReceiptPath == b.SeedCaptureReceiptPath &&
+		a.SeedCaptureReceiptSHA256 == b.SeedCaptureReceiptSHA256 &&
+		slices.Equal(a.SeedArtifactProtectedGenerations, b.SeedArtifactProtectedGenerations) &&
+		a.TopologyID == b.TopologyID &&
+		a.TopologyGeneration == b.TopologyGeneration &&
+		a.TopologyNodeID == b.TopologyNodeID &&
+		a.SourcePVCName == b.SourcePVCName &&
+		a.SourcePVCUID == b.SourcePVCUID &&
+		a.TargetPVCName == b.TargetPVCName &&
+		a.TargetPVCUID == b.TargetPVCUID &&
+		a.TargetLocalNodeID == b.TargetLocalNodeID &&
+		a.TargetReplicaID == b.TargetReplicaID &&
 		a.Reason == b.Reason &&
 		haSameAdminCommandHint(a, b)
 }
@@ -1096,6 +2367,10 @@ func haCLIActionKind(raw string) (haActionKind, bool) {
 		return haActionMarkReseed, true
 	case "acquire_fence":
 		return haActionAcquireFence, true
+	case "fence_former_primary":
+		return haActionFenceFormerPrimary, true
+	case "isolate_former_primary":
+		return haActionIsolateFormerPrimary, true
 	case "assess_promotion", "promotion_assess":
 		return haActionAssessPromotion, true
 	case "promote_standby":
@@ -1164,7 +2439,7 @@ func haCLIFencingAuthority(raw string) antflyv1.HAFencingAuthority {
 
 func haPlannedActionPhase(kind haActionKind) haActionPhase {
 	switch kind {
-	case haActionAcquireFence:
+	case haActionAcquireFence, haActionFenceFormerPrimary, haActionIsolateFormerPrimary:
 		return haActionPhaseFence
 	case haActionAssessPromotion, haActionPromoteStandby:
 		return haActionPhasePromote
@@ -1172,16 +2447,36 @@ func haPlannedActionPhase(kind haActionKind) haActionPhase {
 		return haActionPhaseRoute
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
 		return haActionPhaseRejoin
+	case haActionCaptureSeedArtifact, haActionPublishSeedArtifact, haActionGCSourceSeedGenerations, haActionRestoreSeedArtifact, haActionActivateSeedArtifact, haActionActivateSeededSlot, haActionGCTargetSeedGenerations, haActionPruneSeedArtifacts:
+		return haActionPhaseSeed
 	default:
 		return haActionPhaseReconcile
 	}
 }
 
 func haPlannedActionExecutor(kind haActionKind) haActionExecutor {
-	if kind == haActionUpdatePrimaryRoute {
+	if kind == haActionUpdatePrimaryRoute || kind == haActionIsolateFormerPrimary {
 		return haActionExecutorControllerAction
 	}
+	if haPlannedActionKindIsPortableArtifact(kind) {
+		return haActionExecutorCLIJob
+	}
 	return haActionExecutorAdminAPI
+}
+
+func haPlannedActionKindIsPortableArtifact(kind haActionKind) bool {
+	return kind == haActionPublishSeedArtifact ||
+		kind == haActionGCSourceSeedGenerations ||
+		kind == haActionRestoreSeedArtifact ||
+		kind == haActionActivateSeedArtifact ||
+		kind == haActionGCTargetSeedGenerations ||
+		kind == haActionPruneSeedArtifacts
+}
+
+func haPlannedActionKindUsesSeedSourceAuthority(kind haActionKind) bool {
+	return kind == haActionCaptureSeedArtifact ||
+		haPlannedActionKindIsPortableArtifact(kind) ||
+		kind == haActionActivateSeededSlot
 }
 
 func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIdentitySpec, status *antflyv1.HAStatus) []string {
@@ -1219,6 +2514,117 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			return nil
 		}
 		return []string{"seed", "finish", "--manifest", action.SeedManifestPath}
+	case haActionPublishSeedArtifact:
+		if action.SeedArtifactLocation == "" || action.SeedArtifactGeneration == "" ||
+			action.SeedManifestPath == "" || action.SeedContentRoot == "" || action.SlotName == "" ||
+			action.SeedCaptureReceiptPath == "" || !isLowerHexDigest(action.SeedCaptureReceiptSHA256) {
+			return nil
+		}
+		command := []string{
+			"artifact", "publish",
+			"--location", action.SeedArtifactLocation,
+			"--generation", action.SeedArtifactGeneration,
+			"--slot", action.SlotName,
+			"--manifest", action.SeedManifestPath,
+			"--content-root", action.SeedContentRoot,
+			"--capture-receipt", action.SeedCaptureReceiptPath,
+			"--capture-receipt-sha256", action.SeedCaptureReceiptSHA256,
+		}
+		return haAppendArtifactTopologyBinding(command, action)
+	case haActionGCSourceSeedGenerations:
+		if action.SeedArtifactLocation == "" || action.SeedArtifactGeneration == "" ||
+			action.SlotName == "" || action.SeedArtifactCaptureRoot == "" || action.SeedArtifactRetention <= 0 {
+			return nil
+		}
+		command := []string{
+			"artifact", "gc-source",
+			"--location", action.SeedArtifactLocation,
+			"--generation", action.SeedArtifactGeneration,
+			"--slot", action.SlotName,
+			"--capture-root", action.SeedArtifactCaptureRoot,
+			"--retain-generations", strconv.FormatInt(int64(action.SeedArtifactRetention), 10),
+		}
+		for _, generation := range action.SeedArtifactProtectedGenerations {
+			command = append(command, "--protect-generation", generation)
+		}
+		return command
+	case haActionRestoreSeedArtifact:
+		if identity == nil || action.SeedArtifactLocation == "" || action.SeedArtifactGeneration == "" ||
+			action.SeedContentRoot == "" || action.SlotName == "" ||
+			!isLowerHexDigest(action.SeedCaptureReceiptSHA256) {
+			return nil
+		}
+		command := []string{
+			"artifact", "restore",
+			"--location", action.SeedArtifactLocation,
+			"--generation", action.SeedArtifactGeneration,
+			"--slot", action.SlotName,
+			"--staging-root", action.SeedContentRoot,
+			"--ha-cluster-id", strconv.FormatUint(identity.ClusterID, 10),
+			"--ha-shard-id", strconv.FormatUint(identity.ShardID, 10),
+			"--ha-table-id", strconv.FormatUint(identity.TableID, 10),
+			"--ha-timeline-id", strconv.FormatUint(identity.TimelineID, 10),
+			"--ha-epoch", strconv.FormatUint(identity.Epoch, 10),
+			"--minimum-checkpoint-lsn", strconv.FormatUint(action.TargetLSN, 10),
+			"--capture-receipt-sha256", action.SeedCaptureReceiptSHA256,
+		}
+		return haAppendArtifactTopologyBinding(command, action)
+	case haActionActivateSeedArtifact:
+		if identity == nil || action.SeedArtifactGeneration == "" || action.SeedContentRoot == "" ||
+			action.SeedArtifactTargetRoot == "" || action.SlotName == "" ||
+			!isLowerHexDigest(action.SeedCaptureReceiptSHA256) ||
+			action.TargetLocalNodeID == 0 || action.TargetReplicaID == 0 {
+			return nil
+		}
+		command := []string{
+			"artifact", "activate",
+			"--generation", action.SeedArtifactGeneration,
+			"--slot", action.SlotName,
+			"--staging-root", action.SeedContentRoot,
+			"--target-root", action.SeedArtifactTargetRoot,
+			"--ha-cluster-id", strconv.FormatUint(identity.ClusterID, 10),
+			"--ha-shard-id", strconv.FormatUint(identity.ShardID, 10),
+			"--ha-table-id", strconv.FormatUint(identity.TableID, 10),
+			"--ha-timeline-id", strconv.FormatUint(identity.TimelineID, 10),
+			"--ha-epoch", strconv.FormatUint(identity.Epoch, 10),
+			"--minimum-checkpoint-lsn", strconv.FormatUint(action.TargetLSN, 10),
+			"--capture-receipt-sha256", action.SeedCaptureReceiptSHA256,
+		}
+		command = haAppendArtifactTopologyBinding(command, action)
+		if command == nil {
+			return nil
+		}
+		return append(command,
+			"--target-local-node-id", strconv.FormatUint(action.TargetLocalNodeID, 10),
+			"--target-replica-id", strconv.FormatUint(action.TargetReplicaID, 10),
+		)
+	case haActionGCTargetSeedGenerations:
+		if action.SeedArtifactGeneration == "" || action.SeedArtifactTargetRoot == "" ||
+			action.SlotName == "" || action.SeedArtifactRetention <= 0 {
+			return nil
+		}
+		command := []string{
+			"artifact", "gc-target",
+			"--target-root", action.SeedArtifactTargetRoot,
+			"--slot-activation-receipt", haSeededSlotActivationReceiptPath,
+			"--retain-generations", strconv.FormatInt(int64(action.SeedArtifactRetention), 10),
+		}
+		for _, generation := range action.SeedArtifactProtectedGenerations {
+			command = append(command, "--protect-generation", generation)
+		}
+		return command
+	case haActionPruneSeedArtifacts:
+		if action.SeedArtifactLocation == "" || action.SeedArtifactGeneration == "" ||
+			action.SeedArtifactRetention <= 0 || action.SlotName == "" {
+			return nil
+		}
+		return []string{
+			"artifact", "prune",
+			"--location", action.SeedArtifactLocation,
+			"--generation", action.SeedArtifactGeneration,
+			"--slot", action.SlotName,
+			"--retain-generations", strconv.FormatInt(int64(action.SeedArtifactRetention), 10),
+		}
 	case haActionBootstrapStandbySeed:
 		if action.SeedManifestPath == "" {
 			return nil
@@ -1257,9 +2663,70 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			"--observed-lsn", strconv.FormatUint(action.TargetLSN, 10),
 			"--reason", reason,
 		}
+	case haActionFenceFormerPrimary:
+		promotion := haPromotionReceipt(status)
+		if identity == nil {
+			return nil
+		}
+		if promotion == nil {
+			oldPrimaryID := strings.TrimSpace(action.StandbyName)
+			promotedNodeID := strings.TrimSpace(action.RouteTo)
+			if oldPrimaryID == "" || promotedNodeID == "" || action.TargetLSN == 0 {
+				return nil
+			}
+			reason := action.FenceReason
+			if strings.TrimSpace(reason) == "" {
+				reason = action.Reason
+			}
+			return []string{
+				"fence", "acquire",
+				"--cluster-id", strconv.FormatUint(identity.ClusterID, 10),
+				"--shard-id", strconv.FormatUint(identity.ShardID, 10),
+				"--table-id", strconv.FormatUint(identity.TableID, 10),
+				"--timeline-id", strconv.FormatUint(identity.TimelineID, 10),
+				"--epoch", strconv.FormatUint(identity.Epoch, 10),
+				"--old-primary-id", oldPrimaryID,
+				"--promoted-node-id", promotedNodeID,
+				"--new-timeline-id", strconv.FormatUint(identity.TimelineID+1, 10),
+				"--new-epoch", strconv.FormatUint(identity.Epoch+1, 10),
+				"--required-lsn", strconv.FormatUint(action.TargetLSN, 10),
+				"--observed-lsn", strconv.FormatUint(action.TargetLSN, 10),
+				"--reason", reason,
+			}
+		}
+		return []string{
+			"fence", "acquire",
+			"--cluster-id", strconv.FormatUint(identity.ClusterID, 10),
+			"--shard-id", strconv.FormatUint(identity.ShardID, 10),
+			"--table-id", strconv.FormatUint(identity.TableID, 10),
+			"--timeline-id", strconv.FormatUint(promotion.ParentTimelineID, 10),
+			"--epoch", strconv.FormatUint(promotion.ParentEpoch, 10),
+			"--old-primary-id", promotion.OldPrimaryID,
+			"--promoted-node-id", promotion.PromotedStandbyID,
+			"--new-timeline-id", strconv.FormatUint(promotion.NewTimelineID, 10),
+			"--new-epoch", strconv.FormatUint(promotion.NewEpoch, 10),
+			"--required-lsn", strconv.FormatUint(haPromotionRequiredLSN(promotion), 10),
+			"--observed-lsn", strconv.FormatUint(haPromotionObservedLSN(promotion), 10),
+			"--reason", promotion.FenceReason,
+		}
 	default:
 		return nil
 	}
+}
+
+func haAppendArtifactTopologyBinding(command []string, action haPlannedAction) []string {
+	if strings.TrimSpace(action.TopologyID) == "" || action.TopologyGeneration <= 0 ||
+		strings.TrimSpace(action.TopologyNodeID) == "" || strings.TrimSpace(action.TargetPVCName) == "" ||
+		strings.TrimSpace(action.TargetPVCUID) == "" {
+		return nil
+	}
+	return append(command,
+		"--topology-id", action.TopologyID,
+		"--topology-generation", strconv.FormatInt(action.TopologyGeneration, 10),
+		"--node-id", action.TopologyNodeID,
+		"--target-pvc-name", action.TargetPVCName,
+		"--target-pvc-uid", action.TargetPVCUID,
+	)
 }
 
 func haSlotLifecycleCommand(operation string, action haPlannedAction) []string {
@@ -1367,10 +2834,12 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, statu
 		return ""
 	}
 	switch action.Kind {
-	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionMarkReseed:
+	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionCaptureSeedArtifact, haActionActivateSeededSlot, haActionMarkReseed:
 		return haCurrentPrimaryAdminURL(ha, status)
 	case haActionAcquireFence:
 		return haStandbyAdminURL(ha, action.StandbyName)
+	case haActionFenceFormerPrimary:
+		return haFormerPrimaryAdminURL(ha, action)
 	case haActionBootstrapStandbySeed:
 		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionAssessPromotion, haActionPromoteStandby:
@@ -1415,9 +2884,11 @@ func haCurrentPrimaryAdminURL(ha *antflyv1.HighAvailabilitySpec, status *antflyv
 
 func haAdminNodeID(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
 	switch action.Kind {
-	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionMarkReseed:
+	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionCaptureSeedArtifact, haActionActivateSeededSlot, haActionMarkReseed:
 		return haCurrentPrimaryNodeID(ha, status)
 	case haActionAcquireFence, haActionBootstrapStandbySeed, haActionAssessPromotion, haActionPromoteStandby:
+		return strings.TrimSpace(action.StandbyName)
+	case haActionFenceFormerPrimary:
 		return strings.TrimSpace(action.StandbyName)
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary:
 		return strings.TrimSpace(action.StandbyName)
@@ -1462,9 +2933,15 @@ func haAdminOperation(action haPlannedAction) (string, string) {
 		operation = adminsdk.HABeginBaseBackupOperation()
 	case haActionFinishStandbySeed:
 		operation = adminsdk.HAFinishBaseBackupOperation()
+	case haActionCaptureSeedArtifact:
+		operation = adminsdk.HASeedCaptureOperation()
+	case haActionActivateSeededSlot:
+		operation = adminsdk.HAActivateSeededSlotOperation()
 	case haActionBootstrapStandbySeed:
 		operation = adminsdk.HABootstrapStandbyOperation()
 	case haActionAcquireFence:
+		operation = adminsdk.HAAcquireFenceOperation()
+	case haActionFenceFormerPrimary:
 		operation = adminsdk.HAAcquireFenceOperation()
 	case haActionAssessPromotion:
 		operation = adminsdk.HAAssessPromotionOperation()
@@ -1529,6 +3006,158 @@ func haReplicationIdentity(ha *antflyv1.HighAvailabilitySpec) *antflyv1.HAReplic
 }
 
 func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, targetLSN uint64, reason string, dependsOn haActionKind) []haPlannedAction {
+	if artifact := standby.SeedArtifact; artifact != nil {
+		// Colony first declares the source/target transport, then binds it to
+		// observed topology and PVC identity. The unbound descriptor is pending
+		// state only: never materialize an executable action chain until every
+		// immutable authority field is present.
+		if strings.TrimSpace(artifact.TopologyID) == "" || artifact.TopologyGeneration <= 0 ||
+			strings.TrimSpace(artifact.NodeID) == "" || strings.TrimSpace(artifact.TargetPVCUID) == "" {
+			return nil
+		}
+		location := strings.TrimSpace(artifact.Location)
+		stagingRoot := strings.TrimRight(strings.TrimSpace(artifact.StagingRoot), "/")
+		contentRoot := strings.TrimSpace(standby.SeedContentRoot)
+		targetRoot := ""
+		if artifact.TargetPVC != nil {
+			targetMount := strings.TrimRight(strings.TrimSpace(artifact.TargetPVC.MountPath), "/")
+			if targetMount != "" {
+				targetRoot = targetMount + "/.antfly-ha/active"
+			}
+		}
+		runtimeOwned := strings.TrimSpace(standby.SeedManifestPath) == "" && contentRoot == ""
+		if location == "" || stagingRoot == "" || targetRoot == "" || targetRoot == "." ||
+			(runtimeOwned && artifact.SourcePVC == nil) {
+			return nil
+		}
+		generation := haSeedArtifactGeneration(standby, slotName, targetLSN)
+		retention := artifact.RetainGenerations
+		if retention == 0 {
+			retention = 2
+		}
+		actions := make([]haPlannedAction, 0, 8)
+		publishDependsOn := haActionFinishStandbySeed
+		if runtimeOwned {
+			actions = append(actions, haPlannedAction{
+				Kind:                   haActionCaptureSeedArtifact,
+				DependsOn:              dependsOn,
+				StandbyName:            standby.Name,
+				SlotName:               slotName,
+				TargetLSN:              targetLSN,
+				SeedArtifactGeneration: generation,
+				Reason:                 reason,
+			})
+			publishDependsOn = haActionCaptureSeedArtifact
+		} else {
+			if standby.SeedManifestPath == "" || contentRoot == "" {
+				return nil
+			}
+			actions = append(actions, haPlannedAction{
+				Kind:             haActionFinishStandbySeed,
+				DependsOn:        dependsOn,
+				StandbyName:      standby.Name,
+				SlotName:         slotName,
+				TargetLSN:        targetLSN,
+				SeedManifestPath: standby.SeedManifestPath,
+				SeedContentRoot:  contentRoot,
+				Reason:           reason,
+			})
+		}
+		actions = append(actions,
+			haPlannedAction{
+				Kind:                   haActionPublishSeedArtifact,
+				DependsOn:              publishDependsOn,
+				StandbyName:            standby.Name,
+				SlotName:               slotName,
+				TargetLSN:              targetLSN,
+				SeedManifestPath:       standby.SeedManifestPath,
+				SeedContentRoot:        contentRoot,
+				SeedArtifactLocation:   location,
+				SeedArtifactGeneration: generation,
+				Reason:                 reason,
+			},
+		)
+		restoreDependsOn := haActionPublishSeedArtifact
+		if runtimeOwned {
+			actions = append(actions, haPlannedAction{
+				Kind:                   haActionGCSourceSeedGenerations,
+				DependsOn:              haActionPublishSeedArtifact,
+				StandbyName:            standby.Name,
+				SlotName:               slotName,
+				TargetLSN:              targetLSN,
+				SeedArtifactLocation:   location,
+				SeedArtifactGeneration: generation,
+				SeedArtifactRetention:  retention,
+				Reason:                 reason,
+			})
+			restoreDependsOn = haActionGCSourceSeedGenerations
+		}
+		actions = append(actions,
+			haPlannedAction{
+				Kind:                   haActionRestoreSeedArtifact,
+				DependsOn:              restoreDependsOn,
+				StandbyName:            standby.Name,
+				SlotName:               slotName,
+				TargetLSN:              targetLSN,
+				SeedContentRoot:        stagingRoot,
+				SeedArtifactLocation:   location,
+				SeedArtifactGeneration: generation,
+				Reason:                 reason,
+			},
+			haPlannedAction{
+				Kind:                   haActionActivateSeedArtifact,
+				DependsOn:              haActionRestoreSeedArtifact,
+				StandbyName:            standby.Name,
+				SlotName:               slotName,
+				TargetLSN:              targetLSN,
+				SeedContentRoot:        stagingRoot,
+				SeedArtifactTargetRoot: targetRoot,
+				SeedArtifactGeneration: generation,
+				Reason:                 reason,
+			},
+			haPlannedAction{
+				Kind:                   haActionActivateSeededSlot,
+				DependsOn:              haActionActivateSeedArtifact,
+				StandbyName:            standby.Name,
+				SlotName:               slotName,
+				TargetLSN:              targetLSN,
+				SeedArtifactGeneration: generation,
+				Reason:                 reason,
+			},
+			haPlannedAction{
+				Kind:                   haActionGCTargetSeedGenerations,
+				DependsOn:              haActionActivateSeededSlot,
+				StandbyName:            standby.Name,
+				SlotName:               slotName,
+				TargetLSN:              targetLSN,
+				SeedArtifactTargetRoot: targetRoot,
+				SeedArtifactGeneration: generation,
+				SeedArtifactRetention:  retention,
+				Reason:                 reason,
+			},
+			haPlannedAction{
+				Kind:                   haActionPruneSeedArtifacts,
+				DependsOn:              haActionGCTargetSeedGenerations,
+				StandbyName:            standby.Name,
+				SlotName:               slotName,
+				TargetLSN:              targetLSN,
+				SeedArtifactLocation:   location,
+				SeedArtifactGeneration: generation,
+				SeedArtifactRetention:  retention,
+				Reason:                 reason,
+			},
+		)
+		for i := range actions {
+			actions[i].TopologyID = strings.TrimSpace(artifact.TopologyID)
+			actions[i].TopologyGeneration = artifact.TopologyGeneration
+			actions[i].TopologyNodeID = strings.TrimSpace(artifact.NodeID)
+			if artifact.TargetPVC != nil {
+				actions[i].TargetPVCName = strings.TrimSpace(artifact.TargetPVC.ClaimName)
+			}
+			actions[i].TargetPVCUID = strings.TrimSpace(artifact.TargetPVCUID)
+		}
+		return actions
+	}
 	if standby.SeedManifestPath == "" {
 		return nil
 	}
@@ -1554,6 +3183,27 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 			Reason:           reason,
 		},
 	}
+}
+
+func haSeedArtifactGeneration(standby antflyv1.HAStandbySpec, slotName string, targetLSN uint64) string {
+	if standby.SeedArtifact == nil {
+		return ""
+	}
+	if generation := strings.TrimSpace(standby.SeedArtifact.Generation); generation != "" {
+		return generation
+	}
+	prefix := strings.TrimSpace(standby.SeedArtifact.GenerationPrefix)
+	if prefix == "" {
+		prefix = "seed"
+	}
+	return fmt.Sprintf("%s-%s-%d", prefix, slotName, targetLSN)
+}
+
+func haStandbyUsesRuntimeOwnedSeedCapture(standby antflyv1.HAStandbySpec) bool {
+	return standby.SeedArtifact != nil &&
+		strings.TrimSpace(standby.SeedManifestPath) == "" &&
+		strings.TrimSpace(standby.SeedContentRoot) == "" &&
+		standby.SeedArtifact.SourcePVC != nil
 }
 
 func haAutomaticFailoverFormerPrimaryID(ha *antflyv1.HighAvailabilitySpec) string {
@@ -1641,11 +3291,15 @@ func haFormerPrimaryPlannedAction(evaluation haFormerPrimaryEvaluation, status *
 		return haPlannedAction{}
 	}
 	retainedFromLSN := uint64(0)
+	targetLSN := evaluation.SwitchLSN
 	fenceReason := ""
 	if status != nil {
 		retainedFromLSN = status.Retention.OldestRestartLSN
-		if status.LastPromotion != nil {
-			fenceReason = status.LastPromotion.FenceReason
+		if promotion := haPromotionReceipt(status); promotion != nil {
+			fenceReason = promotion.FenceReason
+			if forkLSN := haPromotionObservedLSN(promotion); forkLSN > 0 {
+				targetLSN = forkLSN
+			}
 		}
 	}
 	switch evaluation.Action {
@@ -1653,7 +3307,8 @@ func haFormerPrimaryPlannedAction(evaluation haFormerPrimaryEvaluation, status *
 		return haPlannedAction{
 			Kind:            haActionKind(evaluation.Action),
 			StandbyName:     evaluation.NodeID,
-			TargetLSN:       evaluation.SwitchLSN,
+			RouteFrom:       evaluation.NodeID,
+			TargetLSN:       targetLSN,
 			ObservedLSN:     evaluation.ObservedLSN,
 			RetainedFromLSN: retainedFromLSN,
 			FenceAuthority:  evaluation.FenceAuthority,
@@ -1685,8 +3340,13 @@ func mergeConfiguredStandbys(status *antflyv1.HAStatus, ha *antflyv1.HighAvailab
 		}
 	}
 	merged := make([]antflyv1.HAStandbyStatus, 0, len(ha.Standbys))
+	promotedPrimaryID := haPromotedPrimaryNodeID(status)
 	for _, desired := range ha.Standbys {
 		if !standbyDesired(desired) {
+			continue
+		}
+		if promotedPrimaryID != "" &&
+			(promotedPrimaryID == strings.TrimSpace(desired.Name) || promotedPrimaryID == strings.TrimSpace(standbySlotName(desired))) {
 			continue
 		}
 		entry, ok := observed[desired.Name]
@@ -1795,16 +3455,30 @@ func haAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antf
 	if !plan.FencingReady {
 		return ""
 	}
-	if !haPrimaryAdminUnavailable(status) {
-		return ""
-	}
-	if !haPromotionBoundaryReady(status) {
-		return ""
-	}
+	committedStandby := haCommittedAutomaticPromotionStandby(ha, status)
 	if plan.PromotionAlreadyRecorded {
 		return ""
 	}
 	if !plan.PromotionRouteReady {
+		return ""
+	}
+	// Once the Lease-backed transaction is recorded, do not re-run the initial
+	// candidate election gates against a moving old-primary tail. The pending
+	// node-local fence freezes the actual durable tail; downstream assessment
+	// then waits for the chosen standby to apply that exact boundary. Requiring
+	// the old writer to remain unreachable and the candidate to remain caught
+	// up here would erase the transaction precisely when transport recovery lets
+	// the controller execute the fence.
+	if committedStandby != "" {
+		if status == nil || committedStandby != status.Fencing.Holder {
+			return ""
+		}
+		return committedStandby
+	}
+	if !haPrimaryAdminUnavailable(status) {
+		return ""
+	}
+	if !haPromotionBoundaryReady(status) {
 		return ""
 	}
 	if haSyncPolicyDegraded(ha, plan) {
@@ -1840,6 +3514,9 @@ func haAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antf
 func haKubernetesLeaseFenceCandidate(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
 	if ha == nil || ha.AutomaticFailover == nil || status == nil {
 		return ""
+	}
+	if committed := haCommittedAutomaticPromotionStandby(ha, status); committed != "" {
+		return committed
 	}
 	if !haPrimaryAdminUnavailable(status) {
 		return ""
@@ -1880,6 +3557,136 @@ func haKubernetesLeaseFenceCandidate(ha *antflyv1.HighAvailabilitySpec, status *
 		return desired.Name
 	}
 	return ""
+}
+
+// Once a failover plan has reached the former-primary fence step, the
+// Kubernetes Lease represents an in-flight ownership transfer. A transient
+// recovery of the old primary admin endpoint must let the controller finish
+// that transfer; otherwise the very connection needed to durably fence the old
+// writer would make the promotion plan disappear.
+func haCommittedAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
+	if ha == nil || status == nil || haPromotionReceipt(status) != nil {
+		return ""
+	}
+	fencing := status.Fencing
+	if fencing.Generation == 0 || !desiredStandbyNamed(ha, fencing.Holder) {
+		return ""
+	}
+	if !fencing.Ready && fencing.Reason != "LeaseExpired" {
+		return ""
+	}
+	if haCommittedFormerPrimaryFenceAction(ha, status, fencing.Holder, fencing.Generation) != nil ||
+		haCommittedFormerPrimaryIsolationAction(ha, status, fencing.Holder, fencing.Generation) != nil {
+		return fencing.Holder
+	}
+	return ""
+}
+
+func haCommittedFormerPrimaryIsolationAction(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus, holder string, generation uint64) *antflyv1.HAPlannedActionStatus {
+	if ha == nil || ha.AutomaticFailover == nil || status == nil || haPromotionReceipt(status) != nil ||
+		generation == 0 || !desiredStandbyNamed(ha, holder) {
+		return nil
+	}
+	identity := haReplicationIdentity(ha)
+	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) == "" {
+		return nil
+	}
+	for i := range status.PlannedActions {
+		action := &status.PlannedActions[i]
+		if haActionKind(action.Kind) != haActionIsolateFormerPrimary ||
+			strings.TrimSpace(action.StandbyName) != strings.TrimSpace(identity.CurrentPrimaryID) ||
+			strings.TrimSpace(action.RouteTo) != strings.TrimSpace(holder) ||
+			strings.TrimSpace(action.FenceHolder) != strings.TrimSpace(holder) ||
+			action.FenceGeneration != generation ||
+			action.FenceAuthority != ha.AutomaticFailover.FencingAuthority ||
+			action.TargetLSN == 0 {
+			continue
+		}
+		switch action.AdminJobPhase {
+		case haAdminJobPhaseRunning:
+			if !haPhysicalIsolationIntentStructurallyMatches(*action) {
+				continue
+			}
+			return action
+		case haAdminJobPhaseSucceeded:
+			if !haPhysicalIsolationSucceededStructurallyWithEvidence(*action) {
+				continue
+			}
+			return action
+		default:
+			continue
+		}
+	}
+	return nil
+}
+
+func haCommittedFormerPrimaryFenceAction(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus, holder string, generation uint64) *antflyv1.HAPlannedActionStatus {
+	if ha == nil || ha.AutomaticFailover == nil || status == nil || haPromotionReceipt(status) != nil ||
+		generation == 0 || !desiredStandbyNamed(ha, holder) {
+		return nil
+	}
+	identity := haReplicationIdentity(ha)
+	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) == "" {
+		return nil
+	}
+	for i := range status.PlannedActions {
+		action := &status.PlannedActions[i]
+		if haActionKind(action.Kind) != haActionFenceFormerPrimary ||
+			strings.TrimSpace(action.StandbyName) != strings.TrimSpace(identity.CurrentPrimaryID) ||
+			strings.TrimSpace(action.RouteTo) != strings.TrimSpace(holder) ||
+			strings.TrimSpace(action.FenceHolder) != strings.TrimSpace(holder) ||
+			action.FenceGeneration != generation ||
+			action.FenceAuthority != ha.AutomaticFailover.FencingAuthority ||
+			action.TargetLSN == 0 {
+			continue
+		}
+		// Merely rendering a plan is not a commitment: the candidate can still
+		// become unhealthy before execution begins. Preserve the transaction only
+		// after the former-primary fence call has actually started (or completed).
+		switch action.AdminJobPhase {
+		case haAdminJobPhasePending, haAdminJobPhaseRunning, haAdminJobPhaseSucceeded:
+		default:
+			continue
+		}
+		return action
+	}
+	return nil
+}
+
+func haAutomaticFailoverPromotionBoundary(status *antflyv1.HAStatus, holder string, generation uint64) uint64 {
+	if status == nil {
+		return 0
+	}
+	var committedLowerBound uint64
+	for _, action := range status.PlannedActions {
+		kind := haActionKind(action.Kind)
+		if (kind != haActionFenceFormerPrimary && kind != haActionIsolateFormerPrimary) ||
+			strings.TrimSpace(action.RouteTo) != strings.TrimSpace(holder) ||
+			action.FenceGeneration != generation {
+			continue
+		}
+		if action.TargetLSN != 0 {
+			committedLowerBound = action.TargetLSN
+		}
+		if kind == haActionIsolateFormerPrimary && action.AdminJobPhase == haAdminJobPhaseSucceeded {
+			return action.TargetLSN
+		}
+		if action.AdminJobPhase != haAdminJobPhaseSucceeded || action.AdminResult == nil {
+			continue
+		}
+		result := action.AdminResult
+		if result.FenceRequiredLSN == 0 ||
+			result.FenceObservedLSN != result.FenceRequiredLSN ||
+			result.FenceGeneration != generation ||
+			strings.TrimSpace(result.FencePromotedNodeID) != strings.TrimSpace(holder) {
+			continue
+		}
+		return result.FenceRequiredLSN
+	}
+	if committedLowerBound != 0 {
+		return committedLowerBound
+	}
+	return status.PrimaryLSN
 }
 
 func standbyReadSafe(status *antflyv1.HAStatus, standby antflyv1.HAStandbyStatus) bool {
@@ -2000,6 +3807,25 @@ func haAutomaticFailoverExecutionEnabled(ha *antflyv1.HighAvailabilitySpec) bool
 	return ha != nil && ha.Admin != nil && ha.Admin.ExecutePlannedActions
 }
 
+const (
+	defaultHAAutomaticFailoverMinimumConsecutiveFailures int32 = 3
+	defaultHAAutomaticFailoverMinimumUnreachableSeconds  int32 = 30
+)
+
+func haAutomaticFailoverFailureThresholds(ha *antflyv1.HighAvailabilitySpec) (int32, time.Duration) {
+	minimumFailures := defaultHAAutomaticFailoverMinimumConsecutiveFailures
+	minimumSeconds := defaultHAAutomaticFailoverMinimumUnreachableSeconds
+	if ha != nil && ha.AutomaticFailover != nil {
+		if ha.AutomaticFailover.MinimumConsecutiveFailures >= 2 {
+			minimumFailures = ha.AutomaticFailover.MinimumConsecutiveFailures
+		}
+		if ha.AutomaticFailover.MinimumUnreachableDurationSeconds >= 1 {
+			minimumSeconds = ha.AutomaticFailover.MinimumUnreachableDurationSeconds
+		}
+	}
+	return minimumFailures, time.Duration(minimumSeconds) * time.Second
+}
+
 func haAutomaticFailoverFencingAuthoritySupported(ha *antflyv1.HighAvailabilitySpec) bool {
 	return ha != nil &&
 		ha.AutomaticFailover != nil &&
@@ -2010,7 +3836,8 @@ func haPrimaryAdminUnavailable(status *antflyv1.HAStatus) bool {
 	if !haPrimaryAdminObservationFailed(status) {
 		return false
 	}
-	return status.PrimaryAdminStatusCode != http.StatusUnauthorized
+	return status.PrimaryAdminStatusCode != http.StatusUnauthorized &&
+		status.PrimaryAdminFailureThresholdMet
 }
 
 func haPrimaryAdminObservationFailed(status *antflyv1.HAStatus) bool {
@@ -2286,6 +4113,19 @@ func haEvaluateFormerPrimary(status *antflyv1.HAStatus) haFormerPrimaryEvaluatio
 	if !evaluation.Fenced {
 		return evaluation
 	}
+	if completed := haCompletedFormerPrimaryRewind(status); completed != nil {
+		result := completed.AdminResult
+		evaluation.ObservedTimelineID = promotion.NewTimelineID
+		evaluation.ObservedLSN = result.RewindCurrentLastLSN
+		evaluation.SwitchLSN = result.ForkLSN
+		evaluation.RejoinRequired = false
+		evaluation.RewindPossible = false
+		evaluation.ReseedRequired = false
+		evaluation.Diverged = false
+		evaluation.Action = "None"
+		evaluation.Reason = "FormerPrimaryRewindApplied"
+		return evaluation
+	}
 	if standby, ok := haStandbyStatusByName(status)[promotion.OldPrimaryID]; ok &&
 		standby.Active &&
 		!standby.ReseedRequired &&
@@ -2377,6 +4217,20 @@ func haApplyFormerPrimaryAssessment(evaluation *haFormerPrimaryEvaluation, forme
 			reason = "FormerPrimaryOnPromotionTimeline"
 		}
 	case "rewind":
+		// A rewind is only safe when the former primary has no divergent suffix.
+		// HA log records are an effects stream, not an undo log: truncating an
+		// already-applied divergent record would hide it from replication without
+		// removing its effects from storage. Older runtimes could report such a
+		// disposition as rewindable, so fail closed and require a reseed.
+		if former.FormerLastLSN != former.ForkLSN || former.DataLossDiscarded {
+			evaluation.RejoinRequired = true
+			evaluation.RewindPossible = false
+			evaluation.ReseedRequired = true
+			evaluation.Diverged = true
+			evaluation.Action = string(haActionReseedFormerPrimary)
+			evaluation.Reason = "FormerPrimaryRequiresReseed"
+			return true
+		}
 		evaluation.RejoinRequired = true
 		evaluation.RewindPossible = true
 		evaluation.ReseedRequired = false
@@ -2405,23 +4259,24 @@ func haFormerPrimaryFenced(status *antflyv1.HAStatus, promotion *antflyv1.HAProm
 	if status == nil || promotion == nil {
 		return false
 	}
-	if promotion.FenceGeneration == 0 {
+	former := status.FormerPrimary
+	if promotion.FenceGeneration == 0 || former == nil || !former.Fenced {
 		return false
 	}
-	if haPromotionReceipt(status) == promotion {
-		return true
-	}
-	if promotion.FenceAuthority != "" && status.Fencing.Authority != promotion.FenceAuthority {
+	if strings.TrimSpace(former.NodeID) != strings.TrimSpace(promotion.OldPrimaryID) {
 		return false
 	}
-	if status.Fencing.Generation < promotion.FenceGeneration {
+	if promotion.FenceAuthority != "" && former.FenceAuthority != promotion.FenceAuthority {
+		return false
+	}
+	if former.FenceGeneration != promotion.FenceGeneration {
 		return false
 	}
 	if promotion.PromotedStandbyID != "" &&
-		status.Fencing.Holder != promotion.PromotedStandbyID {
+		former.FenceHolder != promotion.PromotedStandbyID {
 		return false
 	}
-	return status.Fencing.Ready
+	return true
 }
 
 func maxHAObservedLSN(standby antflyv1.HAStandbyStatus) uint64 {

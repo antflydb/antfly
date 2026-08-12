@@ -393,7 +393,7 @@ When building from the source tree, build the C ABI first:
 
 ```bash
 cd zig
-zig build lite-capi
+zig build capi
 cd ../go/pkg/antflylite
 go test -tags antflylite_capi ./...
 ```
@@ -424,7 +424,7 @@ The repository exposes focused Lite build profiles:
 zig build lite-core
 zig build lite-full -Dlite-local-inference-runtime=true
 zig build lite-wasm
-zig build lite-package-test
+zig build capi-package-test
 zig build lite-dev
 ```
 
@@ -434,7 +434,7 @@ builds the full Antfly CLI with Lite support and requires the local inference
 runtime capability flag so Lite status, C ABI, and bindings advertise
 `local_embedded` correctly. `lite-wasm` builds the
 hosted/manual-maintenance Lite profile for `wasm32-freestanding` without
-pulling in the broader server or inference WASM bundle. `lite-package-test`
+pulling in the broader server or inference WASM bundle. `capi-package-test`
 checks that release packaging preserves the `libantfly` header and library
 artifacts. `lite-dev` runs the broader development and compatibility checks,
 including the Lite WASM profile and packaging regression.

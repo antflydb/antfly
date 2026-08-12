@@ -20,12 +20,36 @@ const is_windows = builtin.os.tag == .windows;
 /// Network address type (std.Io.net.IpAddress).
 pub const Address = net.IpAddress;
 
+/// Optional policy applied to every resolved address immediately before
+/// connecting. The borrowed context lets callers enforce deployment-specific
+/// network policy (for example configured NAT64 prefixes) without global state.
+pub const AddressFilter = struct {
+    context: ?*const anyopaque = null,
+    acceptsFn: *const fn (?*const anyopaque, Address) bool,
+
+    pub fn accepts(self: AddressFilter, address: Address) bool {
+        return self.acceptsFn(self.context, address);
+    }
+};
+
 const HostName = net.HostName;
 
 /// Resolves a host string to an address, trying IP literal parsing first
 /// and falling back to DNS lookup.
 pub fn resolveAddress(io: Io, host: []const u8, port: u16) !Address {
-    if (Address.resolve(io, host, port)) |addr| return addr else |_| {}
+    return resolveAddressFiltered(io, host, port, null);
+}
+
+/// Resolves a host and returns the first address accepted by `filter`.
+/// Literal and DNS results pass through the same policy so callers can pin
+/// SSRF checks to the address that is actually connected.
+pub fn resolveAddressFiltered(io: Io, host: []const u8, port: u16, filter: ?AddressFilter) !Address {
+    if (Address.resolve(io, host, port)) |addr| {
+        if (filter) |policy| {
+            if (!policy.accepts(addr)) return error.AddressRejected;
+        }
+        return addr;
+    } else |_| {}
 
     const host_name = try HostName.init(host);
     var canonical_name_buffer: [HostName.max_len]u8 = undefined;
@@ -35,17 +59,51 @@ pub fn resolveAddress(io: Io, host: []const u8, port: u16) !Address {
         .port = port,
         .canonical_name_buffer = &canonical_name_buffer,
     });
+    var saw_address = false;
     while (true) {
         const result = lookup_queue.getOne(io) catch |err| switch (err) {
             error.Closed => break,
             else => return err,
         };
         switch (result) {
-            .address => |address| return address,
+            .address => |address| {
+                saw_address = true;
+                if (filter) |policy| {
+                    if (!policy.accepts(address)) continue;
+                }
+                return address;
+            },
             .canonical_name => {},
         }
     }
+    if (saw_address) return error.AddressRejected;
     return error.UnknownHostName;
+}
+
+test "resolveAddressFiltered applies policy to literal and DNS results" {
+    const Policy = struct {
+        fn rejectLoopback(_: ?*const anyopaque, address: Address) bool {
+            return switch (address) {
+                .ip4 => |ip4| ip4.bytes[0] != 127,
+                .ip6 => true,
+            };
+        }
+
+        fn rejectAll(_: ?*const anyopaque, _: Address) bool {
+            return false;
+        }
+    };
+
+    try std.testing.expectError(
+        error.AddressRejected,
+        resolveAddressFiltered(std.testing.io, "127.0.0.1", 80, .{ .acceptsFn = Policy.rejectLoopback }),
+    );
+    const accepted = try resolveAddressFiltered(std.testing.io, "8.8.8.8", 53, .{ .acceptsFn = Policy.rejectLoopback });
+    try std.testing.expectEqual(@as(u8, 8), accepted.ip4.bytes[0]);
+    try std.testing.expectError(
+        error.AddressRejected,
+        resolveAddressFiltered(std.testing.io, "localhost", 80, .{ .acceptsFn = Policy.rejectAll }),
+    );
 }
 
 fn firstNonEmptyBuffer(bufs: [][]u8) ?struct { index: usize, buf: []u8 } {
@@ -72,6 +130,8 @@ pub const Socket = struct {
     handle: net.Socket.Handle,
     io: Io,
     request_deadline_ms: ?i64 = null,
+    request_cancel_cb: ?*const fn (context: ?*anyopaque) bool = null,
+    request_cancel_ctx: ?*anyopaque = null,
 
     const Self = @This();
 
@@ -84,6 +144,56 @@ pub const Socket = struct {
     pub fn connect(addr: Address, io: Io) !Self {
         const stream = try addr.connect(io, .{ .mode = .stream });
         return .{ .handle = stream.socket.handle, .io = io };
+    }
+
+    /// Resolves a host and tries each concrete address in resolver order.
+    ///
+    /// This intentionally does not use `HostName.connect`: Zig 0.16 can race
+    /// cancellation of the losing happy-eyeballs task against completion of
+    /// its nested DNS future. Resolving first also preserves IPv6-to-IPv4
+    /// fallback when only one family is listening.
+    pub const HostConnectResult = struct {
+        socket: Socket,
+        address: Address,
+    };
+
+    pub fn connectHostResolved(host: []const u8, port: u16, io: Io) !HostConnectResult {
+        if (Address.resolve(io, host, port)) |addr| {
+            return .{ .socket = try connect(addr, io), .address = addr };
+        } else |_| {}
+
+        const host_name = try HostName.init(host);
+        var canonical_name_buffer: [HostName.max_len]u8 = undefined;
+        var lookup_buffer: [32]HostName.LookupResult = undefined;
+        var lookup_queue: Io.Queue(HostName.LookupResult) = .init(&lookup_buffer);
+        try HostName.lookup(host_name, io, &lookup_queue, .{
+            .port = port,
+            .canonical_name_buffer = &canonical_name_buffer,
+        });
+
+        var last_connect_error: ?anyerror = null;
+        while (true) {
+            const result = lookup_queue.getOne(io) catch |err| switch (err) {
+                error.Closed => break,
+                else => return err,
+            };
+            switch (result) {
+                .address => |address| {
+                    const socket = connect(address, io) catch |err| {
+                        last_connect_error = err;
+                        continue;
+                    };
+                    return .{ .socket = socket, .address = address };
+                },
+                .canonical_name => {},
+            }
+        }
+        if (last_connect_error) |err| return err;
+        return error.UnknownHostName;
+    }
+
+    pub fn connectHost(host: []const u8, port: u16, io: Io) !Self {
+        return (try connectHostResolved(host, port, io)).socket;
     }
 
     /// Creates a socket from a raw handle (e.g. from accept).
@@ -104,10 +214,21 @@ pub const Socket = struct {
 
     /// Sends data, returning the number of bytes written.
     pub fn send(self: *Self, data: []const u8) !usize {
-        try self.applyRequestDeadline(.send);
-        const sent = self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1) catch return error.SendFailed;
-        try self.checkRequestDeadline();
-        return sent;
+        while (true) {
+            try self.checkRequestCancellation();
+            try self.applyRequestDeadline(.send);
+            const sent = self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1) catch |err| {
+                if (err == error.Canceled) self.io.recancel();
+                try self.checkRequestCancellation();
+                if (err == error.Timeout or err == error.WouldBlock) {
+                    try self.checkRequestDeadline();
+                    if (self.request_cancel_cb != null) continue;
+                }
+                return error.SendFailed;
+            };
+            try self.checkRequestDeadline();
+            return sent;
+        }
     }
 
     /// Sends all data, blocking until complete.
@@ -127,41 +248,78 @@ pub const Socket = struct {
     /// Receives data into the buffer, returning bytes received (0 = EOF).
     pub fn recv(self: *Self, buffer: []u8) !usize {
         if (buffer.len == 0) return 0;
-        try self.applyRequestDeadline(.recv);
-        if (!is_windows) {
-            const received = posix.read(self.handle, buffer) catch |err| switch (err) {
-                error.WouldBlock => return error.Timeout,
-                else => return error.RecvFailed,
+        while (true) {
+            try self.checkRequestCancellation();
+            try self.applyRequestDeadline(.recv);
+            if (!is_windows) {
+                const received = posix.read(self.handle, buffer) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        try self.checkRequestCancellation();
+                        try self.checkRequestDeadline();
+                        if (self.request_cancel_cb != null) continue;
+                        return error.Timeout;
+                    },
+                    else => return error.RecvFailed,
+                };
+                try self.checkRequestDeadline();
+                return received;
+            }
+            var bufs = [_][]u8{buffer};
+            const received = self.io.vtable.netRead(self.io.userdata, self.handle, &bufs) catch |err| {
+                if (err == error.Canceled) self.io.recancel();
+                try self.checkRequestCancellation();
+                if (err == error.Timeout) {
+                    try self.checkRequestDeadline();
+                    if (self.request_cancel_cb != null) continue;
+                    return error.Timeout;
+                }
+                return error.RecvFailed;
             };
             try self.checkRequestDeadline();
             return received;
         }
-        var bufs = [_][]u8{buffer};
-        const received = self.io.vtable.netRead(self.io.userdata, self.handle, &bufs) catch return error.RecvFailed;
-        try self.checkRequestDeadline();
-        return received;
     }
 
     pub fn setRequestDeadline(self: *Self, deadline_ms: ?i64) void {
         self.request_deadline_ms = deadline_ms;
     }
 
+    pub fn setRequestCancellation(
+        self: *Self,
+        callback: ?*const fn (context: ?*anyopaque) bool,
+        context: ?*anyopaque,
+    ) void {
+        self.request_cancel_cb = callback;
+        self.request_cancel_ctx = context;
+    }
+
     const DeadlineOperation = enum { recv, send };
 
     fn applyRequestDeadline(self: *Self, operation: DeadlineOperation) !void {
-        const deadline_ms = self.request_deadline_ms orelse return;
-        const now_ms = common.milliTimestamp(self.io);
-        if (now_ms >= deadline_ms) return error.Timeout;
-        const remaining_ms: u64 = @intCast(deadline_ms - now_ms);
+        const poll_ms: ?u64 = if (self.request_cancel_cb != null) 20 else null;
+        const remaining_ms: ?u64 = if (self.request_deadline_ms) |deadline_ms| blk: {
+            const now_ms = common.milliTimestamp(self.io);
+            if (now_ms >= deadline_ms) return error.Timeout;
+            break :blk @intCast(deadline_ms - now_ms);
+        } else null;
+        const timeout_ms = if (remaining_ms) |remaining|
+            if (poll_ms) |poll| @min(remaining, poll) else remaining
+        else
+            poll_ms orelse return;
         switch (operation) {
-            .recv => self.setRecvTimeout(@max(remaining_ms, 1)) catch return error.RecvFailed,
-            .send => self.setSendTimeout(@max(remaining_ms, 1)) catch return error.SendFailed,
+            .recv => self.setRecvTimeout(@max(timeout_ms, 1)) catch return error.RecvFailed,
+            .send => self.setSendTimeout(@max(timeout_ms, 1)) catch return error.SendFailed,
         }
     }
 
     fn checkRequestDeadline(self: *Self) !void {
         const deadline_ms = self.request_deadline_ms orelse return;
         if (common.milliTimestamp(self.io) >= deadline_ms) return error.Timeout;
+    }
+
+    fn checkRequestCancellation(self: *Self) !void {
+        const callback = self.request_cancel_cb orelse return;
+        if (callback(self.request_cancel_ctx)) return error.Canceled;
     }
 
     /// Enables or disables TCP_NODELAY (Nagle's algorithm).
@@ -429,7 +587,10 @@ pub const SocketIoWriter = struct {
             p.socket.sendAll(buffered) catch return error.WriteFailed;
             return w.consumeAll();
         }
-        const n = p.socket.io.vtable.netWrite(p.socket.io.userdata, p.socket.handle, w.buffered(), bufs, splat) catch return error.WriteFailed;
+        const n = p.socket.io.vtable.netWrite(p.socket.io.userdata, p.socket.handle, w.buffered(), bufs, splat) catch |err| {
+            if (err == error.Canceled) p.socket.io.recancel();
+            return error.WriteFailed;
+        };
         return w.consume(n);
     }
 
@@ -812,6 +973,13 @@ pub const TcpListener = struct {
     /// Closes the listener.
     pub fn deinit(self: *Self) void {
         self.server.deinit(self.io);
+    }
+
+    /// Interrupts a concurrent accept without closing the underlying handle.
+    /// Call this before `deinit` when another thread may be blocked in accept.
+    pub fn shutdown(self: *Self) void {
+        var socket = Socket.fromHandle(self.server.socket.handle, self.io);
+        socket.shutdown();
     }
 
     /// Accepts an incoming connection.

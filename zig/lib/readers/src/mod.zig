@@ -16,58 +16,42 @@ const std = @import("std");
 const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
 const inference_api = @import("inference_api");
+const config = @import("antfly_reader_config");
 
 const Allocator = std.mem.Allocator;
 const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
 
-pub const Provider = enum {
-    antfly,
-    openai,
-    vertex,
+fn readHttpStatusError(status: u16) anyerror {
+    return if (status == 408 or status == 409 or status == 425 or status == 429 or status >= 500)
+        error.ReadTransientFailure
+    else
+        error.ReadRequestFailed;
+}
 
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.write(switch (self) {
-            .antfly => "antfly",
-            .openai => "openai",
-            .vertex => "vertex",
-        });
-    }
+test "reader classifies retryable HTTP statuses" {
+    try std.testing.expect(readHttpStatusError(429) == error.ReadTransientFailure);
+    try std.testing.expect(readHttpStatusError(503) == error.ReadTransientFailure);
+    try std.testing.expect(readHttpStatusError(400) == error.ReadRequestFailed);
+}
 
-    pub fn jsonParse(_: Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const raw = switch (try source.next()) {
-            .string => |value| value,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, raw, "antfly")) return .antfly;
-        if (std.mem.eql(u8, raw, "openai")) return .openai;
-        if (std.mem.eql(u8, raw, "vertex")) return .vertex;
-        return error.UnexpectedToken;
-    }
-};
+pub const Provider = config.Provider;
+pub const Config = config.Config;
 
-pub const Config = struct {
-    provider: Provider,
-    model: ?[]const u8 = null,
-    prompt: ?[]const u8 = null,
-    max_tokens: ?i64 = null,
-    api_key: ?[]const u8 = null,
-    bearer_token: ?[]const u8 = null,
-    base_url: ?[]const u8 = null,
-    url: ?[]const u8 = null,
-    api_url: ?[]const u8 = null,
-    project_id: ?[]const u8 = null,
-    location: ?[]const u8 = null,
-    credentials_path: ?[]const u8 = null,
-
-    pub fn resolvedUrl(self: Config) ?[]const u8 {
-        return self.url orelse self.api_url;
-    }
+pub const InlineContentTrust = enum {
+    untrusted,
+    trusted_internal,
 };
 
 pub const Request = struct {
     images: []const []const u8,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
+    /// Trust applies only to inline `data:` image content. Network locations
+    /// always retain the configured download policy.
+    inline_content_trust: InlineContentTrust = .untrusted,
+    /// Stable source fingerprint for opt-in inference profiling. Remote reader
+    /// providers deliberately do not serialize this internal-only value.
+    source_fingerprint: ?[]const u8 = null,
 };
 
 pub const Result = struct {
@@ -328,7 +312,7 @@ const AntflyReaderState = struct {
         } else &.{};
         var resp = try self.http.post(url, .{ .json = body, .headers = headers });
         defer resp.deinit();
-        if (!resp.ok()) return error.ReadRequestFailed;
+        if (!resp.ok()) return readHttpStatusError(resp.status.code);
 
         const payload = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(inference_api.ReadResponse, alloc, payload, .{
@@ -504,7 +488,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             try self.appendAuthHeaders(alloc, &headers, &minted_auth);
             var resp = try self.http.post(url, .{ .json = body, .headers = headers.items });
             defer resp.deinit();
-            if (!resp.ok()) return error.ReadRequestFailed;
+            if (!resp.ok()) return readHttpStatusError(resp.status.code);
             const Response = struct { choices: []const struct { message: struct { content: ?[]const u8 = null } } = &.{} };
             var parsed = try std.json.parseFromSlice(Response, alloc, resp.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
@@ -540,7 +524,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             try self.appendAuthHeaders(alloc, &headers, &minted_auth);
             var resp = try self.http.post(url, .{ .json = body, .headers = headers.items });
             defer resp.deinit();
-            if (!resp.ok()) return error.ReadRequestFailed;
+            if (!resp.ok()) return readHttpStatusError(resp.status.code);
             const Response = struct {
                 candidates: []const struct {
                     content: struct {

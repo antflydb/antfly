@@ -20,6 +20,7 @@ const backend_adapter = @import("backend_adapter.zig");
 const backend_types = @import("backend_types.zig");
 const change_journal_mod = @import("db/derived/change_journal.zig");
 const internal_keys = @import("internal_keys.zig");
+const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 
 pub const types = backend_types;
 
@@ -147,6 +148,7 @@ pub const Cursor = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         close: *const fn (Allocator, *anyopaque) void,
@@ -158,6 +160,7 @@ pub const Cursor = struct {
         seek_at_or_before: *const fn (*anyopaque, []const u8) anyerror!?Entry,
         set_upper_bound: ?*const fn (*anyopaque, ?[]const u8) void = null,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn close(self: *Cursor) void {
         self.vtable.close(self.allocator, self.ptr);
@@ -165,27 +168,27 @@ pub const Cursor = struct {
     }
 
     pub fn first(self: *Cursor) !?Entry {
-        return try self.vtable.first(self.ptr);
+        return try BoundaryAbi.call("first", self.boundary_dispatch, self.vtable.first, .{self.ptr});
     }
 
     pub fn last(self: *Cursor) !?Entry {
-        return try self.vtable.last(self.ptr);
+        return try BoundaryAbi.call("last", self.boundary_dispatch, self.vtable.last, .{self.ptr});
     }
 
     pub fn next(self: *Cursor) !?Entry {
-        return try self.vtable.next(self.ptr);
+        return try BoundaryAbi.call("next", self.boundary_dispatch, self.vtable.next, .{self.ptr});
     }
 
     pub fn prev(self: *Cursor) !?Entry {
-        return try self.vtable.prev(self.ptr);
+        return try BoundaryAbi.call("prev", self.boundary_dispatch, self.vtable.prev, .{self.ptr});
     }
 
     pub fn seekAtOrAfter(self: *Cursor, key: []const u8) !?Entry {
-        return try self.vtable.seek_at_or_after(self.ptr, key);
+        return try BoundaryAbi.call("seek_at_or_after", self.boundary_dispatch, self.vtable.seek_at_or_after, .{ self.ptr, key });
     }
 
     pub fn seekAtOrBefore(self: *Cursor, key: []const u8) !?Entry {
-        return try self.vtable.seek_at_or_before(self.ptr, key);
+        return try BoundaryAbi.call("seek_at_or_before", self.boundary_dispatch, self.vtable.seek_at_or_before, .{ self.ptr, key });
     }
 
     pub fn setUpperBound(self: *Cursor, upper: ?[]const u8) void {
@@ -283,11 +286,13 @@ pub const CurrentScanTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn abort(self: *CurrentScanTxn) void {
         self.vtable.abort(self.allocator, self.ptr);
@@ -295,7 +300,7 @@ pub const CurrentScanTxn = struct {
     }
 
     pub fn openCursor(self: *CurrentScanTxn) !Cursor {
-        return try self.vtable.open_cursor(self.allocator, self.ptr);
+        return try BoundaryAbi.call("open_cursor", self.boundary_dispatch, self.vtable.open_cursor, .{ self.allocator, self.ptr });
     }
 };
 
@@ -344,6 +349,7 @@ pub const WriteTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -354,6 +360,7 @@ pub const WriteTxn = struct {
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn abort(self: *WriteTxn) void {
         self.vtable.abort(self.allocator, self.ptr);
@@ -361,19 +368,19 @@ pub const WriteTxn = struct {
     }
 
     pub fn commit(self: *WriteTxn) !void {
-        try self.vtable.commit(self.allocator, self.ptr);
+        try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
         self.* = undefined;
     }
 
     pub fn get(self: *WriteTxn, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
     }
 
     pub fn getManySorted(self: *WriteTxn, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
-            return try get_many_sorted(self.ptr, keys, values);
+            return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values });
         }
         for (keys, 0..) |key, i| {
             values[i] = self.get(key) catch |err| blk: {
@@ -384,15 +391,15 @@ pub const WriteTxn = struct {
     }
 
     pub fn put(self: *WriteTxn, key: []const u8, value: []const u8) !void {
-        try self.vtable.put(self.ptr, key, value);
+        try BoundaryAbi.call("put", self.boundary_dispatch, self.vtable.put, .{ self.ptr, key, value });
     }
 
     pub fn delete(self: *WriteTxn, key: []const u8) !void {
-        try self.vtable.delete(self.ptr, key);
+        try BoundaryAbi.call("delete", self.boundary_dispatch, self.vtable.delete, .{ self.ptr, key });
     }
 
     pub fn openCursor(self: *WriteTxn) !Cursor {
-        return try self.vtable.open_cursor(self.allocator, self.ptr);
+        return try BoundaryAbi.call("open_cursor", self.boundary_dispatch, self.vtable.open_cursor, .{ self.allocator, self.ptr });
     }
 };
 
@@ -559,6 +566,7 @@ pub const Store = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const ReplayCallback = *const fn (*anyopaque, u64, []const u8) anyerror!void;
 
@@ -586,6 +594,7 @@ pub const Store = struct {
         for_each_replay_from_matching_hint_mask: ?*const fn (*anyopaque, u64, u8, *anyopaque, ReplayCallback) anyerror!void = null,
         truncate_replay_up_to: ?*const fn (Allocator, *anyopaque, u64) anyerror!void = null,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn deinit(self: *Store) void {
         self.vtable.deinit(self.allocator, self.ptr);
@@ -597,47 +606,47 @@ pub const Store = struct {
     }
 
     pub fn beginRead(self: *Store) !ReadTxn {
-        return try self.vtable.begin_read(self.allocator, self.ptr);
+        return try BoundaryAbi.call("begin_read", self.boundary_dispatch, self.vtable.begin_read, .{ self.allocator, self.ptr });
     }
 
     pub fn beginProbe(self: *Store) !ProbeTxn {
         if (self.vtable.begin_probe) |begin_probe| {
-            return try begin_probe(self.allocator, self.ptr);
+            return try BoundaryAbi.call("begin_probe", self.boundary_dispatch, begin_probe, .{ self.allocator, self.ptr });
         }
         return try probeTxnFrom(self.allocator, try self.beginRead());
     }
 
     pub fn beginCurrentScan(self: *Store) !CurrentScanTxn {
         if (self.vtable.begin_current_scan) |begin_current_scan| {
-            return try begin_current_scan(self.allocator, self.ptr);
+            return try BoundaryAbi.call("begin_current_scan", self.boundary_dispatch, begin_current_scan, .{ self.allocator, self.ptr });
         }
         return try currentScanTxnFrom(self.allocator, try self.beginRead());
     }
 
     pub fn beginWrite(self: *Store) !WriteTxn {
-        return try self.vtable.begin_write(self.allocator, self.ptr);
+        return try BoundaryAbi.call("begin_write", self.boundary_dispatch, self.vtable.begin_write, .{ self.allocator, self.ptr });
     }
 
     pub fn beginBatch(self: *Store) !Batch {
-        return try self.vtable.begin_batch(self.allocator, self.ptr);
+        return try BoundaryAbi.call("begin_batch", self.boundary_dispatch, self.vtable.begin_batch, .{ self.allocator, self.ptr });
     }
 
     pub fn beginBatchWithOptions(self: *Store, options: backend_types.BatchOptions) !Batch {
         if (self.vtable.begin_batch_with_options) |begin_batch_with_options| {
-            return try begin_batch_with_options(self.allocator, self.ptr, options);
+            return try BoundaryAbi.call("begin_batch_with_options", self.boundary_dispatch, begin_batch_with_options, .{ self.allocator, self.ptr, options });
         }
         return try self.beginBatch();
     }
 
     pub fn sync(self: *Store, force: bool) !void {
         if (self.vtable.sync) |sync_fn| {
-            try sync_fn(self.ptr, force);
+            try BoundaryAbi.call("sync", self.boundary_dispatch, sync_fn, .{ self.ptr, force });
         }
     }
 
     pub fn syncReplayState(self: *Store) !void {
         if (self.vtable.sync_replay_state) |sync_replay_state_fn| {
-            try sync_replay_state_fn(self.ptr);
+            try BoundaryAbi.call("sync_replay_state", self.boundary_dispatch, sync_replay_state_fn, .{self.ptr});
             return;
         }
         try self.sync(false);
@@ -645,19 +654,19 @@ pub const Store = struct {
 
     pub fn beginBulkIngestSession(self: *Store) !void {
         if (self.vtable.begin_bulk_ingest_session) |begin_bulk_ingest_session| {
-            try begin_bulk_ingest_session(self.ptr);
+            try BoundaryAbi.call("begin_bulk_ingest_session", self.boundary_dispatch, begin_bulk_ingest_session, .{self.ptr});
         }
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *Store, options: backend_types.BulkIngestFinishOptions) !void {
         if (self.vtable.finish_bulk_ingest_session) |finish_bulk_ingest_session| {
-            try finish_bulk_ingest_session(self.ptr, options);
+            try BoundaryAbi.call("finish_bulk_ingest_session", self.boundary_dispatch, finish_bulk_ingest_session, .{ self.ptr, options });
         }
     }
 
     pub fn flushBufferedWritesWithOptions(self: *Store, options: backend_types.BulkIngestFinishOptions) !void {
         if (self.vtable.flush_buffered_writes) |flush_buffered_writes| {
-            try flush_buffered_writes(self.ptr, options);
+            try BoundaryAbi.call("flush_buffered_writes", self.boundary_dispatch, flush_buffered_writes, .{ self.ptr, options });
         }
     }
 
@@ -679,12 +688,12 @@ pub const Store = struct {
 
     pub fn appendReplayOpaque(self: *Store, alloc: Allocator, sequence: u64, payload: []const u8) !void {
         const f = self.vtable.append_replay_opaque orelse return error.Unsupported;
-        return try f(alloc, self.ptr, sequence, payload);
+        return try BoundaryAbi.call("append_replay_opaque", self.boundary_dispatch, f, .{ alloc, self.ptr, sequence, payload });
     }
 
     pub fn iterateReplayFrom(self: *Store, alloc: Allocator, from_sequence: u64) ![]ReplayEntry {
         const f = self.vtable.iterate_replay_from orelse return error.Unsupported;
-        return try f(alloc, self.ptr, from_sequence);
+        return try BoundaryAbi.call("iterate_replay_from", self.boundary_dispatch, f, .{ alloc, self.ptr, from_sequence });
     }
 
     pub fn forEachReplayFrom(
@@ -700,7 +709,7 @@ pub const Store = struct {
                     return try callback(typed_ctx, sequence, payload);
                 }
             };
-            return try f(self.ptr, from_sequence, ctx, Adapter.call);
+            return try BoundaryAbi.call("for_each_replay_from", self.boundary_dispatch, f, .{ self.ptr, from_sequence, ctx, Adapter.call });
         }
 
         const entries = try self.iterateReplayFrom(self.allocator, from_sequence);
@@ -725,7 +734,7 @@ pub const Store = struct {
                     return try callback(typed_ctx, sequence, payload);
                 }
             };
-            return try f(self.ptr, from_sequence, required_hint_mask, ctx, Adapter.call);
+            return try BoundaryAbi.call("for_each_replay_from_matching_hint_mask", self.boundary_dispatch, f, .{ self.ptr, from_sequence, required_hint_mask, ctx, Adapter.call });
         }
         if (self.vtable.for_each_replay_lane_from) |f| {
             const Adapter = struct {
@@ -740,7 +749,7 @@ pub const Store = struct {
                 ordinal
             else
                 return error.Unsupported;
-            _ = try f(self.ptr, lane_ordinal, from_sequence, 0, ctx, Adapter.call);
+            _ = try BoundaryAbi.call("for_each_replay_lane_from", self.boundary_dispatch, f, .{ self.ptr, lane_ordinal, from_sequence, 0, ctx, Adapter.call });
             return;
         }
 
@@ -768,12 +777,12 @@ pub const Store = struct {
                 return try callback(typed_ctx, sequence, payload);
             }
         };
-        return try f(self.ptr, lane_ordinal, from_sequence, max_entries, ctx, Adapter.call);
+        return try BoundaryAbi.call("for_each_replay_lane_from", self.boundary_dispatch, f, .{ self.ptr, lane_ordinal, from_sequence, max_entries, ctx, Adapter.call });
     }
 
     pub fn truncateReplayUpTo(self: *Store, alloc: Allocator, up_to_sequence: u64) !void {
         const f = self.vtable.truncate_replay_up_to orelse return error.Unsupported;
-        return try f(alloc, self.ptr, up_to_sequence);
+        return try BoundaryAbi.call("truncate_replay_up_to", self.boundary_dispatch, f, .{ alloc, self.ptr, up_to_sequence });
     }
 };
 

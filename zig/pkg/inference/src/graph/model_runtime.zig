@@ -385,6 +385,11 @@ pub const PrefillRequest = struct {
     seq_len: usize,
     query_seq_len: usize,
     attention_mode: cache_mod.AttentionMode,
+    /// Largest KV suffix this request may write at once. Device runtimes use
+    /// this with `allow_swa_ring` to size sliding-window rings before the first
+    /// prefill write.
+    max_inflight_tokens: usize = 0,
+    allow_swa_ring: bool = false,
     force_host_logits: bool = false,
     prefer_greedy_token: bool = false,
 };

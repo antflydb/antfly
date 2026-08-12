@@ -10,6 +10,9 @@
 - [x] **Tool-calling parity**: `/api/generate` now executes FunctionGemma-style tool use end to end, including prompt formatting, non-streaming parsing, and streamed `tool_calls` argument deltas.
 - [ ] **Multimodal generation parity**: Zig has an ONNX `ortgenai` image-bearing generation path, but native multimodal generation is still missing for models like Gemma 3, and multimodal success coverage/streaming behavior still lag Go inference.
 - [ ] **Native GLiNER parity validation**: GLiNER now has a native DeBERTa + span-head path and prefers native weights when available. The remaining work is proving parity with real GLiNER models across MLX/BLAS, adding backend-specific tests, and tightening any performance gaps in the native head.
+- [ ] **GLiNER2 Metal follow-ups**: Metal now beats native at batch 8-16, clearly beats Fastino on long documents, and ties Fastino on short documents (see [GLINER2_METAL.md](./GLINER2_METAL.md)). Remaining: batch-1 long-text attention (flash4 PV parallelization / query_block variant), an evidence-backed `auto` backend routing decision, and optional per-seq-len rel Q_r/K_r caching.
+- [ ] **Metal runtime follow-ups from the gliner review**: provider-persistent dynamic linear-slot dedup so sequential requests reuse prepared mirrors instead of re-uploading; export the Metal provider counters (incl. the new host-fallback warns) through server metrics; decide the seq 513-1024 DeBERTa attention envelope (currently GEMM-or-naive).
+- [ ] **Gemma 4 QAT Metal baseline performance**: execute the evidence-gated no-MTP roadmap in [GEMMA4_METAL_PERFORMANCE.md](./GEMMA4_METAL_PERFORMANCE.md), beginning with a current-binary pinned llama.cpp re-anchor and the decode GQA split schedule portfolio.
 
 ## MLX Gemma Follow-Up
 

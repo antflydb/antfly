@@ -18,6 +18,7 @@ const platform = @import("antfly_platform");
 const httpx = @import("httpx");
 const api = @import("inference_api");
 const backends = @import("backends/backends.zig");
+const metal_runtime = if (build_options.enable_metal) @import("backends/metal_runtime.zig") else struct {};
 const decoder_gated_runtime = @import("backends/decoder_gated_runtime.zig");
 const debug_timing = @import("debug_timing.zig");
 const ops = @import("ops/ops.zig");
@@ -25,6 +26,8 @@ const gpt_arch = @import("architectures/gpt.zig");
 const session_factory = @import("architectures/session_factory.zig");
 const generation = @import("pipelines/generation.zig");
 const graph_mod = @import("graph/root.zig");
+const kernel_jit = graph_mod.kernel_jit;
+const quant_matmul = @import("graph/quant_matmul.zig");
 const onnx_decoder_only_vlm = @import("pipelines/onnx_decoder_only_vlm.zig");
 const model_manager_mod = @import("server/model_manager.zig");
 const manifest_mod = @import("models/manifest.zig");
@@ -34,6 +37,8 @@ const c_file = @import("util/c_file.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
 const native_run_artifact = @import("native_run_artifact.zig");
 const compiled_artifact = @import("compiled_artifact.zig");
+const metal_generated_quant_stats = @import("metal_generated_quant_stats.zig");
+const kernel_jit_profile_output = @import("kernel_jit_profile_output.zig");
 const compat = @import("io/compat.zig");
 const cuda_context = if (build_options.enable_cuda) @import("ops/cuda/context.zig") else struct {};
 const hf_tokenizer = @import("inference_hf_tokenizer");
@@ -65,6 +70,12 @@ fn debugGenerateSetup(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("generate-setup: " ++ fmt ++ "\n", args);
 }
 
+fn drainCudaGenerationProfiles(target_session: backends.Session, draft_session: ?backends.Session) void {
+    if (comptime !build_options.enable_cuda) return;
+    session_factory.drainCudaProfile(target_session);
+    if (draft_session) |session| session_factory.drainCudaProfile(session);
+}
+
 fn shouldSkipAutoMtpDraftLoad(opts: Options, draft_cfg: gpt_mod.Config) bool {
     if (opts.speculation_policy != .auto) return false;
     if (!draft_cfg.gemma4_mtp_assistant) return false;
@@ -92,6 +103,7 @@ const Options = struct {
     speculation_policy: generation.SpeculationPolicy = .auto,
     speculation_calibration: generation.SpeculationCalibration = .none,
     no_chat_template: bool = false,
+    enable_thinking: ?bool = null,
     print_finish_reason: bool = false,
     print_token_count: bool = false,
     print_token_ids: bool = false,
@@ -120,24 +132,158 @@ const Options = struct {
     require_server: bool = false,
     stream: bool = false,
     json_timing_path: ?[]const u8 = null,
+    kernel_jit: kernel_jit.Config = .{},
+    kernel_jit_options_explicit: bool = false,
+    kernel_jit_mode_explicit: bool = false,
+    kernel_jit_profile_out: ?[]const u8 = null,
+    kernel_jit_draft_profile_out: ?[]const u8 = null,
+    kernel_jit_draft_qualified_profile: ?[]const u8 = null,
 };
 
-fn shouldDisableMetalAutoDraft(opts: Options) bool {
+fn kernelJitProfileOutputPathsAlias(left: []const u8, right: []const u8) !bool {
+    if (!std.mem.eql(u8, std.fs.path.basename(left), std.fs.path.basename(right))) return false;
+
+    const io = compat.io();
+    var left_parent_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const left_parent_len = try compat.cwd().realPathFile(
+        io,
+        std.fs.path.dirname(left) orelse ".",
+        &left_parent_buffer,
+    );
+    var right_parent_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const right_parent_len = try compat.cwd().realPathFile(
+        io,
+        std.fs.path.dirname(right) orelse ".",
+        &right_parent_buffer,
+    );
+    return std.mem.eql(
+        u8,
+        left_parent_buffer[0..left_parent_len],
+        right_parent_buffer[0..right_parent_len],
+    );
+}
+
+fn validateKernelJitOptions(opts: Options) !kernel_jit.Config {
+    var config = opts.kernel_jit;
+    const draft_profile_requested = opts.kernel_jit_draft_profile_out != null or
+        opts.kernel_jit_draft_qualified_profile != null;
+    if (draft_profile_requested and opts.draft_model == null) {
+        return error.KernelJitDraftProfileRequiresDraftModel;
+    }
+    const capture_requested = opts.kernel_jit_profile_out != null or
+        opts.kernel_jit_draft_profile_out != null;
+    if (opts.kernel_jit_profile_out != null and
+        opts.kernel_jit_draft_profile_out != null and
+        try kernelJitProfileOutputPathsAlias(opts.kernel_jit_profile_out.?, opts.kernel_jit_draft_profile_out.?))
+    {
+        return error.KernelJitTargetDraftProfileOutputConflict;
+    }
+    const qualified_profile_requested = config.qualified_profile_path != null or
+        opts.kernel_jit_draft_qualified_profile != null;
+    config.mode = try kernel_jit.resolveProfileCaptureMode(
+        config.mode,
+        opts.kernel_jit_mode_explicit,
+        capture_requested,
+        qualified_profile_requested,
+    );
+    config.profile_capture_only = capture_requested;
+    try kernel_jit.validateMetalProfileBackend(
+        opts.backend == .metal and build_options.enable_metal,
+        capture_requested,
+        qualified_profile_requested,
+    );
+    try config.validate();
+    return config;
+}
+
+fn draftKernelJitConfig(
+    target: kernel_jit.Config,
+    qualified_profile_path: ?[]const u8,
+    profile_capture_requested: bool,
+) !kernel_jit.Config {
+    var config = target;
+    config.qualified_profile_path = qualified_profile_path;
+    config.profile_capture_only = profile_capture_requested;
+    // The target and draft have independent qualification contracts. Required
+    // target activation must not make an unprofiled draft component fail just
+    // because the draft has no eligible quantized routes. Supplying a draft
+    // profile keeps required mode fail-closed for that component.
+    if (!profile_capture_requested and qualified_profile_path == null and config.mode.failClosed()) {
+        config.mode = .off;
+    }
+    try config.validate();
+    return config;
+}
+
+fn hasLocalKernelJitOptions(opts: Options) bool {
+    const defaults = kernel_jit.Config{};
+    return opts.kernel_jit_options_explicit or
+        opts.kernel_jit_profile_out != null or
+        opts.kernel_jit_draft_profile_out != null or
+        opts.kernel_jit_draft_qualified_profile != null or
+        opts.kernel_jit.mode != defaults.mode or
+        opts.kernel_jit.cache_dir != null or
+        opts.kernel_jit.qualified_profile_path != null or
+        opts.kernel_jit.profile_capture_only != defaults.profile_capture_only or
+        opts.kernel_jit.max_cache_bytes_mb != defaults.max_cache_bytes_mb or
+        opts.kernel_jit.preload_budget_ms != defaults.preload_budget_ms;
+}
+
+fn selectedServerUrl(opts: Options, ambient_server_url: ?[]const u8) ?[]const u8 {
+    if (opts.server_url) |url| return url;
+    if (hasLocalKernelJitOptions(opts)) return null;
+    return ambient_server_url;
+}
+
+fn writeKernelJitWorkloadProfile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    session: backends.Session,
+    requested_tokens: u64,
+    effective_tokens: u64,
+    mtp_k: ?u32,
+) !void {
+    if (comptime !build_options.enable_metal) return error.MetalWorkloadProfileUnavailable;
+    var capture = (try session_factory.endMetalWorkloadProfile(session, allocator, true)) orelse
+        return error.MetalWorkloadProfileUnavailable;
+    defer capture.deinit();
+    const report = capture.report(.{
+        .requested_tokens = requested_tokens,
+        .effective_tokens = effective_tokens,
+        .batch = 1,
+        .mtp_k = mtp_k,
+    });
+    try kernel_jit_profile_output.writeFile(allocator, io, path, report);
+    kernel_jit_profile_output.logWriteSummary(path, report);
+}
+
+fn shouldSkipMetalAutoDraftLoadWithGate(opts: Options, draft_is_gemma4_mtp: bool, metal_auto_enabled: bool) bool {
     return opts.backend == .metal and
         opts.speculation_policy == .auto and
-        !platform.env.getenvBool("ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO");
+        (!draft_is_gemma4_mtp or !metal_auto_enabled);
+}
+
+fn shouldSkipMetalAutoDraftLoad(opts: Options, draft_is_gemma4_mtp: bool) bool {
+    return shouldSkipMetalAutoDraftLoadWithGate(opts, draft_is_gemma4_mtp, generation.gemma4MtpMetalAutoEnabled());
+}
+
+fn validateCacheCompactionOption(ratio: ?f32) !void {
+    const value = ratio orelse return;
+    try (runtime.kv.compaction.CompactionConfig{ .target_ratio = value }).validate();
+    return error.KvStorageCompactionNotSupported;
 }
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
-    const effective_draft_model = if (opts.speculation_policy == .off or shouldDisableMetalAutoDraft(opts)) null else opts.draft_model;
-    if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0)) return error.RawDecodeBenchRequiresTextOnly;
-    if (opts.raw_decode_bench and effective_draft_model != null) return error.RawDecodeBenchSpeculationUnsupported;
-    if (opts.raw_decode_bench and opts.stream) return error.RawDecodeBenchStreamingUnsupported;
+    const jit_config = try validateKernelJitOptions(opts);
+    try validateCacheCompactionOption(opts.cache_compaction_ratio);
     try native_backend_choice.validate(opts.backend);
+    if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0)) return error.RawDecodeBenchRequiresTextOnly;
+    if (opts.raw_decode_bench and opts.draft_model != null and opts.speculation_policy != .off) return error.RawDecodeBenchSpeculationUnsupported;
+    if (opts.raw_decode_bench and opts.stream) return error.RawDecodeBenchStreamingUnsupported;
     const require_server = requireWarmServer(opts);
-    if (effective_draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
-    if (opts.server_url orelse platform.env.getenv("ANTFLY_INFERENCE_SERVER_URL")) |server_url| {
+    if (selectedServerUrl(opts, platform.env.getenv("ANTFLY_INFERENCE_SERVER_URL"))) |server_url| {
         if (opts.raw_decode_bench) return error.RawDecodeBenchRequiresLocalBackend;
         var server_opts = opts;
         server_opts.server_url = server_url;
@@ -148,6 +294,20 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (!serverGenerateSupportsOptions(opts)) return error.UnsupportedServerGenerateOption;
         return error.WarmInferenceServerUnavailable;
     }
+
+    var preflight_draft_gpt_config: ?gpt_mod.Config = null;
+    const effective_draft_model = if (opts.speculation_policy == .off) null else if (opts.backend == .metal and opts.speculation_policy == .auto) blk: {
+        const draft_model_dir = opts.draft_model orelse break :blk null;
+        var draft_manifest = try manifest_mod.loadFromDir(allocator, draft_model_dir);
+        defer draft_manifest.deinit();
+        const draft_cfg = try session_factory.loadGptConfigFromModelDir(allocator, draft_model_dir, draft_manifest);
+        if (shouldSkipAutoMtpDraftLoad(opts, draft_cfg) or shouldSkipMetalAutoDraftLoad(opts, draft_cfg.gemma4_mtp_assistant)) {
+            preflight_draft_gpt_config = draft_cfg;
+            break :blk null;
+        }
+        break :blk draft_model_dir;
+    } else opts.draft_model;
+    if (effective_draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
     const started_at = std.Io.Timestamp.now(io, .awake);
 
     var preflight_manifest = try manifest_mod.loadFromDir(allocator, opts.model_dir);
@@ -222,11 +382,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .prefill_chunk_size = opts.prefill_chunk_size,
         .draft_model = effective_draft_model,
         .speculative_k = opts.speculative_k,
-        .speculation_requested = effective_draft_model != null,
+        .speculation_requested = opts.draft_model != null and opts.speculation_policy != .off,
         .speculation_policy = opts.speculation_policy,
         .speculation_calibration = opts.speculation_calibration,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
         .ignore_eos = opts.ignore_eos,
+        .enable_thinking = opts.enable_thinking,
     };
 
     const artifact_backend = switch (opts.backend) {
@@ -245,7 +406,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const route_onnx_whole_model_graph = opts.backend == .onnx and opts.compiled_target == .whole_model;
 
     const allow_direct_onnx = opts.backend == .auto or opts.backend == .onnx;
-    if (allow_direct_onnx and effective_draft_model == null and build_options.enable_onnx and
+    if (allow_direct_onnx and !jit_config.mode.compiles() and opts.kernel_jit_profile_out == null and effective_draft_model == null and build_options.enable_onnx and
         !route_onnx_whole_model_graph and
         !c_file.fileExistsInDir(allocator, opts.model_dir, "genai_config.json") and
         onnx_decoder_only_vlm.isSupportedModelDir(allocator, opts.model_dir))
@@ -258,7 +419,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         const rendered_prompt = if (opts.raw_prompt)
             try allocator.dupe(u8, opts.prompt)
         else if (apply_chat_template)
-            try pipeline.chat_tmpl.?.apply(allocator, &messages, true)
+            try pipeline.chat_tmpl.?.applyWithOptions(allocator, &messages, .{
+                .enable_thinking = opts.enable_thinking,
+            })
         else
             try generation.formatMessages(allocator, &messages);
         defer allocator.free(rendered_prompt);
@@ -341,9 +504,23 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     var session_manager = backends.SessionManager.initWithIo(allocator, io);
     configureBackendPreference(&session_manager, if (route_onnx_whole_model_graph) .native else opts.backend);
+    session_manager.kernel_jit = jit_config;
+    session_manager.kernel_jit_load_context = .startup_preload;
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
+
+    var draft_session_manager = backends.SessionManager.initWithIo(allocator, io);
+    configureBackendPreference(&draft_session_manager, if (route_onnx_whole_model_graph) .native else opts.backend);
+    const draft_jit_config = try draftKernelJitConfig(
+        jit_config,
+        opts.kernel_jit_draft_qualified_profile,
+        opts.kernel_jit_draft_profile_out != null,
+    );
+    draft_session_manager.kernel_jit = draft_jit_config;
+    draft_session_manager.kernel_jit_load_context = .startup_preload;
+    var draft_model_manager = model_manager_mod.ModelManager.init(allocator, draft_session_manager);
+    defer draft_model_manager.deinit();
 
     if (artifact_backend != null and effective_draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
         var artifact_arena = std.heap.ArenaAllocator.init(allocator);
@@ -384,6 +561,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     debugGenerateSetup("load model begin dir={s}", .{opts.model_dir});
     const model = model_manager.loadFromDir(opts.model_dir) catch |err| {
         debugGenerateSetup("load model failed err={s}", .{@errorName(err)});
+        print("error: failed to load model {s} with backend {s}: {s}\n", .{ opts.model_dir, @tagName(opts.backend), @errorName(err) });
         return err;
     };
     debugGenerateSetup("load model done backend={s}", .{@tagName(model.session.backend())});
@@ -396,19 +574,19 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (effective_draft_model != null and (opts.image_count > 0 or opts.audio_count > 0)) {
         return error.MultimodalSpeculativeDecodingNotSupported;
     }
-    var draft_gpt_config: ?gpt_mod.Config = null;
+    var draft_gpt_config = preflight_draft_gpt_config;
     const draft_model = if (effective_draft_model) |draft_model_dir| blk: {
         if (opts.speculation_policy == .auto) {
             var draft_manifest = try manifest_mod.loadFromDir(allocator, draft_model_dir);
             defer draft_manifest.deinit();
             const draft_cfg = try session_factory.loadGptConfigFromModelDir(allocator, draft_model_dir, draft_manifest);
-            if (shouldSkipAutoMtpDraftLoad(opts, draft_cfg)) {
+            if (shouldSkipAutoMtpDraftLoad(opts, draft_cfg) or shouldSkipMetalAutoDraftLoad(opts, draft_cfg.gemma4_mtp_assistant)) {
                 draft_gpt_config = draft_cfg;
                 break :blk null;
             }
         }
         debugGenerateSetup("load draft model begin dir={s}", .{draft_model_dir});
-        const loaded = model_manager.loadFromDir(draft_model_dir) catch |err| {
+        const loaded = draft_model_manager.loadFromDir(draft_model_dir) catch |err| {
             debugGenerateSetup("load draft model failed err={s}", .{@errorName(err)});
             return err;
         };
@@ -423,22 +601,35 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const rendered_prompt = if (opts.raw_prompt)
         try allocator.dupe(u8, opts.prompt)
     else if (apply_chat_template)
-        try model.chat_tmpl.?.apply(allocator, &messages, true)
+        try model.chat_tmpl.?.applyWithOptions(allocator, &messages, .{
+            .enable_thinking = opts.enable_thinking,
+        })
     else
         try generation.formatMessages(allocator, &messages);
     defer allocator.free(rendered_prompt);
-    var prompt_encoded = try generation.encodePromptForGeneration(
+    const prompt_media_allowance = generation.nativeGenerationMediaTokenAllowance(&messages, gpt_config);
+    const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
+        gpt_config,
+        if (draft_model != null and opts.speculation_policy != .off) draft_gpt_config else null,
+        @intCast(@max(opts.max_tokens, 1)),
+        if (draft_model != null and opts.speculation_policy != .off and opts.speculative_k > 0) 1 else 0,
+        prompt_media_allowance,
+    );
+    var prompt_encoded = try generation.encodeNativeGenerationPrompt(
         tokenizer,
         allocator,
         rendered_prompt,
-        2048,
+        prompt_token_limit,
         !opts.no_bos and model.manifest.add_bos_token,
         model.manifest.bos_token,
     );
     const encoded_prompt_at = std.Io.Timestamp.now(io, .awake);
     defer prompt_encoded.deinit();
-    const prompt_tokens = countPromptTokens(prompt_encoded.attention_mask) +
-        opts.image_count * (@as(usize, gpt_config.mm_tokens_per_image) + 1);
+    const prompt_tokens = std.math.add(
+        usize,
+        countPromptTokens(prompt_encoded.attention_mask),
+        prompt_media_allowance,
+    ) catch return error.PromptTooLong;
 
     if (artifact_backend != null and effective_draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
         if (try tryRunArtifactForPromptShape(
@@ -507,7 +698,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     }
 
     debugGenerateSetup("live whole-model executor probe begin", .{});
-    if (try tryRunLiveWholeModelExecutorGenerate(
+    const live_whole_model_executed = tryRunLiveWholeModelExecutorGenerate(
         allocator,
         io,
         &opts,
@@ -520,7 +711,15 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         started_at,
         loaded_model_at,
         encoded_prompt_at,
-    )) {
+    ) catch |err| {
+        print("error: live whole-model generate failed for {s} with backend {s}: {s}\n", .{
+            opts.model_dir,
+            @tagName(opts.backend),
+            @errorName(err),
+        });
+        return err;
+    };
+    if (live_whole_model_executed) {
         debugGenerateSetup("live whole-model executor handled request", .{});
         return;
     }
@@ -530,6 +729,19 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         graph_mod.executor_stats.printBypass("inference.generate", "native_generation_direct_decoder_runtime");
     }
 
+    const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .pjrt => return error.UnexpectedPjrtBackend,
+        .onnx => return error.UnexpectedOnnxBackend,
+        .wasm => return error.UnexpectedWasmBackend,
+    };
+    const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
+        backend_kind,
+        gpt_config,
+        (runtime.scheduler.native_generate.Policy{}).max_idle_prefill_chunk_size,
+    );
     const decoder_runtime_scheduler_override = false;
     var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
     defer if (native_generate_lease) |lease| {
@@ -540,6 +752,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             native_generate_lease = try coordinator.acquire(.{
                 .requested_units = 1,
                 .prompt_bytes = rendered_prompt.len,
+                .prompt_tokens = prompt_tokens,
+                .prefill_chunk_limit = if (opts.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
                 .max_tokens = opts.max_tokens,
             });
         }
@@ -549,23 +763,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var kv_manager = runtime.kv.manager.KvManager.init(allocator);
     defer kv_manager.deinit();
 
-    const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
-        .native => .native,
-        .metal => .metal,
-        .cuda => .cuda,
-        .pjrt => return error.UnexpectedPjrtBackend,
-        .onnx => return error.UnexpectedOnnxBackend,
-        .wasm => return error.UnexpectedWasmBackend,
-    };
     const draft_backend_kind: ?runtime.kv.pool.BackendKind = if (draft_model) |loaded|
-        switch (loaded.session.backend()) {
-            .native => .native,
-            .metal => .metal,
-            .cuda => .cuda,
-            .pjrt => return error.UnexpectedPjrtBackend,
-            .onnx => return error.UnexpectedOnnxBackend,
-            .wasm => return error.UnexpectedWasmBackend,
-        }
+        generationKvBackendKind(loaded.session.backend()) orelse return error.SpeculativeDecodingRequiresNativeBackend
     else
         null;
     const requested_kv_dtype = if (opts.cache_dtype) |name|
@@ -592,27 +791,23 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (draft_model) |loaded| {
         budget_limits = session_factory.widenBudgetLimitsForSession(loaded.session, budget_limits);
     }
-    budget_limits = applyBudgetOverrides(budget_limits, opts);
+    budget_limits = try applyBudgetOverrides(budget_limits, opts);
+    if (draft_model) |loaded| {
+        const draft_budget_backend_class: runtime.tier.memory.BackendClass = switch (draft_backend_kind.?) {
+            .native => .cpu,
+            else => .gpu,
+        };
+        var draft_budget_limits = runtime.tier.memory.defaultLimitsForBackend(draft_budget_backend_class);
+        draft_budget_limits = session_factory.widenBudgetLimitsForSession(loaded.session, draft_budget_limits);
+        draft_budget_limits = try applyBudgetOverrides(draft_budget_limits, opts);
+        budget_limits = runtime.tier.memory.maxCompositeLimits(budget_limits, draft_budget_limits);
+    }
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-    print("budget: host={d}MB backend={d}MB combined={d}MB\n", .{
+    print("budget: host={d}MiB backend={d}MiB combined={d}MiB\n", .{
         budget_limits.host_limit_bytes / (1024 * 1024),
         budget_limits.backend_limit_bytes / (1024 * 1024),
         budget_limits.combined_limit_bytes / (1024 * 1024),
     });
-    const admission_prefill_chunk = if (opts.prefill_chunk_size > 0) opts.prefill_chunk_size else 256;
-    run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGeneration(
-        backend_kind,
-        kv_dtype,
-        gpt_config,
-        prompt_tokens,
-        @intCast(@max(opts.max_tokens, 1)),
-        admission_prefill_chunk,
-    )) catch |err| {
-        if (err == error.MemoryBudgetExceeded) {
-            printBudgetExceeded(model.session, &run_budget);
-        }
-        return err;
-    };
     const draft_kv_dtype = if (draft_model) |loaded| blk: {
         const requested_draft_kv_dtype = if (opts.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
@@ -629,23 +824,49 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         else
             requested_draft_kv_dtype;
     } else null;
-    if (draft_model != null) {
-        if (draft_gpt_config) |draft_cfg| {
-            run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGeneration(
-                draft_backend_kind.?,
-                draft_kv_dtype.?,
-                draft_cfg,
-                prompt_tokens,
-                @intCast(@max(opts.max_tokens, 1)),
-                admission_prefill_chunk,
-            )) catch |err| {
-                if (err == error.MemoryBudgetExceeded) {
-                    printBudgetExceeded(draft_model.?.session, &run_budget);
-                }
-                return err;
+    var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
+    budget_components[0] = .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config };
+    var budget_component_count: usize = 1;
+    if (draft_gpt_config) |draft_cfg| {
+        if (draft_backend_kind != null and draft_kv_dtype != null) {
+            budget_components[1] = .{
+                .backend = draft_backend_kind.?,
+                .kv_dtype = draft_kv_dtype.?,
+                .config = draft_cfg,
             };
+            budget_component_count = 2;
         }
     }
+    const scheduler_prefill_ceiling = if (native_generate_lease) |lease|
+        lease.prefill_chunk_size
+    else
+        @min(
+            prompt_tokens,
+            if (opts.prefill_chunk_size == 0)
+                idle_prefill_ceiling
+            else
+                (runtime.scheduler.native_generate.Policy{}).max_idle_prefill_chunk_size,
+        );
+    const admission_prefill_ceiling = if (opts.prefill_chunk_size > 0)
+        @min(opts.prefill_chunk_size, scheduler_prefill_ceiling)
+    else
+        scheduler_prefill_ceiling;
+    const speculative_budget_bonus: usize = if (draft_model != null and
+        opts.speculation_policy != .off and
+        opts.speculative_k > 0) 1 else 0;
+    const budget_max_tokens = @as(usize, @intCast(@max(opts.max_tokens, 1))) + speculative_budget_bonus;
+    config.prefill_chunk_size = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
+        &run_budget,
+        budget_components[0..budget_component_count],
+        prompt_tokens,
+        budget_max_tokens,
+        admission_prefill_ceiling,
+    ) catch |err| {
+        if (err == error.MemoryBudgetExceeded) {
+            printBudgetExceeded(model.session, &run_budget);
+        }
+        return err;
+    };
     debugGenerateSetup("compute backend begin", .{});
     var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
         debugGenerateSetup("compute backend failed err={s}", .{@errorName(err)});
@@ -671,43 +892,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         null;
     defer if (draft_cb) |*backend| backend.deinit();
 
-    const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-        null
-    else if (gpt_config.sliding_window > 0 and gpt_config.hasGlobalAttentionLayers() and !kvSlidingTrimForced())
-        // Mixed attention (iSWA-style models like Gemma): global layers need
-        // the full KV history, and the pool packs every layer's KV into
-        // shared blocks, so window-trimming the pool silently truncates the
-        // global layers' context. Retain everything; sliding-window layers
-        // still apply their exact window inside the attention kernels, so
-        // their compute stays bounded — only KV memory grows with context.
-        // ANTFLY_INFERENCE_KV_SLIDING_TRIM=1 restores the old
-        // trim-to-window behavior (lower memory, truncated global context).
-        null
-    else if (gpt_config.sliding_window > 0)
-        gpt_config.sliding_window
-    else if (gpt_config.max_position_embeddings > 0)
-        gpt_config.max_position_embeddings
-    else
-        null;
-
-    const pool_id = try kv_manager.addPool(.{
-        .backend = backend_kind,
-        .dtype = kv_dtype,
-        .page_size_tokens = 16,
-        .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-        .num_kv_heads = gpt_config.maxKvHeads(),
-        .head_dim = gpt_config.maxHeadDim(),
-        .sliding_window_size = sliding_window_size,
-    });
-    var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
-        .backend = backend_kind,
-        .dtype = kv_dtype,
-        .page_size_tokens = 16,
-        .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-        .num_kv_heads = gpt_config.maxKvHeads(),
-        .head_dim = gpt_config.maxHeadDim(),
-        .sliding_window_size = sliding_window_size,
-    });
+    const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, kvSlidingTrimForced());
+    const pool_id = try kv_manager.addPool(kv_pool_config);
+    var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
     defer kv_storage.deinit();
     try cb.provisionKvDeviceWriteHook(&kv_storage);
 
@@ -742,23 +929,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (draft_model != null) {
         if (draft_gpt_config) |draft_cfg| {
             draft_kv_manager = runtime.kv.manager.KvManager.init(allocator);
-            const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
-                null
-            else if (draft_cfg.sliding_window > 0)
-                draft_cfg.sliding_window
-            else if (draft_cfg.max_position_embeddings > 0)
-                draft_cfg.max_position_embeddings
-            else
-                null;
-            const draft_pool_id = try draft_kv_manager.?.addPool(.{
-                .backend = draft_backend_kind.?,
-                .dtype = draft_kv_dtype.?,
-                .page_size_tokens = 16,
-                .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
-                .num_kv_heads = draft_cfg.maxKvHeads(),
-                .head_dim = draft_cfg.maxHeadDim(),
-                .sliding_window_size = draft_sliding_window_size,
-            });
+            const draft_pool_config = generation.kvPoolConfig(draft_backend_kind.?, draft_kv_dtype.?, draft_cfg, kvSlidingTrimForced());
+            const draft_pool_id = try draft_kv_manager.?.addPool(draft_pool_config);
             draft_decode_state = generation.NativeDecodeState.initPaged(allocator, &draft_kv_manager.?, draft_pool_id, null);
         }
     }
@@ -794,6 +966,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .bos_token = model.manifest.bos_token,
         .chat_template = if (opts.no_chat_template) null else model.chat_tmpl,
         .prompt_override = if (opts.raw_prompt) rendered_prompt else null,
+        .return_raw_token_ids = opts.print_token_ids,
         .print_timing = opts.print_timing,
         .model_dir = opts.model_dir,
         .artifact_dir = resolved_artifact_dir,
@@ -810,7 +983,26 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .pjrt_client = if (pjrt_client) |*client| client else null,
     };
 
-    if (build_options.enable_metal and opts.print_timing and model.session.backend().usesGpuHostedSession()) {
+    const profile_started = if (opts.kernel_jit_profile_out != null)
+        try session_factory.beginMetalWorkloadProfile(model.session, .prefill)
+    else
+        false;
+    if (opts.kernel_jit_profile_out != null and !profile_started) return error.MetalWorkloadProfileUnavailable;
+    const draft_profile_started = if (opts.kernel_jit_draft_profile_out != null)
+        if (draft_model) |loaded|
+            try session_factory.beginMetalWorkloadProfile(loaded.session, .prefill)
+        else
+            false
+    else
+        false;
+    if (opts.kernel_jit_draft_profile_out != null and !draft_profile_started) {
+        return error.MetalDraftWorkloadProfileUnavailable;
+    }
+
+    if (build_options.enable_metal and
+        (opts.print_timing or opts.json_timing_path != null) and
+        model.session.backend().usesGpuHostedSession())
+    {
         debug_timing.resetLiveGpuTimingStats(&cb);
         generation.resetDecoderRuntimeDebugStats();
     }
@@ -824,6 +1016,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (draft_model) |loaded_draft| session_factory.getCudaRuntimeStats(loaded_draft.session) else null
     else
         null;
+    const graph_stats_before_generate = graph_mod.executor_stats.snapshot();
     if (opts.raw_decode_bench) {
         const bench_result = runRawDecodeBench(
             allocator,
@@ -835,23 +1028,36 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             config.prefill_chunk_size,
             &decode_state,
         ) catch |err| {
+            drainCudaGenerationProfiles(
+                model.session,
+                if (draft_model) |loaded_draft| loaded_draft.session else null,
+            );
             if (err == error.MemoryBudgetExceeded) {
                 printBudgetExceeded(model.session, &run_budget);
             }
             return err;
         };
         const finished_generate_at = std.Io.Timestamp.now(io, .awake);
+        drainCudaGenerationProfiles(
+            model.session,
+            if (draft_model) |loaded_draft| loaded_draft.session else null,
+        );
         const cuda_stats_after_generate = if (comptime build_options.enable_cuda)
             session_factory.getCudaRuntimeStats(model.session)
         else
             null;
         const cuda_generate_stats = if (comptime build_options.enable_cuda)
             if (cuda_stats_after_generate) |after|
-                if (cuda_stats_before_generate) |before| cudaStatsDelta(after, before) else null
+                if (cuda_stats_before_generate) |before| session_factory.cudaStatsDelta(after, before) else null
             else
                 null
         else
             null;
+        const graph_generate_stats = graph_mod.executor_stats.delta(graph_mod.executor_stats.snapshot(), graph_stats_before_generate);
+        const metal_stats_after_generate: ?ops.BackendDebugTimingSnapshot = if (comptime build_options.enable_metal) blk: {
+            if (cb.kind() == .metal) break :blk cb.debugTimingSnapshot();
+            break :blk null;
+        } else null;
 
         if (opts.print_token_count) print("tokens={d}\n", .{bench_result.tokens});
         if (opts.print_timing) {
@@ -887,13 +1093,30 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 durationMillis(acquired_scheduler_at, created_backend_at),
                 durationMillis(created_backend_at, created_decode_state_at),
                 durationMillis(started_at, finished_generate_at),
+                metal_stats_after_generate,
+                graph_generate_stats,
                 cuda_stats_after_generate,
                 cuda_generate_stats,
+            );
+        }
+        if (opts.kernel_jit_profile_out) |path| {
+            try writeKernelJitWorkloadProfile(
+                allocator,
+                io,
+                path,
+                model.session,
+                @intCast(@max(opts.max_tokens, 0)),
+                bench_result.tokens,
+                null,
             );
         }
         return;
     }
     var result = generateWithOptionalStreaming(&pipeline, &messages, config, opts.stream) catch |err| {
+        drainCudaGenerationProfiles(
+            model.session,
+            if (draft_model) |loaded_draft| loaded_draft.session else null,
+        );
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
         } else if (err == error.AudioInputTooLong) {
@@ -902,6 +1125,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return err;
     };
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
+    // Drain buffered per-op profile events (single host sync, off the hot path)
+    // so the prefill/decode profile counters below reflect the whole request.
+    drainCudaGenerationProfiles(
+        model.session,
+        if (draft_model) |loaded_draft| loaded_draft.session else null,
+    );
     const cuda_stats_after_generate = if (comptime build_options.enable_cuda)
         session_factory.getCudaRuntimeStats(model.session)
     else
@@ -912,19 +1141,44 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         null;
     const cuda_generate_stats = if (comptime build_options.enable_cuda)
         if (cuda_stats_after_generate) |after|
-            if (cuda_stats_before_generate) |before| cudaStatsDelta(after, before) else null
+            if (cuda_stats_before_generate) |before| session_factory.cudaStatsDelta(after, before) else null
         else
             null
     else
         null;
     const draft_cuda_generate_stats = if (comptime build_options.enable_cuda)
         if (draft_cuda_stats_after_generate) |after|
-            if (draft_cuda_stats_before_generate) |before| cudaStatsDelta(after, before) else null
+            if (draft_cuda_stats_before_generate) |before| session_factory.cudaStatsDelta(after, before) else null
         else
             null
     else
         null;
+    const graph_generate_stats = graph_mod.executor_stats.delta(graph_mod.executor_stats.snapshot(), graph_stats_before_generate);
     defer result.deinit();
+
+    if (opts.kernel_jit_profile_out) |path| {
+        try writeKernelJitWorkloadProfile(
+            allocator,
+            io,
+            path,
+            model.session,
+            @intCast(@max(opts.max_tokens, 0)),
+            result.tokens_used,
+            if (draft_model != null) opts.speculative_k else null,
+        );
+    }
+    if (opts.kernel_jit_draft_profile_out) |path| {
+        const loaded_draft = draft_model orelse return error.MetalDraftWorkloadProfileUnavailable;
+        try writeKernelJitWorkloadProfile(
+            allocator,
+            io,
+            path,
+            loaded_draft.session,
+            @intCast(@max(opts.max_tokens, 0)),
+            result.tokens_used,
+            opts.speculative_k,
+        );
+    }
 
     if (!opts.stream) print("{s}\n", .{result.text});
     if (opts.print_token_ids) {
@@ -985,7 +1239,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     metal_snapshot.quant.gated_block_fast_attempts,
                 },
             );
-            printMetalQuantDispatchSummary(metal_snapshot);
+            printMetalQuantDispatchSummary(
+                metal_snapshot,
+                metalStatsWithRuntimePlanCounters(graph_generate_stats, metal_snapshot.provider),
+            );
             print(
                 "metal_gated_quantized_block: calls={d} quantized_branch={d} attn_calls={d} attn_nulls={d} attn_prefill_nulls={d} attn_decode_nulls={d} norm_nulls={d} f32_kv_calls={d} f32_kv_ok={d} f32_kv_nulls={d} f32_quant_direct_ok={d} f32_quant_direct_fail={d} compressed_f32_reroutes={d} active_bootstrap_misses={d}\n",
                 .{
@@ -1018,6 +1275,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     metal_snapshot.provider.metal_runtime_blit_encoder_count,
                 },
             );
+            printMetalStageTiming(metal_snapshot.provider);
             print(
                 "metal_decoder_frame_blits: upload={d} copy={d} slice={d} attention_span={d} ffn_copy={d} embedding={d} other={d}\n",
                 .{
@@ -1335,16 +1593,62 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
-                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_scalar={d}\n",
+                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_generated={d} gqa_score_prework={d} gqa_score_prework_serial={d} gqa_score_prework_serial_hd256={d} gqa_score_prework_serial_hd512={d} gqa_score_prework_tiled64={d} gqa_score_prework_tiled64_hd256={d} gqa_score_prework_tiled64_hd512={d} gqa_score_prework_tiled64_fallbacks={d} gqa_score_prework_tiled64_forbidden_routes={d} gqa_score_prework_tiled64_symbol_fallbacks={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_prefill_tiled_f16_exact={d} gqa_prefill_tiled_f16_exact_hd256={d} gqa_prefill_tiled_f16_exact_hd512={d} gqa_prefill_tiled_f16_warp={d} gqa_prefill_tiled_f16_warp_hd256={d} gqa_prefill_tiled_f16_warp_hd512={d}",
                         .{
                             generate_stats.launch_attention_gqa_decode,
+                            generate_stats.launch_attention_gqa_decode_generated,
+                            generate_stats.launch_attention_gqa_decode_score_prework,
+                            generate_stats.launch_attention_gqa_decode_score_prework_serial,
+                            generate_stats.launch_attention_gqa_decode_score_prework_serial_hd256,
+                            generate_stats.launch_attention_gqa_decode_score_prework_serial_hd512,
+                            generate_stats.launch_attention_gqa_decode_score_prework_tiled64,
+                            generate_stats.launch_attention_gqa_decode_score_prework_tiled64_hd256,
+                            generate_stats.launch_attention_gqa_decode_score_prework_tiled64_hd512,
+                            generate_stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks,
+                            generate_stats.launch_attention_gqa_decode_score_prework_tiled64_forbidden_routes,
+                            generate_stats.launch_attention_gqa_decode_score_prework_tiled64_symbol_fallbacks,
                             generate_stats.launch_attention_gqa_decode_fast,
                             generate_stats.launch_attention_gqa_decode_fast_fallbacks,
                             generate_stats.launch_attention_gqa_prefill_fast,
                             generate_stats.launch_attention_gqa_prefill_tiled,
                             generate_stats.launch_attention_gqa_prefill_mma,
                             generate_stats.launch_attention_gqa_prefill_mma_m32,
+                            generate_stats.launch_attention_gqa_prefill_tiled_f16_exact,
+                            generate_stats.launch_attention_gqa_prefill_tiled_f16_exact_hd256,
+                            generate_stats.launch_attention_gqa_prefill_tiled_f16_exact_hd512,
+                            generate_stats.launch_attention_gqa_prefill_tiled_f16_warp,
+                            generate_stats.launch_attention_gqa_prefill_tiled_f16_warp_hd256,
+                            generate_stats.launch_attention_gqa_prefill_tiled_f16_warp_hd512,
+                        },
+                    );
+                    print(
+                        " gqa_prefill_flash_f16_sm89={d} gqa_prefill_flash_hd256_q512={d} gqa_prefill_flash_hd256_q3={d} gqa_prefill_flash_hd512_q512={d} gqa_prefill_flash_hd512_q3={d} gqa_prefill_flash_fallbacks={d} gqa_prefill_flash_ineligible_fallbacks={d} gqa_prefill_flash_symbol_fallbacks={d} gqa_prefill_flash_fallback_hd256_q512={d} gqa_prefill_flash_fallback_hd256_q3={d} gqa_prefill_flash_fallback_hd512_q512={d} gqa_prefill_flash_fallback_hd512_q3={d} gqa_scalar={d}\n",
+                        .{
+                            generate_stats.launch_attention_gqa_prefill_flash_f16_sm89,
+                            generate_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q512,
+                            generate_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q3,
+                            generate_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q512,
+                            generate_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q3,
+                            generate_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallbacks,
+                            generate_stats.launch_attention_gqa_prefill_flash_f16_sm89_ineligible_fallbacks,
+                            generate_stats.launch_attention_gqa_prefill_flash_f16_sm89_symbol_fallbacks,
+                            generate_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q512,
+                            generate_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q3,
+                            generate_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q512,
+                            generate_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q3,
                             generate_stats.launch_attention_gqa_scalar,
+                        },
+                    );
+                    print(
+                        "cuda_generate_decode_splitk_online_sm89: active={d} hd256={d} hd512={d} fallbacks={d} ineligible_fallbacks={d} symbol_fallbacks={d} forbidden_routes={d}\n",
+                        .{
+                            generate_stats.launch_attention_gqa_decode_splitk_online_sm89,
+                            generate_stats.launch_attention_gqa_decode_splitk_online_sm89_hd256,
+                            generate_stats.launch_attention_gqa_decode_splitk_online_sm89_hd512,
+                            generate_stats.launch_attention_gqa_decode_splitk_online_sm89_fallbacks,
+                            generate_stats.launch_attention_gqa_decode_splitk_online_sm89_ineligible_fallbacks,
+                            generate_stats.launch_attention_gqa_decode_splitk_online_sm89_symbol_fallbacks,
+                            generate_stats.launch_attention_gqa_decode_splitk_online_sm89_forbidden_routes,
                         },
                     );
                     print(
@@ -1370,12 +1674,25 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
-                        "cuda_generate_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4={d} fused_q6={d} fallbacks={d}\n",
+                        "cuda_generate_temp_arena_plan: observations={d} activations={d} invalidations={d} slots={d}\n",
+                        .{
+                            generate_stats.cuda_temp_arena_plan_observations,
+                            generate_stats.cuda_temp_arena_plan_activations,
+                            generate_stats.cuda_temp_arena_plan_invalidations,
+                            generate_stats.cuda_temp_arena_plan_slots,
+                        },
+                    );
+                    print(
+                        "cuda_generate_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4_0_q8_1={d} q4_0_q8_1_fallbacks={d} fused_q4={d} fused_q6={d} generated_q6_k_q8_1_hits={d} generated_q6_k_q8_1_fallbacks={d} fallbacks={d}\n",
                         .{
                             generate_stats.lm_head_argmax_fused_q8,
                             generate_stats.lm_head_argmax_fused_q4_0,
+                            generate_stats.lm_head_argmax_fused_q4_0_q8_1,
+                            generate_stats.lm_head_argmax_q4_0_q8_1_fallbacks,
                             generate_stats.lm_head_argmax_fused_q4,
                             generate_stats.lm_head_argmax_fused_q6,
+                            generate_stats.lm_head_argmax_generated_q6_k_q8_1_hits,
+                            generate_stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks,
                             generate_stats.lm_head_argmax_fallbacks,
                         },
                     );
@@ -1400,6 +1717,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
+                        "cuda_generate_ple_gate_prefill: mirror_first_hits={d} mirror_first_ineligible={d} decode_q4_fused_preserved={d}\n",
+                        .{
+                            generate_stats.ple_gate_prefill_bf16_mirror_first_hits,
+                            generate_stats.ple_gate_prefill_bf16_mirror_first_ineligible,
+                            generate_stats.ple_gate_decode_q4_fused_preserved,
+                        },
+                    );
+                    print(
                         "cuda_generate_decoder_runtime_counts: linear_prepares={d} linear_prepare_misses={d} rms_prepares={d} rms_prepare_misses={d} linear_apply_hits={d} linear_apply_misses={d} linear_pair_apply_hits={d} linear_qkv_apply_hits={d} rms_apply_hits={d} rms_apply_misses={d} attention_residual_attempts={d} attention_residual_hits={d} attention_residual_misses={d} gated_ffn_attempts={d} gated_ffn_hits={d} gated_ffn_misses={d} pinned_eviction_skips={d}\n",
                         .{
                             generate_stats.decoder_runtime_linear_slot_prepares,
@@ -1421,38 +1746,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                             generate_stats.decoder_runtime_pinned_eviction_skips,
                         },
                     );
-                    print(
-                        "cuda_decode_profile_us: events={d} qkv={d} gqa_attention={d} attention_output={d} attention_norm_residual={d} ffn_gate_up={d} ffn_gated_down={d} ffn_post_norm={d} lm_head_argmax={d} graph_replay={d}\n",
-                        .{
-                            generate_stats.decode_profile_events,
-                            generate_stats.decode_profile_qkv_us,
-                            generate_stats.decode_profile_gqa_attention_us,
-                            generate_stats.decode_profile_attention_output_us,
-                            generate_stats.decode_profile_attention_norm_residual_us,
-                            generate_stats.decode_profile_ffn_gate_up_us,
-                            generate_stats.decode_profile_ffn_gated_down_us,
-                            generate_stats.decode_profile_ffn_post_norm_us,
-                            generate_stats.decode_profile_lm_head_argmax_us,
-                            generate_stats.decode_profile_graph_replay_us,
-                        },
-                    );
-                    print(
-                        "cuda_prefill_profile_us: events={d} q4_linear={d} q4_qkv={d} q4_pair={d} q4_gated_down={d} bf16_linear={d} bf16_qkv={d} bf16_pair={d} attention={d} ple_dense={d} staging={d} norm={d}\n",
-                        .{
-                            generate_stats.prefill_profile_events,
-                            generate_stats.prefill_profile_q4_linear_us,
-                            generate_stats.prefill_profile_q4_qkv_us,
-                            generate_stats.prefill_profile_q4_pair_us,
-                            generate_stats.prefill_profile_q4_gated_down_us,
-                            generate_stats.prefill_profile_bf16_linear_us,
-                            generate_stats.prefill_profile_bf16_qkv_us,
-                            generate_stats.prefill_profile_bf16_pair_us,
-                            generate_stats.prefill_profile_attention_us,
-                            generate_stats.prefill_profile_ple_dense_us,
-                            generate_stats.prefill_profile_staging_us,
-                            generate_stats.prefill_profile_norm_us,
-                        },
-                    );
+                    var cuda_profile_line_buf: [768]u8 = undefined;
+                    print("{s}\n", .{session_factory.formatCudaDecodeProfileLine(&cuda_profile_line_buf, generate_stats)});
+                    print("{s}\n", .{session_factory.formatCudaPrefillProfileLine(&cuda_profile_line_buf, generate_stats)});
                 }
                 print(
                     "cuda_eval_breakdown: requests={d} skipped_eager={d} forced_syncs={d}\n",
@@ -1594,16 +1890,62 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_scalar={d}\n",
+                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_generated={d} gqa_score_prework={d} gqa_score_prework_serial={d} gqa_score_prework_serial_hd256={d} gqa_score_prework_serial_hd512={d} gqa_score_prework_tiled64={d} gqa_score_prework_tiled64_hd256={d} gqa_score_prework_tiled64_hd512={d} gqa_score_prework_tiled64_fallbacks={d} gqa_score_prework_tiled64_forbidden_routes={d} gqa_score_prework_tiled64_symbol_fallbacks={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_prefill_tiled_f16_exact={d} gqa_prefill_tiled_f16_exact_hd256={d} gqa_prefill_tiled_f16_exact_hd512={d} gqa_prefill_tiled_f16_warp={d} gqa_prefill_tiled_f16_warp_hd256={d} gqa_prefill_tiled_f16_warp_hd512={d}",
                     .{
                         cuda_stats.launch_attention_gqa_decode,
+                        cuda_stats.launch_attention_gqa_decode_generated,
+                        cuda_stats.launch_attention_gqa_decode_score_prework,
+                        cuda_stats.launch_attention_gqa_decode_score_prework_serial,
+                        cuda_stats.launch_attention_gqa_decode_score_prework_serial_hd256,
+                        cuda_stats.launch_attention_gqa_decode_score_prework_serial_hd512,
+                        cuda_stats.launch_attention_gqa_decode_score_prework_tiled64,
+                        cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_hd256,
+                        cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_hd512,
+                        cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks,
+                        cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_forbidden_routes,
+                        cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_symbol_fallbacks,
                         cuda_stats.launch_attention_gqa_decode_fast,
                         cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
                         cuda_stats.launch_attention_gqa_prefill_fast,
                         cuda_stats.launch_attention_gqa_prefill_tiled,
                         cuda_stats.launch_attention_gqa_prefill_mma,
                         cuda_stats.launch_attention_gqa_prefill_mma_m32,
+                        cuda_stats.launch_attention_gqa_prefill_tiled_f16_exact,
+                        cuda_stats.launch_attention_gqa_prefill_tiled_f16_exact_hd256,
+                        cuda_stats.launch_attention_gqa_prefill_tiled_f16_exact_hd512,
+                        cuda_stats.launch_attention_gqa_prefill_tiled_f16_warp,
+                        cuda_stats.launch_attention_gqa_prefill_tiled_f16_warp_hd256,
+                        cuda_stats.launch_attention_gqa_prefill_tiled_f16_warp_hd512,
+                    },
+                );
+                print(
+                    " gqa_prefill_flash_f16_sm89={d} gqa_prefill_flash_hd256_q512={d} gqa_prefill_flash_hd256_q3={d} gqa_prefill_flash_hd512_q512={d} gqa_prefill_flash_hd512_q3={d} gqa_prefill_flash_fallbacks={d} gqa_prefill_flash_ineligible_fallbacks={d} gqa_prefill_flash_symbol_fallbacks={d} gqa_prefill_flash_fallback_hd256_q512={d} gqa_prefill_flash_fallback_hd256_q3={d} gqa_prefill_flash_fallback_hd512_q512={d} gqa_prefill_flash_fallback_hd512_q3={d} gqa_scalar={d}\n",
+                    .{
+                        cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89,
+                        cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q512,
+                        cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q3,
+                        cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q512,
+                        cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q3,
+                        cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallbacks,
+                        cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_ineligible_fallbacks,
+                        cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_symbol_fallbacks,
+                        cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q512,
+                        cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q3,
+                        cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q512,
+                        cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q3,
                         cuda_stats.launch_attention_gqa_scalar,
+                    },
+                );
+                print(
+                    "cuda_decode_splitk_online_sm89: active={d} hd256={d} hd512={d} fallbacks={d} ineligible_fallbacks={d} symbol_fallbacks={d} forbidden_routes={d}\n",
+                    .{
+                        cuda_stats.launch_attention_gqa_decode_splitk_online_sm89,
+                        cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_hd256,
+                        cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_hd512,
+                        cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_fallbacks,
+                        cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_ineligible_fallbacks,
+                        cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_symbol_fallbacks,
+                        cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_forbidden_routes,
                     },
                 );
                 print(
@@ -1684,7 +2026,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_qkv_counts: fused_q8={d} fused_q4_0={d} fused_q4_0_tile4={d} fused_q4_0_tile8={d} fused_q4={d} fused_q4_q4_f32={d} fused_f32={d} fallback_unsupported={d} kernel_unavailable={d}\n",
+                    "cuda_qkv_counts: fused_q8={d} fused_q4_0={d} fused_q4_0_tile4={d} fused_q4_0_tile8={d} fused_q4={d} fused_q4_q4_f32={d} fused_f32={d} fused_f16={d} fallback_unsupported={d} kernel_unavailable={d}\n",
                     .{
                         cuda_stats.qkv_fused_q8,
                         cuda_stats.qkv_fused_q4_0,
@@ -1693,6 +2035,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.qkv_fused_q4,
                         cuda_stats.qkv_fused_q4_q4_f32,
                         cuda_stats.qkv_fused_f32,
+                        cuda_stats.qkv_fused_f16,
                         cuda_stats.qkv_fallback_unsupported,
                         cuda_stats.qkv_kernel_unavailable,
                     },
@@ -1740,12 +2083,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4={d} fused_q6={d} fallbacks={d}\n",
+                    "cuda_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4_0_q8_1={d} q4_0_q8_1_fallbacks={d} fused_q4={d} fused_q6={d} generated_q6_k_q8_1_hits={d} generated_q6_k_q8_1_fallbacks={d} fallbacks={d}\n",
                     .{
                         cuda_stats.lm_head_argmax_fused_q8,
                         cuda_stats.lm_head_argmax_fused_q4_0,
+                        cuda_stats.lm_head_argmax_fused_q4_0_q8_1,
+                        cuda_stats.lm_head_argmax_q4_0_q8_1_fallbacks,
                         cuda_stats.lm_head_argmax_fused_q4,
                         cuda_stats.lm_head_argmax_fused_q6,
+                        cuda_stats.lm_head_argmax_generated_q6_k_q8_1_hits,
+                        cuda_stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks,
                         cuda_stats.lm_head_argmax_fallbacks,
                     },
                 );
@@ -1767,6 +2114,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.gated_down_fused_q4_0_tile16,
                         cuda_stats.gated_down_fused_q4,
                         cuda_stats.gated_down_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_ple_gate_prefill: mirror_first_hits={d} mirror_first_ineligible={d} decode_q4_fused_preserved={d}\n",
+                    .{
+                        cuda_stats.ple_gate_prefill_bf16_mirror_first_hits,
+                        cuda_stats.ple_gate_prefill_bf16_mirror_first_ineligible,
+                        cuda_stats.ple_gate_decode_q4_fused_preserved,
                     },
                 );
                 print(
@@ -1792,13 +2147,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_bf16_counts: cublaslt_linear={d} cublaslt_qkv={d} cublaslt_activation_staging={d} cublaslt_activation_mirror={d} cublaslt_fallbacks={d} scalar_linear={d} scalar_qkv={d} rms_norm_bf16_mirror={d}\n",
+                    "cuda_bf16_counts: cublaslt_linear={d} cublaslt_qkv={d} cublaslt_activation_staging={d} cublaslt_activation_mirror={d} cublaslt_fallbacks={d} cublaslt_tuning_tuned={d} cublaslt_tuning_heuristic={d} cublaslt_tuning_api_fallbacks={d} scalar_linear={d} scalar_qkv={d} rms_norm_bf16_mirror={d}\n",
                     .{
                         cuda_stats.bf16_cublaslt_linear_calls,
                         cuda_stats.bf16_cublaslt_qkv_calls,
                         cuda_stats.bf16_cublaslt_activation_staging_calls,
                         cuda_stats.bf16_cublaslt_activation_mirror_hits,
                         cuda_stats.bf16_cublaslt_fallbacks,
+                        cuda_stats.bf16_cublaslt_tuning_tuned_calls,
+                        cuda_stats.bf16_cublaslt_tuning_heuristic_calls,
+                        cuda_stats.bf16_cublaslt_tuning_api_fallbacks,
                         cuda_stats.bf16_scalar_linear_calls,
                         cuda_stats.bf16_scalar_qkv_calls,
                         cuda_stats.rms_norm_bf16_mirror_hits,
@@ -1809,6 +2167,63 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     .{
                         cuda_stats.q4k_decode_fast_hits,
                         cuda_stats.q4k_decode_fast_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_q4_0_generated_counts: mmv_hits={d} mmv_fallbacks={d} mm_hits={d} mm_fallbacks={d} pair_hits={d} pair_fallbacks={d} pair_q8_hits={d} pair_q8_fallbacks={d} down_q8_hits={d} down_q8_fallbacks={d} e2b_pair_q8_hits={d} e2b_pair_q8_fallbacks={d} e2b_down_q8_hits={d} e2b_down_q8_fallbacks={d} e2b_pair_only_hits={d} e2b_pair_only_fallbacks={d} e2b_exact_pair_f32_hits={d} e2b_exact_pair_f32_fallbacks={d} e2b_exact_down_f32_hits={d} e2b_exact_down_f32_fallbacks={d} catalog_resolve_attempts={d} catalog_resolve_misses={d} catalog_hits={d} catalog_fallbacks={d}\n",
+                    .{
+                        cuda_stats.q4_0_generated_mmv_hits,
+                        cuda_stats.q4_0_generated_mmv_fallbacks,
+                        cuda_stats.q4_0_generated_mm_hits,
+                        cuda_stats.q4_0_generated_mm_fallbacks,
+                        cuda_stats.q4_0_generated_pair_hits,
+                        cuda_stats.q4_0_generated_pair_fallbacks,
+                        cuda_stats.q4_0_generated_pair_q8_hits,
+                        cuda_stats.q4_0_generated_pair_q8_fallbacks,
+                        cuda_stats.q4_0_generated_down_q8_hits,
+                        cuda_stats.q4_0_generated_down_q8_fallbacks,
+                        cuda_stats.q4_0_generated_e2b_pair_q8_hits,
+                        cuda_stats.q4_0_generated_e2b_pair_q8_fallbacks,
+                        cuda_stats.q4_0_generated_e2b_down_q8_hits,
+                        cuda_stats.q4_0_generated_e2b_down_q8_fallbacks,
+                        cuda_stats.q4_0_generated_e2b_pair_only_hits,
+                        cuda_stats.q4_0_generated_e2b_pair_only_fallbacks,
+                        cuda_stats.q4_0_generated_e2b_exact_pair_f32_hits,
+                        cuda_stats.q4_0_generated_e2b_exact_pair_f32_fallbacks,
+                        cuda_stats.q4_0_generated_e2b_exact_down_f32_hits,
+                        cuda_stats.q4_0_generated_e2b_exact_down_f32_fallbacks,
+                        cuda_stats.generated_kernel_catalog_resolve_attempts,
+                        cuda_stats.generated_kernel_catalog_resolve_misses,
+                        cuda_stats.generated_kernel_catalog_hits,
+                        cuda_stats.generated_kernel_catalog_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_q4_0_ggml_q8_1_counts: e2b_ffn_hits={d} e2b_ffn_fallbacks={d} quantize_fallbacks={d} pair_fallbacks={d} down_fallbacks={d}\n",
+                    .{
+                        cuda_stats.q4_0_ggml_q8_1_e2b_ffn_hits,
+                        cuda_stats.q4_0_ggml_q8_1_e2b_ffn_fallbacks,
+                        cuda_stats.q4_0_ggml_q8_1_quantize_fallbacks,
+                        cuda_stats.q4_0_ggml_q8_1_pair_fallbacks,
+                        cuda_stats.q4_0_ggml_q8_1_down_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d}\n",
+                    .{
+                        cuda_stats.quant_kernel_planned_ops,
+                        cuda_stats.quant_kernel_handwritten_production,
+                        cuda_stats.quant_kernel_generated_production,
+                        cuda_stats.quant_kernel_unsupported_routes,
+                        cuda_stats.quant_kernel_generated_candidates,
+                        cuda_stats.quant_kernel_fallback_generated_artifact_missing,
+                        cuda_stats.quant_kernel_fallback_generated_runtime_not_wired,
+                        cuda_stats.quant_kernel_fallback_unsupported,
+                        cuda_stats.quant_kernel_fallback_unsupported_format,
+                        cuda_stats.quant_kernel_fallback_unsupported_shape,
+                        cuda_stats.quant_kernel_fallback_unsupported_epilogue,
+                        cuda_stats.quant_kernel_fallback_unsupported_backend,
+                        cuda_stats.quant_kernel_fallback_tensor_core_repack_required,
                     },
                 );
                 print(
@@ -1906,6 +2321,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
     }
     if (opts.json_timing_path) |path| {
+        const metal_stats_after_generate: ?ops.BackendDebugTimingSnapshot = if (comptime build_options.enable_metal) blk: {
+            if (cb.kind() == .metal) break :blk cb.debugTimingSnapshot();
+            break :blk null;
+        } else null;
         try writeJsonTiming(
             allocator,
             io,
@@ -1920,6 +2339,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             durationMillis(created_backend_at, created_decode_state_at),
             durationMillis(created_decode_state_at, finished_generate_at),
             durationMillis(started_at, finished_generate_at),
+            metal_stats_after_generate,
+            graph_generate_stats,
             cuda_stats_after_generate,
             cuda_generate_stats,
             draft_cuda_stats_after_generate,
@@ -2235,9 +2656,14 @@ fn writeRawDecodeBenchJson(
     backend_setup_ms: u64,
     decode_setup_ms: u64,
     total_ms: u64,
+    metal_stats_opt: ?ops.BackendDebugTimingSnapshot,
+    graph_stats: graph_mod.executor_stats.ExecutionStats,
     cuda_stats_opt: ?session_factory.CudaRuntimeStats,
     cuda_generate_stats_opt: ?session_factory.CudaRuntimeStats,
 ) !void {
+    const metal_json = try metalStatsCompactJson(allocator, metal_stats_opt, graph_stats);
+    defer allocator.free(metal_json);
+
     const cuda_json = if (comptime build_options.enable_cuda)
         try cudaStatsCompactJson(allocator, cuda_stats_opt, result.tokens)
     else
@@ -2273,6 +2699,7 @@ fn writeRawDecodeBenchJson(
         \\"decode":{d},
         \\"total":{d}
         \\}},
+        \\"metal":{s},
         \\"cuda":{s},
         \\"cuda_generate":{s}
         \\}}
@@ -2296,6 +2723,7 @@ fn writeRawDecodeBenchJson(
             result.warmup_ms,
             result.decode_ms,
             total_ms,
+            metal_json,
             cuda_json,
             cuda_generate_json,
         },
@@ -2307,18 +2735,6 @@ fn writeRawDecodeBenchJson(
 fn perToken(count: usize, tokens: usize) f64 {
     if (tokens == 0) return 0.0;
     return @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(tokens));
-}
-
-fn cudaStatsDelta(after: session_factory.CudaRuntimeStats, before: session_factory.CudaRuntimeStats) session_factory.CudaRuntimeStats {
-    if (comptime !build_options.enable_cuda) return;
-    var delta = after;
-    inline for (std.meta.fields(session_factory.CudaRuntimeStats)) |field| {
-        switch (@typeInfo(field.type)) {
-            .int => @field(delta, field.name) = @field(after, field.name) -| @field(before, field.name),
-            else => {},
-        }
-    }
-    return delta;
 }
 
 fn appendFmt(
@@ -2420,6 +2836,10 @@ fn cudaStatsCompactJson(
         \\"graph_capture_scalar_updates":{d},
         \\"graph_capture_persistent_replays":{d},
         \\"graph_capture_capacity_skips":{d},
+        \\"temp_arena_plan_observations":{d},
+        \\"temp_arena_plan_activations":{d},
+        \\"temp_arena_plan_invalidations":{d},
+        \\"temp_arena_plan_slots":{d},
         \\"launch_linear":{d},
         \\"launch_linear_qkv":{d},
         \\"launch_norm":{d},
@@ -2446,6 +2866,10 @@ fn cudaStatsCompactJson(
             stats.cuda_graph_capture_scalar_updates,
             stats.cuda_graph_capture_persistent_replays,
             stats.cuda_graph_capture_capacity_skips,
+            stats.cuda_temp_arena_plan_observations,
+            stats.cuda_temp_arena_plan_activations,
+            stats.cuda_temp_arena_plan_invalidations,
+            stats.cuda_temp_arena_plan_slots,
             stats.launch_linear,
             stats.launch_linear_qkv,
             stats.launch_norm,
@@ -2464,6 +2888,50 @@ fn cudaStatsCompactJson(
     try appendFmt(
         allocator,
         &out,
+        \\"launch_attention_gqa_prefill_tiled_f16_exact":{d},
+        \\"launch_attention_gqa_prefill_tiled_f16_exact_hd256":{d},
+        \\"launch_attention_gqa_prefill_tiled_f16_exact_hd512":{d},
+        \\"launch_attention_gqa_prefill_tiled_f16_warp":{d},
+        \\"launch_attention_gqa_prefill_tiled_f16_warp_hd256":{d},
+        \\"launch_attention_gqa_prefill_tiled_f16_warp_hd512":{d},
+        \\"launch_attention_gqa_prefill_flash_f16_sm89":{d},
+        \\"launch_attention_gqa_prefill_flash_f16_sm89_hd256_q512":{d},
+        \\"launch_attention_gqa_prefill_flash_f16_sm89_hd256_q3":{d},
+        \\"launch_attention_gqa_prefill_flash_f16_sm89_hd512_q512":{d},
+        \\"launch_attention_gqa_prefill_flash_f16_sm89_hd512_q3":{d},
+        \\"launch_attention_gqa_prefill_flash_f16_sm89_fallbacks":{d},
+        \\"launch_attention_gqa_prefill_flash_f16_sm89_ineligible_fallbacks":{d},
+        \\"launch_attention_gqa_prefill_flash_f16_sm89_symbol_fallbacks":{d},
+        \\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q512":{d},
+        \\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q3":{d},
+        \\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q512":{d},
+        \\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q3":{d},
+        \\
+    ,
+        .{
+            stats.launch_attention_gqa_prefill_tiled_f16_exact,
+            stats.launch_attention_gqa_prefill_tiled_f16_exact_hd256,
+            stats.launch_attention_gqa_prefill_tiled_f16_exact_hd512,
+            stats.launch_attention_gqa_prefill_tiled_f16_warp,
+            stats.launch_attention_gqa_prefill_tiled_f16_warp_hd256,
+            stats.launch_attention_gqa_prefill_tiled_f16_warp_hd512,
+            stats.launch_attention_gqa_prefill_flash_f16_sm89,
+            stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q512,
+            stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q3,
+            stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q512,
+            stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q3,
+            stats.launch_attention_gqa_prefill_flash_f16_sm89_fallbacks,
+            stats.launch_attention_gqa_prefill_flash_f16_sm89_ineligible_fallbacks,
+            stats.launch_attention_gqa_prefill_flash_f16_sm89_symbol_fallbacks,
+            stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q512,
+            stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q3,
+            stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q512,
+            stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q3,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
         \\"decode_profile_events":{d},
         \\"decode_profile_qkv_us":{d},
         \\"decode_profile_gqa_attention_us":{d},
@@ -2476,9 +2944,25 @@ fn cudaStatsCompactJson(
         \\"decode_profile_graph_replay_us":{d},
         \\"lm_head_argmax_fused_q8":{d},
         \\"lm_head_argmax_fused_q4_0":{d},
+        \\"lm_head_argmax_fused_q4_0_q8_1":{d},
+        \\"lm_head_argmax_q4_0_q8_1_fallbacks":{d},
         \\"lm_head_argmax_fused_q4":{d},
         \\"lm_head_argmax_fused_q6":{d},
+        \\"lm_head_argmax_generated_q6_k_q8_1_hits":{d},
+        \\"lm_head_argmax_generated_q6_k_q8_1_fallbacks":{d},
         \\"lm_head_argmax_fallbacks":{d},
+        \\"q4_0_generated_e2b_pair_q8_hits":{d},
+        \\"q4_0_generated_e2b_pair_q8_fallbacks":{d},
+        \\"q4_0_generated_e2b_down_q8_hits":{d},
+        \\"q4_0_generated_e2b_down_q8_fallbacks":{d},
+        \\"q4_0_generated_e2b_exact_pair_f32_hits":{d},
+        \\"q4_0_generated_e2b_exact_pair_f32_fallbacks":{d},
+        \\"q4_0_generated_e2b_exact_down_f32_hits":{d},
+        \\"q4_0_generated_e2b_exact_down_f32_fallbacks":{d},
+        \\"generated_kernel_catalog_resolve_attempts":{d},
+        \\"generated_kernel_catalog_resolve_misses":{d},
+        \\"generated_kernel_catalog_hits":{d},
+        \\"generated_kernel_catalog_fallbacks":{d},
         \\
     ,
         .{
@@ -2494,9 +2978,59 @@ fn cudaStatsCompactJson(
             stats.decode_profile_graph_replay_us,
             stats.lm_head_argmax_fused_q8,
             stats.lm_head_argmax_fused_q4_0,
+            stats.lm_head_argmax_fused_q4_0_q8_1,
+            stats.lm_head_argmax_q4_0_q8_1_fallbacks,
             stats.lm_head_argmax_fused_q4,
             stats.lm_head_argmax_fused_q6,
+            stats.lm_head_argmax_generated_q6_k_q8_1_hits,
+            stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks,
             stats.lm_head_argmax_fallbacks,
+            stats.q4_0_generated_e2b_pair_q8_hits,
+            stats.q4_0_generated_e2b_pair_q8_fallbacks,
+            stats.q4_0_generated_e2b_down_q8_hits,
+            stats.q4_0_generated_e2b_down_q8_fallbacks,
+            stats.q4_0_generated_e2b_exact_pair_f32_hits,
+            stats.q4_0_generated_e2b_exact_pair_f32_fallbacks,
+            stats.q4_0_generated_e2b_exact_down_f32_hits,
+            stats.q4_0_generated_e2b_exact_down_f32_fallbacks,
+            stats.generated_kernel_catalog_resolve_attempts,
+            stats.generated_kernel_catalog_resolve_misses,
+            stats.generated_kernel_catalog_hits,
+            stats.generated_kernel_catalog_fallbacks,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\"q4_0_generated_e2b_pair_only_hits":{d},
+        \\"q4_0_generated_e2b_pair_only_fallbacks":{d},
+        \\"q4_0_ggml_q8_1_e2b_ffn_hits":{d},
+        \\"q4_0_ggml_q8_1_e2b_ffn_fallbacks":{d},
+        \\"q4_0_ggml_q8_1_quantize_fallbacks":{d},
+        \\"q4_0_ggml_q8_1_pair_fallbacks":{d},
+        \\"q4_0_ggml_q8_1_down_fallbacks":{d},
+        \\"bf16_cublaslt_tuning_tuned_calls":{d},
+        \\"bf16_cublaslt_tuning_heuristic_calls":{d},
+        \\"bf16_cublaslt_tuning_api_fallbacks":{d},
+        \\"ple_gate_prefill_bf16_mirror_first_hits":{d},
+        \\"ple_gate_prefill_bf16_mirror_first_ineligible":{d},
+        \\"ple_gate_decode_q4_fused_preserved":{d},
+        \\
+    ,
+        .{
+            stats.q4_0_generated_e2b_pair_only_hits,
+            stats.q4_0_generated_e2b_pair_only_fallbacks,
+            stats.q4_0_ggml_q8_1_e2b_ffn_hits,
+            stats.q4_0_ggml_q8_1_e2b_ffn_fallbacks,
+            stats.q4_0_ggml_q8_1_quantize_fallbacks,
+            stats.q4_0_ggml_q8_1_pair_fallbacks,
+            stats.q4_0_ggml_q8_1_down_fallbacks,
+            stats.bf16_cublaslt_tuning_tuned_calls,
+            stats.bf16_cublaslt_tuning_heuristic_calls,
+            stats.bf16_cublaslt_tuning_api_fallbacks,
+            stats.ple_gate_prefill_bf16_mirror_first_hits,
+            stats.ple_gate_prefill_bf16_mirror_first_ineligible,
+            stats.ple_gate_decode_q4_fused_preserved,
         },
     );
     try appendFmt(
@@ -2614,6 +3148,675 @@ fn cudaStatsCompactJson(
     return try out.toOwnedSlice(allocator);
 }
 
+test "compact CUDA stats serialize generated catalog and legacy FFN counters" {
+    if (build_options.enable_cuda) {
+        var stats = session_factory.CudaRuntimeStats{};
+        stats.q4_0_generated_e2b_pair_q8_hits = 11;
+        stats.q4_0_generated_e2b_pair_q8_fallbacks = 12;
+        stats.q4_0_generated_e2b_down_q8_hits = 13;
+        stats.q4_0_generated_e2b_down_q8_fallbacks = 14;
+        stats.q4_0_generated_e2b_pair_only_hits = 15;
+        stats.q4_0_generated_e2b_pair_only_fallbacks = 16;
+        stats.generated_kernel_catalog_resolve_attempts = 17;
+        stats.generated_kernel_catalog_resolve_misses = 18;
+        stats.generated_kernel_catalog_hits = 19;
+        stats.generated_kernel_catalog_fallbacks = 20;
+        stats.launch_attention_gqa_prefill_tiled_f16_exact = 21;
+        stats.launch_attention_gqa_prefill_tiled_f16_exact_hd256 = 22;
+        stats.launch_attention_gqa_prefill_tiled_f16_exact_hd512 = 23;
+        stats.launch_attention_gqa_prefill_tiled_f16_warp = 24;
+        stats.launch_attention_gqa_prefill_tiled_f16_warp_hd256 = 25;
+        stats.launch_attention_gqa_prefill_tiled_f16_warp_hd512 = 26;
+        stats.launch_attention_gqa_prefill_flash_f16_sm89 = 27;
+        stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q512 = 28;
+        stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q3 = 29;
+        stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q512 = 30;
+        stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q3 = 31;
+        stats.launch_attention_gqa_prefill_flash_f16_sm89_fallbacks = 32;
+        stats.launch_attention_gqa_prefill_flash_f16_sm89_ineligible_fallbacks = 33;
+        stats.launch_attention_gqa_prefill_flash_f16_sm89_symbol_fallbacks = 34;
+        stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q512 = 35;
+        stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q3 = 36;
+        stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q512 = 37;
+        stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q3 = 38;
+        stats.ple_gate_prefill_bf16_mirror_first_hits = 39;
+        stats.ple_gate_prefill_bf16_mirror_first_ineligible = 40;
+        stats.ple_gate_decode_q4_fused_preserved = 41;
+        const json = try cudaStatsCompactJson(std.testing.allocator, stats, 1);
+        defer std.testing.allocator.free(json);
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"q4_0_generated_e2b_pair_q8_hits\":11"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"q4_0_generated_e2b_pair_q8_fallbacks\":12"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"q4_0_generated_e2b_down_q8_hits\":13"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"q4_0_generated_e2b_down_q8_fallbacks\":14"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"q4_0_generated_e2b_pair_only_hits\":15"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"q4_0_generated_e2b_pair_only_fallbacks\":16"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"generated_kernel_catalog_resolve_attempts\":17"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"generated_kernel_catalog_resolve_misses\":18"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"generated_kernel_catalog_hits\":19"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"generated_kernel_catalog_fallbacks\":20"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_tiled_f16_exact\":21"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_tiled_f16_exact_hd256\":22"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_tiled_f16_exact_hd512\":23"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_tiled_f16_warp\":24"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_tiled_f16_warp_hd256\":25"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_tiled_f16_warp_hd512\":26"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_flash_f16_sm89\":27"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_flash_f16_sm89_hd256_q512\":28"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_flash_f16_sm89_hd256_q3\":29"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_flash_f16_sm89_hd512_q512\":30"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_flash_f16_sm89_hd512_q3\":31"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_flash_f16_sm89_fallbacks\":32"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_flash_f16_sm89_ineligible_fallbacks\":33"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_flash_f16_sm89_symbol_fallbacks\":34"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q512\":35"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q3\":36"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q512\":37"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q3\":38"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"ple_gate_prefill_bf16_mirror_first_hits\":39"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"ple_gate_prefill_bf16_mirror_first_ineligible\":40"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"ple_gate_decode_q4_fused_preserved\":41"));
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+    }
+}
+
+const MetalDeviceProvenance = struct {
+    name_json: []u8,
+    registry_id: u64,
+
+    fn deinit(self: MetalDeviceProvenance, allocator: std.mem.Allocator) void {
+        allocator.free(self.name_json);
+    }
+};
+
+fn collectMetalDeviceProvenance(allocator: std.mem.Allocator) !?MetalDeviceProvenance {
+    if (comptime !build_options.enable_metal) return null;
+    // Device identity is diagnostic provenance, not a prerequisite for using a
+    // non-Metal backend from a binary that was compiled with Metal support.
+    // Benchmark contracts reject a missing identity separately and therefore
+    // still fail closed without turning JSON serialization into an inference
+    // failure.
+    if (!metal_runtime.metalDeviceAvailable()) return null;
+
+    const name_len = metal_runtime.termite_metal_copy_device_name(null, 0);
+    if (name_len == 0) return null;
+    const name = try allocator.alloc(u8, name_len);
+    defer allocator.free(name);
+    if (metal_runtime.termite_metal_copy_device_name(name.ptr, name.len) != name_len) {
+        return null;
+    }
+
+    var info: metal_runtime.MetalDeviceInfo = .{};
+    if (metal_runtime.termite_metal_device_info_get(&info) != 0 or info.registry_id == 0) {
+        return null;
+    }
+    return .{
+        .name_json = try std.json.Stringify.valueAlloc(allocator, name, .{}),
+        .registry_id = info.registry_id,
+    };
+}
+
+fn metalStatsCompactJson(
+    allocator: std.mem.Allocator,
+    stats_opt: ?ops.BackendDebugTimingSnapshot,
+    graph_stats: graph_mod.executor_stats.ExecutionStats,
+) ![]u8 {
+    const stats = stats_opt orelse return allocator.dupe(u8, "null");
+    const provider = stats.provider;
+    const stage = provider.metal_stage_timing;
+    const command_operators = provider.metal_runtime_last_frame_planned_command_operator_counts;
+    const command_dispatch = provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts;
+    const generated_route_json = try graph_mod.quant_kernel_compiler.metalRuntimeRouteSummaryJson(allocator);
+    defer allocator.free(generated_route_json);
+    const plan_stats = metalStatsWithRuntimePlanCounters(graph_stats, provider);
+    const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(plan_stats);
+    const fast_path_misses = graph_mod.executor_stats.quantKernelFastPathMisses(plan_stats);
+    const generated_quant = metal_generated_quant_stats.Stats.fromProviderStats(provider);
+    const generated_quant_top = generated_quant.topFamily();
+    const device_provenance = try collectMetalDeviceProvenance(allocator);
+    defer if (device_provenance) |device| device.deinit(allocator);
+    const device_name_json = if (device_provenance) |device| device.name_json else "null";
+    const device_registry_id = if (device_provenance) |device| device.registry_id else 0;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendFmt(
+        allocator,
+        &out,
+        \\{{
+        \\"device":{s},
+        \\"device_registry_id":{d},
+        \\"native_quant_null":{},
+        \\"runtime_command_operators":{{
+        \\"fallback":{d},
+        \\"mul_mv":{d},
+        \\"mul_mv_ext":{d},
+        \\"mul_mm":{d},
+        \\"get_rows":{d},
+        \\"set_rows":{d},
+        \\"cpy_q_to_f32":{d},
+        \\"cpy_f32_to_q":{d},
+        \\"attention_flash":{d},
+        \\"attention_paged":{d},
+        \\"attention_quantized_kv":{d},
+        \\"dispatch_scalar":{d},
+        \\"dispatch_mmv":{d},
+        \\"dispatch_small_batch":{d},
+        \\"dispatch_mm":{d}
+        \\}}
+    ,
+        .{
+            device_name_json,
+            device_registry_id,
+            stats.native_quant_null,
+            command_operators[0],
+            command_operators[1],
+            command_operators[2],
+            command_operators[3],
+            command_operators[4],
+            command_operators[5],
+            command_operators[6],
+            command_operators[7],
+            command_operators[8],
+            command_operators[9],
+            command_operators[10],
+            command_dispatch[0],
+            command_dispatch[1],
+            command_dispatch[2],
+            command_dispatch[3],
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"attention_dispatch":{{
+        \\"paged_1x":{d},
+        \\"decode_gqa_split":{d},
+        \\"generated_decode_1x":{d},
+        \\"generated_flash_prefill":{d},
+        \\"generated_flash_prefill_hd512":{d},
+        \\"prefill_direct_kv":{d},
+        \\"prefill_paged_kv":{d},
+        \\"generated_rms_norm":{d}
+        \\}},
+        \\"prepared_frame":{{
+        \\"fast_path":{d},
+        \\"fallback":{d}
+        \\}}
+    ,
+        .{
+            provider.metal_runtime_paged_attention_1x_calls,
+            provider.metal_runtime_decode_gqa_split_calls,
+            provider.metal_runtime_generated_attention_decode_1x_calls,
+            provider.metal_runtime_generated_attention_flash_prefill_calls,
+            provider.metal_runtime_generated_attention_flash_prefill_hd512_calls,
+            provider.metal_runtime_attention_prefill_direct_kv_calls,
+            provider.metal_runtime_attention_prefill_paged_kv_calls,
+            provider.metal_runtime_generated_rms_norm_calls,
+            provider.metal_runtime_prepared_frame_fast_path_calls,
+            provider.metal_runtime_prepared_frame_fallback_calls,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"stage_timing_ns":{{
+        \\"scope":"runtime_frame",
+        \\"enabled":{d},
+        \\"supported":{d},
+        \\"complete":{d},
+        \\"samples":{d},
+        \\"failures":{d},
+        \\"prefill":{{"frames":{d},"gpu":{d},"attention":{d},"ffn":{d},"ple":{d},"tail":{d},"embedding":{d},"other":{d}}},
+        \\"decode":{{"frames":{d},"gpu":{d},"attention":{d},"ffn":{d},"ple":{d},"tail":{d},"embedding":{d},"other":{d}}}
+        \\}}
+    ,
+        .{
+            stage.enabled,
+            stage.supported,
+            stage.complete,
+            stage.barrier_sample_count,
+            stage.failureCount(),
+            stage.prefill.sampled_frames,
+            stage.prefill.whole_frame_gpu_nanos,
+            stage.prefill.attention_nanos,
+            stage.prefill.ffn_nanos,
+            stage.prefill.ple_nanos,
+            stage.prefill.tail_nanos,
+            stage.prefill.embedding_nanos,
+            stage.prefill.other_nanos,
+            stage.decode.sampled_frames,
+            stage.decode.whole_frame_gpu_nanos,
+            stage.decode.attention_nanos,
+            stage.decode.ffn_nanos,
+            stage.decode.ple_nanos,
+            stage.decode.tail_nanos,
+            stage.decode.embedding_nanos,
+            stage.decode.other_nanos,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"q8_0_dispatch":{{
+        \\"scalar":{d},
+        \\"mmv":{d},
+        \\"small_batch":{d},
+        \\"mm":{d},
+        \\"rows_1":{d},
+        \\"rows_2_8":{d},
+        \\"rows_9_64":{d},
+        \\"rows_65_plus":{d},
+        \\"pair_act_mm_out_f16":{d},
+        \\"linear_mm_in_f16":{d},
+        \\"pair_act_rms_mmv_out_f16":{d},
+        \\"linear_mmv_in_f16":{d}
+        \\}},
+        \\"q4_0_dispatch":{{
+        \\"linear_reduce":{d},
+        \\"linear_reduce_rows_1":{d},
+        \\"linear_reduce_rows_2_8":{d},
+        \\"linear_reduce_rows_9_64":{d},
+        \\"linear_reduce_rows_65_plus":{d}
+        \\}},
+        \\"k_quant_dispatch":{{
+        \\"q4_linear_reduce":{d},
+        \\"q4_linear_reduce_rows_1":{d},
+        \\"q4_linear_reduce_rows_2_8":{d},
+        \\"q4_linear_reduce_rows_9_64":{d},
+        \\"q4_linear_reduce_rows_65_plus":{d},
+        \\"q4_pair_reduce":{d},
+        \\"q4_pair_act_reduce":{d},
+        \\"q4_pair_act_reduce_out_f16":{d},
+        \\"q4_activation_rhs_reduce":{d},
+        \\"q6_linear_reduce":{d},
+        \\"q6_linear_reduce_rows_1":{d},
+        \\"q6_linear_reduce_rows_2_8":{d},
+        \\"q6_linear_reduce_rows_9_64":{d},
+        \\"q6_linear_reduce_rows_65_plus":{d},
+        \\"q6_linear_reduce_in_f16":{d}
+        \\}}
+    ,
+        .{
+            provider.metal_runtime_q8_0_linear_dispatch_scalar,
+            provider.metal_runtime_q8_0_linear_dispatch_mmv,
+            provider.metal_runtime_q8_0_linear_dispatch_small_batch,
+            provider.metal_runtime_q8_0_linear_dispatch_mm,
+            provider.metal_runtime_q8_0_linear_rows_1,
+            provider.metal_runtime_q8_0_linear_rows_2_8,
+            provider.metal_runtime_q8_0_linear_rows_9_64,
+            provider.metal_runtime_q8_0_linear_rows_65_plus,
+            provider.metal_runtime_q8_0_pair_activation_mm_f16_output,
+            provider.metal_runtime_q8_0_linear_mm_f16_input,
+            provider.metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output,
+            provider.metal_runtime_q8_0_linear_mmv_f16_input,
+            provider.metal_runtime_q4_0_linear_reduce,
+            provider.metal_runtime_q4_0_linear_reduce_rows_1,
+            provider.metal_runtime_q4_0_linear_reduce_rows_2_8,
+            provider.metal_runtime_q4_0_linear_reduce_rows_9_64,
+            provider.metal_runtime_q4_0_linear_reduce_rows_65_plus,
+            provider.metal_runtime_q4_k_linear_reduce,
+            provider.metal_runtime_q4_k_linear_reduce_rows_1,
+            provider.metal_runtime_q4_k_linear_reduce_rows_2_8,
+            provider.metal_runtime_q4_k_linear_reduce_rows_9_64,
+            provider.metal_runtime_q4_k_linear_reduce_rows_65_plus,
+            provider.metal_runtime_q4_k_pair_reduce,
+            provider.metal_runtime_q4_k_pair_activation_reduce,
+            provider.metal_runtime_q4_k_pair_activation_reduce_f16_output,
+            provider.metal_runtime_q4_k_activation_rhs_reduce,
+            provider.metal_runtime_q6_k_linear_reduce,
+            provider.metal_runtime_q6_k_linear_reduce_rows_1,
+            provider.metal_runtime_q6_k_linear_reduce_rows_2_8,
+            provider.metal_runtime_q6_k_linear_reduce_rows_9_64,
+            provider.metal_runtime_q6_k_linear_reduce_rows_65_plus,
+            provider.metal_runtime_q6_k_linear_reduce_f16_input,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"q4_0_policy":{{
+        \\"mmv_nr4_nsg2":{d},
+        \\"mmv_nr8_nsg2":{d},
+        \\"mmv_nr4_nsg4":{d},
+        \\"mmv_nr8_nsg4":{d},
+        \\"mmv_variant_fallbacks":{d},
+        \\"mm_sg_aligned":{d},
+        \\"mm_sg_aligned_tail":{d},
+        \\"mm_sg_unrolled":{d}
+        \\}}
+    ,
+        .{
+            provider.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches,
+            provider.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches,
+            provider.metal_runtime_q4_0_mmv_nr4_nsg4_dispatches,
+            provider.metal_runtime_q4_0_mmv_nr8_nsg4_dispatches,
+            provider.metal_runtime_q4_0_mmv_variant_fallbacks,
+            provider.metal_runtime_q4_0_mm_sg_aligned_dispatches,
+            provider.metal_runtime_q4_0_mm_sg_aligned_tail_dispatches,
+            provider.metal_runtime_q4_0_mm_sg_unrolled_dispatches,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"q4_0_pair_activation_policy":{{
+        \\"mmv_nr4_nsg2":{d},
+        \\"mmv_nr8_nsg2":{d},
+        \\"mmv_nr4_nsg4":{d},
+        \\"mmv_nr8_nsg4":{d},
+        \\"mmv_variant_fallbacks":{d},
+        \\"mm_m32_n64_aligned":{d},
+        \\"mm_m32_n64_tail":{d},
+        \\"mm_m32_n32_aligned":{d},
+        \\"mm_m32_n32_tail":{d},
+        \\"mm_variant_fallbacks":{d}
+        \\}}
+    ,
+        .{
+            provider.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg2_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg2_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg4_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg4_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mmv_variant_fallbacks,
+            provider.metal_runtime_q4_0_pair_activation_mm_m32_n64_aligned_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mm_m32_n64_tail_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mm_m32_n32_aligned_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mm_m32_n32_tail_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mm_variant_fallbacks,
+        },
+    );
+    // Keys and their order come from the shared counter-name table; the emitted
+    // JSON must stay byte-identical to the historical hand-written key list.
+    try appendFmt(allocator, &out, ",\n\"generated_quant_dispatch\":{{", .{});
+    for (quant_matmul.generated_quant_counter_names, 0..) |counter, counter_index| {
+        const separator: []const u8 = if (counter_index + 1 == quant_matmul.generated_quant_counter_names.len) "" else ",";
+        try appendFmt(allocator, &out, "\n\"{s}\":{d}{s}", .{
+            counter.name,
+            quant_matmul.generatedQuantDispatchCount(&provider.metal_runtime_antfly_generated_dispatch_counts, counter.format, counter.epilogue),
+            separator,
+        });
+    }
+    try appendFmt(
+        allocator,
+        &out,
+        \\
+        \\}},
+        \\"generated_quant_routes":{s},
+        \\"metal_generated_quant":{d},
+        \\"metal_generated_quant_family_count":{d},
+        \\"metal_generated_quant_top_family":{f},
+        \\"metal_generated_quant_top_count":{d},
+        \\"jit_exact_dispatch":{{
+        \\"q4_0":{d},
+        \\"q4_k":{d}
+        \\}}
+    ,
+        .{
+            generated_route_json,
+            generated_quant.generatedTotal(),
+            generated_quant.nonzeroFamilyCount(),
+            std.json.fmt(generated_quant_top.name, .{}),
+            generated_quant_top.count,
+            provider.metal_runtime_jit_exact_q4_0_hits,
+            provider.metal_runtime_jit_exact_q4_k_hits,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"quant_kernel_plan":{{
+        \\"planned":{d},
+        \\"handwritten_production":{d},
+        \\"generated_production":{d},
+        \\"unsupported_routes":{d},
+        \\"fast_path_misses":{d},
+        \\"generated_candidates":{d},
+        \\"generated_artifact_missing":{d},
+        \\"generated_runtime_not_wired":{d},
+        \\"unsupported":{d},
+        \\"unsupported_format":{d},
+        \\"unsupported_shape":{d},
+        \\"unsupported_epilogue":{d},
+        \\"unsupported_backend":{d},
+        \\"tensor_core_repack_required":{d},
+        \\"top_fallback_reason":{f},
+        \\"top_fallback_count":{d}
+        \\}}
+    ,
+        .{
+            plan_stats.quant_kernel_planned_ops,
+            plan_stats.quant_kernel_handwritten_production,
+            plan_stats.quant_kernel_generated_production,
+            plan_stats.quant_kernel_unsupported_routes,
+            fast_path_misses,
+            plan_stats.quant_kernel_generated_candidates,
+            plan_stats.quant_kernel_fallback_generated_artifact_missing,
+            plan_stats.quant_kernel_fallback_generated_runtime_not_wired,
+            plan_stats.quant_kernel_fallback_unsupported,
+            plan_stats.quant_kernel_fallback_unsupported_format,
+            plan_stats.quant_kernel_fallback_unsupported_shape,
+            plan_stats.quant_kernel_fallback_unsupported_epilogue,
+            plan_stats.quant_kernel_fallback_unsupported_backend,
+            plan_stats.quant_kernel_fallback_tensor_core_repack_required,
+            std.json.fmt(top_fallback.name, .{}),
+            top_fallback.count,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"frame_fallbacks":{{
+        \\"decode_attempts":{d},
+        \\"decode_success":{d},
+        \\"decode_disabled":{d},
+        \\"decode_scratch_fail":{d},
+        \\"decode_fallback":{d},
+        \\"decode_batch":{d},
+        \\"decode_initial":{d},
+        \\"decode_layer":{d},
+        \\"decode_tail":{d},
+        \\"prefill_plan":{d},
+        \\"prefill_plan_attempts":{d},
+        \\"prefill_plan_fail":{d},
+        \\"prefill_execute":{d},
+        \\"prefill_execute_attempts":{d},
+        \\"prefill_execute_fail":{d},
+        \\"prefill_missing_ple":{d}
+        \\}}
+    ,
+        .{
+            provider.active_decode_frame_attempts,
+            provider.active_decode_frame_successes,
+            provider.active_decode_frame_disabled,
+            provider.active_decode_frame_scratch_failures,
+            provider.active_decode_frame_fallbacks,
+            provider.active_decode_frame_batch_fallbacks,
+            provider.active_decode_frame_initial_tensor_fallbacks,
+            provider.active_decode_frame_layer_fallbacks,
+            provider.active_decode_frame_tail_fallbacks,
+            provider.prefill_frame_plan_successes,
+            provider.prefill_frame_plan_attempts,
+            provider.prefill_frame_plan_failures,
+            provider.prefill_frame_execute_successes,
+            provider.prefill_frame_execute_attempts,
+            provider.prefill_frame_execute_failures,
+            provider.prefill_frame_execute_missing_ple,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"residency":{{
+        \\"quantized_slots":{d},
+        \\"quantized_prepared_bytes":{d},
+        \\"runtime_prepared_slots":{d},
+        \\"runtime_prepared_bytes":{d},
+        \\"runtime_private_slots":{d},
+        \\"runtime_private_bytes":{d},
+        \\"runtime_mapped_slots":{d},
+        \\"runtime_mapped_bytes":{d},
+        \\"runtime_mapped_attempts":{d},
+        \\"runtime_mapped_fallbacks":{d},
+        \\"runtime_mapped_failures":{d},
+        \\"active_frame_bootstrap_misses":{d},
+        \\"misses":{d}
+        \\}}
+        \\}}
+    ,
+        .{
+            provider.metal_provider_quantized_slots,
+            provider.metal_provider_quantized_prepared_bytes,
+            provider.metal_provider_quantized_runtime_prepared_slots,
+            provider.metal_provider_quantized_runtime_prepared_bytes,
+            provider.metal_provider_quantized_runtime_private_slots,
+            provider.metal_provider_quantized_runtime_private_bytes,
+            provider.metal_provider_quantized_runtime_mapped_slots,
+            provider.metal_provider_quantized_runtime_mapped_bytes,
+            provider.metal_provider_quantized_runtime_mapped_attempts,
+            provider.metal_provider_quantized_runtime_mapped_fallbacks,
+            provider.metal_provider_quantized_runtime_mapped_failures,
+            provider.compressed_block_active_frame_bootstrap_misses,
+            metalResidencyMisses(provider),
+        },
+    );
+    return try out.toOwnedSlice(allocator);
+}
+
+fn metalResidencyMisses(provider: ops.NativeQuantTimingStats) u64 {
+    return provider.metal_provider_quantized_runtime_mapped_fallbacks +|
+        provider.metal_provider_quantized_runtime_mapped_failures +|
+        provider.compressed_block_active_frame_bootstrap_misses;
+}
+
+fn metalStatsWithRuntimePlanCounters(
+    graph_stats: graph_mod.executor_stats.ExecutionStats,
+    provider: ops.NativeQuantTimingStats,
+) graph_mod.executor_stats.ExecutionStats {
+    if (graph_stats.quant_kernel_planned_ops != 0) return graph_stats;
+    var stats = graph_stats;
+
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_1, .q8_0, .rows_1, .none, .mmv);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, saturatingSub(provider.metal_runtime_q8_0_linear_rows_2_8, quant_matmul.generatedQuantDispatchCount(&provider.metal_runtime_antfly_generated_dispatch_counts, .q8_0, .none)), .q8_0, .rows_2_8, .none, .small_batch);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_9_64, .q8_0, .rows_9_64, .none, .mm);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_65_plus, .q8_0, .rows_65_plus, .none, .mm);
+
+    const q4_0_linear_reduce_rows = provider.metal_runtime_q4_0_linear_reduce_rows_1 +
+        provider.metal_runtime_q4_0_linear_reduce_rows_2_8 +
+        provider.metal_runtime_q4_0_linear_reduce_rows_9_64 +
+        provider.metal_runtime_q4_0_linear_reduce_rows_65_plus;
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_rows_1, .q4_0, .rows_1, .none, .mmv);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_rows_2_8, .q4_0, .rows_2_8, .none, .small_batch);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_rows_9_64, .q4_0, .rows_9_64, .none, .mm);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_rows_65_plus, .q4_0, .rows_65_plus, .none, .mm);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, saturatingSub(provider.metal_runtime_q4_0_linear_reduce, q4_0_linear_reduce_rows));
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_f16_input);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_f16_input_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_sumsq);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_pair);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_pair_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_pair_activation_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_pair_activation_reduce_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_pair_activation_rms_scale_reduce_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_activation_rhs_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_activation_rhs_reduce_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_ple_linear_reduce_f16_input);
+
+    const q4_k_linear_reduce_rows = provider.metal_runtime_q4_k_linear_reduce_rows_1 +
+        provider.metal_runtime_q4_k_linear_reduce_rows_2_8 +
+        provider.metal_runtime_q4_k_linear_reduce_rows_9_64 +
+        provider.metal_runtime_q4_k_linear_reduce_rows_65_plus;
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_linear_reduce_rows_1, .q4_k, .rows_1, .none, .mmv);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_linear_reduce_rows_2_8, .q4_k, .rows_2_8, .none, .small_batch);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_linear_reduce_rows_9_64, .q4_k, .rows_9_64, .none, .mm);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_linear_reduce_rows_65_plus, .q4_k, .rows_65_plus, .none, .mm);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, saturatingSub(provider.metal_runtime_q4_k_linear_reduce, q4_k_linear_reduce_rows));
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_pair_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_pair_activation_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_pair_activation_reduce_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_activation_rhs_reduce);
+
+    const q6_k_linear_reduce_rows = provider.metal_runtime_q6_k_linear_reduce_rows_1 +
+        provider.metal_runtime_q6_k_linear_reduce_rows_2_8 +
+        provider.metal_runtime_q6_k_linear_reduce_rows_9_64 +
+        provider.metal_runtime_q6_k_linear_reduce_rows_65_plus;
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce_rows_1, .q6_k, .rows_1, .none, .mmv);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce_rows_2_8, .q6_k, .rows_2_8, .none, .small_batch);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce_rows_9_64, .q6_k, .rows_9_64, .none, .mm);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce_rows_65_plus, .q6_k, .rows_65_plus, .none, .mm);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, saturatingSub(provider.metal_runtime_q6_k_linear_reduce, q6_k_linear_reduce_rows));
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce_f16_input);
+
+    inline for (quant_matmul.generated_quant_counter_names) |counter| {
+        addMetalRuntimeGeneratedPlanCounter(
+            &stats,
+            quant_matmul.generatedQuantDispatchCount(&provider.metal_runtime_antfly_generated_dispatch_counts, counter.format, counter.epilogue),
+            @field(quant_matmul.Format, @tagName(counter.format)),
+            @field(graph_mod.quant_kernel_compiler.Epilogue, @tagName(counter.epilogue)),
+        );
+    }
+    return stats;
+}
+
+fn addMetalRuntimeHandwrittenPlanCounter(
+    stats: *graph_mod.executor_stats.ExecutionStats,
+    count: u64,
+) void {
+    if (count == 0) return;
+    stats.quant_kernel_planned_ops += count;
+    stats.quant_kernel_handwritten_production += count;
+}
+
+fn addMetalRuntimeObservedHandwrittenPlanCounter(
+    stats: *graph_mod.executor_stats.ExecutionStats,
+    count: u64,
+    format: quant_matmul.Format,
+    row_bucket: quant_matmul.RowBucket,
+    epilogue: graph_mod.quant_kernel_compiler.Epilogue,
+    dispatch: quant_matmul.DispatchKind,
+) void {
+    if (count == 0) return;
+    const lowering = graph_mod.quant_kernel_compiler.registryLoweringFor(.metal, format, row_bucket, epilogue, dispatch);
+    stats.quant_kernel_planned_ops += count;
+    stats.quant_kernel_handwritten_production += count;
+    if (lowering.candidate_route == .generated_dev_candidate) {
+        stats.quant_kernel_generated_candidates += count;
+    }
+}
+
+fn saturatingSub(lhs: u64, rhs: u64) u64 {
+    return if (lhs > rhs) lhs - rhs else 0;
+}
+
+fn addMetalRuntimeGeneratedPlanCounter(
+    stats: *graph_mod.executor_stats.ExecutionStats,
+    count: u64,
+    format: quant_matmul.Format,
+    epilogue: graph_mod.quant_kernel_compiler.Epilogue,
+) void {
+    if (count == 0) return;
+    const lowering = graph_mod.quant_kernel_compiler.registryLoweringFor(.metal, format, .rows_2_8, epilogue, .small_batch);
+    stats.quant_kernel_planned_ops += count;
+    switch (lowering.production_route) {
+        .generated_production => stats.quant_kernel_generated_production += count,
+        else => if (lowering.candidate_route == .generated_dev_candidate) {
+            stats.quant_kernel_generated_candidates += count;
+        } else {
+            stats.quant_kernel_unsupported_routes += count;
+        },
+    }
+}
+
 fn writeJsonTiming(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2628,6 +3831,8 @@ fn writeJsonTiming(
     decode_setup_ms: u64,
     generate_ms: u64,
     total_ms: u64,
+    metal_stats_opt: ?ops.BackendDebugTimingSnapshot,
+    graph_stats: graph_mod.executor_stats.ExecutionStats,
     cuda_stats_opt: ?session_factory.CudaRuntimeStats,
     cuda_generate_stats_opt: ?session_factory.CudaRuntimeStats,
     draft_cuda_stats_opt: ?session_factory.CudaRuntimeStats,
@@ -2697,6 +3902,8 @@ fn writeJsonTiming(
             \\"materialization_hidden_only_fallbacks":{d},
             \\"correction_materializations":{d},
             \\"bonus_materializations":{d},
+            \\"deferred_materializations":{d},
+            \\"pending_flushes":{d},
             \\"bonus_skips":{d},
             \\"fallback_calls":{d},
             \\"draft_embedding_cache_hits":{d},
@@ -2730,6 +3937,8 @@ fn writeJsonTiming(
                 profile.materialization_hidden_only_fallbacks,
                 profile.correction_materializations,
                 profile.bonus_materializations,
+                profile.deferred_materializations,
+                profile.pending_flushes,
                 profile.bonus_skips,
                 profile.fallback_calls,
                 profile.draft_embedding_cache_hits,
@@ -2819,6 +4028,8 @@ fn writeJsonTiming(
         );
     } else try allocator.dupe(u8, "null");
     defer allocator.free(speculative_json);
+    const metal_json = try metalStatsCompactJson(allocator, metal_stats_opt, graph_stats);
+    defer allocator.free(metal_json);
     const cuda_json = if (comptime build_options.enable_cuda) blk: {
         if (cuda_stats_opt) |cuda_stats| {
             var cuda_out = std.ArrayListUnmanaged(u8).empty;
@@ -2899,6 +4110,10 @@ fn writeJsonTiming(
                 \\"graph_capture_scalar_updates":{d},
                 \\"graph_capture_persistent_replays":{d},
                 \\"graph_capture_capacity_skips":{d},
+                \\"temp_arena_plan_observations":{d},
+                \\"temp_arena_plan_activations":{d},
+                \\"temp_arena_plan_invalidations":{d},
+                \\"temp_arena_plan_slots":{d},
                 \\
             ,
                 .{
@@ -2922,6 +4137,10 @@ fn writeJsonTiming(
                     cuda_stats.cuda_graph_capture_scalar_updates,
                     cuda_stats.cuda_graph_capture_persistent_replays,
                     cuda_stats.cuda_graph_capture_capacity_skips,
+                    cuda_stats.cuda_temp_arena_plan_observations,
+                    cuda_stats.cuda_temp_arena_plan_activations,
+                    cuda_stats.cuda_temp_arena_plan_invalidations,
+                    cuda_stats.cuda_temp_arena_plan_slots,
                 },
             );
             try appendFmt(
@@ -2934,6 +4153,17 @@ fn writeJsonTiming(
                 \\"launch_rope":{d},
                 \\"launch_attention":{d},
                 \\"launch_attention_gqa_decode":{d},
+                \\"launch_attention_gqa_decode_generated":{d},
+                \\"launch_attention_gqa_decode_score_prework":{d},
+                \\"launch_attention_gqa_decode_score_prework_serial":{d},
+                \\"launch_attention_gqa_decode_score_prework_serial_hd256":{d},
+                \\"launch_attention_gqa_decode_score_prework_serial_hd512":{d},
+                \\"launch_attention_gqa_decode_score_prework_tiled64":{d},
+                \\"launch_attention_gqa_decode_score_prework_tiled64_hd256":{d},
+                \\"launch_attention_gqa_decode_score_prework_tiled64_hd512":{d},
+                \\"launch_attention_gqa_decode_score_prework_tiled64_fallbacks":{d},
+                \\"launch_attention_gqa_decode_score_prework_tiled64_forbidden_routes":{d},
+                \\"launch_attention_gqa_decode_score_prework_tiled64_symbol_fallbacks":{d},
                 \\"launch_attention_gqa_decode_fast":{d},
                 \\"launch_attention_gqa_decode_fast_fallbacks":{d},
                 \\"launch_attention_gqa_prefill_fast":{d},
@@ -2954,6 +4184,17 @@ fn writeJsonTiming(
                     cuda_stats.launch_rope,
                     cuda_stats.launch_attention,
                     cuda_stats.launch_attention_gqa_decode,
+                    cuda_stats.launch_attention_gqa_decode_generated,
+                    cuda_stats.launch_attention_gqa_decode_score_prework,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_serial,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_serial_hd256,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_serial_hd512,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_tiled64,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_hd256,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_hd512,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_forbidden_routes,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_symbol_fallbacks,
                     cuda_stats.launch_attention_gqa_decode_fast,
                     cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
                     cuda_stats.launch_attention_gqa_prefill_fast,
@@ -2964,6 +4205,86 @@ fn writeJsonTiming(
                     cuda_stats.launch_elementwise,
                     cuda_stats.launch_scalar,
                     cuda_stats.launch_argmax,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"launch_attention_gqa_decode_splitk_online_sm89":{d},
+                \\"launch_attention_gqa_decode_splitk_online_sm89_hd256":{d},
+                \\"launch_attention_gqa_decode_splitk_online_sm89_hd512":{d},
+                \\"launch_attention_gqa_decode_splitk_online_sm89_fallbacks":{d},
+                \\"launch_attention_gqa_decode_splitk_online_sm89_ineligible_fallbacks":{d},
+                \\"launch_attention_gqa_decode_splitk_online_sm89_symbol_fallbacks":{d},
+                \\"launch_attention_gqa_decode_splitk_online_sm89_forbidden_routes":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89,
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_hd256,
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_hd512,
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_fallbacks,
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_ineligible_fallbacks,
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_symbol_fallbacks,
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_forbidden_routes,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"launch_attention_gqa_prefill_tiled_f16_exact":{d},
+                \\"launch_attention_gqa_prefill_tiled_f16_exact_hd256":{d},
+                \\"launch_attention_gqa_prefill_tiled_f16_exact_hd512":{d},
+                \\"launch_attention_gqa_prefill_tiled_f16_warp":{d},
+                \\"launch_attention_gqa_prefill_tiled_f16_warp_hd256":{d},
+                \\"launch_attention_gqa_prefill_tiled_f16_warp_hd512":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_hd256_q512":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_hd256_q3":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_hd512_q512":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_hd512_q3":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_fallbacks":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_ineligible_fallbacks":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_symbol_fallbacks":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q512":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q3":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q512":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q3":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.launch_attention_gqa_prefill_tiled_f16_exact,
+                    cuda_stats.launch_attention_gqa_prefill_tiled_f16_exact_hd256,
+                    cuda_stats.launch_attention_gqa_prefill_tiled_f16_exact_hd512,
+                    cuda_stats.launch_attention_gqa_prefill_tiled_f16_warp,
+                    cuda_stats.launch_attention_gqa_prefill_tiled_f16_warp_hd256,
+                    cuda_stats.launch_attention_gqa_prefill_tiled_f16_warp_hd512,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q512,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q3,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q512,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q3,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallbacks,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_ineligible_fallbacks,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_symbol_fallbacks,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q512,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q3,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q512,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q3,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"ple_gate_prefill_bf16_mirror_first_hits":{d},
+                \\"ple_gate_prefill_bf16_mirror_first_ineligible":{d},
+                \\"ple_gate_decode_q4_fused_preserved":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.ple_gate_prefill_bf16_mirror_first_hits,
+                    cuda_stats.ple_gate_prefill_bf16_mirror_first_ineligible,
+                    cuda_stats.ple_gate_decode_q4_fused_preserved,
                 },
             );
             try appendFmt(
@@ -2990,6 +4311,7 @@ fn writeJsonTiming(
                 \\"qkv_fused_q4":{d},
                 \\"qkv_fused_q4_q4_f32":{d},
                 \\"qkv_fused_f32":{d},
+                \\"qkv_fused_f16":{d},
                 \\"qkv_fallback_unsupported":{d},
                 \\"qkv_kernel_unavailable":{d},
                 \\"linear_pair_fused_q8":{d},
@@ -3023,6 +4345,7 @@ fn writeJsonTiming(
                     cuda_stats.qkv_fused_q4,
                     cuda_stats.qkv_fused_q4_q4_f32,
                     cuda_stats.qkv_fused_f32,
+                    cuda_stats.qkv_fused_f16,
                     cuda_stats.qkv_fallback_unsupported,
                     cuda_stats.qkv_kernel_unavailable,
                     cuda_stats.linear_pair_fused_q8,
@@ -3097,16 +4420,116 @@ fn writeJsonTiming(
                 &cuda_out,
                 \\"lm_head_argmax_fused_q8":{d},
                 \\"lm_head_argmax_fused_q4_0":{d},
+                \\"lm_head_argmax_fused_q4_0_q8_1":{d},
+                \\"lm_head_argmax_q4_0_q8_1_fallbacks":{d},
                 \\"lm_head_argmax_fused_q4":{d},
                 \\"lm_head_argmax_fused_q6":{d},
+                \\"lm_head_argmax_generated_q6_k_q8_1_hits":{d},
+                \\"lm_head_argmax_generated_q6_k_q8_1_fallbacks":{d},
                 \\"lm_head_argmax_fallbacks":{d},
                 \\"q4k_decode_fast_hits":{d},
                 \\"q4k_decode_fast_fallbacks":{d},
+                \\"q4_0_generated_mmv_hits":{d},
+                \\"q4_0_generated_mmv_fallbacks":{d},
+                \\"q4_0_generated_mm_hits":{d},
+                \\"q4_0_generated_mm_fallbacks":{d},
+                \\"q4_0_generated_pair_hits":{d},
+                \\"q4_0_generated_pair_fallbacks":{d},
+                \\"q4_0_generated_pair_q8_hits":{d},
+                \\"q4_0_generated_pair_q8_fallbacks":{d},
+                \\"q4_0_generated_down_q8_hits":{d},
+                \\"q4_0_generated_down_q8_fallbacks":{d},
+                \\"q4_0_generated_e2b_pair_q8_hits":{d},
+                \\"q4_0_generated_e2b_pair_q8_fallbacks":{d},
+                \\"q4_0_generated_e2b_down_q8_hits":{d},
+                \\"q4_0_generated_e2b_down_q8_fallbacks":{d},
+                \\"q4_0_generated_e2b_pair_only_hits":{d},
+                \\"q4_0_generated_e2b_pair_only_fallbacks":{d},
+                \\"q4_0_generated_e2b_exact_pair_f32_hits":{d},
+                \\"q4_0_generated_e2b_exact_pair_f32_fallbacks":{d},
+                \\"q4_0_generated_e2b_exact_down_f32_hits":{d},
+                \\"q4_0_generated_e2b_exact_down_f32_fallbacks":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.lm_head_argmax_fused_q8,
+                    cuda_stats.lm_head_argmax_fused_q4_0,
+                    cuda_stats.lm_head_argmax_fused_q4_0_q8_1,
+                    cuda_stats.lm_head_argmax_q4_0_q8_1_fallbacks,
+                    cuda_stats.lm_head_argmax_fused_q4,
+                    cuda_stats.lm_head_argmax_fused_q6,
+                    cuda_stats.lm_head_argmax_generated_q6_k_q8_1_hits,
+                    cuda_stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks,
+                    cuda_stats.lm_head_argmax_fallbacks,
+                    cuda_stats.q4k_decode_fast_hits,
+                    cuda_stats.q4k_decode_fast_fallbacks,
+                    cuda_stats.q4_0_generated_mmv_hits,
+                    cuda_stats.q4_0_generated_mmv_fallbacks,
+                    cuda_stats.q4_0_generated_mm_hits,
+                    cuda_stats.q4_0_generated_mm_fallbacks,
+                    cuda_stats.q4_0_generated_pair_hits,
+                    cuda_stats.q4_0_generated_pair_fallbacks,
+                    cuda_stats.q4_0_generated_pair_q8_hits,
+                    cuda_stats.q4_0_generated_pair_q8_fallbacks,
+                    cuda_stats.q4_0_generated_down_q8_hits,
+                    cuda_stats.q4_0_generated_down_q8_fallbacks,
+                    cuda_stats.q4_0_generated_e2b_pair_q8_hits,
+                    cuda_stats.q4_0_generated_e2b_pair_q8_fallbacks,
+                    cuda_stats.q4_0_generated_e2b_down_q8_hits,
+                    cuda_stats.q4_0_generated_e2b_down_q8_fallbacks,
+                    cuda_stats.q4_0_generated_e2b_pair_only_hits,
+                    cuda_stats.q4_0_generated_e2b_pair_only_fallbacks,
+                    cuda_stats.q4_0_generated_e2b_exact_pair_f32_hits,
+                    cuda_stats.q4_0_generated_e2b_exact_pair_f32_fallbacks,
+                    cuda_stats.q4_0_generated_e2b_exact_down_f32_hits,
+                    cuda_stats.q4_0_generated_e2b_exact_down_f32_fallbacks,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"q4_0_ggml_q8_1_e2b_ffn_hits":{d},
+                \\"q4_0_ggml_q8_1_e2b_ffn_fallbacks":{d},
+                \\"q4_0_ggml_q8_1_quantize_fallbacks":{d},
+                \\"q4_0_ggml_q8_1_pair_fallbacks":{d},
+                \\"q4_0_ggml_q8_1_down_fallbacks":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.q4_0_ggml_q8_1_e2b_ffn_hits,
+                    cuda_stats.q4_0_ggml_q8_1_e2b_ffn_fallbacks,
+                    cuda_stats.q4_0_ggml_q8_1_quantize_fallbacks,
+                    cuda_stats.q4_0_ggml_q8_1_pair_fallbacks,
+                    cuda_stats.q4_0_ggml_q8_1_down_fallbacks,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"generated_kernel_catalog_resolve_attempts":{d},
+                \\"generated_kernel_catalog_resolve_misses":{d},
+                \\"generated_kernel_catalog_hits":{d},
+                \\"generated_kernel_catalog_fallbacks":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.generated_kernel_catalog_resolve_attempts,
+                    cuda_stats.generated_kernel_catalog_resolve_misses,
+                    cuda_stats.generated_kernel_catalog_hits,
+                    cuda_stats.generated_kernel_catalog_fallbacks,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
                 \\"bf16_cublaslt_linear_calls":{d},
                 \\"bf16_cublaslt_qkv_calls":{d},
                 \\"bf16_cublaslt_activation_staging_calls":{d},
                 \\"bf16_cublaslt_activation_mirror_hits":{d},
                 \\"bf16_cublaslt_fallbacks":{d},
+                \\"bf16_cublaslt_tuning_tuned_calls":{d},
+                \\"bf16_cublaslt_tuning_heuristic_calls":{d},
+                \\"bf16_cublaslt_tuning_api_fallbacks":{d},
                 \\"bf16_scalar_linear_calls":{d},
                 \\"bf16_scalar_qkv_calls":{d},
                 \\"rms_norm_bf16_mirror_hits":{d},
@@ -3117,18 +4540,14 @@ fn writeJsonTiming(
                 \\
             ,
                 .{
-                    cuda_stats.lm_head_argmax_fused_q8,
-                    cuda_stats.lm_head_argmax_fused_q4_0,
-                    cuda_stats.lm_head_argmax_fused_q4,
-                    cuda_stats.lm_head_argmax_fused_q6,
-                    cuda_stats.lm_head_argmax_fallbacks,
-                    cuda_stats.q4k_decode_fast_hits,
-                    cuda_stats.q4k_decode_fast_fallbacks,
                     cuda_stats.bf16_cublaslt_linear_calls,
                     cuda_stats.bf16_cublaslt_qkv_calls,
                     cuda_stats.bf16_cublaslt_activation_staging_calls,
                     cuda_stats.bf16_cublaslt_activation_mirror_hits,
                     cuda_stats.bf16_cublaslt_fallbacks,
+                    cuda_stats.bf16_cublaslt_tuning_tuned_calls,
+                    cuda_stats.bf16_cublaslt_tuning_heuristic_calls,
+                    cuda_stats.bf16_cublaslt_tuning_api_fallbacks,
                     cuda_stats.bf16_scalar_linear_calls,
                     cuda_stats.bf16_scalar_qkv_calls,
                     cuda_stats.rms_norm_bf16_mirror_hits,
@@ -3437,6 +4856,10 @@ fn writeJsonTiming(
                 \\"graph_capture_scalar_updates":{d},
                 \\"graph_capture_persistent_replays":{d},
                 \\"graph_capture_capacity_skips":{d},
+                \\"temp_arena_plan_observations":{d},
+                \\"temp_arena_plan_activations":{d},
+                \\"temp_arena_plan_invalidations":{d},
+                \\"temp_arena_plan_slots":{d},
                 \\"launch_linear":{d},
                 \\"launch_linear_qkv":{d},
                 \\
@@ -3452,6 +4875,10 @@ fn writeJsonTiming(
                     cuda_stats.cuda_graph_capture_scalar_updates,
                     cuda_stats.cuda_graph_capture_persistent_replays,
                     cuda_stats.cuda_graph_capture_capacity_skips,
+                    cuda_stats.cuda_temp_arena_plan_observations,
+                    cuda_stats.cuda_temp_arena_plan_activations,
+                    cuda_stats.cuda_temp_arena_plan_invalidations,
+                    cuda_stats.cuda_temp_arena_plan_slots,
                     cuda_stats.launch_linear,
                     cuda_stats.launch_linear_qkv,
                 },
@@ -3564,6 +4991,17 @@ fn writeJsonTiming(
                 \\"launch_norm_head_rope":{d},
                 \\"launch_attention":{d},
                 \\"launch_attention_gqa_decode":{d},
+                \\"launch_attention_gqa_decode_generated":{d},
+                \\"launch_attention_gqa_decode_score_prework":{d},
+                \\"launch_attention_gqa_decode_score_prework_serial":{d},
+                \\"launch_attention_gqa_decode_score_prework_serial_hd256":{d},
+                \\"launch_attention_gqa_decode_score_prework_serial_hd512":{d},
+                \\"launch_attention_gqa_decode_score_prework_tiled64":{d},
+                \\"launch_attention_gqa_decode_score_prework_tiled64_hd256":{d},
+                \\"launch_attention_gqa_decode_score_prework_tiled64_hd512":{d},
+                \\"launch_attention_gqa_decode_score_prework_tiled64_fallbacks":{d},
+                \\"launch_attention_gqa_decode_score_prework_tiled64_forbidden_routes":{d},
+                \\"launch_attention_gqa_decode_score_prework_tiled64_symbol_fallbacks":{d},
                 \\"launch_attention_gqa_decode_fast":{d},
                 \\"launch_attention_gqa_decode_fast_fallbacks":{d},
                 \\"launch_attention_gqa_prefill_fast":{d},
@@ -3574,15 +5012,6 @@ fn writeJsonTiming(
                 \\"launch_elementwise":{d},
                 \\"launch_scalar":{d},
                 \\"launch_argmax":{d},
-                \\"lm_head_argmax_fused_q8":{d},
-                \\"lm_head_argmax_fused_q4_0":{d},
-                \\"lm_head_argmax_fused_q4":{d},
-                \\"lm_head_argmax_fused_q6":{d},
-                \\"lm_head_argmax_fallbacks":{d},
-                \\"mtp_verify_commit_device_hits":{d},
-                \\"mtp_verify_commit_device_fallbacks":{d},
-                \\"mtp_verify_commit_result_downloads":{d},
-                \\"mtp_verify_commit_choice_downloads":{d},
                 \\
             ,
                 .{
@@ -3597,6 +5026,17 @@ fn writeJsonTiming(
                     cuda_stats.launch_norm_head_rope,
                     cuda_stats.launch_attention,
                     cuda_stats.launch_attention_gqa_decode,
+                    cuda_stats.launch_attention_gqa_decode_generated,
+                    cuda_stats.launch_attention_gqa_decode_score_prework,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_serial,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_serial_hd256,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_serial_hd512,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_tiled64,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_hd256,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_hd512,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_forbidden_routes,
+                    cuda_stats.launch_attention_gqa_decode_score_prework_tiled64_symbol_fallbacks,
                     cuda_stats.launch_attention_gqa_decode_fast,
                     cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
                     cuda_stats.launch_attention_gqa_prefill_fast,
@@ -3607,15 +5047,120 @@ fn writeJsonTiming(
                     cuda_stats.launch_elementwise,
                     cuda_stats.launch_scalar,
                     cuda_stats.launch_argmax,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"launch_attention_gqa_decode_splitk_online_sm89":{d},
+                \\"launch_attention_gqa_decode_splitk_online_sm89_hd256":{d},
+                \\"launch_attention_gqa_decode_splitk_online_sm89_hd512":{d},
+                \\"launch_attention_gqa_decode_splitk_online_sm89_fallbacks":{d},
+                \\"launch_attention_gqa_decode_splitk_online_sm89_ineligible_fallbacks":{d},
+                \\"launch_attention_gqa_decode_splitk_online_sm89_symbol_fallbacks":{d},
+                \\"launch_attention_gqa_decode_splitk_online_sm89_forbidden_routes":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89,
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_hd256,
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_hd512,
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_fallbacks,
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_ineligible_fallbacks,
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_symbol_fallbacks,
+                    cuda_stats.launch_attention_gqa_decode_splitk_online_sm89_forbidden_routes,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"launch_attention_gqa_prefill_tiled_f16_exact":{d},
+                \\"launch_attention_gqa_prefill_tiled_f16_exact_hd256":{d},
+                \\"launch_attention_gqa_prefill_tiled_f16_exact_hd512":{d},
+                \\"launch_attention_gqa_prefill_tiled_f16_warp":{d},
+                \\"launch_attention_gqa_prefill_tiled_f16_warp_hd256":{d},
+                \\"launch_attention_gqa_prefill_tiled_f16_warp_hd512":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_hd256_q512":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_hd256_q3":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_hd512_q512":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_hd512_q3":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_fallbacks":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_ineligible_fallbacks":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_symbol_fallbacks":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q512":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q3":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q512":{d},
+                \\"launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q3":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.launch_attention_gqa_prefill_tiled_f16_exact,
+                    cuda_stats.launch_attention_gqa_prefill_tiled_f16_exact_hd256,
+                    cuda_stats.launch_attention_gqa_prefill_tiled_f16_exact_hd512,
+                    cuda_stats.launch_attention_gqa_prefill_tiled_f16_warp,
+                    cuda_stats.launch_attention_gqa_prefill_tiled_f16_warp_hd256,
+                    cuda_stats.launch_attention_gqa_prefill_tiled_f16_warp_hd512,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q512,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q3,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q512,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q3,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallbacks,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_ineligible_fallbacks,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_symbol_fallbacks,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q512,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q3,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q512,
+                    cuda_stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q3,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"lm_head_argmax_fused_q8":{d},
+                \\"lm_head_argmax_fused_q4_0":{d},
+                \\"lm_head_argmax_fused_q4_0_q8_1":{d},
+                \\"lm_head_argmax_q4_0_q8_1_fallbacks":{d},
+                \\"lm_head_argmax_fused_q4":{d},
+                \\"lm_head_argmax_fused_q6":{d},
+                \\"lm_head_argmax_generated_q6_k_q8_1_hits":{d},
+                \\"lm_head_argmax_generated_q6_k_q8_1_fallbacks":{d},
+                \\"lm_head_argmax_fallbacks":{d},
+                \\"mtp_verify_commit_device_hits":{d},
+                \\"mtp_verify_commit_device_fallbacks":{d},
+                \\"mtp_verify_commit_result_downloads":{d},
+                \\"mtp_verify_commit_choice_downloads":{d},
+                \\
+            ,
+                .{
                     cuda_stats.lm_head_argmax_fused_q8,
                     cuda_stats.lm_head_argmax_fused_q4_0,
+                    cuda_stats.lm_head_argmax_fused_q4_0_q8_1,
+                    cuda_stats.lm_head_argmax_q4_0_q8_1_fallbacks,
                     cuda_stats.lm_head_argmax_fused_q4,
                     cuda_stats.lm_head_argmax_fused_q6,
+                    cuda_stats.lm_head_argmax_generated_q6_k_q8_1_hits,
+                    cuda_stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks,
                     cuda_stats.lm_head_argmax_fallbacks,
                     cuda_stats.mtp_verify_commit_device_hits,
                     cuda_stats.mtp_verify_commit_device_fallbacks,
                     cuda_stats.mtp_verify_commit_result_downloads,
                     cuda_stats.mtp_verify_commit_choice_downloads,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"ple_gate_prefill_bf16_mirror_first_hits":{d},
+                \\"ple_gate_prefill_bf16_mirror_first_ineligible":{d},
+                \\"ple_gate_decode_q4_fused_preserved":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.ple_gate_prefill_bf16_mirror_first_hits,
+                    cuda_stats.ple_gate_prefill_bf16_mirror_first_ineligible,
+                    cuda_stats.ple_gate_decode_q4_fused_preserved,
                 },
             );
             try appendFmt(
@@ -3763,6 +5308,7 @@ fn writeJsonTiming(
         \\"runtime":{s},
         \\"generation_decoder_runtime":{s},
         \\"speculative":{s},
+        \\"metal":{s},
         \\"cuda":{s},
         \\"cuda_generate":{s},
         \\"draft_cuda":{s},
@@ -3794,6 +5340,7 @@ fn writeJsonTiming(
             runtime_json,
             generation_decoder_runtime_json,
             speculative_json,
+            metal_json,
             cuda_json,
             cuda_generate_json,
             draft_cuda_json,
@@ -3882,7 +5429,37 @@ fn printGpuHostedTimingDetails(cb_opt: ?*const ops.ComputeBackend) void {
     );
 }
 
-fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot) void {
+fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot, plan_stats: graph_mod.executor_stats.ExecutionStats) void {
+    const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(plan_stats);
+    const fast_path_misses = graph_mod.executor_stats.quantKernelFastPathMisses(plan_stats);
+    print(
+        "metal_quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} fast_path_misses={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d} top_fallback_reason={s} top_fallback_count={d}\n",
+        .{
+            plan_stats.quant_kernel_planned_ops,
+            plan_stats.quant_kernel_handwritten_production,
+            plan_stats.quant_kernel_generated_production,
+            plan_stats.quant_kernel_unsupported_routes,
+            fast_path_misses,
+            plan_stats.quant_kernel_generated_candidates,
+            plan_stats.quant_kernel_fallback_generated_artifact_missing,
+            plan_stats.quant_kernel_fallback_generated_runtime_not_wired,
+            plan_stats.quant_kernel_fallback_unsupported,
+            plan_stats.quant_kernel_fallback_unsupported_format,
+            plan_stats.quant_kernel_fallback_unsupported_shape,
+            plan_stats.quant_kernel_fallback_unsupported_epilogue,
+            plan_stats.quant_kernel_fallback_unsupported_backend,
+            plan_stats.quant_kernel_fallback_tensor_core_repack_required,
+            top_fallback.name,
+            top_fallback.count,
+        },
+    );
+    print(
+        "metal_jit_exact_dispatch: q4_0={d} q4_k={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_jit_exact_q4_0_hits,
+            metal_snapshot.provider.metal_runtime_jit_exact_q4_k_hits,
+        },
+    );
     print(
         "metal_q8_0_dispatch: scalar={d} mmv={d} small_batch={d} mm={d} rows_1={d} rows_2_8={d} rows_9_64={d} rows_65_plus={d} pair_act_mm_out_f16={d} linear_mm_in_f16={d} pair_act_rms_mmv_out_f16={d} linear_mmv_in_f16={d}\n",
         .{
@@ -3901,13 +5478,33 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_attention_dispatch: paged_1x={d}\n",
-        .{metal_snapshot.provider.metal_runtime_paged_attention_1x_calls},
+        "metal_attention_dispatch: paged_1x={d} decode_gqa_split={d} generated_decode_1x={d} generated_flash_prefill={d} generated_flash_prefill_hd512={d} prefill_direct_kv={d} prefill_paged_kv={d} generated_rms_norm={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_paged_attention_1x_calls,
+            metal_snapshot.provider.metal_runtime_decode_gqa_split_calls,
+            metal_snapshot.provider.metal_runtime_generated_attention_decode_1x_calls,
+            metal_snapshot.provider.metal_runtime_generated_attention_flash_prefill_calls,
+            metal_snapshot.provider.metal_runtime_generated_attention_flash_prefill_hd512_calls,
+            metal_snapshot.provider.metal_runtime_attention_prefill_direct_kv_calls,
+            metal_snapshot.provider.metal_runtime_attention_prefill_paged_kv_calls,
+            metal_snapshot.provider.metal_runtime_generated_rms_norm_calls,
+        },
     );
     print(
-        "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
+        "metal_prepared_frame: fast_path={d} fallback={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_prepared_frame_fast_path_calls,
+            metal_snapshot.provider.metal_runtime_prepared_frame_fallback_calls,
+        },
+    );
+    print(
+        "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_rows={d}/{d}/{d}/{d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_q4_0_linear_reduce,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_rows_1,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_rows_2_8,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_rows_9_64,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_rows_65_plus,
             metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_f16_input,
             metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_f16_output,
             metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_f16_input_f16_output,
@@ -3923,22 +5520,100 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_in_f16={d}\n",
+        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_q4_k_linear_reduce,
+            metal_snapshot.provider.metal_runtime_q4_k_linear_reduce_rows_1,
+            metal_snapshot.provider.metal_runtime_q4_k_linear_reduce_rows_2_8,
+            metal_snapshot.provider.metal_runtime_q4_k_linear_reduce_rows_9_64,
+            metal_snapshot.provider.metal_runtime_q4_k_linear_reduce_rows_65_plus,
             metal_snapshot.provider.metal_runtime_q4_k_pair_reduce,
             metal_snapshot.provider.metal_runtime_q4_k_pair_activation_reduce,
             metal_snapshot.provider.metal_runtime_q4_k_pair_activation_reduce_f16_output,
             metal_snapshot.provider.metal_runtime_q4_k_activation_rhs_reduce,
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce,
+            metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_1,
+            metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_2_8,
+            metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_9_64,
+            metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_65_plus,
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_f16_input,
         },
     );
+    print(
+        "metal_q4_0_policy: mmv_nr4_nsg2={d} mmv_nr8_nsg2={d} mmv_nr4_nsg4={d} mmv_nr8_nsg4={d} mmv_variant_fallbacks={d} mm_sg_aligned={d} mm_sg_aligned_tail={d} mm_sg_unrolled={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_mmv_nr4_nsg4_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_mmv_nr8_nsg4_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_mmv_variant_fallbacks,
+            metal_snapshot.provider.metal_runtime_q4_0_mm_sg_aligned_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_mm_sg_aligned_tail_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_mm_sg_unrolled_dispatches,
+        },
+    );
+    print(
+        "metal_q4_0_pair_activation_policy: mmv_nr4_nsg2={d} mmv_nr8_nsg2={d} mmv_nr4_nsg4={d} mmv_nr8_nsg4={d} mmv_variant_fallbacks={d} mm_m32_n64_aligned={d} mm_m32_n64_tail={d} mm_m32_n32_aligned={d} mm_m32_n32_tail={d} mm_variant_fallbacks={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg2_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg2_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg4_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg4_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_variant_fallbacks,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n64_aligned_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n64_tail_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n32_aligned_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n32_tail_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mm_variant_fallbacks,
+        },
+    );
+    print("metal_generated_quant_dispatch:", .{});
+    for (quant_matmul.generated_quant_counter_names) |counter| {
+        print(" {s}={d}", .{
+            counter.name,
+            quant_matmul.generatedQuantDispatchCount(
+                &metal_snapshot.provider.metal_runtime_antfly_generated_dispatch_counts,
+                counter.format,
+                counter.epilogue,
+            ),
+        });
+    }
+    print("\n", .{});
     print(
         "metal_q4_0_ple_dispatch: activation_rhs_reduce_out_f16={d} linear_reduce_in_f16={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output,
             metal_snapshot.provider.metal_runtime_q4_0_ple_linear_reduce_f16_input,
+        },
+    );
+}
+
+fn printMetalStageTiming(provider: ops.NativeQuantTimingStats) void {
+    const stage = provider.metal_stage_timing;
+    std.debug.print(
+        "metal_stage_timing_ns: enabled={d} supported={d} complete={d} scope=runtime_frame prefill_frames={d} prefill_gpu={d} prefill_attention={d} prefill_ffn={d} prefill_ple={d} prefill_tail={d} prefill_embedding={d} prefill_other={d} decode_frames={d} decode_gpu={d} decode_attention={d} decode_ffn={d} decode_ple={d} decode_tail={d} decode_embedding={d} decode_other={d} samples={d} failures={d}\n",
+        .{
+            stage.enabled,
+            stage.supported,
+            stage.complete,
+            stage.prefill.sampled_frames,
+            stage.prefill.whole_frame_gpu_nanos,
+            stage.prefill.attention_nanos,
+            stage.prefill.ffn_nanos,
+            stage.prefill.ple_nanos,
+            stage.prefill.tail_nanos,
+            stage.prefill.embedding_nanos,
+            stage.prefill.other_nanos,
+            stage.decode.sampled_frames,
+            stage.decode.whole_frame_gpu_nanos,
+            stage.decode.attention_nanos,
+            stage.decode.ffn_nanos,
+            stage.decode.ple_nanos,
+            stage.decode.tail_nanos,
+            stage.decode.embedding_nanos,
+            stage.decode.other_nanos,
+            stage.barrier_sample_count,
+            stage.failureCount(),
         },
     );
 }
@@ -4009,11 +5684,33 @@ fn kvSlidingTrimForced() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
 }
 
+fn generationKvBackendKind(backend: backends.BackendType) ?runtime.kv.pool.BackendKind {
+    return switch (backend) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .onnx, .pjrt, .wasm => null,
+    };
+}
+
+// Promoted default: prefill residency prewarm is default-on. It is a pure
+// residency optimization guarded downstream to the CUDA backend and Gemma
+// non-MoE configs, and a failure never aborts generation. Explicit env values
+// keep overriding in both directions (the DISABLE variables and an explicit
+// `0` on either enable variable turn it off).
 fn cudaGemmaPrefillPrewarmEnabled() bool {
     if (envFlagEnabled("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
     if (envFlagEnabled("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
-    return envFlagEnabled("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM") or
-        envFlagEnabled("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM");
+    if (platform.env.getenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM")) |_| {
+        if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM", true)) return false;
+    }
+    if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM")) |_| {
+        if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", true)) return false;
+    }
+    return platform.env.getenvBoolDefault(
+        "ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM",
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", true),
+    );
 }
 
 fn prewarmCudaGemmaPrefillResidency(
@@ -4084,6 +5781,20 @@ fn liveWholeModelExecutorRequested(opts: *const Options) bool {
     };
 }
 
+fn liveWholeModelSupportsSplitSwaRing(gpt_config: gpt_mod.Config) bool {
+    return gpt_config.supportsSplitSwaGlobalKvRing();
+}
+
+fn liveWholeModelAllowsSplitSwaRing(gpt_config: gpt_mod.Config, config: generation.GenerationConfig) bool {
+    return liveWholeModelSupportsSplitSwaRing(gpt_config) and
+        !config.prompt_cache_enabled and
+        config.cache_compaction_ratio == null;
+}
+
+fn liveWholeModelShouldStopOnEos(gpt_config: gpt_mod.Config, ignore_eos: bool, token_id: i32) bool {
+    return !ignore_eos and token_id >= 0 and gpt_config.isEosToken(@intCast(token_id));
+}
+
 fn runLiveWholeModelExecutorReuseProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -4108,6 +5819,7 @@ fn runLiveWholeModelExecutorReuseProbe(
     var processed: usize = 0;
     var output_accum: ?graph_mod.model_runtime.ModelOutput = null;
     errdefer if (output_accum) |*owned| owned.deinit(allocator);
+    const allow_swa_ring = liveWholeModelSupportsSplitSwaRing(gpt_config);
     while (processed < prompt_ids.len) {
         const chunk_end = @min(prompt_ids.len, processed + @max(prefill_chunk_size, 1));
         if (output_accum) |*owned| owned.deinit(allocator);
@@ -4116,6 +5828,8 @@ fn runLiveWholeModelExecutorReuseProbe(
             .seq_len = chunk_end,
             .query_seq_len = chunk_end - processed,
             .attention_mode = .paged_prefill,
+            .max_inflight_tokens = if (allow_swa_ring) @max(prefill_chunk_size, 1) else 0,
+            .allow_swa_ring = allow_swa_ring,
             .force_host_logits = forcePrefillHostLogits(),
             .prefer_greedy_token = prefillGreedyTokenEnabled() and chunk_end == prompt_ids.len,
         });
@@ -4166,7 +5880,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
 ) !bool {
     if (!liveWholeModelExecutorRequested(opts)) return false;
     if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return false;
-    if (config.draft_model != null) return false;
+    if (config.draft_model != null or config.speculation_requested) return false;
     if (opts.image_count > 0 or opts.audio_count > 0) return false;
 
     gpt_arch.resetDebugTimingStats();
@@ -4193,7 +5907,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
         return err;
     };
     defer runtime_model.deinit();
-    if (opts.print_timing and model.session.backend().usesGpuHostedSession()) {
+    if ((opts.print_timing or opts.json_timing_path != null) and model.session.backend().usesGpuHostedSession()) {
         runtime_model.resetDebugTimingStats();
     }
     const created_runtime_at = std.Io.Timestamp.now(io, .awake);
@@ -4222,7 +5936,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
         if (!prewarm_ok) {
             std.log.warn("Gemma4 Metal runtime prewarm declined for {s}", .{opts.model_dir});
         }
-        if (opts.print_timing) {
+        if (opts.print_timing or opts.json_timing_path != null) {
             runtime_model.resetDebugTimingStats();
         }
     }
@@ -4252,6 +5966,8 @@ fn tryRunLiveWholeModelExecutorGenerate(
     const prefer_prefill_greedy_token = prefillGreedyTokenEnabled() and use_greedy_decode;
     var prefill_chunk_size = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else prompt_ids.len;
     prefill_chunk_size = @max(@min(prefill_chunk_size, prompt_ids.len), 1);
+    const allow_swa_ring = liveWholeModelAllowsSplitSwaRing(gpt_config, config);
+    const graph_stats_before_generate = graph_mod.executor_stats.snapshot();
     const prefill_started_at = std.Io.Timestamp.now(io, .awake);
     var output = blk: {
         var processed: usize = 0;
@@ -4266,6 +5982,8 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 .seq_len = chunk_end,
                 .query_seq_len = chunk_end - processed,
                 .attention_mode = .paged_prefill,
+                .max_inflight_tokens = if (allow_swa_ring) prefill_chunk_size else 0,
+                .allow_swa_ring = allow_swa_ring,
                 .force_host_logits = forcePrefillHostLogits(),
                 .prefer_greedy_token = prefer_prefill_greedy_token and chunk_end == prompt_ids.len,
             }) catch |err| {
@@ -4324,15 +6042,15 @@ fn tryRunLiveWholeModelExecutorGenerate(
             ));
         };
         const next_token_i64: i64 = next_token_i32;
+        if (liveWholeModelShouldStopOnEos(gpt_config, config.ignore_eos, next_token_i32)) {
+            finish_reason = "stop";
+            break;
+        }
         try generated_token_ids.append(allocator, next_token_i32);
         try all_token_ids.append(allocator, next_token_i64);
         generated += 1;
         if (generated == 1) first_token_at = std.Io.Timestamp.now(io, .awake);
 
-        if (gpt_config.eos_token_id >= 0 and next_token_i32 == gpt_config.eos_token_id) {
-            finish_reason = "stop";
-            break;
-        }
         if (generated >= max_tokens) break;
         if (use_greedy_decode or use_sample_decode) continue;
 
@@ -4354,12 +6072,12 @@ fn tryRunLiveWholeModelExecutorGenerate(
     defer allocator.free(result_text);
 
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
+    const graph_generate_stats = graph_mod.executor_stats.delta(graph_mod.executor_stats.snapshot(), graph_stats_before_generate);
     const load_model_ms = durationMillis(started_at, loaded_model_at);
     const prompt_prep_ms = durationMillis(loaded_model_at, encoded_prompt_at);
     const backend_setup_ms = durationMillis(encoded_prompt_at, created_runtime_at);
     const generate_ms = durationMillis(warmed_runtime_at, finished_generate_at);
     const total_ms = durationMillis(started_at, finished_generate_at);
-    const prefill_ms = durationMillis(prefill_started_at, finished_prefill_at);
     const decode_ms = durationMillis(finished_prefill_at, finished_generate_at);
     const first_token_value_at = first_token_at orelse finished_generate_at;
     print("{s}\n", .{result_text});
@@ -4429,7 +6147,10 @@ fn tryRunLiveWholeModelExecutorGenerate(
                     metal_snapshot.quant.gated_block_fast_attempts,
                 },
             );
-            printMetalQuantDispatchSummary(metal_snapshot);
+            printMetalQuantDispatchSummary(
+                metal_snapshot,
+                metalStatsWithRuntimePlanCounters(graph_generate_stats, metal_snapshot.provider),
+            );
             print(
                 "metal_gated_quantized_block: calls={d} quantized_branch={d} attn_calls={d} attn_nulls={d} attn_prefill_nulls={d} attn_decode_nulls={d} norm_nulls={d} f32_kv_calls={d} f32_kv_ok={d} f32_kv_nulls={d} f32_quant_direct_ok={d} f32_quant_direct_fail={d} compressed_f32_reroutes={d} active_bootstrap_misses={d}\n",
                 .{
@@ -4462,6 +6183,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                     metal_snapshot.provider.metal_runtime_blit_encoder_count,
                 },
             );
+            printMetalStageTiming(metal_snapshot.provider);
             print(
                 "metal_decoder_frame_blits: upload={d} copy={d} slice={d} attention_span={d} ffn_copy={d} embedding={d} other={d}\n",
                 .{
@@ -4647,22 +6369,47 @@ fn tryRunLiveWholeModelExecutorGenerate(
         }
     }
     if (opts.json_timing_path) |path| {
-        try writeLiveWholeModelJsonTiming(
+        const live_timing = generation.GenerationTimingMs{
+            .prompt_format = 0,
+            .tokenize = durationMillis(loaded_model_at, encoded_prompt_at),
+            .runtime_prepare = durationMillis(encoded_prompt_at, warmed_runtime_at),
+            .prefill = durationMillis(prefill_started_at, finished_prefill_at),
+            .decode = durationMillis(finished_prefill_at, finished_generate_at),
+            .total = durationMillis(started_at, finished_generate_at),
+        };
+        const live_result = generation.GenerationResult{
+            .text = result_text,
+            .token_ids = result_token_ids,
+            .prompt_tokens = prompt_tokens,
+            .tokens_used = result_token_ids.len,
+            .finish_reason = finish_reason,
+            .timing_ms = live_timing,
+            .allocator = allocator,
+        };
+        const metal_stats: ?ops.BackendDebugTimingSnapshot = if (comptime build_options.enable_metal) blk: {
+            if (model.session.backend() == .metal) break :blk runtime_model.debugTimingStats().backend;
+            break :blk null;
+        } else null;
+        try writeJsonTiming(
             allocator,
             io,
             path,
             opts.model_dir,
             @tagName(model.session.backend()),
-            result_token_ids.len,
-            finish_reason,
-            load_model_ms,
-            prompt_prep_ms,
-            backend_setup_ms,
-            runtime_prewarm_ms,
-            generate_ms,
-            total_ms,
-            prefill_ms,
-            decode_ms,
+            &live_result,
+            durationMillis(started_at, loaded_model_at),
+            durationMillis(loaded_model_at, encoded_prompt_at),
+            0,
+            durationMillis(encoded_prompt_at, created_runtime_at),
+            0,
+            durationMillis(warmed_runtime_at, finished_generate_at),
+            durationMillis(started_at, finished_generate_at),
+            metal_stats,
+            graph_generate_stats,
+            null,
+            null,
+            null,
+            null,
         );
     }
     return true;
@@ -4696,7 +6443,9 @@ fn runOnnxWholeModelGraphGenerate(
     const rendered_prompt = if (opts.raw_prompt)
         try allocator.dupe(u8, opts.prompt)
     else if (apply_chat_template)
-        try model.chat_tmpl.?.apply(allocator, messages, true)
+        try model.chat_tmpl.?.applyWithOptions(allocator, messages, .{
+            .enable_thinking = opts.enable_thinking,
+        })
     else
         try generation.formatMessages(allocator, messages);
     defer allocator.free(rendered_prompt);
@@ -4746,9 +6495,9 @@ fn runOnnxWholeModelGraphGenerate(
     };
     var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
     budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
-    budget_limits = applyBudgetOverrides(budget_limits, opts.*);
+    budget_limits = try applyBudgetOverrides(budget_limits, opts.*);
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-    print("budget: host={d}MB backend={d}MB combined={d}MB\n", .{
+    print("budget: host={d}MiB backend={d}MiB combined={d}MiB\n", .{
         budget_limits.host_limit_bytes / (1024 * 1024),
         budget_limits.backend_limit_bytes / (1024 * 1024),
         budget_limits.combined_limit_bytes / (1024 * 1024),
@@ -4775,42 +6524,9 @@ fn runOnnxWholeModelGraphGenerate(
     const created_backend_at = std.Io.Timestamp.now(io, .awake);
     defer cb.deinit();
 
-    const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-        null
-    else if (gpt_config.sliding_window > 0 and gpt_config.hasGlobalAttentionLayers() and !kvSlidingTrimForced())
-        // Mixed attention (iSWA-style models like Gemma): global layers need
-        // the full KV history, and the pool packs every layer's KV into
-        // shared blocks, so window-trimming the pool silently truncates the
-        // global layers' context. Retain everything; sliding-window layers
-        // still apply their exact window inside the attention kernels, so
-        // their compute stays bounded — only KV memory grows with context.
-        // ANTFLY_INFERENCE_KV_SLIDING_TRIM=1 restores the old
-        // trim-to-window behavior (lower memory, truncated global context).
-        null
-    else if (gpt_config.sliding_window > 0)
-        gpt_config.sliding_window
-    else if (gpt_config.max_position_embeddings > 0)
-        gpt_config.max_position_embeddings
-    else
-        null;
-    const pool_id = try kv_manager.addPool(.{
-        .backend = backend_kind,
-        .dtype = kv_dtype,
-        .page_size_tokens = 16,
-        .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-        .num_kv_heads = gpt_config.maxKvHeads(),
-        .head_dim = gpt_config.maxHeadDim(),
-        .sliding_window_size = sliding_window_size,
-    });
-    var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
-        .backend = backend_kind,
-        .dtype = kv_dtype,
-        .page_size_tokens = 16,
-        .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-        .num_kv_heads = gpt_config.maxKvHeads(),
-        .head_dim = gpt_config.maxHeadDim(),
-        .sliding_window_size = sliding_window_size,
-    });
+    const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, kvSlidingTrimForced());
+    const pool_id = try kv_manager.addPool(kv_pool_config);
+    var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
     defer kv_storage.deinit();
     try cb.provisionKvDeviceWriteHook(&kv_storage);
     var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
@@ -4830,6 +6546,7 @@ fn runOnnxWholeModelGraphGenerate(
         .bos_token = model.manifest.bos_token,
         .chat_template = if (opts.no_chat_template) null else model.chat_tmpl,
         .prompt_override = if (opts.raw_prompt) rendered_prompt else null,
+        .return_raw_token_ids = opts.print_token_ids,
         .print_timing = opts.print_timing,
         .model_dir = opts.model_dir,
         .artifact_dir = artifact_dir,
@@ -4992,6 +6709,35 @@ fn generateWithOptionalStreaming(
     return result;
 }
 
+fn serverGenerateRequest(opts: Options, messages: []const api.ChatMessage) api.GenerateRequest {
+    const draft_requested = opts.draft_model != null;
+    return .{
+        .model = opts.model_dir,
+        .messages = messages,
+        .max_tokens = opts.max_tokens,
+        .temperature = opts.temperature,
+        .top_p = opts.top_p,
+        .top_k = opts.top_k,
+        .ignore_eos = if (opts.ignore_eos) true else null,
+        .repetition_penalty = opts.repetition_penalty,
+        .stream = if (opts.stream) true else null,
+        .stream_options = if (opts.stream) .{ .include_usage = true } else null,
+        .draft_model = opts.draft_model,
+        .speculative_k = if (draft_requested) opts.speculative_k else null,
+        .speculation_policy = if (draft_requested) opts.speculation_policy.name() else null,
+        .speculation_calibration = if (draft_requested) opts.speculation_calibration.name() else null,
+        .cache_dtype = opts.cache_dtype,
+        .cache_compaction_ratio = opts.cache_compaction_ratio,
+        .backend = generateBackendOverrideForChoice(opts.backend),
+        .mode = serverGenerateModeName(opts),
+        .compiled_target = serverGenerateCompiledTargetName(opts),
+    };
+}
+
+fn serializeServerGenerateRequest(allocator: std.mem.Allocator, request: api.GenerateRequest) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, request, .{ .emit_null_optional_fields = false });
+}
+
 fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, quiet_errors: bool) !void {
     if (!serverGenerateSupportsOptions(opts)) {
         return error.UnsupportedServerGenerateOption;
@@ -5009,22 +6755,8 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
         .role = .user,
         .content = .{ .string = opts.prompt },
     }};
-    const request = api.GenerateRequest{
-        .model = opts.model_dir,
-        .messages = &messages,
-        .max_tokens = opts.max_tokens,
-        .temperature = opts.temperature,
-        .top_p = opts.top_p,
-        .top_k = opts.top_k,
-        .repetition_penalty = opts.repetition_penalty,
-        .stream = if (opts.stream) true else null,
-        .cache_dtype = opts.cache_dtype,
-        .cache_compaction_ratio = opts.cache_compaction_ratio,
-        .backend = generateBackendOverrideForChoice(opts.backend),
-        .mode = serverGenerateModeName(opts),
-        .compiled_target = serverGenerateCompiledTargetName(opts),
-    };
-    const body = try httpx.json.Json.stringify(allocator, request);
+    const request = serverGenerateRequest(opts, &messages);
+    const body = try serializeServerGenerateRequest(allocator, request);
     defer allocator.free(body);
 
     if (opts.stream) {
@@ -5066,6 +6798,11 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
             @as(f64, @floatFromInt(parsed.value.usage.completion_tokens)) * 1000.0 / @as(f64, @floatFromInt(total_ms))
         else
             0;
+        if (parsed.value.speculation) |status| {
+            const summary = try formatServerSpeculationStatus(allocator, status);
+            defer allocator.free(summary);
+            print("{s}\n", .{summary});
+        }
         print("timing_ms: server_request={d} total={d} tokens_per_sec={d:.2}\n", .{ total_ms, total_ms, tokens_per_sec });
     }
 }
@@ -5087,14 +6824,28 @@ const SseEventBoundary = struct {
     delimiter_len: usize,
 };
 
-const ServerGenerateSseWriter = struct {
+fn formatServerSpeculationStatus(allocator: std.mem.Allocator, status: api.GenerateSpeculationStatus) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "speculation: policy={s} calibration={s} decision={s} disabled_reason={s}",
+        .{ status.policy, status.calibration, status.decision, status.disabled_reason orelse "none" },
+    );
+}
+
+pub const ServerGenerateSseWriter = struct {
     allocator: std.mem.Allocator,
     buffer: std.ArrayListUnmanaged(u8) = .empty,
     finish_reason: ?api.FinishReason = null,
+    usage: ?api.GenerateUsage = null,
+    speculation_summary: ?[]u8 = null,
     stream_error: bool = false,
+    /// When set, streamed content deltas are also appended here so callers
+    /// (chat) can retain the assistant reply for multi-turn history.
+    capture: ?*std.ArrayListUnmanaged(u8) = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.buffer.deinit(self.allocator);
+        if (self.speculation_summary) |summary| self.allocator.free(summary);
     }
 
     pub fn writeAll(self: *@This(), data: []const u8) !void {
@@ -5102,7 +6853,7 @@ const ServerGenerateSseWriter = struct {
         try self.processCompleteEvents();
     }
 
-    fn finish(self: *@This()) !void {
+    pub fn finish(self: *@This()) !void {
         try self.processCompleteEvents();
         if (std.mem.trim(u8, self.buffer.items, " \t\r\n").len != 0) return error.InvalidResponse;
     }
@@ -5148,9 +6899,18 @@ const ServerGenerateSseWriter = struct {
 
         var parsed = try std.json.parseFromSlice(api.GenerateChunk, self.allocator, data.items, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
+        if (parsed.value.speculation) |status| {
+            const summary = try formatServerSpeculationStatus(self.allocator, status);
+            if (self.speculation_summary) |old| self.allocator.free(old);
+            self.speculation_summary = summary;
+        }
+        if (parsed.value.usage) |usage| self.usage = usage;
         for (parsed.value.choices) |choice| {
             if (choice.delta.content) |content| {
                 print("{s}", .{content});
+                if (self.capture) |capture| {
+                    try capture.appendSlice(self.allocator, content);
+                }
             }
             if (choice.finish_reason) |finish_reason| {
                 self.finish_reason = finish_reason;
@@ -5210,17 +6970,35 @@ fn runServerGenerateStream(
     print("\n", .{});
     if (opts.print_finish_reason or opts.print_token_count) {
         const finish_reason = if (stream_writer.finish_reason) |reason| @tagName(reason) else "unknown";
+        const completion_tokens = if (stream_writer.usage) |usage|
+            if (usage.completion_tokens >= 0) @as(?usize, @intCast(usage.completion_tokens)) else null
+        else
+            null;
         if (opts.print_finish_reason and opts.print_token_count) {
-            print("finish_reason={s} tokens=unavailable\n", .{finish_reason});
+            if (completion_tokens) |tokens|
+                print("finish_reason={s} tokens={d}\n", .{ finish_reason, tokens })
+            else
+                print("finish_reason={s} tokens=unavailable\n", .{finish_reason});
         } else if (opts.print_finish_reason) {
             print("finish_reason={s}\n", .{finish_reason});
+        } else if (completion_tokens) |tokens| {
+            print("tokens={d}\n", .{tokens});
         } else {
             print("tokens=unavailable\n", .{});
         }
     }
     if (opts.print_timing) {
         const total_ms = durationMillis(started_at, finished_at);
-        print("timing_ms: server_request={d} total={d}\n", .{ total_ms, total_ms });
+        if (stream_writer.speculation_summary) |summary| print("{s}\n", .{summary});
+        if (stream_writer.usage) |usage| {
+            const tokens_per_sec: f64 = if (total_ms > 0 and usage.completion_tokens >= 0)
+                @as(f64, @floatFromInt(usage.completion_tokens)) * 1000.0 / @as(f64, @floatFromInt(total_ms))
+            else
+                0;
+            print("timing_ms: server_request={d} total={d} tokens_per_sec={d:.2}\n", .{ total_ms, total_ms, tokens_per_sec });
+        } else {
+            print("timing_ms: server_request={d} total={d}\n", .{ total_ms, total_ms });
+        }
     }
 }
 
@@ -5249,11 +7027,9 @@ fn serverGenerateSupportsOptions(opts: Options) bool {
         !opts.raw_prompt and
         !opts.no_bos and
         !opts.raw_decode_bench and
-        !opts.ignore_eos and
         !opts.no_chat_template and
-        opts.draft_model == null and
-        opts.speculation_policy == .auto and
-        opts.speculation_calibration == .none and
+        (opts.draft_model != null or opts.speculation_policy == .auto) and
+        (opts.draft_model != null or opts.speculation_calibration == .none) and
         !opts.debug_mtp and
         !opts.debug_gemma4_target and
         !opts.disable_gemma_embedding_scale and
@@ -5265,6 +7041,7 @@ fn serverGenerateSupportsOptions(opts: Options) bool {
         opts.scratch_budget_mb == 0 and
         opts.artifact_dir == null and
         opts.json_timing_path == null and
+        !hasLocalKernelJitOptions(opts) and
         !opts.print_token_ids and
         !opts.print_prompt_token_ids and
         !opts.print_prompt and
@@ -5290,7 +7067,7 @@ fn serverGenerateCompiledTargetName(opts: Options) ?[]const u8 {
     return null;
 }
 
-fn generateEndpointUrl(allocator: std.mem.Allocator, server_url: []const u8) ![]u8 {
+pub fn generateEndpointUrl(allocator: std.mem.Allocator, server_url: []const u8) ![]u8 {
     const root = trimRightSlash(server_url);
     if (std.mem.endsWith(u8, root, "/ai/v1")) {
         return try std.fmt.allocPrint(allocator, "{s}/generate", .{root});
@@ -5420,6 +7197,10 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.audio_count += 1;
         } else if (std.mem.eql(u8, arg, "--no-chat-template")) {
             opts.no_chat_template = true;
+        } else if (std.mem.eql(u8, arg, "--enable-thinking")) {
+            opts.enable_thinking = true;
+        } else if (std.mem.eql(u8, arg, "--disable-thinking")) {
+            opts.enable_thinking = false;
         } else if (std.mem.eql(u8, arg, "--print-finish-reason")) {
             opts.print_finish_reason = true;
         } else if (std.mem.eql(u8, arg, "--print-token-count")) {
@@ -5440,6 +7221,50 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingJsonTimingPath;
             opts.json_timing_path = args[i];
+        } else if (std.mem.eql(u8, arg, kernel_jit_profile_output.cli_flag)) {
+            i += 1;
+            if (i >= args.len) return error.MissingKernelJitProfileOut;
+            try kernel_jit_profile_output.validateOutputPath(args[i]);
+            opts.kernel_jit_profile_out = args[i];
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-draft-profile-out")) {
+            i += 1;
+            if (i >= args.len) return error.MissingKernelJitDraftProfileOut;
+            try kernel_jit_profile_output.validateOutputPath(args[i]);
+            opts.kernel_jit_draft_profile_out = args[i];
+            opts.kernel_jit_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingKernelJitMode;
+            opts.kernel_jit.mode = std.meta.stringToEnum(kernel_jit.Mode, args[i]) orelse return error.InvalidKernelJitMode;
+            opts.kernel_jit_options_explicit = true;
+            opts.kernel_jit_mode_explicit = true;
+        } else if (std.mem.eql(u8, arg, kernel_jit_profile_output.qualified_profile_cli_flag)) {
+            i += 1;
+            if (i >= args.len) return error.MissingKernelJitQualifiedProfile;
+            kernel_jit_profile_output.validateOutputPath(args[i]) catch return error.InvalidKernelJitQualifiedProfilePath;
+            opts.kernel_jit.qualified_profile_path = args[i];
+            opts.kernel_jit_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-draft-qualified-profile")) {
+            i += 1;
+            if (i >= args.len) return error.MissingKernelJitDraftQualifiedProfile;
+            kernel_jit_profile_output.validateOutputPath(args[i]) catch return error.InvalidKernelJitQualifiedProfilePath;
+            opts.kernel_jit_draft_qualified_profile = args[i];
+            opts.kernel_jit_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-cache-dir")) {
+            i += 1;
+            if (i >= args.len) return error.MissingKernelJitCacheDir;
+            opts.kernel_jit.cache_dir = args[i];
+            opts.kernel_jit_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-max-cache-mb")) {
+            i += 1;
+            if (i >= args.len) return error.MissingKernelJitMaxCacheMb;
+            opts.kernel_jit.max_cache_bytes_mb = try std.fmt.parseInt(usize, args[i], 10);
+            opts.kernel_jit_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-preload-budget-ms")) {
+            i += 1;
+            if (i >= args.len) return error.MissingKernelJitPreloadBudgetMs;
+            opts.kernel_jit.preload_budget_ms = try std.fmt.parseInt(u64, args[i], 10);
+            opts.kernel_jit_options_explicit = true;
         } else if (std.mem.eql(u8, arg, "--debug-mtp")) {
             opts.debug_mtp = true;
         } else if (std.mem.eql(u8, arg, "--debug-gemma4-target")) {
@@ -5555,7 +7380,7 @@ fn printSpeculativeStats(result: *const generation.GenerationResult) void {
     const profile = stats.mtp_profile;
     if (profile.enabled) {
         print(
-            "mtp_profile: sync={} draft_steps={d} resident_draft_steps={d} host_draft_steps={d} target_verify_calls={d} target_verify_rows={d} target_verify_argmax_calls={d} target_verify_argmax_rows={d} target_verify_argmax_batched_calls={d} target_verify_argmax_syncs={d} dedicated_runtime_hits={d} dedicated_runtime_fallbacks={d} device_verify_commit_hits={d} device_verify_commit_fallbacks={d} device_verify_commit_result_downloads={d} target_choice_downloads={d} commit_forwards_required={d} commit_forwards_avoided={d} accepted_hidden_reuse_rows={d} activation_copies={d} materializations={d} hidden_only_materializations={d} hidden_only_fallbacks={d} correction_materializations={d} bonus_materializations={d} bonus_skips={d} fallback_calls={d}",
+            "mtp_profile: sync={} draft_steps={d} resident_draft_steps={d} host_draft_steps={d} target_verify_calls={d} target_verify_rows={d} target_verify_argmax_calls={d} target_verify_argmax_rows={d} target_verify_argmax_batched_calls={d} target_verify_argmax_syncs={d} dedicated_runtime_hits={d} dedicated_runtime_fallbacks={d} device_verify_commit_hits={d} device_verify_commit_fallbacks={d} device_verify_commit_result_downloads={d} target_choice_downloads={d} commit_forwards_required={d} commit_forwards_avoided={d} accepted_hidden_reuse_rows={d} activation_copies={d} materializations={d} hidden_only_materializations={d} hidden_only_fallbacks={d} correction_materializations={d} bonus_materializations={d} deferred_materializations={d} pending_flushes={d} bonus_skips={d} fallback_calls={d}",
             .{
                 profile.sync_enabled,
                 profile.draft_steps,
@@ -5582,6 +7407,8 @@ fn printSpeculativeStats(result: *const generation.GenerationResult) void {
                 profile.materialization_hidden_only_fallbacks,
                 profile.correction_materializations,
                 profile.bonus_materializations,
+                profile.deferred_materializations,
+                profile.pending_flushes,
                 profile.bonus_skips,
                 profile.fallback_calls,
             },
@@ -5774,7 +7601,7 @@ fn preflightModelLoadBudget(
         limits,
         predicted_backend_type,
     );
-    limits = applyBudgetOverrides(limits, opts);
+    limits = try applyBudgetOverrides(limits, opts);
     var run_budget = runtime.tier.memory.RunBudget.init(limits);
     _ = run_budget.tryReserveWeight(reservation_tier, weight_bytes) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
@@ -5866,7 +7693,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -5879,18 +7706,21 @@ fn printUsage() void {
         \\  compiled-target=whole-model requests a compiled backend only when it can own the full traced graph shape.
         \\  raw-decode-bench runs transformer-body decode without logits/sampling for llama-bench-style baselines.
         \\  ignore-eos keeps generating after EOS for benchmark compatibility with engines that do not stop on the same EOG token set.
+        \\  Kernel-JIT options are local-only and bypass ANTFLY_INFERENCE_SERVER_URL; an explicit --server remains an error.
+        \\  A qualified profile reloads matching package records from the selected cache before model publication; use mode on or required.
+        \\  Profile capture auto-selects shadow unless a conflicting mode is explicit. Target and draft profiles are model-bound and separate.
         \\
     , .{});
 }
 
-fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) runtime.tier.memory.Limits {
-    var limits = defaults;
-    if (opts.host_budget_mb > 0) limits.host_limit_bytes = opts.host_budget_mb * 1024 * 1024;
-    if (opts.backend_budget_mb > 0) limits.backend_limit_bytes = opts.backend_budget_mb * 1024 * 1024;
-    if (opts.combined_budget_mb > 0) limits.combined_limit_bytes = opts.combined_budget_mb * 1024 * 1024;
-    if (opts.kv_budget_mb > 0) limits.kv_limit_bytes = opts.kv_budget_mb * 1024 * 1024;
-    if (opts.scratch_budget_mb > 0) limits.scratch_limit_bytes = opts.scratch_budget_mb * 1024 * 1024;
-    return limits;
+fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) !runtime.tier.memory.Limits {
+    return (runtime.tier.memory.BudgetOverridesMib{
+        .host = opts.host_budget_mb,
+        .backend = opts.backend_budget_mb,
+        .combined = opts.combined_budget_mb,
+        .kv = opts.kv_budget_mb,
+        .scratch = opts.scratch_budget_mb,
+    }).apply(defaults);
 }
 
 fn graphModeEnabled() bool {
@@ -5901,7 +7731,7 @@ fn nativeGenerateSchedulerEnabled() bool {
     return !getenvBool("TERMITE_DISABLE_NATIVE_GENERATE_SCHEDULER");
 }
 
-fn effectiveGenerationKvDType(
+pub fn effectiveGenerationKvDType(
     requested: runtime.kv.pool.KvDType,
     backend_kind: runtime.kv.pool.BackendKind,
     config: gpt_mod.Config,
@@ -5933,6 +7763,330 @@ fn countPromptTokens(attention_mask: anytype) usize {
     return count;
 }
 
+test "metal stats compact json exposes generated quant and fallback counters" {
+    var snapshot = ops.BackendDebugTimingSnapshot{ .native_quant_null = false };
+    snapshot.provider.metal_runtime_last_frame_planned_command_operator_counts[1] = 2;
+    snapshot.provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts[2] = 3;
+    snapshot.provider.metal_runtime_q8_0_linear_rows_2_8 = 4;
+    snapshot.provider.metal_runtime_decode_gqa_split_calls = 31;
+    snapshot.provider.metal_runtime_generated_attention_flash_prefill_calls = 35;
+    snapshot.provider.metal_runtime_generated_attention_flash_prefill_hd512_calls = 7;
+    snapshot.provider.metal_runtime_attention_prefill_direct_kv_calls = 42;
+    snapshot.provider.metal_runtime_prepared_frame_fast_path_calls = 29;
+    snapshot.provider.metal_runtime_prepared_frame_fallback_calls = 2;
+    snapshot.provider.metal_stage_timing = .{
+        .enabled = 1,
+        .supported = 1,
+        .complete = 1,
+        .barrier_sample_count = 12,
+        .prefill = .{ .sampled_frames = 1, .whole_frame_gpu_nanos = 100, .attention_nanos = 40, .ffn_nanos = 60 },
+        .decode = .{ .sampled_frames = 5, .whole_frame_gpu_nanos = 500, .attention_nanos = 200, .ffn_nanos = 300 },
+    };
+    snapshot.provider.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches = 37;
+    snapshot.provider.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches = 38;
+    snapshot.provider.metal_runtime_q4_0_mmv_nr4_nsg4_dispatches = 39;
+    snapshot.provider.metal_runtime_q4_0_mmv_nr8_nsg4_dispatches = 40;
+    snapshot.provider.metal_runtime_q4_0_mmv_variant_fallbacks = 41;
+    snapshot.provider.metal_runtime_q4_0_mm_sg_aligned_dispatches = 42;
+    snapshot.provider.metal_runtime_q4_0_mm_sg_aligned_tail_dispatches = 43;
+    snapshot.provider.metal_runtime_q4_0_mm_sg_unrolled_dispatches = 44;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg2_dispatches = 45;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg2_dispatches = 46;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg4_dispatches = 47;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg4_dispatches = 48;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_variant_fallbacks = 49;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n64_aligned_dispatches = 50;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n64_tail_dispatches = 51;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n32_aligned_dispatches = 52;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n32_tail_dispatches = 53;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mm_variant_fallbacks = 54;
+    snapshot.provider.metal_runtime_jit_exact_q4_0_hits = 25;
+    snapshot.provider.metal_runtime_jit_exact_q4_k_hits = 26;
+    const generated_counts = &snapshot.provider.metal_runtime_antfly_generated_dispatch_counts;
+    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q8_0)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.none)] = 5;
+    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q6_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias)] = 24;
+    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q6_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias_gelu)] = 6;
+    snapshot.provider.active_decode_frame_fallbacks = 7;
+    snapshot.provider.prefill_frame_execute_successes = 8;
+    snapshot.provider.prefill_frame_execute_attempts = 9;
+    snapshot.provider.metal_provider_quantized_runtime_mapped_fallbacks = 10;
+    snapshot.provider.compressed_block_active_frame_bootstrap_misses = 11;
+    snapshot.provider.metal_provider_quantized_runtime_mapped_failures = 12;
+
+    const graph_stats = graph_mod.executor_stats.ExecutionStats{
+        .quant_kernel_planned_ops = 12,
+        .quant_kernel_handwritten_production = 13,
+        .quant_kernel_generated_production = 14,
+        .quant_kernel_unsupported_routes = 15,
+        .quant_kernel_generated_candidates = 16,
+        .quant_kernel_fallback_generated_artifact_missing = 17,
+        .quant_kernel_fallback_generated_runtime_not_wired = 18,
+        .quant_kernel_fallback_unsupported_format = 19,
+        .quant_kernel_fallback_unsupported_shape = 27,
+        .quant_kernel_fallback_unsupported_epilogue = 20,
+        .quant_kernel_fallback_unsupported_backend = 21,
+        .quant_kernel_fallback_tensor_core_repack_required = 22,
+        .quant_kernel_fallback_unsupported = 23,
+    };
+
+    const json = try metalStatsCompactJson(std.testing.allocator, snapshot, graph_stats);
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    if (build_options.enable_metal and metal_runtime.metalDeviceAvailable()) {
+        try std.testing.expect(root.get("device").? == .string);
+        try std.testing.expect(root.get("device").?.string.len > 0);
+        try std.testing.expect(root.get("device_registry_id").?.integer > 0);
+    } else {
+        try std.testing.expect(root.get("device").? == .null);
+        try std.testing.expectEqual(@as(i64, 0), root.get("device_registry_id").?.integer);
+    }
+    try std.testing.expectEqual(false, root.get("native_quant_null").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), root.get("runtime_command_operators").?.object.get("mul_mv").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), root.get("runtime_command_operators").?.object.get("dispatch_small_batch").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), root.get("q8_0_dispatch").?.object.get("rows_2_8").?.integer);
+    try std.testing.expectEqual(@as(i64, 31), root.get("attention_dispatch").?.object.get("decode_gqa_split").?.integer);
+    try std.testing.expectEqual(@as(i64, 35), root.get("attention_dispatch").?.object.get("generated_flash_prefill").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), root.get("attention_dispatch").?.object.get("generated_flash_prefill_hd512").?.integer);
+    try std.testing.expectEqual(@as(i64, 42), root.get("attention_dispatch").?.object.get("prefill_direct_kv").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), root.get("attention_dispatch").?.object.get("prefill_paged_kv").?.integer);
+    try std.testing.expectEqual(@as(i64, 29), root.get("prepared_frame").?.object.get("fast_path").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), root.get("prepared_frame").?.object.get("fallback").?.integer);
+    const stage_timing = root.get("stage_timing_ns").?.object;
+    try std.testing.expectEqualStrings("runtime_frame", stage_timing.get("scope").?.string);
+    try std.testing.expectEqual(@as(i64, 1), stage_timing.get("complete").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), stage_timing.get("prefill").?.object.get("frames").?.integer);
+    try std.testing.expectEqual(@as(i64, 300), stage_timing.get("decode").?.object.get("ffn").?.integer);
+    const q4_0_policy = root.get("q4_0_policy").?.object;
+    try std.testing.expectEqual(@as(i64, 37), q4_0_policy.get("mmv_nr4_nsg2").?.integer);
+    try std.testing.expectEqual(@as(i64, 38), q4_0_policy.get("mmv_nr8_nsg2").?.integer);
+    try std.testing.expectEqual(@as(i64, 39), q4_0_policy.get("mmv_nr4_nsg4").?.integer);
+    try std.testing.expectEqual(@as(i64, 40), q4_0_policy.get("mmv_nr8_nsg4").?.integer);
+    try std.testing.expectEqual(@as(i64, 41), q4_0_policy.get("mmv_variant_fallbacks").?.integer);
+    try std.testing.expectEqual(@as(i64, 42), q4_0_policy.get("mm_sg_aligned").?.integer);
+    try std.testing.expectEqual(@as(i64, 43), q4_0_policy.get("mm_sg_aligned_tail").?.integer);
+    try std.testing.expectEqual(@as(i64, 44), q4_0_policy.get("mm_sg_unrolled").?.integer);
+    const pair_policy = root.get("q4_0_pair_activation_policy").?.object;
+    try std.testing.expectEqual(@as(i64, 45), pair_policy.get("mmv_nr4_nsg2").?.integer);
+    try std.testing.expectEqual(@as(i64, 46), pair_policy.get("mmv_nr8_nsg2").?.integer);
+    try std.testing.expectEqual(@as(i64, 47), pair_policy.get("mmv_nr4_nsg4").?.integer);
+    try std.testing.expectEqual(@as(i64, 48), pair_policy.get("mmv_nr8_nsg4").?.integer);
+    try std.testing.expectEqual(@as(i64, 49), pair_policy.get("mmv_variant_fallbacks").?.integer);
+    try std.testing.expectEqual(@as(i64, 50), pair_policy.get("mm_m32_n64_aligned").?.integer);
+    try std.testing.expectEqual(@as(i64, 51), pair_policy.get("mm_m32_n64_tail").?.integer);
+    try std.testing.expectEqual(@as(i64, 52), pair_policy.get("mm_m32_n32_aligned").?.integer);
+    try std.testing.expectEqual(@as(i64, 53), pair_policy.get("mm_m32_n32_tail").?.integer);
+    try std.testing.expectEqual(@as(i64, 54), pair_policy.get("mm_variant_fallbacks").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), root.get("generated_quant_dispatch").?.object.get("q8_0_small_batch").?.integer);
+    try std.testing.expectEqual(@as(i64, 24), root.get("generated_quant_dispatch").?.object.get("q6_k_small_batch_bias").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), root.get("generated_quant_dispatch").?.object.get("q6_k_small_batch_bias_gelu").?.integer);
+    try std.testing.expectEqual(@as(i64, 35), root.get("metal_generated_quant").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), root.get("metal_generated_quant_family_count").?.integer);
+    try std.testing.expectEqualStrings("q6_k", root.get("metal_generated_quant_top_family").?.string);
+    try std.testing.expectEqual(@as(i64, 30), root.get("metal_generated_quant_top_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 25), root.get("jit_exact_dispatch").?.object.get("q4_0").?.integer);
+    try std.testing.expectEqual(@as(i64, 26), root.get("jit_exact_dispatch").?.object.get("q4_k").?.integer);
+    try std.testing.expectEqualStrings(
+        "antfly_q8_0_small_batch_bias_msl_v1",
+        root.get("generated_quant_routes").?.object.get("q8_0_small_batch_bias").?.object.get("kernel_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "antfly_q6_k_small_batch_bias_msl_v1",
+        root.get("generated_quant_routes").?.object.get("q6_k_small_batch_bias").?.object.get("kernel_id").?.string,
+    );
+    try std.testing.expectEqual(@as(i64, 12), root.get("quant_kernel_plan").?.object.get("planned").?.integer);
+    try std.testing.expectEqual(@as(i64, 13), root.get("quant_kernel_plan").?.object.get("handwritten_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 14), root.get("quant_kernel_plan").?.object.get("generated_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 15), root.get("quant_kernel_plan").?.object.get("unsupported_routes").?.integer);
+    try std.testing.expectEqual(@as(i64, 144), root.get("quant_kernel_plan").?.object.get("fast_path_misses").?.integer);
+    try std.testing.expectEqual(@as(i64, 16), root.get("quant_kernel_plan").?.object.get("generated_candidates").?.integer);
+    try std.testing.expectEqual(@as(i64, 17), root.get("quant_kernel_plan").?.object.get("generated_artifact_missing").?.integer);
+    try std.testing.expectEqual(@as(i64, 18), root.get("quant_kernel_plan").?.object.get("generated_runtime_not_wired").?.integer);
+    try std.testing.expectEqual(@as(i64, 19), root.get("quant_kernel_plan").?.object.get("unsupported_format").?.integer);
+    try std.testing.expectEqual(@as(i64, 27), root.get("quant_kernel_plan").?.object.get("unsupported_shape").?.integer);
+    try std.testing.expectEqual(@as(i64, 20), root.get("quant_kernel_plan").?.object.get("unsupported_epilogue").?.integer);
+    try std.testing.expectEqual(@as(i64, 21), root.get("quant_kernel_plan").?.object.get("unsupported_backend").?.integer);
+    try std.testing.expectEqual(@as(i64, 22), root.get("quant_kernel_plan").?.object.get("tensor_core_repack_required").?.integer);
+    try std.testing.expectEqual(@as(i64, 23), root.get("quant_kernel_plan").?.object.get("unsupported").?.integer);
+    try std.testing.expectEqualStrings("unsupported_shape", root.get("quant_kernel_plan").?.object.get("top_fallback_reason").?.string);
+    try std.testing.expectEqual(@as(i64, 27), root.get("quant_kernel_plan").?.object.get("top_fallback_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), root.get("frame_fallbacks").?.object.get("decode_fallback").?.integer);
+    try std.testing.expectEqual(@as(i64, 8), root.get("frame_fallbacks").?.object.get("prefill_execute").?.integer);
+    try std.testing.expectEqual(@as(i64, 9), root.get("frame_fallbacks").?.object.get("prefill_execute_attempts").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), root.get("residency").?.object.get("runtime_mapped_fallbacks").?.integer);
+    try std.testing.expectEqual(@as(i64, 11), root.get("residency").?.object.get("active_frame_bootstrap_misses").?.integer);
+    try std.testing.expectEqual(@as(i64, 12), root.get("residency").?.object.get("runtime_mapped_failures").?.integer);
+    try std.testing.expectEqual(@as(i64, 33), root.get("residency").?.object.get("misses").?.integer);
+
+    const null_json = try metalStatsCompactJson(std.testing.allocator, null, .{});
+    defer std.testing.allocator.free(null_json);
+    try std.testing.expectEqualStrings("null", null_json);
+}
+
+test "metal stats compact json derives plan counters from runtime generated dispatches" {
+    var snapshot = ops.BackendDebugTimingSnapshot{ .native_quant_null = false };
+    const generated_counts = &snapshot.provider.metal_runtime_antfly_generated_dispatch_counts;
+    // q8_0/none is a promoted production route; q5_k/bias_gelu is still a dev
+    // candidate (q5_k/bias was promoted, so it no longer covers the candidate
+    // branch of this test).
+    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q8_0)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.none)] = 2;
+    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q5_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias_gelu)] = 3;
+
+    const json = try metalStatsCompactJson(std.testing.allocator, snapshot, .{});
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const plan = parsed.value.object.get("quant_kernel_plan").?.object;
+    try std.testing.expectEqual(@as(i64, 5), plan.get("planned").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), plan.get("handwritten_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), plan.get("generated_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), plan.get("fast_path_misses").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), plan.get("generated_candidates").?.integer);
+    try std.testing.expectEqualStrings("none", plan.get("top_fallback_reason").?.string);
+    try std.testing.expectEqual(@as(i64, 0), plan.get("top_fallback_count").?.integer);
+}
+
+test "metal stats compact json derives plan counters from runtime handwritten dispatches" {
+    var snapshot = ops.BackendDebugTimingSnapshot{ .native_quant_null = false };
+    snapshot.provider.metal_runtime_q8_0_linear_rows_1 = 2;
+    snapshot.provider.metal_runtime_q8_0_linear_rows_2_8 = 4;
+    snapshot.provider.metal_runtime_q8_0_linear_rows_9_64 = 3;
+    snapshot.provider.metal_runtime_q4_0_linear_reduce = 6;
+    snapshot.provider.metal_runtime_q4_0_linear_reduce_rows_2_8 = 6;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_reduce = 5;
+    snapshot.provider.metal_runtime_q6_k_linear_reduce = 10;
+    snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_1 = 3;
+
+    const json = try metalStatsCompactJson(std.testing.allocator, snapshot, .{});
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const q4_0 = parsed.value.object.get("q4_0_dispatch").?.object;
+    try std.testing.expectEqual(@as(i64, 6), q4_0.get("linear_reduce").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), q4_0.get("linear_reduce_rows_2_8").?.integer);
+    const k_quant = parsed.value.object.get("k_quant_dispatch").?.object;
+    try std.testing.expectEqual(@as(i64, 10), k_quant.get("q6_linear_reduce").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), k_quant.get("q6_linear_reduce_rows_1").?.integer);
+
+    const plan = parsed.value.object.get("quant_kernel_plan").?.object;
+    try std.testing.expectEqual(@as(i64, 30), plan.get("planned").?.integer);
+    try std.testing.expectEqual(@as(i64, 30), plan.get("handwritten_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), plan.get("generated_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), plan.get("fast_path_misses").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), plan.get("generated_candidates").?.integer);
+    try std.testing.expectEqualStrings("none", plan.get("top_fallback_reason").?.string);
+    try std.testing.expectEqual(@as(i64, 0), plan.get("top_fallback_count").?.integer);
+}
+
+test "metal stats compact json saturates residency miss summary" {
+    var provider = ops.NativeQuantTimingStats{};
+    provider.metal_provider_quantized_runtime_mapped_fallbacks = std.math.maxInt(u64);
+    provider.metal_provider_quantized_runtime_mapped_failures = 1;
+    provider.compressed_block_active_frame_bootstrap_misses = 1;
+    try std.testing.expectEqual(std.math.maxInt(u64), metalResidencyMisses(provider));
+}
+
+test "raw decode bench json includes metal compact stats" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "raw_decode_timing.json" });
+    defer std.testing.allocator.free(path);
+
+    var snapshot = ops.BackendDebugTimingSnapshot{ .native_quant_null = false };
+    snapshot.provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts[2] = 7;
+
+    const graph_stats = graph_mod.executor_stats.ExecutionStats{
+        .quant_kernel_planned_ops = 5,
+        .quant_kernel_unsupported_routes = 2,
+        .quant_kernel_generated_candidates = 3,
+        .quant_kernel_fallback_unsupported_shape = 2,
+    };
+
+    try writeRawDecodeBenchJson(
+        std.testing.allocator,
+        std.testing.io,
+        path,
+        "test-model",
+        "metal",
+        .{
+            .tokens = 4,
+            .warmup_tokens = 1,
+            .prompt_tokens = 2,
+            .scope = "hidden_decode_no_lm_head_sampler",
+            .device_warmup_ms = 3,
+            .prefill_ms = 4,
+            .warmup_ms = 5,
+            .decode_ms = 6,
+        },
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        snapshot,
+        graph_stats,
+        null,
+        null,
+    );
+
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(128 * 1024));
+    defer std.testing.allocator.free(actual);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, actual, .{});
+    defer parsed.deinit();
+
+    const metal = parsed.value.object.get("metal").?.object;
+    try std.testing.expectEqual(@as(i64, 7), metal.get("runtime_command_operators").?.object.get("dispatch_small_batch").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), metal.get("quant_kernel_plan").?.object.get("planned").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), metal.get("quant_kernel_plan").?.object.get("fast_path_misses").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), metal.get("quant_kernel_plan").?.object.get("generated_candidates").?.integer);
+    try std.testing.expectEqualStrings("unsupported_shape", metal.get("quant_kernel_plan").?.object.get("top_fallback_reason").?.string);
+    try std.testing.expectEqual(@as(i64, 2), metal.get("quant_kernel_plan").?.object.get("top_fallback_count").?.integer);
+}
+
+test "Metal auto draft admission defaults off and stays Gemma4 MTP-only" {
+    const opts = Options{
+        .model_dir = "model",
+        .prompt = "prompt",
+        .backend = .metal,
+        .speculation_policy = .auto,
+    };
+    try std.testing.expect(shouldSkipMetalAutoDraftLoadWithGate(opts, false, false));
+    try std.testing.expect(shouldSkipMetalAutoDraftLoadWithGate(opts, true, false));
+    try std.testing.expect(shouldSkipMetalAutoDraftLoadWithGate(opts, false, true));
+    try std.testing.expect(!shouldSkipMetalAutoDraftLoadWithGate(opts, true, true));
+}
+
+test "draft KV backend follows the loaded draft session" {
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .native), generationKvBackendKind(.native));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .metal), generationKvBackendKind(.metal));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationKvBackendKind(.onnx));
+    const mixed_draft: gpt_mod.Config = .{
+        .family = .gemma,
+        .hidden_size = 512,
+        .num_hidden_layers = 6,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 4,
+        .position_encoding = .rope,
+        .sliding_window = 1024,
+        .sliding_window_pattern = 6,
+    };
+    const draft_pool = generation.kvPoolConfig(.native, .f16, mixed_draft, false);
+    try std.testing.expectEqual(runtime.kv.pool.BackendKind.native, draft_pool.backend);
+    try std.testing.expectEqual(@as(?u32, null), draft_pool.sliding_window_size);
+}
+
+test "generate CLI rejects unsupported cache compaction before model loading" {
+    try validateCacheCompactionOption(null);
+    try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionOption(0.0));
+    try std.testing.expectError(error.KvStorageCompactionNotSupported, validateCacheCompactionOption(0.5));
+}
+
 test "parseArgs accepts artifact dir" {
     const opts = try parseArgs(&.{
         "/tmp/model",
@@ -5951,6 +8105,22 @@ test "parseArgs accepts artifact dir" {
     try std.testing.expect(opts.raw_prompt);
 }
 
+test "parseArgs preserves explicit chat template thinking mode" {
+    const disabled = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--disable-thinking",
+    });
+    try std.testing.expectEqual(@as(?bool, false), disabled.enable_thinking);
+
+    const enabled = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--enable-thinking",
+    });
+    try std.testing.expectEqual(@as(?bool, true), enabled.enable_thinking);
+}
+
 test "parseArgs accepts compiled target" {
     const opts = try parseArgs(&.{
         "/tmp/model",
@@ -5965,6 +8135,278 @@ test "parseArgs accepts compiled target" {
     try std.testing.expectEqual(BackendChoice.xla, opts.backend);
     try std.testing.expectEqual(ExecutionMode.compiled, opts.mode.?);
     try std.testing.expectEqual(CompiledTarget.whole_model, opts.compiled_target.?);
+}
+
+test "parseArgs accepts kernel JIT profile output" {
+    const opts = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--backend",
+        "metal",
+        "--kernel-jit-profile-out",
+        "/tmp/profile.json",
+    });
+    try std.testing.expectEqualStrings("/tmp/profile.json", opts.kernel_jit_profile_out.?);
+    if (build_options.enable_metal) {
+        try std.testing.expectEqual(kernel_jit.Mode.shadow, (try validateKernelJitOptions(opts)).mode);
+    } else {
+        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(opts));
+    }
+
+    try std.testing.expectError(error.MissingKernelJitProfileOut, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--kernel-jit-profile-out",
+    }));
+    try std.testing.expectError(error.InvalidKernelJitProfileOut, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--kernel-jit-profile-out",
+        "",
+    }));
+}
+
+test "parseArgs accepts native kernel JIT configuration" {
+    const opts = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--backend",
+        "metal",
+        "--kernel-jit-mode",
+        "on",
+        "--kernel-jit-cache-dir",
+        "/tmp/jit-cache",
+        "--kernel-jit-max-cache-mb",
+        "256",
+        "--kernel-jit-preload-budget-ms",
+        "120000",
+        "--kernel-jit-qualified-profile",
+        "/tmp/profile.json",
+    });
+    try std.testing.expectEqual(kernel_jit.Mode.on, opts.kernel_jit.mode);
+    try std.testing.expectEqualStrings("/tmp/jit-cache", opts.kernel_jit.cache_dir.?);
+    try std.testing.expectEqual(@as(usize, 256), opts.kernel_jit.max_cache_bytes_mb);
+    try std.testing.expectEqual(@as(u64, 120_000), opts.kernel_jit.preload_budget_ms);
+    try std.testing.expectEqualStrings("/tmp/profile.json", opts.kernel_jit.qualified_profile_path.?);
+    try std.testing.expect(opts.kernel_jit_options_explicit);
+    if (build_options.enable_metal) {
+        _ = try validateKernelJitOptions(opts);
+    } else {
+        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(opts));
+    }
+
+    try std.testing.expectError(error.MissingKernelJitMode, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--kernel-jit-mode",
+    }));
+    try std.testing.expectError(error.InvalidKernelJitMode, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--kernel-jit-mode",
+        "automatic",
+    }));
+    try std.testing.expectError(error.InvalidKernelJitQualifiedProfilePath, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--kernel-jit-qualified-profile",
+        "",
+    }));
+}
+
+test "parseArgs accepts isolated target and draft kernel JIT profiles" {
+    const capture_opts = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--backend",
+        "metal",
+        "--draft-model",
+        "/tmp/draft",
+        "--kernel-jit-profile-out",
+        "/tmp/target-capture.json",
+        "--kernel-jit-draft-profile-out",
+        "/tmp/draft-capture.json",
+    });
+    try std.testing.expectEqualStrings("/tmp/target-capture.json", capture_opts.kernel_jit_profile_out.?);
+    try std.testing.expectEqualStrings("/tmp/draft-capture.json", capture_opts.kernel_jit_draft_profile_out.?);
+    if (build_options.enable_metal) {
+        const target_config = try validateKernelJitOptions(capture_opts);
+        try std.testing.expectEqual(kernel_jit.Mode.shadow, target_config.mode);
+        try std.testing.expect(target_config.profile_capture_only);
+        try std.testing.expect((try draftKernelJitConfig(target_config, null, true)).profile_capture_only);
+        try std.testing.expect(!(try draftKernelJitConfig(target_config, null, false)).profile_capture_only);
+    } else {
+        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(capture_opts));
+    }
+
+    const qualified_opts = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--backend",
+        "metal",
+        "--draft-model",
+        "/tmp/draft",
+        "--kernel-jit-mode",
+        "on",
+        "--kernel-jit-qualified-profile",
+        "/tmp/target-qualified.json",
+        "--kernel-jit-draft-qualified-profile",
+        "/tmp/draft-qualified.json",
+    });
+    if (build_options.enable_metal) {
+        const target_config = try validateKernelJitOptions(qualified_opts);
+        const draft_config = try draftKernelJitConfig(target_config, qualified_opts.kernel_jit_draft_qualified_profile, false);
+        try std.testing.expectEqualStrings("/tmp/target-qualified.json", target_config.qualified_profile_path.?);
+        try std.testing.expectEqualStrings("/tmp/draft-qualified.json", draft_config.qualified_profile_path.?);
+        try std.testing.expect((try draftKernelJitConfig(target_config, null, false)).qualified_profile_path == null);
+
+        var draft_only_opts = qualified_opts;
+        draft_only_opts.kernel_jit.qualified_profile_path = null;
+        const draft_only_target = try validateKernelJitOptions(draft_only_opts);
+        try std.testing.expect(draft_only_target.qualified_profile_path == null);
+        try std.testing.expectEqualStrings(
+            "/tmp/draft-qualified.json",
+            (try draftKernelJitConfig(draft_only_target, draft_only_opts.kernel_jit_draft_qualified_profile, false)).qualified_profile_path.?,
+        );
+
+        var required_target = target_config;
+        required_target.mode = .required;
+        const unprofiled_draft = try draftKernelJitConfig(required_target, null, false);
+        try std.testing.expectEqual(kernel_jit.Mode.off, unprofiled_draft.mode);
+        try std.testing.expect(!unprofiled_draft.profile_capture_only);
+        const required_draft = try draftKernelJitConfig(required_target, "/tmp/draft-qualified.json", false);
+        try std.testing.expectEqual(kernel_jit.Mode.required, required_draft.mode);
+    } else {
+        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(qualified_opts));
+    }
+
+    try std.testing.expectError(error.MissingKernelJitDraftProfileOut, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--kernel-jit-draft-profile-out",
+    }));
+    try std.testing.expectError(error.InvalidKernelJitProfileOut, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--kernel-jit-draft-profile-out",
+        "",
+    }));
+    try std.testing.expectError(error.MissingKernelJitDraftQualifiedProfile, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--kernel-jit-draft-qualified-profile",
+    }));
+    try std.testing.expectError(error.InvalidKernelJitQualifiedProfilePath, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--kernel-jit-draft-qualified-profile",
+        "",
+    }));
+}
+
+test "native kernel JIT profile policy is fail closed" {
+    try std.testing.expectError(
+        error.KernelJitTargetDraftProfileOutputConflict,
+        validateKernelJitOptions(.{
+            .model_dir = "/tmp/model",
+            .prompt = "hello",
+            .backend = .metal,
+            .draft_model = "/tmp/draft",
+            .kernel_jit_profile_out = "/tmp/capture.json",
+            .kernel_jit_draft_profile_out = "/tmp/capture.json",
+        }),
+    );
+    try std.testing.expectError(
+        error.KernelJitTargetDraftProfileOutputConflict,
+        validateKernelJitOptions(.{
+            .model_dir = "/tmp/model",
+            .prompt = "hello",
+            .backend = .metal,
+            .draft_model = "/tmp/draft",
+            .kernel_jit_profile_out = "capture.json",
+            .kernel_jit_draft_profile_out = "./capture.json",
+        }),
+    );
+    try std.testing.expectError(
+        error.KernelJitProfileRequiresMetalBackend,
+        validateKernelJitOptions(.{
+            .model_dir = "/tmp/model",
+            .prompt = "hello",
+            .backend = .native,
+            .kernel_jit_profile_out = "/tmp/capture.json",
+        }),
+    );
+    try std.testing.expectError(
+        error.KernelJitProfileRequiresMetalBackend,
+        validateKernelJitOptions(.{
+            .model_dir = "/tmp/model",
+            .prompt = "hello",
+            .backend = .cuda,
+            .kernel_jit = .{ .mode = .on, .qualified_profile_path = "/tmp/qualified.json" },
+        }),
+    );
+    const explicit_off = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--backend",
+        "metal",
+        "--kernel-jit-mode",
+        "off",
+        "--kernel-jit-profile-out",
+        "/tmp/capture.json",
+    });
+    try std.testing.expectError(
+        error.KernelJitProfileCaptureRequiresShadow,
+        validateKernelJitOptions(explicit_off),
+    );
+    try std.testing.expectError(
+        error.KernelJitDraftProfileRequiresDraftModel,
+        validateKernelJitOptions(.{
+            .model_dir = "/tmp/model",
+            .prompt = "hello",
+            .backend = .metal,
+            .kernel_jit_draft_profile_out = "/tmp/draft-capture.json",
+        }),
+    );
+    try std.testing.expectError(
+        error.KernelJitDraftProfileRequiresDraftModel,
+        validateKernelJitOptions(.{
+            .model_dir = "/tmp/model",
+            .prompt = "hello",
+            .backend = .metal,
+            .kernel_jit = .{ .mode = .on },
+            .kernel_jit_draft_qualified_profile = "/tmp/draft-qualified.json",
+        }),
+    );
+    try std.testing.expectError(
+        error.KernelJitQualifiedProfileCaptureConflict,
+        validateKernelJitOptions(.{
+            .model_dir = "/tmp/model",
+            .prompt = "hello",
+            .backend = .metal,
+            .kernel_jit = .{ .mode = .on, .qualified_profile_path = "/tmp/qualified.json" },
+            .kernel_jit_profile_out = "/tmp/capture.json",
+        }),
+    );
+}
+
+test "explicit local kernel JIT options bypass only ambient server routing" {
+    const ambient = "http://127.0.0.1:8090";
+    try std.testing.expectEqualStrings(ambient, selectedServerUrl(.{
+        .model_dir = "/tmp/model",
+        .prompt = "hello",
+    }, ambient).?);
+    try std.testing.expect(selectedServerUrl(.{
+        .model_dir = "/tmp/model",
+        .prompt = "hello",
+        .kernel_jit_options_explicit = true,
+    }, ambient) == null);
+    try std.testing.expectEqualStrings("http://explicit:8090", selectedServerUrl(.{
+        .model_dir = "/tmp/model",
+        .prompt = "hello",
+        .server_url = "http://explicit:8090",
+        .kernel_jit_options_explicit = true,
+    }, ambient).?);
 }
 
 test "parseArgs accepts server URL" {
@@ -6040,15 +8482,112 @@ test "server generate rejects unsupported server options" {
     try std.testing.expect(!serverGenerateSupportsOptions(.{
         .model_dir = "gemma-e2b",
         .prompt = "hello",
-        .backend = .cuda,
-        .raw_decode_bench = true,
+        .backend = .metal,
+        .kernel_jit_profile_out = "/tmp/profile.json",
+    }));
+    try std.testing.expect(!serverGenerateSupportsOptions(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .metal,
+        .kernel_jit_options_explicit = true,
     }));
     try std.testing.expect(!serverGenerateSupportsOptions(.{
         .model_dir = "gemma-e2b",
         .prompt = "hello",
         .backend = .cuda,
+        .raw_decode_bench = true,
+    }));
+    try std.testing.expect(serverGenerateSupportsOptions(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .cuda,
         .ignore_eos = true,
     }));
+}
+
+test "server generate forwards only explicit ignore eos" {
+    const messages = [_]api.ChatMessage{.{
+        .role = .user,
+        .content = .{ .string = "hello" },
+    }};
+    const defaults = serverGenerateRequest(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .cuda,
+    }, &messages);
+    const default_body = try serializeServerGenerateRequest(std.testing.allocator, defaults);
+    defer std.testing.allocator.free(default_body);
+    try std.testing.expect(std.mem.indexOf(u8, default_body, "\"ignore_eos\"") == null);
+
+    const controlled = serverGenerateRequest(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .cuda,
+        .ignore_eos = true,
+    }, &messages);
+    const controlled_body = try serializeServerGenerateRequest(std.testing.allocator, controlled);
+    defer std.testing.allocator.free(controlled_body);
+    try std.testing.expect(std.mem.indexOf(u8, controlled_body, "\"ignore_eos\":true") != null);
+}
+
+test "server generate stream requests terminal usage accounting" {
+    const messages = [_]api.ChatMessage{.{
+        .role = .user,
+        .content = .{ .string = "hello" },
+    }};
+    const request = serverGenerateRequest(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .cuda,
+        .stream = true,
+    }, &messages);
+    const body = try serializeServerGenerateRequest(std.testing.allocator, request);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream_options\":{\"include_usage\":true}") != null);
+}
+
+test "server generate forwards supported speculation options" {
+    const opts = Options{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .cuda,
+        .draft_model = "gemma-e2b-mtp",
+        .speculative_k = 7,
+        .speculation_policy = .force,
+        .speculation_calibration = .positive,
+    };
+    try std.testing.expect(serverGenerateSupportsOptions(opts));
+
+    const messages = [_]api.ChatMessage{.{
+        .role = .user,
+        .content = .{ .string = opts.prompt },
+    }};
+    const request = serverGenerateRequest(opts, &messages);
+    const body = try serializeServerGenerateRequest(std.testing.allocator, request);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"draft_model\":\"gemma-e2b-mtp\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"speculative_k\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"speculation_policy\":\"force\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"speculation_calibration\":\"positive\"") != null);
+}
+
+test "server generate stream retains final speculation status" {
+    var writer = ServerGenerateSseWriter{ .allocator = std.testing.allocator };
+    defer writer.deinit();
+    try writer.writeAll(
+        "data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gemma-e2b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"speculation\":{\"policy\":\"auto\",\"calibration\":\"probe\",\"decision\":\"disabled_slow\",\"disabled_reason\":\"mtp_auto_cost_probe_slow\"}}\n\n",
+    );
+    try writer.writeAll(
+        "data: {\"id\":\"chunk-2\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gemma-e2b\",\"choices\":[],\"usage\":{\"prompt_tokens\":2003,\"completion_tokens\":300,\"total_tokens\":2303}}\n\n",
+    );
+    try writer.finish();
+    try std.testing.expectEqualStrings(
+        "speculation: policy=auto calibration=probe decision=disabled_slow disabled_reason=mtp_auto_cost_probe_slow",
+        writer.speculation_summary.?,
+    );
+    try std.testing.expectEqual(api.FinishReason.stop, writer.finish_reason.?);
+    try std.testing.expectEqual(@as(i64, 2003), writer.usage.?.prompt_tokens);
+    try std.testing.expectEqual(@as(i64, 300), writer.usage.?.completion_tokens);
 }
 
 test "server model name strips local models dir prefix" {
@@ -6074,4 +8613,90 @@ test "explicit compiled whole model does not route through live executor" {
         .compiled_target = .whole_model,
     };
     try std.testing.expect(!liveWholeModelExecutorRequested(&opts));
+}
+
+test "live whole-model split KV policy preserves cache and compaction guards" {
+    const gpt_config = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+        .ple_hidden_size = 256,
+    };
+    try std.testing.expect(liveWholeModelAllowsSplitSwaRing(gpt_config, .{}));
+    try std.testing.expect(!liveWholeModelAllowsSplitSwaRing(gpt_config, .{
+        .prompt_cache_enabled = true,
+    }));
+    try std.testing.expect(!liveWholeModelAllowsSplitSwaRing(gpt_config, .{
+        .cache_compaction_ratio = 0.5,
+    }));
+}
+
+test "live whole-model generation excludes all EOS tokens unless ignored" {
+    var gpt_config = gpt_mod.Config{
+        .eos_token_id = 7,
+        .extra_eos_token_ids_len = 1,
+    };
+    gpt_config.extra_eos_token_ids[0] = 9;
+
+    try std.testing.expect(liveWholeModelShouldStopOnEos(gpt_config, false, 7));
+    try std.testing.expect(liveWholeModelShouldStopOnEos(gpt_config, false, 9));
+    try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, false, 4));
+    try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, true, 7));
+    try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, false, -1));
+}
+
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
+
+test "cuda gemma prefill prewarm defaults on with bidirectional env overrides" {
+    const allocator = std.testing.allocator;
+    const names = [_][:0]const u8{
+        "ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM",
+        "ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM",
+        "ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM",
+        "ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM",
+    };
+    var saved: [names.len]?[:0]u8 = @splat(null);
+    defer for (names, saved) |name, value| {
+        if (value) |owned| {
+            _ = setenv(name.ptr, owned.ptr, 1);
+            allocator.free(owned);
+        } else {
+            _ = unsetenv(name.ptr);
+        }
+    };
+    for (names, &saved) |name, *slot| {
+        if (platform.env.getenv(name.ptr)) |value| slot.* = try allocator.dupeZ(u8, value);
+        _ = unsetenv(name.ptr);
+    }
+
+    // Unset: promoted default-on.
+    try std.testing.expect(cudaGemmaPrefillPrewarmEnabled());
+
+    // Explicit 0 on either enable variable disables.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", "0", 1));
+    try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", "1", 1));
+    try std.testing.expect(cudaGemmaPrefillPrewarmEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM", "0", 1));
+    try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM"));
+
+    // Either explicit false wins when both enable variables are configured.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM", "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", "0", 1));
+    try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM", "0", 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", "1", 1));
+    try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM"));
+
+    // The DISABLE variables always win.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM", "1", 1));
+    try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM"));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM", "1", 1));
+    try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
 }

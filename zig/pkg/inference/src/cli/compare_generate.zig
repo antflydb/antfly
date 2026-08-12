@@ -2780,7 +2780,7 @@ fn makeAnalyzeRunBudget(
     };
     var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
     budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
-    budget_limits = applyBudgetOverrides(budget_limits, opts);
+    budget_limits = try applyBudgetOverrides(budget_limits, opts);
 
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
@@ -2797,7 +2797,7 @@ fn makeAnalyzeRunBudget(
     };
 
     _ = allocator;
-    print("budget: host={d}MB backend={d}MB combined={d}MB kv={d}MB scratch={d}MB\n", .{
+    print("budget: host={d}MiB backend={d}MiB combined={d}MiB kv={d}MiB scratch={d}MiB\n", .{
         budget_limits.host_limit_bytes / (1024 * 1024),
         budget_limits.backend_limit_bytes / (1024 * 1024),
         budget_limits.combined_limit_bytes / (1024 * 1024),
@@ -2816,14 +2816,14 @@ fn backendKindForSession(backend: backends.BackendType) ?runtime.kv.pool.Backend
     };
 }
 
-fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) runtime.tier.memory.Limits {
-    var limits = defaults;
-    if (opts.host_budget_mb > 0) limits.host_limit_bytes = opts.host_budget_mb * 1024 * 1024;
-    if (opts.backend_budget_mb > 0) limits.backend_limit_bytes = opts.backend_budget_mb * 1024 * 1024;
-    if (opts.combined_budget_mb > 0) limits.combined_limit_bytes = opts.combined_budget_mb * 1024 * 1024;
-    if (opts.kv_budget_mb > 0) limits.kv_limit_bytes = opts.kv_budget_mb * 1024 * 1024;
-    if (opts.scratch_budget_mb > 0) limits.scratch_limit_bytes = opts.scratch_budget_mb * 1024 * 1024;
-    return limits;
+fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) !runtime.tier.memory.Limits {
+    return (runtime.tier.memory.BudgetOverridesMib{
+        .host = opts.host_budget_mb,
+        .backend = opts.backend_budget_mb,
+        .combined = opts.combined_budget_mb,
+        .kv = opts.kv_budget_mb,
+        .scratch = opts.scratch_budget_mb,
+    }).apply(defaults);
 }
 
 fn printCompareBudgetExceeded(

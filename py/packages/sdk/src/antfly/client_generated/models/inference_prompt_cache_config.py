@@ -20,9 +20,12 @@ class InferencePromptCacheConfig:
         enabled (bool | Unset): Enable inference-native prompt KV cache reuse for generator requests. Default: False.
         mode (InferencePromptCacheConfigMode | Unset): Prompt KV cache implementation. `block_hash` (default) uses hash-
             addressed
-            full KV blocks under prompt_cache_key with O(1) block lookup and is the
-            scalable production mode. `simple` keeps the linear-scan retained-prefix
-            cache and is only suitable for small caches or debugging.
+            full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an
+            opt-in page-aligned compressed radix tree with shared-prefix ownership and
+            leaf-only LRU eviction; it is currently qualified for native and Metal
+            backends. Eligible Metal requests use eager paged attention; explicit compiled
+            generation is incompatible with prompt caching. `simple` keeps the linear-scan
+            retained-prefix cache and is only suitable for small caches or debugging.
              Default: InferencePromptCacheConfigMode.BLOCK_HASH.
         max_bytes_mb (int | Unset): Node-wide target for live prompt-cache entries. The runtime divides it
             across participating model caches and evicts using estimated metadata

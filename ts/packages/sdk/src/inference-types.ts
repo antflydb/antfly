@@ -50,6 +50,11 @@ export type ModelsResponse = components["schemas"]["InferenceModelsResponse"];
 export type TranscribeRequest = components["schemas"]["InferenceTranscribeRequest"];
 export type TranscribeResponse = components["schemas"]["InferenceTranscribeResponse"];
 
+export type InferenceChatMessage = components["schemas"]["InferenceChatMessage"];
+export type GenerateRequest = components["schemas"]["InferenceGenerateRequest"];
+export type GenerateResponse = components["schemas"]["InferenceGenerateResponse"];
+export type GenerateChunk = components["schemas"]["InferenceGenerateChunk"];
+
 // Content part types for multimodal embeddings
 export type ContentPart = components["schemas"]["InferenceContentPart"];
 export type TextContentPart = components["schemas"]["InferenceTextContentPart"];
@@ -82,6 +87,8 @@ export interface InferenceConfig {
   baseUrl: string;
   /** Additional headers to include in requests */
   headers?: Record<string, string>;
+  /** Maximum binary inference response size. Defaults to 64 MiB. */
+  maxBinaryResponseBytes?: number;
 }
 
 // Helper type for embedding input - supports all three formats

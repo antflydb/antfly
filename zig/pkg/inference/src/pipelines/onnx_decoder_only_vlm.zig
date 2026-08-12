@@ -368,7 +368,9 @@ pub const Pipeline = struct {
         const prompt = if (self.prompt_override) |override|
             try self.allocator.dupe(u8, override)
         else if (self.chat_tmpl) |ct|
-            try ct.apply(self.allocator, messages, true)
+            try ct.applyWithOptions(self.allocator, messages, .{
+                .enable_thinking = config.enable_thinking,
+            })
         else
             try generation.formatMessages(self.allocator, messages);
         defer self.allocator.free(prompt);
@@ -444,7 +446,7 @@ pub const Pipeline = struct {
             try generation_ids.append(self.allocator, next_token_i32);
             try penalty_state.noteToken(self.allocator, next_token_i64);
 
-            if (isEosToken(self.eos_token_ids, next_token_i64)) {
+            if (!config.ignore_eos and isEosToken(self.eos_token_ids, next_token_i64)) {
                 finish_reason = "stop";
                 break;
             }

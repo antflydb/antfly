@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -9,6 +10,19 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+func TestHAStartupGateSerializationPreservesExplicitFalseRuntimeEligibility(t *testing.T) {
+	raw, err := json.Marshal(HAStartupGateSpec{
+		Policy:             HAStartupGatePolicyRequireActivatedSeed,
+		ReceiptMatchPolicy: HAReceiptMatchPolicyExact,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"runtimeEligible":false`) {
+		t.Fatalf("fail-closed runtimeEligible=false was omitted from JSON: %s", raw)
+	}
+}
 
 func TestValidateCreate_ValidBalanced(t *testing.T) {
 	cluster := &AntflyCluster{
@@ -1740,6 +1754,48 @@ func TestDefault_StandaloneDefaults(t *testing.T) {
 	}
 }
 
+func TestDefault_NormalizesLegacySwarmToStandaloneWithoutChangingResourceIdentity(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.Mode = ClusterModeSwarm
+	cluster.Spec.Swarm = cluster.Spec.Standalone
+	cluster.Spec.Standalone = nil
+	cluster.Spec.Storage.SwarmStorage = cluster.Spec.Storage.StandaloneStorage
+	cluster.Spec.Storage.StandaloneStorage = ""
+
+	cluster.Default()
+
+	if cluster.Spec.Mode != ClusterModeStandalone || cluster.Spec.Standalone == nil {
+		t.Fatalf("expected legacy Swarm shape to normalize to Standalone: %#v", cluster.Spec)
+	}
+	if cluster.Spec.Standalone.ResourceIdentity != StandaloneResourceIdentityLegacySwarm {
+		t.Fatalf("expected legacy resource identity, got %q", cluster.Spec.Standalone.ResourceIdentity)
+	}
+	if cluster.Spec.Storage.StandaloneStorage != "1Gi" || cluster.Spec.Swarm != nil {
+		t.Fatalf("expected storage migration without duplicate Swarm shape: %#v", cluster.Spec.Storage)
+	}
+}
+
+func TestValidateUpdate_AllowsOnlyLegacySwarmToStandaloneIdentityMigration(t *testing.T) {
+	old := baseStandaloneCluster()
+	old.Spec.Mode = ClusterModeSwarm
+	old.Spec.Swarm = old.Spec.Standalone
+	old.Spec.Standalone = nil
+	old.Spec.Storage.SwarmStorage = old.Spec.Storage.StandaloneStorage
+	old.Spec.Storage.StandaloneStorage = ""
+
+	next := old.DeepCopy()
+	next.Default()
+	if err := next.ValidateUpdate(old); err != nil {
+		t.Fatalf("expected one-way legacy migration to pass, got %v", err)
+	}
+
+	wrongIdentity := next.DeepCopy()
+	wrongIdentity.Spec.Standalone.ResourceIdentity = StandaloneResourceIdentityV1
+	if err := wrongIdentity.ValidateUpdate(old); err == nil {
+		t.Fatal("expected Swarm migration to current Standalone resource identity to fail")
+	}
+}
+
 func TestDefault_StandaloneLiteDefaultsFileName(t *testing.T) {
 	cluster := baseStandaloneCluster()
 	cluster.Spec.Storage.Engine = "lite"
@@ -1897,6 +1953,9 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
+		Runtime: &HARuntimeSpec{Role: HARuntimeRolePrimary, NodeID: "primary-a", AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"}, FencingLease: &HARuntimeFencingLeaseSpec{
+			Name: "topology-ha-fence", TopologyID: "topology-anchor-uid", WatchdogGraceSeconds: 10,
+		}},
 		Admin: &HAAdminSpec{
 			PrimaryURL:            "http://primary-ha.default.svc:8081",
 			ExecutePlannedActions: true,
@@ -1931,6 +1990,96 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 
 	if err := cluster.ValidateCreate(); err != nil {
 		t.Fatalf("expected valid hot-standby HA config, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityAutomaticFailoverRequiresNoLossDurability(t *testing.T) {
+	base := baseStandaloneCluster()
+	base.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Runtime: &HARuntimeSpec{Role: HARuntimeRolePrimary, NodeID: "primary-a", AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"}, FencingLease: &HARuntimeFencingLeaseSpec{
+			Name: "topology-ha-fence", TopologyID: "topology-anchor-uid", WatchdogGraceSeconds: 10,
+		}},
+		Admin: &HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081", ExecutePlannedActions: true},
+		Standbys: []HAStandbySpec{{
+			Name:          "standby-a",
+			AdminURL:      "http://standby-a-ha.default.svc:8081",
+			RouteSelector: map[string]string{"app.kubernetes.io/instance": "standby-a"},
+		}},
+		Identity: &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a"},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityKubernetesLease,
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:          HADurabilityModeRemoteApply,
+			Required:      1,
+			StandbyNames:  []string{"standby-a"},
+			FailurePolicy: HAFailurePolicyBlock,
+		},
+	}
+	if err := base.ValidateCreate(); err != nil {
+		t.Fatalf("expected no-loss automatic failover baseline to be valid: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*HighAvailabilitySpec)
+		message string
+	}{
+		{
+			name: "async",
+			mutate: func(ha *HighAvailabilitySpec) {
+				ha.SyncPolicy = &HASyncPolicy{Mode: HADurabilityModeAsync}
+			},
+			message: "automaticFailover requires syncPolicy.mode RemoteApply",
+		},
+		{
+			name: "remote write",
+			mutate: func(ha *HighAvailabilitySpec) {
+				ha.SyncPolicy.Mode = HADurabilityModeRemoteWrite
+			},
+			message: "automaticFailover requires syncPolicy.mode RemoteApply",
+		},
+		{
+			name: "degrade to async",
+			mutate: func(ha *HighAvailabilitySpec) {
+				ha.SyncPolicy.FailurePolicy = HAFailurePolicyDegradeToAsync
+			},
+			message: "automaticFailover requires syncPolicy.failurePolicy Block or FailClosed",
+		},
+		{
+			name: "remote apply opt out",
+			mutate: func(ha *HighAvailabilitySpec) {
+				value := false
+				ha.AutomaticFailover.RequireRemoteApply = &value
+			},
+			message: "automaticFailover.requireRemoteApply must be true",
+		},
+		{
+			name: "watchdog grace below timing floor",
+			mutate: func(ha *HighAvailabilitySpec) {
+				ha.Runtime.FencingLease.WatchdogGraceSeconds = 9
+			},
+			message: "watchdogGraceSeconds must be at least 10 seconds",
+		},
+		{
+			name: "watchdog grace reaches lease duration",
+			mutate: func(ha *HighAvailabilitySpec) {
+				ha.Runtime.FencingLease.WatchdogGraceSeconds = 30
+			},
+			message: "watchdogGraceSeconds must be less than the 30 second Lease duration",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cluster := base.DeepCopy()
+			tc.mutate(cluster.Spec.HighAvailability)
+			err := cluster.ValidateCreate()
+			if err == nil || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("expected %q rejection, got %v", tc.message, err)
+			}
+		})
 	}
 }
 
@@ -2003,6 +2152,319 @@ func TestValidateCreate_HighAvailabilityAllowsExecutableActionsWithoutEveryStand
 	}
 }
 
+func TestValidateCreate_HighAvailabilityAllowsPortableSeedArtifact(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:             "standby-a",
+			SeedManifestPath: "/antflydb/seed/manifest.afha",
+			SeedContentRoot:  "/antflydb/seed/content",
+			SeedArtifact: &HASeedArtifactSpec{
+				Location:             "s3://ha-seeds/cluster-a",
+				GenerationPrefix:     "prod",
+				StagingRoot:          "/antflydb/seed/staging",
+				TopologyID:           "cluster-a",
+				TopologyGeneration:   1,
+				NodeID:               "standby-a",
+				TargetPVCUID:         "standby-pvc-uid",
+				CredentialsSecretRef: &corev1.LocalObjectReference{Name: "ha-seed-credentials"},
+				RetainGenerations:    2,
+				SourcePVC:            &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/antflydb/seed"},
+				TargetPVC:            &HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/antflydb/seed"},
+			},
+		}},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected portable seed artifact configuration to be valid, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsNonExecutablePortableSeedArtifact(t *testing.T) {
+	base := baseStandaloneCluster()
+	base.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{Role: HARuntimeRolePrimary, NodeID: "primary-a", AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"}},
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a", SeedManifestPath: "/source/manifest.afha", SeedContentRoot: "/source/content",
+			SeedArtifact: &HASeedArtifactSpec{
+				Location: "s3://ha-seeds/cluster-a", StagingRoot: "/target/staging",
+				TopologyID: "cluster-a", TopologyGeneration: 1, NodeID: "standby-a", TargetPVCUID: "target-pvc-uid",
+				SourcePVC: &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+				TargetPVC: &HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+			},
+		}},
+	}
+	if err := base.ValidateCreate(); err != nil {
+		t.Fatalf("valid executable seed fixture: %v", err)
+	}
+
+	tests := map[string]func(*HASeedArtifactSpec){
+		"topology id":         func(a *HASeedArtifactSpec) { a.TopologyID = "" },
+		"topology generation": func(a *HASeedArtifactSpec) { a.TopologyGeneration = 0 },
+		"node id":             func(a *HASeedArtifactSpec) { a.NodeID = "" },
+		"target pvc uid":      func(a *HASeedArtifactSpec) { a.TargetPVCUID = "" },
+		"source pvc":          func(a *HASeedArtifactSpec) { a.SourcePVC = nil },
+		"target pvc":          func(a *HASeedArtifactSpec) { a.TargetPVC = nil },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			cluster := base.DeepCopy()
+			mutate(cluster.Spec.HighAvailability.Standbys[0].SeedArtifact)
+			if err := cluster.ValidateCreate(); err == nil {
+				t.Fatal("expected incomplete portable seed artifact to be rejected")
+			}
+		})
+	}
+}
+
+func TestValidateCreate_HighAvailabilityAllowsRuntimeOwnedSeedCapture(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRolePrimary, NodeID: "primary-a",
+			AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"},
+			SeedCaptureRoot: "/antflydb/ha/seed-captures",
+		},
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a",
+			SeedArtifact: &HASeedArtifactSpec{
+				Location:    "s3://ha-seeds/cluster-a",
+				StagingRoot: "/target/.antfly-ha/staging",
+				SourcePVC:   &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/antflydb"},
+				TargetPVC:   &HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+			},
+		}},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected runtime-owned seed capture configuration to be valid, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRoleStandby, NodeID: "standby-a",
+			AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"},
+			Standby: &HAStandbyRuntimeSpec{UpstreamURL: "http://primary.default.svc:8080", SlotName: "standby-a"},
+			StartupGate: &HAStartupGateSpec{
+				Policy:             HAStartupGatePolicyRequireActivatedSeed,
+				RuntimeEligible:    false,
+				ReceiptMatchPolicy: HAReceiptMatchPolicyExact,
+				RequiredReceipt: &HARequiredSeedActivationReceipt{
+					TopologyID: "test-standalone-cluster", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
+					Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data", TargetPVCUID: "standby-pvc-uid",
+					ManifestSHA256: strings.Repeat("a", 64),
+				},
+			},
+		},
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a", SeedManifestPath: "/source/manifest.afha", SeedContentRoot: "/source/content",
+			SeedArtifact: &HASeedArtifactSpec{
+				Location: "s3://ha-seeds/cluster-a", Generation: "prod-standby-a-10",
+				StagingRoot: "/target/.antfly-ha/staging",
+				TopologyID:  "test-standalone-cluster", TopologyGeneration: 3, NodeID: "standby-a", TargetPVCUID: "standby-pvc-uid",
+				SourcePVC: &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+				TargetPVC: &HASeedArtifactPVCSpec{ClaimName: "standby-a-data", MountPath: "/target"},
+			},
+		}},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected exact activated-seed startup gate to be valid: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityAllowsSharedTopologyAnnotationAcrossRuntimeCRs(t *testing.T) {
+	targetOnly := false
+	cluster := baseStandaloneCluster()
+	cluster.Name = "antflydb-standby-a"
+	cluster.Annotations = map[string]string{"antfly.io/ha-topology-id": "antflydb"}
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode:     HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a"},
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRoleStandby, NodeID: "standby-a",
+			AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"},
+			Standby: &HAStandbyRuntimeSpec{UpstreamURL: "http://primary.default.svc:8080", SlotName: "standby-a"},
+			StartupGate: &HAStartupGateSpec{
+				Policy: HAStartupGatePolicyRequireActivatedSeed, RuntimeEligible: false, ReceiptMatchPolicy: HAReceiptMatchPolicyExact,
+				RequiredReceipt: &HARequiredSeedActivationReceipt{
+					TopologyID: "antflydb", TopologyGeneration: 3, NodeID: "standby-a", SlotName: "standby-a",
+					Generation: "prod-standby-a-10", TargetPVCName: "standby-a-data",
+				},
+			},
+		},
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a", Desired: &targetOnly,
+			SeedArtifact: &HASeedArtifactSpec{
+				Location: "s3://ha-seeds/antflydb", Generation: "prod-standby-a-10", StagingRoot: "/target/.antfly-ha/staging",
+				TargetPVC: &HASeedArtifactPVCSpec{ClaimName: "standby-a-data", MountPath: "/target"},
+			},
+		}},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected exact-gated standby-local target-only seed artifact to be accepted: %v", err)
+	}
+	cluster.Spec.HighAvailability.Standbys[0].SeedArtifact.SourcePVC = &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"}
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "sourcePVC must be omitted for standby-local target-only seed artifact") {
+		t.Fatalf("expected target-only seed artifact with sourcePVC to fail closed, got: %v", err)
+	}
+	cluster.Spec.HighAvailability.Standbys[0].SeedArtifact.SourcePVC = nil
+	cluster.Spec.HighAvailability.Standbys[0].Desired = nil
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "runtime-owned seed capture requires runtime.role Primary") {
+		t.Fatalf("expected implicit desired=true source-less artifact to retain primary-only validation, got: %v", err)
+	}
+	cluster.Spec.HighAvailability.Standbys[0].Desired = &targetOnly
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.Generation = "stale-generation"
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "requiredReceipt.generation must match seedArtifact.generation") {
+		t.Fatalf("expected target-only artifact without an exact generation binding to fail closed, got: %v", err)
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.Generation = "prod-standby-a-10"
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TopologyID = "other-topology"
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "must match metadata.annotations[antfly.io/ha-topology-id]") {
+		t.Fatalf("expected annotated topology mismatch to fail closed, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityAllowsExplicitSuspendStartupGate(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode:     HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 2, Epoch: 2, CurrentPrimaryID: "primary-b"},
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRoleStandby, NodeID: "former-primary-a",
+			AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN", AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"},
+			Standby: &HAStandbyRuntimeSpec{UpstreamURL: "http://primary-b.default.svc:8080", SlotName: "former-primary-a"},
+			StartupGate: &HAStartupGateSpec{
+				Policy:          HAStartupGatePolicy("Suspend"),
+				RuntimeEligible: false,
+			},
+		},
+		Standbys: []HAStandbySpec{{Name: "former-primary-a"}},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected fail-closed Suspend startup gate without activation evidence to be valid: %v", err)
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = true
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "Suspend requires runtimeEligible=false") {
+		t.Fatalf("expected Suspend with runtimeEligible=true to be rejected: %v", err)
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = false
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt = &HARequiredSeedActivationReceipt{TopologyID: "must-not-be-used"}
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "requiredReceipt must be omitted for Suspend") {
+		t.Fatalf("expected Suspend with activation evidence to be rejected: %v", err)
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt = nil
+	cluster.Spec.HighAvailability.Runtime.Role = HARuntimeRolePrimary
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "requires runtime.role Standby") {
+		t.Fatalf("expected Suspend on a primary runtime to be rejected: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsUnboundStartupGate(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode:     HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a"},
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRoleStandby, NodeID: "standby-a",
+			Standby: &HAStandbyRuntimeSpec{UpstreamURL: "http://primary.default.svc:8080", SlotName: "standby-b"},
+			StartupGate: &HAStartupGateSpec{
+				Policy: HAStartupGatePolicy("Unsafe"), RuntimeEligible: true,
+				ReceiptMatchPolicy: HAReceiptMatchPolicy("Prefix"),
+				RequiredReceipt: &HARequiredSeedActivationReceipt{
+					TopologyID: "other-topology", TopologyGeneration: -1, NodeID: "standby-b", SlotName: "standby-a",
+					Generation: "wrong-generation", TargetPVCName: "wrong-pvc",
+					ManifestSHA256: "not-a-digest", TargetPVCUID: " padded ",
+				},
+			},
+		},
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a", SeedManifestPath: "/source/manifest.afha", SeedContentRoot: "/source/content",
+			SeedArtifact: &HASeedArtifactSpec{
+				Location: "s3://ha-seeds/cluster-a", Generation: "prod-standby-a-10",
+				StagingRoot: "/target/.antfly-ha/staging",
+				SourcePVC:   &HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+				TargetPVC:   &HASeedArtifactPVCSpec{ClaimName: "standby-a-data", MountPath: "/target"},
+			},
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected unbound startup gate to be rejected")
+	}
+	for _, want := range []string{
+		"startupGate.policy must be Suspend or RequireActivatedSeed",
+		"startupGate.receiptMatchPolicy must be Exact",
+		"requiredReceipt.topologyID must match metadata.name",
+		"requiredReceipt.topologyGeneration must not be negative",
+		"requiredReceipt.nodeID must match runtime.nodeID",
+		"requiredReceipt.slotName must match runtime.standby.slotName",
+		"requiredReceipt.generation must match seedArtifact.generation",
+		"requiredReceipt.targetPVCName must match seedArtifact.targetPVC.claimName",
+		"requiredReceipt.manifestSHA256 must be a lowercase SHA-256 digest",
+		"requiredReceipt.targetPVCUID must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected startup gate validation error containing %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsUnsafeSeedArtifact(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a",
+			SeedArtifact: &HASeedArtifactSpec{
+				Location:             "http://not-object-storage/seed",
+				GenerationPrefix:     "bad prefix",
+				StagingRoot:          "relative/staging",
+				CredentialsSecretRef: &corev1.LocalObjectReference{Name: " Bad Secret "},
+				TargetPVC:            &HASeedArtifactPVCSpec{ClaimName: " Bad Claim ", MountPath: "relative"},
+			},
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected unsafe portable seed artifact configuration to be rejected")
+	}
+	for _, want := range []string{
+		"seedArtifact.location must be an s3://, gs://, or file:// URI",
+		"seedArtifact.generationPrefix must be a valid HA identifier",
+		"seedArtifact.stagingRoot must be an absolute normalized path",
+		"seedArtifact.credentialsSecretRef.name must not have leading or trailing whitespace",
+		"seedArtifact.targetPVC.claimName must not have leading or trailing whitespace",
+		"seedArtifact.targetPVC.mountPath must be an absolute normalized path",
+		"runtime-owned seed capture requires runtime.role Primary",
+		"seedArtifact.sourcePVC is required for runtime-owned seed publication",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected portable seed validation error containing %q, got: %v", want, err)
+		}
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsAdminExecutionWithoutIdentity(t *testing.T) {
 	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
@@ -2030,14 +2492,25 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 	backoffLimit := int32(-1)
 	timeoutSeconds := int64(0)
 	ttlSecondsAfterFinished := int32(-10)
+	directRetryLimit := int32(0)
+	directRetryBaseSeconds := int32(30)
+	directRetryMaxSeconds := int32(10)
+	directReservationSeconds := int32(0)
+	directPrerequisiteTimeoutSeconds := int32(0)
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
-			PrimaryURL:                 "primary-ha.default.svc:8081",
-			ExecutePlannedActions:      true,
-			JobBackoffLimit:            &backoffLimit,
-			JobTimeoutSeconds:          &timeoutSeconds,
-			JobTTLSecondsAfterFinished: &ttlSecondsAfterFinished,
+			PrimaryURL:                       "primary-ha.default.svc:8081",
+			ExecutePlannedActions:            true,
+			JobBackoffLimit:                  &backoffLimit,
+			JobTimeoutSeconds:                &timeoutSeconds,
+			JobTTLSecondsAfterFinished:       &ttlSecondsAfterFinished,
+			DirectRetryLimit:                 &directRetryLimit,
+			DirectRetryBaseSeconds:           &directRetryBaseSeconds,
+			DirectRetryMaxSeconds:            &directRetryMaxSeconds,
+			DirectReservationSeconds:         &directReservationSeconds,
+			DirectPrerequisiteTimeoutSeconds: &directPrerequisiteTimeoutSeconds,
+			RetryGeneration:                  -1,
 		},
 		Standbys: []HAStandbySpec{
 			{Name: "standby-a", AdminURL: "grpc://standby-a-ha.default.svc:8081"},
@@ -2053,8 +2526,70 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 		!strings.Contains(err.Error(), "standbys[0].adminURL") ||
 		!strings.Contains(err.Error(), "admin.jobBackoffLimit") ||
 		!strings.Contains(err.Error(), "admin.jobTimeoutSeconds") ||
-		!strings.Contains(err.Error(), "admin.jobTTLSecondsAfterFinished") {
+		!strings.Contains(err.Error(), "admin.jobTTLSecondsAfterFinished") ||
+		!strings.Contains(err.Error(), "admin.directRetryLimit") ||
+		!strings.Contains(err.Error(), "admin.directRetryMaxSeconds must be greater than or equal") ||
+		!strings.Contains(err.Error(), "admin.directReservationSeconds") ||
+		!strings.Contains(err.Error(), "admin.directPrerequisiteTimeoutSeconds") ||
+		!strings.Contains(err.Error(), "admin.retryGeneration") {
 		t.Fatalf("expected invalid HA admin endpoint errors, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityComparesRetryBaseWithEffectiveDefaultMaximum(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	retryBaseSeconds := int32(121)
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode:  HAModeHotStandby,
+		Admin: &HAAdminSpec{DirectRetryBaseSeconds: &retryBaseSeconds},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil || !strings.Contains(err.Error(), "admin.directRetryMaxSeconds must be greater than or equal to directRetryBaseSeconds") {
+		t.Fatalf("expected retry base above the effective default maximum to be rejected, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityComparesRetryMaximumWithEffectiveDefaultBase(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	retryMaxSeconds := int32(4)
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode:  HAModeHotStandby,
+		Admin: &HAAdminSpec{DirectRetryMaxSeconds: &retryMaxSeconds},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil || !strings.Contains(err.Error(), "admin.directRetryMaxSeconds must be greater than or equal to directRetryBaseSeconds") {
+		t.Fatalf("expected retry maximum below the effective default base to be rejected, got: %v", err)
+	}
+}
+
+func TestValidateUpdate_HighAvailabilityRetryGenerationCannotDecrease(t *testing.T) {
+	oldCluster := baseStandaloneCluster()
+	oldCluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode:  HAModeHotStandby,
+		Admin: &HAAdminSpec{RetryGeneration: 2},
+	}
+	updated := oldCluster.DeepCopy()
+	updated.Spec.HighAvailability.Admin.RetryGeneration = 1
+
+	err := updated.ValidateUpdate(oldCluster)
+	if err == nil || !strings.Contains(err.Error(), "admin.retryGeneration cannot decrease") {
+		t.Fatalf("expected retryGeneration rollback to be rejected, got: %v", err)
+	}
+
+	updated.Spec.HighAvailability.Admin.RetryGeneration = 3
+	if err := updated.ValidateUpdate(oldCluster); err != nil {
+		t.Fatalf("expected monotonic retryGeneration recovery bump to be accepted, got: %v", err)
+	}
+
+	updated.Spec.HighAvailability.Admin = nil
+	if err := updated.ValidateUpdate(oldCluster); err == nil || !strings.Contains(err.Error(), "admin.retryGeneration cannot decrease") {
+		t.Fatalf("expected removing admin to preserve the monotonic retryGeneration boundary, got: %v", err)
+	}
+	updated.Spec.HighAvailability = nil
+	if err := updated.ValidateUpdate(oldCluster); err == nil || !strings.Contains(err.Error(), "admin.retryGeneration cannot decrease") {
+		t.Fatalf("expected removing HA to preserve the monotonic retryGeneration boundary, got: %v", err)
 	}
 }
 
@@ -2319,8 +2854,10 @@ func TestValidateCreate_HighAvailabilityRuntimeNodeIDMustMatchRoleIdentity(t *te
 			CurrentPrimaryID: "primary-a",
 		},
 		Runtime: &HARuntimeSpec{
-			Role:   HARuntimeRolePrimary,
-			NodeID: "standby-a",
+			Role:                HARuntimeRolePrimary,
+			NodeID:              "standby-a",
+			AdminTokenEnvVar:    "ANTFLY_HA_ADMIN_TOKEN",
+			AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"},
 		},
 	}
 
@@ -2563,6 +3100,31 @@ func TestValidateCreate_HighAvailabilityRuntimeAdminTokenRequiresPodEnvSource(t 
 	}}
 	if err := cluster.ValidateCreate(); err != nil {
 		t.Fatalf("expected runtime admin token to accept spec.standalone.envFrom token source, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRuntimeRequiresAdminToken(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRolePrimary,
+			NodeID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected hot-standby runtime without an admin token to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.adminTokenEnvVar is required") {
+		t.Fatalf("expected runtime admin token requirement, got: %v", err)
 	}
 }
 

@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { InferenceCapacityError, InferenceClient, serializeEmbeddings } from "../src/index.js";
+import {
+  Client,
+  InferenceAPIError,
+  InferenceCapacityError,
+  InferenceClient,
+  serializeEmbeddings,
+} from "../src/index.js";
 
 describe("InferenceClient", () => {
   it("should create a client with base config", () => {
@@ -20,12 +26,20 @@ describe("InferenceClient", () => {
     expect(client).toBeDefined();
   });
 
+  it("rejects invalid binary response limits", () => {
+    expect(
+      () => new InferenceClient({ baseUrl: "http://localhost:8080", maxBinaryResponseBytes: 0 })
+    ).toThrow("maxBinaryResponseBytes must be a positive safe integer");
+  });
+
   it("should have all expected methods", () => {
     const client = new InferenceClient({
       baseUrl: "http://localhost:8080",
     });
 
     expect(typeof client.embed).toBe("function");
+    expect(typeof client.generate).toBe("function");
+    expect(typeof client.generateStream).toBe("function");
     expect(typeof client.embedBinary).toBe("function");
     expect(typeof client.chunk).toBe("function");
     expect(typeof client.rerank).toBe("function");
@@ -94,14 +108,342 @@ describe("InferenceClient with mock fetch", () => {
     throw new Error("fetch call did not include a JSON request body");
   }
 
+  describe("generate", () => {
+    const request = {
+      model: "gemma",
+      messages: [{ role: "user" as const, content: "hello" }],
+    };
+
+    it("supports JSON and framed SSE generation without exposing the generated parser gap", async () => {
+      const completion = {
+        id: "chatcmpl-json",
+        object: "chat.completion" as const,
+        created: 1,
+        model: "gemma",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant" as const, content: "hello" },
+            finish_reason: "stop" as const,
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      };
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(JSON.stringify(completion), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(client.generate(request)).resolves.toEqual(completion);
+      expect(await lastFetchJSONBody()).toMatchObject({ model: "gemma", stream: false });
+
+      const encoder = new TextEncoder();
+      const eventBytes = encoder.encode(
+        ': heartbeat\r\n\r\nevent: message\r\ndata: {"id":"chatcmpl-stream","object":"chat.completion.chunk",\r\ndata: "created":1,"model":"gemma","choices":[{"index":0,"delta":{"content":"hé🐜"}}]}\r\n\r\ndata: [DONE]\r\n\r\n'
+      );
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              for (let index = 0; index < eventBytes.length; index++) {
+                controller.enqueue(eventBytes.slice(index, index + 1));
+              }
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream; charset=utf-8" } }
+        )
+      );
+
+      const controller = new AbortController();
+      const chunks = [];
+      for await (const chunk of client.generateStream(request, { signal: controller.signal })) {
+        chunks.push(chunk);
+      }
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]?.choices[0]?.delta.content).toBe("hé🐜");
+      expect(await lastFetchJSONBody()).toMatchObject({ model: "gemma", stream: true });
+      const [, init] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
+      expect(init?.signal).toBe(controller.signal);
+      expect((init?.headers as Record<string, string>).Accept).toBe("text/event-stream");
+    });
+
+    it("normalizes repeated trailing slashes and an explicit inference prefix", async () => {
+      const completion = {
+        id: "chatcmpl-json",
+        object: "chat.completion" as const,
+        created: 1,
+        model: "gemma",
+        choices: [],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      };
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(JSON.stringify(completion), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080/ai/v1///" });
+      await client.generate(request);
+      const [input] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
+      expect(input instanceof Request ? input.url : input).toBe(
+        "http://localhost:8080/ai/v1/generate"
+      );
+    });
+
+    it("forwards consolidated client authentication and custom headers", async () => {
+      const completion = {
+        id: "chatcmpl-json",
+        object: "chat.completion" as const,
+        created: 1,
+        model: "gemma",
+        choices: [],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      };
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(JSON.stringify(completion), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      );
+
+      const client = new Client({
+        baseUrl: "http://localhost:8080",
+        auth: { type: "token", token: "secret" },
+        headers: { "X-Tenant": "tenant-1" },
+      });
+      await client.Inference().generate(request);
+
+      const [input, init] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
+      const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+      expect(headers.get("Authorization")).toBe("Bearer secret");
+      expect(headers.get("X-Tenant")).toBe("tenant-1");
+    });
+
+    it("returns typed 507 detail and cancels the response body when iteration stops", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: "MEMORY_BUDGET_EXCEEDED",
+            message: "model needs 8 GiB",
+            retryable: true,
+          }),
+          { status: 507, headers: { "Content-Type": "application/json" } }
+        )
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      let caught: unknown;
+      try {
+        await client.generate(request);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(InferenceAPIError);
+      expect(caught).toMatchObject({
+        status: 507,
+        code: "MEMORY_BUDGET_EXCEEDED",
+        retryable: true,
+      });
+      expect((caught as Error).message).toContain("model needs 8 GiB (MEMORY_BUDGET_EXCEEDED)");
+
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: "MEMORY_BUDGET_EXCEEDED",
+            message: "model needs 8 GiB",
+            retryable: true,
+          }),
+          { status: 507, headers: { "Content-Type": "application/json" } }
+        )
+      );
+      await expect(client.generateStream(request).next()).rejects.toMatchObject({
+        status: 507,
+        code: "MEMORY_BUDGET_EXCEEDED",
+        retryable: true,
+      });
+
+      const cancel = vi.fn();
+      const body = new ReadableStream<Uint8Array>({
+        start(streamController) {
+          streamController.enqueue(
+            new TextEncoder().encode(
+              'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"gemma","choices":[]}\n\n'
+            )
+          );
+        },
+        cancel,
+      });
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } })
+      );
+      for await (const _chunk of client.generateStream(request)) break;
+      expect(cancel).toHaveBeenCalledOnce();
+    });
+
+    it("cancels the response body when a stream event contains invalid JSON", async () => {
+      const cancel = vi.fn();
+      const body = new ReadableStream<Uint8Array>({
+        start(streamController) {
+          streamController.enqueue(new TextEncoder().encode("data: not-json\n\n"));
+        },
+        cancel,
+      });
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } })
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(client.generateStream(request).next()).rejects.toThrow(
+        "Generation stream returned invalid JSON"
+      );
+      expect(cancel).toHaveBeenCalledOnce();
+    });
+
+    it("rejects malformed UTF-8 in stream JSON and cancels the response body", async () => {
+      const prefix = new TextEncoder().encode(
+        'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"gemma","choices":[{"index":0,"delta":{"content":"'
+      );
+      const suffix = new TextEncoder().encode('"}}]}\n\n');
+      const bytes = new Uint8Array(prefix.length + 2 + suffix.length);
+      bytes.set(prefix);
+      bytes.set([0xc3, 0x28], prefix.length);
+      bytes.set(suffix, prefix.length + 2);
+      const cancel = vi.fn();
+      const body = new ReadableStream<Uint8Array>({
+        start(streamController) {
+          streamController.enqueue(bytes);
+        },
+        cancel,
+      });
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } })
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(client.generateStream(request).next()).rejects.toThrow(
+        "Generation stream contained invalid UTF-8"
+      );
+      expect(cancel).toHaveBeenCalledOnce();
+    });
+
+    it("rejects oversized SSE transport chunks before decoding and cancels the body", async () => {
+      const cancel = vi.fn();
+      const body = new ReadableStream<Uint8Array>({
+        start(streamController) {
+          streamController.enqueue(new Uint8Array((16 << 20) + 1));
+        },
+        cancel,
+      });
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } })
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(client.generateStream(request).next()).rejects.toThrow(
+        "Generation SSE chunk exceeded 16777216 bytes"
+      );
+      expect(cancel).toHaveBeenCalledOnce();
+    });
+
+    it("rejects oversized SSE lines accumulated across transport chunks", async () => {
+      const cancel = vi.fn();
+      const chunk = new Uint8Array(1 << 20);
+      chunk.fill(0x61);
+      const body = new ReadableStream<Uint8Array>({
+        start(streamController) {
+          for (let index = 0; index < 16; index++) streamController.enqueue(chunk);
+          streamController.enqueue(new Uint8Array([0x61]));
+        },
+        cancel,
+      });
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } })
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(client.generateStream(request).next()).rejects.toThrow(
+        "Generation SSE line exceeded 16777216 bytes"
+      );
+      expect(cancel).toHaveBeenCalledOnce();
+    });
+
+    it("bounds oversized error responses", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response("x".repeat((1 << 20) + 1), {
+          status: 500,
+          statusText: "Internal Server Error",
+        })
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(client.generate(request)).rejects.toThrow(
+        "Internal Server Error (response body exceeded 1048576 bytes)"
+      );
+    });
+
+    it("bounds oversized non-streaming generation responses", async () => {
+      const cancel = vi.fn();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("x".repeat((16 << 20) + 1)));
+        },
+        cancel,
+      });
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(body, {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(client.generate(request)).rejects.toThrow(
+        "Generation response exceeded 16777216 bytes"
+      );
+      expect(cancel).toHaveBeenCalledOnce();
+    });
+
+    it("rejects a stream that closes without [DONE]", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode(
+                  'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"gemma","choices":[]}\n\n'
+                )
+              );
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } }
+        )
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      const consume = async () => {
+        for await (const _chunk of client.generateStream(request)) {
+          // Consume the stream.
+        }
+      };
+      await expect(consume()).rejects.toThrow("ended before [DONE]");
+    });
+  });
+
   describe("embed (JSON response)", () => {
     it("should request JSON format and parse response", async () => {
       const mockResponse = {
+        object: "list" as const,
         model: "bge-small-en-v1.5",
-        embeddings: [
-          [0.1, 0.2, 0.3],
-          [0.4, 0.5, 0.6],
+        data: [
+          { object: "embedding" as const, index: 0, embedding: [0.1, 0.2, 0.3] },
+          { object: "embedding" as const, index: 1, embedding: [0.4, 0.5, 0.6] },
         ],
+        usage: { prompt_tokens: 2, total_tokens: 2 },
       };
 
       // openapi-fetch uses global fetch internally
@@ -120,20 +462,138 @@ describe("InferenceClient with mock fetch", () => {
       const result = await client.embed("bge-small-en-v1.5", ["hello", "world"]);
 
       expect(result.model).toBe("bge-small-en-v1.5");
-      expect(result.embeddings).toHaveLength(2);
-      expect(result.embeddings[0]).toEqual([0.1, 0.2, 0.3]);
-      expect(result.embeddings[1]).toEqual([0.4, 0.5, 0.6]);
+      expect(result.data).toHaveLength(2);
+      expect(result.data[0]?.embedding).toEqual([0.1, 0.2, 0.3]);
+      expect(result.data[1]?.embedding).toEqual([0.4, 0.5, 0.6]);
 
       // Verify fetch was called (openapi-fetch uses global fetch)
       expect(fetch).toHaveBeenCalled();
     });
 
+    it("rejects and cancels declared oversized generated-client responses", async () => {
+      const cancel = vi.fn();
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array([123]));
+            },
+            cancel,
+          }),
+          {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              "Content-Length": String((16 << 20) + 1),
+            },
+          }
+        )
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(client.embed("test-model", ["test"])).rejects.toThrow(
+        "Inference response exceeded 16777216 bytes"
+      );
+      expect(cancel).toHaveBeenCalledOnce();
+    });
+
+    it("bounds streamed binary bodies across generated-client calls", async () => {
+      const cancel = vi.fn();
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array(17));
+            },
+            cancel,
+          }),
+          { status: 200, headers: { "Content-Type": "application/octet-stream" } }
+        )
+      );
+
+      const client = new InferenceClient({
+        baseUrl: "http://localhost:8080",
+        maxBinaryResponseBytes: 16,
+      });
+      await expect(client.embed("test-model", ["test"])).rejects.toThrow(
+        "Inference response exceeded 16 bytes"
+      );
+      expect(cancel).toHaveBeenCalledOnce();
+    });
+
+    it("leaves successful SSE streams unbuffered but still bounds SSE-labeled errors", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(new ReadableStream({ start: (controller) => controller.close() }), {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Content-Length": String((16 << 20) + 1),
+          },
+        })
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      const streamed = await client.getRawClient().POST("/ai/v1/embed", {
+        body: { model: "test-model", input: ["test"] },
+        headers: { Accept: "text/event-stream" },
+        parseAs: "stream",
+      });
+      expect(streamed.data).toBeInstanceOf(ReadableStream);
+
+      const cancel = vi.fn();
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(new ReadableStream({ cancel }), {
+          status: 500,
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Content-Length": String((1 << 20) + 1),
+          },
+        })
+      );
+      await expect(client.embed("test-model", ["test"])).rejects.toThrow(
+        "Inference response exceeded 1048576 bytes"
+      );
+      expect(cancel).toHaveBeenCalledOnce();
+    });
+
+    it("bounds successful SSE-mislabeled JSON responses when SSE was not requested", async () => {
+      const cancel = vi.fn();
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array((16 << 20) + 1));
+            },
+            cancel,
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } }
+        )
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(client.embed("test-model", ["test"])).rejects.toThrow(
+        "Inference response exceeded 16777216 bytes"
+      );
+      expect(cancel).toHaveBeenCalledOnce();
+    });
+
     it("should handle embed errors", async () => {
       vi.mocked(fetch).mockResolvedValueOnce({
         ok: false,
-        status: 400,
-        json: () => Promise.resolve({ error: "Invalid model" }),
-        text: () => Promise.resolve(JSON.stringify({ error: "Invalid model" })),
+        status: 403,
+        json: () =>
+          Promise.resolve({
+            error: "CONTENT_NOT_ALLOWED",
+            message: "remote content is blocked",
+            retryable: false,
+          }),
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              error: "CONTENT_NOT_ALLOWED",
+              message: "remote content is blocked",
+              retryable: false,
+            })
+          ),
         headers: new Headers({ "Content-Type": "application/json" }),
       } as Response);
 
@@ -141,7 +601,11 @@ describe("InferenceClient with mock fetch", () => {
         baseUrl: "http://localhost:8080/api",
       });
 
-      await expect(client.embed("invalid-model", ["test"])).rejects.toThrow();
+      await expect(client.embed("invalid-model", ["test"])).rejects.toMatchObject({
+        status: 403,
+        code: "CONTENT_NOT_ALLOWED",
+        retryable: false,
+      });
     });
 
     it("should preserve structured transient capacity errors", async () => {
@@ -173,20 +637,43 @@ describe("InferenceClient with mock fetch", () => {
     });
   });
 
-  describe("embedBinary (binary response)", () => {
-    it("should request binary format and deserialize response", async () => {
+  describe("embedBinary (dense-vector compatibility helper)", () => {
+    it("extracts dense vectors from the current OpenAI-compatible JSON response", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            object: "list",
+            model: "bge-small-en-v1.5",
+            data: [
+              { object: "embedding", index: 0, embedding: [0.1, 0.2] },
+              { object: "embedding", index: 1, embedding: [0.3, 0.4] },
+            ],
+            usage: { prompt_tokens: 2, total_tokens: 2 },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } }
+        )
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
+      await expect(client.embedBinary("bge-small-en-v1.5", ["hello", "world"])).resolves.toEqual([
+        [0.1, 0.2],
+        [0.3, 0.4],
+      ]);
+    });
+
+    it("requests and deserializes the legacy binary format", async () => {
       const embeddings = [
         [0.1, 0.2, 0.3],
         [0.4, 0.5, 0.6],
       ];
       const binaryData = serializeEmbeddings(embeddings);
 
-      vi.mocked(fetch).mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        arrayBuffer: () => Promise.resolve(binaryData),
-        headers: new Headers({ "Content-Type": "application/octet-stream" }),
-      } as Response);
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(binaryData, {
+          status: 200,
+          headers: { "Content-Type": "application/octet-stream" },
+        })
+      );
 
       const client = new InferenceClient({
         baseUrl: "http://localhost:8080/api",
@@ -219,12 +706,12 @@ describe("InferenceClient with mock fetch", () => {
         retryable: true,
         retry_after_ms: 1000,
       };
-      vi.mocked(fetch).mockResolvedValueOnce({
-        ok: false,
-        status: 503,
-        text: () => Promise.resolve(JSON.stringify(capacity)),
-        headers: new Headers({ "Content-Type": "application/json", "Retry-After": "1" }),
-      } as Response);
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(JSON.stringify(capacity), {
+          status: 503,
+          headers: { "Content-Type": "application/json", "Retry-After": "1" },
+        })
+      );
 
       const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
       const error = await client
@@ -238,12 +725,12 @@ describe("InferenceClient with mock fetch", () => {
     it("should handle empty embeddings in binary response", async () => {
       const binaryData = serializeEmbeddings([]);
 
-      vi.mocked(fetch).mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        arrayBuffer: () => Promise.resolve(binaryData),
-        headers: new Headers({ "Content-Type": "application/octet-stream" }),
-      } as Response);
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(binaryData, {
+          status: 200,
+          headers: { "Content-Type": "application/octet-stream" },
+        })
+      );
 
       const client = new InferenceClient({
         baseUrl: "http://localhost:8080/api",
@@ -254,19 +741,78 @@ describe("InferenceClient with mock fetch", () => {
     });
 
     it("should handle binary embed errors", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({
-        ok: false,
-        status: 400,
-        text: () => Promise.resolve("Invalid model"),
-        headers: new Headers({ "Content-Type": "text/plain" }),
-      } as Response);
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response("Invalid model", {
+          status: 400,
+          headers: { "Content-Type": "text/plain" },
+        })
+      );
 
       const client = new InferenceClient({
         baseUrl: "http://localhost:8080/api",
       });
 
       await expect(client.embedBinary("invalid-model", ["test"])).rejects.toThrow(
-        "Embed failed: 400 Invalid model"
+        "inference request failed (400): Invalid model"
+      );
+    });
+
+    it("bounds and cancels oversized binary responses", async () => {
+      const cancel = vi.fn();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(17));
+        },
+        cancel,
+      });
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(body, {
+          status: 200,
+          headers: { "Content-Type": "application/octet-stream" },
+        })
+      );
+      const client = new InferenceClient({
+        baseUrl: "http://localhost:8080/api",
+        maxBinaryResponseBytes: 16,
+      });
+
+      await expect(client.embedBinary("test-model", ["test"])).rejects.toThrow(
+        "Embedding response exceeded 16 bytes"
+      );
+      expect(cancel).toHaveBeenCalledOnce();
+    });
+
+    it("rejects sparse JSON and unregistered binary media types", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            object: "list",
+            model: "sparse-model",
+            data: [
+              {
+                object: "embedding",
+                index: 0,
+                embedding: { indices: [1], values: [0.5] },
+              },
+            ],
+            usage: { prompt_tokens: 1, total_tokens: 1 },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
+      await expect(client.embedBinary("sparse-model", ["test"])).rejects.toThrow(
+        "item 0 is not a dense vector"
+      );
+
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(serializeEmbeddings([[0.5]]), {
+          status: 200,
+          headers: { "Content-Type": "application/octet-streamx" },
+        })
+      );
+      await expect(client.embedBinary("test-model", ["test"])).rejects.toThrow(
+        'Unexpected embedding response content type "application/octet-streamx"'
       );
     });
 
@@ -283,12 +829,12 @@ describe("InferenceClient with mock fetch", () => {
       }
       const binaryData = serializeEmbeddings(embeddings);
 
-      vi.mocked(fetch).mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        arrayBuffer: () => Promise.resolve(binaryData),
-        headers: new Headers({ "Content-Type": "application/octet-stream" }),
-      } as Response);
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(binaryData, {
+          status: 200,
+          headers: { "Content-Type": "application/octet-stream" },
+        })
+      );
 
       const client = new InferenceClient({
         baseUrl: "http://localhost:8080/api",
@@ -312,12 +858,12 @@ describe("InferenceClient with mock fetch", () => {
     it("should pass truncate option in request body", async () => {
       const binaryData = serializeEmbeddings([[0.1, 0.2]]);
 
-      vi.mocked(fetch).mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        arrayBuffer: () => Promise.resolve(binaryData),
-        headers: new Headers({ "Content-Type": "application/octet-stream" }),
-      } as Response);
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(binaryData, {
+          status: 200,
+          headers: { "Content-Type": "application/octet-stream" },
+        })
+      );
 
       const client = new InferenceClient({
         baseUrl: "http://localhost:8080/api",
@@ -388,7 +934,7 @@ describe("InferenceClient with mock fetch", () => {
       const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
       await expect(
         client.extract("invalid-model", ["test"], { person: ["name::str"] })
-      ).rejects.toThrow("Extract failed");
+      ).rejects.toMatchObject({ status: 400, code: "Model does not support extraction" });
     });
 
     it("should accept all optional parameters without error", async () => {
@@ -567,7 +1113,10 @@ describe("InferenceClient with mock fetch", () => {
       } as Response);
 
       const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
-      await expect(client.rewrite("invalid-model", ["test"])).rejects.toThrow("Rewrite failed");
+      await expect(client.rewrite("invalid-model", ["test"])).rejects.toMatchObject({
+        status: 400,
+        code: "Invalid model",
+      });
     });
 
     it("should handle multiple inputs", async () => {
@@ -627,7 +1176,10 @@ describe("InferenceClient with mock fetch", () => {
       } as Response);
 
       const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
-      await expect(client.transcribe("bad-data")).rejects.toThrow("Transcribe failed");
+      await expect(client.transcribe("bad-data")).rejects.toMatchObject({
+        status: 400,
+        code: "Invalid audio",
+      });
     });
   });
 
@@ -639,8 +1191,14 @@ describe("InferenceClient with mock fetch", () => {
       ];
 
       const jsonResponse = {
+        object: "list" as const,
         model: "test-model",
-        embeddings,
+        data: embeddings.map((embedding, index) => ({
+          object: "embedding" as const,
+          index,
+          embedding,
+        })),
+        usage: { prompt_tokens: 2, total_tokens: 2 },
       };
 
       const binaryData = serializeEmbeddings(embeddings);
@@ -655,12 +1213,12 @@ describe("InferenceClient with mock fetch", () => {
       } as Response);
 
       // Second call returns binary
-      vi.mocked(fetch).mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        arrayBuffer: () => Promise.resolve(binaryData),
-        headers: new Headers({ "Content-Type": "application/octet-stream" }),
-      } as Response);
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(binaryData, {
+          status: 200,
+          headers: { "Content-Type": "application/octet-stream" },
+        })
+      );
 
       const client = new InferenceClient({
         baseUrl: "http://localhost:8080/api",
@@ -671,12 +1229,16 @@ describe("InferenceClient with mock fetch", () => {
 
       // JSON response includes model, binary does not
       expect(jsonResult.model).toBe("test-model");
-      expect(jsonResult.embeddings.length).toBe(binaryResult.length);
+      expect(jsonResult.data.length).toBe(binaryResult.length);
 
       // Verify embeddings are equivalent (within float32 precision)
       for (let i = 0; i < embeddings.length; i++) {
         for (let j = 0; j < embeddings[i].length; j++) {
-          expect(jsonResult.embeddings[i][j]).toBeCloseTo(binaryResult[i][j], 5);
+          const jsonEmbedding = jsonResult.data[i]?.embedding;
+          expect(Array.isArray(jsonEmbedding) ? jsonEmbedding[j] : undefined).toBeCloseTo(
+            binaryResult[i][j],
+            5
+          );
         }
       }
     });

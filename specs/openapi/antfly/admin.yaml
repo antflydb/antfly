@@ -193,6 +193,27 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
+  /ha/watchdog-proof:
+    get:
+      tags: [ha]
+      operationId: getHAWatchdogProof
+      summary: Get the runtime Lease watchdog capability proof
+      description: >-
+        Returns only the authenticated, process-local Lease watchdog proof. This
+        endpoint remains independent of storage mutation critical sections so a
+        slow seed capture cannot prevent the operator from renewing an otherwise
+        valid fencing Lease.
+      responses:
+        "200":
+          description: Current runtime Lease watchdog capability proof.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAWatchdogProofResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
   /ha/standby/status:
     get:
       tags: [ha]
@@ -479,6 +500,102 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HABaseBackupFinishResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/base-backups/capture:
+    post:
+      tags: [ha]
+      operationId: captureHASeedArtifact
+      summary: Capture an immutable seed from runtime-owned primary storage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SeedArtifactCaptureRequest"
+      responses:
+        "200":
+          description: The runtime-owned seed generation is durably complete.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HASeedArtifactCaptureResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/seed-lifecycle/receipts:
+    get:
+      tags: [ha]
+      operationId: getHASeedLifecycleReceipts
+      summary: Read durable runtime-owned HA seed lifecycle receipts
+      description: |
+        Returns an authenticated, read-only cursor page from the runtime-owned
+        append-only receipt ledger. `history_truncated` and `gap` make bounded
+        retention explicit so observers can fail closed when their collection
+        window is incomplete.
+      parameters:
+        - name: kind
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [capture, activation]
+        - name: after
+          in: query
+          required: false
+          description: Exclusive durable ledger cursor. Zero starts at the retained prefix.
+          schema:
+            type: integer
+            format: uint64
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: uint32
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        "200":
+          description: Durable receipt page and current runtime observation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HASeedLifecycleReceiptInventoryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: Durable ledger or authoritative retained receipt is corrupt.
+  /ha/base-backups/activate:
+    post:
+      tags: [ha]
+      operationId: activateHASeededSlot
+      summary: Activate a seeded slot after durable target-generation publication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SeededSlotActivateRequest"
+      responses:
+        "200":
+          description: The verified seed checkpoint is now streamable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HASeededSlotActivateResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -860,6 +977,219 @@ components:
           type: string
           nullable: true
           description: Optional absolute normalized pod-local directory containing files referenced by the manifest.
+    SeededSlotActivateRequest:
+      type: object
+      required:
+        - slot_name
+        - generation
+        - manifest_id
+        - timeline_id
+        - checkpoint_lsn
+        - seed_receipt_sha256
+        - capture_receipt_sha256
+        - manifest_sha256
+        - aggregate_sha256
+      additionalProperties: false
+      properties:
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        generation:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: "^[A-Za-z0-9_.:-]+$"
+        manifest_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        checkpoint_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        seed_receipt_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        capture_receipt_sha256:
+          type: string
+          description: SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
+          pattern: "^[0-9a-f]{64}$"
+        manifest_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        aggregate_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+    SeedArtifactCaptureRequest:
+      type: object
+      required:
+        - slot_name
+        - generation
+        - topology_id
+        - topology_generation
+        - node_id
+        - target_pvc_name
+        - target_pvc_uid
+      additionalProperties: false
+      properties:
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        generation:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: "^[A-Za-z0-9_.:-]+$"
+        topology_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_.:-]+$"
+        topology_generation:
+          type: integer
+          format: uint64
+          minimum: 1
+        node_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_.:-]+$"
+        target_pvc_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_.:-]+$"
+        target_pvc_uid:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_.:-]+$"
+    HARuntimeLifecycleObservation:
+      type: object
+      required: [role, fenced, observed_at_unix_ns]
+      additionalProperties: false
+      properties:
+        node_id:
+          type: string
+          nullable: true
+        role:
+          type: string
+          enum: [primary, standby, unknown]
+        pod_uid:
+          type: string
+          nullable: true
+        fenced:
+          type: boolean
+        observed_at_unix_ns:
+          type: integer
+          format: uint64
+          minimum: 1
+    HASeedLifecycleReceiptEvent:
+      type: object
+      required:
+        - cursor
+        - kind
+        - generation
+        - slot_name
+        - topology_id
+        - topology_generation
+        - node_id
+        - target_pvc_name
+        - target_pvc_uid
+        - receipt_sha256
+        - receipt_json
+        - recorded_at_unix_ns
+        - authoritative_state
+      additionalProperties: false
+      properties:
+        cursor:
+          type: integer
+          format: uint64
+          minimum: 1
+        kind:
+          type: string
+          enum: [capture, activation]
+        generation:
+          type: string
+          minLength: 1
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        topology_id:
+          type: string
+          minLength: 1
+        topology_generation:
+          type: integer
+          format: uint64
+          minimum: 1
+        node_id:
+          type: string
+          minLength: 1
+        target_pvc_name:
+          type: string
+          minLength: 1
+        target_pvc_uid:
+          type: string
+          minLength: 1
+        receipt_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        receipt_json:
+          type: string
+          minLength: 2
+        recorded_at_unix_ns:
+          type: integer
+          format: uint64
+          minimum: 1
+        pod_uid:
+          type: string
+          nullable: true
+        authoritative_state:
+          type: string
+          enum: [retained, missing]
+    HASeedLifecycleReceiptInventoryResponse:
+      type: object
+      required:
+        - schema_version
+        - entries
+        - first_cursor
+        - end_cursor
+        - next_cursor
+        - history_truncated
+        - gap
+        - has_more
+        - runtime
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/HASeedLifecycleReceiptEvent"
+        first_cursor:
+          type: integer
+          format: uint64
+          minimum: 0
+        end_cursor:
+          type: integer
+          format: uint64
+          minimum: 0
+        next_cursor:
+          type: integer
+          format: uint64
+          minimum: 0
+        history_truncated:
+          type: boolean
+        gap:
+          type: boolean
+        has_more:
+          type: boolean
+        runtime:
+          $ref: "#/components/schemas/HARuntimeLifecycleObservation"
     HASyncPolicy:
       type: object
       required: [mode]
@@ -1183,6 +1513,17 @@ components:
           minimum: 1
         snapshot:
           $ref: "#/components/schemas/HAPrimarySnapshot"
+    HAWatchdogProofResponse:
+      type: object
+      required: [schema_version, proof]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        proof:
+          $ref: "#/components/schemas/HALeaseWatchdogProof"
     HAStandbyStatusResponse:
       type: object
       required: [schema_version, snapshot]
@@ -1271,6 +1612,8 @@ components:
             - replication_slot_drop
             - base_backup_begin
             - base_backup_finish
+            - seed_capture
+            - seeded_slot_activate
             - standby_bootstrap
             - fence_acquire
             - promotion_assess
@@ -1393,6 +1736,180 @@ components:
           format: uint64
           minimum: 1
           description: Standby checkpoint LSN after manifest validation.
+    HASeededSlotActivateResponse:
+      type: object
+      required:
+        - schema_version
+        - action
+        - slot_name
+        - generation
+        - manifest_id
+        - timeline_id
+        - checkpoint_lsn
+        - seed_receipt_sha256
+        - capture_receipt_sha256
+        - manifest_sha256
+        - aggregate_sha256
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        generation:
+          type: string
+          minLength: 1
+        manifest_id:
+          type: string
+          minLength: 1
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        checkpoint_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        seed_receipt_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        capture_receipt_sha256:
+          type: string
+          description: SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
+          pattern: "^[0-9a-f]{64}$"
+        manifest_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        aggregate_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+    HASeedArtifactCaptureResponse:
+      type: object
+      required:
+        - schema_version
+        - action
+        - slot_name
+        - generation
+        - topology_id
+        - topology_generation
+        - node_id
+        - target_pvc_name
+        - target_pvc_uid
+        - cluster_id
+        - shard_id
+        - table_id
+        - timeline_id
+        - epoch
+        - manifest_id
+        - source_plan_sha256
+        - backup_lsn
+        - checkpoint_lsn
+        - end_record_lsn
+        - manifest_sha256
+        - capture_receipt_sha256
+        - file_count
+        - total_bytes
+        - generation_root
+        - content_root
+        - manifest_path
+        - already_captured
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        generation:
+          type: string
+          minLength: 1
+        topology_id:
+          type: string
+          minLength: 1
+        topology_generation:
+          type: integer
+          format: uint64
+          minimum: 1
+        node_id:
+          type: string
+          minLength: 1
+        target_pvc_name:
+          type: string
+          minLength: 1
+        target_pvc_uid:
+          type: string
+          minLength: 1
+        cluster_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        shard_id:
+          type: integer
+          format: uint64
+          minimum: 0
+        table_id:
+          type: integer
+          format: uint64
+          minimum: 0
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        manifest_id:
+          type: string
+          minLength: 1
+        source_plan_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        backup_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        checkpoint_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        end_record_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        manifest_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        capture_receipt_sha256:
+          type: string
+          description: SHA-256 of the exact immutable runtime capture COMPLETE response bytes.
+          pattern: "^[0-9a-f]{64}$"
+        file_count:
+          type: integer
+          format: uint64
+          minimum: 1
+        total_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+        generation_root:
+          type: string
+          pattern: "^/.*"
+        content_root:
+          type: string
+          pattern: "^/.*"
+        manifest_path:
+          type: string
+          pattern: "^/.*"
+        already_captured:
+          type: boolean
     HAFenceResponse:
       type: object
       required: [schema_version, action, receipt]
@@ -1748,6 +2265,70 @@ components:
         durability:
           nullable: true
           $ref: "#/components/schemas/HADurabilityDecision"
+        lease_watchdog:
+          nullable: true
+          $ref: "#/components/schemas/HALeaseWatchdogProof"
+    HALeaseWatchdogProof:
+      type: object
+      additionalProperties: false
+      required:
+        - capability_version
+        - active
+        - authority_granted
+        - authority_remaining_ms
+        - lease_name
+        - lease_namespace
+        - stable_topology_id
+        - local_node_id
+        - observed_holder_node_id
+        - pod_uid
+        - process_boot_id
+        - observed_lease_transitions
+        - max_fence_latency_ms
+      properties:
+        capability_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        active:
+          type: boolean
+          description: Watchdog capability is running and has validated this exact shared Lease.
+        authority_granted:
+          type: boolean
+          description: This process is the current holder and its suspend-inclusive local deadline has not elapsed.
+        authority_remaining_ms:
+          type: integer
+          format: uint64
+          description: Suspend-inclusive local authority remaining when this proof snapshot was created; zero when authority is not granted.
+        lease_name:
+          type: string
+          minLength: 1
+        lease_namespace:
+          type: string
+          minLength: 1
+        stable_topology_id:
+          type: string
+          minLength: 1
+        local_node_id:
+          $ref: "#/components/schemas/HANodeID"
+          description: Local runtime node id producing the proof.
+        observed_holder_node_id:
+          $ref: "#/components/schemas/HANodeID"
+          description: Holder identity copied from the exact validated Kubernetes Lease.
+        pod_uid:
+          type: string
+          minLength: 1
+        process_boot_id:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        observed_lease_transitions:
+          type: integer
+          format: uint64
+          minimum: 1
+        max_fence_latency_ms:
+          type: integer
+          format: uint64
+          minimum: 1
     HAStandbySnapshot:
       type: object
       required:
@@ -1832,6 +2413,9 @@ components:
           type: boolean
         can_serve_safe_reads:
           type: boolean
+        lease_watchdog:
+          nullable: true
+          $ref: "#/components/schemas/HALeaseWatchdogProof"
     HASlotSnapshot:
       type: object
       required:

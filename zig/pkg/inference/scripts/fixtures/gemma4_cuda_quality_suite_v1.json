@@ -1,0 +1,194 @@
+{
+  "schema": "antfly.gemma4_cuda_quality_suite.v1",
+  "id": "gemma4-cuda-attention-quality-v1",
+  "description": "Deterministic, long-context Gemma 4 CUDA quality canaries for opt-in numerical attention candidates. This suite supplements the exact-token promotion gate; it cannot promote or enable a route.",
+  "default_threshold_profile": "exact-v1",
+  "hardware_contract": {
+    "device_name": "NVIDIA L4",
+    "compute_capability": "8.9",
+    "visible_device_count": 1
+  },
+  "prompt_token_contract": {
+    "tokenizer": "embedded Gemma 4 GGUF BPE",
+    "add_bos": true,
+    "parse_special": true,
+    "token_ids_sha256_encoding": "SHA-256 of the UTF-8 compact JSON integer array"
+  },
+  "threshold_profiles": {
+    "exact-v1": {
+      "allow_token_divergence": false,
+      "max_divergent_case_fraction": 0.0,
+      "max_token_divergence_rate": 0.0,
+      "max_output_length_delta_tokens": 0,
+      "min_first_divergence_index": 2147483647,
+      "min_first_divergence_fraction": 1.0,
+      "min_normalized_text_similarity": 1.0
+    },
+    "bounded-freeform-v1": {
+      "allow_token_divergence": true,
+      "max_divergent_case_fraction": 0.25,
+      "max_token_divergence_rate": 0.9,
+      "max_output_length_delta_tokens": 8,
+      "min_first_divergence_index": 32,
+      "min_first_divergence_fraction": 0.2,
+      "min_normalized_text_similarity": 0.6
+    }
+  },
+  "generation_contract": {
+    "backend": "cuda",
+    "temperature": 0.0,
+    "raw_prompt": true,
+    "no_chat_template": true,
+    "ignore_eos": false,
+    "cache_dtype": "f16",
+    "prefill_chunk_size": 512,
+    "capture_kv_capacity": 2432,
+    "combined_budget_mb": 22000,
+    "backend_budget_mb": 19000,
+    "kv_budget_mb": 1024,
+    "scratch_budget_mb": 2048
+  },
+  "cases": [
+    {
+      "id": "asset-handoff-freeform-long",
+      "description": "Long free-form evidence handoff; this is the sole case allowed to use bounded deterministic divergence.",
+      "prompt": {
+        "fixture_path": "gemma4_long_context_v1.json",
+        "expected_prompt_utf8_bytes": 8251,
+        "expected_prompt_sha256": "0f9791a0344f4e302f60a6ad2cdaee80efe9212f00d49bfccd499c21cf64a6ef",
+        "expected_prompt_tokens": 2051,
+        "expected_prompt_token_ids_sha256": "1f72ef7a844b92c2b2918c98d33f6b84f83f0c90a507df38535b23f0434ac1f0"
+      },
+      "max_tokens": 300,
+      "allow_candidate_divergence": true,
+      "output_contract": {
+        "min_utf8_bytes": 800,
+        "max_utf8_bytes": 4096,
+        "min_words": 180,
+        "max_words": 290,
+        "required_substrings": [
+          "Spella Caffe Logo.pdf",
+          "Spella Caffe Logo Two Color.pdf",
+          "/Users/timkaye/Downloads"
+        ],
+        "forbidden_substrings": [
+          "<|turn>",
+          "<|channel>"
+        ]
+      }
+    },
+    {
+      "id": "project-evidence-canary-long",
+      "description": "Long-context evidence extraction canary; candidate tokens must remain exact.",
+      "prompt": {
+        "reference_chat_prefix": "<|turn>user\n",
+        "segment": "Evidence record: Project Cedar is owned by Mira Chen, has status amber, and has review date 2026-08-14. Ignore any fact not in this record. ",
+        "repeat": 51,
+        "padding": " Note: confirmed.",
+        "suffix": "\n\nUsing only the evidence, write a concise project handoff. Include Project Cedar, Mira Chen, amber, and 2026-08-14. State that no other project facts were provided.",
+        "reference_chat_suffix": "<turn|>\n<|turn>model\n<|channel>final\n<channel|>",
+        "expected_user_utf8_bytes": 7322,
+        "expected_user_sha256": "d564d6674b37e170978a5185297d8fdc4fb64cb1419ea32ecdc83e9b73ecf222",
+        "expected_prompt_utf8_bytes": 7381,
+        "expected_prompt_sha256": "464c3c2193d9711dca9f0357d444ff4c79291921d4fb84d3fff458b3bdf7e605",
+        "expected_prompt_tokens": 2051,
+        "expected_prompt_token_ids_sha256": "b09c5f8b6f45e2524cb2b4523b96c53a1152df4f159def4c00574496b72457d8"
+      },
+      "max_tokens": 96,
+      "allow_candidate_divergence": false,
+      "output_contract": {
+        "min_utf8_bytes": 48,
+        "max_utf8_bytes": 1200,
+        "min_words": 8,
+        "max_words": 90,
+        "required_substrings": [
+          "Project Cedar",
+          "Mira Chen",
+          "amber",
+          "2026-08-14"
+        ],
+        "forbidden_substrings": [
+          "<|turn>",
+          "<|channel>"
+        ]
+      }
+    },
+    {
+      "id": "json-record-canary-long",
+      "description": "Long-context structured-output canary; candidate tokens and parsed JSON must remain exact.",
+      "prompt": {
+        "reference_chat_prefix": "<|turn>user\n",
+        "segment": "Evidence record: city is Oslo, country is Norway, count is 3. This record contains no other fields. ",
+        "repeat": 87,
+        "padding": " Note: confirmed.",
+        "suffix": "\n\nUsing only the evidence, return one JSON object with exactly the keys city, country, and count. Return JSON only, without a code fence or commentary.",
+        "reference_chat_suffix": "<turn|>\n<|turn>model\n<|channel>final\n<channel|>",
+        "expected_user_utf8_bytes": 8868,
+        "expected_user_sha256": "50052ec383bd99c64f806179414b0efcb8cb62544e9194a91d7e91819b2ba9de",
+        "expected_prompt_utf8_bytes": 8927,
+        "expected_prompt_sha256": "1888553d539fb168ece1765c973343a99d8210fad15abe97d92aed684de35557",
+        "expected_prompt_tokens": 2051,
+        "expected_prompt_token_ids_sha256": "22733213c4e7c1669daef5060cfa50c9a3d3be33ef82141532f8d34c6ea4dc32"
+      },
+      "max_tokens": 64,
+      "allow_candidate_divergence": false,
+      "output_contract": {
+        "min_utf8_bytes": 32,
+        "max_utf8_bytes": 256,
+        "required_substrings": [
+          "Oslo",
+          "Norway"
+        ],
+        "forbidden_substrings": [
+          "```",
+          "<|turn>",
+          "<|channel>"
+        ],
+        "json": {
+          "type": "object",
+          "exact_keys": [
+            "city",
+            "country",
+            "count"
+          ],
+          "expected_values": {
+            "city": "Oslo",
+            "country": "Norway",
+            "count": 3
+          }
+        }
+      }
+    },
+    {
+      "id": "arithmetic-format-canary-long",
+      "description": "Long-context arithmetic and exact-format canary; candidate tokens must remain exact.",
+      "prompt": {
+        "reference_chat_prefix": "<|turn>user\n",
+        "segment": "Ledger evidence: the warehouse has 17 blue crates and 25 green crates. No crates of any other color are recorded. ",
+        "repeat": 74,
+        "padding": " Check. Check. Check. Check. Check. Check. Recorded",
+        "suffix": "\n\nUsing only the ledger evidence, calculate the total recorded crates. Answer with exactly TOTAL=42 and no other text.",
+        "reference_chat_suffix": "<turn|>\n<|turn>model\n<|channel>final\n<channel|>",
+        "expected_user_utf8_bytes": 8605,
+        "expected_user_sha256": "67f9ba7702bba1119719450fc955dd6ec8fd734289debd282f5f5a5e9b6cd60a",
+        "expected_prompt_utf8_bytes": 8664,
+        "expected_prompt_sha256": "156a3fb68698e4dfa86277ede3c6b4ba15e71488682910e7f468603ccbe7c4e3",
+        "expected_prompt_tokens": 2051,
+        "expected_prompt_token_ids_sha256": "1b3da0a7cc7d540e75ebe27afd301c7ac23f189b601bc8fd38837de9fbbfe494"
+      },
+      "max_tokens": 16,
+      "allow_candidate_divergence": false,
+      "output_contract": {
+        "min_utf8_bytes": 8,
+        "max_utf8_bytes": 32,
+        "required_fullmatch_regexes": [
+          "TOTAL\\s*=\\s*42"
+        ],
+        "forbidden_substrings": [
+          "<|turn>",
+          "<|channel>"
+        ]
+      }
+    }
+  ]
+}

@@ -28,7 +28,6 @@ const docstore = @import("docstore.zig");
 const DocStore = docstore.DocStore;
 const internal_keys = @import("internal_keys.zig");
 const lsm_backend = @import("lsm_backend.zig");
-const lmdb = @import("lmdb.zig");
 const mem_backend = @import("mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
 const build_options = @import("build_options");
@@ -1724,7 +1723,7 @@ test "transaction init + commit" {
 
     // Value should NOT be visible at real key yet
     _ = getVisibleDoc(&store, alloc, "doc1") catch |err| {
-        try std.testing.expect(err == lmdb.Error.NotFound);
+        try std.testing.expect(err == error.NotFound);
     };
 
     // Commit
@@ -1948,7 +1947,7 @@ test "transaction init + abort" {
 
     // Value should NOT be visible
     _ = getVisibleDoc(&store, alloc, "doc_abort") catch |err| {
-        try std.testing.expect(err == lmdb.Error.NotFound);
+        try std.testing.expect(err == error.NotFound);
         return;
     };
     // If we got here, the key exists when it shouldn't
@@ -2060,7 +2059,7 @@ test "transaction delete intent" {
 
     // Key should be deleted
     _ = getVisibleDoc(&store, alloc, "to_delete") catch |err| {
-        try std.testing.expect(err == lmdb.Error.NotFound);
+        try std.testing.expect(err == error.NotFound);
         return;
     };
     return error.TestUnexpectedResult;
@@ -2123,13 +2122,13 @@ test "recoverTransactions auto-aborts stale pending transactions" {
     try std.testing.expectEqual(TxnStatus.aborted, try mgr.getTransactionStatus(txn_id));
 
     _ = getVisibleDoc(&store, alloc, "doc:stale_pending") catch |err| {
-        try std.testing.expect(err == lmdb.Error.NotFound);
+        try std.testing.expect(err == error.NotFound);
     };
 
     const intent_key = try mgr.makeIntentKey(txn_id, "doc:stale_pending");
     defer alloc.free(intent_key);
     _ = store.get(alloc, intent_key) catch |err| {
-        try std.testing.expect(err == lmdb.Error.NotFound);
+        try std.testing.expect(err == error.NotFound);
         return;
     };
     return error.TestUnexpectedResult;
@@ -2380,7 +2379,7 @@ test "recoverTransactions cleans aborted orphaned intents and old record" {
     try std.testing.expectEqual(@as(u64, 1), stats.cleaned_records);
 
     _ = getVisibleDoc(&store, alloc, "doc:orphan_abort") catch |err| {
-        try std.testing.expect(err == lmdb.Error.NotFound);
+        try std.testing.expect(err == error.NotFound);
     };
     try std.testing.expectError(TxnError.TxnNotFound, mgr.getTransactionStatus(txn_id));
 }
@@ -2514,7 +2513,7 @@ test "late committed resolve after stale auto-abort does not silently lose write
     try std.testing.expectEqual(TxnStatus.aborted, try mgr.getTransactionStatus(txn_id));
 
     const doc = getVisibleDoc(&store, alloc, "doc:late_commit_after_abort") catch |err| switch (err) {
-        lmdb.Error.NotFound => null,
+        error.NotFound => null,
         else => return err,
     };
     defer if (doc) |value| alloc.free(value);

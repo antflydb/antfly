@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const AtomicU64 = platform.atomic.Value(u64);
@@ -32,7 +33,7 @@ const internal_keys = @import("internal_keys.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
-const supports_lmdb = builtin.os.tag != .freestanding;
+const supports_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
 const backend_lmdb_adapter = if (supports_lmdb) @import("backend_lmdb_adapter.zig") else struct {
     pub const Cursor = struct {
         pub fn init(_: anytype) @This() {
@@ -376,6 +377,7 @@ pub const DocStore = struct {
     kind: Kind,
     runtime_store: backend_erased.Store,
     owns_runtime_store: bool,
+    owned_lsm_backend: ?lsm_backend.BackendHandle,
     env: LmdbEnvironment,
     dbi: LmdbDbi,
     lmdb_user_db_kind: LmdbUserDbKind,
@@ -709,7 +711,29 @@ pub const DocStore = struct {
     };
 
     pub fn open(alloc: Allocator, path: [*:0]const u8, opts: DocStoreOptions) !DocStore {
-        if (!supports_lmdb) return error.UnsupportedPlatform;
+        if (!supports_lmdb) {
+            var backend = try lsm_backend.BackendHandle.open(alloc, std.mem.span(path), .{
+                .backend = .{
+                    .read_only = opts.read_only,
+                    .create_if_missing = !opts.read_only,
+                },
+                .wal_enabled = !opts.read_only,
+            });
+            errdefer backend.close();
+            const runtime_store = try backend.backend.runtimeStore(alloc, .{});
+            return .{
+                .alloc = alloc,
+                .kind = .runtime,
+                .runtime_store = runtime_store,
+                .owns_runtime_store = true,
+                .owned_lsm_backend = backend,
+                .env = undefined,
+                .dbi = undefined,
+                .lmdb_user_db_kind = undefined,
+                .replay_index_state = .init(replay_index_unknown),
+                .next_replay_sequence_cached = .init(0),
+            };
+        }
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         if (!opts.read_only) {
@@ -746,6 +770,7 @@ pub const DocStore = struct {
             .kind = .lmdb,
             .runtime_store = undefined,
             .owns_runtime_store = false,
+            .owned_lsm_backend = null,
             .env = env,
             .dbi = resolved.dbi,
             .lmdb_user_db_kind = resolved.kind,
@@ -761,6 +786,7 @@ pub const DocStore = struct {
             .kind = .runtime,
             .runtime_store = runtime_store.store,
             .owns_runtime_store = runtime_store.owned,
+            .owned_lsm_backend = null,
             .env = undefined,
             .dbi = undefined,
             .lmdb_user_db_kind = undefined,
@@ -772,7 +798,10 @@ pub const DocStore = struct {
     pub fn close(self: *DocStore) void {
         switch (self.kind) {
             .lmdb => if (supports_lmdb) self.env.close(),
-            .runtime => if (self.owns_runtime_store) self.runtime_store.deinit(),
+            .runtime => {
+                if (self.owns_runtime_store) self.runtime_store.deinit();
+                if (self.owned_lsm_backend) |*backend| backend.close();
+            },
         }
         self.* = undefined;
     }
@@ -817,7 +846,7 @@ pub const DocStore = struct {
         }
     }
 
-    pub fn splitRightToDir(self: *DocStore, split_key: []const u8, dest_dir: []const u8) !bool {
+    pub fn splitRightToDir(self: *DocStore, split_key: []const u8, dest_dir: []const u8) anyerror!bool {
         if (!supports_lmdb) return error.UnsupportedPlatform;
         if (self.kind != .lmdb) return error.Unsupported;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -828,7 +857,7 @@ pub const DocStore = struct {
         };
     }
 
-    pub fn rewriteLeftInPlace(self: *DocStore, split_key: []const u8) !bool {
+    pub fn rewriteLeftInPlace(self: *DocStore, split_key: []const u8) anyerror!bool {
         if (!supports_lmdb) return error.UnsupportedPlatform;
         if (self.kind != .lmdb) return error.Unsupported;
         var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;

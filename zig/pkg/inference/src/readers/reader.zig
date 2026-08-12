@@ -28,6 +28,7 @@ const vision_reader_mod = @import("vision_reader.zig");
 const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const reader_types = @import("types.zig");
+const metal_generated_quant_stats = @import("../metal_generated_quant_stats.zig");
 
 pub const Field = reader_types.Field;
 pub const Region = reader_types.Region;
@@ -71,6 +72,7 @@ const VisionLoadedReader = struct {
         var raw = try self.core.readRaw(image_data, .{
             .prompt = normalized_prompt,
             .max_tokens = options.max_tokens,
+            .source_fingerprint = options.source_fingerprint,
         });
         defer raw.deinit();
 
@@ -83,6 +85,7 @@ const VisionLoadedReader = struct {
         const raw_results = try self.core.readRawBatch(image_datas, .{
             .prompt = normalized_prompt,
             .max_tokens = options.max_tokens,
+            .source_fingerprint = options.source_fingerprint,
         });
         defer {
             for (raw_results) |raw| {
@@ -279,6 +282,13 @@ pub const LoadedReader = union(enum) {
         errdefer result.deinit();
         try sanitizeResultUtf8(&result);
         return result;
+    }
+
+    pub fn snapshotMetalGeneratedQuantStats(self: *LoadedReader, allocator: std.mem.Allocator) metal_generated_quant_stats.Stats {
+        return switch (self.*) {
+            .vision => |*reader| reader.core.snapshotMetalGeneratedQuantStats(allocator),
+            .genai, .vlm, .multistage => .{},
+        };
     }
 
     pub fn readBatch(self: *LoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {

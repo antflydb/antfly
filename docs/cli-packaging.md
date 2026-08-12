@@ -57,7 +57,7 @@ antfly_0.2.0_Linux_x86_64.tar.gz
 
 Those archives must include `include/antfly.h` and the platform library
 under `lib/`; `scripts/packaging/build_zig_release_archive.sh` builds the normal
-runtime and then the `lite-capi` target into the same archive prefix.
+runtime and then the `capi` target into the same archive prefix.
 
 For prerelease tags, npm uses the release version directly. Python wheels use
 PEP 440 equivalents, for example `v0.2.0-dev10` becomes `0.2.0.dev10`.

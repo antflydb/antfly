@@ -33,7 +33,6 @@ const platform_time = @import("antfly_platform").time;
 const docstore = @import("docstore.zig");
 const DocStore = docstore.DocStore;
 const ByteRange = docstore.ByteRange;
-const lmdb = @import("lmdb.zig");
 
 // ============================================================================
 // Dud enrichment sentinel
@@ -241,7 +240,7 @@ pub const RebuildState = struct {
     /// Returns the resume key (caller-owned), or null if no rebuild in progress.
     pub fn check(self: *RebuildState, alloc: Allocator) !?[]u8 {
         return self.store.get(alloc, self.state_key) catch |err| switch (err) {
-            lmdb.Error.NotFound => null,
+            error.NotFound => null,
             else => return err,
         };
     }
@@ -254,7 +253,7 @@ pub const RebuildState = struct {
     /// Clear rebuild state (rebuild complete).
     pub fn clear(self: *RebuildState) !void {
         self.store.delete(self.state_key) catch |err| switch (err) {
-            lmdb.Error.NotFound => {},
+            error.NotFound => {},
             else => return err,
         };
     }
@@ -342,7 +341,7 @@ pub fn readEnrichmentStatus(store: *DocStore, alloc: Allocator, key: []const u8,
     var buf: [1024]u8 = undefined;
     const full_key = makeFullKey(&buf, key, suffix);
     const val = store.get(alloc, full_key) catch |err| switch (err) {
-        lmdb.Error.NotFound => return null,
+        error.NotFound => return null,
         else => return err,
     };
     defer alloc.free(val);

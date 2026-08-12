@@ -132,7 +132,7 @@ pub fn create(config: Config) Graph {
     const target = config.target;
     const optimize = config.optimize;
 
-    const build_options = addBuildOptions(b, backend);
+    const build_options = addBuildOptions(b, backend, paths);
     const build_options_mod = build_options.createModule();
     const audio_open_corpus_build_options_mod = addAudioOpenCorpusBuildOptions(b, backend).createModule();
 
@@ -160,6 +160,7 @@ pub fn create(config: Config) Graph {
     const scraping_mod = shared.scraping orelse blk: {
         const mod = createSharedModule(config, "lib/scraping/src/mod.zig");
         mod.addImport("objectstore", objectstore_mod);
+        mod.addImport("httpx", httpx_mod);
         break :blk mod;
     };
     const regex_mod = shared.regex orelse blk: {
@@ -449,11 +450,95 @@ pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRoot
     }
 }
 
-fn addBuildOptions(b: *std.Build, backend: BackendOptions) *std.Build.Step.Options {
+fn sourceSha256Hex(b: *std.Build, path: []const u8) []const u8 {
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        b.graph.io,
+        path,
+        b.allocator,
+        .limited(16 * 1024 * 1024),
+    ) catch |err| std.debug.panic("cannot hash JIT identity source {s}: {s}", .{ path, @errorName(err) });
+    defer b.allocator.free(source);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return b.allocator.dupe(u8, &hex) catch @panic("out of memory hashing JIT identity source");
+}
+
+fn sourceBundleSha256Hex(b: *std.Build, paths: []const []const u8) []const u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly-runtime-jit-source-bundle/v1");
+    var length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length, @intCast(paths.len), .little);
+    hasher.update(&length);
+    for (paths) |path| {
+        const source = std.Io.Dir.cwd().readFileAlloc(
+            b.graph.io,
+            path,
+            b.allocator,
+            .limited(16 * 1024 * 1024),
+        ) catch |err| std.debug.panic("cannot hash JIT identity source {s}: {s}", .{ path, @errorName(err) });
+        defer b.allocator.free(source);
+
+        std.mem.writeInt(u64, &length, @intCast(source.len), .little);
+        hasher.update(&length);
+        hasher.update(source);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return b.allocator.dupe(u8, &hex) catch @panic("out of memory hashing JIT identity source bundle");
+}
+
+fn addBuildOptions(b: *std.Build, backend: BackendOptions, paths: Paths) *std.Build.Step.Options {
     const options = b.addOptions();
     addCommonOptions(options, backend);
     options.addOption(bool, "enable_ffmpeg_audio", backend.enable_ffmpeg_audio);
     options.addOption(bool, "enable_native_quant_dispatch_stats", backend.enable_native_quant_dispatch_stats);
+    options.addOption(
+        []const u8,
+        "metal_jit_baseline_implementation_sha256",
+        sourceSha256Hex(b, pathJoin(b, paths.inference_root, "src/backends/metal_kernels.m")),
+    );
+    options.addOption(
+        []const u8,
+        "metal_jit_qualification_implementation_sha256",
+        sourceBundleSha256Hex(b, &.{
+            pathJoin(b, paths.inference_root, "src/backends/metal_runtime.zig"),
+            pathJoin(b, paths.inference_root, "src/graph/kernel_jit.zig"),
+            pathJoin(b, paths.inference_root, "src/graph/quant_kernel_compiler.zig"),
+            pathJoin(b, paths.inference_root, "src/graph/quant_matmul.zig"),
+            pathJoin(b, paths.inference_root, "src/gguf/quant_codec.zig"),
+            pathJoin(b, paths.inference_root, "src/gguf/tensor_types.zig"),
+        }),
+    );
+    options.addOption(
+        []const u8,
+        "cuda_jit_baseline_implementation_sha256",
+        sourceSha256Hex(b, pathJoin(b, paths.inference_root, "src/ops/cuda/artifacts/inference_cuda_kernels.cu")),
+    );
+    options.addOption(
+        []const u8,
+        "cuda_jit_qualification_implementation_sha256",
+        sourceBundleSha256Hex(b, &.{
+            pathJoin(b, paths.inference_root, "src/ops/cuda/kernels.zig"),
+            pathJoin(b, paths.inference_root, "src/graph/kernel_jit.zig"),
+            pathJoin(b, paths.inference_root, "src/graph/quant_kernel_compiler.zig"),
+            pathJoin(b, paths.inference_root, "src/graph/quant_kernel_cuda_renderer.zig"),
+            pathJoin(b, paths.inference_root, "src/graph/quant_matmul.zig"),
+            pathJoin(b, paths.inference_root, "src/gguf/quant_codec.zig"),
+            pathJoin(b, paths.inference_root, "src/gguf/tensor_types.zig"),
+        }),
+    );
+    options.addOption(
+        []const u8,
+        "cuda_jit_dispatch_implementation_sha256",
+        sourceBundleSha256Hex(b, &.{
+            pathJoin(b, paths.inference_root, "src/ops/cuda/cuda_compute.zig"),
+            pathJoin(b, paths.inference_root, "src/graph/quant_kernel_compiler.zig"),
+            pathJoin(b, paths.inference_root, "src/graph/quant_matmul.zig"),
+            pathJoin(b, paths.inference_root, "src/gguf/tensor_types.zig"),
+        }),
+    );
     return options;
 }
 
@@ -772,7 +857,10 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
+    const sdk_root = b.sysroot orelse
+        b.graph.environ_map.get("SDK_PATH") orelse
+        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
+        return;
     module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
     module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
     module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });

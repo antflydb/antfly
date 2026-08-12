@@ -70,9 +70,11 @@ pub const Assessment = struct {
     parent_table_id: u64 = 0,
     parent_timeline_id: u64 = 0,
     parent_epoch: u64 = 0,
+    required_lsn: u64 = 0,
     fork_lsn: u64,
     former_last_lsn: u64,
     retained_from_lsn: u64,
+    forced: bool = false,
     data_loss_discarded: bool,
 };
 
@@ -138,9 +140,11 @@ pub fn assessFormerPrimary(
             .parent_table_id = fence.identity.table_id,
             .parent_timeline_id = fence.parent_timeline_id,
             .parent_epoch = fence.parent_epoch,
+            .required_lsn = fence.required_lsn,
             .fork_lsn = fence.observed_lsn,
             .former_last_lsn = former.last_lsn,
             .retained_from_lsn = policy.retained_from_lsn,
+            .forced = fence.forced,
             .data_loss_discarded = false,
         };
     }
@@ -158,6 +162,15 @@ pub fn assessFormerPrimary(
         return reseed(.parent_timeline_wal_expired, former, fence, policy);
     }
 
+    // The replication log is an effects stream, not an undo log for the LSM.
+    // Once this primary has applied a write beyond the promotion fork, removing
+    // the corresponding HA envelope would hide the divergent state without
+    // rolling it back. Only an exact-fork former primary is safe to reuse in
+    // place; every divergent branch needs a fresh base backup.
+    if (former.last_lsn > fork_lsn) {
+        return reseed(.parent_timeline_retained, former, fence, policy);
+    }
+
     if (fence.forced and !policy.allow_rewind_after_forced_promotion) {
         return reseed(.parent_timeline_retained, former, fence, policy);
     }
@@ -173,10 +186,12 @@ pub fn assessFormerPrimary(
         .parent_table_id = fence.identity.table_id,
         .parent_timeline_id = fence.parent_timeline_id,
         .parent_epoch = fence.parent_epoch,
+        .required_lsn = fence.required_lsn,
         .fork_lsn = fork_lsn,
         .former_last_lsn = former.last_lsn,
         .retained_from_lsn = policy.retained_from_lsn,
-        .data_loss_discarded = former.last_lsn > fork_lsn or fence.forced,
+        .forced = fence.forced,
+        .data_loss_discarded = false,
     };
 }
 
@@ -191,6 +206,7 @@ pub fn rewindReplicationLog(
     if (previous_last_lsn != assessment.former_last_lsn) return error.RejoinAssessmentStale;
     if (assessment.fork_lsn < assessment.retained_from_lsn) return error.WalNoLongerRetained;
     if (previous_last_lsn < assessment.fork_lsn) return error.FormerPrimaryBeforeFork;
+    if (previous_last_lsn > assessment.fork_lsn) return error.RejoinDivergentDataRequiresReseed;
 
     if (assessment.fork_lsn > 0) {
         var fork_entry = (try log.entryAt(alloc, assessment.fork_lsn)) orelse return error.WalNoLongerRetained;
@@ -199,6 +215,21 @@ pub fn rewindReplicationLog(
     }
 
     try log.truncateAfter(assessment.fork_lsn);
+    const switch_lsn = std.math.add(u64, assessment.fork_lsn, 1) catch return error.LsnOverflow;
+    const payload = try rejoinTimelineSwitchPayload(alloc, assessment);
+    defer alloc.free(payload);
+    _ = try log.append(alloc, .{
+        .kind = .timeline_switch,
+        .payload_codec = .json,
+        .cluster_id = assessment.parent_cluster_id,
+        .shard_id = assessment.parent_shard_id,
+        .table_id = assessment.parent_table_id,
+        .timeline_id = assessment.target_timeline_id,
+        .epoch = assessment.target_epoch,
+        .lsn = switch_lsn,
+        .previous_lsn = assessment.fork_lsn,
+        .payload = payload,
+    });
     const current_last_lsn = log.lastLsn();
     return .{
         .node_id = assessment.former_node_id,
@@ -206,7 +237,7 @@ pub fn rewindReplicationLog(
         .previous_last_lsn = previous_last_lsn,
         .current_last_lsn = current_last_lsn,
         .next_lsn = log.nextLsn(),
-        .discarded_lsn_count = previous_last_lsn - current_last_lsn,
+        .discarded_lsn_count = previous_last_lsn - assessment.fork_lsn,
         .target_timeline_id = assessment.target_timeline_id,
         .target_epoch = assessment.target_epoch,
         .data_loss_discarded = assessment.data_loss_discarded,
@@ -225,11 +256,25 @@ fn reseed(reason: Reason, former: FormerPrimaryState, receipt: fencing.Receipt, 
         .parent_table_id = receipt.identity.table_id,
         .parent_timeline_id = receipt.parent_timeline_id,
         .parent_epoch = receipt.parent_epoch,
+        .required_lsn = receipt.required_lsn,
         .fork_lsn = receipt.observed_lsn,
         .former_last_lsn = former.last_lsn,
         .retained_from_lsn = policy.retained_from_lsn,
+        .forced = receipt.forced,
         .data_loss_discarded = false,
     };
+}
+
+fn rejoinTimelineSwitchPayload(alloc: std.mem.Allocator, assessment: Assessment) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .parent_timeline_id = assessment.parent_timeline_id,
+        .new_timeline_id = assessment.target_timeline_id,
+        .parent_epoch = assessment.parent_epoch,
+        .new_epoch = assessment.target_epoch,
+        .required_lsn = assessment.required_lsn,
+        .forced = assessment.forced,
+        .data_loss_possible = false,
+    }, .{});
 }
 
 fn validateForkRecord(assessment: Assessment, record: replication_record.RecordView) !void {
@@ -331,7 +376,7 @@ test "storage.ha rejoin rewinds compatible fenced former primary when WAL is ret
     const former = FormerPrimaryState{
         .node_id = "primary-a",
         .identity = parentIdentity(),
-        .last_lsn = 12,
+        .last_lsn = 10,
     };
     const receipt = promotedReceipt();
     const assessment = assessFormerPrimary(former, receipt, .{ .retained_from_lsn = 8 });
@@ -339,7 +384,7 @@ test "storage.ha rejoin rewinds compatible fenced former primary when WAL is ret
     try std.testing.expectEqual(Reason.parent_timeline_retained, assessment.reason);
     try std.testing.expectEqual(@as(u64, 2), assessment.target_timeline_id);
     try std.testing.expectEqual(@as(u64, 10), assessment.fork_lsn);
-    try std.testing.expect(assessment.data_loss_discarded);
+    try std.testing.expect(!assessment.data_loss_discarded);
 }
 
 test "storage.ha rejoin reseeds when timeline is incompatible or WAL expired" {
@@ -384,7 +429,7 @@ test "storage.ha rejoin requires explicit policy for forced-promotion rewind" {
     const former = FormerPrimaryState{
         .node_id = "primary-a",
         .identity = parentIdentity(),
-        .last_lsn = 10,
+        .last_lsn = 8,
     };
 
     var assessment = assessFormerPrimary(former, receipt, .{ .retained_from_lsn = 1 });
@@ -396,10 +441,63 @@ test "storage.ha rejoin requires explicit policy for forced-promotion rewind" {
         .allow_rewind_after_forced_promotion = true,
     });
     try std.testing.expectEqual(Action.rewind, assessment.action);
-    try std.testing.expect(assessment.data_loss_discarded);
+    try std.testing.expect(!assessment.data_loss_discarded);
 }
 
-test "storage.ha rejoin rewind truncates former primary divergent log suffix" {
+test "storage.ha rejoin reseeds a divergent former primary instead of hiding applied writes" {
+    var receipt = promotedReceipt();
+    receipt.required_lsn = 2;
+    receipt.observed_lsn = 2;
+    const assessment = assessFormerPrimary(.{
+        .node_id = "primary-a",
+        .identity = parentIdentity(),
+        .last_lsn = 3,
+    }, receipt, .{ .retained_from_lsn = 1 });
+
+    // Truncating the logical HA stream cannot roll back a batch that was
+    // already applied to the former primary's LSM. A divergent data branch
+    // therefore requires a fresh base backup even when the parent WAL is
+    // retained.
+    try std.testing.expectEqual(Action.reseed, assessment.action);
+    try std.testing.expectEqual(Reason.parent_timeline_retained, assessment.reason);
+    try std.testing.expect(!assessment.data_loss_discarded);
+}
+
+test "storage.ha rejoin rewind installs the promoted timeline boundary" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "rewind-timeline-switch");
+    defer alloc.free(path);
+
+    var log = try replication_log.ReplicationLog.open(path.ptr, .{});
+    defer log.close();
+    _ = try log.append(alloc, baseRecord(1, "one"));
+    _ = try log.append(alloc, baseRecord(2, "two"));
+
+    var receipt = promotedReceipt();
+    receipt.required_lsn = 2;
+    receipt.observed_lsn = 2;
+    const assessment = assessFormerPrimary(.{
+        .node_id = "primary-a",
+        .identity = parentIdentity(),
+        .last_lsn = log.lastLsn(),
+    }, receipt, .{ .retained_from_lsn = 1 });
+    try std.testing.expectEqual(Action.rewind, assessment.action);
+
+    const result = try rewindReplicationLog(alloc, &log, assessment);
+    try std.testing.expectEqual(@as(u64, 3), result.current_last_lsn);
+    try std.testing.expectEqual(@as(u64, 4), result.next_lsn);
+    try std.testing.expectEqual(@as(u64, 0), result.discarded_lsn_count);
+
+    var boundary = (try log.entryAt(alloc, 3)) orelse return error.TestExpectedEqual;
+    defer boundary.deinit(alloc);
+    try std.testing.expectEqual(replication_record.RecordKind.timeline_switch, boundary.record.kind);
+    try std.testing.expectEqual(replication_record.PayloadCodec.json, boundary.record.payload_codec);
+    try std.testing.expectEqual(@as(u64, 2), boundary.record.previous_lsn);
+    try std.testing.expectEqual(receipt.new_timeline_id, boundary.record.timeline_id);
+    try std.testing.expectEqual(receipt.new_epoch, boundary.record.epoch);
+}
+
+test "storage.ha rejoin rewind defensively rejects a divergent log suffix" {
     const alloc = std.testing.allocator;
     const path = try testPath(alloc, "rewind-log");
     defer alloc.free(path);
@@ -414,27 +512,29 @@ test "storage.ha rejoin rewind truncates former primary divergent log suffix" {
     var receipt = promotedReceipt();
     receipt.required_lsn = 2;
     receipt.observed_lsn = 2;
-    const assessment = assessFormerPrimary(.{
+    var assessment = assessFormerPrimary(.{
         .node_id = "primary-a",
         .identity = parentIdentity(),
         .last_lsn = log.lastLsn(),
     }, receipt, .{ .retained_from_lsn = 1 });
+    try std.testing.expectEqual(Action.reseed, assessment.action);
 
-    const result = try rewindReplicationLog(alloc, &log, assessment);
-    try std.testing.expectEqual(@as(u64, 2), result.fork_lsn);
-    try std.testing.expectEqual(@as(u64, 4), result.previous_last_lsn);
-    try std.testing.expectEqual(@as(u64, 2), result.current_last_lsn);
-    try std.testing.expectEqual(@as(u64, 3), result.next_lsn);
-    try std.testing.expectEqual(@as(u64, 2), result.discarded_lsn_count);
+    // Even a stale or malicious caller cannot bypass the assessment outcome by
+    // relabeling it as a rewind request.
+    assessment.action = .rewind;
+    try std.testing.expectError(
+        error.RejoinDivergentDataRequiresReseed,
+        rewindReplicationLog(alloc, &log, assessment),
+    );
 
     const entries = try log.iterateFrom(alloc, 1);
     defer replication_log.freeEntries(alloc, entries);
-    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(@as(usize, 4), entries.len);
     try std.testing.expectEqualStrings("one", entries[0].record.payload);
     try std.testing.expectEqualStrings("two", entries[1].record.payload);
-
-    _ = try log.append(alloc, baseRecord(3, "new-timeline-switch-or-catchup"));
-    try std.testing.expectEqual(@as(u64, 3), log.lastLsn());
+    try std.testing.expectEqualStrings("divergent-three", entries[2].record.payload);
+    try std.testing.expectEqualStrings("divergent-four", entries[3].record.payload);
+    try std.testing.expectEqual(@as(u64, 4), log.lastLsn());
 }
 
 test "storage.ha rejoin rewind rejects stale or non-rewind assessments" {
@@ -448,8 +548,8 @@ test "storage.ha rejoin rewind rejects stale or non-rewind assessments" {
     _ = try log.append(alloc, baseRecord(2, "two"));
 
     var receipt = promotedReceipt();
-    receipt.required_lsn = 1;
-    receipt.observed_lsn = 1;
+    receipt.required_lsn = 2;
+    receipt.observed_lsn = 2;
     const assessment = assessFormerPrimary(.{
         .node_id = "primary-a",
         .identity = parentIdentity(),
@@ -486,8 +586,8 @@ test "storage.ha rejoin rewind requires retained fork record" {
     _ = try log.append(alloc, baseRecord(3, "three"));
 
     var receipt = promotedReceipt();
-    receipt.required_lsn = 2;
-    receipt.observed_lsn = 2;
+    receipt.required_lsn = 3;
+    receipt.observed_lsn = 3;
     const assessment = assessFormerPrimary(.{
         .node_id = "primary-a",
         .identity = parentIdentity(),
@@ -495,7 +595,7 @@ test "storage.ha rejoin rewind requires retained fork record" {
     }, receipt, .{ .retained_from_lsn = 1 });
     try std.testing.expectEqual(Action.rewind, assessment.action);
 
-    try log.truncate(2);
+    try log.truncate(3);
     try std.testing.expectError(
         error.WalNoLongerRetained,
         rewindReplicationLog(alloc, &log, assessment),
@@ -510,16 +610,14 @@ test "storage.ha rejoin rewind rejects fork record identity mismatch" {
     var log = try replication_log.ReplicationLog.open(path.ptr, .{});
     defer log.close();
     _ = try log.append(alloc, baseRecord(1, "one"));
-    var wrong_timeline = baseRecord(2, "wrong-parent");
+    _ = try log.append(alloc, baseRecord(2, "two"));
+    var wrong_timeline = baseRecord(3, "wrong-parent-fork");
     wrong_timeline.timeline_id = 99;
     _ = try log.append(alloc, wrong_timeline);
-    var suffix = baseRecord(3, "suffix");
-    suffix.previous_lsn = 2;
-    _ = try log.append(alloc, suffix);
 
     var receipt = promotedReceipt();
-    receipt.required_lsn = 2;
-    receipt.observed_lsn = 2;
+    receipt.required_lsn = 3;
+    receipt.observed_lsn = 3;
     const assessment = assessFormerPrimary(.{
         .node_id = "primary-a",
         .identity = parentIdentity(),

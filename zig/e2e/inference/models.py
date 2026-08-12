@@ -25,6 +25,7 @@ Set ANTFLY_INFERENCE_ML_DIR to control where Traditional ML predictors are store
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -397,12 +398,16 @@ def inference_command() -> list[str]:
             return [str(candidate), "inference"]
     raise RuntimeError(
         "ANTFLY_INFERENCE_DOWNLOAD=1 requires an antfly inference binary. "
-        "Set ANTFLY_BIN, or build zig-out/bin/antfly with `zig build install -Dedition=inference`."
+        "Set ANTFLY_BIN, or build zig-out/bin/antfly with `zig build antfly`."
     )
 
 
 def _model_path(spec: ModelSpec) -> Path:
-    return models_dir() / spec.repo
+    legacy_path = models_dir() / spec.repo
+    if spec.variant == "auto":
+        return legacy_path
+    variant_hash = hashlib.sha256(spec.variant.encode()).hexdigest()[:16]
+    return legacy_path.with_name(f"{legacy_path.name}--antfly-{variant_hash}")
 
 
 def _validated_managed_artifacts(path: Path) -> tuple[str, ...] | None:
@@ -427,7 +432,10 @@ def _validated_managed_artifacts(path: Path) -> tuple[str, ...] | None:
         artifacts = completion["artifacts"]
     except (OSError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
         return ()
-    if type(completion.get("version")) is not int or completion["version"] != 1:
+    if (
+        type(completion.get("version")) is not int
+        or completion["version"] not in {1, 2}
+    ):
         return ()
     if (
         not isinstance(artifacts, list)
@@ -566,7 +574,7 @@ def _model_satisfies_spec(model: LocalModel, spec: ModelSpec) -> bool:
 def model_available(spec: ModelSpec) -> bool:
     """Check if a model is already downloaded."""
 
-    model = _find_local_model(spec.request_name, spec.task)
+    model = _find_local_model_for_spec(spec)
     if model is None:
         return False
     return _model_satisfies_spec(model, spec)
@@ -585,7 +593,16 @@ def _find_local_model(name: str, task_hint: str | None = None) -> LocalModel | N
         return None
 
     root = models_dir()
-    candidates: list[Path] = [root / name]
+    legacy_path = root / name
+    candidates: list[Path] = [legacy_path]
+    # Explicit variants are installed beside the legacy path so multiple
+    # formats/quantizations can coexist. Bare names retain compatibility by
+    # selecting a completed variant deterministically when no legacy install
+    # exists; callers that know the variant use `_model_path` instead.
+    try:
+        candidates.extend(sorted(legacy_path.parent.glob(f"{legacy_path.name}--antfly-*")))
+    except OSError:
+        pass
 
     seen: set[Path] = set()
     for candidate in candidates:
@@ -593,6 +610,21 @@ def _find_local_model(name: str, task_hint: str | None = None) -> LocalModel | N
             continue
         seen.add(candidate)
         if model := _probe_model_dir(candidate):
+            return model
+    return None
+
+
+def _find_local_model_for_spec(spec: ModelSpec) -> LocalModel | None:
+    """Resolve the exact variant first, then its pre-variant legacy location."""
+
+    expected = _model_path(spec)
+    candidates = [expected]
+    legacy = models_dir() / spec.repo
+    if legacy != expected:
+        candidates.append(legacy)
+    for candidate in candidates:
+        model = _probe_model_dir(candidate)
+        if model is not None and _model_satisfies_spec(model, spec):
             return model
     return None
 
@@ -620,8 +652,8 @@ def spec_for_name(name: str, task_hint: str | None = None) -> ModelSpec | None:
 def ensure_model(spec: ModelSpec) -> Path:
     """Download a model with `antfly inference pull` if not already present."""
 
-    existing = _find_local_model(spec.request_name, spec.task)
-    if existing is not None and _model_satisfies_spec(existing, spec):
+    existing = _find_local_model_for_spec(spec)
+    if existing is not None:
         return existing.path
 
     command = [
@@ -639,7 +671,10 @@ def ensure_model(spec: ModelSpec) -> Path:
     print(f"Downloading {spec.pull_ref}")
     subprocess.run(command, cwd=REPO_ROOT, check=True)
 
-    resolved = _find_local_model(spec.request_name, spec.task)
+    resolved = _probe_model_dir(_model_path(spec))
+    legacy = models_dir() / spec.repo
+    if resolved is None and legacy != _model_path(spec):
+        resolved = _probe_model_dir(legacy)
     if resolved is None:
         raise RuntimeError(
             f"antfly inference pull finished but could not locate {spec.request_name} in {models_dir()}"

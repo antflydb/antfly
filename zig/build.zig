@@ -34,9 +34,20 @@ const makeLmdbModule = antfly_storage_build.makeLmdbModule;
 const makeRootBuildOptions = antfly_storage_build.makeRootBuildOptions;
 const selectTestFilters = antfly_tests_build.selectTestFilters;
 
-const BuildEdition = enum {
-    full,
+const RuntimeArtifactRole = enum {
+    cli,
+    data,
     inference,
+    metadata,
+    standalone,
+};
+
+const RuntimeLibraryUnit = enum {
+    api_kernel,
+    distributed,
+    inference,
+    // Remote/client commands do not own storage or server runtimes.
+    cli,
 };
 
 const snowball_languages = [_][]const u8{
@@ -82,8 +93,8 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
     const sdk_root = b.sysroot orelse
-        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         b.graph.environ_map.get("SDK_PATH") orelse
+        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         return;
     module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
     module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
@@ -167,6 +178,40 @@ const DelegatedInferenceBuildSteps = struct {
 fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) void {
     for (dependencies) |dependency| {
         step.dependOn(dependency);
+    }
+}
+
+fn assignDefaultAggregateMaxRss(
+    b: *std.Build,
+    root: *std.Build.Step,
+    compile_max_rss: usize,
+    run_max_rss: usize,
+) void {
+    var visited = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
+    defer visited.deinit();
+    assignDefaultAggregateMaxRssRecursive(root, compile_max_rss, run_max_rss, &visited);
+}
+
+fn assignDefaultAggregateMaxRssRecursive(
+    step: *std.Build.Step,
+    compile_max_rss: usize,
+    run_max_rss: usize,
+    visited: *std.AutoHashMap(*std.Build.Step, void),
+) void {
+    const entry = visited.getOrPut(step) catch @panic("OOM");
+    if (entry.found_existing) return;
+    if (step.max_rss == 0) switch (step.id) {
+        .compile => step.max_rss = compile_max_rss,
+        .run => step.max_rss = run_max_rss,
+        else => {},
+    };
+    for (step.dependencies.items) |dependency| {
+        assignDefaultAggregateMaxRssRecursive(
+            dependency,
+            compile_max_rss,
+            run_max_rss,
+            visited,
+        );
     }
 }
 
@@ -521,6 +566,7 @@ const AntflyRootImports = struct {
     reranking_openapi: *std.Build.Module,
     extraction_openapi: *std.Build.Module,
     transcribing: *std.Build.Module,
+    reader_config: *std.Build.Module,
     readers: *std.Build.Module,
     extracting: *std.Build.Module,
     synthesizing: *std.Build.Module,
@@ -590,6 +636,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_reranking_openapi", .field = "reranking_openapi" },
         .{ .name = "antfly_extraction_openapi", .field = "extraction_openapi" },
         .{ .name = "antfly_transcribing", .field = "transcribing" },
+        .{ .name = "antfly_reader_config", .field = "reader_config" },
         .{ .name = "antfly_readers", .field = "readers" },
         .{ .name = "antfly_extracting", .field = "extracting" },
         .{ .name = "antfly_synthesizing", .field = "synthesizing" },
@@ -625,9 +672,27 @@ const AntflyRootImports = struct {
     };
 
     fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
+        self.configureRuntime(b, mod, include_lmdb_c, link_libc, true);
+    }
+
+    /// Install the production runtime imports while keeping the heavyweight
+    /// inference server graph out of compilation units that only exchange its
+    /// language-neutral bridge types. Supporting inference API, chunking,
+    /// extraction, and audio modules remain available because distributed
+    /// server roles genuinely use them.
+    fn configureRuntime(
+        self: @This(),
+        b: *std.Build,
+        mod: *std.Build.Module,
+        include_lmdb_c: bool,
+        link_libc: bool,
+        include_inference_server: bool,
+    ) void {
         mod.addOptions("build_options", self.build_options);
         inline for (import_table) |entry| {
-            mod.addImport(entry.name, @field(self, entry.field));
+            if (include_inference_server or !std.mem.eql(u8, entry.name, "inference_server")) {
+                mod.addImport(entry.name, @field(self, entry.field));
+            }
         }
         mod.addImport("antfly_platform", self.platform);
         if (link_libc and !self.platform_link_libc) {
@@ -1100,7 +1165,7 @@ fn addOpenApiRegenStep(
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/audio.yaml"), "antfly_audio_openapi", antfly_generated_root ++ "/antfly_audio_openapi", "types", &.{
             .{ "../shared/s3.yaml", "antfly_s3_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/middleware/openapi.yaml"), "antfly_middleware_openapi", antfly_generated_root ++ "/antfly_middleware_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/middleware.yaml"), "antfly_middleware_openapi", antfly_generated_root ++ "/antfly_middleware_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/scraping.yaml"), "antfly_scraping_openapi", antfly_generated_root ++ "/antfly_scraping_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/s3.yaml"), "antfly_s3_openapi", antfly_generated_root ++ "/antfly_s3_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/inference/config.yaml"), "antfly_inference_config_openapi", antfly_generated_root ++ "/antfly_inference_config_openapi", "types", &.{
@@ -1120,7 +1185,7 @@ fn addOpenApiRegenStep(
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/config.yaml"), "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi", "types", &.{
             .{ "../shared/logging.yaml", "antfly_logging_openapi" },
             .{ "audio.yaml", "antfly_audio_openapi" },
-            .{ "../../../go/pkg/antfly/lib/middleware/openapi.yaml", "antfly_middleware_openapi" },
+            .{ "../shared/middleware.yaml", "antfly_middleware_openapi" },
             .{ "embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
             .{ "reranking.yaml", "antfly_reranking_openapi" },
@@ -1166,7 +1231,11 @@ pub fn build(b: *std.Build) void {
     // target keeps user-supplied -Dtarget overrides intact while making the
     // no-argument path use Zig's bundled libc startup objects.
     const default_target: std.Target.Query = if (builtin.os.tag == .linux)
-        .{ .cpu_arch = builtin.cpu.arch, .os_tag = .linux, .abi = .gnu }
+        .{
+            .cpu_arch = builtin.cpu.arch,
+            .os_tag = .linux,
+            .abi = .gnu,
+        }
     else
         .{};
     const target = b.standardTargetOptions(.{ .default_target = default_target });
@@ -1182,8 +1251,7 @@ pub fn build(b: *std.Build) void {
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
-    const include_ha_tests_in_aggregates = b.option(bool, "ha-tests", "Include hot-standby HA suites in aggregate test steps") orelse true;
-    const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
+    const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused runtime artifact: cli, data, inference, metadata, or standalone");
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
@@ -1203,9 +1271,9 @@ pub fn build(b: *std.Build) void {
     else
         false;
     const termite_enable_cuda = b.option(bool, "cuda", "Enable CUDA inference support through the NVIDIA Driver API") orelse false;
-    const termite_cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: portable PTX; fatbin is not implemented yet") orelse "portable";
-    if (!std.mem.eql(u8, termite_cuda_artifacts, "portable")) {
-        @panic("invalid -Dcuda-artifacts (expected portable; fatbin is not implemented yet)");
+    const termite_cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: fatbin SASS+PTX, portable PTX, or sm89 cubin") orelse "fatbin";
+    if (!std.mem.eql(u8, termite_cuda_artifacts, "portable") and !std.mem.eql(u8, termite_cuda_artifacts, "fatbin") and !std.mem.eql(u8, termite_cuda_artifacts, "sm89")) {
+        @panic("invalid -Dcuda-artifacts (expected portable, fatbin, or sm89)");
     }
     const termite_blas_root_opt = b.option([]const u8, "blas-root", "Path to system BLAS root with include/ and lib/ for non-macOS native acceleration");
     const termite_system_blas_available = link_libc and (target.result.os.tag == .macos or termite_blas_root_opt != null);
@@ -1238,8 +1306,9 @@ pub fn build(b: *std.Build) void {
     );
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, antfly_version);
-    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, antfly_version);
+    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, true, antfly_version);
+    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, true, antfly_version);
+    const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, false, antfly_version);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
     const lmdb_engine_wasm_mod = makeLmdbEngineModule(b, wasm_target, optimize, false, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
@@ -1534,6 +1603,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     scraping_mod.addImport("objectstore", objectstore_mod);
+    scraping_mod.addImport("httpx", httpx_mod);
     const reranking_mod = b.createModule(.{
         .root_source_file = b.path("lib/reranking/src/mod.zig"),
         .target = target,
@@ -1571,6 +1641,11 @@ pub fn build(b: *std.Build) void {
     });
     pdf_mod.addImport("antfly_image", image_mod);
     pdf_mod.addImport("antfly_font", font_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_mod, target);
+        pdf_mod.linkFramework("CoreFoundation", .{});
+        pdf_mod.linkFramework("CoreGraphics", .{});
+    }
     const wasm_image_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
         .target = wasm_target,
@@ -1689,7 +1764,6 @@ pub fn build(b: *std.Build) void {
     const inference_fixed_tokenizer_data_mod = inference_graph.inference_fixed_tokenizer_data_mod;
     const inference_chunker_mod = inference_graph.inference_chunker_mod;
     const inference_server_mod = inference_graph.inference_mod;
-
     const hf_tokenizer_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("lib/tokenizer/src/hf_tokenizer.zig"),
@@ -1719,6 +1793,11 @@ pub fn build(b: *std.Build) void {
     transcribing_mod.addImport("inference_api", inference_api_mod);
     transcribing_mod.addImport("antfly_scraping", scraping_mod);
     transcribing_mod.addImport("antfly_google", google_mod);
+    const reader_config_mod = b.createModule(.{
+        .root_source_file = b.path("lib/readers/src/config.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const readers_mod = b.createModule(.{
         .root_source_file = b.path("lib/readers/src/mod.zig"),
         .target = target,
@@ -1727,6 +1806,7 @@ pub fn build(b: *std.Build) void {
     readers_mod.addImport("httpx", httpx_mod);
     readers_mod.addImport("inference_api", inference_api_mod);
     readers_mod.addImport("antfly_google", google_mod);
+    readers_mod.addImport("antfly_reader_config", reader_config_mod);
     inference_server_mod.addImport("antfly_readers", readers_mod);
     inference_server_mod.addImport("antfly_transcribing", transcribing_mod);
     inference_server_mod.addImport("antfly_extracting", extracting_mod);
@@ -1771,6 +1851,7 @@ pub fn build(b: *std.Build) void {
         .reranking_openapi = reranking_openapi_mod,
         .extraction_openapi = extraction_openapi_mod,
         .transcribing = transcribing_mod,
+        .reader_config = reader_config_mod,
         .readers = readers_mod,
         .extracting = extracting_mod,
         .synthesizing = synthesizing_mod,
@@ -1808,6 +1889,8 @@ pub fn build(b: *std.Build) void {
         .platform_target = target,
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
+    var production_antfly_imports = antfly_imports;
+    production_antfly_imports.build_options = production_build_options;
 
     // Library module
     const lib_mod = b.addModule("antfly-zig", .{
@@ -1829,6 +1912,8 @@ pub fn build(b: *std.Build) void {
         "pkg/antfly/src/metadata_reconciler_test_root.zig",
         "pkg/antfly/src/metadata_service_http_test_root.zig",
         "pkg/antfly/src/metadata_core_test_root.zig",
+        "pkg/antfly/src/metadata_api_admin_test_root.zig",
+        "pkg/antfly/src/metadata_server_test_root.zig",
         "pkg/antfly/src/metadata_planning_transition_test_root.zig",
         "pkg/antfly/src/metadata_table_provisioner_test_root.zig",
         "pkg/antfly/src/metadata_replication_backfill_test_root.zig",
@@ -1910,6 +1995,15 @@ pub fn build(b: *std.Build) void {
     usermgr_storage_test_mod.addImport("antfly_root", lib_test_mod);
     usermgr_storage_test_mod.addImport("antfly_platform", platform_mod);
     lib_test_mod.addImport("usermgr_storage", usermgr_storage_test_mod);
+
+    const usermgr_storage_data_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    usermgr_storage_data_runtime_test_mod.addImport("antfly_root", data_runtime_test_mod);
+    usermgr_storage_data_runtime_test_mod.addImport("antfly_platform", platform_mod);
+    data_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_data_runtime_test_mod);
 
     const embedded_deps = .{
         build_options,
@@ -2244,68 +2338,76 @@ pub fn build(b: *std.Build) void {
     });
     _ = lib;
 
+    const capi_root_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/capi_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, capi_root_mod, false, link_libc);
+    const capi_usermgr_storage_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    capi_usermgr_storage_mod.addImport("antfly_root", capi_root_mod);
+    capi_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+    capi_root_mod.addImport("usermgr_storage", capi_usermgr_storage_mod);
+
     const capi_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
         .target = target,
         .optimize = optimize,
+        .pic = true,
     });
-    capi_mod.addImport("antfly-zig", lib_mod);
+    capi_mod.addImport("antfly_storage_root", capi_root_mod);
     capi_mod.addImport("structlog", structlog_mod);
 
-    const capi_lib = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "antfly_zig_capi",
-        .root_module = capi_mod,
-    });
-    const install_capi_lib = b.addInstallArtifact(capi_lib, .{});
-
-    const lite_capi_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
+    // The public C ABI and executable reuse the distributed PIC storage
+    // archive, so production builds analyze and optimize that graph once.
+    const libantfly_link_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/capi/link_anchor.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = link_libc,
+        .strip = strip,
     });
-    lite_capi_mod.addImport("antfly-zig", lib_mod);
-    lite_capi_mod.addImport("structlog", structlog_mod);
-
-    const lite_capi_lib = b.addLibrary(.{
+    addMacosSdkPaths(b, libantfly_link_mod, target);
+    const libantfly = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "antfly",
-        .root_module = lite_capi_mod,
+        .root_module = libantfly_link_mod,
+        .max_rss = 2 * 1024 * 1024 * 1024,
     });
-    const install_lite_capi_lib = b.addInstallArtifact(lite_capi_lib, .{});
-    const install_lite_capi_header = b.addInstallFileWithDir(
+    libantfly.link_gc_sections = true;
+    const install_libantfly = b.addInstallArtifact(libantfly, .{});
+    const install_capi_header = b.addInstallFileWithDir(
         b.path("pkg/antfly/include/antfly.h"),
         .header,
         "antfly.h",
     );
 
-    const capi_step = b.step("capi", "Build the Zig C API shared libraries");
-    capi_step.dependOn(&install_capi_lib.step);
-    capi_step.dependOn(&install_lite_capi_lib.step);
-    capi_step.dependOn(&install_lite_capi_header.step);
+    const capi_step = b.step("capi", "Build the public libantfly C ABI shared library");
+    capi_step.dependOn(&install_libantfly.step);
+    capi_step.dependOn(&install_capi_header.step);
 
-    const lite_capi_step = b.step("lite-capi", "Build the libantfly C ABI shared library");
-    lite_capi_step.dependOn(&install_lite_capi_lib.step);
-    lite_capi_step.dependOn(&install_lite_capi_header.step);
-
-    const lite_capi_smoke_mod = b.createModule(.{
+    const capi_smoke_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
     });
-    lite_capi_smoke_mod.link_libc = true;
-    lite_capi_smoke_mod.addIncludePath(b.path("pkg/antfly/include"));
-    lite_capi_smoke_mod.addCSourceFile(.{
-        .file = b.path("examples/antfly_lite_c_smoke.c"),
+    capi_smoke_mod.link_libc = true;
+    capi_smoke_mod.addIncludePath(b.path("pkg/antfly/include"));
+    capi_smoke_mod.addCSourceFile(.{
+        .file = b.path("examples/antfly_c_smoke.c"),
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
-    const lite_capi_smoke = b.addExecutable(.{
-        .name = "antfly-lite-c-smoke",
-        .root_module = lite_capi_smoke_mod,
+    const capi_smoke = b.addExecutable(.{
+        .name = "antfly-c-smoke",
+        .root_module = capi_smoke_mod,
     });
-    lite_capi_smoke.root_module.linkLibrary(lite_capi_lib);
-    const run_lite_capi_smoke = b.addRunArtifact(lite_capi_smoke);
-    const lite_capi_smoke_step = b.step("lite-capi-smoke", "Compile and run a C consumer smoke test for libantfly");
-    lite_capi_smoke_step.dependOn(&run_lite_capi_smoke.step);
+    capi_smoke.root_module.linkLibrary(libantfly);
+    const run_capi_smoke = b.addRunArtifact(capi_smoke);
+    const capi_smoke_step = b.step("capi-smoke", "Compile and run a C consumer smoke test for libantfly");
+    capi_smoke_step.dependOn(&run_capi_smoke.step);
 
     const run_lite_go_tests = b.addSystemCommand(&.{
         "env",
@@ -2318,8 +2420,8 @@ pub fn build(b: *std.Build) void {
         "./...",
     });
     run_lite_go_tests.setCwd(b.path("../go/pkg/antflylite"));
-    run_lite_go_tests.step.dependOn(&install_lite_capi_lib.step);
-    run_lite_go_tests.step.dependOn(&install_lite_capi_header.step);
+    run_lite_go_tests.step.dependOn(&install_libantfly.step);
+    run_lite_go_tests.step.dependOn(&install_capi_header.step);
     const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantfly");
     lite_go_test_step.dependOn(&run_lite_go_tests.step);
 
@@ -2336,8 +2438,8 @@ pub fn build(b: *std.Build) void {
         "../../zig/.zig-cache/antfly-lite-go-example.afb",
     });
     run_lite_go_example.setCwd(b.path("../examples/antfly-lite-go"));
-    run_lite_go_example.step.dependOn(&install_lite_capi_lib.step);
-    run_lite_go_example.step.dependOn(&install_lite_capi_header.step);
+    run_lite_go_example.step.dependOn(&install_libantfly.step);
+    run_lite_go_example.step.dependOn(&install_capi_header.step);
     const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go Antfly Lite example app");
     lite_go_example_step.dependOn(&run_lite_go_example.step);
 
@@ -2354,8 +2456,8 @@ pub fn build(b: *std.Build) void {
         "../../zig/.zig-cache/antfly-lite-retrieval-go.afb",
     });
     run_lite_go_retrieval_template.setCwd(b.path("../examples/antfly-lite-retrieval-go"));
-    run_lite_go_retrieval_template.step.dependOn(&install_lite_capi_lib.step);
-    run_lite_go_retrieval_template.step.dependOn(&install_lite_capi_header.step);
+    run_lite_go_retrieval_template.step.dependOn(&install_libantfly.step);
+    run_lite_go_retrieval_template.step.dependOn(&install_capi_header.step);
     const lite_go_retrieval_template_step = b.step("lite-go-retrieval-template", "Run the embedded Go Antfly Lite retrieval template");
     lite_go_retrieval_template_step.dependOn(&run_lite_go_retrieval_template.step);
 
@@ -2366,8 +2468,8 @@ pub fn build(b: *std.Build) void {
         "scripts/packaging/test_cabi_packaging.py",
     });
     run_cabi_packaging_tests.setCwd(b.path(".."));
-    const lite_package_test_step = b.step("lite-package-test", "Run Antfly C ABI release packaging regression tests");
-    lite_package_test_step.dependOn(&run_cabi_packaging_tests.step);
+    const capi_package_test_step = b.step("capi-package-test", "Run Antfly C ABI release packaging regression tests");
+    capi_package_test_step.dependOn(&run_cabi_packaging_tests.step);
 
     const capi_default_filters = [_][]const u8{
         "capi lite opens exports imports checks and vacuums aflite",
@@ -2544,6 +2646,22 @@ pub fn build(b: *std.Build) void {
     const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");
     lib_httpx_test_step.dependOn(&run_httpx_tests.step);
 
+    const common_http_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/common_http_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    common_http_test_mod.addImport("raft_engine", raft_engine_mod);
+    common_http_test_mod.addImport("antfly_platform", platform_mod);
+    common_http_test_mod.addImport("httpx", httpx_mod);
+    const common_http_tests = b.addTest(.{
+        .root_module = common_http_test_mod,
+    });
+    common_http_tests.root_module.link_libc = true;
+    const run_common_http_tests = b.addRunArtifact(common_http_tests);
+    const common_http_test_step = b.step("common-http-test", "Run common HTTP listener and client tests");
+    common_http_test_step.dependOn(&run_common_http_tests.step);
+
     const httpx_transport_regression_tests = b.addTest(.{
         .root_module = httpx_mod,
         .filters = &.{"H2 response serialization strips connection-specific headers"},
@@ -2624,6 +2742,7 @@ pub fn build(b: *std.Build) void {
             "delayed restore contention yields FIFO capacity to unrelated jobs",
             "restore job runnable queue drains incrementally and preserves insertion order",
             "replicated restore leadership rebuild preserves FIFO and recovers running attempts",
+            "replicated restore expiry deletion preserves foreign boundary failure",
             "restore requests without idempotency keys create independent opaque jobs",
             "restore runtime store persists checkpoints and requeues interrupted work",
             "restore progress ordinals remain bounded at maximum table count",
@@ -2678,6 +2797,13 @@ pub fn build(b: *std.Build) void {
     const lib_embeddings_test_step = b.step("lib-embeddings-test", "Run standalone lib/embeddings tests");
     lib_embeddings_test_step.dependOn(&run_lib_embeddings_tests.step);
 
+    const lib_scraping_tests = b.addTest(.{
+        .root_module = scraping_mod,
+    });
+    const run_lib_scraping_tests = b.addRunArtifact(lib_scraping_tests);
+    const lib_scraping_test_step = b.step("lib-scraping-test", "Run standalone lib/scraping tests");
+    lib_scraping_test_step.dependOn(&run_lib_scraping_tests.step);
+
     const lib_vectorindex_tests = b.addTest(.{
         .root_module = vectorindex_mod,
     });
@@ -2718,6 +2844,26 @@ pub fn build(b: *std.Build) void {
     const run_lib_image_tests = b.addRunArtifact(lib_image_tests);
     const lib_image_test_step = b.step("lib-image-test", "Run shared image tests");
     lib_image_test_step.dependOn(&run_lib_image_tests.step);
+
+    const pdf_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/pdf/pdf_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pdf_test_mod.addImport("antfly_image", image_mod);
+    pdf_test_mod.addImport("antfly_font", font_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_test_mod, target);
+        pdf_test_mod.linkFramework("CoreFoundation", .{});
+        pdf_test_mod.linkFramework("CoreGraphics", .{});
+    }
+    const lib_pdf_tests = b.addTest(.{
+        .root_module = pdf_test_mod,
+    });
+    lib_pdf_tests.root_module.link_libc = true;
+    const run_lib_pdf_tests = b.addRunArtifact(lib_pdf_tests);
+    const lib_pdf_test_step = b.step("lib-pdf-test", "Run shared PDF tests");
+    lib_pdf_test_step.dependOn(&run_lib_pdf_tests.step);
 
     const lib_image_bench_build_options = b.addOptions();
     const lib_image_spng_paths = detectSpngPaths(b, target);
@@ -2774,6 +2920,11 @@ pub fn build(b: *std.Build) void {
     });
     pdf_bench_pdf_mod.addImport("antfly_image", pdf_bench_image_mod);
     pdf_bench_pdf_mod.addImport("antfly_font", pdf_bench_font_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_bench_pdf_mod, target);
+        pdf_bench_pdf_mod.linkFramework("CoreFoundation", .{});
+        pdf_bench_pdf_mod.linkFramework("CoreGraphics", .{});
+    }
     const pdf_bench_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/src/pdf_bench.zig"),
         .target = target,
@@ -3013,7 +3164,7 @@ pub fn build(b: *std.Build) void {
     const lib_reranking_runtime_test_step = b.step("lib-reranking-runtime-test", "Run reranking backend adapter tests");
     lib_reranking_runtime_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
 
-    const lib_common_default_filters = [_][]const u8{ "provider registry", "std http listener", "std http executor", "threaded connector" };
+    const lib_common_default_filters = [_][]const u8{ "provider registry", "std http listener", "std http executor", "threaded connector", "health server" };
     const lib_common_runtime_filters = selectTestFilters(b, &lib_common_default_filters);
     const lib_common_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -3210,9 +3361,17 @@ pub fn build(b: *std.Build) void {
         "provisioned leader admission rejects uncommitted writes under dense repair pressure",
         "api maintenance resumes recovered durable named index cancellation without client advance",
         "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible",
+        "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
+        "managed embedder sends antfly media parts when local provider is configured",
+        "managed embedder normalizes local admission overload across embedding modes",
+        "partial coverage embeddings readiness counts skipped source units",
+        "partial coverage embeddings readiness does not mask pending enrichment",
         "create table raw parser merges default full text with quickstart embedding index",
         "create table raw parser accepts its canonical full text output",
         "table contract rejects unsupported index kinds before admission",
+        "table contract preserves artifact-backed public full text indexes",
+        "table contract rejects invalid inline artifact enrichments before admission",
+        "public enrichment validation rejects invalid execution and producer config",
         "provisioned primary lookup lease fails on identity namespace mismatch",
         "inference pull recognizes help before model resolution",
         "inference run recognizes help before server startup",
@@ -3397,15 +3556,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    antfly_imports.configure(b, cmd_test_mod, true, true);
+    const cmd_usermgr_storage_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cmd_usermgr_storage_mod.addImport("antfly_root", cmd_test_mod);
+    cmd_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+    cmd_test_mod.addImport("usermgr_storage", cmd_usermgr_storage_mod);
     cmd_test_mod.addImport("antfly-zig", lib_mod);
     cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    cmd_test_mod.addImport("httpx", httpx_mod);
-    cmd_test_mod.addImport("antfly_vellum", vellum_mod);
-    cmd_test_mod.addImport("raft_engine", raft_engine_mod);
-    cmd_test_mod.addImport("structlog", structlog_mod);
-    cmd_test_mod.addImport("antfly_platform", platform_mod);
-    cmd_test_mod.addImport("handlebars", handlebars_mod);
-    cmd_test_mod.addOptions("build_options", build_options);
     const cmd_tests = b.addTest(.{
         .root_module = cmd_test_mod,
         .filters = &.{ "cmd.lite", "cmd.serverless", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.mod" },
@@ -3413,6 +3574,9 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
+        // Mach-O debug codegen retained 10.3 GiB for this intentionally broad
+        // command root. Linux remains within the aggregate's 7 GiB claim.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_cmd_tests = addFilteredTestRunArtifact(b, cmd_tests);
     const cmd_test_step = b.step("cmd-test", "Run Antfly command and client CLI tests");
@@ -3423,15 +3587,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    antfly_imports.configure(b, lite_cmd_test_mod, true, true);
+    const lite_cmd_usermgr_storage_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lite_cmd_usermgr_storage_mod.addImport("antfly_root", lite_cmd_test_mod);
+    lite_cmd_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+    lite_cmd_test_mod.addImport("usermgr_storage", lite_cmd_usermgr_storage_mod);
     lite_cmd_test_mod.addImport("antfly-zig", lib_mod);
     lite_cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    lite_cmd_test_mod.addImport("httpx", httpx_mod);
-    lite_cmd_test_mod.addImport("antfly_vellum", vellum_mod);
-    lite_cmd_test_mod.addImport("raft_engine", raft_engine_mod);
-    lite_cmd_test_mod.addImport("structlog", structlog_mod);
-    lite_cmd_test_mod.addImport("antfly_platform", platform_mod);
-    lite_cmd_test_mod.addImport("handlebars", handlebars_mod);
-    lite_cmd_test_mod.addOptions("build_options", build_options);
     const lite_cmd_tests = b.addTest(.{
         .root_module = lite_cmd_test_mod,
         .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.mod" },
@@ -3830,12 +3996,17 @@ pub fn build(b: *std.Build) void {
         "data server fail-closed sync policy rejects primary writes before local commit",
         "data server block sync policy waits for standby acknowledgement before commit returns",
         "data server propagates standby HA write gate into provisioned write sources",
+        "storage.ha data runtime default seed snapshot derives standalone groups from metadata only",
+        "storage.ha data runtime rejects concurrent seed capture before waiting on mutation barrier",
         "storage.ha data server rejects writes and owner jobs after primary promotion fence",
         "data server applies routed HA replication records through standby write gate",
         "data server pulls and applies HA standby replication through internal HTTP client",
+        "data server HA state change synchronously adopts promotion and rewires live HTTP executor",
+        "data server promotion open failure preserves retryable standby",
         "data server resumes HA standby replication from durable progress after restart",
+        "data runtime records and backs off HA standby replication round failures",
+        "data runtime HA replication HTTP budget covers base64 apply envelope",
         "data server keeps upstream replication availability failures nonfatal",
-        "data runtime records HA standby replication round failures",
         "data runtime records HA standby apply failures without stopping run round",
     };
     const lib_data_runtime_tests = b.addTest(.{
@@ -3951,6 +4122,21 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db replay applies dense embeddings from artifact payloads",
             "storage.db.db.test.db split cutover",
             "storage.db.db.test.db merge-style cutover",
+            "remote fetch classification retries only transient failures",
+            "remote HTTP failures consume retry budget before terminal coverage",
+            "enrichment retries unknown errors and isolates known permanent errors",
+            "document extraction reserves PDF decoder peak memory atomically",
+            "PDF decoder credit and OCR transient allocations compose without double charging",
+            "reserved PDF working set is bounded without duplicate resource charges",
+            "budgeted document download composes with materialization accounting",
+            "retained document collection allocations compose with the hard working-set cap",
+            "document replay payloads are admitted before persistent allocation",
+            "document extraction generated OCR bypasses unsupported native batch",
+            "OCR pending metadata construction is allocation-failure safe",
+            "generated text provider config is validated while parsing extraction config",
+            "public enrichment validation rejects invalid execution and producer config",
+            "enrichment runtime document extraction manifest uses v2 range and merge shape",
+            "db document extraction failure manifest preserves prior artifacts",
         },
     });
     const run_lib_db_enrichment_tests = addFilteredTestRunArtifact(b, lib_db_enrichment_tests);
@@ -4599,6 +4785,9 @@ pub fn build(b: *std.Build) void {
 
     const lib_api_auth_default_filters = [_][]const u8{
         "api http server requires auth on public routes when enabled",
+        "continuous HA rejects non-replicated public mutations before handlers",
+        "continuous HA freezes pre-existing restore workers and resumption",
+        "continuous HA allows a configured RemoteApply batch write",
         "api http server document scan requires table read permission",
         "api http server returns retryable not leader when local reconcile lease is lost",
         "api http server returns retryable not leader when metadata proposal is dropped",
@@ -4607,7 +4796,7 @@ pub fn build(b: *std.Build) void {
         "api http server cluster backup succeeds after load balanced metadata timeout retry",
         "api http server does not advertise a retry after cluster backup side effects begin",
         "api http server dispatches HA admin and internal executors",
-        "api http server protects HA admin routes while exempting HA internal routes",
+        "api http server requires exact HA bearer token for internal replication routes",
         "api http server forbids non-admin secret access when auth is enabled",
         "api http server query builder requires table read permission when auth is enabled",
         "api http server restricts runtime schema debug to admins when auth is enabled",
@@ -5121,6 +5310,7 @@ pub fn build(b: *std.Build) void {
             "provisioned stateless batch retries definite aborts to the production bound",
             "bound table write source backs up and restores a local table",
             "bound table write source backs up and restores a portable local table",
+            "provisioned table write source backs up and restores a local table",
             "provisioned table write source backs up a portable local table",
             "provisioned table write source backs up and restores a local table",
             "provisioned native backup restore repeats through shared read and write owners",
@@ -5129,6 +5319,8 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source path invalidation clears shared vector read cache",
             "provisioned table restore retry repairs exact incomplete restore state through active writer",
             "provisioned restore repair source deinit cancels sleeping retry worker",
+            "provisioned restore repair worker retries transient step failures to completion",
+            "provisioned table write source restore repair completion retires cached vector read state",
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache blocks same-root generation replacement while stale lease stays live",
             "provisioned transition writer fences exact supplied table metadata",
@@ -5159,6 +5351,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source drop table closes schema-bearing cached writer once",
             "provisioned table write source backup releases read cache exclusive before native snapshot copy",
             "managed startup catch-up repeats replay while dense debt progresses",
+            "managed startup catch-up open constructs bounded enrichment runtime without workers",
             "provisioned group storage wires remote content to writer caches",
             "startup runtime status snapshot publishes live db when active cache is empty",
             "best effort startup runtime status publishes live db when cache is empty",
@@ -5226,6 +5419,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "public table batch handler maps doc identity unavailable errors",
             "public table batch handler maps write unavailable errors",
+            "public table batch handler exposes pending HA durability without claiming rollback",
             "public table batch handler preserves ambiguous write outcomes",
             "public table batch handler maps HA write gate errors",
             "public table batch handler returns concise dense repair backpressure",
@@ -5359,6 +5553,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table transition activity excludes writers but preserves reads",
             "provisioned table transition waiter queues ahead of later writers",
             "provisioned table transition waiter queues ahead of later readers",
+            "provisioned table write source read request permits replicated apply activity",
             "provisioned table group operation waiter queues ahead of later readers",
             "provisioned table write request queues structural reconcile ahead of later writes",
             "structural reconcile reservation defers metadata group refresh without blocking admitted work",
@@ -5382,6 +5577,7 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
             "managed startup catch-up allocation failure preserves bounded retry",
+            "standby HA replay reconciles managed indexes without opening the public write gate",
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
             "managed db open modes never drain resolver backfill on raft apply",
             "replica root reconcile enqueues newly admitted managed full text repair",
@@ -5668,6 +5864,22 @@ pub fn build(b: *std.Build) void {
     const ha_test_step = b.step("ha-test", "Run hot-standby HA storage tests");
     ha_test_step.dependOn(&run_ha_tests.step);
 
+    // cmd/ha.zig is owned by the distributed runtime unit. Keep its focused
+    // parser root inside pkg/antfly/src so relative imports stay within the Zig
+    // module boundary, without pulling the command back into the CLI unit.
+    const ha_cli_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/ha_cmd_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ha_cli_test_mod.addImport("antfly-zig", lib_mod);
+    const ha_cli_tests = b.addTest(.{
+        .root_module = ha_cli_test_mod,
+        .filters = &.{"ha cmd artifact"},
+    });
+    const run_ha_cli_tests = b.addRunArtifact(ha_cli_tests);
+    ha_test_step.dependOn(&run_ha_cli_tests.step);
+
     const lsm_backend_runtime_filters = selectTestFilters(b, &.{"storage.lsm_backend."});
     const lsm_backend_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -5858,9 +6070,7 @@ pub fn build(b: *std.Build) void {
     var chaos_progress_tail: ?*std.Build.Step = null;
     chaos_progress_tail = chainLabeledRun(b, lib_metadata_vopr_chaos_tests, "lib-metadata-vopr-chaos-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_lsm_backend_chaos_tests, "lib-lsm-backend-chaos-test", chaos_progress_tail);
-    if (include_ha_tests_in_aggregates) {
-        chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
-    }
+    chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
     const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad legacy metadata and raft chaos simulation soaks");
@@ -6019,6 +6229,12 @@ pub fn build(b: *std.Build) void {
         .root_module = standalone_runtime_test_mod,
         .filters = &.{
             "standalone runtime module compiles",
+            "standalone runtime local generator accepts media url data uris",
+            "standalone runtime local dense embed preserves borrowed binary media",
+            "standalone runtime local generator preflights mixed resident media exactly",
+            "standalone runtime local generator refuses decode allocation beyond preflight",
+            "standalone inference middleware reuses public API authentication",
+            "standalone CORS middleware enforces dynamic configuration",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",
             "standalone runtime registers internal group routes explicitly",
             "standalone runtime registers mcp routes before antfarm catch-all",
@@ -6028,6 +6244,7 @@ pub fn build(b: *std.Build) void {
             "standalone bridge shared adapter preserves protocol headers and absent body",
             "standalone protocol bridge releases converted request headers",
             "standalone runtime antfarm path guards keep api routes reserved",
+            "standalone startup checkpoint readiness requires applied and safe-read progress",
             "parse cli accepts config path",
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
@@ -6038,10 +6255,13 @@ pub fn build(b: *std.Build) void {
             "standalone HA standby replication flags require upstream and slot",
             "standalone HA string classifier distinguishes missing padded and valid values",
             "standalone HA runtime rejects ambiguous role flags",
+            "standalone HA roles freeze startup-local mutation producers",
             "antfly config uses cli override before common config",
             "standalone public api caps keep alive request reuse",
             "standalone public api body limit matches common http listener",
+            "standalone public ready endpoint fails closed before API initialization",
             "standalone public HTTP server is restart-safe and uses public API request body limit",
+            "standalone rejects configured server TLS instead of serving plaintext",
             "standalone Lite transaction sessions survive file reopen",
             "durable session mutations publish only after persistence succeeds",
             "durable session limits bound count and encoded record size",
@@ -6049,8 +6269,11 @@ pub fn build(b: *std.Build) void {
             "common config parses bounded transaction session policy",
             "standalone public listener lease is exclusive and immediately reusable",
             "parse cli accepts inference budget overrides",
+            "standalone kernel JIT mode precedence is CLI then environment then config",
             "inference config falls back to common config",
+            "standalone prompt cache detaches resource observer before owner teardown",
             "inference admission bridge charges combined native residency to resource manager",
+            "standalone inference keep alive parses compound durations and zero",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
@@ -6060,6 +6283,13 @@ pub fn build(b: *std.Build) void {
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",
             "standalone metadata finalizes schema migration from resident runtime evidence",
             "standalone unified server lifecycle propagates startup failure",
+            "runtime lease watchdog fetch and validation failures publish no bootstrap capability",
+            "runtime lease watchdog retains a bounded Kubernetes response budget",
+            "runtime lease watchdog prefers a DNS-verified Kubernetes API host and retains the injected port",
+            "Lease executor rejects unscoped request shapes",
+            "Lease executor accepts optional CertificateRequest with projected CA and verified hostname",
+            "Lease executor accepts TLS 1.2 optional CertificateRequest",
+            "Lease executor rejects optional CertificateRequest hostname mismatch",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -6126,14 +6356,14 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_mcp_tests.step);
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
+    unit_test_step.dependOn(&run_lib_pdf_tests.step);
+    unit_test_step.dependOn(&run_lib_scraping_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(&run_hf_tokenizer_tests.step);
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_standalone_runtime_test_step);
-    if (include_ha_tests_in_aggregates) {
-        unit_test_step.dependOn(ha_test_step);
-    }
+    unit_test_step.dependOn(ha_test_step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_runtime_tests.step);
     unit_test_step.dependOn(&run_raft_restore_tests.step);
@@ -6166,9 +6396,7 @@ pub fn build(b: *std.Build) void {
 
     var unit_progress_tail: ?*std.Build.Step = null;
     unit_progress_tail = chainLabeledRunStep(b, run_unit_progress_root_tests, "lib-root-test", unit_progress_tail);
-    if (include_ha_tests_in_aggregates) {
-        unit_progress_tail = chainLabeledRun(b, ha_tests, "ha-test", unit_progress_tail);
-    }
+    unit_progress_tail = chainLabeledRun(b, ha_tests, "ha-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, lib_template_tests, "lib-template-test", unit_progress_tail);
     unit_test_progress_step.dependOn(unit_progress_tail.?);
 
@@ -6467,6 +6695,7 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("inference_api", inference_api_mod);
     db_test_mod.addImport("antfly_reranking", reranking_mod);
     db_test_mod.addImport("antfly_scraping", scraping_mod);
+    db_test_mod.addImport("antfly_reader_config", reader_config_mod);
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
     db_test_mod.addImport("httpx", httpx_mod);
     db_test_mod.addImport("antfly_pdf", pdf_mod);
@@ -6716,18 +6945,167 @@ pub fn build(b: *std.Build) void {
     const derived_log_test_step = b.step("derived-log-test", "Run storage/db/derived/derived_log unit tests");
     derived_log_test_step.dependOn(&run_derived_log_unit_tests.step);
 
-    // Keep the default root coverage in bounded compile/run artifacts. A
-    // single union of API, storage, and metadata tests creates a very large
-    // process whose startup competes with the compiler's resident pages on CI.
-    // Reuse the focused compile artifacts and partition overlaps at runtime so
-    // each selected test still executes exactly once.
-    const run_unit_storage_tests = b.addRunArtifact(lib_storage_tests);
-    addRuntimeTestFilters(b, run_unit_storage_tests, lib_storage_runtime_filters);
-    addRuntimeSkipTestFilters(run_unit_storage_tests, lib_unit_filters);
-    for (root_test_skip_filters) |filter| {
-        run_unit_storage_tests.addArgs(&.{ "--skip-test-filter", filter });
+    // The root storage filter used to produce one roughly 2,400-test codegen
+    // unit. Split it by implementation domain so CI never has to retain the
+    // complete DB, HA, LSM, Lite, and storage utility test graph in one compiler
+    // process. These compile-time prefixes are disjoint; the existing runtime
+    // filters below continue to own overlap and caller-selected filtering.
+    const unit_storage_shard_filters = [_][]const []const u8{
+        &.{"storage.db.algebraic."},
+        &.{
+            "storage.db.derived.",
+            "storage.db.enrichment.",
+        },
+        &.{
+            "storage.db.catalog.",
+            "storage.db.maintenance.",
+            "storage.db.query.",
+        },
+        &.{
+            "storage.db.aggregations.",
+            "storage.db.apply_rw_lock.",
+            "storage.db.artifact_ids.",
+            "storage.db.backfill_state.",
+            "storage.db.batcher.",
+            "storage.db.config.",
+            "storage.db.db.",
+            "storage.db.dense_exact.",
+            "storage.db.doc_filter_wire.",
+            "storage.db.doc_identity.",
+            "storage.db.doc_set.",
+            "storage.db.document_mapper.",
+            "storage.db.document_query.",
+            "storage.db.generation_lifecycle.",
+            "storage.db.lease.",
+            "storage.db.mod.",
+            "storage.db.ownership.",
+            "storage.db.planning_stats.",
+            "storage.db.promotion_runtime.",
+            "storage.db.query_metrics.",
+            "storage.db.range_state.",
+            "storage.db.resolution_runtime.",
+            "storage.db.root_identity.",
+            "storage.db.template_remote_stub.",
+            "storage.db.template_stub.",
+            "storage.db.transform.",
+            "storage.db.typed_doc_values_coverage.",
+            "storage.db.types.",
+        },
+        &.{"storage.ha."},
+        &.{
+            "storage.lite.",
+            "storage.lsm.",
+            "storage.lsm_backend.",
+            "storage.lsm_backend_sim_test.",
+        },
+        &.{
+            "storage.backend_adapter.",
+            "storage.backend_conformance_test.",
+            "storage.backend_erased.",
+            "storage.backend_types.",
+            "storage.background_runtime.",
+            "storage.backup_codec.",
+            "storage.coverage_identity.",
+            "storage.derived_log_test_root.",
+            "storage.docstore.",
+            "storage.enrichment.",
+            "storage.filesystem_capacity.",
+            "storage.hbc_adapter.",
+            "storage.internal_keys.",
+            "storage.lmdb.",
+            "storage.lmdb_backend.",
+            "storage.maintenance.",
+            "storage.mem_backend.",
+            "storage.object_storage.",
+            "storage.persistent.",
+            "storage.portable_backup.",
+            "storage.resource_manager.",
+            "storage.schema.",
+            "storage.shard.",
+            "storage.sim_runtime.",
+            "storage.transactions.",
+            "storage.ttl.",
+            "storage.wal.",
+        },
+    };
+    const unit_storage_shard_names = [_][]const u8{
+        "storage-algebraic-tests",
+        "storage-derived-enrichment-tests",
+        "storage-query-catalog-tests",
+        "storage-db-core-tests",
+        "storage-ha-tests",
+        "storage-lsm-lite-tests",
+        "storage-utility-tests",
+    };
+    const unit_storage_shard_max_rss = [_]usize{
+        4 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        8 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        4 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+    };
+    const unit_storage_sharded_test_step = b.step(
+        "unit-storage-test",
+        "Run the storage portion of the default unit-test target in bounded codegen shards",
+    );
+    const unit_storage_shard_audit = b.addSystemCommand(&.{"python3"});
+    unit_storage_shard_audit.addFileArg(b.path("tools/audit_storage_test_shards.py"));
+    unit_storage_shard_audit.addArg("--root");
+    unit_storage_shard_audit.addDirectoryArg(b.path("pkg/antfly/src/storage"));
+    unit_storage_shard_audit.addArg("--manifest");
+    unit_storage_shard_audit.addFileArg(b.path("pkg/antfly/src/storage/test_manifest.zig"));
+    for (unit_storage_shard_filters) |shard_filters| {
+        for (shard_filters) |shard_filter| {
+            unit_storage_shard_audit.addArgs(&.{ "--filter", shard_filter });
+        }
     }
-    addRuntimeSkipTestFilters(run_unit_storage_tests, &release_scale_test_filters);
+    const unit_storage_shard_audit_step = b.step(
+        "unit-storage-test-audit",
+        "Verify every test-bearing storage module belongs to a bounded codegen shard",
+    );
+    unit_storage_shard_audit_step.dependOn(&unit_storage_shard_audit.step);
+    const storage_runtime_filter_is_default =
+        lib_storage_runtime_filters.len == 1 and
+        std.mem.eql(u8, lib_storage_runtime_filters[0], "storage.");
+    var unit_storage_tail: ?*std.Build.Step = null;
+    for (
+        unit_storage_shard_filters,
+        unit_storage_shard_names,
+        unit_storage_shard_max_rss,
+    ) |shard_filters, shard_name, shard_max_rss| {
+        const unit_storage_tests = b.addTest(.{
+            .name = shard_name,
+            .root_module = lib_test_mod,
+            .filters = shard_filters,
+            .test_runner = .{
+                .path = b.path("pkg/antfly/src/test_runner.zig"),
+                .mode = .simple,
+            },
+            .max_rss = shard_max_rss,
+        });
+        unit_storage_tests.step.dependOn(&unit_storage_shard_audit.step);
+        if (unit_storage_tail) |previous| unit_storage_tests.step.dependOn(previous);
+        const run_unit_storage_tests = b.addRunArtifact(unit_storage_tests);
+        addRuntimeTestFilters(b, run_unit_storage_tests, lib_storage_runtime_filters);
+        if (!storage_runtime_filter_is_default) {
+            run_unit_storage_tests.addArg("--allow-empty-test-filter");
+        }
+        addRuntimeSkipTestFilters(run_unit_storage_tests, lib_unit_filters);
+        const is_ha_shard = std.mem.eql(u8, shard_name, "storage-ha-tests");
+        for (root_test_skip_filters) |filter| {
+            // `storage.ha` keeps the HA suite out of broad root-module test
+            // runs. Applying that same exclusion to its dedicated shard makes
+            // the shard select zero tests and fail before exercising anything.
+            if (is_ha_shard and std.mem.eql(u8, filter, "storage.ha")) continue;
+            run_unit_storage_tests.addArgs(&.{ "--skip-test-filter", filter });
+        }
+        addRuntimeSkipTestFilters(run_unit_storage_tests, &release_scale_test_filters);
+        unit_test_step.dependOn(&run_unit_storage_tests.step);
+        unit_storage_sharded_test_step.dependOn(&run_unit_storage_tests.step);
+        unit_storage_tail = &run_unit_storage_tests.step;
+    }
 
     // The complete metadata namespace pulls in the simulation harness and a
     // large amount of control-plane code even though the default unit target
@@ -6749,14 +7127,16 @@ pub fn build(b: *std.Build) void {
         &.{
             "metadata.state.",
             "metadata.runtime.",
-            "metadata.server.",
-            "metadata.api.",
-            "metadata.admin.",
             "metadata.authority.",
             "metadata.incarnation.",
             "metadata.reconcile_lease.",
             "metadata.store_observer.",
         },
+        &.{
+            "metadata.api.",
+            "metadata.admin.",
+        },
+        &.{"metadata.server."},
         &.{
             "metadata.placement_planner.",
             "metadata.control_loop.",
@@ -6779,19 +7159,36 @@ pub fn build(b: *std.Build) void {
         "metadata-reconciler-tests",
         "metadata-service-http-tests",
         "metadata-core-tests",
+        "metadata-api-admin-tests",
+        "metadata-server-tests",
         "metadata-planning-transition-tests",
         "metadata-table-provisioner-tests",
         "metadata-replication-backfill-tests",
         "metadata-storage-tests",
     };
+    const unit_metadata_shard_max_rss = [_]usize{
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        7 * 1024 * 1024 * 1024,
+        6 * 1024 * 1024 * 1024,
+    };
     const metadata_runtime_filter_is_default =
         lib_metadata_runtime_filters.len == 1 and
         std.mem.eql(u8, lib_metadata_runtime_filters[0], "metadata.");
+    var unit_metadata_compile_tail: ?*std.Build.Step = null;
+    var unit_metadata_aggregate_run_tail: ?*std.Build.Step = null;
+    var unit_metadata_focused_run_tail: ?*std.Build.Step = null;
     for (
         unit_metadata_shard_filters,
         unit_metadata_shard_names,
         metadata_unit_test_mods,
-    ) |shard_filters, shard_name, test_mod| {
+        unit_metadata_shard_max_rss,
+    ) |shard_filters, shard_name, test_mod, shard_max_rss| {
         const unit_metadata_tests = b.addTest(.{
             .name = shard_name,
             .root_module = test_mod,
@@ -6800,7 +7197,10 @@ pub fn build(b: *std.Build) void {
                 .path = b.path("pkg/antfly/src/test_runner.zig"),
                 .mode = .simple,
             },
+            .max_rss = shard_max_rss,
         });
+        if (unit_metadata_compile_tail) |previous| unit_metadata_tests.step.dependOn(previous);
+        unit_metadata_compile_tail = &unit_metadata_tests.step;
         const run_unit_metadata_tests = b.addRunArtifact(unit_metadata_tests);
         const runtime_filters = if (metadata_runtime_filter_is_default)
             shard_filters
@@ -6818,7 +7218,11 @@ pub fn build(b: *std.Build) void {
         for (root_test_skip_filters) |filter| {
             run_unit_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
         }
+        if (unit_metadata_aggregate_run_tail) |previous| {
+            run_unit_metadata_tests.step.dependOn(previous);
+        }
         unit_test_step.dependOn(&run_unit_metadata_tests.step);
+        unit_metadata_aggregate_run_tail = &run_unit_metadata_tests.step;
 
         // The standalone metadata step owns its selected metadata tests. Use a
         // separate run policy so a caller filter is not mistaken for the root
@@ -6831,8 +7235,12 @@ pub fn build(b: *std.Build) void {
         for (root_test_skip_filters) |filter| {
             run_focused_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
         }
+        if (unit_metadata_focused_run_tail) |previous| {
+            run_focused_metadata_tests.step.dependOn(previous);
+        }
         unit_metadata_sharded_test_step.dependOn(&run_focused_metadata_tests.step);
         lib_metadata_test_step.dependOn(&run_focused_metadata_tests.step);
+        unit_metadata_focused_run_tail = &run_focused_metadata_tests.step;
     }
 
     // Default Antfly unit coverage is hermetic: no network fetchers, no
@@ -6844,15 +7252,15 @@ pub fn build(b: *std.Build) void {
         &run_lib_onnx_tests.step,
         &run_httpx_json_tests.step,
         &run_httpx_tests.step,
+        &run_common_http_tests.step,
         &run_api_json_helpers_tests.step,
         &run_antfly_client_pkg_tests.step,
         &run_lib_unit_tests.step,
-        &run_unit_storage_tests.step,
         &run_sparse_unit_tests.step,
     });
 
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
-    const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, lite_local_inference_runtime, antfly_version);
+    const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_c);
     const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod);
     const lmdb_bench_mod_c = b.createModule(.{
@@ -6869,7 +7277,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const lmdb_bench_engine_options_zig = makeLmdbBuildOptions(b, .zig, lmdb_evented_async_io, false);
-    const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, antfly_version);
+    const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const lmdb_bench_engine_mod_zig = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_zig);
     const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod);
     const lmdb_bench_mod_zig = b.createModule(.{
@@ -6927,7 +7335,7 @@ pub fn build(b: *std.Build) void {
     lmdb_bench_mmap_step.dependOn(&run_lmdb_bench_zig_mmap.step);
 
     const split_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, antfly_version);
+    const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const split_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, split_bench_engine_options);
     const split_bench_root_mod = makeLmdbModule(b, antfly_benches_build.split_bench_root, target, .ReleaseFast, split_bench_build_options, split_bench_engine_mod, platform_mod);
     const split_bench_mod = b.createModule(.{
@@ -7217,7 +7625,7 @@ pub fn build(b: *std.Build) void {
     regex_bench_step.dependOn(&run_regex_bench.step);
 
     const wal_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, antfly_version);
+    const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const wal_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, wal_bench_engine_options);
     const wal_bench_wal_mod = makeLmdbModule(b, antfly_benches_build.wal_bench_root, target, .ReleaseFast, wal_bench_build_options, wal_bench_engine_mod, platform_mod);
     const wal_bench_mod = b.createModule(.{
@@ -7308,7 +7716,7 @@ pub fn build(b: *std.Build) void {
     wal_bench_adaptive_stress_step.dependOn(&run_wal_bench_adaptive_stress.step);
 
     const derived_log_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const derived_log_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, antfly_version);
+    const derived_log_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const derived_log_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, derived_log_bench_engine_options);
     const derived_log_bench_root_mod = b.createModule(.{
         .root_source_file = b.path(antfly_benches_build.derived_log_bench_root),
@@ -7516,9 +7924,7 @@ pub fn build(b: *std.Build) void {
     run_compat.addArg("compat/cases");
     const compat_step = b.step("compat", "Run the shared compatibility corpus");
     compat_step.dependOn(&run_compat.step);
-    if (include_ha_tests_in_aggregates) {
-        compat_step.dependOn(&run_lib_ha_compat_tests.step);
-    }
+    compat_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const search_benchmark_index_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_index.zig"),
@@ -8572,56 +8978,155 @@ pub fn build(b: *std.Build) void {
     const recall_harness_step = b.step("recall-harness", "Run Zig recall suites against exported vector datasets");
     recall_harness_step.dependOn(&run_recall_harness.step);
 
-    const antfly_main_mod = if (edition == .full) blk: {
-        const mod = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .sanitize_thread = sanitize_thread,
-        });
-        mod.addImport("antfly-zig", lib_mod);
-        mod.addImport("antfly-client", antfly_client_pkg_mod);
-        mod.addImport("httpx", httpx_mod);
-        mod.addImport("antfly_vellum", vellum_mod);
-        mod.addImport("raft_engine", raft_engine_mod);
-        mod.addImport("structlog", structlog_mod);
-        mod.addImport("antfly_platform", platform_mod);
-        mod.addImport("handlebars", handlebars_mod);
-        mod.addOptions("build_options", build_options);
-        break :blk mod;
-    } else blk: {
-        const inference_cli_mod = b.createModule(.{
-            .root_source_file = b.path("pkg/inference/src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        inference_cli_mod.addImport("inference", inference_server_mod);
-        inference_cli_mod.addImport("build_options", inference_build_options_mod);
-        inference_cli_mod.addImport("antfly_platform", platform_mod);
-        inference_cli_mod.addImport("structlog", structlog_mod);
-
-        const mod = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/inference_main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .sanitize_thread = sanitize_thread,
-        });
-        mod.addImport("inference_cli", inference_cli_mod);
-        mod.addImport("antfly_platform", platform_mod);
-        mod.addImport("structlog", structlog_mod);
-        mod.addOptions("build_options", build_options);
-        break :blk mod;
-    };
+    const antfly_main_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    });
+    antfly_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    antfly_main_mod.addImport("structlog", structlog_mod);
+    antfly_main_mod.addImport("antfly_platform", platform_mod);
+    antfly_main_mod.addOptions("build_options", production_build_options);
+    addMacosSdkPaths(b, antfly_main_mod, target);
 
     const antfly_main = b.addExecutable(.{
         .name = "antfly",
         .root_module = antfly_main_mod,
     });
+
+    var runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile = @splat(null);
+    inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
+        // The executable, C API, and focused artifacts reuse their owning
+        // runtime units instead of recompiling implementations in each root.
+        const unit_options = b.addOptions();
+        unit_options.addOption(RuntimeLibraryUnit, "unit", unit);
+
+        const role_mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/runtime_artifact_lib.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .pic = if (unit == .distributed) true else null,
+        });
+        production_antfly_imports.configureRuntime(
+            b,
+            role_mod,
+            false,
+            link_libc,
+            unit == .inference,
+        );
+        addMacosSdkPaths(b, role_mod, target);
+        role_mod.addImport("antfly-client", antfly_client_pkg_mod);
+        if (unit == .distributed) role_mod.addImport("antfly_storage_root", role_mod);
+        role_mod.addOptions("runtime_library_options", unit_options);
+        const role_usermgr_storage_mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        role_usermgr_storage_mod.addImport("antfly_root", role_mod);
+        role_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+        role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
+
+        const role_artifact = b.addLibrary(.{
+            .name = if (unit == .distributed)
+                "antfly-storage-kernel"
+            else
+                b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
+            .root_module = role_mod,
+            .linkage = .static,
+            .max_rss = switch (unit) {
+                // Claims conservatively cover clean production ReleaseFast
+                // peaks measured for both aarch64-linux-musl and explicit
+                // aarch64-macos (including Metal and Accelerate). They are
+                // scheduling reservations, not hard process limits. A 20 GiB
+                // budget can overlap all four units while a smaller cgroup
+                // automatically schedules only the subset that fits.
+                .api_kernel => 4 * 1024 * 1024 * 1024,
+                .distributed => 8 * 1024 * 1024 * 1024,
+                .inference => 5 * 1024 * 1024 * 1024,
+                .cli => 2 * 1024 * 1024 * 1024,
+            },
+        });
+        runtime_library_artifacts[@intFromEnum(unit)] = role_artifact;
+        if (unit == .distributed) {
+            // The executable and C ABI libraries share this one optimized
+            // PIC object. Give the final links enough section granularity
+            // to retain only the C ABI roots in the shared libraries while
+            // the executable retains the runtime entry points as well.
+            role_artifact.link_function_sections = true;
+            role_artifact.link_data_sections = true;
+        }
+        // Zig's build runner uses these claims to run as many LLVM codegen
+        // steps concurrently as fit in available RAM. The distributed
+        // archive is PIC because the executable and C ABI libraries share
+        // it; both consumers therefore reuse the same analyzed and
+        // optimized storage graph.
+        if (unit == .distributed) {
+            libantfly_link_mod.linkLibrary(role_artifact);
+        }
+        antfly_main.root_module.linkLibrary(role_artifact);
+        if (strip) {
+            var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+            defer visited.deinit();
+            setStripRecursively(role_mod, &visited);
+        }
+    }
+
+    if (runtime_artifact_role) |role| {
+        const role_options = b.addOptions();
+        role_options.addOption(RuntimeArtifactRole, "role", role);
+
+        const role_mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/runtime_artifact_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+        });
+        role_mod.addImport("structlog", structlog_mod);
+        role_mod.link_libc = link_libc;
+        addMacosSdkPaths(b, role_mod, target);
+        role_mod.addOptions("runtime_artifact_options", role_options);
+
+        const role_name = @tagName(role);
+        const role_exe = b.addExecutable(.{
+            .name = b.fmt("antfly-{s}", .{role_name}),
+            .root_module = role_mod,
+        });
+        role_exe.link_gc_sections = true;
+        switch (role) {
+            .cli => {
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.cli)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
+            },
+            .data, .metadata => {
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
+            },
+            .inference => {
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
+            },
+            .standalone => {
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
+            },
+        }
+        if (strip) {
+            var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+            defer visited.deinit();
+            setStripRecursively(role_mod, &visited);
+        }
+        const install_role = b.addInstallArtifact(role_exe, .{});
+        const role_step = b.step("runtime-artifact", "Build and install one focused server runtime artifact");
+        role_step.dependOn(&install_role.step);
+    }
     if (strip) {
         var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
         defer visited.deinit();
         setStripRecursively(antfly_main_mod, &visited);
-        setStripRecursively(lite_capi_mod, &visited);
+        setStripRecursively(capi_mod, &visited);
     }
     const antfly_main_tests = b.addTest(.{
         .root_module = antfly_main_mod,
@@ -8636,6 +9141,17 @@ pub fn build(b: *std.Build) void {
     antfly_main_test_step.dependOn(&run_antfly_main_tests.step);
     unit_test_step.dependOn(&run_antfly_main_tests.step);
 
+    // The aggregate intentionally runs with normal CPU concurrency. Give every
+    // compile step a conservative scheduler claim unless it already has a
+    // measured, domain-specific claim above; CI supplies the cgroup-aware
+    // aggregate budget through --maxrss.
+    assignDefaultAggregateMaxRss(
+        b,
+        unit_test_step,
+        7 * 1024 * 1024 * 1024,
+        6 * 1024 * 1024 * 1024,
+    );
+
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
     const install_antfarm_assets = b.addInstallDirectory(.{
         .source_dir = b.path("../go/pkg/antfly/src/metadata/antfarm"),
@@ -8643,9 +9159,10 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "share/antfly/antfarm",
     });
     b.getInstallStep().dependOn(&install_antfly.step);
-    if (edition == .full) {
-        b.getInstallStep().dependOn(&install_antfarm_assets.step);
-    }
+    b.getInstallStep().dependOn(&install_antfarm_assets.step);
+    const antfly_step = b.step("antfly", "Build and install the top-level Antfly CLI");
+    antfly_step.dependOn(&install_antfly.step);
+    antfly_step.dependOn(&install_antfarm_assets.step);
 
     const lite_core_main_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_core_main.zig"),
@@ -8692,7 +9209,7 @@ pub fn build(b: *std.Build) void {
     lite_core_test_step.dependOn(&run_lite_core_main_tests.step);
     lite_core_test_step.dependOn(&run_lite_cmd_tests.step);
     lite_core_test_step.dependOn(&run_lite_native_tests.step);
-    lite_core_test_step.dependOn(&run_lite_capi_smoke.step);
+    lite_core_test_step.dependOn(&run_capi_smoke.step);
     lite_core_test_step.dependOn(&run_lite_go_tests.step);
     lite_core_test_step.dependOn(&run_lite_go_example.step);
     lite_core_test_step.dependOn(&run_lite_go_retrieval_template.step);
@@ -8702,10 +9219,10 @@ pub fn build(b: *std.Build) void {
 
     const lite_core_step = b.step("lite-core", "Build Antfly Lite core CLI, embedded package check, and libantfly C ABI");
     lite_core_step.dependOn(&install_lite_core_main.step);
-    lite_core_step.dependOn(&install_lite_capi_lib.step);
-    lite_core_step.dependOn(&install_lite_capi_header.step);
+    lite_core_step.dependOn(&install_libantfly.step);
+    lite_core_step.dependOn(&install_capi_header.step);
     lite_core_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_step.dependOn(&run_lite_capi_smoke.step);
+    lite_core_step.dependOn(&run_capi_smoke.step);
     lite_core_step.dependOn(&run_lite_go_tests.step);
     lite_core_step.dependOn(&run_lite_go_example.step);
     lite_core_step.dependOn(&run_lite_go_retrieval_template.step);
@@ -8717,12 +9234,12 @@ pub fn build(b: *std.Build) void {
         lite_full_step.dependOn(&b.addFail("lite-full requires -Dlite-local-inference-runtime=true so Lite status and bindings advertise the local inference runtime").step);
     }
     lite_full_step.dependOn(&install_antfly.step);
-    lite_full_step.dependOn(&install_lite_capi_lib.step);
-    lite_full_step.dependOn(&install_lite_capi_header.step);
+    lite_full_step.dependOn(&install_libantfly.step);
+    lite_full_step.dependOn(&install_capi_header.step);
     lite_full_step.dependOn(&run_antfly_main_tests.step);
     lite_full_step.dependOn(&run_lite_cmd_tests.step);
     lite_full_step.dependOn(&run_lite_native_tests.step);
-    lite_full_step.dependOn(&run_lite_capi_smoke.step);
+    lite_full_step.dependOn(&run_capi_smoke.step);
     lite_full_step.dependOn(&run_lite_go_tests.step);
     lite_full_step.dependOn(&run_lite_go_example.step);
     lite_full_step.dependOn(&run_lite_go_retrieval_template.step);
@@ -8760,13 +9277,13 @@ pub fn build(b: *std.Build) void {
 
     const lite_dev_step = b.step("lite-dev", "Build the Antfly Lite development profile with CLI diagnostics and C ABI checks");
     lite_dev_step.dependOn(&install_antfly.step);
-    lite_dev_step.dependOn(&install_lite_capi_lib.step);
-    lite_dev_step.dependOn(&install_lite_capi_header.step);
+    lite_dev_step.dependOn(&install_libantfly.step);
+    lite_dev_step.dependOn(&install_capi_header.step);
     lite_dev_step.dependOn(&run_antfly_main_tests.step);
     lite_dev_step.dependOn(&run_lite_core_main_tests.step);
     lite_dev_step.dependOn(&run_lite_cmd_tests.step);
     lite_dev_step.dependOn(&run_lite_native_tests.step);
-    lite_dev_step.dependOn(&run_lite_capi_smoke.step);
+    lite_dev_step.dependOn(&run_capi_smoke.step);
     lite_dev_step.dependOn(&run_lite_go_tests.step);
     lite_dev_step.dependOn(&run_lite_go_example.step);
     lite_dev_step.dependOn(&run_lite_go_retrieval_template.step);
@@ -8777,13 +9294,6 @@ pub fn build(b: *std.Build) void {
     lite_dev_step.dependOn(&run_cabi_packaging_tests.step);
     lite_dev_step.dependOn(&run_capi_tests.step);
     lite_dev_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-
-    const run_antfly = b.addRunArtifact(antfly_main);
-    if (b.args) |args| {
-        run_antfly.addArgs(args);
-    }
-    const antfly_step = b.step("antfly", "Run the top-level Antfly CLI");
-    antfly_step.dependOn(&run_antfly.step);
 
     const run_recall_harness_default = b.addRunArtifact(recall_harness);
     run_recall_harness_default.stdio = .inherit;
@@ -8804,6 +9314,16 @@ pub fn build(b: *std.Build) void {
         antfly_test_step,
         delegated_inference_steps.inference_test,
     });
+
+    // `test` owns more than the Antfly unit-test subgraph. Fill in claims for
+    // simulation, integration, recall, chaos, and delegated inference steps
+    // too so --maxrss bounds the complete aggregate instead of only one arm.
+    assignDefaultAggregateMaxRss(
+        b,
+        test_step,
+        7 * 1024 * 1024 * 1024,
+        6 * 1024 * 1024 * 1024,
+    );
 
     const hbc_trace_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/tools/hbc_trace.zig"),

@@ -54,6 +54,93 @@ pub const RowBucket = enum(u8) {
     rows_65_plus = 4,
 };
 
+/// Dense format index for the generated small-batch quant kernel dispatch
+/// counters (`antfly_generated_dispatch_counts[format][epilogue]`). Order and
+/// values must stay in lockstep with the
+/// TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_* constants and
+/// termite_metal_generated_quant_format_index() in src/backends/metal_kernels.m.
+pub const GeneratedQuantFormatIndex = enum(u8) {
+    q2_k = 0,
+    q3_k = 1,
+    q4_0 = 2,
+    q4_1 = 3,
+    q4_k = 4,
+    q5_0 = 5,
+    q5_1 = 6,
+    q5_k = 7,
+    q6_k = 8,
+    q8_0 = 9,
+    q8_1 = 10,
+    q8_k = 11,
+};
+
+/// Dense epilogue index for the generated small-batch quant kernel dispatch
+/// counters. Values match TERMITE_METAL_GENERATED_QUANT_EPILOGUE_* in
+/// src/backends/metal_kernels.m.
+pub const GeneratedQuantEpilogueIndex = enum(u8) {
+    none = 0,
+    bias = 1,
+    bias_gelu = 2,
+    relu = 3,
+};
+
+pub const generated_quant_format_count = std.enums.values(GeneratedQuantFormatIndex).len;
+pub const generated_quant_epilogue_count = std.enums.values(GeneratedQuantEpilogueIndex).len;
+
+/// Storage shape shared by the C runtime/provider counters and every Zig mirror.
+pub const GeneratedQuantDispatchCounts = [generated_quant_format_count][generated_quant_epilogue_count]u64;
+
+pub const generated_quant_dispatch_counts_zero: GeneratedQuantDispatchCounts =
+    [_][generated_quant_epilogue_count]u64{[_]u64{0} ** generated_quant_epilogue_count} ** generated_quant_format_count;
+
+pub fn generatedQuantDispatchCount(
+    counts: *const GeneratedQuantDispatchCounts,
+    format: GeneratedQuantFormatIndex,
+    epilogue: GeneratedQuantEpilogueIndex,
+) u64 {
+    return counts[@intFromEnum(format)][@intFromEnum(epilogue)];
+}
+
+pub const GeneratedQuantCounterName = struct {
+    format: GeneratedQuantFormatIndex,
+    epilogue: GeneratedQuantEpilogueIndex,
+    /// Externally visible base name. Compact-JSON timing keys and debug
+    /// printouts derive from this string, so entries must stay byte-identical
+    /// and in this exact order.
+    name: []const u8,
+};
+
+/// The wired generated-quant dispatch counters in canonical serialization
+/// order (matches the historical per-field order of the collapsed
+/// `antfly_<format>_small_batch*_dispatches` counters).
+pub const generated_quant_counter_names = [_]GeneratedQuantCounterName{
+    .{ .format = .q8_0, .epilogue = .none, .name = "q8_0_small_batch" },
+    .{ .format = .q8_0, .epilogue = .bias, .name = "q8_0_small_batch_bias" },
+    .{ .format = .q8_0, .epilogue = .bias_gelu, .name = "q8_0_small_batch_bias_gelu" },
+    .{ .format = .q8_0, .epilogue = .relu, .name = "q8_0_small_batch_relu" },
+    .{ .format = .q8_1, .epilogue = .none, .name = "q8_1_small_batch" },
+    .{ .format = .q8_k, .epilogue = .none, .name = "q8_k_small_batch" },
+    .{ .format = .q2_k, .epilogue = .none, .name = "q2_k_small_batch" },
+    .{ .format = .q2_k, .epilogue = .bias, .name = "q2_k_small_batch_bias" },
+    .{ .format = .q2_k, .epilogue = .bias_gelu, .name = "q2_k_small_batch_bias_gelu" },
+    .{ .format = .q3_k, .epilogue = .none, .name = "q3_k_small_batch" },
+    .{ .format = .q3_k, .epilogue = .bias, .name = "q3_k_small_batch_bias" },
+    .{ .format = .q3_k, .epilogue = .bias_gelu, .name = "q3_k_small_batch_bias_gelu" },
+    .{ .format = .q4_0, .epilogue = .none, .name = "q4_0_small_batch" },
+    .{ .format = .q4_1, .epilogue = .none, .name = "q4_1_small_batch" },
+    .{ .format = .q5_0, .epilogue = .none, .name = "q5_0_small_batch" },
+    .{ .format = .q5_1, .epilogue = .none, .name = "q5_1_small_batch" },
+    .{ .format = .q4_k, .epilogue = .none, .name = "q4_k_small_batch" },
+    .{ .format = .q4_k, .epilogue = .bias, .name = "q4_k_small_batch_bias" },
+    .{ .format = .q4_k, .epilogue = .bias_gelu, .name = "q4_k_small_batch_bias_gelu" },
+    .{ .format = .q5_k, .epilogue = .none, .name = "q5_k_small_batch" },
+    .{ .format = .q5_k, .epilogue = .bias, .name = "q5_k_small_batch_bias" },
+    .{ .format = .q5_k, .epilogue = .bias_gelu, .name = "q5_k_small_batch_bias_gelu" },
+    .{ .format = .q6_k, .epilogue = .none, .name = "q6_k_small_batch" },
+    .{ .format = .q6_k, .epilogue = .bias, .name = "q6_k_small_batch_bias" },
+    .{ .format = .q6_k, .epilogue = .bias_gelu, .name = "q6_k_small_batch_bias_gelu" },
+};
+
 pub const Format = enum(u16) {
     unknown = 0,
     q4_0,
@@ -142,15 +229,14 @@ pub const Format = enum(u16) {
             .tl1,
             .tl2,
             => 1,
-            .iq1_s,
-            .iq1_m,
-            .iq2_xxs,
-            .iq2_s,
-            .iq3_xxs,
-            .iq3_s,
-            .tq1_0,
-            .tq2_0,
-            => null,
+            .iq1_s => 50,
+            .iq1_m => 56,
+            .iq2_xxs => 66,
+            .iq2_s => 82,
+            .iq3_xxs => 98,
+            .iq3_s => 110,
+            .tq1_0 => 54,
+            .tq2_0 => 66,
             .iq2_xs => 74,
             .nvfp4 => 36,
         };

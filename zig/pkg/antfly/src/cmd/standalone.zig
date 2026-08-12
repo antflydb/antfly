@@ -13,14 +13,14 @@
 // limitations.
 
 const std = @import("std");
-const antfly = @import("antfly-zig");
+const standalone_runtime = @import("../standalone/runtime.zig");
 
 pub fn run(init: std.process.Init) !void {
-    return try antfly.standalone.runtime.run(init);
+    return try standalone_runtime.run(init);
 }
 
 pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.process.Args.Iterator) !void {
-    return try antfly.standalone.runtime.runFromIterator(init, argv0, args);
+    return try standalone_runtime.runFromIterator(init, argv0, args);
 }
 
 test "standalone cmd compiles" {

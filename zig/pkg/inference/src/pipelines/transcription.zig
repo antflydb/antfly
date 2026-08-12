@@ -37,6 +37,9 @@ pub const TranscribeConfig = struct {
     sample_rate: usize = 16000,
     n_mels: usize = 80,
     chunk_length_s: usize = 30,
+    /// Peak live allocation budget for encoded-audio decode. The returned mono
+    /// PCM is included in this budget.
+    max_decode_working_bytes: usize = audio.default_decode_working_bytes,
     decoder_start_token_id: i32 = 50258,
     eos_token_id: i32 = 50257,
     /// Decoder prompt entries from generation_config.json. A null token leaves
@@ -92,7 +95,12 @@ pub const TranscriptionPipeline = struct {
         audio_data: []const u8,
         decode_options: audio.DecodeOptions,
     ) !TranscribeResult {
-        var decoded = try audio.decode(self.allocator, audio_data, decode_options);
+        var decoded = try audio.decodeBounded(
+            self.allocator,
+            audio_data,
+            decode_options,
+            self.config.max_decode_working_bytes,
+        );
         defer decoded.deinit();
 
         return self.transcribePcm(decoded.samples, decoded.sample_rate);

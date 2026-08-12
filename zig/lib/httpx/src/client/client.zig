@@ -22,6 +22,7 @@ const serializeToSlice = array_list_writer_mod.serializeToSlice;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Io = std.Io;
+const HostName = Io.net.HostName;
 
 const types = @import("../core/types.zig");
 const meta = @import("../core/meta.zig");
@@ -34,7 +35,9 @@ const Status = @import("../core/status.zig").Status;
 const socket_mod = @import("../net/socket.zig");
 const Socket = socket_mod.Socket;
 const Address = socket_mod.Address;
+const AddressFilter = socket_mod.AddressFilter;
 const resolveAddress = socket_mod.resolveAddress;
+const resolveAddressFiltered = socket_mod.resolveAddressFiltered;
 const SocketIoReader = socket_mod.SocketIoReader;
 const SocketIoWriter = socket_mod.SocketIoWriter;
 const SliceIoReader = socket_mod.SliceIoReader;
@@ -66,6 +69,8 @@ pub const ClientConfig = struct {
     max_response_size: usize = types.default_max_body_size,
     max_response_headers: usize = 256,
     verify_ssl: bool = true,
+    /// Optional explicit CA bundle file. When set, system roots are not loaded.
+    tls_ca_file: ?[]const u8 = null,
     /// Enable HTTP/2 via "prior knowledge" mode (RFC 7540 §3.4).
     /// The client sends the h2 preface directly without ALPN negotiation.
     /// When Zig's stdlib exposes ALPN, this will additionally negotiate h2.
@@ -78,6 +83,17 @@ pub const ClientConfig = struct {
     pool_max_connections: u32 = 20,
     pool_max_per_host: u32 = 5,
     max_cookies: usize = 1000,
+    /// Disable cookie persistence for credentialed or policy-constrained
+    /// transports where ambient state must not cross requests.
+    cookies_enabled: bool = true,
+    /// Cache only addresses that have completed a TCP connection. A failed
+    /// cached address is evicted before the next DNS lookup. Ignored when an
+    /// explicit address filter is installed.
+    cache_resolved_addresses: bool = false,
+    /// Optional connection-time address policy. When set, pooled HTTP/1
+    /// connections and the resolved-address cache are bypassed so every new
+    /// connection uses a freshly vetted result.
+    address_filter: ?AddressFilter = null,
     /// Send a PING health check after this many ms of no frames received on
     /// an H2 connection. 0 = disabled. Similar to Go's http2.Transport.ReadIdleTimeout.
     h2_read_idle_timeout_ms: u64 = 30_000,
@@ -102,6 +118,30 @@ pub const RequestOptions = struct {
 };
 
 const cancellation_poll_interval_ms: u64 = 25;
+
+fn shouldUseHttp2(config: ClientConfig) bool {
+    return config.http2_enabled or config.force_http2;
+}
+
+fn shouldSendConnectionClose(config: ClientConfig) bool {
+    if (!config.keep_alive) return true;
+    return config.address_filter != null and !shouldUseHttp2(config);
+}
+
+test "filtered HTTP1 connections advertise close when pools are bypassed" {
+    const Policy = struct {
+        fn acceptAll(_: ?*const anyopaque, _: Address) bool {
+            return true;
+        }
+    };
+
+    try std.testing.expect(shouldSendConnectionClose(.{ .address_filter = .{ .acceptsFn = Policy.acceptAll } }));
+    try std.testing.expect(!shouldSendConnectionClose(.{
+        .address_filter = .{ .acceptsFn = Policy.acceptAll },
+        .http2_enabled = true,
+    }));
+    try std.testing.expect(!shouldSendConnectionClose(.{}));
+}
 
 /// Stack-owned state used to interrupt a single HTTP/1 request.  HTTP/2 is
 /// deliberately excluded: its socket is shared by many streams.
@@ -180,7 +220,7 @@ const RequestInterrupt = struct {
         // teardown below: a woken owner must acquire this mutex to unregister
         // its pointer before destroying it, so no producer can retain a raw
         // waiter pointer across destruction.
-        if (stream.completion_sem) |sem| sem.post(io);
+        stream.completion_event.set(io);
         if (stream.data_event) |event| event.set(io);
         h2.write_mutex.unlock(io);
 
@@ -219,6 +259,33 @@ fn requestDeadlineMs(io: Io, timeout_ms: u64) ?i64 {
 fn ensureRequestDeadline(io: Io, deadline_ms: ?i64) !void {
     const deadline = deadline_ms orelse return;
     if (common.milliTimestamp(io) >= deadline) return error.Timeout;
+}
+
+fn isSafeUnsentRetryError(err: anyerror) bool {
+    return switch (err) {
+        error.GoawayRefused,
+        error.MaxConcurrentStreamsExceeded,
+        error.StreamIdExhausted,
+        => true,
+        else => false,
+    };
+}
+
+fn isRetryableTransportError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionClosed,
+        error.ConnectionRefused,
+        error.Closed,
+        error.NotConnected,
+        error.EndOfStream,
+        error.UnexpectedEof,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.RecvFailed,
+        error.SendFailed,
+        => true,
+        else => false,
+    };
 }
 
 /// Request interceptor function type.
@@ -365,6 +432,8 @@ pub const Client = struct {
     /// Protects h2_conns from concurrent fiber access during connection
     /// creation (getOrCreateH2Conn yields on DNS, connect, TLS handshake).
     h2_mutex: Io.Mutex = Io.Mutex.init,
+    resolved_addresses: std.StringHashMapUnmanaged(Address) = .{},
+    resolved_addresses_mutex: Io.Mutex = Io.Mutex.init,
 
     const Self = @This();
 
@@ -398,7 +467,10 @@ pub const Client = struct {
             .io = io,
             .config = config,
             .pool = ConnectionPool.initWithConfig(allocator, io, pool_cfg, {}),
-            .tls_pool = TlsPool.initWithConfig(allocator, io, pool_cfg, .{ .verify_ssl = config.verify_ssl }),
+            .tls_pool = TlsPool.initWithConfig(allocator, io, pool_cfg, .{
+                .verify_ssl = config.verify_ssl,
+                .ca_file = config.tls_ca_file,
+            }),
         };
     }
 
@@ -413,6 +485,9 @@ pub const Client = struct {
         self.cookies.deinit(self.allocator);
         self.pool.deinit();
         self.tls_pool.deinit();
+        var address_it = self.resolved_addresses.iterator();
+        while (address_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.resolved_addresses.deinit(self.allocator);
 
         // Clean up cached HTTP/2 connections.
         var h2_it = self.h2_conns.iterator();
@@ -496,7 +571,7 @@ pub const Client = struct {
             }
         }
 
-        if (!self.config.keep_alive and !req.headers.contains(HeaderName.CONNECTION)) {
+        if (shouldSendConnectionClose(self.config) and !req.headers.contains(HeaderName.CONNECTION)) {
             try req.headers.set(HeaderName.CONNECTION, "close");
         }
 
@@ -513,7 +588,7 @@ pub const Client = struct {
             try req.headers.set(HeaderName.ACCEPT_ENCODING, "gzip, deflate");
         }
 
-        try self.attachCookies(&req);
+        if (self.config.cookies_enabled) try self.attachCookies(&req);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.request_fn) |f| {
@@ -524,7 +599,7 @@ pub const Client = struct {
         var response = try self.executeRequest(&req, reqOpts.timeout_ms, reqOpts.cancellation);
         errdefer response.deinit();
 
-        try self.storeCookies(&response);
+        if (self.config.cookies_enabled) try self.storeCookies(&response);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.response_fn) |f| {
@@ -591,7 +666,7 @@ pub const Client = struct {
             }
         }
 
-        if (!self.config.keep_alive and !req.headers.contains(HeaderName.CONNECTION)) {
+        if (shouldSendConnectionClose(self.config) and !req.headers.contains(HeaderName.CONNECTION)) {
             try req.headers.set(HeaderName.CONNECTION, "close");
         }
 
@@ -607,7 +682,7 @@ pub const Client = struct {
             try req.headers.set(HeaderName.ACCEPT_ENCODING, "gzip, deflate");
         }
 
-        try self.attachCookies(&req);
+        if (self.config.cookies_enabled) try self.attachCookies(&req);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.request_fn) |f| {
@@ -618,7 +693,7 @@ pub const Client = struct {
         var response = try self.executeRequestToWriter(&req, reqOpts.timeout_ms, writer, progress_cb, progress_ctx, reqOpts.cancellation);
         errdefer response.deinit();
 
-        try self.storeCookies(&response);
+        if (self.config.cookies_enabled) try self.storeCookies(&response);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.response_fn) |f| {
@@ -831,13 +906,10 @@ pub const Client = struct {
             var res = self.executeRequestOnce(req, timeout_override_ms, deadline_ms, interrupt) catch |err| {
                 if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
                 ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
-                // RFC 7540 §6.8: Streams refused via GOAWAY were never
-                // processed and are always safe to retry on a new connection.
-                const is_goaway_refused = (err == error.GoawayRefused);
-                const is_max_streams = (err == error.MaxConcurrentStreamsExceeded);
-                if ((is_goaway_refused or
-                    is_max_streams or
-                    (policy.retry_on_connection_error and can_retry_method and mayRetryConnectionError(err))) and
+                const safe_unsent = isSafeUnsentRetryError(err);
+                const replayable_transport = policy.retry_on_connection_error and
+                    can_retry_method and isRetryableTransportError(err);
+                if ((safe_unsent or replayable_transport) and
                     attempt < policy.max_retries)
                 {
                     attempt += 1;
@@ -1066,44 +1138,25 @@ pub const Client = struct {
         progress_ctx: ?*anyopaque,
         interrupt: *RequestInterrupt,
     ) !Response {
-        const policy = self.config.retry_policy;
-        const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
-
-        var attempt: u32 = 0;
-        while (true) {
+        // Once a generic writer observes bytes, replaying the request can
+        // duplicate or corrupt caller-owned output. Without transactional
+        // writer semantics there is no safe way to distinguish a pre-send
+        // failure from a partially committed response, so this API performs
+        // exactly one attempt.
+        if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+        return self.executeRequestToWriterOnce(
+            req,
+            timeout_override_ms,
+            deadline_ms,
+            writer,
+            progress_cb,
+            progress_ctx,
+            interrupt,
+        ) catch |err| {
             if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
-            var res = self.executeRequestToWriterOnce(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, interrupt) catch |err| {
-                if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
-                ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
-                const is_goaway_refused = (err == error.GoawayRefused);
-                const is_max_streams = (err == error.MaxConcurrentStreamsExceeded);
-                if ((is_goaway_refused or
-                    is_max_streams or
-                    (policy.retry_on_connection_error and can_retry_method and mayRetryConnectionError(err))) and
-                    attempt < policy.max_retries)
-                {
-                    attempt += 1;
-                    const delay_ms = policy.calculateDelay(attempt);
-                    if (delay_ms > 0) {
-                        self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
-                    }
-                    continue;
-                }
-                return err;
-            };
-
-            if (can_retry_method and attempt < policy.max_retries and policy.shouldRetryStatus(res.status.code)) {
-                res.deinit();
-                attempt += 1;
-                const delay_ms = policy.calculateDelay(attempt);
-                if (delay_ms > 0) {
-                    self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
-                }
-                continue;
-            }
-
-            return res;
-        }
+            ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
+            return err;
+        };
     }
 
     fn applyTimeouts(socket: *Socket, recv_ms: u64, send_ms: u64, deadline_ms: ?i64) !void {
@@ -1112,6 +1165,57 @@ pub const Client = struct {
         try socket.setRecvTimeout(recv_ms);
         try socket.setSendTimeout(send_ms);
         socket.setRequestDeadline(deadline_ms);
+    }
+
+    fn connectHost(self: *Self, host: []const u8, port: u16) !Socket {
+        if (self.config.address_filter != null) {
+            const address = try resolveAddressFiltered(self.io, host, port, self.config.address_filter);
+            return try Socket.connect(address, self.io);
+        }
+        if (!self.config.cache_resolved_addresses) {
+            return try Socket.connectHost(host, port, self.io);
+        }
+
+        var key_buffer: [HostName.max_len + 8]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buffer, "{s}:{d}", .{ host, port }) catch
+            return error.InvalidHostName;
+        if (self.cachedResolvedAddress(key)) |address| {
+            if (Socket.connect(address, self.io)) |socket| return socket else |_| {
+                self.removeCachedResolvedAddress(key);
+            }
+        }
+
+        const connected = try Socket.connectHostResolved(host, port, self.io);
+        self.cacheResolvedAddress(key, connected.address) catch {};
+        return connected.socket;
+    }
+
+    fn cachedResolvedAddress(self: *Self, key: []const u8) ?Address {
+        self.resolved_addresses_mutex.lockUncancelable(self.io);
+        defer self.resolved_addresses_mutex.unlock(self.io);
+        return self.resolved_addresses.get(key);
+    }
+
+    fn removeCachedResolvedAddress(self: *Self, key: []const u8) void {
+        self.resolved_addresses_mutex.lockUncancelable(self.io);
+        const removed = self.resolved_addresses.fetchRemove(key);
+        self.resolved_addresses_mutex.unlock(self.io);
+        if (removed) |entry| self.allocator.free(entry.key);
+    }
+
+    fn cacheResolvedAddress(self: *Self, key: []const u8, address: Address) !void {
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+
+        self.resolved_addresses_mutex.lockUncancelable(self.io);
+        defer self.resolved_addresses_mutex.unlock(self.io);
+        const result = try self.resolved_addresses.getOrPut(self.allocator, owned_key);
+        if (result.found_existing) {
+            self.allocator.free(owned_key);
+        } else {
+            result.key_ptr.* = owned_key;
+        }
+        result.value_ptr.* = address;
     }
 
     fn responseSizeLimit(self: *const Self, req: *const Request) usize {
@@ -1168,7 +1272,7 @@ pub const Client = struct {
 
         // HTTP/2 "prior knowledge" path (RFC 7540 §3.4).
         // Reuses a pooled connection per host when available.
-        if (self.config.http2_enabled or self.config.force_http2) {
+        if (shouldUseHttp2(self.config)) {
             const is_tls = req.uri.isTls();
             var lease = try self.getOrCreateH2Conn(host, port, is_tls);
             defer lease.release();
@@ -1196,7 +1300,7 @@ pub const Client = struct {
         }
 
         if (req.uri.isTls()) {
-            if (self.config.keep_alive) {
+            if (self.config.keep_alive and self.config.address_filter == null) {
                 var tls_conn = try self.tls_pool.getConnection(host, port);
                 var ok = false;
                 defer {
@@ -1210,8 +1314,7 @@ pub const Client = struct {
             }
 
             // Non-pooled TLS fallback (keep_alive disabled).
-            const addr = try resolveAddress(self.io, host, port);
-            var socket = try Socket.connect(addr, self.io);
+            var socket = try self.connectHost(host, port);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             interrupt.publish(&socket, self.io);
@@ -1219,7 +1322,7 @@ pub const Client = struct {
             return self.executeOnNewTls(&socket, host, req);
         }
 
-        if (self.config.keep_alive) {
+        if (self.config.keep_alive and self.config.address_filter == null) {
             var conn = try self.pool.getConnection(host, port);
             var ok = false;
             defer {
@@ -1232,8 +1335,7 @@ pub const Client = struct {
             return self.executeOnSocket(&conn.socket, req, &ok);
         }
 
-        const addr = try resolveAddress(self.io, host, port);
-        var socket = try Socket.connect(addr, self.io);
+        var socket = try self.connectHost(host, port);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
         interrupt.publish(&socket, self.io);
@@ -1262,7 +1364,7 @@ pub const Client = struct {
             break :blk self.config.timeouts.write_ms;
         };
 
-        if (self.config.http2_enabled or self.config.force_http2) {
+        if (shouldUseHttp2(self.config)) {
             var res = try self.executeRequestOnce(req, timeout_override_ms, deadline_ms, interrupt);
             errdefer res.deinit();
             try writeBufferedBody(&res, writer, progress_cb, progress_ctx);
@@ -1270,7 +1372,7 @@ pub const Client = struct {
         }
 
         if (req.uri.isTls()) {
-            if (self.config.keep_alive) {
+            if (self.config.keep_alive and self.config.address_filter == null) {
                 var tls_conn = try self.tls_pool.getConnection(host, port);
                 var ok = false;
                 defer {
@@ -1283,8 +1385,7 @@ pub const Client = struct {
                 return self.executeOnTlsToWriter(&tls_conn.session, req, writer, progress_cb, progress_ctx, &ok);
             }
 
-            const addr = try resolveAddress(self.io, host, port);
-            var socket = try Socket.connect(addr, self.io);
+            var socket = try self.connectHost(host, port);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             interrupt.publish(&socket, self.io);
@@ -1292,7 +1393,7 @@ pub const Client = struct {
             return self.executeOnNewTlsToWriter(&socket, host, req, writer, progress_cb, progress_ctx);
         }
 
-        if (self.config.keep_alive) {
+        if (self.config.keep_alive and self.config.address_filter == null) {
             var conn = try self.pool.getConnection(host, port);
             var ok = false;
             defer {
@@ -1305,8 +1406,7 @@ pub const Client = struct {
             return self.executeOnSocketToWriter(&conn.socket, req, writer, progress_cb, progress_ctx, &ok);
         }
 
-        const addr = try resolveAddress(self.io, host, port);
-        var socket = try Socket.connect(addr, self.io);
+        var socket = try self.connectHost(host, port);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
         interrupt.publish(&socket, self.io);
@@ -1398,7 +1498,8 @@ pub const Client = struct {
 
     /// Creates a new TLS session on a socket and executes a request.
     fn executeOnNewTls(self: *Self, socket: *Socket, host: []const u8, req: *Request) !Response {
-        const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        tls_cfg.ca_file = self.config.tls_ca_file;
         var session = TlsSession.init(tls_cfg, self.io);
         defer session.deinit();
         session.attachSocket(socket);
@@ -1415,7 +1516,8 @@ pub const Client = struct {
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
     ) !Response {
-        const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        tls_cfg.ca_file = self.config.tls_ca_file;
         var session = TlsSession.init(tls_cfg, self.io);
         defer session.deinit();
         session.attachSocket(socket);
@@ -1454,8 +1556,7 @@ pub const Client = struct {
         entry.recv_running = false;
         errdefer self.allocator.destroy(entry);
 
-        const addr = try resolveAddress(self.io, host, port);
-        entry.socket = try Socket.connect(addr, self.io);
+        entry.socket = try self.connectHost(host, port);
         // Guard socket close only until fibers take ownership (recv_running).
         // After fibers start, the errdefer at line ~521 handles shutdown.
         errdefer if (!entry.recv_running) entry.socket.close();
@@ -1467,6 +1568,7 @@ pub const Client = struct {
 
         if (is_tls) {
             var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+            tls_cfg.ca_file = self.config.tls_ca_file;
             tls_cfg.alpn_protocols = &.{ "h2", "http/1.1" };
             entry.session = TlsSession.init(tls_cfg, self.io);
             errdefer entry.session.deinit();
@@ -1769,23 +1871,8 @@ pub const Client = struct {
         const has_body = req.body != null;
 
         if (entry.recv_running) {
-            // Multiplexed mode: background fiber pumps frames; we wait on a
-            // per-stream completion semaphore that the receive loop posts.
-            // Heap-allocated for pointer stability: the receive loop may post
-            // after this function returns on a write error path, so a stack-
-            // allocated semaphore would be use-after-free.
-            const sem = try self.allocator.create(Io.Semaphore);
-            sem.* = .{ .permits = 0 };
-            // Re-fetch the stream pointer for cleanup since the backing
-            // map may have rehashed while we were blocked on I/O.
-            defer {
-                h2.write_mutex.lockUncancelable(self.io);
-                if (h2.stream_manager.getStream(stream_id)) |s| {
-                    s.completion_sem = null;
-                }
-                h2.write_mutex.unlock(self.io);
-                self.allocator.destroy(sem);
-            }
+            // Multiplexed mode: the background fiber pumps frames while this
+            // request waits on synchronization state owned by the stream.
 
             // Serialize frame writes via the connection's write mutex.
             {
@@ -1799,10 +1886,6 @@ pub const Client = struct {
                     return error.ConnectionClosed;
                 if (published.stream_error) |err| return normalizeH2ResponseError(err);
                 if (published.completed) return error.ConnectionClosed;
-                // Publish the waiter under the same lock used by the receive
-                // loop. This makes pointer publication and the pre-send error
-                // check atomic with connection teardown.
-                published.completion_sem = sem;
                 if (entry.is_tls) {
                     const w = try entry.session.getWriter();
                     try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
@@ -1811,9 +1894,9 @@ pub const Client = struct {
                 }
             }
 
-            // The completion semaphore is installed before publication. Do
-            // this immediately after HEADERS, before potentially blocking on
-            // request-body flow control, so cancellation owns a live stream.
+            // Publish cancellation immediately after HEADERS, before
+            // potentially blocking on request-body flow control, so
+            // cancellation owns a live stream.
             interrupt.publishH2(entry, stream_id, self.io);
 
             if (req.body) |body| {
@@ -1828,7 +1911,7 @@ pub const Client = struct {
             }
 
             // Wait for the receive loop to deliver the response.
-            sem.waitUncancelable(self.io);
+            try stream.completion_event.wait(self.io);
         } else {
             // Fallback mode: pump frames inline (no fiber support).
             if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
@@ -2037,10 +2120,6 @@ pub const Client = struct {
         if (data_event) |event| {
             if (stream.data_event == event) stream.data_event = null;
         }
-        // This request-stream path does not install a completion waiter, but
-        // clearing it here keeps removal safe if that changes.
-        stream.completion_sem = null;
-
         // Never RST an idle stream: before HEADERS reaches the peer it is only
         // a local allocation. Once HEADERS is live, reset it before removal so
         // the peer does not retain a half-open stream.
@@ -2239,7 +2318,6 @@ pub const Client = struct {
         parser.headers_only = true;
 
         var buf: [16 * 1024]u8 = undefined;
-        var total_read: usize = 0;
         var leftover: usize = 0;
         var informational_count: u8 = 0;
 
@@ -2262,11 +2340,9 @@ pub const Client = struct {
                     return err;
                 };
                 if (n == 0) break;
-                total_read += n;
                 // This phase parses response headers into a fixed stack buffer.
                 // The caller-specific body ceiling is enforced by the streaming
                 // body pipeline after framing and decompression.
-                if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
                 const total = leftover + n;
                 const consumed = try parser.feed(buf[0..total]);
                 leftover = total - consumed;
@@ -2284,7 +2360,6 @@ pub const Client = struct {
                     if (informational_count > 20) return error.TooManyInformationalResponses;
                     parser.reset();
                     parser.headers_only = true;
-                    total_read = 0;
                     continue;
                 }
             }
@@ -2310,7 +2385,6 @@ pub const Client = struct {
         parser.headers_only = true;
 
         var buf: [16 * 1024]u8 = undefined;
-        var total_read: usize = 0;
         var leftover: usize = 0;
         var informational_count: u8 = 0;
 
@@ -2333,8 +2407,6 @@ pub const Client = struct {
                     return err;
                 };
                 if (n == 0) break;
-                total_read += n;
-                if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
                 const total = leftover + n;
                 const consumed = try parser.feed(buf[0..total]);
                 leftover = total - consumed;
@@ -2352,7 +2424,6 @@ pub const Client = struct {
                     if (informational_count > 20) return error.TooManyInformationalResponses;
                     parser.reset();
                     parser.headers_only = true;
-                    total_read = 0;
                     continue;
                 }
             }

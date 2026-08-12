@@ -42,6 +42,9 @@ type Config struct {
 	InferenceBaseURL string
 	// HTTPClient is shared by Antfly and inference clients when provided.
 	HTTPClient *http.Client
+	// RequestEditors are applied to both Antfly and inference requests. Use
+	// WithBasicAuth, WithApiKey, or WithToken for authentication.
+	RequestEditors []oapi.RequestEditorFn
 }
 
 // Client is the consolidated SDK entrypoint. Antfly operations are exposed via
@@ -55,7 +58,21 @@ type Client struct {
 // public contract rooted at /db/v1, /auth/v1, and /ai/v1.
 func NewClient(config Config) (*Client, error) {
 	baseURL := strings.TrimRight(config.BaseURL, "/")
-	antfly, err := NewAntflyClient(baseURL, config.HTTPClient)
+	antflyOptions := make([]oapi.ClientOption, 0, len(config.RequestEditors)+1)
+	inferenceOptions := make([]oapi.ClientOption, 0, len(config.RequestEditors)+1)
+	if config.HTTPClient != nil {
+		antflyOptions = append(antflyOptions, oapi.WithHTTPClient(config.HTTPClient))
+		inferenceOptions = append(inferenceOptions, oapi.WithHTTPClient(config.HTTPClient))
+	}
+	for _, editor := range config.RequestEditors {
+		if editor == nil {
+			continue
+		}
+		antflyOptions = append(antflyOptions, oapi.WithRequestEditorFn(editor))
+		inferenceOptions = append(inferenceOptions, oapi.WithRequestEditorFn(editor))
+	}
+
+	antfly, err := NewAntflyClientWithOptions(baseURL, antflyOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("creating antfly client: %w", err)
 	}
@@ -64,7 +81,7 @@ func NewClient(config Config) (*Client, error) {
 	if inferenceBaseURL == "" {
 		inferenceBaseURL = baseURL
 	}
-	inference, err := NewInferenceClient(inferenceBaseURL, config.HTTPClient)
+	inference, err := NewInferenceClientWithOptions(inferenceBaseURL, inferenceOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("creating inference client: %w", err)
 	}

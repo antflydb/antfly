@@ -33,7 +33,7 @@ Detailed execution belongs in subsystem docs:
 
 Use these build targets for the current test split:
 
-- `zig build unit-test`
+- `make unit-test`
   - focused fast/unit-style buckets, storage, auth, serverless, and other
     non-chaos lanes
 - `zig build sim-test`
@@ -42,7 +42,7 @@ Use these build targets for the current test split:
 - `zig build chaos-test`
   - delayed transport, restart, partition, and long-running metadata chaos
     coverage
-- `zig build test`
+- `make test`
   - umbrella target that runs all of the above
 
 ## Current Shape

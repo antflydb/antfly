@@ -259,6 +259,34 @@ func TestHAClientPrimaryStatusParsedResponseValidatesRawBody(t *testing.T) {
 	}
 }
 
+func TestHAClientWatchdogProofUsesDedicatedAuthenticatedRoute(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != HAWatchdogProofPath {
+			t.Fatalf("request = %s %s, want GET %s", r.Method, r.URL.Path, HAWatchdogProofPath)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("Authorization = %q, want Bearer test-token", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"schema_version":1,"proof":{"capability_version":1,"active":true,"authority_granted":true,"authority_remaining_ms":5000,"lease_name":"lease-a","lease_namespace":"default","stable_topology_id":"topology-a","local_node_id":"primary-a","observed_holder_node_id":"primary-a","pod_uid":"pod-a","process_boot_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","observed_lease_transitions":1,"max_fence_latency_ms":10000}}`)
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	response, err := client.WithToken("test-token").WatchdogProofResponse(context.Background())
+	if err != nil {
+		t.Fatalf("WatchdogProofResponse returned error: %v", err)
+	}
+	if response.Value.Proof.LocalNodeId != "primary-a" || !response.Value.Proof.AuthorityGranted {
+		t.Fatalf("watchdog proof = %+v, want authoritative primary-a proof", response.Value.Proof)
+	}
+}
+
 func TestHAClientPrimaryStatusParsedResponseSanitizesGeneratedQuery(t *testing.T) {
 	t.Parallel()
 
@@ -299,6 +327,42 @@ func TestHAClientPrimaryStatusParsedResponseSanitizesGeneratedQuery(t *testing.T
 		SyncSelection: HAPrimaryStatusSyncSelectionAll,
 		SyncRequired:  2,
 		SyncStandby:   []string{"standby-a", "standby-b"},
+	})
+	if err != nil {
+		t.Fatalf("PrimaryStatusParsedResponse returned error: %v", err)
+	}
+}
+
+func TestHAClientPrimaryStatusParsedResponseOmitsEmptyAsyncSyncQuery(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodGet)
+		}
+		if r.URL.Path != HAPrimaryStatusPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAPrimaryStatusPath)
+		}
+		query := r.URL.Query()
+		if got := query.Get("max_lag_lsn"); got != "1000000" {
+			t.Fatalf("max_lag_lsn = %q, want 1000000", got)
+		}
+		for _, key := range []string{"sync_mode", "sync_selection", "sync_required", "sync_standby", "sync_failure"} {
+			if values, ok := query[key]; ok {
+				t.Fatalf("query includes %s = %q, want omitted for async policy", key, values)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, haLegacyPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	_, err = client.PrimaryStatusParsedResponse(context.Background(), &HAPrimaryStatusParams{
+		MaxLagLsn: 1000000,
 	})
 	if err != nil {
 		t.Fatalf("PrimaryStatusParsedResponse returned error: %v", err)

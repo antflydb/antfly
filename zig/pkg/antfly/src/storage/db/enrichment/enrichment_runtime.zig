@@ -418,6 +418,14 @@ fn yieldToInteractiveEmbeds(runtime: *EnrichmentRuntime) void {
     }
 }
 
+fn yieldToInteractiveGeneration(runtime: *EnrichmentRuntime) void {
+    if (comptime builtin.os.tag == .freestanding) return;
+    while (enrichment_types.interactive_generate_inflight.load(.monotonic) > 0) {
+        if (runtimeShuttingDown(runtime)) return;
+        sleepRetryBackoff(query_yield_poll_ns);
+    }
+}
+
 fn runtimeShuttingDown(runtime: *EnrichmentRuntime) bool {
     if (comptime builtin.os.tag == .freestanding) return false;
     const io_impl = runtime.io_impl orelse return runtime.shutdown;
@@ -521,6 +529,76 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
     }
 }
 
+// Request-path embeddings can overlap each other and the single replay
+// worker. They contribute to the cumulative and last-completed telemetry, but
+// deliberately do not overwrite the replay worker's single active-batch
+// snapshot. Treating concurrent request batches as that one slot lets the
+// first completion clear another still-running batch from runtime status.
+fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, items: usize) void {
+    if (comptime builtin.os.tag == .freestanding) {
+        runtime.embed_batches_started += 1;
+        runtime.embed_items_started += @intCast(items);
+        return;
+    }
+
+    if (runtime.io_impl) |io_impl| {
+        const io = io_impl.io();
+        runtime.mutex.lockUncancelable(io);
+        defer runtime.mutex.unlock(io);
+        runtime.embed_batches_started += 1;
+        runtime.embed_items_started += @intCast(items);
+    } else {
+        runtime.embed_batches_started += 1;
+        runtime.embed_items_started += @intCast(items);
+    }
+}
+
+fn noteTrackedRequestEmbedBatchFinished(
+    runtime: *EnrichmentRuntime,
+    items: usize,
+    bytes: usize,
+    max_bytes: usize,
+    elapsed_ns: u64,
+    success: bool,
+) void {
+    if (!success) return;
+
+    if (comptime builtin.os.tag == .freestanding) {
+        runtime.embed_batches_completed += 1;
+        runtime.embed_items_completed += @intCast(items);
+        runtime.last_embed_batch_items = @intCast(items);
+        runtime.last_embed_batch_bytes = @intCast(bytes);
+        runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
+        runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+        runtime.last_embed_batch_ns = elapsed_ns;
+        runtime.total_embed_ns += elapsed_ns;
+        return;
+    }
+
+    if (runtime.io_impl) |io_impl| {
+        const io = io_impl.io();
+        runtime.mutex.lockUncancelable(io);
+        defer runtime.mutex.unlock(io);
+        runtime.embed_batches_completed += 1;
+        runtime.embed_items_completed += @intCast(items);
+        runtime.last_embed_batch_items = @intCast(items);
+        runtime.last_embed_batch_bytes = @intCast(bytes);
+        runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
+        runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+        runtime.last_embed_batch_ns = elapsed_ns;
+        runtime.total_embed_ns += elapsed_ns;
+    } else {
+        runtime.embed_batches_completed += 1;
+        runtime.embed_items_completed += @intCast(items);
+        runtime.last_embed_batch_items = @intCast(items);
+        runtime.last_embed_batch_bytes = @intCast(bytes);
+        runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
+        runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+        runtime.last_embed_batch_ns = elapsed_ns;
+        runtime.total_embed_ns += elapsed_ns;
+    }
+}
+
 const TextBatchByteStats = struct {
     total_bytes: usize = 0,
     max_bytes: usize = 0,
@@ -533,6 +611,113 @@ fn textBatchByteStats(texts: []const []const u8) TextBatchByteStats {
         stats.max_bytes = @max(stats.max_bytes, text.len);
     }
     return stats;
+}
+
+/// Records request-path embedding work in the same runtime counters as the
+/// replay worker. These calls deliberately use the request allocator and do
+/// not add retry/backoff: the synchronous caller owns its latency and retry
+/// policy, while runtime status must still reflect all provider work.
+pub fn embedDenseTracked(
+    runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    text: []const u8,
+    dims: u32,
+) ![]f32 {
+    noteTrackedRequestEmbedBatchStarted(runtime, 1);
+    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const vector = dense_embedder.embedDense(alloc, embedding_name, text, dims) catch |err| {
+        noteTrackedRequestEmbedBatchFinished(runtime, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), false);
+        return err;
+    };
+    noteTrackedRequestEmbedBatchFinished(runtime, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), true);
+    return vector;
+}
+
+pub fn embedDenseBatchTracked(
+    runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    texts: []const []const u8,
+    dims: u32,
+) ![]const []const f32 {
+    const stats = textBatchByteStats(texts);
+    noteTrackedRequestEmbedBatchStarted(runtime, texts.len);
+    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const vectors = dense_embedder.embedDenseBatch(alloc, embedding_name, texts, dims) catch |err| {
+        noteTrackedRequestEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        return err;
+    };
+    if (vectors.len != texts.len) {
+        embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+        noteTrackedRequestEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        return error.InvalidEmbeddingResponse;
+    }
+    noteTrackedRequestEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), true);
+    return vectors;
+}
+
+pub fn embedDensePartsTracked(
+    runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    parts: []const template.ContentPart,
+    dims: u32,
+) ![]f32 {
+    var total_bytes: usize = 0;
+    var max_bytes: usize = 0;
+    for (parts) |part| {
+        const bytes = switch (part) {
+            .text => |text| text.len,
+            .media_url => |url| url.len,
+            .binary => |binary| binary.data.len,
+        };
+        total_bytes +|= bytes;
+        max_bytes = @max(max_bytes, bytes);
+    }
+    noteTrackedRequestEmbedBatchStarted(runtime, 1);
+    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const vector = dense_embedder.embedDenseParts(alloc, embedding_name, parts, dims) catch |err| {
+        noteTrackedRequestEmbedBatchFinished(runtime, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), false);
+        return err;
+    };
+    noteTrackedRequestEmbedBatchFinished(runtime, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), true);
+    return vector;
+}
+
+test "request embedding telemetry preserves an overlapping replay batch snapshot" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+
+    noteEmbedBatchStarted(&runtime, 4, 400, 125);
+    noteTrackedRequestEmbedBatchStarted(&runtime, 2);
+    noteTrackedRequestEmbedBatchFinished(&runtime, 2, 80, 40, 10, true);
+    try std.testing.expectEqual(@as(u64, 4), runtime.active_embed_batch_items);
+    try std.testing.expectEqual(@as(u64, 400), runtime.active_embed_batch_bytes);
+    try std.testing.expectEqual(@as(u64, 125), runtime.active_embed_batch_max_bytes);
+
+    noteEmbedBatchFinished(&runtime, 4, 400, 125, 20, true);
+    try std.testing.expectEqual(@as(u64, 0), runtime.active_embed_batch_items);
+    try std.testing.expectEqual(@as(u64, 2), runtime.embed_batches_started);
+    try std.testing.expectEqual(@as(u64, 2), runtime.embed_batches_completed);
+    try std.testing.expectEqual(@as(u64, 6), runtime.embed_items_started);
+    try std.testing.expectEqual(@as(u64, 6), runtime.embed_items_completed);
 }
 
 fn boundedTextBatchEnd(texts: []const []const u8, start: usize, max_items: usize, max_bytes: usize) usize {
@@ -567,6 +752,7 @@ const EnrichmentErrorDisposition = enum {
 };
 
 fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
+    if (document_extraction_mod.remoteContentErrorIsPermanent(err)) return .terminal_request;
     return switch (err) {
         error.OutOfMemory,
         error.InvalidDenseArtifactTargetCounter,
@@ -578,6 +764,9 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InvalidDocumentExtractionConfig,
         error.InvalidEnrichmentConfig,
         error.InvalidEmbeddingResponse,
+        error.ReadRequestFailed,
+        error.OcrPromptEcho,
+        error.TrivialOcrOutput,
         error.UnsupportedEmbeddingProvider,
         error.UnsupportedReaderProvider,
         error.MissingAssetProducer,
@@ -589,6 +778,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InvalidDocumentExtractionManifest,
         error.InvalidDocumentExtractionState,
         error.InvalidGraphAssetState,
+        error.ResourceLimitExceeded,
         error.MissingDocxDocumentXml,
         error.PdfExtractionUnavailable,
         error.UnsupportedCompressionMethod,
@@ -600,6 +790,9 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.ZipEncryptionUnsupported,
         error.ZipNoEndRecord,
         error.ZipTruncated,
+        error.DecodedStreamTooLarge,
+        error.PdfDecodeWorkingSetTooLarge,
+        error.InvalidPdfDecodeLimits,
         => .terminal_request,
 
         // New provider, transport, and decoder errors must not silently drop
@@ -609,7 +802,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
     };
 }
 
-fn isRetryableEnrichmentError(err: anyerror) bool {
+pub fn isRetryableEnrichmentError(err: anyerror) bool {
     return enrichmentErrorDisposition(err) == .retryable_request;
 }
 
@@ -742,6 +935,17 @@ fn shouldYieldRequestError(runtime: *EnrichmentRuntime, err: anyerror) bool {
     };
 }
 
+fn shouldYieldRemoteHttpFailure(runtime: *EnrichmentRuntime, status: u16) bool {
+    return remoteHttpFailureNeedsRetry(
+        status,
+        shouldYieldRequestError(runtime, error.RemoteDocumentFetchFailed),
+    );
+}
+
+fn remoteHttpFailureNeedsRetry(status: u16, retry_budget_allows: bool) bool {
+    return document_extraction_mod.remoteHttpStatusIsTransient(status) and retry_budget_allows;
+}
+
 fn workerRetryDelayMs(consecutive_retry_count: u32) u64 {
     // Six doublings already exceed the cap; bounding the shift also keeps
     // user-supplied retry budgets from overflowing before the min is applied.
@@ -753,13 +957,18 @@ fn isEnrichmentControlError(err: anyerror) bool {
     return err == error.EnrichmentRetryAborted;
 }
 
-test "enrichment treats missing local model as retryable" {
+test "enrichment distinguishes transient capacity from permanent resource limits" {
     try std.testing.expect(isRetryableEnrichmentError(error.ModelNotFound));
+    try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
+    try std.testing.expect(!isRetryableEnrichmentError(error.ResourceLimitExceeded));
 }
 
 test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.UnexpectedEndOfInput));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedEmbeddingProvider));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.ReadRequestFailed));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.OcrPromptEcho));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.TrivialOcrOutput));
     try std.testing.expectEqual(EnrichmentErrorDisposition.fatal_worker, enrichmentErrorDisposition(error.OutOfMemory));
 }
 
@@ -771,6 +980,13 @@ test "enrichment worker attempt budget includes the current request" {
     try std.testing.expectEqual(@as(u32, 2), requestPriorAttempts(41, 41, 2));
     try std.testing.expectEqual(@as(u32, 0), requestPriorAttempts(42, 41, 2));
     try std.testing.expectEqual(@as(u32, 0), requestPriorAttempts(0, 41, 2));
+}
+
+test "remote HTTP failures consume retry budget before terminal coverage" {
+    try std.testing.expect(remoteHttpFailureNeedsRetry(503, true));
+    try std.testing.expect(remoteHttpFailureNeedsRetry(429, true));
+    try std.testing.expect(!remoteHttpFailureNeedsRetry(503, false));
+    try std.testing.expect(!remoteHttpFailureNeedsRetry(404, true));
 }
 
 test "enrichment worker retry delay is exponential and capped" {
@@ -3052,10 +3268,19 @@ fn flushAssetProducerBatch(
     setActiveFailureFingerprint(runtime, assetProducerBatchFailureFingerprint(items.items));
     defer clearAssetProducerBatchItems(runtime.alloc, items);
 
+    yieldToInteractiveGeneration(runtime);
+
     const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
     const requests = try runtime.alloc.alloc(asset_producer_mod.Request, items.items.len);
     defer runtime.alloc.free(requests);
     for (items.items, 0..) |*item, idx| requests[idx] = item.asRequest();
+
+    const can_batch = producer.canProduceBatch(runtime.alloc, requests) catch |err| {
+        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
+    };
+    if (!can_batch)
+        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
 
     var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
@@ -3191,37 +3416,52 @@ fn processDocumentExtractionAsset(
         }
     }
 
+    var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
+    defer resource_tracker.deinit();
+    var download_budgeted: ?resource_manager_mod.BudgetedAllocator = if (resource_tracker.manager) |manager|
+        resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
+    else
+        null;
+    defer if (download_budgeted) |*allocator| allocator.deinit();
+    const download_alloc = if (download_budgeted) |*allocator| allocator.allocator() else runtime.alloc;
+
     const fetched = template_remote.downloadRemoteContentOutcomeAllocWithConfig(
-        runtime.alloc,
+        download_alloc,
         runtime.config.remote_content,
         runtime.config.secret_store,
         source_url,
         if (config.credentials.len > 0) config.credentials else null,
-    ) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => {
-            try writeDocumentExtractionFailureManifest(
-                runtime,
-                request.doc_key,
-                artifact_name,
-                source_url,
-                metadata_fingerprint orelse "",
-                config.content_type,
-                @errorName(err),
-                "remote content download failed",
-                manifest_key,
-                state_key,
-                previous_child_ranges,
-                existing_state,
-                from_generation,
-                window,
-            );
-            return;
-        },
+    ) catch |raw_err| {
+        const err: anyerror = if (raw_err == error.OutOfMemory and download_budgeted != null and download_budgeted.?.denied())
+            error.DocumentExtractionWorkingSetTooLarge
+        else
+            raw_err;
+        if (shouldYieldRequestError(runtime, err)) return err;
+        try writeDocumentExtractionFailureManifest(
+            runtime,
+            request.doc_key,
+            artifact_name,
+            source_url,
+            metadata_fingerprint orelse "",
+            config.content_type,
+            @errorName(err),
+            "remote content download failed",
+            "remote_content_download",
+            manifest_key,
+            previous_child_ranges,
+            existing_state,
+            from_generation,
+            window,
+        );
+        try recordIsolatedRequestError(runtime, window, request, err);
+        return;
     };
     const downloaded = switch (fetched) {
         .ok => |content| content,
         .http_error => |http_error| {
+            if (shouldYieldRemoteHttpFailure(runtime, http_error.status)) {
+                return error.RemoteDocumentFetchFailed;
+            }
             const message = try std.fmt.allocPrint(runtime.alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
             defer runtime.alloc.free(message);
             try writeDocumentExtractionFailureManifest(
@@ -3233,21 +3473,39 @@ fn processDocumentExtractionAsset(
                 config.content_type,
                 "RemoteDocumentFetchFailed",
                 message,
+                "remote_content_http",
                 manifest_key,
-                state_key,
                 previous_child_ranges,
                 existing_state,
                 from_generation,
                 window,
             );
+            try recordIsolatedRequestError(runtime, window, request, error.RemoteDocumentFetchFailed);
             return;
         },
     };
     var downloaded_mut = downloaded;
-    defer downloaded_mut.deinit(runtime.alloc);
-    var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
-    defer resource_tracker.deinit();
-    try resource_tracker.setDownloadedBytes(downloaded_mut.data.len);
+    defer downloaded_mut.deinit(download_alloc);
+    if (download_budgeted != null) {
+        resource_tracker.setExternallyAccountedDownloadedBytes(downloaded_mut.data.len);
+    } else {
+        try resource_tracker.setDownloadedBytes(downloaded_mut.data.len);
+    }
+    if (document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data)) {
+        const decode_budget = try resource_tracker.reservePdfDecodeWorkingSet(config.pdf_decode_limits.max_working_set_bytes);
+        config.pdf_decode_limits.max_working_set_bytes = decode_budget;
+        config.pdf_decode_limits.max_decoded_stream_bytes = @min(config.pdf_decode_limits.max_decoded_stream_bytes, decode_budget);
+    }
+
+    // Retained collection state can grow with row-controlled unit/chunk
+    // cardinality. Charge allocator capacity directly so the hard limit is
+    // enforced before each allocation without an O(n) rescan per unit.
+    var collection_budgeted: ?resource_manager_mod.BudgetedAllocator = if (resource_tracker.manager) |manager|
+        resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
+    else
+        null;
+    defer if (collection_budgeted) |*allocator| allocator.deinit();
+    const collection_alloc = if (collection_budgeted) |*allocator| allocator.allocator() else runtime.alloc;
 
     const byte_source_fingerprint = if (metadata_fingerprint == null)
         try documentExtractionFingerprintAlloc(runtime.alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
@@ -3258,26 +3516,27 @@ fn processDocumentExtractionAsset(
 
     var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer {
-        for (desired_unit_keys.items) |key| runtime.alloc.free(@constCast(key));
-        desired_unit_keys.deinit(runtime.alloc);
+        for (desired_unit_keys.items) |key| collection_alloc.free(@constCast(key));
+        desired_unit_keys.deinit(collection_alloc);
     }
     var desired_unit_fingerprints = std.ArrayListUnmanaged([]const u8).empty;
     defer {
-        for (desired_unit_fingerprints.items) |fingerprint| runtime.alloc.free(@constCast(fingerprint));
-        desired_unit_fingerprints.deinit(runtime.alloc);
+        for (desired_unit_fingerprints.items) |fingerprint| collection_alloc.free(@constCast(fingerprint));
+        desired_unit_fingerprints.deinit(collection_alloc);
     }
     var desired_chunk_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer {
-        for (desired_chunk_keys.items) |key| runtime.alloc.free(@constCast(key));
-        desired_chunk_keys.deinit(runtime.alloc);
+        for (desired_chunk_keys.items) |key| collection_alloc.free(@constCast(key));
+        desired_chunk_keys.deinit(collection_alloc);
     }
     var unit_text_lengths = std.ArrayListUnmanaged(usize).empty;
-    defer unit_text_lengths.deinit(runtime.alloc);
+    defer unit_text_lengths.deinit(collection_alloc);
     var generated_units = RuntimeGeneratedUnitCache{};
-    defer generated_units.deinit(runtime.alloc);
+    defer generated_units.deinit(collection_alloc);
 
     var collect_ctx = RuntimeDocumentExtractionCollectContext{
         .runtime = runtime,
+        .alloc = collection_alloc,
         .config = config,
         .batch_policy = requestGeneratedTextBatchPolicy(runtime.alloc, request),
         .source_url = source_url,
@@ -3291,8 +3550,12 @@ fn processDocumentExtractionAsset(
         .resource_tracker = &resource_tracker,
         .generated_units = &generated_units,
     };
-    defer collect_ctx.deinit(runtime.alloc);
-    document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, collect_ctx.sink()) catch |err| {
+    defer collect_ctx.deinit();
+    document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, collect_ctx.sink()) catch |raw_err| {
+        const err: anyerror = if (raw_err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
+            error.DocumentExtractionWorkingSetTooLarge
+        else
+            raw_err;
         if (shouldYieldRequestError(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
@@ -3303,26 +3566,45 @@ fn processDocumentExtractionAsset(
             if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type,
             @errorName(err),
             "document extraction failed",
+            document_extraction_mod.failureStage(err, "document_extraction"),
             manifest_key,
-            state_key,
             previous_child_ranges,
             existing_state,
             from_generation,
             window,
         );
+        try recordIsolatedRequestError(runtime, window, request, err);
         return;
     };
+    // The streaming extractor has released its last borrowed unit. Retained
+    // collection allocations remain independently charged by collection_alloc.
+    try resource_tracker.setBytes(resource_tracker.locallyAccountedDownloadedBytes());
 
-    const desired_unit_descriptors = try documentExtractionUnitDescriptorsFromKeysAlloc(runtime.alloc, desired_unit_keys.items, desired_unit_fingerprints.items);
-    defer runtime.alloc.free(desired_unit_descriptors);
+    const desired_unit_descriptors = documentExtractionUnitDescriptorsFromKeysAlloc(collection_alloc, desired_unit_keys.items, desired_unit_fingerprints.items) catch |err| {
+        if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
+            return error.DocumentExtractionWorkingSetTooLarge;
+        return err;
+    };
+    defer collection_alloc.free(desired_unit_descriptors);
 
-    const new_state = try documentExtractionStateValueAlloc(runtime.alloc, source_fingerprint, desired_unit_keys.items, desired_unit_descriptors, desired_chunk_keys.items);
-    defer runtime.alloc.free(new_state);
+    const new_state = documentExtractionStateValueAlloc(collection_alloc, source_fingerprint, desired_unit_keys.items, desired_unit_descriptors, desired_chunk_keys.items) catch |err| {
+        if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
+            return error.DocumentExtractionWorkingSetTooLarge;
+        return err;
+    };
+    defer collection_alloc.free(new_state);
 
     if (existing_state) |state| {
         if (std.mem.eql(u8, state, new_state)) {
             if (existing_manifest) |value| {
                 if (!(try documentExtractionManifestHasLastError(runtime.alloc, value))) {
+                    // Full-index writes may precompute and persist document
+                    // extraction before the generated replay reaches this
+                    // worker. Preserve the final coverage outcome for an empty
+                    // extraction even when replay can skip all work by hash.
+                    if (desired_chunk_keys.items.len == 0) {
+                        try finalizeEmptyDocumentExtractionCoverage(runtime, window, request, value);
+                    }
                     runtime.skip_by_hash_count += 1;
                     return;
                 }
@@ -3354,24 +3636,59 @@ fn processDocumentExtractionAsset(
     if (existing_state != null) {
         for (previous_state.unit_keys) |previous_key| {
             if (runtimeContainsConstKey(desired_unit_keys.items, previous_key)) continue;
-            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
-            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
-            try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
+            try appendUniqueOwnedRuntimeKey([]const u8, &resource_tracker, runtime.alloc, &deletes, previous_key);
+            try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.changed_artifact_keys, previous_key);
+            try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.deleted_keys, previous_key);
         }
         for (previous_state.chunk_keys) |previous_key| {
             if (runtimeContainsConstKey(desired_chunk_keys.items, previous_key)) continue;
-            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
-            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
-            try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
+            try appendUniqueOwnedRuntimeKey([]const u8, &resource_tracker, runtime.alloc, &deletes, previous_key);
+            try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.changed_artifact_keys, previous_key);
+            try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.deleted_keys, previous_key);
         }
     }
 
     const empty_units: [0]document_extraction_mod.Unit = .{};
+    var ocr_failed_page_numbers = std.ArrayListUnmanaged(u32).empty;
+    defer ocr_failed_page_numbers.deinit(runtime.alloc);
+    var ocr_failure_details = std.ArrayListUnmanaged(document_extraction_mod.OcrFailureDetail).empty;
+    defer ocr_failure_details.deinit(runtime.alloc);
+    var ocr_attempted_count: usize = 0;
+    var ocr_selected_count: usize = 0;
+    var ocr_retained_embedded_count: usize = 0;
+    var ocr_failed_count: usize = 0;
+    for (generated_units.entries.items) |entry| {
+        const unit = entry.unit;
+        if (!unit.ocr_attempted) continue;
+        ocr_attempted_count += 1;
+        if (unit.ocr_used) ocr_selected_count += 1;
+        if (unit.extraction_status) |status| {
+            if (std.mem.eql(u8, status, "completed_embedded_preferred")) ocr_retained_embedded_count += 1;
+            if (std.mem.eql(u8, status, "failed_ocr")) {
+                ocr_failed_count += 1;
+                if (ocr_failed_page_numbers.items.len < 32) if (unit.page_number) |page| try ocr_failed_page_numbers.append(runtime.alloc, page);
+                if (ocr_failure_details.items.len < 32) try ocr_failure_details.append(runtime.alloc, .{
+                    .page_number = unit.page_number,
+                    .unit_id = unit.unit_id,
+                    .retained_method = unit.method,
+                    .error_message = unit.extraction_warning orelse "OCR failed without a recorded cause",
+                    .failure_stage = unit.ocr_failure_stage,
+                    .retryable = unit.ocr_failure_retryable orelse false,
+                });
+            }
+        }
+    }
     const streamed_extraction = document_extraction_mod.Result{
         .content_type = collect_ctx.info.content_type,
         .route_type = collect_ctx.info.route_type,
         .unsupported_reason = collect_ctx.info.unsupported_reason,
         .units = @constCast(empty_units[0..]),
+        .ocr_attempted_count = ocr_attempted_count,
+        .ocr_selected_count = ocr_selected_count,
+        .ocr_retained_embedded_count = ocr_retained_embedded_count,
+        .ocr_failed_count = ocr_failed_count,
+        .ocr_failed_page_numbers = ocr_failed_page_numbers.items,
+        .ocr_failure_details = ocr_failure_details.items,
     };
 
     const in_progress_manifest = try documentExtractionManifestPayloadAlloc(
@@ -3441,13 +3758,14 @@ fn processDocumentExtractionAsset(
             collect_ctx.info.content_type,
             @errorName(err),
             "document extraction materialization failed",
+            document_extraction_mod.failureStage(err, "document_materialization"),
             manifest_key,
-            state_key,
             previous_child_ranges,
             existing_state,
             from_generation,
             window,
         );
+        try recordIsolatedRequestError(runtime, window, request, err);
         return;
     };
     try flushRuntimeKVBatchAndClear(runtime, &writes, &deletes);
@@ -3507,6 +3825,13 @@ fn processDocumentExtractionAsset(
         .mode = .publish_replay,
     };
     try document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, replay_ctx.sink());
+    // A successful extraction can legitimately produce no chunk artifacts (for
+    // example, an image-only PDF whose OCR output is rejected as trivial). No
+    // downstream chunk or embedding request will exist to close coverage for
+    // that source, so make the final outcome explicit here.
+    if (desired_chunk_keys.items.len == 0) {
+        try finalizeEmptyDocumentExtractionCoverage(runtime, window, request, manifest);
+    }
     try flushGeneratedReplayWindow(runtime, window);
 
     try writes.append(runtime.alloc, .{
@@ -3526,8 +3851,8 @@ fn writeDocumentExtractionFailureManifest(
     content_type: []const u8,
     error_code: []const u8,
     error_message: []const u8,
+    error_stage: []const u8,
     manifest_key: []const u8,
-    state_key: []const u8,
     previous_child_ranges: []const types.DocumentArtifactChildRange,
     existing_state: ?[]const u8,
     from_generation: u64,
@@ -3554,9 +3879,9 @@ fn writeDocumentExtractionFailureManifest(
         source_fingerprint,
         failed_extraction,
         &.{},
-        &.{},
-        &.{},
-        &.{},
+        previous_state.unit_keys,
+        previous_state.unit_descriptors,
+        previous_state.chunk_keys,
         previous_child_ranges,
         previous_state.unit_keys,
         previous_state.unit_descriptors,
@@ -3566,7 +3891,7 @@ fn writeDocumentExtractionFailureManifest(
         from_generation,
         to_generation,
         "failed",
-        .{ .code = error_code, .message = error_message },
+        .{ .code = error_code, .message = error_message, .stage = error_stage },
     );
     defer runtime.alloc.free(manifest);
 
@@ -3578,11 +3903,6 @@ fn writeDocumentExtractionFailureManifest(
         }
         writes.deinit(runtime.alloc);
     }
-    var deletes = std.ArrayListUnmanaged([]const u8).empty;
-    defer {
-        for (deletes.items) |key| runtime.alloc.free(@constCast(key));
-        deletes.deinit(runtime.alloc);
-    }
 
     try writes.append(runtime.alloc, .{
         .key = try runtime.alloc.dupe(u8, manifest_key),
@@ -3590,19 +3910,11 @@ fn writeDocumentExtractionFailureManifest(
     });
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
 
-    try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, state_key));
-    for (previous_state.unit_keys) |previous_key| {
-        try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
-        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
-        try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
-    }
-    for (previous_state.chunk_keys) |previous_key| {
-        try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
-        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
-        try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
-    }
-
-    try storePutBatchWithRetry(runtime, writes.items, deletes.items);
+    // Keep the last successfully materialized state and child artifacts. The
+    // failed manifest and repair ledger make the source stale/observable, while
+    // retaining searchable data and enough prior state for a later repair to
+    // diff and remove obsolete children correctly.
+    try storePutBatchWithRetry(runtime, writes.items, &.{});
     recordArtifactBytes(runtime, .asset, manifest.len);
 }
 
@@ -3648,22 +3960,187 @@ fn deleteDocumentExtractionForRuntime(
     try storePutBatchWithRetry(runtime, &.{}, deletes.items);
 }
 
-fn completeRuntimeDocumentExtractionGeneratedText(
+/// Complete OCR/transcription for the synchronous document-extraction path
+/// using the same batching, fallback isolation, validation, and provenance
+/// machinery as replay-driven extraction.
+pub fn completeDocumentExtractionGeneratedTextForRequest(
     runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    request: enrichment_types.GeneratedEnrichmentRequest,
     config: document_extraction_mod.Config,
-    batch_policy: GeneratedTextBatchPolicy,
     source_url: []const u8,
     source_bytes: []const u8,
     source_content_type: []const u8,
     extraction: *document_extraction_mod.Result,
 ) !void {
-    const producer = runtime.config.asset_producer orelse return;
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .ocr);
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .transcript);
+    const generated_text_enabled = document_extraction_mod.ocrEnabledForRoute(config, extraction.route_type) or
+        config.transcription_enabled;
+    if (!generated_text_enabled) return;
+    const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+    const batch_policy = requestGeneratedTextBatchPolicy(alloc, request);
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .ocr);
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .transcript);
 }
+
+/// Enforces a pre-reserved decoder ceiling without charging the node
+/// ResourceManager a second time. Rendering and request serialization use a
+/// separate budgeted allocator because those bytes are additional to the PDF
+/// decoder reservation.
+const ReservedWorkingSetAllocator = struct {
+    backing: Allocator,
+    live_bytes: usize = 0,
+    max_live_bytes: usize,
+    limit_exceeded: bool = false,
+
+    fn init(backing: Allocator, max_live_bytes: usize) @This() {
+        return .{ .backing = backing, .max_live_bytes = max_live_bytes };
+    }
+
+    fn allocator(self: *@This()) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn permitsGrowth(self: *@This(), additional_bytes: usize) bool {
+        if (additional_bytes <= self.max_live_bytes -| self.live_bytes) return true;
+        self.limit_exceeded = true;
+        return false;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (!self.permitsGrowth(len)) return null;
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live_bytes += len;
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permitsGrowth(growth)) return false;
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permitsGrowth(growth)) return null;
+        const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.live_bytes -|= memory.len;
+    }
+};
 
 fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    producer: asset_producer_mod.Producer,
+    config: document_extraction_mod.Config,
+    batch_policy: GeneratedTextBatchPolicy,
+    source_url: []const u8,
+    source_bytes: []const u8,
+    route_type: []const u8,
+    source_content_type: []const u8,
+    units: []document_extraction_mod.Unit,
+    kind: RuntimeGeneratedUnitTextKind,
+) !void {
+    return completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
+        runtime,
+        alloc,
+        alloc,
+        producer,
+        config,
+        batch_policy,
+        source_url,
+        source_bytes,
+        route_type,
+        source_content_type,
+        units,
+        kind,
+    );
+}
+
+/// Keep retained unit ownership separate from transient decoder/provider
+/// allocations. Collection uses a persistent budgeted allocator for the former
+/// while the latter is independently charged against the same resource slice.
+fn completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
+    runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    backing_alloc: Allocator,
+    producer: asset_producer_mod.Producer,
+    config: document_extraction_mod.Config,
+    batch_policy: GeneratedTextBatchPolicy,
+    source_url: []const u8,
+    source_bytes: []const u8,
+    route_type: []const u8,
+    source_content_type: []const u8,
+    units: []document_extraction_mod.Unit,
+    kind: RuntimeGeneratedUnitTextKind,
+) !void {
+    const uses_pdf_decoder_reservation = kind == .ocr and std.mem.eql(u8, route_type, "pdf");
+    var decoder_allocator: ?ReservedWorkingSetAllocator = if (uses_pdf_decoder_reservation)
+        ReservedWorkingSetAllocator.init(backing_alloc, config.pdf_decode_limits.max_working_set_bytes)
+    else
+        null;
+    var budgeted_allocator: ?resource_manager_mod.BudgetedAllocator = if ((runtime.config.resource_manager orelse runtime.index_manager.resource_manager) != null)
+        resource_manager_mod.BudgetedAllocator.init((runtime.config.resource_manager orelse runtime.index_manager.resource_manager).?, .document_extraction_working_set, backing_alloc, 1)
+    else
+        null;
+    defer if (budgeted_allocator) |*budgeted| budgeted.deinit();
+    const decoder_alloc = if (decoder_allocator) |*decoder|
+        decoder.allocator()
+    else
+        backing_alloc;
+    const working_alloc = if (budgeted_allocator) |*budgeted|
+        budgeted.allocator()
+    else
+        backing_alloc;
+    completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
+        runtime,
+        alloc,
+        decoder_alloc,
+        working_alloc,
+        producer,
+        config,
+        batch_policy,
+        source_url,
+        source_bytes,
+        route_type,
+        source_content_type,
+        units,
+        kind,
+    ) catch |err| {
+        if (decoder_allocator) |*decoder| {
+            if (decoder.limit_exceeded) return error.DocumentExtractionWorkingSetTooLarge;
+        }
+        if (budgeted_allocator) |*budgeted| {
+            if (budgeted.denied()) return error.DocumentExtractionWorkingSetTooLarge;
+        }
+        return err;
+    };
+}
+
+fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
+    runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    decoder_alloc: Allocator,
+    working_alloc: Allocator,
     producer: asset_producer_mod.Producer,
     config: document_extraction_mod.Config,
     batch_policy: GeneratedTextBatchPolicy,
@@ -3679,6 +4156,11 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         .transcript => config.transcription_enabled,
     };
     if (!enabled) return;
+
+    var source_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source_bytes, &source_digest, .{});
+    const source_hex = std.fmt.bytesToHex(source_digest, .lower);
+    const source_fingerprint = source_hex[0..16];
 
     const pending_status = switch (kind) {
         .ocr => "pending_ocr",
@@ -3696,57 +4178,102 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         .ocr => "ocr_text",
         .transcript => "transcript_text",
     };
+    const ocr_prompt = if (kind == .ocr) document_extraction_mod.effectiveOcrPrompt(config) else "";
 
     var requests = std.ArrayListUnmanaged(asset_producer_mod.Request).empty;
-    defer requests.deinit(runtime.alloc);
+    defer requests.deinit(working_alloc);
     var unit_indices = std.ArrayListUnmanaged(usize).empty;
-    defer unit_indices.deinit(runtime.alloc);
+    defer unit_indices.deinit(working_alloc);
     var parts_values = std.ArrayListUnmanaged([]u8).empty;
     defer {
-        clearRuntimeGeneratedTextBatchParts(runtime.alloc, &parts_values);
-        parts_values.deinit(runtime.alloc);
+        clearRuntimeGeneratedTextBatchParts(working_alloc, &parts_values);
+        parts_values.deinit(working_alloc);
     }
 
     var batch_bytes: usize = 0;
+    var owned_pdf_session: ?document_extraction_mod.PdfRenderSession = null;
+    defer if (owned_pdf_session) |*session| session.deinit();
+    var pdf_session: ?*document_extraction_mod.PdfRenderSession = null;
+    if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
+        // The reader and decoded stream graph consume the pre-reserved decoder
+        // credit. The RGBA canvas, PNG encoder, and serialized OCR request are
+        // additional live bytes and remain on the independently charged
+        // working allocator below.
+        owned_pdf_session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(decoder_alloc, source_bytes, config.pdf_decode_limits);
+        pdf_session = &owned_pdf_session.?;
+    }
     for (units, 0..) |unit, idx| {
         if (unit.extraction_status == null or !std.mem.eql(u8, unit.extraction_status.?, pending_status)) continue;
-        var rendered_page: ?[]u8 = null;
-        defer if (rendered_page) |png| runtime.alloc.free(png);
-        if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
-            rendered_page = document_extraction_mod.renderPdfPagePngAlloc(runtime.alloc, source_bytes, unit.page_number orelse 1) catch |err| {
-                if (shouldYieldRequestError(runtime, err)) return err;
-                try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[idx], method, kind, err);
-                continue;
-            };
+        var rendered: ?[]u8 = null;
+        defer if (rendered) |png| working_alloc.free(png);
+        if (kind == .ocr) {
+            units[idx].ocr_attempted = true;
+            if (std.mem.eql(u8, route_type, "pdf")) {
+                units[idx].ocr_render_dpi = config.ocr_render_dpi;
+                const render_started_ns = runtime.config.clock.nowRealtimeNs();
+                const rendered_page = pdf_session.?.renderPagePngAdaptiveAlloc(working_alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
+                    logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, @errorName(err));
+                    if (shouldYieldRequestError(runtime, err)) return err;
+                    try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "render");
+                    try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, err);
+                    continue;
+                };
+                units[idx].ocr_effective_render_dpi = rendered_page.effective_dpi;
+                units[idx].ocr_rendered_width = rendered_page.width;
+                units[idx].ocr_rendered_height = rendered_page.height;
+                units[idx].ocr_rendered_bytes = rendered_page.png.len;
+                rendered = rendered_page.png;
+                logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, rendered_page.effective_dpi, rendered_page.width, rendered_page.height, rendered_page.png.len, render_started_ns, null);
+            }
         }
-        const parts_json = if (rendered_page) |png|
-            try document_extraction_mod.ocrPagePartsJsonAlloc(runtime.alloc, route_type, source_content_type, unit, png)
+        // Avoid allocating the base64 and JSON copies when the encoded PNG
+        // alone cannot fit the configured request budget. The exact request
+        // size is checked again after serialization below.
+        if (rendered) |png| {
+            const encoded_len = std.base64.standard.Encoder.calcSize(png.len);
+            if (encoded_len >= batch_policy.max_bytes or config_json.len >= batch_policy.max_bytes - encoded_len) {
+                try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "request");
+                try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, error.GeneratedTextRequestTooLarge);
+                continue;
+            }
+        }
+        const parts_json = if (rendered) |png|
+            try document_extraction_mod.ocrPagePartsJsonAlloc(working_alloc, config, route_type, source_content_type, unit, png)
         else
-            try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, route_type, source_content_type, unit);
+            try runtimeDocumentGeneratedTextPartsJsonAlloc(working_alloc, route_type, source_content_type, unit);
         var owns_parts_json = true;
-        errdefer if (owns_parts_json) runtime.alloc.free(parts_json);
+        errdefer if (owns_parts_json) working_alloc.free(parts_json);
         const request = asset_producer_mod.Request{
             .producer_type = producer_type,
             .config_json = config_json,
-            .source_text = if (rendered_page != null) "" else source_url,
+            .source_text = if (rendered != null) "" else source_url,
             .source_parts_json = parts_json,
             .content_type = "text/plain",
+            .inline_media_trusted = rendered != null,
+            .source_fingerprint = source_fingerprint,
         };
         const request_bytes = runtimeGeneratedTextRequestBytes(request);
+        if (request_bytes > batch_policy.max_bytes) {
+            try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "request");
+            try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, error.GeneratedTextRequestTooLarge);
+            working_alloc.free(parts_json);
+            owns_parts_json = false;
+            continue;
+        }
         if (requests.items.len > 0 and (requests.items.len >= batch_policy.max_items or batch_bytes + request_bytes > batch_policy.max_bytes)) {
-            try flushRuntimeGeneratedTextBatch(runtime, producer, requests.items, unit_indices.items, &parts_values, units, method, kind);
+            try flushRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
             requests.clearRetainingCapacity();
             unit_indices.clearRetainingCapacity();
             batch_bytes = 0;
         }
-        try parts_values.append(runtime.alloc, parts_json);
+        try parts_values.append(working_alloc, parts_json);
         owns_parts_json = false;
-        try unit_indices.append(runtime.alloc, idx);
-        try requests.append(runtime.alloc, request);
+        try unit_indices.append(working_alloc, idx);
+        try requests.append(working_alloc, request);
         batch_bytes = addUsizeSaturating(batch_bytes, request_bytes);
     }
     if (requests.items.len > 0) {
-        try flushRuntimeGeneratedTextBatch(runtime, producer, requests.items, unit_indices.items, &parts_values, units, method, kind);
+        try flushRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
     }
 }
 
@@ -3767,6 +4294,8 @@ fn clearRuntimeGeneratedTextBatchParts(
 
 fn flushRuntimeGeneratedTextBatch(
     runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    working_alloc: Allocator,
     producer: asset_producer_mod.Producer,
     requests: []const asset_producer_mod.Request,
     unit_indices: []const usize,
@@ -3774,47 +4303,64 @@ fn flushRuntimeGeneratedTextBatch(
     units: []document_extraction_mod.Unit,
     method: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
+    quality_config: document_extraction_mod.OcrQualityConfig,
+    ocr_prompt: []const u8,
+    source_fingerprint: []const u8,
 ) !void {
     if (requests.len == 0) return;
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
 
-    var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
+    if (!(try producer.canProduceBatch(alloc, requests))) {
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, "native_batch_unsupported");
+    }
+
+    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const request_bytes = runtimeGeneratedTextBatchBytes(requests);
+    var produced = producer.produceBatch(alloc, requests) catch |err| {
+        logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", @errorName(err), started_ns);
         if (isUnavailableOcrModelError(kind, err)) {
             for (unit_indices) |unit_idx| {
-                try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
+                try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
+                try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
             }
-            clearRuntimeGeneratedTextBatchParts(runtime.alloc, parts_values);
+            clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
             return;
         }
         if (shouldYieldRequestError(runtime, err)) return err;
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind);
+        for (unit_indices) |unit_idx| try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, @errorName(err));
     };
     if (produced.len != requests.len) {
         for (produced) |item| {
-            if (item.len > 0) runtime.alloc.free(item);
+            if (item.len > 0) alloc.free(item);
         }
-        runtime.alloc.free(produced);
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind);
+        alloc.free(produced);
+        logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", "response_count_mismatch", started_ns);
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, "response_count_mismatch");
     }
+    logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "batch", null, started_ns);
 
-    defer runtime.alloc.free(produced);
+    defer alloc.free(produced);
     errdefer {
         for (produced) |item| {
-            if (item.len > 0) runtime.alloc.free(item);
+            if (item.len > 0) alloc.free(item);
         }
     }
     for (produced, unit_indices, 0..) |item, unit_idx, i| {
         produced[i] = &.{};
-        applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], item, method, "completed", kind) catch |err| {
+        applyRuntimeGeneratedUnitText(alloc, &units[unit_idx], item, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
             if (shouldYieldRequestError(runtime, err)) return err;
-            try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
+            try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
+            try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
         };
     }
-    clearRuntimeGeneratedTextBatchParts(runtime.alloc, parts_values);
+    clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
 }
 
 fn flushRuntimeGeneratedTextBatchSequential(
     runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    working_alloc: Allocator,
     producer: asset_producer_mod.Producer,
     requests: []const asset_producer_mod.Request,
     unit_indices: []const usize,
@@ -3822,24 +4368,153 @@ fn flushRuntimeGeneratedTextBatchSequential(
     units: []document_extraction_mod.Unit,
     method: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
+    quality_config: document_extraction_mod.OcrQualityConfig,
+    ocr_prompt: []const u8,
+    source_fingerprint: []const u8,
+    fallback_reason: []const u8,
 ) !void {
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
     for (requests, unit_indices) |request, unit_idx| {
-        const produced = producer.produce(runtime.alloc, request) catch |err| {
+        const started_ns = runtime.config.clock.nowRealtimeNs();
+        const produced = producer.produce(alloc, request) catch |err| {
+            logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", @errorName(err), started_ns);
             if (isUnavailableOcrModelError(kind, err)) {
-                try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
+                try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
+                try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
                 continue;
             }
             if (shouldYieldRequestError(runtime, err)) return err;
-            try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
+            try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
+            try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
             continue;
         };
-        applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], produced, method, "completed", kind) catch |err| {
+        logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", fallback_reason, started_ns);
+        applyRuntimeGeneratedUnitText(alloc, &units[unit_idx], produced, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
             if (shouldYieldRequestError(runtime, err)) return err;
-            try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
+            try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
+            try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
         };
     }
-    clearRuntimeGeneratedTextBatchParts(runtime.alloc, parts_values);
+    clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
+}
+
+fn runtimeGeneratedTextBatchBytes(requests: []const asset_producer_mod.Request) usize {
+    var total: usize = 0;
+    for (requests) |request| total = addUsizeSaturating(total, runtimeGeneratedTextRequestBytes(request));
+    return total;
+}
+
+fn runtimeReadProfileEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE");
+}
+
+fn profileElapsedMs(runtime: *EnrichmentRuntime, started_ns: u64) f64 {
+    const finished_ns = runtime.config.clock.nowRealtimeNs();
+    const elapsed_ns = if (finished_ns >= started_ns) finished_ns - started_ns else 0;
+    return @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, std.time.ns_per_ms);
+}
+
+fn logRuntimeOcrRenderProfile(
+    runtime: *EnrichmentRuntime,
+    source_fingerprint: []const u8,
+    page_number: ?u32,
+    requested_dpi: u16,
+    effective_dpi: ?u16,
+    width: ?u32,
+    height: ?u32,
+    encoded_bytes: ?usize,
+    started_ns: u64,
+    failure: ?[]const u8,
+) void {
+    if (!runtimeReadProfileEnabled()) return;
+    std.log.info("read-profile phase=pdf_render source_fingerprint={s} page={?d} requested_dpi={d} effective_dpi={?d} width={?d} height={?d} encoded_bytes={?d} failure={?s} elapsed_ms={d:.3}", .{
+        source_fingerprint, page_number, requested_dpi, effective_dpi, width, height, encoded_bytes, failure, profileElapsedMs(runtime, started_ns),
+    });
+}
+
+fn logRuntimeOcrBatchProfile(
+    runtime: *EnrichmentRuntime,
+    source_fingerprint: []const u8,
+    units: []const document_extraction_mod.Unit,
+    unit_indices: []const usize,
+    batch_size: usize,
+    request_bytes: usize,
+    mode: []const u8,
+    fallback_reason: ?[]const u8,
+    started_ns: u64,
+) void {
+    if (!runtimeReadProfileEnabled()) return;
+    const first_page = if (unit_indices.len > 0) units[unit_indices[0]].page_number else null;
+    const last_page = if (unit_indices.len > 0) units[unit_indices[unit_indices.len - 1]].page_number else null;
+    std.log.info("read-profile phase=ocr_batch source_fingerprint={s} first_page={?d} last_page={?d} batch_size={d} request_bytes={d} mode={s} serial_fallback_reason={?s} elapsed_ms={d:.3}", .{
+        source_fingerprint, first_page, last_page, batch_size, request_bytes, mode, fallback_reason, profileElapsedMs(runtime, started_ns),
+    });
+}
+
+fn completeRuntimeDocumentExtractionGeneratedTextUnit(
+    runtime: *EnrichmentRuntime,
+    producer: asset_producer_mod.Producer,
+    config: document_extraction_mod.Config,
+    source_url: []const u8,
+    source_bytes: []const u8,
+    route_type: []const u8,
+    source_content_type: []const u8,
+    unit: *document_extraction_mod.Unit,
+) !void {
+    const kind: RuntimeGeneratedUnitTextKind = if (config.ocr_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr"))
+        .ocr
+    else if (config.transcription_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_transcription"))
+        .transcript
+    else
+        return;
+
+    const producer_type: asset_producer_mod.ProducerType = switch (kind) {
+        .ocr => .reader,
+        .transcript => .transcriber,
+    };
+    const config_json = switch (kind) {
+        .ocr => config.ocr_config_json,
+        .transcript => config.transcription_config_json,
+    };
+    const method = switch (kind) {
+        .ocr => "ocr_text",
+        .transcript => "transcript_text",
+    };
+
+    unit.ocr_attempted = kind == .ocr;
+    const rendered = if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) blk: {
+        unit.ocr_render_dpi = config.ocr_render_dpi;
+        var rendered_page = document_extraction_mod.PdfRenderSession.initWithDecodeLimits(runtime.alloc, source_bytes, config.pdf_decode_limits) catch |err| {
+            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, unit, kind, "render");
+            return err;
+        };
+        defer rendered_page.deinit();
+        const page = rendered_page.renderPagePngAdaptiveAlloc(runtime.alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
+            try setRuntimeGeneratedUnitFailureStage(runtime.alloc, unit, kind, "render");
+            return err;
+        };
+        unit.ocr_effective_render_dpi = page.effective_dpi;
+        unit.ocr_rendered_width = page.width;
+        unit.ocr_rendered_height = page.height;
+        unit.ocr_rendered_bytes = page.png.len;
+        break :blk page.png;
+    } else null;
+    defer if (rendered) |png| runtime.alloc.free(png);
+    const parts_json = if (rendered) |png|
+        try document_extraction_mod.ocrPagePartsJsonAlloc(runtime.alloc, config, route_type, source_content_type, unit.*, png)
+    else
+        try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, route_type, source_content_type, unit.*);
+    defer runtime.alloc.free(parts_json);
+    const produced = try producer.produce(runtime.alloc, .{
+        .producer_type = producer_type,
+        .config_json = config_json,
+        .source_text = if (rendered != null) "" else source_url,
+        .source_parts_json = parts_json,
+        .content_type = "text/plain",
+        .inline_media_trusted = rendered != null,
+    });
+    errdefer runtime.alloc.free(produced);
+    try applyRuntimeGeneratedUnitText(runtime.alloc, unit, produced, method, "completed", kind, config.ocr_quality, if (kind == .ocr) document_extraction_mod.effectiveOcrPrompt(config) else "");
 }
 
 const RuntimeGeneratedUnitTextKind = enum { ocr, transcript };
@@ -3862,14 +4537,52 @@ fn applyRuntimeGeneratedUnitText(
     method: []const u8,
     status: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
+    quality_config: document_extraction_mod.OcrQualityConfig,
+    ocr_prompt: []const u8,
 ) !void {
-    if (produced.len == 0) {
+    if (produced.len == 0 and kind != .ocr) {
         alloc.free(produced);
         return error.EmptyGeneratedText;
     }
     defer alloc.free(produced);
     var parsed = try parseRuntimeGeneratedUnitTextOutputAlloc(alloc, produced);
     errdefer parsed.deinit(alloc);
+    if (kind == .ocr and document_extraction_mod.isOcrPromptEcho(parsed.text, ocr_prompt)) return error.OcrPromptEcho;
+    if (kind == .ocr and !document_extraction_mod.hasMeaningfulOcrContent(parsed.text)) return error.TrivialOcrOutput;
+    if (kind == .ocr) {
+        if (unit.ocr_failure_stage) |value| alloc.free(value);
+        unit.ocr_failure_stage = null;
+        unit.ocr_failure_retryable = null;
+    }
+    if (kind == .ocr and !std.mem.eql(u8, unit.unit_type, "image")) {
+        unit.ocr_attempted = true;
+        const embedded_quality = document_extraction_mod.assessOcrQuality(unit.text, quality_config);
+        const output_quality = document_extraction_mod.assessOcrQuality(parsed.text, quality_config);
+        const prefer_ocr = document_extraction_mod.preferOcrText(embedded_quality, output_quality);
+        {
+            const owned_embedded_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, embedded_quality);
+            errdefer alloc.free(owned_embedded_quality);
+            const owned_output_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, output_quality);
+            errdefer alloc.free(owned_output_quality);
+            if (unit.ocr_embedded_quality) |value| alloc.free(value);
+            unit.ocr_embedded_quality = owned_embedded_quality;
+            if (unit.ocr_output_quality) |value| alloc.free(value);
+            unit.ocr_output_quality = owned_output_quality;
+        }
+        if (!prefer_ocr) {
+            const owned_extraction_status = try alloc.dupe(u8, "completed_embedded_preferred");
+            errdefer alloc.free(owned_extraction_status);
+            const owned_method = try alloc.dupe(u8, "pdf_text");
+            errdefer alloc.free(owned_method);
+            if (unit.extraction_status) |value| alloc.free(value);
+            unit.extraction_status = owned_extraction_status;
+            alloc.free(unit.method);
+            unit.method = owned_method;
+            unit.ocr_used = false;
+            parsed.deinit(alloc);
+            return;
+        }
+    }
     const owned_method = try alloc.dupe(u8, method);
     errdefer alloc.free(owned_method);
     const owned_status = try alloc.dupe(u8, status);
@@ -3888,6 +4601,8 @@ fn applyRuntimeGeneratedUnitText(
             unit.ocr_used = true;
             unit.ocr_confidence = parsed.confidence;
             unit.ocr_bbox = parsed.bbox;
+            if (unit.text_regions.len > 0) alloc.free(unit.text_regions);
+            unit.text_regions = &.{};
         },
         .transcript => {
             unit.transcript_used = true;
@@ -3914,27 +4629,29 @@ fn markRuntimeGeneratedUnitTextFailure(
     };
     const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, @errorName(err) });
     errdefer alloc.free(warning);
-    const owned_text = try alloc.dupe(u8, "");
-    errdefer alloc.free(owned_text);
-    const owned_method = try alloc.dupe(u8, method);
+    const owned_method = try alloc.dupe(u8, if (kind == .ocr and !std.mem.eql(u8, unit.unit_type, "image")) "pdf_text" else method);
     errdefer alloc.free(owned_method);
     const owned_status = try alloc.dupe(u8, failed_status);
     errdefer alloc.free(owned_status);
 
-    alloc.free(unit.text);
     alloc.free(unit.method);
     if (unit.extraction_status) |value| alloc.free(value);
     if (unit.extraction_warning) |value| alloc.free(value);
 
-    unit.text = owned_text;
     unit.method = owned_method;
     unit.extraction_status = owned_status;
     unit.extraction_warning = warning;
     switch (kind) {
         .ocr => {
+            unit.ocr_attempted = true;
             unit.ocr_used = false;
             unit.ocr_confidence = null;
             unit.ocr_bbox = null;
+            unit.ocr_failure_retryable = isRetryableEnrichmentError(err);
+            if (std.mem.eql(u8, unit.unit_type, "image")) {
+                alloc.free(unit.text);
+                unit.text = try alloc.dupe(u8, "");
+            }
         },
         .transcript => {
             unit.transcript_used = false;
@@ -3943,7 +4660,26 @@ fn markRuntimeGeneratedUnitTextFailure(
     }
     const start = unit.char_start orelse 0;
     unit.char_start = start;
-    unit.char_end = @intCast(start);
+    unit.char_end = std.math.cast(u32, @as(usize, @intCast(start)) + unit.text.len);
+}
+
+fn setRuntimeGeneratedUnitFailureStage(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    kind: RuntimeGeneratedUnitTextKind,
+    stage: []const u8,
+) !void {
+    if (kind != .ocr) return;
+    const owned = try alloc.dupe(u8, stage);
+    if (unit.ocr_failure_stage) |value| alloc.free(value);
+    unit.ocr_failure_stage = owned;
+}
+
+fn runtimeGeneratedTextFailureStage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.OcrPromptEcho, error.TrivialOcrOutput => "ocr_output_validation",
+        else => "inference",
+    };
 }
 
 const RuntimeParsedGeneratedUnitText = struct {
@@ -4028,6 +4764,17 @@ fn runtimeDocumentGeneratedTextPartsJsonAlloc(
         .text_regions = unit.text_regions,
         .byte_length = unit.byte_length,
         .source_sha256 = unit.source_sha256,
+        .ocr_attempted = unit.ocr_attempted,
+        .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+        .ocr_rendered_width = unit.ocr_rendered_width,
+        .ocr_rendered_height = unit.ocr_rendered_height,
+        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+        .ocr_failure_stage = unit.ocr_failure_stage,
+        .ocr_failure_retryable = unit.ocr_failure_retryable,
+        .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+        .ocr_embedded_quality = unit.ocr_embedded_quality,
+        .ocr_output_quality = unit.ocr_output_quality,
         .ocr_confidence = unit.ocr_confidence,
         .ocr_bbox = unit.ocr_bbox,
         .transcript_confidence = unit.transcript_confidence,
@@ -4037,6 +4784,7 @@ fn runtimeDocumentGeneratedTextPartsJsonAlloc(
 
 fn collectRuntimeDocumentExtractionDesiredKeys(
     runtime: *EnrichmentRuntime,
+    alloc: Allocator,
     doc_key: []const u8,
     artifact_name: []const u8,
     units: []const document_extraction_mod.Unit,
@@ -4045,12 +4793,13 @@ fn collectRuntimeDocumentExtractionDesiredKeys(
     desired_chunk_keys: *std.ArrayListUnmanaged([]const u8),
 ) !void {
     for (units) |unit| {
-        try collectRuntimeDocumentExtractionDesiredKeysForUnit(runtime, doc_key, artifact_name, unit, desired_unit_keys, desired_unit_fingerprints, desired_chunk_keys);
+        try collectRuntimeDocumentExtractionDesiredKeysForUnit(runtime, alloc, doc_key, artifact_name, unit, desired_unit_keys, desired_unit_fingerprints, desired_chunk_keys);
     }
 }
 
 fn collectRuntimeDocumentExtractionDesiredKeysForUnit(
     runtime: *EnrichmentRuntime,
+    alloc: Allocator,
     doc_key: []const u8,
     artifact_name: []const u8,
     unit: document_extraction_mod.Unit,
@@ -4058,18 +4807,21 @@ fn collectRuntimeDocumentExtractionDesiredKeysForUnit(
     desired_unit_fingerprints: *std.ArrayListUnmanaged([]const u8),
     desired_chunk_keys: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    try desired_unit_keys.append(runtime.alloc, try internal_keys.documentUnitArtifactKeyAlloc(runtime.alloc, doc_key, artifact_name, unit.unit_id));
-    try desired_unit_fingerprints.append(runtime.alloc, try documentExtractionUnitFingerprintAlloc(runtime.alloc, unit));
+    try desired_unit_keys.ensureUnusedCapacity(alloc, 1);
+    desired_unit_keys.appendAssumeCapacity(try internal_keys.documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, unit.unit_id));
+    try desired_unit_fingerprints.ensureUnusedCapacity(alloc, 1);
+    desired_unit_fingerprints.appendAssumeCapacity(try documentExtractionUnitFingerprintAlloc(alloc, unit));
     for (runtime.index_manager.enrichments.items) |entry| {
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
         const chunks = if (entry.chunker_json.len > 0)
-            try chunker_mod.chunkTextWithConfigJson(runtime.alloc, unit.text, entry.chunker_json)
+            try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
         else
-            try chunker_mod.chunkText(runtime.alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
-        defer chunker_mod.freeChunks(runtime.alloc, chunks);
+            try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+        defer chunker_mod.freeChunks(alloc, chunks);
         for (chunks) |chunk| {
-            try desired_chunk_keys.append(runtime.alloc, try internal_keys.documentUnitChunkArtifactKeyAlloc(runtime.alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id)));
+            try desired_chunk_keys.ensureUnusedCapacity(alloc, 1);
+            desired_chunk_keys.appendAssumeCapacity(try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id)));
         }
     }
 }
@@ -4110,11 +4862,12 @@ const RuntimeGeneratedUnitCacheEntry = struct {
 
 const RuntimeGeneratedUnitCache = struct {
     entries: std.ArrayListUnmanaged(RuntimeGeneratedUnitCacheEntry) = .empty,
+    indexes: std.StringHashMapUnmanaged(usize) = .empty,
     bytes: usize = 0,
 
     fn putClone(self: *@This(), alloc: Allocator, unit: document_extraction_mod.Unit) !void {
-        for (self.entries.items) |*entry| {
-            if (!std.mem.eql(u8, entry.unit_id, unit.unit_id)) continue;
+        if (self.indexes.get(unit.unit_id)) |index| {
+            const entry = &self.entries.items[index];
             var cloned = try cloneDocumentExtractionUnit(alloc, unit);
             errdefer cloned.deinit(alloc);
             self.bytes = self.bytes -| runtimeGeneratedUnitCacheEntryBytes(entry.*);
@@ -4131,17 +4884,20 @@ const RuntimeGeneratedUnitCache = struct {
             .unit_id = unit_id,
             .unit = cloned,
         });
+        errdefer {
+            _ = self.entries.pop().?;
+        }
+        try self.indexes.put(alloc, unit_id, self.entries.items.len - 1);
         self.bytes = addUsizeSaturating(self.bytes, unit_id.len + runtimeDocumentExtractionUnitOwnedBytes(cloned));
     }
 
     fn get(self: *const @This(), unit_id: []const u8) ?*const document_extraction_mod.Unit {
-        for (self.entries.items) |*entry| {
-            if (std.mem.eql(u8, entry.unit_id, unit_id)) return &entry.unit;
-        }
-        return null;
+        const index = self.indexes.get(unit_id) orelse return null;
+        return &self.entries.items[index].unit;
     }
 
     fn deinit(self: *@This(), alloc: Allocator) void {
+        self.indexes.deinit(alloc);
         for (self.entries.items) |*entry| entry.deinit(alloc);
         self.entries.deinit(alloc);
         self.* = .{};
@@ -4161,6 +4917,10 @@ fn runtimeDocumentExtractionUnitOwnedBytes(unit: document_extraction_mod.Unit) u
     if (unit.extraction_status) |value| total = addUsizeSaturating(total, value.len);
     if (unit.source_sha256) |value| total = addUsizeSaturating(total, value.len);
     if (unit.extraction_warning) |value| total = addUsizeSaturating(total, value.len);
+    if (unit.ocr_trigger_reasons) |value| total = addUsizeSaturating(total, value.len);
+    if (unit.ocr_embedded_quality) |value| total = addUsizeSaturating(total, value.len);
+    if (unit.ocr_output_quality) |value| total = addUsizeSaturating(total, value.len);
+    if (unit.ocr_failure_stage) |value| total = addUsizeSaturating(total, value.len);
     if (unit.page_label) |value| total = addUsizeSaturating(total, value.len);
     total = addUsizeSaturating(total, unit.text_regions.len * @sizeOf(document_extraction_mod.TextRegion));
     return total;
@@ -4187,6 +4947,14 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
     errdefer if (source_sha256) |value| alloc.free(value);
     var extraction_warning = try cloneOptionalBytes(alloc, unit.extraction_warning);
     errdefer if (extraction_warning) |value| alloc.free(value);
+    var ocr_trigger_reasons = try cloneOptionalBytes(alloc, unit.ocr_trigger_reasons);
+    errdefer if (ocr_trigger_reasons) |value| alloc.free(value);
+    var ocr_embedded_quality = try cloneOptionalBytes(alloc, unit.ocr_embedded_quality);
+    errdefer if (ocr_embedded_quality) |value| alloc.free(value);
+    var ocr_output_quality = try cloneOptionalBytes(alloc, unit.ocr_output_quality);
+    errdefer if (ocr_output_quality) |value| alloc.free(value);
+    var ocr_failure_stage = try cloneOptionalBytes(alloc, unit.ocr_failure_stage);
+    errdefer if (ocr_failure_stage) |value| alloc.free(value);
     var page_label = try cloneOptionalBytes(alloc, unit.page_label);
     errdefer if (page_label) |value| alloc.free(value);
     var text_regions: []document_extraction_mod.TextRegion = if (unit.text_regions.len > 0) try alloc.dupe(document_extraction_mod.TextRegion, unit.text_regions) else &.{};
@@ -4202,6 +4970,17 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
         .source_sha256 = source_sha256,
         .byte_length = unit.byte_length,
         .ocr_used = unit.ocr_used,
+        .ocr_attempted = unit.ocr_attempted,
+        .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+        .ocr_rendered_width = unit.ocr_rendered_width,
+        .ocr_rendered_height = unit.ocr_rendered_height,
+        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+        .ocr_failure_stage = ocr_failure_stage,
+        .ocr_failure_retryable = unit.ocr_failure_retryable,
+        .ocr_trigger_reasons = ocr_trigger_reasons,
+        .ocr_embedded_quality = ocr_embedded_quality,
+        .ocr_output_quality = ocr_output_quality,
         .ocr_confidence = unit.ocr_confidence,
         .ocr_bbox = unit.ocr_bbox,
         .transcript_used = unit.transcript_used,
@@ -4223,6 +5002,10 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
     extraction_status = null;
     source_sha256 = null;
     extraction_warning = null;
+    ocr_trigger_reasons = null;
+    ocr_embedded_quality = null;
+    ocr_output_quality = null;
+    ocr_failure_stage = null;
     page_label = null;
     text_regions = &.{};
     return cloned;
@@ -4248,6 +5031,9 @@ fn runtimeGeneratedTextKind(config: document_extraction_mod.Config, route_type: 
 
 const RuntimeDocumentExtractionCollectContext = struct {
     runtime: *EnrichmentRuntime,
+    /// Owns every retained collection allocation and charges its actual
+    /// allocator capacity directly to the document-extraction resource slice.
+    alloc: Allocator,
     config: document_extraction_mod.Config,
     batch_policy: GeneratedTextBatchPolicy,
     source_url: []const u8,
@@ -4264,6 +5050,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
     pending_generated_units: std.ArrayListUnmanaged(document_extraction_mod.Unit) = .empty,
     pending_generated_kind: ?RuntimeGeneratedUnitTextKind = null,
     pending_generated_bytes: usize = 0,
+    resolved_char_cursor: usize = 0,
 
     fn sink(self: *@This()) document_extraction_mod.UnitSink {
         return .{
@@ -4274,15 +5061,15 @@ const RuntimeDocumentExtractionCollectContext = struct {
         };
     }
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
-        self.info.deinit(alloc);
-        self.clearPendingGeneratedUnits(alloc);
-        self.pending_generated_units.deinit(alloc);
+    fn deinit(self: *@This()) void {
+        self.info.deinit(self.alloc);
+        self.clearPendingGeneratedUnits();
+        self.pending_generated_units.deinit(self.alloc);
     }
 
     fn onBegin(ptr: *anyopaque, info: document_extraction_mod.StreamInfo) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        try self.info.set(self.runtime.alloc, info);
+        try self.info.set(self.alloc, info);
     }
 
     fn onUnit(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
@@ -4299,10 +5086,10 @@ const RuntimeDocumentExtractionCollectContext = struct {
                 try self.flushPendingGeneratedText();
                 self.pending_generated_kind = kind;
             }
-            var cloned = try cloneDocumentExtractionUnit(self.runtime.alloc, unit.*);
+            var cloned = try cloneDocumentExtractionUnit(self.alloc, unit.*);
             var owns_cloned = true;
-            errdefer if (owns_cloned) cloned.deinit(self.runtime.alloc);
-            try self.pending_generated_units.append(self.runtime.alloc, cloned);
+            errdefer if (owns_cloned) cloned.deinit(self.alloc);
+            try self.pending_generated_units.append(self.alloc, cloned);
             owns_cloned = false;
             self.pending_generated_bytes = addUsizeSaturating(self.pending_generated_bytes, runtimeDocumentExtractionUnitOwnedBytes(cloned));
             if (self.pending_generated_units.items.len >= self.batch_policy.max_items or self.pending_generated_bytes >= self.batch_policy.max_bytes) {
@@ -4311,6 +5098,10 @@ const RuntimeDocumentExtractionCollectContext = struct {
             return;
         }
         try self.flushPendingGeneratedText();
+        unit.char_start = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
+        self.resolved_char_cursor = std.math.add(usize, self.resolved_char_cursor, unit.text.len) catch
+            return error.DocumentExtractionOffsetOverflow;
+        unit.char_end = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
         try self.collectUnit(unit.*, false);
     }
 
@@ -4323,8 +5114,10 @@ const RuntimeDocumentExtractionCollectContext = struct {
         if (self.pending_generated_units.items.len == 0) return;
         const producer = self.runtime.config.asset_producer orelse return error.MissingAssetProducer;
         const kind = self.pending_generated_kind orelse return error.InvalidAssetProducerResponse;
-        try completeRuntimeDocumentExtractionGeneratedTextBatch(
+        try completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
             self.runtime,
+            self.alloc,
+            self.runtime.alloc,
             producer,
             self.config,
             self.batch_policy,
@@ -4335,25 +5128,28 @@ const RuntimeDocumentExtractionCollectContext = struct {
             self.pending_generated_units.items,
             kind,
         );
-        for (self.pending_generated_units.items) |unit| {
-            try self.generated_units.putClone(self.runtime.alloc, unit);
-            try self.collectUnit(unit, true);
+        for (self.pending_generated_units.items) |*unit| {
+            unit.char_start = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
+            self.resolved_char_cursor = std.math.add(usize, self.resolved_char_cursor, unit.text.len) catch
+                return error.DocumentExtractionOffsetOverflow;
+            unit.char_end = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
+            try self.generated_units.putClone(self.alloc, unit.*);
+            try self.collectUnit(unit.*, true);
         }
-        self.clearPendingGeneratedUnits(self.runtime.alloc);
+        self.clearPendingGeneratedUnits();
     }
 
     fn collectUnit(self: *@This(), unit: document_extraction_mod.Unit, generated: bool) !void {
         const current_unit_bytes: usize = if (generated) 0 else runtimeDocumentExtractionUnitOwnedBytes(unit);
-        try self.resource_tracker.setBytes(addUsizeSaturating(
-            addUsizeSaturating(self.resource_tracker.downloaded_bytes, self.generated_units.bytes),
-            current_unit_bytes,
-        ));
-        try collectRuntimeDocumentExtractionDesiredKeysForUnit(self.runtime, self.doc_key, self.artifact_name, unit, self.desired_unit_keys, self.desired_unit_fingerprints, self.desired_chunk_keys);
-        try self.unit_text_lengths.append(self.runtime.alloc, unit.text.len);
+        // Retained collection state is already charged by `self.alloc`; this
+        // tracker covers only the borrowed current unit and local download.
+        try self.resource_tracker.setBytes(addUsizeSaturating(self.resource_tracker.locallyAccountedDownloadedBytes(), current_unit_bytes));
+        try collectRuntimeDocumentExtractionDesiredKeysForUnit(self.runtime, self.alloc, self.doc_key, self.artifact_name, unit, self.desired_unit_keys, self.desired_unit_fingerprints, self.desired_chunk_keys);
+        try self.unit_text_lengths.append(self.alloc, unit.text.len);
     }
 
-    fn clearPendingGeneratedUnits(self: *@This(), alloc: Allocator) void {
-        for (self.pending_generated_units.items) |*unit| unit.deinit(alloc);
+    fn clearPendingGeneratedUnits(self: *@This()) void {
+        for (self.pending_generated_units.items) |*unit| unit.deinit(self.alloc);
         self.pending_generated_units.clearRetainingCapacity();
         self.pending_generated_kind = null;
         self.pending_generated_bytes = 0;
@@ -4368,6 +5164,8 @@ const RuntimeDocumentExtractionResourceTracker = struct {
     manager: ?*resource_manager_mod.ResourceManager,
     current_bytes: u64 = 0,
     downloaded_bytes: usize = 0,
+    downloaded_bytes_externally_accounted: bool = false,
+    pdf_decode_reservation_bytes: u64 = 0,
 
     fn init(runtime: *EnrichmentRuntime) @This() {
         return .{ .manager = runtime.config.resource_manager orelse runtime.index_manager.resource_manager };
@@ -4378,50 +5176,92 @@ const RuntimeDocumentExtractionResourceTracker = struct {
         try self.setBytes(bytes);
     }
 
+    fn setExternallyAccountedDownloadedBytes(self: *@This(), bytes: usize) void {
+        self.downloaded_bytes = bytes;
+        self.downloaded_bytes_externally_accounted = true;
+    }
+
+    fn locallyAccountedDownloadedBytes(self: *const @This()) usize {
+        return if (self.downloaded_bytes_externally_accounted) 0 else self.downloaded_bytes;
+    }
+
+    fn externallyAccountedDownloadedBytes(self: *const @This()) u64 {
+        if (!self.downloaded_bytes_externally_accounted) return 0;
+        return std.math.cast(u64, self.downloaded_bytes) orelse std.math.maxInt(u64);
+    }
+
+    fn reservePdfDecodeWorkingSet(self: *@This(), requested_bytes: usize) !usize {
+        const manager = self.manager orelse return requested_bytes;
+        const stats = manager.sliceStats(.document_extraction_working_set);
+        const operation_current = std.math.add(u64, self.current_bytes, self.externallyAccountedDownloadedBytes()) catch
+            return error.DocumentExtractionWorkingSetTooLarge;
+        const own_available = if (stats.hard_limit_bytes == 0)
+            @as(u64, @intCast(requested_bytes))
+        else
+            stats.hard_limit_bytes -| operation_current;
+        const reserved = @min(@as(u64, @intCast(requested_bytes)), own_available);
+        if (reserved == 0) return error.DocumentExtractionWorkingSetTooLarge;
+        const next = std.math.add(u64, self.current_bytes, reserved) catch return error.ResourceBudgetExceeded;
+        try self.setAccountedBytes(next);
+        self.pdf_decode_reservation_bytes = reserved;
+        return std.math.cast(usize, reserved) orelse return error.DocumentExtractionWorkingSetTooLarge;
+    }
+
     fn updateWorkingSet(
         self: *@This(),
         unit_bytes: usize,
         generated_cache_bytes: usize,
-        writes: []const KVPair,
+        writes: *const std.ArrayListUnmanaged(KVPair),
+        deletes: *const std.ArrayListUnmanaged([]const u8),
         window: *const GeneratedReplayWindow,
     ) !void {
-        var total = self.downloaded_bytes;
+        var total = self.locallyAccountedDownloadedBytes();
         total = addUsizeSaturating(total, unit_bytes);
         total = addUsizeSaturating(total, generated_cache_bytes);
-        total = addUsizeSaturating(total, runtimeDocumentExtractionWriteBytes(writes));
+        total = addUsizeSaturating(total, runtimeDocumentExtractionWriteWorkingSetBytes(writes));
+        total = addUsizeSaturating(total, runtimeDocumentExtractionDeleteWorkingSetBytes(deletes));
         total = addUsizeSaturating(total, runtimeDocumentExtractionWindowBytes(window));
         try self.setBytes(total);
     }
 
-    fn observeWorkingSet(
-        self: *@This(),
-        unit_bytes: usize,
-        generated_cache_bytes: usize,
-        writes: []const KVPair,
-        window: *const GeneratedReplayWindow,
-    ) void {
-        var total = self.downloaded_bytes;
-        total = addUsizeSaturating(total, unit_bytes);
-        total = addUsizeSaturating(total, generated_cache_bytes);
-        total = addUsizeSaturating(total, runtimeDocumentExtractionWriteBytes(writes));
-        total = addUsizeSaturating(total, runtimeDocumentExtractionWindowBytes(window));
-        self.observeBytes(total);
+    /// Reserves durable materialization bytes before they are allocated by the
+    /// runtime allocator. The next working-set update reconciles the
+    /// conservative reservation with exact live payload sizes.
+    fn reserveAdditional(self: *@This(), bytes: usize) !void {
+        const additional = std.math.cast(u64, bytes) orelse return error.DocumentExtractionWorkingSetTooLarge;
+        if (self.manager) |manager| {
+            const stats = manager.sliceStats(.document_extraction_working_set);
+            const operation_current = std.math.add(u64, self.current_bytes, self.externallyAccountedDownloadedBytes()) catch
+                return error.DocumentExtractionWorkingSetTooLarge;
+            const operation_next = std.math.add(u64, operation_current, additional) catch
+                return error.DocumentExtractionWorkingSetTooLarge;
+            if (stats.hard_limit_bytes > 0 and operation_next > stats.hard_limit_bytes)
+                return error.DocumentExtractionWorkingSetTooLarge;
+        }
+        const next = std.math.add(u64, self.current_bytes, additional) catch return error.DocumentExtractionWorkingSetTooLarge;
+        try self.setAccountedBytes(next);
     }
 
     fn setBytes(self: *@This(), bytes: usize) !void {
+        const actual = std.math.cast(u64, bytes) orelse return error.ResourceBudgetExceeded;
+        const next = std.math.add(u64, actual, self.pdf_decode_reservation_bytes) catch return error.ResourceBudgetExceeded;
+        if (self.manager) |manager| {
+            const stats = manager.sliceStats(.document_extraction_working_set);
+            const operation_next = std.math.add(u64, next, self.externallyAccountedDownloadedBytes()) catch
+                return error.DocumentExtractionWorkingSetTooLarge;
+            if (stats.hard_limit_bytes > 0 and operation_next > stats.hard_limit_bytes)
+                return error.DocumentExtractionWorkingSetTooLarge;
+        }
+        return try self.setAccountedBytes(next);
+    }
+
+    fn setAccountedBytes(self: *@This(), next: u64) !void {
         const manager = self.manager orelse return;
-        const next = std.math.cast(u64, bytes) orelse return error.ResourceBudgetExceeded;
         const stats = manager.sliceStats(.document_extraction_working_set);
         if (stats.hard_limit_bytes > 0 and next > stats.hard_limit_bytes) {
             return error.DocumentExtractionWorkingSetTooLarge;
         }
         try manager.adjustUsage(.document_extraction_working_set, &self.current_bytes, next);
-    }
-
-    fn observeBytes(self: *@This(), bytes: usize) void {
-        const manager = self.manager orelse return;
-        const next = std.math.cast(u64, bytes) orelse std.math.maxInt(u64);
-        manager.observeUsage(.document_extraction_working_set, &self.current_bytes, next);
     }
 
     fn deinit(self: *@This()) void {
@@ -4446,9 +5286,165 @@ test "document extraction working set accounts generated unit cache bytes" {
 
     var window = GeneratedReplayWindow{ .alloc = std.testing.allocator };
     defer window.deinit();
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
 
-    try tracker.updateWorkingSet(40, 0, &.{}, &window);
-    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.updateWorkingSet(40, 60, &.{}, &window));
+    try tracker.updateWorkingSet(40, 0, &writes, &deletes, &window);
+    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.updateWorkingSet(40, 60, &writes, &deletes, &window));
+}
+
+test "budgeted document download composes with materialization accounting" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 100,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var download_budgeted = resource_manager_mod.BudgetedAllocator.init(
+        &manager,
+        .document_extraction_working_set,
+        std.testing.allocator,
+        1,
+    );
+    defer download_budgeted.deinit();
+    const download_alloc = download_budgeted.allocator();
+    const body = try download_alloc.alloc(u8, 40);
+    defer download_alloc.free(body);
+
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    tracker.setExternallyAccountedDownloadedBytes(body.len);
+    var window = GeneratedReplayWindow{ .alloc = std.testing.allocator };
+    defer window.deinit();
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+
+    try tracker.updateWorkingSet(20, 0, &writes, &deletes, &window);
+    try std.testing.expectEqual(@as(u64, 60), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.reserveAdditional(41));
+}
+
+test "retained document collection allocations compose with the hard working-set cap" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 100,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    try tracker.setDownloadedBytes(40);
+
+    var collection = resource_manager_mod.BudgetedAllocator.init(
+        &manager,
+        .document_extraction_working_set,
+        std.testing.allocator,
+        1,
+    );
+    defer collection.deinit();
+    const collection_alloc = collection.allocator();
+    const retained = try collection_alloc.alloc(u8, 50);
+    defer collection_alloc.free(retained);
+
+    try std.testing.expectEqual(@as(u64, 90), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectError(error.OutOfMemory, collection_alloc.alloc(u8, 11));
+    try std.testing.expect(collection.denied());
+}
+
+test "document replay payloads are admitted before persistent allocation" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 1024,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+
+    const oversized = try alloc.alloc(u8, 2048);
+    defer alloc.free(oversized);
+    try std.testing.expectError(
+        error.DocumentExtractionWorkingSetTooLarge,
+        appendRuntimeReplayDocument(&tracker, alloc, &window, "unit", oversized, &.{"text"}),
+    );
+    try std.testing.expectEqual(@as(usize, 0), window.documents.items.len);
+}
+
+test "document extraction reserves PDF decoder peak memory atomically" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 100,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+
+    try tracker.setDownloadedBytes(10);
+    try std.testing.expectEqual(@as(usize, 60), try tracker.reservePdfDecodeWorkingSet(60));
+    try std.testing.expectEqual(@as(u64, 70), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try tracker.setBytes(40);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.setBytes(41));
+}
+
+test "PDF decoder credit and OCR transient allocations compose without double charging" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 100,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    try tracker.setDownloadedBytes(40);
+    try std.testing.expectEqual(@as(usize, 20), try tracker.reservePdfDecodeWorkingSet(20));
+
+    var decoder = ReservedWorkingSetAllocator.init(std.testing.allocator, 20);
+    const decoder_alloc = decoder.allocator();
+    const decoded = try decoder_alloc.alloc(u8, 20);
+    defer decoder_alloc.free(decoded);
+    try std.testing.expectEqual(@as(u64, 60), manager.sliceStats(.document_extraction_working_set).used_bytes);
+
+    var budgeted = resource_manager_mod.BudgetedAllocator.init(
+        &manager,
+        .document_extraction_working_set,
+        std.testing.allocator,
+        1,
+    );
+    defer budgeted.deinit();
+    const transient_alloc = budgeted.allocator();
+    const canvas = try transient_alloc.alloc(u8, 40);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectError(error.OutOfMemory, transient_alloc.alloc(u8, 1));
+    try std.testing.expect(budgeted.denied());
+    transient_alloc.free(canvas);
+    try std.testing.expectEqual(@as(u64, 60), manager.sliceStats(.document_extraction_working_set).used_bytes);
+}
+
+test "reserved PDF working set is bounded without duplicate resource charges" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 100,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    try tracker.setDownloadedBytes(10);
+    try std.testing.expectEqual(@as(usize, 60), try tracker.reservePdfDecodeWorkingSet(60));
+
+    var bounded = ReservedWorkingSetAllocator.init(std.testing.allocator, 60);
+    const working_alloc = bounded.allocator();
+    const canvas = try working_alloc.alloc(u8, 60);
+    try std.testing.expectEqual(@as(u64, 70), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectError(error.OutOfMemory, working_alloc.alloc(u8, 1));
+    try std.testing.expect(bounded.limit_exceeded);
+    working_alloc.free(canvas);
+    try std.testing.expectEqual(@as(u64, 70), manager.sliceStats(.document_extraction_working_set).used_bytes);
 }
 
 fn addUsizeSaturating(a: usize, b: usize) usize {
@@ -4457,18 +5453,39 @@ fn addUsizeSaturating(a: usize, b: usize) usize {
 
 fn runtimeDocumentExtractionWriteBytes(writes: []const KVPair) usize {
     var total: usize = 0;
-    for (writes) |write| total += write.key.len + write.value.len;
+    for (writes) |write| total = addUsizeSaturating(total, addUsizeSaturating(write.key.len, write.value.len));
+    return total;
+}
+
+fn runtimeDocumentExtractionWriteWorkingSetBytes(writes: *const std.ArrayListUnmanaged(KVPair)) usize {
+    return addUsizeSaturating(
+        writes.capacity *| @sizeOf(KVPair),
+        runtimeDocumentExtractionWriteBytes(writes.items),
+    );
+}
+
+fn runtimeDocumentExtractionDeleteWorkingSetBytes(deletes: *const std.ArrayListUnmanaged([]const u8)) usize {
+    var total = deletes.capacity *| @sizeOf([]const u8);
+    for (deletes.items) |key| total = addUsizeSaturating(total, key.len);
     return total;
 }
 
 fn runtimeDocumentExtractionWindowBytes(window: *const GeneratedReplayWindow) usize {
-    var total: usize = 0;
+    var total: usize = window.documents.capacity *| @sizeOf(derived_types.DerivedDocument);
+    total = addUsizeSaturating(total, window.deleted_keys.capacity *| @sizeOf([]const u8));
+    total = addUsizeSaturating(total, window.artifact_delete_keys.capacity *| @sizeOf([]const u8));
+    total = addUsizeSaturating(total, window.changed_artifact_keys.capacity *| @sizeOf([]const u8));
+    total = addUsizeSaturating(total, window.dense_embeddings.capacity *| @sizeOf(derived_types.DerivedDenseEmbeddingWrite));
+    total = addUsizeSaturating(total, window.sparse_embeddings.capacity *| @sizeOf(derived_types.DerivedSparseEmbeddingWrite));
+    total = addUsizeSaturating(total, window.coverage_transitions.capacity *| @sizeOf(CoverageOutcomeTransition));
     for (window.documents.items) |doc| {
         total = addUsizeSaturating(total, doc.key.len);
         if (doc.cleaned_value) |value| total = addUsizeSaturating(total, value.len);
+        total = addUsizeSaturating(total, doc.targets.len *| @sizeOf(derived_types.DerivedTargetRef));
         for (doc.targets) |target| total = addUsizeSaturating(total, target.index_name.len);
     }
     for (window.deleted_keys.items) |key| total = addUsizeSaturating(total, key.len);
+    for (window.artifact_delete_keys.items) |key| total = addUsizeSaturating(total, key.len);
     for (window.changed_artifact_keys.items) |key| total = addUsizeSaturating(total, key.len);
     for (window.dense_embeddings.items) |embedding| {
         total = addUsizeSaturating(total, embedding.index_name.len);
@@ -4484,6 +5501,17 @@ fn runtimeDocumentExtractionWindowBytes(window: *const GeneratedReplayWindow) us
         total = addUsizeSaturating(total, embedding.values.len * @sizeOf(f32));
         if (embedding.artifact_key) |key| total = addUsizeSaturating(total, key.len);
     }
+    for (window.coverage_transitions.items) |transition| {
+        total = addUsizeSaturating(total, transition.index_name.len);
+        total = addUsizeSaturating(total, transition.marker_key.len);
+        for (transition.counter_keys) |key| total = addUsizeSaturating(total, key.len);
+        total = addUsizeSaturating(total, transition.failure_guards.capacity *| @sizeOf(FailureIdentity));
+        for (transition.failure_guards.items) |failure| {
+            total = addUsizeSaturating(total, failure.artifact_name.len);
+            total = addUsizeSaturating(total, failure.source_artifact_name.len);
+            total = addUsizeSaturating(total, failure.doc_key.len);
+        }
+    }
     return total;
 }
 
@@ -4495,6 +5523,103 @@ fn clearRuntimeKVBatch(runtime: *EnrichmentRuntime, writes: *std.ArrayListUnmana
     writes.clearRetainingCapacity();
     for (deletes.items) |key| runtime.alloc.free(@constCast(key));
     deletes.clearRetainingCapacity();
+}
+
+fn appendOwnedRuntimeKVPair(
+    resource_tracker: *RuntimeDocumentExtractionResourceTracker,
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(KVPair),
+    key: []const u8,
+    value: []const u8,
+) !void {
+    try ensureRuntimeListAppendCapacity(KVPair, resource_tracker, alloc, writes);
+    try resource_tracker.reserveAdditional(addUsizeSaturating(key.len, value.len));
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    writes.appendAssumeCapacity(.{ .key = owned_key, .value = owned_value });
+}
+
+fn ensureRuntimeListAppendCapacity(
+    comptime T: type,
+    resource_tracker: *RuntimeDocumentExtractionResourceTracker,
+    alloc: Allocator,
+    list: *std.ArrayListUnmanaged(T),
+) !void {
+    if (list.items.len < list.capacity) return;
+    const next_capacity = if (list.capacity < 8)
+        @as(usize, 8)
+    else
+        std.math.mul(usize, list.capacity, 2) catch return error.DocumentExtractionWorkingSetTooLarge;
+    const growth_items = next_capacity - list.capacity;
+    const growth_bytes = std.math.mul(usize, growth_items, @sizeOf(T)) catch
+        return error.DocumentExtractionWorkingSetTooLarge;
+    try resource_tracker.reserveAdditional(growth_bytes);
+    try list.ensureTotalCapacityPrecise(alloc, next_capacity);
+}
+
+fn appendUniqueOwnedRuntimeKey(
+    comptime T: type,
+    resource_tracker: *RuntimeDocumentExtractionResourceTracker,
+    alloc: Allocator,
+    keys: *std.ArrayListUnmanaged(T),
+    key: []const u8,
+) !void {
+    for (keys.items) |existing| {
+        if (std.mem.eql(u8, existing, key)) return;
+    }
+    try ensureRuntimeListAppendCapacity(T, resource_tracker, alloc, keys);
+    try resource_tracker.reserveAdditional(key.len);
+    const owned = try alloc.dupe(u8, key);
+    keys.appendAssumeCapacity(owned);
+}
+
+fn appendRuntimeReplayDocument(
+    resource_tracker: *RuntimeDocumentExtractionResourceTracker,
+    alloc: Allocator,
+    window: *GeneratedReplayWindow,
+    key: []const u8,
+    payload: []const u8,
+    text_indexes: []const []const u8,
+) !void {
+    try ensureRuntimeListAppendCapacity(
+        derived_types.DerivedDocument,
+        resource_tracker,
+        alloc,
+        &window.documents,
+    );
+    var owned_bytes = addUsizeSaturating(key.len, payload.len);
+    owned_bytes = addUsizeSaturating(
+        owned_bytes,
+        text_indexes.len *| @sizeOf(derived_types.DerivedTargetRef),
+    );
+    for (text_indexes) |index_name| owned_bytes = addUsizeSaturating(owned_bytes, index_name.len);
+    try resource_tracker.reserveAdditional(owned_bytes);
+
+    const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+    var targets_initialized: usize = 0;
+    errdefer {
+        for (targets[0..targets_initialized]) |target| alloc.free(@constCast(target.index_name));
+        alloc.free(targets);
+    }
+    for (text_indexes, 0..) |index_name, i| {
+        targets[i] = .{
+            .kind = .full_text,
+            .index_name = try alloc.dupe(u8, index_name),
+        };
+        targets_initialized += 1;
+    }
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_payload = try alloc.dupe(u8, payload);
+    errdefer alloc.free(owned_payload);
+    window.documents.appendAssumeCapacity(.{
+        .key = owned_key,
+        .action = .upsert,
+        .cleaned_value = owned_payload,
+        .targets = targets,
+    });
 }
 
 fn flushRuntimeKVBatchAndClear(
@@ -4529,6 +5654,7 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
     mode: RuntimeDocumentExtractionMaterializeMode,
     unit_index: usize = 0,
     chunk_range_base_index: usize = 0,
+    resolved_char_cursor: usize = 0,
 
     fn sink(self: *@This()) document_extraction_mod.UnitSink {
         self.chunk_range_base_index = documentExtractionUnitRangeCountFromTextLengths(self.unit_text_lengths);
@@ -4543,60 +5669,87 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
     fn onBegin(_: *anyopaque, _: document_extraction_mod.StreamInfo) anyerror!void {}
 
     fn accountWorkingSet(self: *@This(), unit_bytes: usize, generated_cache_bytes: usize) !void {
-        if (self.mode == .store_artifacts) {
-            try self.resource_tracker.updateWorkingSet(unit_bytes, generated_cache_bytes, self.writes.items, self.window);
-        } else {
-            self.resource_tracker.observeWorkingSet(unit_bytes, generated_cache_bytes, self.writes.items, self.window);
-        }
+        try self.resource_tracker.updateWorkingSet(unit_bytes, generated_cache_bytes, self.writes, self.deletes, self.window);
+    }
+
+    fn accountAndFlushReplay(self: *@This(), unit_bytes: usize, generated_cache_bytes: usize) !void {
+        if (self.mode != .publish_replay) return;
+        try self.accountWorkingSet(unit_bytes, generated_cache_bytes);
+        try flushGeneratedReplayWindowIfNeeded(self.runtime, self.window, self.max_window_items);
+        try self.accountWorkingSet(unit_bytes, generated_cache_bytes);
     }
 
     fn onUnit(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        var budgeted: ?resource_manager_mod.BudgetedAllocator = if (self.resource_tracker.manager) |manager|
+            resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, self.runtime.alloc, 1)
+        else
+            null;
+        defer if (budgeted) |*allocator| allocator.deinit();
+        const working_alloc = if (budgeted) |*allocator| allocator.allocator() else self.runtime.alloc;
+        return self.onUnitWithAllocator(working_alloc, unit) catch |err| {
+            if (err == error.OutOfMemory) {
+                if (budgeted) |*allocator| if (allocator.denied())
+                    return error.DocumentExtractionWorkingSetTooLarge;
+            }
+            return err;
+        };
+    }
+
+    fn onUnitWithAllocator(self: *@This(), working_alloc: Allocator, unit: *document_extraction_mod.Unit) !void {
         if (runtimeGeneratedTextNeeded(self.config, self.info.route_type, unit.*)) {
             const cached = self.generated_units.get(unit.unit_id) orelse return error.MissingGeneratedUnitCache;
             try replaceDocumentExtractionUnitWithClone(self.runtime.alloc, unit, cached.*);
         }
+        unit.char_start = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
+        self.resolved_char_cursor = std.math.add(usize, self.resolved_char_cursor, unit.text.len) catch
+            return error.DocumentExtractionOffsetOverflow;
+        unit.char_end = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
         const unit_working_bytes = runtimeDocumentExtractionUnitOwnedBytes(unit.*);
-        const generated_cache_bytes = self.generated_units.bytes;
+        // The generated cache is retained on the collection budget allocator,
+        // so its live capacity is already present in the resource manager.
+        const generated_cache_bytes: usize = 0;
         try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
 
         const unit_key = self.desired_unit_keys[self.unit_index];
-        const unit_range_id = try documentExtractionRangeIdAlloc(self.runtime.alloc, documentExtractionUnitRangeIndexFromTextLengths(self.unit_text_lengths, self.unit_index));
-        defer self.runtime.alloc.free(unit_range_id);
+        const unit_range_id = try documentExtractionRangeIdAlloc(working_alloc, documentExtractionUnitRangeIndexFromTextLengths(self.unit_text_lengths, self.unit_index));
+        defer working_alloc.free(unit_range_id);
         const unit_route = documentExtractionRangeRoute(self.previous_child_ranges, unit_range_id, "unit", self.artifact_name);
-        const payload = try documentUnitPayloadAlloc(self.runtime.alloc, self.doc_key, self.artifact_name, unit.*, self.source_url, self.info.content_type, unit_route);
-        defer self.runtime.alloc.free(payload);
+        const payload = try documentUnitPayloadAlloc(working_alloc, self.doc_key, self.artifact_name, unit.*, self.source_url, self.info.content_type, unit_route);
+        defer working_alloc.free(payload);
 
         if (self.mode == .store_artifacts) {
-            try self.writes.append(self.runtime.alloc, .{
-                .key = try self.runtime.alloc.dupe(u8, unit_key),
-                .value = try self.runtime.alloc.dupe(u8, payload),
-            });
+            try appendOwnedRuntimeKVPair(self.resource_tracker, self.runtime.alloc, self.writes, unit_key, payload);
+            try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
+            if (self.writes.items.len >= runtime_document_extraction_flush_write_count or
+                runtimeDocumentExtractionWriteBytes(self.writes.items) >= runtime_document_extraction_flush_write_bytes)
+            {
+                try flushRuntimeKVBatchAndClear(self.runtime, self.writes, self.deletes);
+                try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
+            }
         } else {
-            try appendUniqueDupeKey(self.runtime.alloc, &self.window.changed_artifact_keys, unit_key);
+            try appendUniqueOwnedRuntimeKey(
+                []u8,
+                self.resource_tracker,
+                self.runtime.alloc,
+                &self.window.changed_artifact_keys,
+                unit_key,
+            );
         }
 
         if (self.mode == .publish_replay and self.text_indexes.len > 0) {
-            var targets = try self.runtime.alloc.alloc(derived_types.DerivedTargetRef, self.text_indexes.len);
-            errdefer {
-                for (targets) |target| self.runtime.alloc.free(@constCast(target.index_name));
-                self.runtime.alloc.free(targets);
-            }
-            for (self.text_indexes, 0..) |index_name, i| {
-                targets[i] = .{
-                    .kind = .full_text,
-                    .index_name = try self.runtime.alloc.dupe(u8, index_name),
-                };
-            }
-            try self.window.documents.append(self.runtime.alloc, .{
-                .key = try self.runtime.alloc.dupe(u8, unit_key),
-                .action = .upsert,
-                .cleaned_value = try self.runtime.alloc.dupe(u8, payload),
-                .targets = targets,
-            });
+            try appendRuntimeReplayDocument(
+                self.resource_tracker,
+                self.runtime.alloc,
+                self.window,
+                unit_key,
+                payload,
+                self.text_indexes,
+            );
         }
+        try self.accountAndFlushReplay(unit_working_bytes, generated_cache_bytes);
 
-        try appendRuntimeDocumentUnitChunkWrites(self.runtime, self.doc_key, self.artifact_name, unit_key, unit.*, self.desired_chunk_keys, self.chunk_range_base_index, self.previous_child_ranges, self.writes, self.window, self.mode);
+        try appendRuntimeDocumentUnitChunkWrites(self, working_alloc, unit_key, unit.*, unit_working_bytes, generated_cache_bytes);
         self.unit_index += 1;
         try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
 
@@ -4606,9 +5759,7 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
             try flushRuntimeKVBatchAndClear(self.runtime, self.writes, self.deletes);
             try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
         }
-        if (self.mode == .publish_replay) {
-            try flushGeneratedReplayWindowIfNeeded(self.runtime, self.window, self.max_window_items);
-        }
+        try self.accountAndFlushReplay(unit_working_bytes, generated_cache_bytes);
         try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
     }
 
@@ -4616,75 +5767,73 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
 };
 
 fn appendRuntimeDocumentUnitChunkWrites(
-    runtime: *EnrichmentRuntime,
-    doc_key: []const u8,
-    source_artifact_name: []const u8,
+    context: *RuntimeDocumentExtractionMaterializeContext,
+    working_alloc: Allocator,
     unit_key: []const u8,
     unit: document_extraction_mod.Unit,
-    desired_chunk_keys: []const []const u8,
-    chunk_range_base_index: usize,
-    previous_child_ranges: []const types.DocumentArtifactChildRange,
-    writes: *std.ArrayListUnmanaged(KVPair),
-    window: *GeneratedReplayWindow,
-    mode: RuntimeDocumentExtractionMaterializeMode,
+    unit_working_bytes: usize,
+    generated_cache_bytes: usize,
 ) !void {
-    for (runtime.index_manager.enrichments.items) |entry| {
+    for (context.runtime.index_manager.enrichments.items) |entry| {
         if (entry.kind != .chunk) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, context.artifact_name)) continue;
         const chunks = if (entry.chunker_json.len > 0)
-            try chunker_mod.chunkTextWithConfigJson(runtime.alloc, unit.text, entry.chunker_json)
+            try chunker_mod.chunkTextWithConfigJson(working_alloc, unit.text, entry.chunker_json)
         else
-            try chunker_mod.chunkText(runtime.alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
-        defer chunker_mod.freeChunks(runtime.alloc, chunks);
+            try chunker_mod.chunkText(working_alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+        defer chunker_mod.freeChunks(working_alloc, chunks);
         if (chunks.len == 0) continue;
 
         const include_default_full_text = entry.full_text_index or
-            try chunking_types_mod.parseHasFullTextIndexFromSlice(runtime.alloc, entry.chunker_json);
-        const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, entry.name, include_default_full_text);
+            try chunking_types_mod.parseHasFullTextIndexFromSlice(working_alloc, entry.chunker_json);
+        const text_indexes = try context.runtime.index_manager.textIndexesForChunk(working_alloc, entry.name, include_default_full_text);
         defer {
-            for (text_indexes) |name| runtime.alloc.free(name);
-            runtime.alloc.free(text_indexes);
+            for (text_indexes) |name| working_alloc.free(name);
+            working_alloc.free(text_indexes);
         }
 
-        var arena_state = std.heap.ArenaAllocator.init(runtime.alloc);
+        var arena_state = std.heap.ArenaAllocator.init(working_alloc);
         defer arena_state.deinit();
         const scratch = arena_state.allocator();
 
         for (chunks) |chunk| {
             if (!chunk.isText()) continue;
-            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(runtime.alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
-            defer runtime.alloc.free(chunk_key);
-            const chunk_key_index = documentExtractionKeyIndex(desired_chunk_keys, chunk_key) orelse return error.DocumentExtractionChunkRangeMissing;
-            const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
-            const chunk_route = documentExtractionRangeRoute(previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
-            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit, chunk, true, chunk_route);
-            if (mode == .store_artifacts) {
-                try writes.append(runtime.alloc, .{
-                    .key = try runtime.alloc.dupe(u8, chunk_key),
-                    .value = try runtime.alloc.dupe(u8, payload),
-                });
+            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(working_alloc, context.doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
+            defer working_alloc.free(chunk_key);
+            const chunk_key_index = documentExtractionKeyIndex(context.desired_chunk_keys, chunk_key) orelse return error.DocumentExtractionChunkRangeMissing;
+            const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, context.chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
+            const chunk_route = documentExtractionRangeRoute(context.previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
+            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, context.doc_key, unit_key, entry.name, context.artifact_name, entry.source_field, unit, chunk, true, chunk_route);
+            if (context.mode == .store_artifacts) {
+                try appendOwnedRuntimeKVPair(context.resource_tracker, context.runtime.alloc, context.writes, chunk_key, payload);
             } else {
-                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, chunk_key);
+                try appendUniqueOwnedRuntimeKey(
+                    []u8,
+                    context.resource_tracker,
+                    context.runtime.alloc,
+                    &context.window.changed_artifact_keys,
+                    chunk_key,
+                );
             }
 
-            if (mode == .publish_replay and text_indexes.len > 0) {
-                var targets = try runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
-                errdefer {
-                    for (targets) |target| runtime.alloc.free(@constCast(target.index_name));
-                    runtime.alloc.free(targets);
-                }
-                for (text_indexes, 0..) |index_name, i| {
-                    targets[i] = .{
-                        .kind = .full_text,
-                        .index_name = try runtime.alloc.dupe(u8, index_name),
-                    };
-                }
-                try window.documents.append(runtime.alloc, .{
-                    .key = try runtime.alloc.dupe(u8, chunk_key),
-                    .action = .upsert,
-                    .cleaned_value = try runtime.alloc.dupe(u8, payload),
-                    .targets = targets,
-                });
+            if (context.mode == .publish_replay and text_indexes.len > 0) {
+                try appendRuntimeReplayDocument(
+                    context.resource_tracker,
+                    context.runtime.alloc,
+                    context.window,
+                    chunk_key,
+                    payload,
+                    text_indexes,
+                );
+            }
+
+            try context.accountAndFlushReplay(unit_working_bytes, generated_cache_bytes);
+            try context.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
+            if (context.mode == .store_artifacts and (context.writes.items.len >= runtime_document_extraction_flush_write_count or
+                runtimeDocumentExtractionWriteBytes(context.writes.items) >= runtime_document_extraction_flush_write_bytes))
+            {
+                try flushRuntimeKVBatchAndClear(context.runtime, context.writes, context.deletes);
+                try context.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
             }
 
             _ = arena_state.reset(.retain_capacity);
@@ -4731,6 +5880,17 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .extraction_status = unit.extraction_status,
         .confidence = documentUnitConfidence(unit),
         .ocr_used = unit.ocr_used,
+        .ocr_attempted = unit.ocr_attempted,
+        .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+        .ocr_rendered_width = unit.ocr_rendered_width,
+        .ocr_rendered_height = unit.ocr_rendered_height,
+        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+        .ocr_failure_stage = unit.ocr_failure_stage,
+        .ocr_failure_retryable = unit.ocr_failure_retryable,
+        .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+        .ocr_embedded_quality = unit.ocr_embedded_quality,
+        .ocr_output_quality = unit.ocr_output_quality,
         .ocr_confidence = unit.ocr_confidence,
         .ocr_bbox = unit.ocr_bbox,
         .transcript_used = unit.transcript_used,
@@ -5712,7 +6872,15 @@ fn processMaterializedChunkDenseRequest(
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
-    if (desired_chunk_keys.count() == 0) try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
+    if (desired_chunk_keys.count() == 0) {
+        try queueDerivedCoverageOutcome(
+            runtime,
+            window,
+            request,
+            consumer_indexes,
+            try materializedChunkEmptyCoverageOutcome(runtime, request, chunk_artifact_name),
+        );
+    }
     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
 }
 
@@ -5923,7 +7091,15 @@ fn processMaterializedChunkSparseRequest(
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
-    if (desired_chunk_keys.count() == 0) try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
+    if (desired_chunk_keys.count() == 0) {
+        try queueDerivedCoverageOutcome(
+            runtime,
+            window,
+            request,
+            consumer_indexes,
+            try materializedChunkEmptyCoverageOutcome(runtime, request, chunk_artifact_name),
+        );
+    }
     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
 }
 
@@ -6642,7 +7818,13 @@ fn processDenseEmbedding(
     defer runtime.alloc.free(raw);
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
-        const source_parts = try renderSourceParts(runtime.alloc, runtime.config, raw, request);
+        const source_parts = try renderSourceParts(
+            runtime.alloc,
+            runtime.config,
+            raw,
+            request,
+            dense_embedder.mediaPartLimit(embedding_artifact_name),
+        );
         if (source_parts) |parts| {
             defer template.freeContentParts(runtime.alloc, parts);
 
@@ -7418,6 +8600,25 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
         hasher.update(&buf);
     }
     hasher.update(if (unit.ocr_used) "ocr:1" else "ocr:0");
+    hasher.update(if (unit.ocr_attempted) "ocr_attempted:1" else "ocr_attempted:0");
+    if (unit.ocr_render_dpi) |dpi| {
+        var dpi_buf: [@sizeOf(u16)]u8 = undefined;
+        std.mem.writeInt(u16, &dpi_buf, dpi, .big);
+        hasher.update(&dpi_buf);
+    }
+    if (unit.ocr_effective_render_dpi) |dpi| {
+        var dpi_buf: [@sizeOf(u16)]u8 = undefined;
+        std.mem.writeInt(u16, &dpi_buf, dpi, .big);
+        hasher.update(&dpi_buf);
+    }
+    if (unit.ocr_rendered_width) |value| hasher.update(std.mem.asBytes(&value));
+    if (unit.ocr_rendered_height) |value| hasher.update(std.mem.asBytes(&value));
+    if (unit.ocr_rendered_bytes) |value| hasher.update(std.mem.asBytes(&value));
+    if (unit.ocr_failure_stage) |value| hasher.update(value);
+    if (unit.ocr_failure_retryable) |value| hasher.update(if (value) "ocr_failure_retryable:1" else "ocr_failure_retryable:0");
+    if (unit.ocr_trigger_reasons) |value| hasher.update(value);
+    if (unit.ocr_embedded_quality) |value| hasher.update(value);
+    if (unit.ocr_output_quality) |value| hasher.update(value);
     if (unit.ocr_confidence) |confidence| {
         var value = confidence;
         hasher.update(std.mem.asBytes(&value));
@@ -7665,6 +8866,17 @@ fn documentUnitPayloadAlloc(
         .source_sha256 = unit.source_sha256,
         .byte_length = unit.byte_length,
         .confidence = documentUnitConfidence(unit),
+        .ocr_attempted = unit.ocr_attempted,
+        .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+        .ocr_rendered_width = unit.ocr_rendered_width,
+        .ocr_rendered_height = unit.ocr_rendered_height,
+        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+        .ocr_failure_stage = unit.ocr_failure_stage,
+        .ocr_failure_retryable = unit.ocr_failure_retryable,
+        .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+        .ocr_embedded_quality = unit.ocr_embedded_quality,
+        .ocr_output_quality = unit.ocr_output_quality,
         .ocr_confidence = unit.ocr_confidence,
         .ocr_bbox = unit.ocr_bbox,
         .transcript_confidence = unit.transcript_confidence,
@@ -7678,6 +8890,17 @@ fn documentUnitPayloadAlloc(
             .byte_length = unit.byte_length,
             .confidence = documentUnitConfidence(unit),
             .ocr_used = unit.ocr_used,
+            .ocr_attempted = unit.ocr_attempted,
+            .ocr_render_dpi = unit.ocr_render_dpi,
+            .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+            .ocr_rendered_width = unit.ocr_rendered_width,
+            .ocr_rendered_height = unit.ocr_rendered_height,
+            .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+            .ocr_failure_stage = unit.ocr_failure_stage,
+            .ocr_failure_retryable = unit.ocr_failure_retryable,
+            .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+            .ocr_embedded_quality = unit.ocr_embedded_quality,
+            .ocr_output_quality = unit.ocr_output_quality,
             .ocr_confidence = unit.ocr_confidence,
             .ocr_bbox = unit.ocr_bbox,
             .transcript_used = unit.transcript_used,
@@ -7702,6 +8925,17 @@ fn documentUnitPayloadAlloc(
                 .byte_length = unit.byte_length,
                 .confidence = documentUnitConfidence(unit),
                 .ocr_used = unit.ocr_used,
+                .ocr_attempted = unit.ocr_attempted,
+                .ocr_render_dpi = unit.ocr_render_dpi,
+                .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+                .ocr_rendered_width = unit.ocr_rendered_width,
+                .ocr_rendered_height = unit.ocr_rendered_height,
+                .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+                .ocr_failure_stage = unit.ocr_failure_stage,
+                .ocr_failure_retryable = unit.ocr_failure_retryable,
+                .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+                .ocr_embedded_quality = unit.ocr_embedded_quality,
+                .ocr_output_quality = unit.ocr_output_quality,
                 .ocr_confidence = unit.ocr_confidence,
                 .ocr_bbox = unit.ocr_bbox,
                 .transcript_used = unit.transcript_used,
@@ -7796,6 +9030,88 @@ fn documentExtractionManifestHasLastError(alloc: Allocator, manifest_json: []con
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     return parsed.value.object.get("last_error") != null;
+}
+
+fn documentExtractionEmptyCoverageOutcome(alloc: Allocator, manifest_json: []const u8) !CoverageOutcome {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
+    const object = parsed.value.object;
+    if (object.get("last_error") != null) return .terminal_failed;
+    if (object.get("merge_status")) |value| {
+        if (value == .string and std.mem.eql(u8, value.string, "failed")) return .terminal_failed;
+    }
+    if (object.get("route_type")) |value| {
+        if (value == .string and std.mem.eql(u8, value.string, "error")) return .terminal_failed;
+    }
+    const chunk_count = try jsonObjectU64(object, "chunk_count");
+    const ocr_failed_count = try jsonObjectU64(object, "ocr_failed_count");
+    const failed_pages = if (object.get("ocr_failed_page_numbers")) |value|
+        if (value == .array) value.array.items.len else 0
+    else
+        0;
+    if (chunk_count == 0 and (ocr_failed_count > 0 or failed_pages > 0)) return .terminal_failed;
+    return .skipped;
+}
+
+fn queueCoverageOutcomeForRequest(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    outcome: CoverageOutcome,
+) !void {
+    const indexes = try affectedIndexesForRequestAlloc(runtime, request);
+    defer freeAffectedIndexes(runtime, indexes);
+    try queueDerivedCoverageOutcome(runtime, window, request, indexes, outcome);
+}
+
+fn finalizeEmptyDocumentExtractionCoverage(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    manifest_json: []const u8,
+) !void {
+    const outcome = try documentExtractionEmptyCoverageOutcome(runtime.alloc, manifest_json);
+    if (outcome == .terminal_failed) {
+        // Mainline coverage transitions revalidate terminal outcomes against
+        // durable repair debt. Publish that debt before queueing the guarded
+        // transition so an empty OCR failure cannot look like a healthy skip.
+        try recordIsolatedRequestError(runtime, window, request, error.DocumentExtractionProducedNoUsableText);
+        return;
+    }
+    try queueCoverageOutcomeForRequest(runtime, window, request, outcome);
+}
+
+fn materializedChunkEmptyCoverageOutcome(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    chunk_artifact_name: []const u8,
+) !CoverageOutcome {
+    const chunk_cfg = runtime.index_manager.getEnrichment(.chunk, chunk_artifact_name) orelse return .skipped;
+    if (chunk_cfg.source_artifact_name.len == 0) return .skipped;
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", chunk_cfg.source_artifact_name);
+    defer runtime.alloc.free(manifest_key);
+    const manifest = storeGetAllocWithRetry(runtime, manifest_key) catch |err| switch (err) {
+        error.NotFound => return .skipped,
+        else => return err,
+    };
+    defer runtime.alloc.free(manifest);
+    return documentExtractionEmptyCoverageOutcome(runtime.alloc, manifest);
+}
+
+test "empty document extraction coverage distinguishes skip and terminal failure" {
+    try std.testing.expectEqual(
+        CoverageOutcome.skipped,
+        try documentExtractionEmptyCoverageOutcome(std.testing.allocator, "{\"route_type\":\"pdf\",\"merge_status\":\"converged\",\"chunk_count\":0,\"ocr_failed_count\":0}"),
+    );
+    try std.testing.expectEqual(
+        CoverageOutcome.terminal_failed,
+        try documentExtractionEmptyCoverageOutcome(std.testing.allocator, "{\"route_type\":\"error\",\"merge_status\":\"failed\",\"chunk_count\":0,\"ocr_failed_count\":0,\"last_error\":{\"code\":\"InvalidFlateStream\"}}"),
+    );
+    try std.testing.expectEqual(
+        CoverageOutcome.terminal_failed,
+        try documentExtractionEmptyCoverageOutcome(std.testing.allocator, "{\"route_type\":\"pdf\",\"merge_status\":\"converged\",\"chunk_count\":0,\"ocr_failed_count\":1,\"ocr_failed_page_numbers\":[7]}"),
+    );
 }
 
 fn jsonObjectStringDup(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) ![]u8 {
@@ -8216,6 +9532,7 @@ fn appendDocumentExtractionMergeOperation(
 const DocumentExtractionLastError = struct {
     code: []const u8,
     message: []const u8,
+    stage: ?[]const u8 = null,
 };
 
 fn documentExtractionManifestPayloadAlloc(
@@ -8262,10 +9579,46 @@ fn documentExtractionManifestPayloadAlloc(
         var error_first = true;
         try appendJsonFieldString(alloc, &out, &error_first, "code", value.code);
         try appendJsonFieldString(alloc, &out, &error_first, "message", value.message);
+        if (value.stage) |stage| try appendJsonFieldString(alloc, &out, &error_first, "stage", stage);
         try out.append(alloc, '}');
     }
-    try appendJsonFieldUsize(alloc, &out, &first, "unit_count", if (unit_text_lengths.len > 0) unit_text_lengths.len else extraction.units.len);
+    const unit_count = if (unit_text_lengths.len > 0)
+        unit_text_lengths.len
+    else if (extraction.units.len > 0)
+        extraction.units.len
+    else
+        unit_keys.len;
+    try appendJsonFieldUsize(alloc, &out, &first, "unit_count", unit_count);
     try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
+    try appendJsonFieldUsize(alloc, &out, &first, "ocr_attempted_count", extraction.ocr_attempted_count);
+    try appendJsonFieldUsize(alloc, &out, &first, "ocr_selected_count", extraction.ocr_selected_count);
+    try appendJsonFieldUsize(alloc, &out, &first, "ocr_retained_embedded_count", extraction.ocr_retained_embedded_count);
+    try appendJsonFieldUsize(alloc, &out, &first, "ocr_failed_count", extraction.ocr_failed_count);
+    try appendJsonFieldName(alloc, &out, &first, "ocr_failed_page_numbers");
+    try out.append(alloc, '[');
+    for (extraction.ocr_failed_page_numbers, 0..) |page, i| {
+        if (i > 0) try out.append(alloc, ',');
+        const rendered_page = try std.fmt.allocPrint(alloc, "{d}", .{page});
+        defer alloc.free(rendered_page);
+        try out.appendSlice(alloc, rendered_page);
+    }
+    try out.append(alloc, ']');
+    try appendJsonFieldBool(alloc, &out, &first, "ocr_failed_pages_truncated", extraction.ocr_failed_count > extraction.ocr_failed_page_numbers.len);
+    try appendJsonFieldName(alloc, &out, &first, "ocr_failure_details");
+    try out.append(alloc, '[');
+    for (extraction.ocr_failure_details, 0..) |detail, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        var detail_first = true;
+        if (detail.page_number) |page| try appendJsonFieldU64(alloc, &out, &detail_first, "page_number", page);
+        try appendJsonFieldString(alloc, &out, &detail_first, "unit_id", detail.unit_id);
+        try appendJsonFieldString(alloc, &out, &detail_first, "retained_method", detail.retained_method);
+        try appendJsonFieldString(alloc, &out, &detail_first, "error_message", detail.error_message);
+        if (detail.failure_stage) |stage| try appendJsonFieldString(alloc, &out, &detail_first, "failure_stage", stage);
+        try appendJsonFieldBool(alloc, &out, &detail_first, "retryable", detail.retryable);
+        try out.append(alloc, '}');
+    }
+    try out.append(alloc, ']');
     try appendJsonFieldName(alloc, &out, &first, "child_ranges");
     try out.append(alloc, '[');
     if (child_ranges_override.len > 0) {
@@ -9368,7 +10721,11 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
         else
             null;
 
-        if (existing_outcome == null or existing_outcome.? != target_outcome) {
+        // Producer failures are authoritative for the current source version.
+        // A later successful replay may replace one, but an empty downstream
+        // consumer must not relabel the same failure as an intentional skip.
+        const weaker_than_existing_failure = existing_outcome == .terminal_failed and target_outcome == .skipped;
+        if (!weaker_than_existing_failure and (existing_outcome == null or existing_outcome.? != target_outcome)) {
             if (existing_outcome) |previous_outcome| {
                 const previous_state_index = try counterState(runtime, &counter_states, &counter_indexes, transition, previous_outcome);
                 if (counter_states.items[previous_state_index].count == 0) return error.InvalidDerivedCoverageCounter;
@@ -9534,6 +10891,18 @@ test "derived coverage outcome transitions are exclusive and idempotent" {
     try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
     try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
     try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.terminal_failed)]));
+
+    transition.outcome = .skipped;
+    try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
+    const terminal_outcome = try storeGetAlloc(&runtime, transition.marker_key);
+    defer runtime.alloc.free(terminal_outcome);
+    try std.testing.expectEqualStrings("terminal_failed", terminal_outcome);
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.skipped)]));
+
+    transition.outcome = .produced;
+    try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
+    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.terminal_failed)]));
 }
 
 test "enrichment applied checkpoint stays degraded until runtime status clears" {
@@ -9663,6 +11032,20 @@ fn storeGetAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
     return try runtime.alloc.dupe(u8, raw);
 }
 
+fn storeGetAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        return storeGetAlloc(runtime, key) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
 fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
@@ -9711,6 +11094,7 @@ fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: [
 fn remoteRenderConfig(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    max_media_parts: ?usize,
 ) template_remote.RenderConfig {
     var config: template_remote.RenderConfig = .{};
     if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
@@ -9718,6 +11102,9 @@ fn remoteRenderConfig(
     }
     if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
         config.remote_content = remote_content;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
+        config.max_media_parts = max_media_parts;
     }
     return config;
 }
@@ -9764,14 +11151,14 @@ fn renderSourceTemplateText(
             alloc,
             source_template,
             raw_doc,
-            remoteRenderConfig(config.secret_store, config.remote_content),
+            remoteRenderConfig(config.secret_store, config.remote_content, null),
         );
     }
     return try template_remote.renderJsonToTextWithConfig(
         alloc,
         source_template,
         raw_doc,
-        remoteRenderConfig(config.secret_store, config.remote_content),
+        remoteRenderConfig(config.secret_store, config.remote_content, null),
     );
 }
 
@@ -9818,10 +11205,11 @@ fn renderSourceParts(
     config: Config,
     raw_doc: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
+    max_media_parts: ?usize,
 ) !?[]template.ContentPart {
     if (request.source_template.len == 0) return null;
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
-        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content)) catch |err| switch (err) {
+        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, max_media_parts)) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         }
@@ -9843,7 +11231,7 @@ fn renderSourcePartsJson(
     raw_doc: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]u8 {
-    const parts = try renderSourceParts(alloc, config, raw_doc, request) orelse return null;
+    const parts = try renderSourceParts(alloc, config, raw_doc, request, null) orelse return null;
     defer template.freeContentParts(alloc, parts);
     return try contentPartsJsonAlloc(alloc, parts);
 }
@@ -9912,7 +11300,7 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
 // Tests
 // ============================================================================
 
-test "document extraction generated OCR batches honor execution item cap" {
+test "synchronous document extraction OCR batches honor request execution item cap" {
     const alloc = std.testing.allocator;
 
     const FakeProducer = struct {
@@ -9965,6 +11353,8 @@ test "document extraction generated OCR batches honor execution item cap" {
 
     var fake = FakeProducer{};
     const producer = fake.producer();
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
         .io_impl = null,
@@ -9977,7 +11367,10 @@ test "document extraction generated OCR batches honor execution item cap" {
         .write_fn = undefined,
         .notify_ctx = undefined,
         .notify_fn = undefined,
-        .config = .{ .asset_producer = producer },
+        .config = .{
+            .asset_producer = producer,
+            .resource_manager = &resource_manager,
+        },
         .ownership = undefined,
     };
 
@@ -9988,17 +11381,27 @@ test "document extraction generated OCR batches honor execution item cap" {
     };
     defer for (&units) |*unit| unit.deinit(alloc);
 
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(
+    var extraction = document_extraction_mod.Result{
+        .content_type = @constCast("image/png"),
+        .route_type = @constCast("image"),
+        .units = units[0..],
+    };
+    try completeDocumentExtractionGeneratedTextForRequest(
         &runtime,
-        producer,
+        alloc,
+        .{
+            .kind = .asset,
+            .index_name = "document_units_v1",
+            .artifact_name = "document_units_v1",
+            .doc_key = "doc:sync-batch",
+            .source_field = "source",
+            .execution_json = "{\"batch_items\":2,\"batch_bytes\":1048576}",
+        },
         .{ .ocr_enabled = true },
-        .{ .max_items = 2, .max_bytes = 1024 * 1024 },
-        "data:application/pdf;base64,AA==",
-        &.{},
-        "ocr",
-        "application/pdf",
-        units[0..],
-        .ocr,
+        "data:image/png;base64,AA==",
+        "",
+        "image/png",
+        &extraction,
     );
 
     try std.testing.expectEqual(@as(usize, 2), fake.batch_count);
@@ -10007,6 +11410,89 @@ test "document extraction generated OCR batches honor execution item cap" {
     try std.testing.expectEqualStrings("ocr text 0", units[0].text);
     try std.testing.expectEqualStrings("ocr text 1", units[1].text);
     try std.testing.expectEqualStrings("ocr text 0", units[2].text);
+}
+
+test "document extraction rejects and records Florence prompt echoes" {
+    const alloc = std.testing.allocator;
+
+    const EchoProducer = struct {
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .produce = produce,
+                    .produce_batch = produceBatch,
+                },
+            };
+        }
+
+        fn produce(_: *anyopaque, a: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return try a.dupe(u8, document_extraction_mod.florence_ocr_canonical_prompt);
+        }
+
+        fn produceBatch(_: *anyopaque, a: Allocator, requests: []const asset_producer_mod.Request) ![][]u8 {
+            const out = try a.alloc([]u8, requests.len);
+            errdefer a.free(out);
+            var initialized: usize = 0;
+            errdefer for (out[0..initialized]) |item| a.free(item);
+            for (out) |*item| {
+                item.* = try a.dupe(u8, document_extraction_mod.florence_ocr_canonical_prompt);
+                initialized += 1;
+            }
+            return out;
+        }
+    };
+
+    var fake = EchoProducer{};
+    const producer = fake.producer();
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{
+            .asset_producer = producer,
+            .resource_manager = &resource_manager,
+        },
+        .ownership = undefined,
+    };
+    var units = [_]document_extraction_mod.Unit{.{
+        .unit_id = try alloc.dupe(u8, "image:1"),
+        .unit_type = try alloc.dupe(u8, "image"),
+        .text = try alloc.dupe(u8, "ocr_pending"),
+        .method = try alloc.dupe(u8, "ocr_pending"),
+        .extraction_status = try alloc.dupe(u8, "pending_ocr"),
+    }};
+    defer units[0].deinit(alloc);
+
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(
+        &runtime,
+        alloc,
+        producer,
+        .{ .ocr_enabled = true, .ocr_model = "antflydb/Florence-2-base" },
+        .{ .max_items = 8, .max_bytes = 1024 * 1024 },
+        "data:image/png;base64,AA==",
+        "",
+        "image",
+        "image/png",
+        units[0..],
+        .ocr,
+    );
+
+    try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
+    try std.testing.expectEqualStrings("", units[0].text);
+    try std.testing.expect(!units[0].ocr_used);
+    try std.testing.expectEqual(@as(?bool, false), units[0].ocr_failure_retryable);
+    try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "OcrPromptEcho") != null);
 }
 
 test "document extraction missing OCR model is a terminal unit failure" {
@@ -10028,6 +11514,8 @@ test "document extraction missing OCR model is a terminal unit failure" {
 
     var fake = MissingModelProducer{};
     const producer = fake.producer();
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
         .io_impl = null,
@@ -10040,7 +11528,10 @@ test "document extraction missing OCR model is a terminal unit failure" {
         .write_fn = undefined,
         .notify_ctx = undefined,
         .notify_fn = undefined,
-        .config = .{ .asset_producer = producer },
+        .config = .{
+            .asset_producer = producer,
+            .resource_manager = &resource_manager,
+        },
         .ownership = undefined,
     };
     var units = [_]document_extraction_mod.Unit{.{
@@ -10054,11 +11545,12 @@ test "document extraction missing OCR model is a terminal unit failure" {
 
     try completeRuntimeDocumentExtractionGeneratedTextBatch(
         &runtime,
+        alloc,
         producer,
         .{ .ocr_enabled = true },
         .{ .max_items = 8, .max_bytes = 1024 * 1024 },
         "https://example.test/image.png",
-        &.{},
+        "",
         "image",
         "image/png",
         units[0..],
@@ -10067,6 +11559,7 @@ test "document extraction missing OCR model is a terminal unit failure" {
 
     try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
     try std.testing.expect(!units[0].ocr_used);
+    try std.testing.expectEqual(@as(?bool, true), units[0].ocr_failure_retryable);
     try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "ModelNotFound") != null);
 }
 
@@ -10280,7 +11773,7 @@ test "asset batch fallback keeps the logical request retry budget" {
     try std.testing.expectEqual(@as(u64, 2), failure_capture.failure.?.attempts);
 }
 
-test "document extraction generated OCR batch fallback isolates permanent unit failure" {
+test "document extraction generated OCR bypasses unsupported native batch" {
     const alloc = std.testing.allocator;
 
     const FallbackProducer = struct {
@@ -10293,8 +11786,13 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
                 .vtable = &.{
                     .produce = produce,
                     .produce_batch = produceBatch,
+                    .can_produce_batch = canProduceBatch,
                 },
             };
+        }
+
+        fn canProduceBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
+            return false;
         }
 
         fn produce(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request) ![]u8 {
@@ -10310,9 +11808,7 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
         fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.batch_count += 1;
-            // A known terminal request error triggers sequential isolation.
-            // Unknown provider errors intentionally remain retryable so a
-            // transient batch outage cannot fan out into N immediate calls.
+            // Capability admission must prevent this function from running.
             return error.BadUnitInput;
         }
     };
@@ -10331,6 +11827,8 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
 
     var fake = FallbackProducer{};
     const producer = fake.producer();
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
         .io_impl = null,
@@ -10343,7 +11841,10 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
         .write_fn = undefined,
         .notify_ctx = undefined,
         .notify_fn = undefined,
-        .config = .{ .asset_producer = producer },
+        .config = .{
+            .asset_producer = producer,
+            .resource_manager = &resource_manager,
+        },
         .ownership = undefined,
     };
 
@@ -10356,18 +11857,19 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
 
     try completeRuntimeDocumentExtractionGeneratedTextBatch(
         &runtime,
+        alloc,
         producer,
         .{ .ocr_enabled = true },
         .{ .max_items = 8, .max_bytes = 1024 * 1024 },
         "data:application/pdf;base64,AA==",
-        &.{},
+        "",
         "ocr",
         "application/pdf",
         units[0..],
         .ocr,
     );
 
-    try std.testing.expectEqual(@as(usize, 1), fake.batch_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.batch_count);
     try std.testing.expectEqual(@as(usize, 3), fake.single_count);
     try std.testing.expectEqualStrings("ok:unit:1", units[0].text);
     try std.testing.expectEqualStrings("completed", units[0].extraction_status.?);
@@ -10429,6 +11931,8 @@ test "document extraction generated OCR batch fallback isolates malformed batch 
 
     var fake = FallbackProducer{};
     const producer = fake.producer();
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
         .io_impl = null,
@@ -10441,7 +11945,10 @@ test "document extraction generated OCR batch fallback isolates malformed batch 
         .write_fn = undefined,
         .notify_ctx = undefined,
         .notify_fn = undefined,
-        .config = .{ .asset_producer = producer },
+        .config = .{
+            .asset_producer = producer,
+            .resource_manager = &resource_manager,
+        },
         .ownership = undefined,
     };
 
@@ -10453,11 +11960,12 @@ test "document extraction generated OCR batch fallback isolates malformed batch 
 
     try completeRuntimeDocumentExtractionGeneratedTextBatch(
         &runtime,
+        alloc,
         producer,
         .{ .ocr_enabled = true },
         .{ .max_items = 8, .max_bytes = 1024 * 1024 },
         "data:application/pdf;base64,AA==",
-        &.{},
+        "",
         "ocr",
         "application/pdf",
         units[0..],
@@ -10524,6 +12032,27 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
         .content_type = @constCast("text/plain"),
         .route_type = @constCast("text"),
         .units = @constCast(units[0..]),
+        .ocr_attempted_count = 1,
+        .ocr_failed_count = 2,
+        .ocr_failed_page_numbers = &.{ 5, 6 },
+        .ocr_failure_details = &.{
+            .{
+                .page_number = 5,
+                .unit_id = "unit:b",
+                .retained_method = "pdf_text",
+                .error_message = "pdf_ocr failed: UnsupportedStreamFilter",
+                .failure_stage = "render",
+                .retryable = false,
+            },
+            .{
+                .page_number = 6,
+                .unit_id = "unit:c",
+                .retained_method = "pdf_text",
+                .error_message = "pdf_ocr failed: ReadTransientFailure",
+                .failure_stage = "inference",
+                .retryable = true,
+            },
+        },
     };
     const desired_descriptors = [_]DocumentExtractionUnitDescriptor{
         .{ .key = unit_keys[0], .fingerprint = "same-fingerprint" },
@@ -10606,6 +12135,11 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"delete\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"ocr_failure_details\":[{\"page_number\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"error_message\":\"pdf_ocr failed: UnsupportedStreamFilter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"failure_stage\":\"render\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"retryable\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"failure_stage\":\"inference\",\"retryable\":true") != null);
 
     const in_progress = try documentExtractionManifestPayloadAlloc(
         alloc,
@@ -10648,9 +12182,9 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
         "source-fingerprint",
         failed_extraction,
         &.{},
-        &.{},
-        &.{},
-        &.{},
+        &previous_unit_keys,
+        &previous_descriptors,
+        &previous_chunk_keys,
         &.{},
         &previous_unit_keys,
         &previous_descriptors,
@@ -10665,8 +12199,8 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
     defer alloc.free(failed);
     try std.testing.expect(std.mem.indexOf(u8, failed, "\"generation\":6") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed, "\"last_error\":{\"code\":\"InvalidPdf\",\"message\":\"document extraction failed\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, failed, "\"unit_count\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, failed, "\"chunk_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "\"unit_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "\"chunk_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed, "\"child_count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed, "\"route_status\":\"remote_committed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed, "\"status\":\"failed\"") != null);
