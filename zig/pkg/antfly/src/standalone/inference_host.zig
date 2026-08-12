@@ -25,7 +25,6 @@ pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
     node: inference.server.Node,
     warm_models: ResolvedWarmModels,
-    io: ?std.Io = null,
 };
 
 const DenseEmbeddingOwner = struct {
@@ -37,6 +36,39 @@ const DenseEmbeddingOwner = struct {
         for (self.vectors) |vector| alloc.free(vector);
         alloc.free(self.vectors);
         alloc.free(self.descriptors);
+        alloc.destroy(self);
+    }
+};
+
+const SparseEmbeddingOwner = struct {
+    vectors: []inference.server.Node.DirectSparseEmbedding,
+    descriptors: []inference_bridge.SparseVector,
+
+    fn deinit(self: *SparseEmbeddingOwner) void {
+        const alloc = std.heap.c_allocator;
+        for (self.vectors) |*vector| vector.deinit(alloc);
+        alloc.free(self.vectors);
+        alloc.free(self.descriptors);
+        alloc.destroy(self);
+    }
+};
+
+const FloatOwner = struct {
+    values: []f32,
+
+    fn deinit(self: *FloatOwner) void {
+        const alloc = std.heap.c_allocator;
+        alloc.free(self.values);
+        alloc.destroy(self);
+    }
+};
+
+const BytesOwner = struct {
+    bytes: []u8,
+
+    fn deinit(self: *BytesOwner) void {
+        const alloc = std.heap.c_allocator;
+        alloc.free(self.bytes);
         alloc.destroy(self);
     }
 };
@@ -203,7 +235,6 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
     if (context.io) |io_ptr| {
         const io: *const std.Io = @ptrCast(@alignCast(io_ptr));
         state.node.attachIo(io.*);
-        state.io = io.*;
     }
     state.node.warmConfiguredModels(state.alloc) catch |err| {
         std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
@@ -231,10 +262,10 @@ pub fn linkedInferenceEmbedDense(
     defer alloc.free(texts);
     for (input_strings, 0..) |input, i| texts[i] = input.slice();
 
-    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
-    const io = state.io orelse std.Io.Threaded.global_single_threaded.io();
+    const node: *inference.server.Node = @ptrCast(@alignCast(handle));
+    const io = node.session_manager.io orelse std.Io.Threaded.global_single_threaded.io();
     const deadline_ns: ?u64 = if (request.has_deadline != 0) request.deadline_ns else null;
-    const vectors = try state.node.embedDenseTextsDirectWithContext(
+    const vectors = try node.embedDenseTextsDirectWithContext(
         alloc,
         io,
         deadline_ns,
@@ -310,6 +341,121 @@ test "dense inference request validation preserves protocol error identity" {
 pub fn linkedInferenceDenseResultDestroy(result: *inference_bridge.DenseEmbeddingResult) void {
     if (result.owner) |opaque_owner| {
         const owner: *DenseEmbeddingOwner = @ptrCast(@alignCast(opaque_owner));
+        owner.deinit();
+    }
+    result.* = .{};
+}
+
+pub fn linkedInferenceEmbedSparse(
+    request: *const inference_bridge.DenseEmbeddingRequest,
+    out_result: *inference_bridge.SparseEmbeddingResult,
+) !void {
+    try validateDenseEmbeddingRequest(request);
+    const alloc = std.heap.c_allocator;
+    const input_strings = if (request.text_count == 0) &.{} else request.texts.?[0..request.text_count];
+    const texts = try alloc.alloc([]const u8, input_strings.len);
+    defer alloc.free(texts);
+    for (input_strings, 0..) |input, i| texts[i] = input.slice();
+
+    const node: *inference.server.Node = @ptrCast(@alignCast(request.handle.?));
+    const vectors = try node.embedSparseTextsDirect(alloc, request.model.slice(), texts);
+    errdefer {
+        for (vectors) |*vector| vector.deinit(alloc);
+        alloc.free(vectors);
+    }
+    const descriptors = try alloc.alloc(inference_bridge.SparseVector, vectors.len);
+    errdefer alloc.free(descriptors);
+    for (vectors, 0..) |vector, i| {
+        if (vector.indices.len != vector.values.len) return error.InvalidBoundaryQueryResponse;
+        descriptors[i] = .{
+            .indices = if (vector.indices.len == 0) null else vector.indices.ptr,
+            .values = if (vector.values.len == 0) null else vector.values.ptr,
+            .value_count = vector.values.len,
+        };
+    }
+    const owner = try alloc.create(SparseEmbeddingOwner);
+    owner.* = .{ .vectors = vectors, .descriptors = descriptors };
+    out_result.* = .{
+        .owner = owner,
+        .vectors = if (descriptors.len == 0) null else descriptors.ptr,
+        .vector_count = descriptors.len,
+    };
+}
+
+pub fn linkedInferenceSparseResultDestroy(result: *inference_bridge.SparseEmbeddingResult) void {
+    if (result.owner) |raw| {
+        const owner: *SparseEmbeddingOwner = @ptrCast(@alignCast(raw));
+        owner.deinit();
+    }
+    result.* = .{};
+}
+
+pub fn linkedInferenceRerank(
+    request: *const inference_bridge.RerankRequest,
+    out_result: *inference_bridge.FloatResult,
+) !void {
+    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
+    if (request._reserved0 != 0 or request.handle == null or
+        request.document_count > 1_000_000 or
+        (request.document_count == 0 and request.documents != null) or
+        (request.document_count != 0 and request.documents == null))
+    {
+        return error.InvalidArgument;
+    }
+    const alloc = std.heap.c_allocator;
+    const input = if (request.document_count == 0) &.{} else request.documents.?[0..request.document_count];
+    const documents = try alloc.alloc([]const u8, input.len);
+    defer alloc.free(documents);
+    for (input, 0..) |document, i| documents[i] = document.slice();
+    const node: *inference.server.Node = @ptrCast(@alignCast(request.handle.?));
+    const values = try node.rerankTextsDirect(
+        alloc,
+        request.model.slice(),
+        request.query.slice(),
+        documents,
+    );
+    errdefer alloc.free(values);
+    const owner = try alloc.create(FloatOwner);
+    owner.* = .{ .values = values };
+    out_result.* = .{
+        .owner = owner,
+        .values = if (values.len == 0) null else values.ptr,
+        .value_count = values.len,
+    };
+}
+
+pub fn linkedInferenceFloatResultDestroy(result: *inference_bridge.FloatResult) void {
+    if (result.owner) |raw| {
+        const owner: *FloatOwner = @ptrCast(@alignCast(raw));
+        owner.deinit();
+    }
+    result.* = .{};
+}
+
+pub fn linkedInferenceListModels(
+    request: *const inference_bridge.HandleRequest,
+    out_result: *inference_bridge.BytesResult,
+) !void {
+    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
+    if (request._reserved0 != 0 or request.handle == null) return error.InvalidArgument;
+    const alloc = std.heap.c_allocator;
+    const node: *inference.server.Node = @ptrCast(@alignCast(request.handle.?));
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const bytes = try node.listModelsJsonAlloc(alloc, io_impl.io());
+    errdefer alloc.free(bytes);
+    const owner = try alloc.create(BytesOwner);
+    owner.* = .{ .bytes = bytes };
+    out_result.* = .{
+        .owner = owner,
+        .bytes = if (bytes.len == 0) null else bytes.ptr,
+        .byte_count = bytes.len,
+    };
+}
+
+pub fn linkedInferenceBytesResultDestroy(result: *inference_bridge.BytesResult) void {
+    if (result.owner) |raw| {
+        const owner: *BytesOwner = @ptrCast(@alignCast(raw));
         owner.deinit();
     }
     result.* = .{};

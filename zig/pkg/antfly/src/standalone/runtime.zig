@@ -1786,7 +1786,7 @@ pub fn runFromIterator(
             .handle = antfly_node,
             .out_provider = &provider,
         });
-        inference_client.installDenseAdapter(&provider, antfly_node);
+        inference_client.installProviderAdapters(&provider);
         data_server.setAntflyProvider(provider);
     }
 

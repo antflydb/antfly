@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const bridge = @import("inference_bridge.zig");
 const failure_identity = @import("runtime_failure_identity");
 
@@ -35,13 +36,43 @@ const linked_dense_api = DenseApi{
     .destroy = bridge.antfly_standalone_inference_dense_result_destroy,
 };
 
-pub fn installDenseAdapter(
-    provider: *managed_embedder.AntflyProvider,
-    inference_handle: *anyopaque,
-) void {
-    provider.ptr = inference_handle;
+const SparseApi = struct {
+    execute: *const fn (*const bridge.DenseEmbeddingRequest, *bridge.SparseEmbeddingResult, *bridge.FailureIdentity) callconv(.c) bridge.Status,
+    destroy: *const fn (*bridge.SparseEmbeddingResult) callconv(.c) void,
+};
+const linked_sparse_api = SparseApi{
+    .execute = bridge.antfly_standalone_inference_embed_sparse,
+    .destroy = bridge.antfly_standalone_inference_sparse_result_destroy,
+};
+
+const RerankApi = struct {
+    execute: *const fn (*const bridge.RerankRequest, *bridge.FloatResult, *bridge.FailureIdentity) callconv(.c) bridge.Status,
+    destroy: *const fn (*bridge.FloatResult) callconv(.c) void,
+};
+const linked_rerank_api = RerankApi{
+    .execute = bridge.antfly_standalone_inference_rerank,
+    .destroy = bridge.antfly_standalone_inference_float_result_destroy,
+};
+
+const ListModelsApi = struct {
+    execute: *const fn (*const bridge.HandleRequest, *bridge.BytesResult, *bridge.FailureIdentity) callconv(.c) bridge.Status,
+    destroy: *const fn (*bridge.BytesResult) callconv(.c) void,
+};
+const linked_list_models_api = ListModelsApi{
+    .execute = bridge.antfly_standalone_inference_list_models,
+    .destroy = bridge.antfly_standalone_inference_bytes_result_destroy,
+};
+
+pub fn installProviderAdapters(provider: *managed_embedder.AntflyProvider) void {
+    // Preserve the provider's existing opaque Node handle while this migration
+    // is mixed: both the ABI shims and the remaining legacy callbacks consume
+    // that same handle. Once every callback is migrated, the provider table
+    // export and this transitional constraint disappear together.
     provider.embed_dense_texts = embedDenseTexts;
     provider.embed_dense_texts_with_context = embedDenseTextsWithContext;
+    provider.embed_sparse_texts = embedSparseTexts;
+    provider.rerank_texts = rerankTexts;
+    provider.list_models_json = listModelsJson;
 }
 
 fn embedDenseTexts(
@@ -107,6 +138,7 @@ fn embedDenseTextsInnerWithApi(
     }, &result, &failure);
     try acceptFailure(status, &failure, .embed_dense_texts);
     try validateDenseResult(result);
+    if (result.vector_count != texts.len) return error.InvalidBoundaryQueryResponse;
 
     const descriptors = if (result.vector_count == 0)
         &.{}
@@ -123,6 +155,87 @@ fn embedDenseTextsInnerWithApi(
         initialized += 1;
     }
     return vectors;
+}
+
+fn embedSparseTexts(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    texts: []const []const u8,
+) anyerror![]db_embedder.SparseEmbedding {
+    const input = try alloc.alloc(bridge.String, texts.len);
+    defer alloc.free(input);
+    for (texts, 0..) |text_value, i| input[i] = .init(text_value);
+    var result: bridge.SparseEmbeddingResult = .{};
+    defer linked_sparse_api.destroy(&result);
+    var failure: bridge.FailureIdentity = .{};
+    const status = linked_sparse_api.execute(&.{
+        .handle = handle,
+        .model = .init(model),
+        .texts = if (input.len == 0) null else input.ptr,
+        .text_count = input.len,
+    }, &result, &failure);
+    try acceptFailure(status, &failure, .embed_sparse_texts);
+    try validateSparseResult(result);
+    if (result.vector_count != texts.len) return error.InvalidBoundaryQueryResponse;
+
+    const descriptors = if (result.vector_count == 0) &.{} else result.vectors.?[0..result.vector_count];
+    const vectors = try alloc.alloc(db_embedder.SparseEmbedding, descriptors.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (vectors[0..initialized]) |*vector| vector.deinit(alloc);
+        alloc.free(vectors);
+    }
+    for (descriptors, 0..) |descriptor, i| {
+        const indices = if (descriptor.value_count == 0) &.{} else descriptor.indices.?[0..descriptor.value_count];
+        const values = if (descriptor.value_count == 0) &.{} else descriptor.values.?[0..descriptor.value_count];
+        vectors[i] = .{
+            .indices = try alloc.dupe(u32, indices),
+            .values = undefined,
+        };
+        vectors[i].values = alloc.dupe(f32, values) catch |err| {
+            alloc.free(vectors[i].indices);
+            return err;
+        };
+        initialized += 1;
+    }
+    return vectors;
+}
+
+fn rerankTexts(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    query: []const u8,
+    documents: []const []const u8,
+) anyerror![]f32 {
+    const input = try alloc.alloc(bridge.String, documents.len);
+    defer alloc.free(input);
+    for (documents, 0..) |document, i| input[i] = .init(document);
+    var result: bridge.FloatResult = .{};
+    defer linked_rerank_api.destroy(&result);
+    var failure: bridge.FailureIdentity = .{};
+    const status = linked_rerank_api.execute(&.{
+        .handle = handle,
+        .model = .init(model),
+        .query = .init(query),
+        .documents = if (input.len == 0) null else input.ptr,
+        .document_count = input.len,
+    }, &result, &failure);
+    try acceptFailure(status, &failure, .rerank_texts);
+    try validateFloatResult(result);
+    if (result.value_count != documents.len) return error.InvalidBoundaryQueryResponse;
+    return try alloc.dupe(f32, if (result.value_count == 0) &.{} else result.values.?[0..result.value_count]);
+}
+
+fn listModelsJson(handle: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
+    var result: bridge.BytesResult = .{};
+    defer linked_list_models_api.destroy(&result);
+    var failure: bridge.FailureIdentity = .{};
+    const status = linked_list_models_api.execute(&.{ .handle = handle }, &result, &failure);
+    try acceptFailure(status, &failure, .list_models_json);
+    try validateBytesResult(result);
+    return try alloc.dupe(u8, if (result.byte_count == 0) &.{} else result.bytes.?[0..result.byte_count]);
 }
 
 fn cancellationProbe(context: ?*const anyopaque) callconv(.c) u8 {
@@ -176,6 +289,36 @@ fn validateDenseResult(result: bridge.DenseEmbeddingResult) !void {
     }
 }
 
+fn validateSparseResult(result: bridge.SparseEmbeddingResult) !void {
+    if (result.version != bridge.abi_version or result._reserved0 != 0 or result.owner == null or
+        result.vector_count > 1_000_000 or
+        (result.vector_count == 0 and result.vectors != null) or
+        (result.vector_count != 0 and result.vectors == null)) return error.InvalidBoundaryQueryResponse;
+    const vectors = if (result.vector_count == 0) &.{} else result.vectors.?[0..result.vector_count];
+    for (vectors) |vector| {
+        if (vector.value_count > 16 * 1024 * 1024 or
+            (vector.value_count == 0 and (vector.indices != null or vector.values != null)) or
+            (vector.value_count != 0 and (vector.indices == null or vector.values == null)))
+        {
+            return error.InvalidBoundaryQueryResponse;
+        }
+    }
+}
+
+fn validateFloatResult(result: bridge.FloatResult) !void {
+    if (result.version != bridge.abi_version or result._reserved0 != 0 or result.owner == null or
+        result.value_count > 16 * 1024 * 1024 or
+        (result.value_count == 0 and result.values != null) or
+        (result.value_count != 0 and result.values == null)) return error.InvalidBoundaryQueryResponse;
+}
+
+fn validateBytesResult(result: bridge.BytesResult) !void {
+    if (result.version != bridge.abi_version or result._reserved0 != 0 or result.owner == null or
+        result.byte_count > 256 * 1024 * 1024 or
+        (result.byte_count == 0 and result.bytes != null) or
+        (result.byte_count != 0 and result.bytes == null)) return error.InvalidBoundaryQueryResponse;
+}
+
 fn logMalformedFailure(status: bridge.Status, failure: *const bridge.FailureIdentity) void {
     std.log.err(
         "inference provider returned inconsistent failure status={s} identity_status={s} boundary={d} version={d} operation={d} error={s} hash={x}",
@@ -206,6 +349,25 @@ test "dense result validation rejects noncanonical ownership and pointers" {
     try std.testing.expectError(
         error.InvalidBoundaryQueryResponse,
         validateDenseResult(.{ .owner = &owner, .vector_count = 1 }),
+    );
+}
+
+test "simple inference result families reject ambiguous shapes" {
+    var owner: u8 = 0;
+    try validateSparseResult(.{ .owner = &owner });
+    try validateFloatResult(.{ .owner = &owner });
+    try validateBytesResult(.{ .owner = &owner });
+    try std.testing.expectError(
+        error.InvalidBoundaryQueryResponse,
+        validateSparseResult(.{ .owner = &owner, .vector_count = 1 }),
+    );
+    try std.testing.expectError(
+        error.InvalidBoundaryQueryResponse,
+        validateFloatResult(.{ .owner = &owner, .value_count = 1 }),
+    );
+    try std.testing.expectError(
+        error.InvalidBoundaryQueryResponse,
+        validateBytesResult(.{ .owner = &owner, .byte_count = 1 }),
     );
 }
 
@@ -301,4 +463,23 @@ test "dense adapter preserves registered failure identity and rejects wrong orig
         error.InvalidBoundaryFailureIdentity,
         acceptFailure(.model_not_found, &declared, .embed_dense_texts),
     );
+}
+
+test "simple inference operations retain their distinct failure origins" {
+    inline for (.{
+        bridge.Operation.embed_sparse_texts,
+        bridge.Operation.rerank_texts,
+        bridge.Operation.list_models_json,
+    }) |operation| {
+        const failure = failure_identity.failureFromError(
+            error.ModelNotFound,
+            .inference_runtime,
+            bridge.abi_version,
+            @intFromEnum(operation),
+        );
+        try std.testing.expectError(
+            error.ModelNotFound,
+            acceptFailure(.model_not_found, &failure, operation),
+        );
+    }
 }

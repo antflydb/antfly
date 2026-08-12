@@ -506,6 +506,12 @@ comptime {
             exportInternal(&standaloneInferenceProvider, "antfly_standalone_inference_provider");
             exportInternal(&standaloneInferenceEmbedDense, "antfly_standalone_inference_embed_dense");
             exportInternal(&standaloneInferenceDenseResultDestroy, "antfly_standalone_inference_dense_result_destroy");
+            exportInternal(&standaloneInferenceEmbedSparse, "antfly_standalone_inference_embed_sparse");
+            exportInternal(&standaloneInferenceSparseResultDestroy, "antfly_standalone_inference_sparse_result_destroy");
+            exportInternal(&standaloneInferenceRerank, "antfly_standalone_inference_rerank");
+            exportInternal(&standaloneInferenceFloatResultDestroy, "antfly_standalone_inference_float_result_destroy");
+            exportInternal(&standaloneInferenceListModels, "antfly_standalone_inference_list_models");
+            exportInternal(&standaloneInferenceBytesResultDestroy, "antfly_standalone_inference_bytes_result_destroy");
             exportInternal(&standaloneInferenceRegisterRoutes, "antfly_standalone_inference_register_routes");
             exportInternal(&standaloneInferenceDestroy, "antfly_standalone_inference_destroy");
         },
@@ -550,6 +556,63 @@ fn standaloneInferenceDenseResultDestroy(
     result: *standalone_inference_bridge.DenseEmbeddingResult,
 ) callconv(.c) void {
     standalone_inference_host.linkedInferenceDenseResultDestroy(result);
+}
+
+fn standaloneInferenceEmbedSparse(
+    request: *const standalone_inference_bridge.DenseEmbeddingRequest,
+    out_result: *standalone_inference_bridge.SparseEmbeddingResult,
+    out_failure: *standalone_inference_bridge.FailureIdentity,
+) callconv(.c) standalone_inference_bridge.Status {
+    out_result.* = .{};
+    out_failure.* = .{};
+    standalone_inference_host.linkedInferenceEmbedSparse(request, out_result) catch |err| {
+        return reportStandaloneInferenceFailure(out_failure, .embed_sparse_texts, err);
+    };
+    return .ok;
+}
+
+fn standaloneInferenceSparseResultDestroy(
+    result: *standalone_inference_bridge.SparseEmbeddingResult,
+) callconv(.c) void {
+    standalone_inference_host.linkedInferenceSparseResultDestroy(result);
+}
+
+fn standaloneInferenceRerank(
+    request: *const standalone_inference_bridge.RerankRequest,
+    out_result: *standalone_inference_bridge.FloatResult,
+    out_failure: *standalone_inference_bridge.FailureIdentity,
+) callconv(.c) standalone_inference_bridge.Status {
+    out_result.* = .{};
+    out_failure.* = .{};
+    standalone_inference_host.linkedInferenceRerank(request, out_result) catch |err| {
+        return reportStandaloneInferenceFailure(out_failure, .rerank_texts, err);
+    };
+    return .ok;
+}
+
+fn standaloneInferenceFloatResultDestroy(
+    result: *standalone_inference_bridge.FloatResult,
+) callconv(.c) void {
+    standalone_inference_host.linkedInferenceFloatResultDestroy(result);
+}
+
+fn standaloneInferenceListModels(
+    request: *const standalone_inference_bridge.HandleRequest,
+    out_result: *standalone_inference_bridge.BytesResult,
+    out_failure: *standalone_inference_bridge.FailureIdentity,
+) callconv(.c) standalone_inference_bridge.Status {
+    out_result.* = .{};
+    out_failure.* = .{};
+    standalone_inference_host.linkedInferenceListModels(request, out_result) catch |err| {
+        return reportStandaloneInferenceFailure(out_failure, .list_models_json, err);
+    };
+    return .ok;
+}
+
+fn standaloneInferenceBytesResultDestroy(
+    result: *standalone_inference_bridge.BytesResult,
+) callconv(.c) void {
+    standalone_inference_host.linkedInferenceBytesResultDestroy(result);
 }
 
 fn standaloneInferenceRegisterRoutes(context: *const standalone_inference_bridge.RoutesContext) callconv(.c) standalone_inference_bridge.Status {

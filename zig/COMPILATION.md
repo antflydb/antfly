@@ -4028,7 +4028,7 @@ at the consumer call site.
 
 Behavioral validation passed with zero leaks:
 
-- 47/47 focused standalone tests, including provider-owned result copying and
+- 49/49 focused standalone tests, including provider-owned result copying and
   destruction, request/result validation, exact registered-error round trips,
   and wrong-origin rejection;
 - the complete linked five-unit native Debug build;
@@ -4045,15 +4045,25 @@ execution. If a future measured workload disproves that assumption, the next
 design should use a typed caller-buffer protocol, not a cross-unit Zig
 allocator.
 
+The same template now covers the three simple result families: sparse embedding
+returns provider-owned paired index/value vectors, reranking returns one owned
+f32 vector whose cardinality must equal the document count, and model listing
+returns one bounded owned byte buffer. Each operation has a distinct append-only
+operation identity and therefore cannot be misattributed to dense embedding or
+to another provider stage. Their consumers reject ambiguous pointer/count
+shapes before copying. During the mixed migration, the adapters deliberately
+preserve the raw table's existing opaque Node pointer; changing it to the
+lifecycle-state handle would silently break every not-yet-migrated callback.
+
 Decision: **keep this as the identity and ownership template for the remaining
 coarse inference operations**. It is a prerequisite slice, not yet a compiler
-graph win: sparse embedding, multipart embedding, reranking, generation,
-media, extraction, and model listing still come from the transitional raw Zig
-provider table. Because that table still exists, a cold `ReleaseFast` compiler
-comparison would not measure the intended root removal. Migrate the remaining
-callbacks using the same status/envelope and provider-owned-result rules, then
-delete `ProviderContext`, `linkedInferenceProvider`, and the raw provider export
-before taking the authoritative cold graph, time, RSS, and artifact measurement.
+graph win: multipart embedding, generation, media, and extraction still come
+from the transitional raw Zig provider table. Because that table still exists,
+a cold `ReleaseFast` compiler comparison would not measure the intended root
+removal. Migrate the remaining callbacks using the same status/envelope and
+provider-owned-result rules, then delete `ProviderContext`,
+`linkedInferenceProvider`, and the raw provider export before taking the
+authoritative cold graph, time, RSS, and artifact measurement.
 
 ## Holistic target architecture
 

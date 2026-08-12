@@ -28,6 +28,9 @@ pub const Operation = enum(u32) {
     configure = 2,
     register_routes = 3,
     embed_dense_texts = 4,
+    embed_sparse_texts = 5,
+    rerank_texts = 6,
+    list_models_json = 7,
 };
 
 pub const String = extern struct {
@@ -134,6 +137,52 @@ pub const DenseEmbeddingResult = extern struct {
     vector_count: usize = 0,
 };
 
+pub const SparseVector = extern struct {
+    indices: ?[*]const u32 = null,
+    values: ?[*]const f32 = null,
+    value_count: usize = 0,
+};
+
+pub const SparseEmbeddingResult = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    owner: ?*anyopaque = null,
+    vectors: ?[*]const SparseVector = null,
+    vector_count: usize = 0,
+};
+
+pub const RerankRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    handle: ?*anyopaque = null,
+    model: String,
+    query: String,
+    documents: ?[*]const String = null,
+    document_count: usize = 0,
+};
+
+pub const FloatResult = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    owner: ?*anyopaque = null,
+    values: ?[*]const f32 = null,
+    value_count: usize = 0,
+};
+
+pub const HandleRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    handle: ?*anyopaque = null,
+};
+
+pub const BytesResult = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    owner: ?*anyopaque = null,
+    bytes: ?[*]const u8 = null,
+    byte_count: usize = 0,
+};
+
 pub const RoutesContext = extern struct {
     handle: *anyopaque,
     server: *anyopaque,
@@ -150,6 +199,30 @@ pub extern fn antfly_standalone_inference_embed_dense(
 ) callconv(.c) Status;
 pub extern fn antfly_standalone_inference_dense_result_destroy(
     result: *DenseEmbeddingResult,
+) callconv(.c) void;
+pub extern fn antfly_standalone_inference_embed_sparse(
+    request: *const DenseEmbeddingRequest,
+    out_result: *SparseEmbeddingResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub extern fn antfly_standalone_inference_sparse_result_destroy(
+    result: *SparseEmbeddingResult,
+) callconv(.c) void;
+pub extern fn antfly_standalone_inference_rerank(
+    request: *const RerankRequest,
+    out_result: *FloatResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub extern fn antfly_standalone_inference_float_result_destroy(
+    result: *FloatResult,
+) callconv(.c) void;
+pub extern fn antfly_standalone_inference_list_models(
+    request: *const HandleRequest,
+    out_result: *BytesResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub extern fn antfly_standalone_inference_bytes_result_destroy(
+    result: *BytesResult,
 ) callconv(.c) void;
 pub extern fn antfly_standalone_inference_register_routes(context: *const RoutesContext) callconv(.c) Status;
 pub extern fn antfly_standalone_inference_destroy(handle: *anyopaque) callconv(.c) void;
