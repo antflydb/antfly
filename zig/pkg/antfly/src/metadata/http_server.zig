@@ -19,6 +19,7 @@ const metadata_api = @import("api.zig");
 const metadata_authority = @import("authority.zig");
 const metadata_admin = @import("admin.zig");
 const admin_read_operations = @import("admin_read_operations.zig");
+const admin_mutation_operations = @import("admin_mutation_operations.zig");
 const operation = @import("../api/operation.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
@@ -1123,11 +1124,11 @@ pub const MetadataHttpServer = struct {
         try server.get(node_shutdown_path, httpx.Handler.bind(self, metadataNodeShutdownStatus));
         try server.put(node_shutdown_path, handler);
         try server.delete(node_shutdown_path, handler);
+        try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
+        try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
+        try server.post(routes.Routes.internal_reallocate, httpx.Handler.bind(self, metadataTriggerReallocate));
 
         const static_paths = [_][]const u8{
-            routes.Routes.internal_catalog_publication_check,
-            routes.Routes.internal_catalog_table_publication_check,
-            routes.Routes.internal_reallocate,
             routes.Routes.internal_nodes,
             routes.Routes.internal_schema_progress,
             routes.Routes.internal_extension_restore,
@@ -1219,6 +1220,23 @@ pub const MetadataHttpServer = struct {
         return handler(self, &ctx);
     }
 
+    fn executeTypedHandlerWithBodyForTest(
+        self: *MetadataHttpServer,
+        method: httpx.Method,
+        uri: []const u8,
+        params: []const httpx.RouteParam,
+        body: []const u8,
+        comptime handler: anytype,
+    ) !httpx.Response {
+        var request = try httpx.Request.init(std.testing.allocator, method, uri);
+        defer request.deinit();
+        try request.setBody(body);
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = params;
+        return handler(self, &ctx);
+    }
+
     fn metadataReadError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         if (metadata_authority.isRetryableError(err)) {
             try ctx.setHeader("Retry-After", "1");
@@ -1289,6 +1307,67 @@ pub const MetadataHttpServer = struct {
         return self.trackedJson(ctx, result);
     }
 
+    fn mutationOperations(self: *MetadataHttpServer) admin_mutation_operations.Operations {
+        return .{ .source = .{
+            .ptr = self,
+            .vtable = &.{
+                .validate_publication = validatePublicationOperation,
+                .validate_table_publication = validateTablePublicationOperation,
+                .trigger_reallocate = triggerReallocateOperation,
+            },
+        } };
+    }
+
+    fn validatePublicationOperation(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.validatePublication(contract);
+    }
+
+    fn validateTablePublicationOperation(ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) !bool {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.validateTablePublication(contract);
+    }
+
+    fn triggerReallocateOperation(ptr: *anyopaque) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.triggerReallocate();
+    }
+
+    fn metadataMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.UnsupportedOperation) return ctx.status(405).text("unsupported operation");
+        return metadataReadError(ctx, err);
+    }
+
+    fn metadataCatalogPublicationCheck(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse "";
+        var parsed = std.json.parseFromSlice(metadata_api.CatalogPublicationContract, ctx.allocator, body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return ctx.status(400).text("invalid catalog publication contract");
+        defer parsed.deinit();
+        const valid = self.mutationOperations().validatePublication(requestContext(ctx), parsed.value) catch |err|
+            return metadataMutationError(ctx, err);
+        return ctx.status(if (valid) 204 else 409).text("");
+    }
+
+    fn metadataCatalogTablePublicationCheck(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse "";
+        var parsed = std.json.parseFromSlice(metadata_api.CatalogTablePublicationContract, ctx.allocator, body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return ctx.status(400).text("invalid catalog table publication contract");
+        defer parsed.deinit();
+        const valid = self.mutationOperations().validateTablePublication(requestContext(ctx), parsed.value) catch |err|
+            return metadataMutationError(ctx, err);
+        return ctx.status(if (valid) 204 else 409).text("");
+    }
+
+    fn metadataTriggerReallocate(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        self.mutationOperations().triggerReallocate(requestContext(ctx)) catch |err|
+            return metadataMutationError(ctx, err);
+        return ctx.status(202).text("accepted");
+    }
+
     fn contextualRoute(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const method: http_common.Method = switch (ctx.request.method) {
             .GET => .GET,
@@ -1326,43 +1405,6 @@ pub const MetadataHttpServer = struct {
         switch (req.method) {
             .GET => {},
             .POST => {
-                if (std.mem.eql(u8, req.uri, routes.Routes.internal_catalog_publication_check)) {
-                    var parsed = std.json.parseFromSlice(metadata_api.CatalogPublicationContract, alloc, req.body, .{
-                        .allocate = .alloc_always,
-                        .ignore_unknown_fields = true,
-                    }) catch return try textResponse(alloc, 400, "invalid catalog publication contract");
-                    defer parsed.deinit();
-                    const valid = self.source.validatePublication(parsed.value) catch |err| switch (err) {
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => if (metadata_authority.isRetryableError(err))
-                            return try notLeaderResponse(alloc)
-                        else
-                            return err,
-                    };
-                    return try textResponse(alloc, if (valid) 204 else 409, "");
-                }
-                if (std.mem.eql(u8, req.uri, routes.Routes.internal_catalog_table_publication_check)) {
-                    var parsed = std.json.parseFromSlice(metadata_api.CatalogTablePublicationContract, alloc, req.body, .{
-                        .allocate = .alloc_always,
-                        .ignore_unknown_fields = true,
-                    }) catch return try textResponse(alloc, 400, "invalid catalog table publication contract");
-                    defer parsed.deinit();
-                    const valid = self.source.validateTablePublication(parsed.value) catch |err| switch (err) {
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => if (metadata_authority.isRetryableError(err))
-                            return try notLeaderResponse(alloc)
-                        else
-                            return err,
-                    };
-                    return try textResponse(alloc, if (valid) 204 else 409, "");
-                }
-                if (std.mem.eql(u8, req.uri, routes.Routes.internal_reallocate)) {
-                    self.source.triggerReallocate() catch |err| switch (err) {
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
                 if (std.mem.eql(u8, req.uri, routes.Routes.internal_extension_restore)) {
                     var parsed = std.json.parseFromSlice(RestoreExtensionsRequest, alloc, req.body, .{
                         .allocate = .alloc_always,
@@ -3203,13 +3245,9 @@ test "metadata http server serves status and filtered admin routes" {
         .range = .{ .group_id = 10, .table_id = 1, .start_key = "doc:a", .end_key = "doc:m" },
     }, .{});
     defer std.testing.allocator.free(publication_body);
-    var publication_resp = try server.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.internal_catalog_publication_check,
-        .body = publication_body,
-    });
-    defer publication_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 204), publication_resp.status);
+    var publication_resp = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_catalog_publication_check, &.{}, publication_body, MetadataHttpServer.metadataCatalogPublicationCheck);
+    defer publication_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 204), publication_resp.status.code);
     const table_publication_body = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata_api.CatalogTablePublicationContract{
         .metadata_group_id = 77,
         .metadata_incarnation = FakeSource.incarnation,
@@ -3223,13 +3261,9 @@ test "metadata http server serves status and filtered admin routes" {
         })[0..]),
     }, .{});
     defer std.testing.allocator.free(table_publication_body);
-    var table_publication_resp = try server.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.internal_catalog_table_publication_check,
-        .body = table_publication_body,
-    });
-    defer table_publication_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 204), table_publication_resp.status);
+    var table_publication_resp = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_catalog_table_publication_check, &.{}, table_publication_body, MetadataHttpServer.metadataCatalogTablePublicationCheck);
+    defer table_publication_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 204), table_publication_resp.status.code);
     const foreign_group_publication_body = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata_api.CatalogPublicationContract{
         .metadata_group_id = 78,
         .metadata_incarnation = FakeSource.incarnation,
@@ -3240,13 +3274,9 @@ test "metadata http server serves status and filtered admin routes" {
         .range = .{ .group_id = 10, .table_id = 1, .start_key = "doc:a", .end_key = "doc:m" },
     }, .{});
     defer std.testing.allocator.free(foreign_group_publication_body);
-    var foreign_group_publication_resp = try server.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.internal_catalog_publication_check,
-        .body = foreign_group_publication_body,
-    });
-    defer foreign_group_publication_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 409), foreign_group_publication_resp.status);
+    var foreign_group_publication_resp = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_catalog_publication_check, &.{}, foreign_group_publication_body, MetadataHttpServer.metadataCatalogPublicationCheck);
+    defer foreign_group_publication_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 409), foreign_group_publication_resp.status.code);
     const foreign_incarnation_publication_body = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata_api.CatalogPublicationContract{
         .metadata_group_id = 77,
         .metadata_incarnation = "78787878787878787878787878787878".*,
@@ -3257,13 +3287,9 @@ test "metadata http server serves status and filtered admin routes" {
         .range = .{ .group_id = 10, .table_id = 1, .start_key = "doc:a", .end_key = "doc:m" },
     }, .{});
     defer std.testing.allocator.free(foreign_incarnation_publication_body);
-    var foreign_incarnation_publication_resp = try server.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.internal_catalog_publication_check,
-        .body = foreign_incarnation_publication_body,
-    });
-    defer foreign_incarnation_publication_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 409), foreign_incarnation_publication_resp.status);
+    var foreign_incarnation_publication_resp = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_catalog_publication_check, &.{}, foreign_incarnation_publication_body, MetadataHttpServer.metadataCatalogPublicationCheck);
+    defer foreign_incarnation_publication_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 409), foreign_incarnation_publication_resp.status.code);
     const stale_publication_body = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata_api.CatalogPublicationContract{
         .metadata_group_id = 77,
         .metadata_incarnation = FakeSource.incarnation,
@@ -3274,13 +3300,9 @@ test "metadata http server serves status and filtered admin routes" {
         .range = .{ .group_id = 10, .table_id = 1, .start_key = "doc:b", .end_key = "doc:m" },
     }, .{});
     defer std.testing.allocator.free(stale_publication_body);
-    var stale_publication_resp = try server.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.internal_catalog_publication_check,
-        .body = stale_publication_body,
-    });
-    defer stale_publication_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 409), stale_publication_resp.status);
+    var stale_publication_resp = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_catalog_publication_check, &.{}, stale_publication_body, MetadataHttpServer.metadataCatalogPublicationCheck);
+    defer stale_publication_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 409), stale_publication_resp.status.code);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body.?, "\"replication_source_action_hints\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body.?, "\"source_kind\":\"postgres\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body.?, "\"external_table\":\"users\"") != null);
@@ -4251,9 +4273,9 @@ test "metadata http server accepts internal reallocate and split merge routes" {
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
 
-    var reallocate = try server.handle(.{ .method = .POST, .uri = routes.Routes.internal_reallocate, .body = "" });
-    defer reallocate.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), reallocate.status);
+    var reallocate = try server.executeTypedHandlerForTest(.POST, routes.Routes.internal_reallocate, &.{}, MetadataHttpServer.metadataTriggerReallocate);
+    defer reallocate.deinit();
+    try std.testing.expectEqual(@as(u16, 202), reallocate.status.code);
 
     var zero_node = try server.handle(.{
         .method = .POST,
