@@ -120,6 +120,10 @@ const SlotBinding = struct {
         self.position_offset = position_offset;
         return true;
     }
+
+    fn truncateTo(self: *SlotBinding, retained_token_count: usize) void {
+        self.written_tokens = @min(self.written_tokens, retained_token_count);
+    }
 };
 
 pub const MetalKvStorage = struct {
@@ -673,6 +677,19 @@ pub const MetalKvStorage = struct {
         self.releaseSequenceSlots(sequence_id);
     }
 
+    fn truncateSequenceOp(
+        ctx: *anyopaque,
+        sequence_id: storage_runtime.SequenceId,
+        retained_token_count: usize,
+    ) void {
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        var it = self.slot_map.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.sequence_id != sequence_id) continue;
+            entry.value_ptr.truncateTo(retained_token_count);
+        }
+    }
+
     fn gatherLayerKv(
         ctx: *anyopaque,
         gather: storage_runtime.KvLayerGather,
@@ -942,6 +959,10 @@ test "Metal KV binding only covers successfully encoded tokens" {
     try std.testing.expectEqual(@as(usize, 4), binding.position_offset);
     try std.testing.expect(!binding.commitWrite(39, 4));
     try std.testing.expect(!binding.commitWrite(40, 3));
+    binding.truncateTo(32);
+    try std.testing.expectEqual(@as(usize, 32), binding.written_tokens);
+    try std.testing.expectEqual(@as(usize, 4), binding.position_offset);
+    try std.testing.expect(binding.commitWrite(33, 4));
 }
 
 const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{
@@ -951,6 +972,7 @@ const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{
     .pagedLayerKvDevice = MetalKvStorage.pagedLayerKvDevice,
     .reserveLayerKvDevice = MetalKvStorage.reserveLayerKvDevice,
     .commitLayerKvDeviceWrite = MetalKvStorage.commitLayerKvDeviceWrite,
+    .truncateSequence = MetalKvStorage.truncateSequenceOp,
     .releaseSequence = MetalKvStorage.releaseSequenceOp,
     .deinit = MetalKvStorage.hookDeinit,
 };

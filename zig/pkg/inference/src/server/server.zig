@@ -5598,7 +5598,7 @@ pub const Node = struct {
             }
 
             var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                return generationErrorResponse(ctx, err);
             defer result.deinit();
 
             var response_text = result.text;
@@ -5736,7 +5736,7 @@ pub const Node = struct {
                 }
 
                 var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    return generationErrorResponse(ctx, err);
                 defer result.deinit();
 
                 var response_text = result.text;
@@ -6395,7 +6395,7 @@ pub const Node = struct {
         }
 
         var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+            return generationErrorResponse(ctx, err);
         defer result.deinit();
         if (debug_metal_timing) {
             if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
@@ -6903,18 +6903,7 @@ pub const Node = struct {
 
         fn run(self: *@This()) std.Io.Cancelable!void {
             self.runInner() catch |err| {
-                self.out.@"error" = switch (err) {
-                    error.InvalidStructuredOutput => .{
-                        .code = "STRUCTURED_OUTPUT_INVALID",
-                        .message = @errorName(err),
-                        .retryable = true,
-                    },
-                    else => .{
-                        .code = "GENERATION_FAILED",
-                        .message = @errorName(err),
-                        .retryable = true,
-                    },
-                };
+                self.out.@"error" = batchGenerationError(err);
             };
         }
 
@@ -8176,7 +8165,7 @@ pub const Node = struct {
                 if (cuda_profile_session) |sess| session_factory.drainCudaProfile(sess);
             }
             // Try to send an error event before closing
-            writeInternalStreamError(&writer, "GENERATION_FAILED", err);
+            writeGenerationStreamError(&writer, err);
             writer.close() catch {};
             return ctx.response.build();
         };
@@ -13669,6 +13658,25 @@ test "internal error response hides implementation error names" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "SecretModelFilesystemFailure") == null);
 }
 
+test "post-preprocessing prompt overflow remains a client generation error" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try generationErrorResponse(&ctx, error.PromptTooLong);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"error\":\"INVALID_REQUEST\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "prompt exceeds the model context window") != null);
+
+    const batch_error = batchGenerationError(error.PromptTooLong);
+    try std.testing.expectEqualStrings("INVALID_REQUEST", batch_error.code);
+    try std.testing.expect(!batch_error.retryable);
+}
+
 test "registerRoutesOn supports alternate prefixes through the shared router" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
@@ -16938,6 +16946,25 @@ fn isRemoteContentRequestError(err: anyerror) bool {
 
 const internal_error_message = "internal inference error";
 
+const GenerationRequestFailure = struct {
+    status: u16,
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
+fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
+    return switch (err) {
+        error.PromptTooLong => .{
+            .status = 400,
+            .code = "INVALID_REQUEST",
+            .message = "prompt exceeds the model context window after reserving output tokens",
+            .retryable = false,
+        },
+        else => null,
+    };
+}
+
 fn internalErrorMessage(code: []const u8, err: anyerror) []const u8 {
     if (!builtin.is_test) std.log.err("inference request failed code={s}: {s}", .{ code, @errorName(err) });
     return internal_error_message;
@@ -16950,12 +16977,53 @@ fn internalErrorResponse(ctx: *httpx.Context, code: []const u8, err: anyerror) !
     });
 }
 
+fn generationErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (generationRequestFailure(err)) |failure| {
+        return ctx.status(failure.status).json(.{
+            .@"error" = failure.code,
+            .message = failure.message,
+            .retryable = failure.retryable,
+        });
+    }
+    return internalErrorResponse(ctx, "GENERATION_FAILED", err);
+}
+
+fn batchGenerationError(err: anyerror) api.GenerateBatchError {
+    if (generationRequestFailure(err)) |failure| {
+        return .{
+            .code = failure.code,
+            .message = failure.message,
+            .retryable = failure.retryable,
+        };
+    }
+    if (err == error.InvalidStructuredOutput) {
+        return .{
+            .code = "STRUCTURED_OUTPUT_INVALID",
+            .message = @errorName(err),
+            .retryable = true,
+        };
+    }
+    return .{
+        .code = "GENERATION_FAILED",
+        .message = @errorName(err),
+        .retryable = true,
+    };
+}
+
 fn writeInternalStreamError(
     writer: *httpx.Context.StreamWriter,
     stage: []const u8,
     err: anyerror,
 ) void {
     writer.writeEvent("error", internalErrorMessage(stage, err)) catch {};
+}
+
+fn writeGenerationStreamError(writer: *httpx.Context.StreamWriter, err: anyerror) void {
+    if (generationRequestFailure(err)) |failure| {
+        writer.writeEvent("error", failure.message) catch {};
+        return;
+    }
+    writeInternalStreamError(writer, "GENERATION_FAILED", err);
 }
 
 fn remoteContentErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {

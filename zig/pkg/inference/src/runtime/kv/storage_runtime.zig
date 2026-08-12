@@ -296,6 +296,14 @@ pub const DeviceWriteHook = struct {
             ctx: *anyopaque,
             commit: DeviceKvLayerWriteCommit,
         ) anyerror!void = null,
+        /// Optional notification that a sequence tail was truncated. Device
+        /// coverage metadata must shrink with the logical block table so a
+        /// subsequent correction/retry can rewrite the rolled-back positions.
+        truncateSequence: ?*const fn (
+            ctx: *anyopaque,
+            sequence_id: SequenceId,
+            retained_token_count: usize,
+        ) void = null,
         /// Optional notification that a sequence has been released — the hook
         /// can reclaim any per-sequence resources (device slot reservations,
         /// cache entries, etc.). Called from `releaseSequence` before the
@@ -341,6 +349,11 @@ pub const DeviceWriteHook = struct {
     pub fn commitLayerKvDeviceWrite(self: DeviceWriteHook, commit: DeviceKvLayerWriteCommit) !void {
         const commit_fn = self.vtable.commitLayerKvDeviceWrite orelse return error.DeviceWriteUnsupported;
         return commit_fn(self.ctx, commit);
+    }
+
+    pub fn truncateSequence(self: DeviceWriteHook, sequence_id: SequenceId, retained_token_count: usize) void {
+        const truncate_fn = self.vtable.truncateSequence orelse return;
+        truncate_fn(self.ctx, sequence_id, retained_token_count);
     }
 
     pub fn releaseSequence(self: DeviceWriteHook, sequence_id: SequenceId) void {
@@ -786,10 +799,11 @@ pub const KvStorageRuntime = struct {
         defer if (excess_blocks > 0) self.allocator.free(dropped_block_ids);
 
         _ = sequence_state.block_table.dropTailTokens(page_size, count);
+        const after = sequence_state.block_table.tokenCount(page_size);
+        if (self.device_write_hook) |hook| hook.truncateSequence(sequence_id, after);
         for (dropped_block_ids) |block_id| {
             _ = try self.storage.releaseRef(self.allocator, block_id);
         }
-        const after = sequence_state.block_table.tokenCount(page_size);
         return before - after;
     }
 
@@ -1038,6 +1052,9 @@ const TestDeviceWriteHookContext = struct {
     last_logical_block_count: usize = 0,
     last_page_size_tokens: u16 = 0,
     last_allow_swa_ring: bool = false,
+    truncate_calls: usize = 0,
+    last_truncated_sequence_id: SequenceId = 0,
+    last_retained_token_count: usize = 0,
 };
 
 fn testDeviceWriteLayerKvSuffix(ctx: *anyopaque, write: KvSuffixWrite, _: DeviceKvRef, _: DeviceKvRef) anyerror!void {
@@ -1051,10 +1068,44 @@ fn testDeviceWriteLayerKvSuffix(ctx: *anyopaque, write: KvSuffixWrite, _: Device
 
 fn testDeviceWriteHookDeinit(_: *anyopaque, _: std.mem.Allocator) void {}
 
+fn testDeviceTruncateSequence(ctx: *anyopaque, sequence_id: SequenceId, retained_token_count: usize) void {
+    const typed: *TestDeviceWriteHookContext = @ptrCast(@alignCast(ctx));
+    typed.truncate_calls += 1;
+    typed.last_truncated_sequence_id = sequence_id;
+    typed.last_retained_token_count = retained_token_count;
+}
+
 const test_device_write_hook_vtable = DeviceWriteHook.VTable{
     .writeLayerKvSuffix = testDeviceWriteLayerKvSuffix,
+    .truncateSequence = testDeviceTruncateSequence,
     .deinit = testDeviceWriteHookDeinit,
 };
+
+test "storage runtime notifies device hooks after tail truncation" {
+    const allocator = std.testing.allocator;
+    var runtime = try KvStorageRuntime.init(allocator, .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+    });
+    defer runtime.deinit();
+
+    var hook_context = TestDeviceWriteHookContext{};
+    runtime.setDeviceWriteHook(.{
+        .ctx = &hook_context,
+        .vtable = &test_device_write_hook_vtable,
+    });
+
+    const sequence_id = try runtime.attachSequence(runtime.poolId());
+    try runtime.appendTokens(sequence_id, 7);
+    try std.testing.expectEqual(@as(usize, 3), try runtime.truncateSequence(sequence_id, 3));
+    try std.testing.expectEqual(@as(usize, 1), hook_context.truncate_calls);
+    try std.testing.expectEqual(sequence_id, hook_context.last_truncated_sequence_id);
+    try std.testing.expectEqual(@as(usize, 4), hook_context.last_retained_token_count);
+}
 
 test "storage runtime device writes count reserved blocks as capacity" {
     const allocator = std.testing.allocator;
