@@ -3794,7 +3794,6 @@ pub const ApiHttpServer = struct {
                 .body = body,
             };
         }
-        if (try self.dispatchExtensionAgentRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         const extension_resp = self.dispatchExtensionRoutes(req, uri_parts) catch |err| {
             if (metadata_authority.isRetryableError(err)) {
@@ -4019,39 +4018,44 @@ pub const ApiHttpServer = struct {
         return error.NotFound;
     }
 
-    fn dispatchExtensionAgentRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        const parsed = parseExtensionAgentRunRoute(uri_parts.path) orelse return null;
-        const descriptor = (try self.visibleExtensionAgentDescriptorJsonAlloc(parsed.extension_name, parsed.agent_name, uri_parts.query, authenticated_identity)) orelse
-            return try jsonErrorResponse(self.alloc, 404, "not found");
+    pub fn executeExtensionAgent(
+        self: *ApiHttpServer,
+        method: contextual_operations.Method,
+        path: []const u8,
+        query: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        const parsed = parseExtensionAgentRunRoute(path) orelse return error.NotFound;
+        const descriptor = (try self.visibleExtensionAgentDescriptorJsonAlloc(parsed.extension_name, parsed.agent_name, query, authenticated_identity)) orelse
+            return error.NotFound;
         self.alloc.free(descriptor);
 
         if (std.mem.eql(u8, parsed.tail, "runs")) {
-            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            if (method != .post) return error.MethodNotAllowed;
             const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, null);
-            return try self.bodyResponseOwned(501, "application/json", body, false);
+            return .{ .status = 501, .content_type = "application/json", .body = body };
         }
-        if (!std.mem.startsWith(u8, parsed.tail, "runs/")) return try jsonErrorResponse(self.alloc, 404, "not found");
+        if (!std.mem.startsWith(u8, parsed.tail, "runs/")) return error.NotFound;
         const run_tail = parsed.tail["runs/".len..];
-        if (run_tail.len == 0) return try jsonErrorResponse(self.alloc, 404, "not found");
+        if (run_tail.len == 0) return error.NotFound;
         if (std.mem.endsWith(u8, run_tail, "/events")) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            if (method != .get) return error.MethodNotAllowed;
             const run_id = run_tail[0 .. run_tail.len - "/events".len];
-            if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return try jsonErrorResponse(self.alloc, 404, "not found");
+            if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return error.NotFound;
             const body = try extensionAgentUnsupportedRuntimeEventAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_id);
-            defer self.alloc.free(body);
-            return try eventStreamResponse(self.alloc, 501, body);
+            return .{ .status = 501, .content_type = "text/event-stream", .body = body };
         }
         if (std.mem.endsWith(u8, run_tail, "/cancel")) {
-            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            if (method != .post) return error.MethodNotAllowed;
             const run_id = run_tail[0 .. run_tail.len - "/cancel".len];
-            if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return try jsonErrorResponse(self.alloc, 404, "not found");
+            if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return error.NotFound;
             const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_id);
-            return try self.bodyResponseOwned(501, "application/json", body, false);
+            return .{ .status = 501, .content_type = "application/json", .body = body };
         }
-        if (std.mem.indexOfScalar(u8, run_tail, '/') != null) return try jsonErrorResponse(self.alloc, 404, "not found");
-        if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        if (std.mem.indexOfScalar(u8, run_tail, '/') != null) return error.NotFound;
+        if (method != .get) return error.MethodNotAllowed;
         const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_tail);
-        return try self.bodyResponseOwned(501, "application/json", body, false);
+        return .{ .status = 501, .content_type = "application/json", .body = body };
     }
 
     fn visibleExtensionAgentDescriptorJsonAlloc(
@@ -4139,29 +4143,6 @@ pub const ApiHttpServer = struct {
         if (std.mem.eql(u8, name, "extensions.yaml")) return .{ .body = build_options.ard_openapi_extensions_yaml, .admin_only = true };
         if (std.mem.eql(u8, name, "auth.yaml")) return .{ .body = build_options.ard_openapi_auth_yaml, .admin_only = true };
         return null;
-    }
-
-    fn bodyResponseOwned(self: *ApiHttpServer, status: u16, content_type: []const u8, body: []u8, public_cors: bool) !http_common.HttpResponse {
-        errdefer self.alloc.free(body);
-        var headers: []http_common.Header = &.{};
-        errdefer {
-            for (headers) |*header| header.deinit(self.alloc);
-            if (headers.len > 0) self.alloc.free(headers);
-        }
-        if (public_cors) {
-            headers = try self.alloc.dupe(http_common.Header, &[_]http_common.Header{
-                .{
-                    .name = try self.alloc.dupe(u8, "Access-Control-Allow-Origin"),
-                    .value = try self.alloc.dupe(u8, "*"),
-                },
-            });
-        }
-        return .{
-            .status = status,
-            .content_type = try self.alloc.dupe(u8, content_type),
-            .headers = headers,
-            .body = body,
-        };
     }
 
     fn dispatchExtensionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {

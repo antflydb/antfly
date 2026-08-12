@@ -30,6 +30,7 @@ const probe_operations = @import("probe_operations.zig");
 const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 const internal_group_operations = @import("internal_group_operations.zig");
 const internal_query_operations = @import("internal_query_operations.zig");
+const contextual_operations = @import("contextual_operations.zig");
 const internal_join_operations = @import("internal_join_operations.zig");
 const internal_repair_operations = @import("internal_repair_operations.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
@@ -284,13 +285,16 @@ pub const AntflyApiHandler = struct {
             routes.extensions_v1_packages_prefix ++ "*",
             routes.extensions_v1_installed,
             routes.extensions_v1_installed_prefix ++ "*",
-            routes.agents_v1_extensions_prefix ++ "*",
         };
         inline for (extension_paths) |path| {
             try server.get(path, handler);
             try server.post(path, handler);
             try server.put(path, handler);
         }
+        const extension_agent_handler = httpx.Handler.bind(self, extensionAgentRoute);
+        try server.get(routes.agents_v1_extensions_prefix ++ "*", extension_agent_handler);
+        try server.post(routes.agents_v1_extensions_prefix ++ "*", extension_agent_handler);
+        try server.put(routes.agents_v1_extensions_prefix ++ "*", extension_agent_handler);
 
         const ha_admin_paths = [_][]const u8{ admin_routes.ha, admin_routes.ha ++ "/*" };
         inline for (ha_admin_paths) |path| {
@@ -622,6 +626,34 @@ pub const AntflyApiHandler = struct {
         _ = ctx.status(response.status);
         try ctx.setHeader("content-type", response.content_type);
         if (response.public_cors) try ctx.setHeader("Access-Control-Allow-Origin", "*");
+        _ = ctx.response.body(response.body);
+        return ctx.response.build();
+    }
+
+    fn extensionAgentRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |response| return response;
+        const method: contextual_operations.Method = switch (ctx.request.method) {
+            .GET => .get,
+            .POST => .post,
+            .PUT => .put,
+            .DELETE => .delete,
+            else => return jsonResponse(ctx, 405, "{\"error\":\"method not allowed\"}"),
+        };
+        var response = self.api_server.executeExtensionAgent(
+            method,
+            ctx.request.uri.path,
+            ctx.request.uri.query orelse "",
+            authenticated_identity,
+        ) catch |err| return switch (err) {
+            error.NotFound => jsonResponse(ctx, 404, "{\"error\":\"not found\"}"),
+            error.MethodNotAllowed => jsonResponse(ctx, 405, "{\"error\":\"method not allowed\"}"),
+            else => return err,
+        };
+        defer response.deinit(self.api_server.alloc);
+        _ = ctx.status(response.status);
+        try ctx.setHeader("content-type", response.content_type);
         _ = ctx.response.body(response.body);
         return ctx.response.build();
     }

@@ -7,6 +7,13 @@
 
 const std = @import("std");
 
+pub const Method = enum {
+    get,
+    post,
+    put,
+    delete,
+};
+
 pub const OwnedResponse = struct {
     status: u16 = 200,
     content_type: []const u8,

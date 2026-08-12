@@ -167,6 +167,11 @@ that end state:
   HTTP request; authentication, status/error mapping, content type, and public
   CORS headers remain at ingress. ARD no longer enters
   `ApiHttpServer.handle()` or allocates a legacy `HttpResponse`.
+- Extension-agent run, status, event, and cancellation routes reuse the same
+  owned contextual result contract and have a dedicated registrar. Route
+  parsing and visibility checks receive typed method/path/query values; JSON
+  and event-stream adaptation is performed by `httpx`. Their legacy dispatcher
+  branch and response-conversion helper have been removed.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those
