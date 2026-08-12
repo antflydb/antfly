@@ -13133,7 +13133,8 @@ test "quant kernel compiler Metal build check covers generated and promoted arti
     try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, "quant_kernel_local_check_step.dependOn(quant_kernel_metal_runtime_route_all_step)"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, "quant_kernel_local_check_step.dependOn(quant_kernel_metal_production_regression_step)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "if (targetRunsOnBuildHost(b, target)) {\n        quant_kernel_local_check_step.dependOn(&run_quant_kernel_compiler_tests.step);\n        quant_kernel_metal_local_check_step.dependOn(&run_quant_kernel_compiler_tests.step);\n    }"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "if (targetRunsOnBuildHost(b, target)) {\n        quant_kernel_local_check_step.dependOn(&run_quant_kernel_cuda_microbench_tests.step);\n    }"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "if (enable_cuda and targetRunsOnBuildHost(b, target)) {\n        const run_quant_kernel_cuda_microbench_tests = b.addRunArtifact(tests);"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, "if (targetRunsOnBuildHost(b, target)) {\n        quant_kernel_local_check_step.dependOn(&run_quant_kernel_cuda_microbench_tests.step);\n    }"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "test-metal-gemma4-prefill-frame-e4b-generated-q8"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "\"--e4b-smoke\",\n        \"--generated-q8-smoke\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "test-metal-gemma4-prefill-frame-e4b-generated-q8-q4-0"));

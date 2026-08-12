@@ -69,6 +69,7 @@ comptime {
     _ = @import("db/enrichment/asset_producer.zig");
     _ = @import("db/enrichment/chunker.zig");
     _ = @import("db/enrichment/chunker_stub.zig");
+    _ = @import("db/enrichment/config_validation.zig");
     _ = @import("db/enrichment/document_extraction.zig");
     _ = @import("db/enrichment/embedder.zig");
     _ = @import("db/enrichment/enrichment_runtime.zig");
@@ -114,8 +115,13 @@ comptime {
     _ = @import("ha/http_client.zig");
     _ = @import("ha/http_internal.zig");
     _ = @import("ha/http_replication_client.zig");
+    _ = @import("ha/kubernetes_lease_watchdog.zig");
+    _ = @import("ha/lifecycle_receipt_inventory_test.zig");
+    _ = @import("ha/local_generation_gc.zig");
     _ = @import("ha/metrics.zig");
     _ = @import("ha/mod.zig");
+    _ = @import("ha/mutation_barrier.zig");
+    _ = @import("ha/mutation_inventory.zig");
     _ = @import("ha/operator.zig");
     _ = @import("ha/owner_job_gate.zig");
     _ = @import("ha/primary.zig");
@@ -125,6 +131,11 @@ comptime {
     _ = @import("ha/replication_api.zig");
     _ = @import("ha/replication_log.zig");
     _ = @import("ha/replication_record.zig");
+    _ = @import("ha/seed_activation.zig");
+    _ = @import("ha/seed_artifact.zig");
+    _ = @import("ha/seed_capture.zig");
+    _ = @import("ha/seed_namespace_control.zig");
+    _ = @import("ha/seed_prefix_cleanup_test.zig");
     _ = @import("ha/session.zig");
     _ = @import("ha/slot_store.zig");
     _ = @import("ha/standby.zig");
