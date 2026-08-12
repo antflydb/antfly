@@ -93,6 +93,10 @@ that end state:
 - Internal corrupt-embedding-artifact control now calls the table-write source
   through the typed internal-group operation surface. Its body/path decoding
   and empty JSON response are handled only by the concrete `httpx` adapter.
+- Internal split observation, merge observation, and transition execution are
+  concrete `httpx` routes over typed shard operations. Route-group invariants,
+  local-leader projection, and operational error classification now live below
+  the transport; their former method/path dispatcher branches are gone.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

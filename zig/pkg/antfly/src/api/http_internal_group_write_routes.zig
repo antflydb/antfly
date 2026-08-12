@@ -242,87 +242,6 @@ fn validateDocumentArtifactChildRangeBatchScope(
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
     if (req.method != .POST) return null;
 
-    if (routes.Routes.matchGroupShardObserveSplit(path)) |route| {
-        const ops = ctx.shard_ops orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        var record = parseSplitTransitionRecord(ctx.alloc, req.body) catch {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid split transition request");
-        };
-        defer freeSplitTransitionRecordOwned(ctx.alloc, &record);
-        if (route.group_id != record.source_group_id and route.group_id != record.destination_group_id) {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "group does not match transition");
-        }
-        var observation = ops.observeSplit(record) catch |err| switch (err) {
-            error.UnknownGroup, error.UnknownSplitRuntime, error.MissingSplitRuntime => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
-            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
-            error.LeaderUnavailable,
-            error.GroupLeaderUnavailable,
-            error.SplitSourceProjectionNotReady,
-            error.DurableRootIncarnationUnavailable,
-            error.AutoBulkIngestBusy,
-            error.ApplyStoreGroupRetired,
-            error.ApplyStoreShuttingDown,
-            => return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable"),
-            else => return err,
-        };
-        if (route.group_id == record.source_group_id) observation.source_local_leader = true;
-        if (route.group_id == record.destination_group_id) observation.destination_local_leader = true;
-        return try http_route_helpers.jsonResponse(ctx.alloc, observation);
-    }
-    if (routes.Routes.matchGroupShardObserveMerge(path)) |route| {
-        const ops = ctx.shard_ops orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        var record = parseMergeTransitionRecord(ctx.alloc, req.body) catch {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid merge transition request");
-        };
-        defer freeMergeTransitionRecordOwned(ctx.alloc, &record);
-        if (route.group_id != record.donor_group_id and route.group_id != record.receiver_group_id) {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "group does not match transition");
-        }
-        var observation = ops.observeMerge(record) catch |err| switch (err) {
-            error.UnknownGroup, error.UnknownMergeRuntime, error.MissingMergeRuntime => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
-            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
-            error.LeaderUnavailable, error.GroupLeaderUnavailable => return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable"),
-            else => return err,
-        };
-        if (route.group_id == record.donor_group_id) observation.donor_local_leader = true;
-        if (route.group_id == record.receiver_group_id) observation.receiver_local_leader = true;
-        return try http_route_helpers.jsonResponse(ctx.alloc, observation);
-    }
-    if (routes.Routes.matchGroupShardExecute(path)) |route| {
-        const ops = ctx.shard_ops orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        var action = parseTransitionAction(ctx.alloc, req.body) catch {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transition action request");
-        };
-        defer freeTransitionActionOwned(ctx.alloc, &action);
-        if (!transitionActionMatchesRouteGroup(action, route.group_id)) {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "group does not match transition action");
-        }
-        ops.execute(action) catch |err| switch (err) {
-            error.UnknownGroup, error.UnknownSplitRuntime, error.UnknownMergeRuntime, error.MissingSplitRuntime, error.MissingMergeRuntime => {
-                return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-            },
-            error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
-            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
-            error.LeaderUnavailable,
-            error.GroupLeaderUnavailable,
-            error.MetadataSnapshotUnavailable,
-            error.SplitSourceProjectionNotReady,
-            error.SplitSourceProjectionAdvanced,
-            error.DurableRootIncarnationUnavailable,
-            error.AutoBulkIngestBusy,
-            error.ApplyStoreGroupRetired,
-            error.ApplyStoreShuttingDown,
-            error.BackgroundOwnerClosing,
-            error.BackgroundOwnerClosed,
-            error.TransitionOperationBusy,
-            => {
-                return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable");
-            },
-            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
-            else => return err,
-        };
-        return try http_route_helpers.jsonResponse(ctx.alloc, struct {}{});
-    }
-
     const routed_batch_route = routes.Routes.matchGroupRoutedBatch(path);
     if (routed_batch_route orelse routes.Routes.matchGroupBatch(path)) |batch_route| {
         if (routed_batch_route == null and ctx.routed_raft_batch_writer != null) {
@@ -843,7 +762,7 @@ fn requiredTransitionGroupId(value: ?u64) !u64 {
     return group_id;
 }
 
-fn parseSplitTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_transition_state.SplitTransitionRecord {
+pub fn parseSplitTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_transition_state.SplitTransitionRecord {
     var parsed = try std.json.parseFromSlice(metadata_transition_state.SplitTransitionRecord, alloc, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     if (parsed.value.transition_id == 0 or parsed.value.attempt_epoch == 0 or
@@ -881,7 +800,7 @@ fn parseSplitTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metad
     };
 }
 
-fn parseMergeTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_transition_state.MergeTransitionRecord {
+pub fn parseMergeTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_transition_state.MergeTransitionRecord {
     var parsed = try std.json.parseFromSlice(metadata_transition_state.MergeTransitionRecord, alloc, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     if (parsed.value.transition_id == 0 or parsed.value.donor_group_id == 0 or
@@ -909,7 +828,7 @@ fn parseMergeTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metad
     };
 }
 
-fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_mod.TransitionAction {
+pub fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_mod.TransitionAction {
     var parsed = try std.json.parseFromSlice(EncodedTransitionAction, alloc, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     switch (parsed.value.kind) {
@@ -1061,7 +980,7 @@ fn parsePrepareSplitTransitionAction(
     };
 }
 
-fn freeSplitTransitionRecordOwned(alloc: std.mem.Allocator, record: *metadata_transition_state.SplitTransitionRecord) void {
+pub fn freeSplitTransitionRecordOwned(alloc: std.mem.Allocator, record: *metadata_transition_state.SplitTransitionRecord) void {
     if (record.split_key) |value| alloc.free(value);
     if (record.source_range_end) |value| alloc.free(value);
     if (record.rollback_reason) |value| alloc.free(value);
@@ -1069,7 +988,7 @@ fn freeSplitTransitionRecordOwned(alloc: std.mem.Allocator, record: *metadata_tr
     record.* = undefined;
 }
 
-fn freeMergeTransitionRecordOwned(alloc: std.mem.Allocator, record: *metadata_transition_state.MergeTransitionRecord) void {
+pub fn freeMergeTransitionRecordOwned(alloc: std.mem.Allocator, record: *metadata_transition_state.MergeTransitionRecord) void {
     if (record.rollback_reason) |value| alloc.free(value);
     record.table_contract.deinitOwned(alloc);
     record.* = undefined;
@@ -1740,7 +1659,7 @@ const TestShardOps = struct {
     }
 };
 
-fn freeTransitionActionOwned(alloc: std.mem.Allocator, action: *metadata_mod.TransitionAction) void {
+pub fn freeTransitionActionOwned(alloc: std.mem.Allocator, action: *metadata_mod.TransitionAction) void {
     const table_contract: ?metadata_transition_state.TransitionTableContract = switch (action.*) {
         .none => null,
         inline else => |op| op.table_contract,

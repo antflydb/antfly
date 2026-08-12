@@ -18,6 +18,7 @@ pub const Error = operation.ApiError || error{
     IdentityReadGenerationChanged,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
+    GroupLeaderUnavailable,
 };
 
 pub const LookupInput = struct {
@@ -31,6 +32,7 @@ pub const Operations = struct {
     reads: ?table_reads.TableReadSource,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter,
     writes: ?table_writes.TableWriteSource = null,
+    shard_ops: ?raft_mod.ShardOperationAdapter = null,
 
     pub fn corruptEmbeddingArtifact(
         self: Operations,
@@ -46,6 +48,107 @@ pub const Operations = struct {
             error.NotFound => return error.NotFound,
             else => return error.Internal,
         }) orelse return error.NotFound;
+    }
+
+    pub fn observeSplit(
+        self: Operations,
+        request: operation.RequestContext,
+        group_id: u64,
+        record: @import("../metadata/transition_state.zig").SplitTransitionRecord,
+    ) Error!@import("../metadata/transition_state.zig").SplitObservation {
+        try request.ensureActive();
+        const ops = self.shard_ops orelse return error.NotFound;
+        if (group_id != record.source_group_id and group_id != record.destination_group_id)
+            return error.InvalidArgument;
+        var observation = ops.observeSplit(record) catch |err| switch (err) {
+            error.UnknownGroup, error.UnknownSplitRuntime, error.MissingSplitRuntime => return error.NotFound,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.SplitSourceProjectionNotReady,
+            error.DurableRootIncarnationUnavailable,
+            error.AutoBulkIngestBusy,
+            error.ApplyStoreGroupRetired,
+            error.ApplyStoreShuttingDown,
+            => return error.GroupLeaderUnavailable,
+            else => return error.Internal,
+        };
+        if (group_id == record.source_group_id) observation.source_local_leader = true;
+        if (group_id == record.destination_group_id) observation.destination_local_leader = true;
+        return observation;
+    }
+
+    pub fn observeMerge(
+        self: Operations,
+        request: operation.RequestContext,
+        group_id: u64,
+        record: @import("../metadata/transition_state.zig").MergeTransitionRecord,
+    ) Error!@import("../metadata/transition_state.zig").MergeObservation {
+        try request.ensureActive();
+        const ops = self.shard_ops orelse return error.NotFound;
+        if (group_id != record.donor_group_id and group_id != record.receiver_group_id)
+            return error.InvalidArgument;
+        var observation = ops.observeMerge(record) catch |err| switch (err) {
+            error.UnknownGroup, error.UnknownMergeRuntime, error.MissingMergeRuntime => return error.NotFound,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.LeaderUnavailable, error.GroupLeaderUnavailable => return error.GroupLeaderUnavailable,
+            else => return error.Internal,
+        };
+        if (group_id == record.donor_group_id) observation.donor_local_leader = true;
+        if (group_id == record.receiver_group_id) observation.receiver_local_leader = true;
+        return observation;
+    }
+
+    pub fn executeTransition(
+        self: Operations,
+        request: operation.RequestContext,
+        group_id: u64,
+        action: @import("../metadata/domain.zig").TransitionAction,
+    ) Error!void {
+        try request.ensureActive();
+        const ops = self.shard_ops orelse return error.NotFound;
+        if (!transitionActionMatchesGroup(action, group_id)) return error.InvalidArgument;
+        ops.execute(action) catch |err| switch (err) {
+            error.UnknownGroup,
+            error.UnknownSplitRuntime,
+            error.UnknownMergeRuntime,
+            error.MissingSplitRuntime,
+            error.MissingMergeRuntime,
+            => return error.NotFound,
+            error.TopologyChanged => return error.TopologyChanged,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.MetadataSnapshotUnavailable,
+            error.SplitSourceProjectionNotReady,
+            error.SplitSourceProjectionAdvanced,
+            error.DurableRootIncarnationUnavailable,
+            error.AutoBulkIngestBusy,
+            error.ApplyStoreGroupRetired,
+            error.ApplyStoreShuttingDown,
+            error.BackgroundOwnerClosing,
+            error.BackgroundOwnerClosed,
+            error.TransitionOperationBusy,
+            => return error.GroupLeaderUnavailable,
+            else => return error.Internal,
+        };
+    }
+
+    fn transitionActionMatchesGroup(action: @import("../metadata/domain.zig").TransitionAction, group_id: u64) bool {
+        return switch (action) {
+            .none => group_id == 0,
+            .prepare_split_source => |op| group_id == op.source_group_id,
+            .start_split_source => |op| group_id == op.source_group_id,
+            .bootstrap_split_destination => |op| group_id == op.source_group_id or group_id == op.destination_group_id,
+            .catch_up_split_destination => |op| group_id == op.source_group_id or group_id == op.destination_group_id,
+            .finalize_split_source => |op| group_id == op.source_group_id,
+            .rollback_split => |op| group_id == op.source_group_id,
+            .accept_merge_receiver => |op| group_id == op.receiver_group_id,
+            .catch_up_merge_receiver => |op| group_id == op.receiver_group_id,
+            .finalize_merge => |op| group_id == op.receiver_group_id,
+            .rollback_merge => |op| group_id == op.receiver_group_id,
+        };
     }
 
     pub fn lookup(

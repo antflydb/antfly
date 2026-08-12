@@ -318,10 +318,10 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.join_unmatched_suffix, httpx.Handler.bind(self, internalJoinUnmatched));
         try server.post(table_prefix ++ routes.join_partition_suffix, httpx.Handler.bind(self, internalJoinPartition));
         try server.post(internal_table_prefix ++ routes.corrupt_embedding_artifact_suffix, httpx.Handler.bind(self, internalCorruptEmbeddingArtifact));
+        try server.post(group_prefix ++ routes.shard_ops_observe_split_suffix, httpx.Handler.bind(self, internalObserveSplit));
+        try server.post(group_prefix ++ routes.shard_ops_observe_merge_suffix, httpx.Handler.bind(self, internalObserveMerge));
+        try server.post(group_prefix ++ routes.shard_ops_execute_suffix, httpx.Handler.bind(self, internalExecuteTransition));
         const internal_posts = [_][]const u8{
-            group_prefix ++ routes.shard_ops_observe_split_suffix,
-            group_prefix ++ routes.shard_ops_observe_merge_suffix,
-            group_prefix ++ routes.shard_ops_execute_suffix,
             table_prefix ++ routes.documents_suffix,
             table_prefix ++ routes.graph_expand_suffix,
             table_prefix ++ routes.graph_hydrate_suffix,
@@ -774,6 +774,7 @@ pub const AntflyApiHandler = struct {
             .reads = self.api_server.table_reads,
             .shard_db_adapter = self.api_server.cfg.shard_db_adapter,
             .writes = self.api_server.table_writes,
+            .shard_ops = self.api_server.cfg.shard_ops,
         };
     }
 
@@ -999,6 +1000,71 @@ pub const AntflyApiHandler = struct {
             input.value.doc_key,
             input.value.index_name,
         ) catch |err| return internalGroupErrorResponse(ctx, err);
+        return ctx.json(struct {}{});
+    }
+
+    fn internalGroupId(ctx: *httpx.Context) !?u64 {
+        const raw = ctx.param("group_id") orelse return null;
+        return std.fmt.parseUnsigned(u64, raw, 10) catch null;
+    }
+
+    fn internalTransitionErrorResponse(
+        ctx: *httpx.Context,
+        err: internal_group_operations.Error,
+        mismatch_message: []const u8,
+    ) !httpx.Response {
+        return switch (err) {
+            error.InvalidArgument => textResponse(ctx, 400, mismatch_message),
+            error.NotFound => textResponse(ctx, 404, "not found"),
+            error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
+            error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
+            error.GroupLeaderUnavailable => textResponse(ctx, 503, "group leader unavailable"),
+            error.Unsupported => textResponse(ctx, 405, "method not allowed"),
+            error.Canceled => textResponse(ctx, 408, "request canceled"),
+            error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            else => textResponse(ctx, 500, "internal server error"),
+        };
+    }
+
+    fn internalObserveSplit(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const group_id = (try internalGroupId(ctx)) orelse return textResponse(ctx, 400, "invalid group id");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid split transition request");
+        var record = @import("http_internal_group_write_routes.zig").parseSplitTransitionRecord(ctx.allocator, body) catch
+            return textResponse(ctx, 400, "invalid split transition request");
+        defer @import("http_internal_group_write_routes.zig").freeSplitTransitionRecordOwned(ctx.allocator, &record);
+        const observation = self.internalGroupOperations().observeSplit(
+            operationContext(ctx, null),
+            group_id,
+            record,
+        ) catch |err| return internalTransitionErrorResponse(ctx, err, "group does not match transition");
+        return ctx.json(observation);
+    }
+
+    fn internalObserveMerge(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const group_id = (try internalGroupId(ctx)) orelse return textResponse(ctx, 400, "invalid group id");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid merge transition request");
+        var record = @import("http_internal_group_write_routes.zig").parseMergeTransitionRecord(ctx.allocator, body) catch
+            return textResponse(ctx, 400, "invalid merge transition request");
+        defer @import("http_internal_group_write_routes.zig").freeMergeTransitionRecordOwned(ctx.allocator, &record);
+        const observation = self.internalGroupOperations().observeMerge(
+            operationContext(ctx, null),
+            group_id,
+            record,
+        ) catch |err| return internalTransitionErrorResponse(ctx, err, "group does not match transition");
+        return ctx.json(observation);
+    }
+
+    fn internalExecuteTransition(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const group_id = (try internalGroupId(ctx)) orelse return textResponse(ctx, 400, "invalid group id");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transition action request");
+        var action = @import("http_internal_group_write_routes.zig").parseTransitionAction(ctx.allocator, body) catch
+            return textResponse(ctx, 400, "invalid transition action request");
+        defer @import("http_internal_group_write_routes.zig").freeTransitionActionOwned(ctx.allocator, &action);
+        self.internalGroupOperations().executeTransition(
+            operationContext(ctx, null),
+            group_id,
+            action,
+        ) catch |err| return internalTransitionErrorResponse(ctx, err, "group does not match transition action");
         return ctx.json(struct {}{});
     }
 
@@ -5144,6 +5210,19 @@ test "httpx internal control routes call typed operations directly" {
     defer invalid_corrupt.deinit();
     try std.testing.expectEqual(@as(u16, 400), invalid_corrupt.status.code);
     try std.testing.expectEqualStrings("invalid corrupt embedding artifact request", invalid_corrupt.body.?);
+
+    inline for (.{
+        .{ "shard-ops/observe-split", "invalid split transition request" },
+        .{ "shard-ops/observe-merge", "invalid merge transition request" },
+        .{ "shard-ops/execute", "invalid transition action request" },
+    }) |case| {
+        const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/{s}", .{ base_url, case[0] });
+        defer alloc.free(url);
+        var response = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &headers, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expectEqualStrings(case[1], response.body.?);
+    }
 }
 
 test "httpx storage maintenance routes call typed operations directly" {
