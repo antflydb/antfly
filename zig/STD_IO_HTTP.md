@@ -98,8 +98,8 @@ that end state:
   local-leader projection, and operational error classification now live below
   the transport; their former method/path dispatcher branches are gone.
 - The temporary internal compatibility registrar now enumerates every
-  remaining canonical internal read, write, artifact, transaction, routed
-  batch, and retrieval-agent route. This preserves reachability during
+  remaining canonical internal read, write, artifact, routed-batch, and
+  retrieval-agent route. This preserves reachability during
   extraction without a global fallback or any legacy public alias; router
   registration still rejects duplicate route shapes.
 - The ordinary internal group batch route now decodes directly into an owned
@@ -112,7 +112,8 @@ that end state:
   registered as concrete `httpx` handlers over typed group operations. The
   operation layer owns schema validation, participant writes, status lookup,
   cancellation, and conflict classification; JSON ownership remains at the
-  transport edge.
+  transport edge. Their dead synthetic-dispatch branches and the legacy
+  transaction-validator hook have been deleted.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

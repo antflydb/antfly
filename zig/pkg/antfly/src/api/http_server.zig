@@ -5634,10 +5634,6 @@ pub const ApiHttpServer = struct {
                     .ptr = self,
                     .validate = validateInternalGroupBatchWrites,
                 },
-                .txn_validator = .{
-                    .ptr = self,
-                    .validate = validateInternalGroupTxnWrites,
-                },
             },
             .retrieval_executor = .{
                 .ptr = self,
@@ -6715,11 +6711,6 @@ pub const ApiHttpServer = struct {
     }
 
     fn validateInternalGroupBatchWrites(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
-        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.validateTableWritesAgainstSchema(table_name, writes);
-    }
-
-    fn validateInternalGroupTxnWrites(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         return try self.validateTableWritesAgainstSchema(table_name, writes);
     }

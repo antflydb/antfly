@@ -15,7 +15,6 @@
 const std = @import("std");
 const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
-const distributed_txn = @import("distributed_txn.zig");
 const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -36,15 +35,6 @@ pub const BatchValidator = struct {
     validate: *const fn (ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) anyerror!void,
 
     fn run(self: BatchValidator, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
-        return try self.validate(self.ptr, table_name, writes);
-    }
-};
-
-pub const TxnValidator = struct {
-    ptr: *anyopaque,
-    validate: *const fn (ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) anyerror!void,
-
-    fn run(self: TxnValidator, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
         return try self.validate(self.ptr, table_name, writes);
     }
 };
@@ -83,7 +73,6 @@ pub const Context = struct {
     repair_job_store: ?*repair_jobs.Store = null,
     repair_cancel_executor: ?http_common.RequestExecutor = null,
     batch_validator: BatchValidator,
-    txn_validator: TxnValidator,
 };
 
 fn raftBatchOutcomeResponse(
@@ -588,122 +577,6 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         if (!handled) return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         return try http_route_helpers.jsonResponse(ctx.alloc, .{ .reprocess = "triggered" });
     }
-    if (routes.Routes.matchGroupTxnBegin(path)) |txn_route| {
-        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        var txn_req = distributed_txn.parseTxnBeginRequest(ctx.alloc, req.body) catch {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request");
-        };
-        defer distributed_txn.freeTxnBeginRequest(ctx.alloc, &txn_req);
-        _ = (writes.txnBeginGroupLocal(
-            ctx.alloc,
-            txn_route.group_id,
-            txn_route.table_name,
-            txn_req.txn_id,
-            txn_req.begin_timestamp,
-            txn_req.topology_epoch,
-            txn_req.retain_terminal,
-            txn_req.participants,
-        ) catch |err| switch (err) {
-            error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request"),
-            error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
-            error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
-            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
-            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
-            error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
-            else => return err,
-        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        return try http_route_helpers.jsonResponse(ctx.alloc, struct {}{});
-    }
-    if (routes.Routes.matchGroupTxnPrepare(path)) |txn_route| {
-        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        var txn_req = distributed_txn.parseTxnPrepareRequest(ctx.alloc, req.body) catch {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request");
-        };
-        defer distributed_txn.freeTxnPrepareRequest(ctx.alloc, &txn_req);
-        ctx.txn_validator.run(txn_route.table_name, txn_req.req.writes) catch |err| switch (err) {
-            error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request"),
-            else => return err,
-        };
-        _ = (writes.txnPrepareGroupLocal(
-            ctx.alloc,
-            txn_route.group_id,
-            txn_route.table_name,
-            txn_req.txn_id,
-            txn_req.topology_epoch,
-            txn_req.req,
-        ) catch |err| switch (err) {
-            error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
-            error.VersionConflict, error.IntentConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "transaction conflict"),
-            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
-            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
-            error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
-            else => return err,
-        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        return try http_route_helpers.jsonResponse(ctx.alloc, struct {}{});
-    }
-    if (routes.Routes.matchGroupTxnResolve(path)) |txn_route| {
-        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        const txn_req = distributed_txn.parseTxnResolveRequest(ctx.alloc, req.body) catch {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request");
-        };
-        _ = (writes.txnResolveGroupLocal(
-            ctx.alloc,
-            txn_route.group_id,
-            txn_route.table_name,
-            txn_req.txn_id,
-            txn_req.status,
-            txn_req.commit_version,
-            txn_req.topology_epoch,
-            txn_req.sync_level,
-        ) catch |err| switch (err) {
-            error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
-            error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
-            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
-            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
-            error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
-            else => return err,
-        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        return try http_route_helpers.jsonResponse(ctx.alloc, struct {}{});
-    }
-    if (routes.Routes.matchGroupTxnStatus(path)) |txn_route| {
-        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        const txn_id = distributed_txn.parseTxnStatusRequest(ctx.alloc, req.body) catch {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request");
-        };
-        const status = (writes.txnStatusGroupLocal(
-            ctx.alloc,
-            txn_route.group_id,
-            txn_route.table_name,
-            txn_id,
-        ) catch |err| switch (err) {
-            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
-            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
-            error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
-            else => return err,
-        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        return try http_route_helpers.jsonResponse(ctx.alloc, distributed_txn.TxnStatusResponse{ .status = status });
-    }
-    if (routes.Routes.matchGroupTxnAcknowledge(path)) |txn_route| {
-        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        var txn_req = distributed_txn.parseTxnAcknowledgeRequest(ctx.alloc, req.body) catch {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request");
-        };
-        defer distributed_txn.freeTxnAcknowledgeRequest(ctx.alloc, &txn_req);
-        _ = (writes.txnAcknowledgeGroupLocal(
-            ctx.alloc,
-            txn_route.group_id,
-            txn_route.table_name,
-            txn_req.txn_id,
-            txn_req.participant,
-        ) catch |err| switch (err) {
-            error.InvalidParticipant, error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
-            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
-            error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
-            else => return err,
-        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        return try http_route_helpers.jsonResponse(ctx.alloc, struct {}{});
-    }
-
     return null;
 }
 
@@ -987,7 +860,6 @@ test "legacy internal write dispatcher no longer handles unrouted batch requests
         .shard_ops = null,
         .writes = TestWriteSource.source(),
         .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/batch",
@@ -1049,7 +921,6 @@ test "internal group write route dispatches bounded raft forwarding context" {
         .writes = TestWriteSource.source(),
         .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
         .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
@@ -1071,7 +942,6 @@ test "internal group write route dispatches bounded raft forwarding context" {
         .writes = TestWriteSource.source(),
         .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
         .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
@@ -1089,7 +959,6 @@ test "internal group write route dispatches bounded raft forwarding context" {
         .writes = TestWriteSource.source(),
         .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
         .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
@@ -1113,7 +982,6 @@ test "internal group write route dispatches bounded raft forwarding context" {
         .writes = TestWriteSource.source(),
         .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
         .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
@@ -1130,24 +998,29 @@ test "internal group write route dispatches bounded raft forwarding context" {
     );
 }
 
-test "internal group write routes validate transaction status requests" {
+test "legacy internal group write dispatcher does not handle transactions" {
     const alloc = std.testing.allocator;
 
-    var resp = (try handle(.{
+    try std.testing.expect((try handle(.{
         .alloc = alloc,
         .shard_ops = null,
         .writes = TestWriteSource.source(),
         .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-status",
         .body = "{}",
-    }, "/internal/v1/groups/7/tables/docs/txn-status")).?;
-    defer resp.deinit(alloc);
+    }, "/internal/v1/groups/7/tables/docs/txn-status")) == null);
 
-    try std.testing.expectEqual(@as(u16, 400), resp.status);
-    try std.testing.expectEqualStrings("invalid transaction request", resp.body);
+    const operations = internal_group_operations.Operations{
+        .reads = null,
+        .shard_db_adapter = null,
+        .writes = TestWriteSource.source(),
+    };
+    try std.testing.expectEqual(
+        db_mod.types.TxnStatus.pending,
+        try operations.txnStatus(alloc, .{}, 7, "docs", .{0} ** 16),
+    );
 }
 
 test "internal group write routes update document artifact child range placement" {
@@ -1158,7 +1031,6 @@ test "internal group write routes update document artifact child range placement
         .shard_ops = null,
         .writes = TestWriteSource.source(),
         .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement",
@@ -1189,7 +1061,6 @@ test "internal group write routes apply document artifact child range batch" {
         .shard_ops = null,
         .writes = TestWriteSource.source(),
         .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:child-range-batch",
@@ -1209,7 +1080,6 @@ pub fn expectRejectsCallbackTokenWithoutCancelExecutorForTest() !void {
         .shard_ops = null,
         .writes = TestWriteSource.source(),
         .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/repair/run",
@@ -1430,16 +1300,7 @@ const TestWriteSource = struct {
         };
     }
 
-    fn txnValidator() TxnValidator {
-        return .{
-            .ptr = undefined,
-            .validate = validateTxn,
-        };
-    }
-
     fn validateBatch(_: *anyopaque, _: []const u8, _: []const db_mod.types.BatchWrite) !void {}
-
-    fn validateTxn(_: *anyopaque, _: []const u8, _: []const db_mod.types.TransactionWrite) !void {}
 
     fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
         return null;
