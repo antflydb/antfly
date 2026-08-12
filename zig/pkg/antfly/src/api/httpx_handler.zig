@@ -40,6 +40,7 @@ const ApiHttpServer = http_server_mod.ApiHttpServer;
 const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
 
 const common_secrets = @import("../common/secrets.zig");
+const ha_mutation_inventory = @import("../storage/ha/mutation_inventory.zig");
 const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const backups_api = @import("backups.zig");
@@ -142,6 +143,7 @@ pub const AntflyApiHandler = struct {
 
     fn installMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
         try server.use(httpx.Middleware.bind("antfly-request-stats", self, recordRequest));
+        try server.use(httpx.Middleware.bind("antfly-ha-mutation-policy", self, enforceHaMutationPolicy));
     }
 
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
@@ -150,6 +152,29 @@ pub const AntflyApiHandler = struct {
             if (metadata_authority.isRetryableError(err)) return metadataNotLeaderResponse(ctx);
             return err;
         };
+    }
+
+    /// Continuous-HA mutation safety belongs to ingress policy, not to a
+    /// compatibility dispatcher or individual business handlers. The
+    /// classifier consumes canonical application paths, so generated
+    /// `/db/v1` routes and root contextual routes share one inventory.
+    fn enforceHaMutationPolicy(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
+        if (!self.api_server.cfg.ha_failover_safe_mutations_only) return next.call(ctx);
+        const method = requestMethod(ctx) orelse return next.call(ctx);
+        const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
+        const mutation = ha_mutation_inventory.classify(method, path) orelse return next.call(ctx);
+        if (mutation.disposition != .reject and
+            (mutation.disposition != .remote_apply or self.api_server.cfg.ha_remote_apply_mutations_enabled))
+        {
+            return next.call(ctx);
+        }
+
+        _ = ctx.status(503);
+        return ctx.json(.{
+            .@"error" = "mutation is not continuously replicated while HA is active",
+            .code = "ha_mutation_not_replicated",
+            .surface = @tagName(mutation.surface),
+        });
     }
 
     fn metadataNotLeaderResponse(ctx: *httpx.Context) !httpx.Response {
@@ -947,13 +972,32 @@ pub const AntflyApiHandler = struct {
         };
     }
 
+    const InternalHttpErrorSpec = struct {
+        status: u16,
+        message: []const u8,
+    };
+
+    /// Classify cross-operation transport semantics once, independently of an
+    /// HTTP context. Typed internal operations retain their own error sets;
+    /// this is only the shared wire projection at the `httpx` boundary.
+    fn sharedInternalHttpErrorSpec(err: anyerror) ?InternalHttpErrorSpec {
+        return switch (err) {
+            error.DocIdentityNamespaceMismatch => .{
+                .status = 409,
+                .message = "doc identity namespace mismatch",
+            },
+            else => null,
+        };
+    }
+
     fn internalGroupErrorResponse(ctx: *httpx.Context, err: internal_group_operations.Error) !httpx.Response {
+        if (sharedInternalHttpErrorSpec(err)) |spec|
+            return textResponse(ctx, spec.status, spec.message);
         return switch (err) {
             error.NotFound => textResponse(ctx, 404, "not found"),
             error.Unsupported => textResponse(ctx, 405, "method not allowed"),
             error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
             error.IdentityReadGenerationChanged => textResponse(ctx, 409, "identity read generation changed"),
-            error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
             error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
@@ -1054,12 +1098,13 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalJoinErrorResponse(ctx: *httpx.Context, err: internal_join_operations.Error, invalid_message: []const u8) !httpx.Response {
+        if (sharedInternalHttpErrorSpec(err)) |spec|
+            return textResponse(ctx, spec.status, spec.message);
         return switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => textResponse(ctx, 400, invalid_message),
             error.NotFound => textResponse(ctx, 404, "not found"),
             error.Timeout, error.Canceled => textResponse(ctx, 408, "query timeout"),
             error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
-            error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
             error.Unavailable => textResponse(ctx, 503, "join unavailable"),
             else => textResponse(ctx, 500, "internal server error"),
@@ -5375,6 +5420,13 @@ const SchemaReconcileWriteSource = struct {
     }
 };
 
+test "typed internal HTTP errors preserve doc identity conflict semantics" {
+    const spec = AntflyApiHandler.sharedInternalHttpErrorSpec(error.DocIdentityNamespaceMismatch).?;
+    try std.testing.expectEqual(@as(u16, 409), spec.status);
+    try std.testing.expectEqualStrings("doc identity namespace mismatch", spec.message);
+    try std.testing.expect(AntflyApiHandler.sharedInternalHttpErrorSpec(error.NotFound) == null);
+}
+
 test "httpx multi batch route uses the batch commit hook and public response contract" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
@@ -6573,8 +6625,8 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     var forbidden = try getWithRetry(&client, client_io.io(), secrets_url, &reader_headers, 20);
     defer forbidden.deinit();
     try std.testing.expectEqual(@as(u16, 403), forbidden.status.code);
-    try std.testing.expectEqualStrings("text/plain", forbidden.contentType().?);
-    try std.testing.expectEqualStrings("forbidden", forbidden.body.?);
+    try std.testing.expectEqualStrings("application/json", forbidden.contentType().?);
+    try std.testing.expectEqualStrings("{\"error\":\"forbidden\"}", forbidden.body.?);
 
     const batch_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/batch", .{base_url});
     defer alloc.free(batch_url);
@@ -6594,8 +6646,8 @@ test "httpx antfly routes require auth and enforce admin middleware" {
         );
         defer denied_batch.deinit();
         try std.testing.expectEqual(@as(u16, 403), denied_batch.status.code);
-        try std.testing.expectEqualStrings("text/plain", denied_batch.contentType().?);
-        try std.testing.expectEqualStrings("forbidden", denied_batch.body.?);
+        try std.testing.expectEqualStrings("application/json", denied_batch.contentType().?);
+        try std.testing.expectEqualStrings("{\"error\":\"forbidden\"}", denied_batch.body.?);
     }
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");

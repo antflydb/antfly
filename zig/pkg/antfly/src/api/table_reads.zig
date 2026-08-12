@@ -19080,7 +19080,7 @@ test "remote shard query phases propagate deadline and request cancellation" {
     const alloc = std.testing.allocator;
 
     const ExecutorState = struct {
-        signal: *const std.atomic.Value(bool),
+        signal: *std.atomic.Value(bool),
         calls: usize = 0,
 
         fn iface(self: *@This()) http_common.RequestExecutor {
@@ -19097,8 +19097,10 @@ test "remote shard query phases propagate deadline and request cancellation" {
             try std.testing.expect(req.timeout_ms.? > 0);
             try std.testing.expect(req.timeout_ms.? <= 60_000);
             const cancellation = req.cancellation orelse return error.TestExpectedCancellation;
-            try std.testing.expect(cancellation.signal() == self.signal);
             try std.testing.expect(!cancellation.isCancelled());
+            self.signal.store(true, .release);
+            defer self.signal.store(false, .release);
+            try std.testing.expect(cancellation.isCancelled());
             return error.Timeout;
         }
     };
@@ -19107,7 +19109,7 @@ test "remote shard query phases propagate deadline and request cancellation" {
     var state = ExecutorState{ .signal = &cancelled };
     const controlled_request = db_mod.types.SearchRequest{
         .execution_deadline_ns = platform_time.monotonicNs() + 60 * std.time.ns_per_s,
-        .cancellation = &cancelled,
+        .cancellation = db_mod.types.CancellationToken.fromAtomic(&cancelled),
     };
     try std.testing.expectError(error.Timeout, queryRemote(
         state.iface(),

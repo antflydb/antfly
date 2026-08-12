@@ -124,7 +124,7 @@ func validInferenceCapacityError(body *oapi.TransientCapacity) bool {
 	const maxDurationMillis = int64((1<<63 - 1) / int64(time.Millisecond))
 	return bool(body.Retryable) &&
 		body.Message != "" &&
-		(reason == "inference_capacity" || reason == "request_queue") &&
+		(reason == "inference_capacity" || reason == "inference_admission" || reason == "request_queue") &&
 		retryAfterMs > 0 && retryAfterMs <= maxDurationMillis
 }
 

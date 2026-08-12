@@ -6149,7 +6149,11 @@ test "metadata http cluster simulation seeds default admin for auth-enabled publ
     defer std.heap.page_allocator.free(admin_auth);
 
     for (public_api.api_base_uris) |base_uri| {
-        const status_uri = try raft_transport.Routes.join(std.heap.page_allocator, base_uri, api_http_routes.Routes.status);
+        const status_uri = try std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "{s}/db/v1{s}",
+            .{ base_uri, api_http_routes.Routes.status },
+        );
         defer std.heap.page_allocator.free(status_uri);
 
         var unauthorized = try public_api.client_executor.executor().execute(std.heap.page_allocator, .{

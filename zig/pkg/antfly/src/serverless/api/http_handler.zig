@@ -530,11 +530,21 @@ pub const HttpHandler = struct {
             query_mod.QueryCacheStats{};
         const query_metrics = self.query.metricsSnapshot();
         const query_count_f32: f32 = if (query_metrics.total_queries == 0) 0 else @floatFromInt(query_metrics.total_queries);
+        const query_admission = self.query_admission.stats();
+        const write_admission = self.write_admission.stats();
 
         var result = api_types.MetricsResult{
             .live = true,
             .ready = self.runtime_status.validated,
             .validated = self.runtime_status.validated,
+            .query_capacity = query_admission.capacity,
+            .query_in_flight = query_admission.in_flight,
+            .query_peak_in_flight = query_admission.peak_in_flight,
+            .query_rejected_total = query_admission.rejected_total,
+            .write_capacity = write_admission.capacity,
+            .write_in_flight = write_admission.in_flight,
+            .write_peak_in_flight = write_admission.peak_in_flight,
+            .write_rejected_total = write_admission.rejected_total,
             .namespace_count = namespaces.len,
             .total_pending_records = total_pending_records,
             .total_retained_versions = total_retained_versions,
@@ -6416,6 +6426,8 @@ test "serverless http handler serves internal namespace lifecycle, admission, an
     try std.testing.expectEqual(@as(u64, 0), parsed_metrics.value.cache_pinned_block_count);
     try std.testing.expectEqual(@as(u64, 0), parsed_metrics.value.cache_approx_payload_block_hits);
     try std.testing.expectEqual(@as(u64, 0), parsed_metrics.value.cache_max_payload_bytes);
+    try std.testing.expectEqual(@as(usize, common_config.default_query_max_concurrent_requests), parsed_metrics.value.query_capacity);
+    try std.testing.expectEqual(@as(usize, common_config.default_write_max_concurrent_requests), parsed_metrics.value.write_capacity);
 
     var create = try handler.handle(.{
         .method = .put,
@@ -6452,6 +6464,22 @@ test "serverless http handler serves internal namespace lifecycle, admission, an
     try std.testing.expectEqual(@as(?u32, 1), saturated_write.retry_after_seconds);
     handler.query_admission.release();
     handler.write_admission.release();
+
+    var admission_metrics = try handler.handle(.{
+        .method = .get,
+        .path = "/metrics",
+    });
+    defer admission_metrics.deinit(alloc);
+    var parsed_admission_metrics = try parseJsonTestBody(api_types.MetricsResult, alloc, admission_metrics.body);
+    defer parsed_admission_metrics.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.query_capacity);
+    try std.testing.expectEqual(@as(usize, 0), parsed_admission_metrics.value.query_in_flight);
+    try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.query_peak_in_flight);
+    try std.testing.expectEqual(@as(u64, 1), parsed_admission_metrics.value.query_rejected_total);
+    try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.write_capacity);
+    try std.testing.expectEqual(@as(usize, 0), parsed_admission_metrics.value.write_in_flight);
+    try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.write_peak_in_flight);
+    try std.testing.expectEqual(@as(u64, 1), parsed_admission_metrics.value.write_rejected_total);
 
     var list = try handler.handle(.{
         .method = .get,

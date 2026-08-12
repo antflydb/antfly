@@ -698,11 +698,14 @@ describe("InferenceClient with mock fetch", () => {
       expect(headers.Accept).toBe("application/octet-stream");
     });
 
-    it("should parse capacity metadata from JSON error responses", async () => {
+    it.each([
+      "inference_admission",
+      "request_queue",
+    ])("should parse %s capacity metadata from JSON error responses", async (reason) => {
       const capacity = {
         error: "SERVICE_UNAVAILABLE",
         message: "server at capacity, try again later",
-        reason: "request_queue",
+        reason,
         retryable: true,
         retry_after_ms: 1000,
       };
@@ -719,7 +722,7 @@ describe("InferenceClient with mock fetch", () => {
         .catch((caught: unknown) => caught);
 
       expect(error).toBeInstanceOf(InferenceCapacityError);
-      expect(error).toMatchObject({ reason: "request_queue", retryAfterMs: 1000 });
+      expect(error).toMatchObject({ reason, retryAfterMs: 1000 });
     });
 
     it("should handle empty embeddings in binary response", async () => {

@@ -21,6 +21,7 @@ pub const remote_content_runtime = @import("remote_content_runtime.zig");
 pub const health_server = @import("health_server.zig");
 pub const runtime_lifecycle = @import("runtime_lifecycle.zig");
 pub const prometheus = @import("prometheus.zig");
+pub const request_admission = @import("request_admission.zig");
 pub const group_ids = @import("group_ids.zig");
 pub const data_format = @import("data_format.zig");
 pub const fs_paths = @import("fs_paths.zig");
@@ -38,6 +39,7 @@ test {
     _ = health_server;
     _ = runtime_lifecycle;
     _ = prometheus;
+    _ = request_admission;
     _ = group_ids;
     _ = data_format;
     _ = fs_paths;

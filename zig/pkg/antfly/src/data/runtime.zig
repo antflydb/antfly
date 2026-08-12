@@ -1269,14 +1269,18 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_http_connection_thread_limit", "gauge", "Maximum public HTTP connection handoff threads", http.max_connection_threads);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_connection_threads", "gauge", "Currently active public HTTP connection handoff threads", http.active_connection_threads);
             try health_metrics.appendPromMetric(writer, "antfly_http_peak_connection_threads", "gauge", "Peak public HTTP connection handoff threads since process start", http.peak_connection_threads);
-            try health_metrics.appendPromMetric(writer, "antfly_query_capacity", "gauge", "Maximum concurrent expensive public queries", http.max_active_requests);
-            try health_metrics.appendPromMetric(writer, "antfly_query_in_flight", "gauge", "Currently executing expensive public queries", http.active_requests);
-            try health_metrics.appendPromMetric(writer, "antfly_query_peak_in_flight", "gauge", "Peak concurrent expensive public queries since process start", http.peak_active_requests);
-            try health_metrics.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public queries rejected by admission control", http.rejected_requests_total);
-            try health_metrics.appendPromMetric(writer, "antfly_write_capacity", "gauge", "Maximum concurrent foreground data mutations", http.max_active_writes);
-            try health_metrics.appendPromMetric(writer, "antfly_write_in_flight", "gauge", "Currently executing foreground data mutations", http.active_writes);
-            try health_metrics.appendPromMetric(writer, "antfly_write_peak_in_flight", "gauge", "Peak concurrent foreground data mutations since process start", http.peak_active_writes);
-            try health_metrics.appendPromMetric(writer, "antfly_write_rejected_total", "counter", "Foreground data mutations rejected by admission control", http.rejected_writes_total);
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, .{
+                .capacity = http.max_active_requests,
+                .in_flight = http.active_requests,
+                .peak_in_flight = http.peak_active_requests,
+                .rejected_total = http.rejected_requests_total,
+            });
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, .{
+                .capacity = http.max_active_writes,
+                .in_flight = http.active_writes,
+                .peak_in_flight = http.peak_active_writes,
+                .rejected_total = http.rejected_writes_total,
+            });
             try health_metrics.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests cancelled because peer observation could not be scheduled", http.cancellation_watcher_start_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public requests cancelled after transport cancellation observation failed", http.peer_observer_failures_total);

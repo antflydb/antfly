@@ -267,31 +267,35 @@ func TestClient_Embed_BadRequest(t *testing.T) {
 }
 
 func TestClient_Embed_TransientCapacityError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Retry-After", "1")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error":          "MODEL_RESOURCE_BUSY",
-			"message":        "insufficient inference capacity is currently available",
-			"reason":         "inference_capacity",
-			"retryable":      true,
-			"retry_after_ms": 1000,
+	for _, reason := range []string{"inference_capacity", "inference_admission", "request_queue"} {
+		t.Run(reason, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error":          "MODEL_RESOURCE_BUSY",
+					"message":        "insufficient inference capacity is currently available",
+					"reason":         reason,
+					"retryable":      true,
+					"retry_after_ms": 1000,
+				})
+			}))
+			defer server.Close()
+
+			inferenceClient, err := NewInferenceClient(server.URL, nil)
+			require.NoError(t, err)
+
+			_, err = inferenceClient.Embed(context.Background(), "busy-model", []string{"hello"})
+			require.Error(t, err)
+			var capacityErr *InferenceCapacityError
+			require.True(t, errors.As(err, &capacityErr))
+			assert.Equal(t, "MODEL_RESOURCE_BUSY", capacityErr.Code)
+			assert.Equal(t, reason, capacityErr.Reason)
+			assert.Equal(t, time.Second, capacityErr.RetryAfter)
+			assert.True(t, capacityErr.Temporary())
 		})
-	}))
-	defer server.Close()
-
-	inferenceClient, err := NewInferenceClient(server.URL, nil)
-	require.NoError(t, err)
-
-	_, err = inferenceClient.Embed(context.Background(), "busy-model", []string{"hello"})
-	require.Error(t, err)
-	var capacityErr *InferenceCapacityError
-	require.True(t, errors.As(err, &capacityErr))
-	assert.Equal(t, "MODEL_RESOURCE_BUSY", capacityErr.Code)
-	assert.Equal(t, "inference_capacity", capacityErr.Reason)
-	assert.Equal(t, time.Second, capacityErr.RetryAfter)
-	assert.True(t, capacityErr.Temporary())
+	}
 }
 
 func TestClient_Embed_NonRetryableCapacityBodyIsNotTemporary(t *testing.T) {

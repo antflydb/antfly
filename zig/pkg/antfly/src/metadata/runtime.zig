@@ -214,6 +214,13 @@ pub const HealthSource = struct {
             try append(writer, "antfly_executor_control_rejections_total", "counter", "Control executor lease acquisitions rejected during shutdown", lanes.control_rejections_total);
         }
 
+        if (self.server.server.owned_public_http_server) |public_api| {
+            const query = public_api.queryAdmissionStats();
+            const write = public_api.writeAdmissionStats();
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, query);
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, write);
+        }
+
         try append(writer, "antfly_raft_hosted_groups", "gauge", "Number of raft groups hosted on this node", @intCast(host_metrics.hosted_groups));
         try append(writer, "antfly_raft_reconcile_rounds_total", "counter", "Total number of reconcile rounds", @intCast(host_metrics.reconcile_rounds));
         try append(writer, "antfly_raft_ensure_replica_calls_total", "counter", "Total ensure_replica calls", @intCast(host_metrics.ensure_replica_calls));
@@ -1831,6 +1838,12 @@ test "metadata runtime metrics expose memory ownership buckets" {
     try expectMetricPresent(output, "antfly_metadata_raft_memory_storage_estimated_bytes");
     try expectMetricPresent(output, "antfly_metadata_hosted_write_cache_entries");
     try expectMetricPresent(output, "antfly_metadata_hosted_write_cache_lsm_wal_retained_bytes");
+    try expectMetricPresent(output, "antfly_admission_query_capacity_requests");
+    try expectMetricPresent(output, "antfly_admission_query_in_flight_requests");
+    try expectMetricPresent(output, "antfly_admission_query_rejected_requests_total");
+    try expectMetricPresent(output, "antfly_admission_write_capacity_requests");
+    try expectMetricPresent(output, "antfly_admission_write_in_flight_requests");
+    try expectMetricPresent(output, "antfly_admission_write_rejected_requests_total");
 }
 
 test "metadata runtime memory soak diagnostic" {

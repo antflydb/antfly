@@ -817,6 +817,156 @@ fn validateDocumentArtifactChildRangeBatchScope(
     };
 }
 
+test "typed routed batch preserves forwarding cancellation and identity conflicts" {
+    const State = struct {
+        cancellation_signal: *const std.atomic.Value(bool),
+        calls: usize = 0,
+        fail_identity: bool = false,
+
+        fn validate(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self;
+            try std.testing.expectEqualStrings("documents", table_name);
+            try std.testing.expectEqual(@as(usize, 0), writes.len);
+        }
+
+        fn write(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            _: db_mod.types.BatchRequest,
+            forwarding: internal_batch_forwarding.Context,
+            cancellation: CancellationToken,
+        ) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u64, 17), group_id);
+            try std.testing.expectEqualStrings("documents", table_name);
+            try std.testing.expectEqual(@as(u32, 425), forwarding.remaining_ms);
+            try std.testing.expectEqual(@as(u8, 1), forwarding.forwards_remaining);
+            try std.testing.expect(!forwarding.campaign_allowed);
+            try std.testing.expect(cancellation.ptr == @as(*const anyopaque, @ptrCast(self.cancellation_signal)));
+            try std.testing.expect(!cancellation.isCancelled());
+            if (self.fail_identity) return error.DocIdentityNamespaceMismatch;
+            return {};
+        }
+    };
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    var state = State{ .cancellation_signal = &cancelled };
+    const operations = Operations{
+        .reads = null,
+        .shard_db_adapter = null,
+        .batch_validator = .{ .ptr = &state, .validate_fn = State.validate },
+        .routed_raft_batch_writer = .{ .ptr = &state, .write_fn = State.write },
+    };
+    const forwarding: internal_batch_forwarding.Context = .{
+        .remaining_ms = 425,
+        .forwards_remaining = 1,
+        .campaign_allowed = false,
+    };
+    const request: operation.RequestContext = .{
+        .cancellation = CancellationToken.fromAtomic(&cancelled),
+    };
+
+    const result = try operations.routedBatch(
+        std.testing.allocator,
+        request,
+        17,
+        "documents",
+        .{},
+        forwarding,
+    );
+    try std.testing.expectEqual(@as(u32, 0), result.inserted);
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+
+    state.fail_identity = true;
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, operations.routedBatch(
+        std.testing.allocator,
+        request,
+        17,
+        "documents",
+        .{},
+        forwarding,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+}
+
+test "typed internal query workers preserve identity generation validation" {
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = publicQuery,
+                .query_group_local = groupQuery,
+                .graph_expand_group_local = graphExpand,
+            } };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn publicQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn groupQuery(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            try std.testing.expectEqual(@as(u64, 17), group_id);
+            try std.testing.expectEqualStrings("documents", table_name);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
+            return error.UnsupportedQueryRequest;
+        }
+
+        fn graphExpand(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_graph.GraphExpandRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphExpandResponse {
+            try std.testing.expectEqual(@as(u64, 17), group_id);
+            try std.testing.expectEqualStrings("documents", table_name);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
+            return error.UnsupportedQueryRequest;
+        }
+    };
+
+    const operations = Operations{
+        .reads = FakeReads.source(),
+        .shard_db_adapter = null,
+    };
+
+    try std.testing.expectError(error.InvalidArgument, operations.query(
+        std.testing.allocator,
+        .{},
+        17,
+        "documents",
+        .{ .identity_read_generation = 12345 },
+    ));
+
+    var frontier: [0]distributed_graph.GraphFrontierItem = .{};
+    var exclude_nodes: [0]distributed_graph.GraphNodeIdentity = .{};
+    var exclude_edges: [0][]u8 = .{};
+    try std.testing.expectError(error.InvalidArgument, operations.graphExpand(
+        std.testing.allocator,
+        .{},
+        17,
+        "documents",
+        .{
+            .name = @constCast("graph"),
+            .index_name = @constCast("graph-index"),
+            .frontier = frontier[0..],
+            .exclude_nodes = exclude_nodes[0..],
+            .exclude_edges = exclude_edges[0..],
+            .params = .{},
+            .identity_read_generation = 12345,
+        },
+    ));
+}
+
 test "typed internal group reads preserve retryable resident storage failures" {
     const alloc = std.testing.allocator;
     const FakeReads = struct {

@@ -263,7 +263,14 @@ pub const Observer = struct {
     fn probeLocked(self: *Observer, index: usize) void {
         const entry = &self.entries.items[index];
         var byte: [1]u8 = undefined;
-        const n = std.c.recv(entry.fd, &byte, byte.len, @intCast(std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT));
+        const n = std.posix.system.recvfrom(
+            entry.fd,
+            &byte,
+            byte.len,
+            @intCast(std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT),
+            null,
+            null,
+        );
         if (n == 0) return self.stopWatchingLocked(index);
         if (n > 0) {
             self.stopWatchingLocked(index);

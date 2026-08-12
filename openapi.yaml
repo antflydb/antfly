@@ -20811,7 +20811,7 @@ components:
           description: Machine-readable capacity source when the failure is retryable
           enum:
             - inference_capacity
-            - request_queue
+            - inference_admission
         retryable:
           type: boolean
           x-go-type-skip-optional-pointer: false
@@ -20841,7 +20841,7 @@ components:
           description: Machine-readable capacity source
           enum:
             - inference_capacity
-            - request_queue
+            - inference_admission
         retryable:
           type: boolean
           enum:

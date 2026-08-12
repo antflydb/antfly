@@ -11222,7 +11222,7 @@ export interface components {
              * @description Machine-readable capacity source when the failure is retryable
              * @enum {string}
              */
-            reason?: "inference_capacity" | "request_queue";
+            reason?: "inference_capacity" | "inference_admission";
             /** @description Whether retrying the request may succeed */
             retryable?: boolean;
             /** @description Minimum retry delay in milliseconds */
@@ -11238,7 +11238,7 @@ export interface components {
              * @description Machine-readable capacity source
              * @enum {string}
              */
-            reason: "inference_capacity" | "request_queue";
+            reason: "inference_capacity" | "inference_admission";
             /**
              * @description Always true for a transient-capacity response
              * @enum {boolean}

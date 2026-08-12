@@ -78,7 +78,7 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
     };
 };
 pub const metrics_mod = @import("metrics.zig");
-const request_queue_mod = @import("request_queue.zig");
+const inference_admission_mod = @import("inference_admission.zig");
 
 fn spinLock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
@@ -291,7 +291,7 @@ fn validateQualifiedProfileDraft(
     }
 }
 
-fn generateQueueUnitsForSpeculation(
+fn generateAdmissionUnitsForSpeculation(
     base_units: usize,
     draft_requested: bool,
     policy: generation.SpeculationPolicy,
@@ -830,7 +830,7 @@ pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 const max_generate_batch_items: usize = 128;
 const max_read_batch_images: usize = 64;
-const default_read_queue_max_tokens: usize = 256;
+const default_read_admission_max_tokens: usize = 256;
 const max_read_tokens: usize = 1024;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 const default_max_request_media_bytes: usize = 100 * 1024 * 1024;
@@ -2495,7 +2495,7 @@ pub const Node = struct {
     tabular_registry: tabular_mod.registry.Registry,
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
-    request_queue: request_queue_mod.RequestQueue,
+    inference_admission: inference_admission_mod.InferenceAdmission,
     compatibility_cache: std.StringHashMapUnmanaged(*CachedCompatibility) = .empty,
     compatibility_cache_lock: std.atomic.Mutex = .unlocked,
     /// Runtime JIT qualification is limited to the single-threaded startup phase.
@@ -2527,7 +2527,7 @@ pub const Node = struct {
         has_audio: bool = false,
     };
 
-    /// Owns one direct-generation queue admission from source preflight through
+    /// Owns one direct-generation admission from source preflight through
     /// media conversion and model execution. Call deinit exactly once when
     /// ownership ends; repeated calls are harmless to keep error cleanup safe.
     pub const DirectGenerateAdmission = struct {
@@ -2556,7 +2556,7 @@ pub const Node = struct {
                 const max_dimension = effectiveRequestContentSecurity(node).max_image_dimension;
                 const decoded_pixel_cap = readDecodedPixelCapForLimits(
                     actual.image_count,
-                    node.request_queue.max_concurrent,
+                    node.inference_admission.capacity,
                     max_dimension,
                     self.resident_bytes,
                 );
@@ -2574,9 +2574,9 @@ pub const Node = struct {
                 }
 
                 const required_units = @max(self.reserved_units, decoded_budget.requiredUnits());
-                try node.request_queue.growUnits(self.reserved_units, required_units);
+                try node.inference_admission.growUnits(self.reserved_units, required_units);
                 self.reserved_units = required_units;
-                node.updateQueueMetrics();
+                node.updateAdmissionMetrics();
             }
             self.prepared = true;
         }
@@ -2625,7 +2625,7 @@ pub const Node = struct {
             .tabular_registry = tabular_mod.registry.Registry.init(allocator),
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
-            .request_queue = request_queue_mod.RequestQueue.init(config.max_concurrent_requests),
+            .inference_admission = inference_admission_mod.InferenceAdmission.init(config.max_concurrent_requests),
             .compatibility_cache = .empty,
         };
         node.model_manager.configureServingPolicy(.{
@@ -2645,7 +2645,7 @@ pub const Node = struct {
         node.model_manager.tokenizer_cache_config = config.tokenizer_cache;
         node.model_manager.tokenizer_parallel_bpe_config =
             config.tokenizer_parallel_bpe;
-        node.updateQueueMetrics();
+        node.updateAdmissionMetrics();
         return node;
     }
 
@@ -2870,8 +2870,8 @@ pub const Node = struct {
     ) ![][]f32 {
         if (texts.len == 0) return try allocator.alloc([]f32, 0);
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        try self.request_queue.acquire();
-        self.updateQueueMetrics();
+        try self.inference_admission.acquire();
+        self.updateAdmissionMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
@@ -2934,8 +2934,8 @@ pub const Node = struct {
         texts: []const []const u8,
     ) ![]DirectSparseEmbedding {
         if (texts.len == 0) return try allocator.alloc(DirectSparseEmbedding, 0);
-        try self.request_queue.acquire();
-        self.updateQueueMetrics();
+        try self.inference_admission.acquire();
+        self.updateAdmissionMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("embed_sparse.local");
         defer self.metrics.decActive();
@@ -2976,8 +2976,8 @@ pub const Node = struct {
         documents: []const []const u8,
     ) ![]f32 {
         if (documents.len == 0) return try allocator.alloc(f32, 0);
-        try self.request_queue.acquire();
-        self.updateQueueMetrics();
+        try self.inference_admission.acquire();
+        self.updateAdmissionMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("rerank.local");
         defer self.metrics.decActive();
@@ -3051,15 +3051,15 @@ pub const Node = struct {
             0;
         const peak_bytes = std.math.add(usize, resident_bytes, audio_working_bytes) catch
             std.math.maxInt(usize);
-        if (preflight.has_audio and self.request_queue.max_concurrent != 0) {
+        if (preflight.has_audio and self.inference_admission.capacity != 0) {
             const capacity_bytes = std.math.mul(
                 usize,
-                self.request_queue.max_concurrent,
+                self.inference_admission.capacity,
                 read_admission_bytes_per_unit,
             ) catch std.math.maxInt(usize);
             if (peak_bytes > capacity_bytes) return error.AudioTooLarge;
         }
-        const generation_units = estimateGenerateQueueUnitsFromShape(
+        const generation_units = estimateGenerateAdmissionUnitsFromShape(
             preflight.text_bytes,
             preflight.media_count,
             max_tokens,
@@ -3070,8 +3070,8 @@ pub const Node = struct {
         );
         const reserved_units = @max(generation_units, byte_units);
 
-        try self.request_queue.acquireUnits(reserved_units);
-        self.updateQueueMetrics();
+        try self.inference_admission.acquireUnits(reserved_units);
+        self.updateAdmissionMetrics();
         self.metrics.incRequest("generate.local");
         return .{
             .node = self,
@@ -3647,8 +3647,8 @@ pub const Node = struct {
     ) ![][]f32 {
         try ensureDirectEmbeddingDeadline(deadline_ns);
         const media_admission = requestMediaAdmission(self, denseEmbedRequestMediaShape(input));
-        try self.request_queue.acquireUnits(media_admission.units);
-        self.updateQueueMetrics();
+        try self.inference_admission.acquireUnits(media_admission.units);
+        self.updateAdmissionMetrics();
         var reserved_units = media_admission.units;
         defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("embed.local");
@@ -3712,7 +3712,7 @@ pub const Node = struct {
         else
             null;
         if (audio_admission) |admission| {
-            if (self.request_queue.max_concurrent != 0 and admission.max_decode_working_bytes == 0)
+            if (self.inference_admission.capacity != 0 and admission.max_decode_working_bytes == 0)
                 return error.AudioTooLarge;
         }
         const initial_units = if (audio_admission) |admission|
@@ -3723,8 +3723,8 @@ pub const Node = struct {
         // Only bounded arithmetic and borrowed-slice inspection precede this
         // lease. Fetch, decode, model resolution/loading, and output allocation
         // all happen while the weighted request remains admitted.
-        try self.request_queue.acquireUnits(initial_units);
-        self.updateQueueMetrics();
+        try self.inference_admission.acquireUnits(initial_units);
+        self.updateAdmissionMetrics();
         var reserved_units = initial_units;
         defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("embed.local");
@@ -3775,18 +3775,18 @@ pub const Node = struct {
             var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
             for (parsed.images.items) |image| try decoded_budget.addImage(image.bytes);
             const required_units = @max(reserved_units.*, decoded_budget.requiredUnits());
-            try self.request_queue.growUnits(reserved_units.*, required_units);
+            try self.inference_admission.growUnits(reserved_units.*, required_units);
             reserved_units.* = required_units;
-            self.updateQueueMetrics();
+            self.updateAdmissionMetrics();
         }
 
         if (parsed.audio.items.len > 0) {
             const audio_admission = audioDecodeAdmission(self, media_admission.resident_byte_cap);
             const required_units = @max(reserved_units.*, audio_admission.units);
-            try self.request_queue.growUnits(reserved_units.*, required_units);
+            try self.inference_admission.growUnits(reserved_units.*, required_units);
             reserved_units.* = required_units;
             audio_decode_working_bytes = audio_admission.max_decode_working_bytes;
-            self.updateQueueMetrics();
+            self.updateAdmissionMetrics();
         }
 
         const Attempt = struct {
@@ -3848,8 +3848,8 @@ pub const Node = struct {
             inline_source_bytes = try addReadInlineSourceBytes(inline_source_bytes, url, inline_source_cap);
         }
         const admission = readRequestAdmission(self, request.images.len, inline_source_bytes, max_tokens);
-        try self.request_queue.acquireUnits(admission.units);
-        self.updateQueueMetrics();
+        try self.inference_admission.acquireUnits(admission.units);
+        self.updateAdmissionMetrics();
         var reserved_units = admission.units;
         defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("read.local");
@@ -3888,9 +3888,9 @@ pub const Node = struct {
         }
 
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
-        try self.request_queue.growUnits(reserved_units, required_units);
+        try self.inference_admission.growUnits(reserved_units, required_units);
         reserved_units = required_units;
-        self.updateQueueMetrics();
+        self.updateAdmissionMetrics();
 
         var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager);
         defer reader.deinit();
@@ -3941,8 +3941,8 @@ pub const Node = struct {
         else
             media_shape.has_remote = true;
         const media_admission = requestMediaAdmission(self, media_shape);
-        try self.request_queue.acquireUnits(media_admission.units);
-        self.updateQueueMetrics();
+        try self.inference_admission.acquireUnits(media_admission.units);
+        self.updateAdmissionMetrics();
         var reserved_units = media_admission.units;
         defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("transcribe.local");
@@ -3967,11 +3967,11 @@ pub const Node = struct {
         // *potential* max download, which is typically larger than the actual
         // clip's decode reservation. growUnits() is grow-only, so overwriting
         // reserved_units downward here would under-release on the deferred
-        // releaseSlotUnits() and permanently leak shared-queue capacity.
+        // releaseSlotUnits() and permanently leak shared admission capacity.
         const required_units = @max(reserved_units, audio_admission.units);
-        try self.request_queue.growUnits(reserved_units, required_units);
+        try self.inference_admission.growUnits(reserved_units, required_units);
         reserved_units = required_units;
-        self.updateQueueMetrics();
+        self.updateAdmissionMetrics();
 
         var decoded = audio_mod.decodeBounded(
             allocator,
@@ -4027,8 +4027,8 @@ pub const Node = struct {
         model_name: []const u8,
         request: extracting_api.Request,
     ) !extracting_api.Response {
-        try self.request_queue.acquire();
-        self.updateQueueMetrics();
+        try self.inference_admission.acquire();
+        self.updateAdmissionMetrics();
         var reserved_units: usize = 1;
         defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("extract.local");
@@ -4036,9 +4036,9 @@ pub const Node = struct {
 
         const media_shape = try directExtractionMediaShape(allocator, request.inputs);
         const media_admission = requestMediaAdmission(self, media_shape);
-        try self.request_queue.growUnits(reserved_units, media_admission.units);
+        try self.inference_admission.growUnits(reserved_units, media_admission.units);
         reserved_units = media_admission.units;
-        self.updateQueueMetrics();
+        self.updateAdmissionMetrics();
 
         var schema_parsed = try std.json.parseFromSlice(extraction_api.ExtractionSchema, allocator, request.schema_json, .{
             .allocate = .alloc_always,
@@ -4097,11 +4097,11 @@ pub const Node = struct {
             for (parsed_inputs.images.items) |image_bytes| try decoded_budget.addImage(image_bytes);
             const required_units = @max(
                 @max(reserved_units, decoded_budget.requiredUnits()),
-                estimateReadQueueUnits(parsed_inputs.images.items.len, parsed_inputs.max_tokens),
+                estimateReadAdmissionUnits(parsed_inputs.images.items.len, parsed_inputs.max_tokens),
             );
-            try self.request_queue.growUnits(reserved_units, required_units);
+            try self.inference_admission.growUnits(reserved_units, required_units);
             reserved_units = required_units;
-            self.updateQueueMetrics();
+            self.updateAdmissionMetrics();
         }
 
         const results = if (parsed_inputs.images.items.len > 0)
@@ -4358,43 +4358,43 @@ pub const Node = struct {
     // --- ServerRouter handler methods ---
     // These implement the interface required by api.ServerRouter(Node).
 
-    /// Acquire a request slot; returns 503 if queue is full.
+    /// Acquire a request slot; returns 503 if inference admission is exhausted.
     fn acquireSlot(self: *Node, ctx: *httpx.Context) !?httpx.Response {
         return self.acquireSlotUnits(ctx, 1);
     }
 
     fn acquireSlotUnits(self: *Node, ctx: *httpx.Context, units: usize) !?httpx.Response {
-        const requested_units = self.request_queue.capacityUnits(units);
-        self.request_queue.acquireUnits(units) catch {
+        const requested_units = self.inference_admission.capacityUnits(units);
+        self.inference_admission.acquireUnits(units) catch {
             self.metrics.incError();
-            self.metrics.recordQueueRejection(requested_units);
-            self.updateQueueMetrics();
+            self.metrics.recordAdmissionRejection(requested_units);
+            self.updateAdmissionMetrics();
             const resp = try transientCapacityFailureResponse(
                 ctx,
                 "SERVICE_UNAVAILABLE",
                 "server at capacity, try again later",
-                "request_queue",
+                "inference_admission",
             );
             return resp;
         };
-        self.updateQueueMetrics();
+        self.updateAdmissionMetrics();
         return null;
     }
 
     fn growSlotUnits(self: *Node, ctx: *httpx.Context, current_units: usize, target_units: usize) !?httpx.Response {
-        const requested_units = self.request_queue.capacityUnits(target_units);
-        self.request_queue.growUnits(current_units, target_units) catch {
+        const requested_units = self.inference_admission.capacityUnits(target_units);
+        self.inference_admission.growUnits(current_units, target_units) catch {
             self.metrics.incError();
-            self.metrics.recordQueueRejection(requested_units);
-            self.updateQueueMetrics();
+            self.metrics.recordAdmissionRejection(requested_units);
+            self.updateAdmissionMetrics();
             return try transientCapacityFailureResponse(
                 ctx,
                 "SERVICE_UNAVAILABLE",
                 "server at capacity for expanded request workload, try again later",
-                "request_queue",
+                "inference_admission",
             );
         };
-        self.updateQueueMetrics();
+        self.updateAdmissionMetrics();
         return null;
     }
 
@@ -4403,19 +4403,21 @@ pub const Node = struct {
     }
 
     fn releaseSlotUnits(self: *Node, units: usize) void {
-        self.request_queue.releaseUnits(units);
-        self.updateQueueMetrics();
+        self.inference_admission.releaseUnits(units);
+        self.updateAdmissionMetrics();
     }
 
-    fn updateQueueMetrics(self: *Node) void {
-        self.metrics.setQueueState(
-            self.request_queue.depth(),
-            self.request_queue.max_concurrent,
-            self.request_queue.requests(),
+    fn updateAdmissionMetrics(self: *Node) void {
+        const admission = self.inference_admission.stats();
+        self.metrics.setAdmissionState(
+            admission.capacity_units,
+            admission.in_flight_units,
+            admission.available_units,
+            admission.in_flight_requests,
         );
     }
 
-    fn estimateHttpRequestQueueUnits(self: *Node, ctx: *httpx.Context) usize {
+    fn estimateHttpRequestAdmissionUnits(self: *Node, ctx: *httpx.Context) usize {
         _ = self;
         const body_len = if (ctx.request.body) |body| body.len else 0;
         const bytes_per_unit: usize = 1024 * 1024;
@@ -4468,7 +4470,7 @@ pub const Node = struct {
         return preflight;
     }
 
-    fn estimateGenerateQueueUnits(self: *Node, messages: []const generation.Message, max_tokens: i32) usize {
+    fn estimateGenerateAdmissionUnits(self: *Node, messages: []const generation.Message, max_tokens: i32) usize {
         _ = self;
         var text_bytes: usize = 0;
         var media_count: usize = 0;
@@ -4478,10 +4480,10 @@ pub const Node = struct {
             if (msg.audio_bytes) |audio| media_count = std.math.add(usize, media_count, audio.len) catch std.math.maxInt(usize);
         }
 
-        return estimateGenerateQueueUnitsFromShape(text_bytes, media_count, max_tokens);
+        return estimateGenerateAdmissionUnitsFromShape(text_bytes, media_count, max_tokens);
     }
 
-    fn estimateGenerateRequestQueueUnits(body: api.GenerateRequest, max_tokens: i32) usize {
+    fn estimateGenerateRequestAdmissionUnits(body: api.GenerateRequest, max_tokens: i32) usize {
         var text_bytes: usize = 0;
         var media_count: usize = 0;
         for (body.messages) |msg| {
@@ -4511,21 +4513,21 @@ pub const Node = struct {
             }
         }
 
-        const base_units = estimateGenerateQueueUnitsFromShape(text_bytes, media_count, max_tokens);
+        const base_units = estimateGenerateAdmissionUnitsFromShape(text_bytes, media_count, max_tokens);
         const speculation = parseGenerateSpeculationOptions(
             body.draft_model != null,
             body.speculative_k,
             body.speculation_policy,
             body.speculation_calibration,
         ) catch return base_units;
-        return generateQueueUnitsForSpeculation(
+        return generateAdmissionUnitsForSpeculation(
             base_units,
             body.draft_model != null,
             speculation.policy,
         );
     }
 
-    fn estimateGenerateBatchQueueUnitsPreflight(self: *Node, requests: []const api.GenerateBatchRequestItem, pending: []const bool) usize {
+    fn estimateGenerateBatchAdmissionUnitsPreflight(self: *Node, requests: []const api.GenerateBatchRequestItem, pending: []const bool) usize {
         _ = self;
         var total: usize = 1;
         for (requests, pending) |item, is_pending| {
@@ -4537,13 +4539,13 @@ pub const Node = struct {
             total = std.math.add(
                 usize,
                 total,
-                estimateGenerateRequestQueueUnits(item.body, max_tokens),
+                estimateGenerateRequestAdmissionUnits(item.body, max_tokens),
             ) catch std.math.maxInt(usize);
         }
         return total;
     }
 
-    fn estimateGenerateQueueUnitsFromShape(text_bytes: usize, media_count: usize, max_tokens: i32) usize {
+    fn estimateGenerateAdmissionUnitsFromShape(text_bytes: usize, media_count: usize, max_tokens: i32) usize {
         const prompt_units = std.math.add(usize, 1, text_bytes / 2048) catch std.math.maxInt(usize);
         const decode_units: usize = @intCast(@max(@divTrunc(max_tokens, 256), 0));
         const media_units = std.math.mul(usize, media_count, 2) catch std.math.maxInt(usize);
@@ -4552,7 +4554,7 @@ pub const Node = struct {
         return std.math.add(usize, total, media_units) catch std.math.maxInt(usize);
     }
 
-    fn estimateGenerateBatchQueueUnits(
+    fn estimateGenerateBatchAdmissionUnits(
         self: *Node,
         requests: []const api.GenerateBatchRequestItem,
         owned_messages: []const OwnedGenerateMessages,
@@ -4562,7 +4564,7 @@ pub const Node = struct {
         for (requests, pending, 0..) |item, is_pending, idx| {
             if (!is_pending) continue;
             const max_tokens: i32 = if (item.body.max_tokens) |mt| @intCast(mt) else 256;
-            const item_units = self.estimateGenerateQueueUnits(owned_messages[idx].messages, max_tokens);
+            const item_units = self.estimateGenerateAdmissionUnits(owned_messages[idx].messages, max_tokens);
             total = std.math.add(usize, total, item_units) catch std.math.maxInt(usize);
         }
         return total;
@@ -4672,9 +4674,9 @@ pub const Node = struct {
         };
 
         const media_admission = requestMediaAdmission(self, denseEmbedRequestMediaShape(request.input));
-        const queue_units = @max(self.estimateHttpRequestQueueUnits(ctx), media_admission.units);
-        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        var reserved_units = queue_units;
+        const admission_units = @max(self.estimateHttpRequestAdmissionUnits(ctx), media_admission.units);
+        if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
+        var reserved_units = admission_units;
         defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("embed");
         defer self.metrics.decActive();
@@ -4921,9 +4923,9 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
-        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        defer self.releaseSlotUnits(queue_units);
+        const admission_units = self.estimateHttpRequestAdmissionUnits(ctx);
+        if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
+        defer self.releaseSlotUnits(admission_units);
         self.metrics.incRequest("chunk");
         defer self.metrics.decActive();
 
@@ -5252,9 +5254,9 @@ pub const Node = struct {
         // Admission precedes model resolution and media decoding so rejected
         // requests cannot consume model or download work first.
         const media_admission = requestMediaAdmission(self, generateRequestMediaShape(body));
-        const queue_units = @max(estimateGenerateRequestQueueUnits(body, numeric.max_tokens), media_admission.units);
-        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        var reserved_units = queue_units;
+        const admission_units = @max(estimateGenerateRequestAdmissionUnits(body, numeric.max_tokens), media_admission.units);
+        if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
+        var reserved_units = admission_units;
         defer self.releaseSlotUnits(reserved_units);
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
 
@@ -5880,7 +5882,7 @@ pub const Node = struct {
         };
         if (model.native_generate_coordinator) |coordinator| {
             native_generate_lease = try self.acquireNativeGenerateLease(coordinator, .{
-                .requested_units = queue_units,
+                .requested_units = admission_units,
                 .prompt_bytes = prompt_bytes,
                 .prompt_tokens = prompt_tokens,
                 .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
@@ -7071,9 +7073,9 @@ pub const Node = struct {
             }
         }
 
-        const queue_units = self.estimateGenerateBatchQueueUnitsPreflight(body.requests, pending);
-        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        defer self.releaseSlotUnits(queue_units);
+        const admission_units = self.estimateGenerateBatchAdmissionUnitsPreflight(body.requests, pending);
+        if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
+        defer self.releaseSlotUnits(admission_units);
         self.metrics.incRequest("generate_batch");
         defer self.metrics.decActive();
 
@@ -7293,9 +7295,9 @@ pub const Node = struct {
                 if (model.native_generate_coordinator) |coordinator| {
                     for (group_indices.items, 0..) |idx, pos| {
                         if (!pending[idx]) continue;
-                        const queue_item_units = self.estimateGenerateQueueUnits(owned_messages[idx].messages, configs[pos].max_tokens);
+                        const admission_item_units = self.estimateGenerateAdmissionUnits(owned_messages[idx].messages, configs[pos].max_tokens);
                         leases[pos] = self.acquireNativeGenerateLease(coordinator, .{
-                            .requested_units = queue_item_units,
+                            .requested_units = admission_item_units,
                             .prompt_bytes = prompt_bytes[pos],
                             .prompt_tokens = prompt_tokens[pos],
                             .prefill_chunk_limit = if (configs[pos].prefill_chunk_size == 0) idle_prefill_ceiling else 0,
@@ -8813,9 +8815,9 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
-        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        defer self.releaseSlotUnits(queue_units);
+        const admission_units = self.estimateHttpRequestAdmissionUnits(ctx);
+        if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
+        defer self.releaseSlotUnits(admission_units);
         self.metrics.incRequest("classify");
         defer self.metrics.decActive();
 
@@ -9464,9 +9466,9 @@ pub const Node = struct {
             media_admission.byte_cap,
         ) catch std.math.maxInt(usize);
         const audio_admission = audioDecodeAdmission(self, resident_bytes);
-        const queue_units = @max(self.estimateHttpRequestQueueUnits(ctx), audio_admission.units);
-        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        const reserved_units = queue_units;
+        const admission_units = @max(self.estimateHttpRequestAdmissionUnits(ctx), audio_admission.units);
+        if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
+        const reserved_units = admission_units;
         defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("transcribe");
         defer self.metrics.decActive();
@@ -10146,9 +10148,9 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
-        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        defer self.releaseSlotUnits(queue_units);
+        const admission_units = self.estimateHttpRequestAdmissionUnits(ctx);
+        if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
+        defer self.releaseSlotUnits(admission_units);
         self.metrics.incRequest("predict");
         defer self.metrics.decActive();
 
@@ -11684,10 +11686,10 @@ test "generate speculation options validate the HTTP trust boundary" {
     const forced = try parseGenerateSpeculationOptions(true, null, "force", null);
     try std.testing.expectEqual(generation.SpeculationCalibration.none, forced.calibration);
     try std.testing.expect(!shouldResolveDraftModel(.off));
-    try std.testing.expectEqual(@as(usize, 7), generateQueueUnitsForSpeculation(7, false, .auto));
-    try std.testing.expectEqual(@as(usize, 7), generateQueueUnitsForSpeculation(7, true, .off));
-    try std.testing.expectEqual(@as(usize, 14), generateQueueUnitsForSpeculation(7, true, .auto));
-    try std.testing.expectEqual(std.math.maxInt(usize), generateQueueUnitsForSpeculation(std.math.maxInt(usize), true, .force));
+    try std.testing.expectEqual(@as(usize, 7), generateAdmissionUnitsForSpeculation(7, false, .auto));
+    try std.testing.expectEqual(@as(usize, 7), generateAdmissionUnitsForSpeculation(7, true, .off));
+    try std.testing.expectEqual(@as(usize, 14), generateAdmissionUnitsForSpeculation(7, true, .auto));
+    try std.testing.expectEqual(std.math.maxInt(usize), generateAdmissionUnitsForSpeculation(std.math.maxInt(usize), true, .force));
     try std.testing.expectError(error.SpeculationRequiresDraftModel, parseGenerateSpeculationOptions(false, 4, null, null));
     try std.testing.expectError(error.SpeculationRequiresDraftModel, parseGenerateSpeculationOptions(false, null, "auto", null));
     try std.testing.expectError(error.SpeculationRequiresDraftModel, parseGenerateSpeculationOptions(false, null, null, "probe"));
@@ -11698,20 +11700,20 @@ test "generate speculation options validate the HTTP trust boundary" {
     try std.testing.expectError(error.InvalidSpeculationCalibration, parseGenerateSpeculationOptions(true, 4, null, "unknown"));
 }
 
-test "generate queue units conservatively charge active draft requests" {
+test "generate admission units conservatively charge active draft requests" {
     const request_json =
         \\{"model":"m","draft_model":"draft","messages":[{"role":"user","content":"hello"}]}
     ;
     var parsed = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, request_json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
-    try std.testing.expectEqual(@as(usize, 6), Node.estimateGenerateRequestQueueUnits(parsed.value, 256));
+    try std.testing.expectEqual(@as(usize, 6), Node.estimateGenerateRequestAdmissionUnits(parsed.value, 256));
     var probing = parsed.value;
     probing.speculation_calibration = "probe";
-    try std.testing.expectEqual(@as(usize, 6), Node.estimateGenerateRequestQueueUnits(probing, 256));
+    try std.testing.expectEqual(@as(usize, 6), Node.estimateGenerateRequestAdmissionUnits(probing, 256));
     var off = parsed.value;
     off.speculation_policy = "off";
-    try std.testing.expectEqual(@as(usize, 3), Node.estimateGenerateRequestQueueUnits(off, 256));
+    try std.testing.expectEqual(@as(usize, 3), Node.estimateGenerateRequestAdmissionUnits(off, 256));
 }
 
 test "generate numeric options validate narrowing at the HTTP trust boundary" {
@@ -12209,7 +12211,7 @@ test "generate batch isolates native execution and serializes stateful GPU backe
     );
 }
 
-test "generate batch queue units sum pending generation work" {
+test "generate batch admission units sum pending generation work" {
     const alloc = std.testing.allocator;
     var node = try Node.init(alloc, .{});
     defer node.deinit();
@@ -12217,7 +12219,7 @@ test "generate batch queue units sum pending generation work" {
     const request_json =
         \\{"mode":"sync","requests":[
         \\{"custom_id":"a","body":{"model":"m","max_tokens":512,"messages":[{"role":"user","content":"short"}]}},
-        \\{"custom_id":"b","body":{"model":"m","max_tokens":256,"messages":[{"role":"user","content":"this prompt is deliberately longer than one prompt queue block so the estimate is weighted"}]}},
+        \\{"custom_id":"b","body":{"model":"m","max_tokens":256,"messages":[{"role":"user","content":"this prompt is deliberately longer than one prompt admission block so the estimate is weighted"}]}},
         \\{"custom_id":"c","body":{"model":"m","max_tokens":256,"messages":[{"role":"user","content":"already rejected"}]}}
         \\]}
     ;
@@ -12236,9 +12238,9 @@ test "generate batch queue units sum pending generation work" {
 
     const expected =
         @as(usize, 1) +
-        node.estimateGenerateQueueUnits(owned_messages[0].messages, 512) +
-        node.estimateGenerateQueueUnits(owned_messages[1].messages, 256);
-    try std.testing.expectEqual(expected, node.estimateGenerateBatchQueueUnits(parsed.value.requests, owned_messages, pending[0..]));
+        node.estimateGenerateAdmissionUnits(owned_messages[0].messages, 512) +
+        node.estimateGenerateAdmissionUnits(owned_messages[1].messages, 256);
+    try std.testing.expectEqual(expected, node.estimateGenerateBatchAdmissionUnits(parsed.value.requests, owned_messages, pending[0..]));
 }
 
 test "generate batch shared backends own the outer model lock" {
@@ -12287,7 +12289,7 @@ test "serial batch admission covers each request without summing them" {
     try std.testing.expectEqual(@as(usize, 700), merged.scratch_bytes);
 }
 
-test "direct generation admission owns queue capacity exactly once" {
+test "direct generation admission owns capacity exactly once" {
     var node = try Node.init(std.testing.allocator, .{ .max_concurrent_requests = 32 });
     defer node.deinit();
 
@@ -12298,19 +12300,19 @@ test "direct generation admission owns queue capacity exactly once" {
         .media_count = 1,
         .has_audio = true,
     }, 256);
-    try std.testing.expectEqual(@as(usize, 9), node.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 1), node.request_queue.requests());
+    try std.testing.expectEqual(@as(usize, 9), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightRequests());
 
     admission.deinit();
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
 
     admission.deinit();
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
 }
 
-test "direct generation admission rejects resident media before queue acquisition" {
+test "direct generation admission rejects resident media before acquisition" {
     var node = try Node.init(std.testing.allocator, .{
         .content_security = .{ .max_download_size_bytes = 4 },
         .max_concurrent_requests = 32,
@@ -12326,8 +12328,8 @@ test "direct generation admission rejects resident media before queue acquisitio
             .image_count = 1,
         }, 256),
     );
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
 }
 
 test "direct generation audio admission honors configured byte capacity boundary" {
@@ -12338,7 +12340,7 @@ test "direct generation audio admission honors configured byte capacity boundary
         .media_count = 1,
         .has_audio = true,
     }, 256);
-    try std.testing.expectEqual(@as(usize, 8), bounded.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 8), bounded.inference_admission.inFlightUnits());
     exact.deinit();
 
     try std.testing.expectError(
@@ -12349,8 +12351,8 @@ test "direct generation audio admission honors configured byte capacity boundary
             .has_audio = true,
         }, 256),
     );
-    try std.testing.expectEqual(@as(usize, 0), bounded.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 0), bounded.request_queue.requests());
+    try std.testing.expectEqual(@as(usize, 0), bounded.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), bounded.inference_admission.inFlightRequests());
 
     var unlimited = try Node.init(std.testing.allocator, .{ .max_concurrent_requests = 0 });
     defer unlimited.deinit();
@@ -12359,8 +12361,8 @@ test "direct generation audio admission honors configured byte capacity boundary
         .media_count = 1,
         .has_audio = true,
     }, 256);
-    try std.testing.expectEqual(@as(usize, 0), unlimited.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 1), unlimited.request_queue.requests());
+    try std.testing.expectEqual(@as(usize, 0), unlimited.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 1), unlimited.inference_admission.inFlightRequests());
     admitted.deinit();
 }
 
@@ -12378,8 +12380,8 @@ test "direct generation media inspection releases admission on early error" {
         error.ImageDecodeFailed,
         node.generateMessagesDirect(std.testing.allocator, "unused", &messages),
     );
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
 }
 
 test "direct generation image admission subtracts resident bytes from capacity" {
@@ -12402,8 +12404,8 @@ test "direct generation image admission subtracts resident bytes from capacity" 
         error.ImageBatchTooLarge,
         node.generateMessagesDirect(std.testing.allocator, "unused", &messages),
     );
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
 }
 
 test "generate batch capacity errors include actionable retry metadata" {
@@ -12509,8 +12511,8 @@ test "read admission reserves default batch bytes and image pressure without ove
         0,
     );
     try std.testing.expectEqual(32 * read_admission_bytes_per_unit, overflow.byte_cap);
-    var queue = request_queue_mod.RequestQueue.init(32);
-    try std.testing.expectEqual(@as(usize, 32), queue.capacityUnits(overflow.units));
+    var admission = inference_admission_mod.InferenceAdmission.init(32);
+    try std.testing.expectEqual(@as(usize, 32), admission.capacityUnits(overflow.units));
 
     try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), batch.decoded_pixel_cap);
     try std.testing.expectEqual(
@@ -12555,12 +12557,12 @@ test "remote and inline media reserve distinct resident peaks before download" {
     try std.testing.expectEqual(default_max_request_media_bytes, remote.resident_byte_cap);
     try std.testing.expectEqual(@as(usize, 7), remote.units);
 
-    var queue = request_queue_mod.RequestQueue.init(32);
-    for (0..4) |_| try queue.acquireUnits(remote.units);
-    try std.testing.expectEqual(@as(usize, 28), queue.depth());
-    try std.testing.expectError(error.QueueFull, queue.acquireUnits(remote.units));
-    for (0..4) |_| queue.releaseUnits(remote.units);
-    try std.testing.expectEqual(@as(usize, 0), queue.depth());
+    var admission = inference_admission_mod.InferenceAdmission.init(32);
+    for (0..4) |_| try admission.acquireUnits(remote.units);
+    try std.testing.expectEqual(@as(usize, 28), admission.inFlightUnits());
+    try std.testing.expectError(error.QueueFull, admission.acquireUnits(remote.units));
+    for (0..4) |_| admission.releaseUnits(remote.units);
+    try std.testing.expectEqual(@as(usize, 0), admission.inFlightUnits());
 
     const capacity_limited = requestMediaAdmissionForLimits(remote_shape, default_max_request_media_bytes, 1, null);
     try std.testing.expectEqual(read_admission_bytes_per_unit, capacity_limited.byte_cap);
@@ -12744,8 +12746,8 @@ test "direct dense embed rejects media and reserves audio before model work" {
         error.RemoteContentTooLarge,
         oversized_node.embedDensePartsDirect(allocator, "missing", &oversized),
     );
-    try std.testing.expectEqual(@as(usize, 0), oversized_node.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 0), oversized_node.request_queue.requests());
+    try std.testing.expectEqual(@as(usize, 0), oversized_node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), oversized_node.inference_admission.inFlightRequests());
 
     const capacity_audio = try allocator.alloc(u8, read_admission_bytes_per_unit);
     defer allocator.free(capacity_audio);
@@ -12765,15 +12767,15 @@ test "direct dense embed rejects media and reserves audio before model work" {
     );
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
-    try std.testing.expectEqual(@as(usize, 0), tiny_node.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 0), tiny_node.request_queue.requests());
+    try std.testing.expectEqual(@as(usize, 0), tiny_node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), tiny_node.inference_admission.inFlightRequests());
 
     var reserve_node = try Node.init(allocator, .{
         .models_dir = "missing-model-root",
         .max_concurrent_requests = 8,
     });
     defer reserve_node.deinit();
-    try reserve_node.request_queue.acquire();
+    try reserve_node.inference_admission.acquire();
     const small_audio = [_]Node.DirectDenseEmbedPart{.{ .media = .{
         .mime_type = "audio/wav",
         .data = "x",
@@ -12782,11 +12784,11 @@ test "direct dense embed rejects media and reserves audio before model work" {
         error.QueueFull,
         reserve_node.embedDensePartsDirect(allocator, "missing", &small_audio),
     );
-    try std.testing.expectEqual(@as(usize, 1), reserve_node.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 1), reserve_node.request_queue.requests());
-    reserve_node.request_queue.release();
-    try std.testing.expectEqual(@as(usize, 0), reserve_node.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 0), reserve_node.request_queue.requests());
+    try std.testing.expectEqual(@as(usize, 1), reserve_node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 1), reserve_node.inference_admission.inFlightRequests());
+    reserve_node.inference_admission.release();
+    try std.testing.expectEqual(@as(usize, 0), reserve_node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), reserve_node.inference_admission.inFlightRequests());
 }
 
 test "direct dense embed rejects borrowed image expansion before model loading" {
@@ -12824,8 +12826,8 @@ test "direct dense embed rejects borrowed image expansion before model loading" 
     );
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
 }
 
 test "read decoded image budget rejects aggregate expansion and overflow" {
@@ -12978,7 +12980,7 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
         error.ImageBatchTooLarge,
         node.embedDenseJsonInputDirect(allocator, "owner/embed", parsed_input.value),
     );
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }
 
 test "sparse embed validates text-only input before model loading" {
@@ -13016,7 +13018,7 @@ test "sparse embed validates text-only input before model loading" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "sparse models only support text input") != null);
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }
 
 test "multimodal rerank rejects incompatible manifest before media or model loading" {
@@ -13055,15 +13057,15 @@ test "multimodal rerank rejects incompatible manifest before media or model load
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_NOT_SUPPORTED") != null);
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }
 
 test "read weighted admission rejects before model resolution or download" {
     const allocator = std.testing.allocator;
     var node = try Node.init(allocator, .{ .max_concurrent_requests = 8 });
     defer node.deinit();
-    try node.request_queue.acquire();
-    defer node.request_queue.release();
+    try node.inference_admission.acquire();
+    defer node.inference_admission.release();
 
     var body = std.ArrayListUnmanaged(u8).empty;
     defer body.deinit(allocator);
@@ -13106,8 +13108,8 @@ test "transcribe validates encoded audio before model resolution and releases ad
     try std.testing.expectEqual(@as(u16, 413), response.status.code);
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
 }
 
 test "transcribe bounded-decodes corrupt and metadata-amplified audio before model resolution" {
@@ -13153,8 +13155,8 @@ test "transcribe bounded-decodes corrupt and metadata-amplified audio before mod
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, case.expected_code) != null);
         try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
         try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
-        try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
-        try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
     }
 }
 
@@ -13259,7 +13261,7 @@ test "read image preflight maps malformed dimension and aggregate errors before 
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 413), response.status.code);
     }
-    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }
 
 test "extraction image downloads transfer ownership and clean up aggregate failures" {
@@ -13309,11 +13311,11 @@ test "read prompt treats empty public values as an omitted OCR prompt" {
     try std.testing.expectEqualStrings("<OCR>", normalizeReadPrompt("<OCR>").?);
 }
 
-test "read queue units scale with image batch and decode length" {
-    try std.testing.expectEqual(@as(usize, 1), estimateReadQueueUnits(1, null));
-    try std.testing.expectEqual(@as(usize, 4), estimateReadQueueUnits(4, null));
-    try std.testing.expectEqual(@as(usize, 8), estimateReadQueueUnits(4, default_read_queue_max_tokens + 1));
-    try std.testing.expectEqual(@as(usize, 16), estimateReadQueueUnits(4, max_read_tokens));
+test "read admission units scale with image batch and decode length" {
+    try std.testing.expectEqual(@as(usize, 1), estimateReadAdmissionUnits(1, null));
+    try std.testing.expectEqual(@as(usize, 4), estimateReadAdmissionUnits(4, null));
+    try std.testing.expectEqual(@as(usize, 8), estimateReadAdmissionUnits(4, default_read_admission_max_tokens + 1));
+    try std.testing.expectEqual(@as(usize, 16), estimateReadAdmissionUnits(4, max_read_tokens));
 }
 
 test "direct extraction validates read max tokens" {
@@ -14014,7 +14016,7 @@ test "download remote content accepts data uri" {
         .tabular_registry = undefined,
         .embed_cache = undefined,
         .metrics = undefined,
-        .request_queue = undefined,
+        .inference_admission = undefined,
     };
     var downloaded = try downloadRemoteContent(&node, alloc, "data:text/plain;base64,aGVsbG8=");
     defer downloaded.deinit(alloc);
@@ -14254,7 +14256,7 @@ test "download remote content blocks private ip urls when configured" {
         .tabular_registry = undefined,
         .embed_cache = undefined,
         .metrics = undefined,
-        .request_queue = undefined,
+        .inference_admission = undefined,
     };
     try std.testing.expectError(error.PrivateIpBlocked, downloadRemoteContent(&node, alloc, "http://127.0.0.1/test.png"));
 }
@@ -14272,7 +14274,7 @@ test "download remote content blocks hosts outside allowlist" {
         .tabular_registry = undefined,
         .embed_cache = undefined,
         .metrics = undefined,
-        .request_queue = undefined,
+        .inference_admission = undefined,
     };
     try std.testing.expectError(error.HostNotAllowed, downloadRemoteContent(&node, alloc, "https://example.com/a.png"));
 }
@@ -17147,10 +17149,10 @@ fn readBatchMaxBytes() usize {
 }
 
 fn readInlineSourceByteCap(self: *const Node) usize {
-    if (self.request_queue.max_concurrent == 0) return readBatchMaxBytes();
+    if (self.inference_admission.capacity == 0) return readBatchMaxBytes();
     const capacity_bytes = std.math.mul(
         usize,
-        self.request_queue.max_concurrent,
+        self.inference_admission.capacity,
         read_admission_bytes_per_unit,
     ) catch std.math.maxInt(usize);
     return @min(readBatchMaxBytes(), capacity_bytes);
@@ -17207,7 +17209,7 @@ fn audioDecodeAdmissionForLimits(resident_bytes: usize, max_concurrent_units: us
 }
 
 fn audioDecodeAdmission(self: *const Node, resident_bytes: usize) AudioDecodeAdmission {
-    return audioDecodeAdmissionForLimits(resident_bytes, self.request_queue.max_concurrent);
+    return audioDecodeAdmissionForLimits(resident_bytes, self.inference_admission.capacity);
 }
 
 fn readRequestAdmissionForLimits(
@@ -17284,11 +17286,11 @@ fn readRequestAdmission(
         image_count,
         readBatchMaxBytes(),
         per_image_byte_cap,
-        self.request_queue.max_concurrent,
+        self.inference_admission.capacity,
         security.max_image_dimension,
         inline_source_bytes,
     );
-    admission.units = @max(admission.units, estimateReadQueueUnits(image_count, max_tokens));
+    admission.units = @max(admission.units, estimateReadAdmissionUnits(image_count, max_tokens));
     return admission;
 }
 
@@ -17336,7 +17338,7 @@ fn requestMediaAdmission(self: *const Node, shape: RequestMediaAdmissionShape) R
     return requestMediaAdmissionForLimits(
         shape,
         requestMediaMaxBytes(self),
-        self.request_queue.max_concurrent,
+        self.inference_admission.capacity,
         effectiveRequestContentSecurity(self).max_image_dimension,
     );
 }
@@ -17398,9 +17400,9 @@ fn normalizeReadPrompt(prompt: ?[]const u8) ?[]const u8 {
     return if (std.mem.trim(u8, value, " \t\r\n").len == 0) null else value;
 }
 
-fn estimateReadQueueUnits(image_count: usize, max_tokens: ?usize) usize {
-    const estimated_max_tokens = max_tokens orelse default_read_queue_max_tokens;
-    const token_units = 1 + ((@max(estimated_max_tokens, 1) - 1) / default_read_queue_max_tokens);
+fn estimateReadAdmissionUnits(image_count: usize, max_tokens: ?usize) usize {
+    const estimated_max_tokens = max_tokens orelse default_read_admission_max_tokens;
+    const token_units = 1 + ((@max(estimated_max_tokens, 1) - 1) / default_read_admission_max_tokens);
     return std.math.mul(usize, @max(image_count, 1), token_units) catch std.math.maxInt(usize);
 }
 
@@ -17617,8 +17619,8 @@ test "admission rejection includes Retry-After" {
     var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
     defer node.deinit();
 
-    try node.request_queue.acquire();
-    defer node.request_queue.release();
+    try node.inference_admission.acquire();
+    defer node.inference_admission.release();
 
     var request = try httpx.Request.init(allocator, .GET, "/ai/v1/models");
     defer request.deinit();
@@ -17644,8 +17646,8 @@ test "predict endpoint shares inference request admission" {
     var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
     defer node.deinit();
 
-    try node.request_queue.acquire();
-    defer node.request_queue.release();
+    try node.inference_admission.acquire();
+    defer node.inference_admission.release();
 
     var request = try httpx.Request.init(allocator, .POST, "/ml/v1/predict");
     defer request.deinit();

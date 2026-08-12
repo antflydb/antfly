@@ -125,6 +125,21 @@ pub const StdHttpListener = struct {
         shared,
     };
 
+    /// Heap-stable ownership published before a connection task is handed to
+    /// `std.Io.Group`. `stop()` can therefore shut down every accepted socket
+    /// even when the executor has not started the task yet.
+    const ConnectionTask = struct {
+        listener: *StdHttpListener,
+        stream: std.Io.net.Stream,
+
+        fn deinit(self: *ConnectionTask) void {
+            const listener = self.listener;
+            listener.unregisterActiveStream(&self.stream);
+            self.stream.close(listener.io_impl.io());
+            listener.alloc.destroy(self);
+        }
+    };
+
     alloc: std.mem.Allocator,
     cfg: StdHttpListenerConfig,
     app: common.RequestExecutor,
@@ -369,18 +384,34 @@ pub const StdHttpListener = struct {
                 return;
             }
             if (self.cfg.serve_in_connection_threads) {
+                const task = self.prepareConnectionTask(stream) catch |err| {
+                    var rejected_stream = stream;
+                    rejected_stream.close(io);
+                    self.releaseConnectionThreadSlot();
+                    slot_held = false;
+                    if (err != error.OutOfMemory)
+                        std.log.warn("std http listener connection registration failed err={s}", .{@errorName(err)});
+                    continue;
+                };
                 self.connection_group.concurrent(
                     io,
                     serveStreamThread,
-                    .{ self, stream },
+                    .{task},
                 ) catch |err| {
+                    if (self.stopping.load(.acquire)) {
+                        task.deinit();
+                        self.releaseConnectionThreadSlot();
+                        slot_held = false;
+                        return;
+                    }
                     // Resource exhaustion must degrade to bounded inline
                     // service, not drop an already accepted request. The
                     // listener thread remains joinable by stop(), and retains
                     // this connection's admission slot while serving it.
                     if (err != error.ConcurrencyUnavailable)
                         std.log.warn("std http listener connection task handoff failed err={s}", .{@errorName(err)});
-                    self.serveStream(stream);
+                    self.serveRegisteredStream(&task.stream);
+                    task.deinit();
                     self.releaseConnectionThreadSlot();
                     slot_held = false;
                     continue;
@@ -455,9 +486,20 @@ pub const StdHttpListener = struct {
         return @max(self.acceptErrorBackoffInitialMs(), self.cfg.accept_error_backoff_max_ms);
     }
 
-    fn serveStreamThread(self: *StdHttpListener, stream: std.Io.net.Stream) std.Io.Cancelable!void {
+    fn prepareConnectionTask(self: *StdHttpListener, stream: std.Io.net.Stream) !*ConnectionTask {
+        const task = try self.alloc.create(ConnectionTask);
+        errdefer self.alloc.destroy(task);
+        task.* = .{ .listener = self, .stream = stream };
+        try self.registerActiveStream(&task.stream);
+        if (self.stopping.load(.acquire)) task.stream.shutdown(self.io_impl.io(), .both) catch {};
+        return task;
+    }
+
+    fn serveStreamThread(task: *ConnectionTask) std.Io.Cancelable!void {
+        const self = task.listener;
         defer self.releaseConnectionThreadSlot();
-        self.serveStream(stream);
+        defer task.deinit();
+        self.serveRegisteredStream(&task.stream);
     }
 
     fn serveStream(self: *StdHttpListener, stream: std.Io.net.Stream) void {
@@ -474,6 +516,12 @@ pub const StdHttpListener = struct {
             owned_stream.close(io);
         }
 
+        self.serveRegisteredStream(&owned_stream);
+    }
+
+    fn serveRegisteredStream(self: *StdHttpListener, owned_stream: *std.Io.net.Stream) void {
+        const io = self.io_impl.io();
+
         const recv_buffer = self.alloc.alloc(u8, self.cfg.recv_buffer_bytes) catch return;
         defer self.alloc.free(recv_buffer);
         const send_buffer = self.alloc.alloc(u8, self.cfg.send_buffer_bytes) catch return;
@@ -483,7 +531,7 @@ pub const StdHttpListener = struct {
         var stream_writer = owned_stream.writer(io, send_buffer);
         var server: std.http.Server = .init(&stream_reader.interface, &stream_writer.interface);
 
-        var request = self.receiveHeadWithTimeout(io, &owned_stream, &server) catch |err| {
+        var request = self.receiveHeadWithTimeout(io, owned_stream, &server) catch |err| {
             // Closing here with unread request bytes sends RST to a client
             // that is awaiting a response; keep the common idle-close quiet
             // but record anything else so resets are diagnosable from logs.
@@ -499,7 +547,7 @@ pub const StdHttpListener = struct {
         const request_target_len = @min(request.head.target.len, request_target_buf.len);
         @memcpy(request_target_buf[0..request_target_len], request.head.target[0..request_target_len]);
         const request_target = request_target_buf[0..request_target_len];
-        self.handleRequest(&owned_stream, &request) catch |err| {
+        self.handleRequest(owned_stream, &request) catch |err| {
             // Request-lifecycle cancellation is an expected terminal state:
             // the peer has gone away or the owning I/O task is being torn
             // down. Do not turn disconnect storms into error-log storms or
@@ -2449,7 +2497,7 @@ fn countLinuxProcEntries(path: []const u8) !usize {
     return count;
 }
 
-test "std http listener process threads and descriptors recover after cancellation storms" {
+test "std http listener retains a bounded worker plateau and recovers descriptors after cancellation storms" {
     if (comptime builtin.os.tag != .linux) return;
 
     if (std.c.getenv("ANTFLY_REQUIRE_LOW_FD_HTTP_RATCHET") != null) {
@@ -2488,8 +2536,8 @@ test "std http listener process threads and descriptors recover after cancellati
     sleepMs(100);
     const baseline_threads = try countLinuxProcEntries("/proc/self/task");
     const baseline_fds = try countLinuxProcEntries("/proc/self/fd");
-    var recovered_thread_min: usize = std.math.maxInt(usize);
-    var recovered_thread_max: usize = 0;
+    const hard_thread_ceiling = baseline_threads + @as(usize, listener.cfg.max_connection_threads) + thread_slack;
+    var warmed_thread_ceiling: ?usize = null;
 
     for (0..rounds) |_| {
         var clients = [_]?std.Io.net.Stream{null} ** batch_size;
@@ -2511,7 +2559,8 @@ test "std http listener process threads and descriptors recover after cancellati
             sleepMs(5);
         }
         try std.testing.expect(loaded);
-        try std.testing.expect((try countLinuxProcEntries("/proc/self/task")) >= baseline_threads + batch_size);
+        const loaded_threads = try countLinuxProcEntries("/proc/self/task");
+        try std.testing.expect(loaded_threads <= hard_thread_ceiling);
 
         for (&clients) |*maybe_stream| {
             if (maybe_stream.*) |*stream| {
@@ -2530,7 +2579,6 @@ test "std http listener process threads and descriptors recover after cancellati
             if (stats.active_deadline_observers == 0 and
                 stats.active_peer_observers == 0 and
                 stats.active_connection_threads <= 1 and
-                threads <= baseline_threads + thread_slack and
                 fds <= baseline_fds + fd_slack)
             {
                 recovered = true;
@@ -2540,11 +2588,14 @@ test "std http listener process threads and descriptors recover after cancellati
             sleepMs(5);
         }
         try std.testing.expect(recovered);
-        recovered_thread_min = @min(recovered_thread_min, recovered_threads);
-        recovered_thread_max = @max(recovered_thread_max, recovered_threads);
+        try std.testing.expect(recovered_threads <= hard_thread_ceiling);
+        if (warmed_thread_ceiling) |ceiling| {
+            try std.testing.expect(loaded_threads <= ceiling);
+            try std.testing.expect(recovered_threads <= ceiling);
+        } else {
+            warmed_thread_ceiling = @max(loaded_threads, recovered_threads) + thread_slack;
+        }
     }
-
-    try std.testing.expect(recovered_thread_max - recovered_thread_min <= thread_slack);
 }
 
 test "std http listener stop interrupts accepted header read" {

@@ -39,6 +39,10 @@ that end state:
   `ApiHttpServer`, not handler-local or listener-local limits. Generated HTTP,
   MCP, A2A, extension-host, and other in-process entry points therefore share
   the same capacity and rejection metrics.
+- Continuous-HA mutation safety is enforced by inventory-backed `httpx`
+  middleware across generated, contextual, and internal routes. Removing the
+  compatibility dispatcher therefore cannot remove the fail-closed mutation
+  gate or let a new non-GET route bypass classification.
 - Process roles share signal cancellation and one absolute shutdown deadline.
 - Listener address reuse and listener sharing are independent policies:
   `SO_REUSEADDR` supports deterministic restart, while `SO_REUSEPORT` is an
@@ -53,7 +57,9 @@ that end state:
   standalone, and serverless health metrics. The dedicated inference command
   uses the same lifecycle while retaining model-specific readiness. The
   internal compatibility listener now owns connection tasks in a `std.Io.Group`
-  and cancels/joins that group instead of detaching OS threads.
+  and cancels/joins that group instead of detaching OS threads. Accepted
+  sockets are registered in stable task ownership before executor handoff, so
+  shutdown can interrupt them even if a worker has not started the task yet.
 - The API-kernel and inference archives expose versioned function tables and
   immutable route manifests; the runtime owns router mutation and wire
   adaptation on both boundaries.
@@ -609,6 +615,13 @@ deadlines remain necessary when an orderly half-close must not retain work.
 Fatal observer failures mark `HttpRuntime` unhealthy, cancel all current
 registrations, and make shared-role readiness fail until the runtime is
 restarted.
+
+Retained `Io.Threaded` workers are an executor capacity plateau, not leaked
+connection ownership. Cancellation-storm tests therefore require descriptors,
+active tasks, and observer registrations to return to baseline while asserting
+that the warmed worker count remains bounded and cannot ratchet upward on later
+rounds. Requiring process thread count to return to its cold baseline would
+misstate the executor's documented lifetime model.
 
 This observer is intentionally not a `BackendRuntime` lane. Giving it a lane
 would mix transport lifetime with storage-executor policy and would still risk
