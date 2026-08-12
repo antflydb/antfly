@@ -36381,7 +36381,7 @@ test "managed startup catch-up reclaims due obsolete primary run files" {
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(@as(u64, 0), statuses.items[0].lsm_storage_stats.?.obsolete_paths_reclaimable);
+    try std.testing.expectEqual(@as(u64, 0), statuses.items[0].lsm_storage_stats.?.maintenance.obsolete_paths_reclaimable);
 }
 
 test "managed startup catch-up bypasses shared write cache" {

@@ -27,7 +27,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 7;
+pub const abi_version: u32 = 8;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -96,12 +96,17 @@ pub const HeaderView = http_abi.HeaderView;
 pub const RouteParamView = http_abi.RouteParamView;
 pub const HttpRequestView = http_abi.HttpRequestView;
 pub const HttpResponseView = http_abi.HttpResponseView;
+pub const RequestBodyMode = http_abi.RequestBodyMode;
+pub const CancellationView = http_abi.CancellationView;
+pub const StreamSink = http_abi.StreamSink;
 
 pub const HttpHandleContext = extern struct {
     abi_version: u32,
     struct_size: u32 = @sizeOf(@This()),
     route_handle: *anyopaque,
     request: *const HttpRequestView,
+    cancellation: CancellationView = .{},
+    stream: StreamSink = .{},
     out_response_handle: *?*anyopaque,
     out_response: *HttpResponseView,
 };
@@ -110,6 +115,8 @@ pub const RouteManifestEntry = extern struct {
     route_handle: *anyopaque,
     method: HttpMethod,
     path: Bytes,
+    request_body: RequestBodyMode,
+    streaming_response: u8,
 };
 
 pub const RouteManifestContext = extern struct {

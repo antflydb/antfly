@@ -33,6 +33,8 @@ pub const RequestCancellation = struct {
     /// Optional listener-owned signal (for example an H2 RST_STREAM). It is
     /// borrowed for the request lifetime and complements local cancellation.
     borrowed: ?*const std.atomic.Value(bool) = null,
+    borrowed_context: ?*const anyopaque = null,
+    borrowed_is_cancelled: ?*const fn (*const anyopaque) bool = null,
 
     pub fn cancel(self: *RequestCancellation) void {
         self.cancelled.store(true, .release);
@@ -40,7 +42,8 @@ pub const RequestCancellation = struct {
 
     pub fn isCancelled(self: *const RequestCancellation) bool {
         return self.cancelled.load(.acquire) or
-            (self.borrowed != null and self.borrowed.?.load(.acquire));
+            (self.borrowed != null and self.borrowed.?.load(.acquire)) or
+            (self.borrowed_context != null and self.borrowed_is_cancelled.?(self.borrowed_context.?));
     }
 
     /// The listener installs at most one cancellation source per transport:

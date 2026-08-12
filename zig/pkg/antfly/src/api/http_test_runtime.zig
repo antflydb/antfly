@@ -83,6 +83,7 @@ pub const Runtime = struct {
     server: *httpx.Server,
     handler: *httpx_handler.AntflyApiHandler,
     listener_task: *httpx.ListenerTask,
+    owns_io: bool = true,
     active: bool = true,
 
     pub fn initStopped(alloc: std.mem.Allocator) Runtime {
@@ -92,6 +93,7 @@ pub const Runtime = struct {
             .server = undefined,
             .handler = undefined,
             .listener_task = undefined,
+            .owns_io = false,
             .active = false,
         };
     }
@@ -101,7 +103,23 @@ pub const Runtime = struct {
         errdefer alloc.destroy(io_impl);
         io_impl.* = std.Io.Threaded.init(alloc, .{});
         errdefer io_impl.deinit();
+        return startWithIo(alloc, io_impl, api, true);
+    }
 
+    pub fn startShared(
+        alloc: std.mem.Allocator,
+        io_impl: *std.Io.Threaded,
+        api: *http_server.ApiHttpServer,
+    ) !Runtime {
+        return startWithIo(alloc, io_impl, api, false);
+    }
+
+    fn startWithIo(
+        alloc: std.mem.Allocator,
+        io_impl: *std.Io.Threaded,
+        api: *http_server.ApiHttpServer,
+        owns_io: bool,
+    ) !Runtime {
         const handler = try alloc.create(httpx_handler.AntflyApiHandler);
         errdefer alloc.destroy(handler);
         handler.* = .{ .api_server = api };
@@ -134,6 +152,7 @@ pub const Runtime = struct {
             .server = server,
             .handler = handler,
             .listener_task = listener_task,
+            .owns_io = owns_io,
         };
     }
 
@@ -154,8 +173,10 @@ pub const Runtime = struct {
         self.alloc.destroy(self.server);
         self.handler.deinitRuntime();
         self.alloc.destroy(self.handler);
-        self.io_impl.deinit();
-        self.alloc.destroy(self.io_impl);
+        if (self.owns_io) {
+            self.io_impl.deinit();
+            self.alloc.destroy(self.io_impl);
+        }
         self.* = undefined;
     }
 };

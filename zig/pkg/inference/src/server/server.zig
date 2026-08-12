@@ -8032,12 +8032,12 @@ pub const Node = struct {
             model_name: []const u8,
             allocator: std.mem.Allocator,
             parser: ?*tool_parser_mod.Parser,
-            cancellation: ?*const std.atomic.Value(bool),
+            request_context: *const httpx.Context,
             errored: bool = false,
 
             fn shouldContinue(raw_ctx: *anyopaque) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
-                return generationStreamShouldContinue(stream.errored, stream.cancellation);
+                return !stream.errored and !stream.request_context.isCancellationRequested();
             }
 
             fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
@@ -8085,7 +8085,7 @@ pub const Node = struct {
             .model_name = model_name,
             .allocator = ctx.allocator,
             .parser = tool_parser,
-            .cancellation = ctx.cancellation,
+            .request_context = ctx,
         };
 
         if (comptime @hasField(@TypeOf(pipeline.*), "continue_ctx") and

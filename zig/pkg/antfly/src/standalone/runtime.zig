@@ -2444,6 +2444,8 @@ fn serveUnifiedInner(
 const LinkedInferenceRoute = struct {
     functions: *const inference_bridge.FunctionTable,
     kernel_route_handle: *anyopaque,
+    request_body: runtime_http_abi.RequestBodyMode,
+    streaming_response: bool,
 };
 
 fn registerLinkedInferenceManifest(
@@ -2469,6 +2471,8 @@ fn registerLinkedInferenceManifest(
         route.* = .{
             .functions = functions,
             .kernel_route_handle = entry.route_handle,
+            .request_body = entry.request_body,
+            .streaming_response = entry.streaming_response != 0,
         };
         try owned_routes.append(alloc, route);
         errdefer _ = owned_routes.pop();
@@ -2483,6 +2487,7 @@ fn registerLinkedInferenceManifest(
 
 fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     const route: *const LinkedInferenceRoute = @ptrCast(@alignCast(context.route_data orelse return error.InferenceRuntimeUnavailable));
+    if (route.request_body == .buffered) _ = try context.body();
     const source_headers = context.request.headers.iterator();
     const headers = try context.allocator.alloc(runtime_http_abi.HeaderView, source_headers.len);
     defer context.allocator.free(headers);
@@ -2519,12 +2524,15 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .authorization = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Authorization")),
         .content_type = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
     };
+    var transport = @import("../runtime_http_bridge.zig").Outbound{ .context = context };
     var response_handle: ?*anyopaque = null;
     var response_view: runtime_http_abi.HttpResponseView = undefined;
     const status = route.functions.handle_http(&.{
         .abi_version = inference_bridge.abi_version,
         .route_handle = route.kernel_route_handle,
         .request = &request_view,
+        .cancellation = transport.cancellation(),
+        .stream = if (route.streaming_response) transport.stream() else .{},
         .out_response_handle = &response_handle,
         .out_response = &response_view,
     });

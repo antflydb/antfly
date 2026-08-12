@@ -926,6 +926,22 @@ The API-kernel archive owns operation implementation. This keeps
 `httpx.Server`, Zig error sets, and unstable Zig layouts out of the ABI while
 preserving the compiler-memory benefit of independent code generation.
 
+The linked API and inference manifests now carry buffered-body and streaming-
+response policy. Before crossing the archive boundary, the listener buffers a
+deferred HTTP/2 body only when the matched route requires it. Each dispatch
+also receives request-scoped cancellation and streaming callback views. The
+archive reconstructs an `httpx.Context` with transport-neutral delegates, so
+an inference SSE handler can start, write, and close the original listener's
+HTTP/1 chunked stream or HTTP/2 DATA stream without sharing socket or
+connection layouts across the ABI. The same callback cancellation source is
+used by operation contexts and inference generation loops.
+
+Production request accounting happens inside linked dispatch, where the API
+kernel owns the metric, rather than relying on direct-registration middleware
+that is absent from opaque builds. ABI versions were advanced with these
+layout changes; old callers fail prefix validation rather than interpreting a
+new structure with an old layout.
+
 Passing an opaque server pointer may remain as a same-toolchain migration step,
 but it is not the final ABI contract. Kernel-created objects must still be
 destroyed by the archive and allocator that created them.
@@ -1036,10 +1052,14 @@ The branch completed the migration in this order:
 12. Audited long-lived background work and retained explicit OS threads only
     where they remain owned, stopped, and joined.
 13. Hardened the API-kernel and linked-inference boundaries with versioned
-    function tables, owned route manifests, prefix validation, and duplicate
-    route rejection.
+    function tables, owned route manifests, route body/stream metadata,
+    request-scoped cancellation and streaming sinks, prefix validation, and
+    duplicate route rejection.
 14. Added lifecycle, routing, cancellation, shutdown, ABI, restart, and
     resource-leak tests plus linked native and ARM64 Linux build coverage.
+15. Migrated public API simulation fixtures from compatibility executors to
+    shared-I/O `httpx` runtimes and made Windows listener reuse retain the
+    platform's exclusive bind default.
 
 Each migration should preserve a strict stop-and-await-before-deinit invariant.
 Executor backend changes should occur only after the blocking and cancellation

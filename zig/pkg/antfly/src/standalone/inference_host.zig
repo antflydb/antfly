@@ -22,6 +22,8 @@ const inference = @import("inference_server");
 const inference_bridge = @import("inference_bridge.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const platform_sync = @import("antfly_platform").sync;
+const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const inference_api = @import("inference_api");
 
 pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
@@ -476,6 +478,7 @@ const ManifestServer = struct {
     owner: *LinkedInferenceState,
 
     fn register(self: *const ManifestServer, method: http_abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
+        const metadata = routeMetadata(method, path);
         self.owner.route_validator.add(switch (method) {
             .get => .GET,
             .post => .POST,
@@ -498,6 +501,8 @@ const ManifestServer = struct {
             .route_handle = route,
             .method = method,
             .path = http_abi.Bytes.init(path),
+            .request_body = metadata.request_body,
+            .streaming_response = @intFromBool(metadata.streaming_response),
         });
     }
 
@@ -517,6 +522,41 @@ const ManifestServer = struct {
         try self.register(.delete, path, handler);
     }
 };
+
+const RouteMetadata = struct {
+    request_body: http_abi.RequestBodyMode,
+    streaming_response: bool,
+};
+
+fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
+    const method_name = switch (method) {
+        .get => "GET",
+        .post => "POST",
+        .put => "PUT",
+        .delete => "DELETE",
+    };
+    const relative_path = if (std.mem.startsWith(u8, path, inference.server.public_api_prefix))
+        path[inference.server.public_api_prefix.len..]
+    else if (std.mem.startsWith(u8, path, inference.server.ai_api_prefix))
+        path[inference.server.ai_api_prefix.len..]
+    else
+        path;
+    for (inference_api.server.routes) |route| {
+        if (std.mem.eql(u8, route.method, method_name) and std.mem.eql(u8, route.path, relative_path)) {
+            return .{
+                .request_body = switch (route.request_body) {
+                    .none => .none,
+                    .buffered => .buffered,
+                },
+                .streaming_response = route.streaming_response,
+            };
+        }
+    }
+    return .{
+        .request_body = if (method == .get) .none else .buffered,
+        .streaming_response = false,
+    };
+}
 
 const DirectServer = struct {
     owner: *LinkedInferenceState,
@@ -591,6 +631,7 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
     var http_context = httpx.Context.init(alloc, state.io_impl.io(), &http_request);
     defer http_context.deinit();
     http_context.params = params;
+    runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.stream);
     var response = try route.handler.invoke(&http_context);
     errdefer response.deinit();
 

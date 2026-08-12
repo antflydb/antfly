@@ -13,6 +13,17 @@ pub const HttpMethod = enum(c_int) {
     delete,
 };
 
+pub const RequestBodyMode = enum(c_int) {
+    none,
+    buffered,
+};
+
+pub const CallbackStatus = enum(c_int) {
+    ok,
+    failed,
+    canceled,
+};
+
 pub const Bytes = extern struct {
     ptr: [*]const u8,
     len: usize,
@@ -64,6 +75,28 @@ pub const HttpRequestView = extern struct {
     content_type: OptionalBytes = .{},
 };
 
+/// Transport-owned request lifetime state. The callback and its context are
+/// borrowed only for the synchronous handler invocation.
+pub const CancellationView = extern struct {
+    context: ?*const anyopaque = null,
+    is_cancelled: ?*const fn (?*const anyopaque) callconv(.c) u8 = null,
+
+    pub fn requested(self: CancellationView) bool {
+        const callback = self.is_cancelled orelse return false;
+        return callback(self.context) != 0;
+    }
+};
+
+/// Transport-owned response sink used by independently generated handlers.
+/// `start` publishes SSE response headers, `write` transfers one body chunk,
+/// and `close` commits the terminating frame. Callbacks are request-scoped.
+pub const StreamSink = extern struct {
+    context: ?*anyopaque = null,
+    start: ?*const fn (?*anyopaque, u16) callconv(.c) CallbackStatus = null,
+    write: ?*const fn (?*anyopaque, Bytes) callconv(.c) CallbackStatus = null,
+    close: ?*const fn (?*anyopaque) callconv(.c) CallbackStatus = null,
+};
+
 pub const HttpResponseView = extern struct {
     status: u16 = 500,
     content_type: OptionalBytes = .{},
@@ -77,4 +110,6 @@ test "runtime HTTP values retain C layout" {
     try std.testing.expectEqual(.@"extern", @typeInfo(Bytes).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(HttpRequestView).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(HttpResponseView).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(CancellationView).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(StreamSink).@"struct".layout);
 }

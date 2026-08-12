@@ -15972,6 +15972,7 @@ test "api http plain public query preserves outer absolute request deadline" {
         null,
         outer_deadline_ns,
         .{ .domain = .internal, .value = "test" },
+        null,
     );
     defer response.deinit(alloc);
     try std.testing.expectEqualStrings("{\"hits\":[],\"total\":0}", response.json);

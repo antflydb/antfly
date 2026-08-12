@@ -1012,7 +1012,11 @@ fn listenWithOptions(addr: Address, io: Io, options: TcpListener.ListenOptions) 
         if (options.reuse_port) return error.OptionUnsupported;
         return try addr.listen(io, .{
             .kernel_backlog = options.kernel_backlog,
-            .reuse_address = options.reuse_address,
+            // Windows SO_REUSEADDR permits a second live bind and is not the
+            // POSIX restart-only semantic promised by this API. std.Io does
+            // not expose SO_EXCLUSIVEADDRUSE for its AFD listener, so retain
+            // the secure Windows default by never enabling address reuse.
+            .reuse_address = if (comptime is_windows) false else options.reuse_address,
         });
     }
     return try listenPosix(addr, io, options);

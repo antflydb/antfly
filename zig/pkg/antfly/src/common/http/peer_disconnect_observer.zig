@@ -83,9 +83,16 @@ pub const Observer = struct {
         expirations_total: ?*std.atomic.Value(u64),
     };
 
+    const ProbeAction = struct {
+        cancellation: *http_common.RequestCancellation,
+        context: *const anyopaque,
+        is_cancelled: *const fn (*const anyopaque) bool,
+    };
+
     const Action = union(enum) {
         peer: PeerAction,
         deadline: DeadlineAction,
+        probe: ProbeAction,
     };
 
     const Entry = struct {
@@ -244,6 +251,38 @@ pub const Observer = struct {
         return .{ .observer = self, .id = id };
     }
 
+    /// Mirrors a transport-neutral cancellation callback into the atomic
+    /// request signal still consumed by storage and search internals. Probe
+    /// registrations share this observer's one bounded owner thread.
+    pub fn registerProbe(
+        self: *Observer,
+        cancellation: *http_common.RequestCancellation,
+        context: *const anyopaque,
+        is_cancelled: *const fn (*const anyopaque) bool,
+    ) !Registration {
+        if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding)
+            return error.ObserverUnavailable;
+        if (self.thread == null or self.stopping.load(.acquire)) return error.ObserverUnavailable;
+
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.stopping.load(.acquire)) return error.ObserverUnavailable;
+        if (self.entries.items.len >= self.capacity) return error.ObserverCapacityExceeded;
+
+        const id = self.nextId();
+        self.entries.appendAssumeCapacity(.{
+            .id = id,
+            .fd = 0,
+            .action = .{ .probe = .{
+                .cancellation = cancellation,
+                .context = context,
+                .is_cancelled = is_cancelled,
+            } },
+        });
+        _ = self.active_count.fetchAdd(1, .release);
+        return .{ .observer = self, .id = id };
+    }
+
     pub fn activeCount(self: *const Observer) usize {
         return self.active_count.load(.acquire);
     }
@@ -324,10 +363,12 @@ pub const Observer = struct {
             if (ready > 0) {
                 platform_sync.lockYielding(&self.mutex);
                 self.processPollEventsLocked(fds.items, ids.items);
+                self.checkProbesLocked();
                 self.expireDeadlinesLocked();
                 self.mutex.unlock();
             } else {
                 platform_sync.lockYielding(&self.mutex);
+                self.checkProbesLocked();
                 self.expireDeadlinesLocked();
                 self.mutex.unlock();
             }
@@ -388,6 +429,7 @@ pub const Observer = struct {
                     self.peekEntryLocked(index);
                 }
             }
+            self.checkProbesLocked();
             self.expireDeadlinesLocked();
             self.mutex.unlock();
         }
@@ -452,7 +494,7 @@ pub const Observer = struct {
         const entry = self.entries.items[index];
         const peer = switch (entry.action) {
             .peer => |value| value,
-            .deadline => unreachable,
+            .deadline, .probe => unreachable,
         };
         if (peer_disconnect) {
             if (peer.peer_disconnects_total) |counter| _ = counter.fetchAdd(1, .monotonic);
@@ -478,6 +520,10 @@ pub const Observer = struct {
                     index += 1;
                     continue;
                 },
+                .probe => {
+                    index += 1;
+                    continue;
+                },
             };
             if (now_ns < deadline.expires_at_ns) {
                 index += 1;
@@ -487,6 +533,25 @@ pub const Observer = struct {
             _ = self.deadline_expirations_total.fetchAdd(1, .monotonic);
             if (deadline.expirations_total) |counter| _ = counter.fetchAdd(1, .monotonic);
             _ = std.c.shutdown(entry.fd, std.c.SHUT.RDWR);
+            self.removeEntryLocked(index);
+        }
+    }
+
+    fn checkProbesLocked(self: *Observer) void {
+        var index: usize = 0;
+        while (index < self.entries.items.len) {
+            const probe = switch (self.entries.items[index].action) {
+                .probe => |value| value,
+                else => {
+                    index += 1;
+                    continue;
+                },
+            };
+            if (!probe.is_cancelled(probe.context)) {
+                index += 1;
+                continue;
+            }
+            probe.cancellation.cancel();
             self.removeEntryLocked(index);
         }
     }
@@ -501,6 +566,7 @@ pub const Observer = struct {
             .deadline => {
                 _ = self.active_deadline_count.fetchSub(1, .release);
             },
+            .probe => {},
         }
         _ = self.entries.swapRemove(index);
         _ = self.active_count.fetchSub(1, .release);
@@ -515,6 +581,10 @@ pub const Observer = struct {
                 .deadline => |deadline| {
                     deadline.state.state.store(.observer_failed, .release);
                     _ = std.c.shutdown(entry.fd, std.c.SHUT.RDWR);
+                    self.removeEntryLocked(index);
+                },
+                .probe => |probe| {
+                    probe.cancellation.cancel();
                     self.removeEntryLocked(index);
                 },
             }
@@ -559,6 +629,34 @@ test "std http listener multiplexed peer observer cancels many disconnected sock
         sleepMs(5);
     }
     for (&cancellations) |*signal| try std.testing.expect(signal.isCancelled());
+}
+
+test "peer observer mirrors transport-neutral cancellation probes" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+    var observer = Observer.init(std.testing.allocator, 1);
+    try observer.start();
+    defer observer.deinit();
+
+    var source = std.atomic.Value(bool).init(false);
+    var cancellation: http_common.RequestCancellation = .{};
+    var registration = try observer.registerProbe(
+        &cancellation,
+        &source,
+        struct {
+            fn call(raw: *const anyopaque) bool {
+                const value: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+                return value.load(.acquire);
+            }
+        }.call,
+    );
+    defer registration.deinit();
+
+    source.store(true, .release);
+    for (0..400) |_| {
+        if (cancellation.isCancelled()) break;
+        sleepMs(5);
+    }
+    try std.testing.expect(cancellation.isCancelled());
 }
 
 test "std http listener peer observer sees FIN behind unread bytes without consuming them" {

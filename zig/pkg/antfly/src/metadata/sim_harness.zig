@@ -27,6 +27,7 @@ const metadata_storage = @import("storage/mod.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const api_http_client = @import("../api/http_client.zig");
+const api_http_test_runtime = @import("../api/http_test_runtime.zig");
 const api_http_routes = @import("../api/http_routes.zig");
 const api_http_server = @import("../api/http_server.zig");
 const backups_api = @import("../api/backups.zig");
@@ -52,7 +53,6 @@ const raft_engine = @import("raft_engine");
 const data_mod = @import("../data/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const common_config = @import("../common/config.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
@@ -67,10 +67,6 @@ const LeanSimAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 // Public API simulations can open DBs and hosted indexes from the listener
 // request thread; keep enough stack for that Linux CI path.
 const lean_sim_thread_stack_size = 4 * 1024 * 1024;
-const lean_sim_http_listener_cfg = std_http_listener.StdHttpListenerConfig{
-    .thread_stack_size = lean_sim_thread_stack_size,
-};
-
 fn leanSimHttpAllocator() std.mem.Allocator {
     return std.heap.smp_allocator;
 }
@@ -4943,7 +4939,7 @@ fn startPublicApiServers(
     roots: *const [N][]const u8,
     metadata_snapshot_mode: PublicApiStatusSource.MetadataSnapshotMode,
     forward_executor: *std_http_executor.StdHttpExecutor,
-    listeners: *[N]std_http_listener.StdHttpListener,
+    listeners: *[N]api_http_test_runtime.Runtime,
     servers: *[N]api_http_server.ApiHttpServer,
     status_sources: *[N]PublicApiStatusSource,
     catalog_sources: *[N]PublicApiCatalogSource,
@@ -4991,8 +4987,7 @@ fn startPublicApiServers(
             read_sources[i].source(),
             write_sources[i].source(),
         );
-        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), shared_io);
-        try listeners[i].start();
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, shared_io, &servers[i]);
         started += 1;
     }
 
@@ -5026,7 +5021,7 @@ fn deinitPublicApiServers(comptime N: usize, servers: *[N]api_http_server.ApiHtt
 
 fn deinitPublicApiStack(
     comptime N: usize,
-    listeners: *[N]std_http_listener.StdHttpListener,
+    listeners: *[N]api_http_test_runtime.Runtime,
     servers: *[N]api_http_server.ApiHttpServer,
     write_sources: *[N]api_table_writes.HostedProvisionedTableWriteSource,
 ) void {
@@ -5039,7 +5034,7 @@ fn PublicApiTestRig(comptime N: usize) type {
     return struct {
         alloc: std.mem.Allocator,
         http_io: std.Io.Threaded,
-        listeners: [N]std_http_listener.StdHttpListener = undefined,
+        listeners: [N]api_http_test_runtime.Runtime = undefined,
         servers: [N]api_http_server.ApiHttpServer = undefined,
         status_sources: [N]PublicApiStatusSource = undefined,
         catalog_sources: [N]PublicApiCatalogSource = undefined,
@@ -6258,7 +6253,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     defer deinitMetadataAdminServers(4, &metadata_admin_servers);
     defer for (metadata_apis) |uri| sim_alloc.free(uri);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -6458,7 +6453,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     defer deinitMetadataAdminServers(4, &metadata_admin_servers);
     defer for (metadata_apis) |uri| sim_alloc.free(uri);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -9840,7 +9835,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
-    var listeners: [3]std_http_listener.StdHttpListener = undefined;
+    var listeners: [3]api_http_test_runtime.Runtime = undefined;
     var servers: [3]api_http_server.ApiHttpServer = undefined;
     var status_sources: [3]TestStatusSource = undefined;
     var catalog_sources: [3]TestCatalogSource = undefined;
@@ -9882,8 +9877,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
             read_sources[i].source(),
             write_sources[i].source(),
         );
-        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
-        try listeners[i].start();
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
@@ -10125,7 +10119,7 @@ test "metadata http cluster simulation forwards public table io across split ran
     var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
-    var listeners: [3]std_http_listener.StdHttpListener = undefined;
+    var listeners: [3]api_http_test_runtime.Runtime = undefined;
     var servers: [3]api_http_server.ApiHttpServer = undefined;
     var status_sources: [3]TestStatusSource = undefined;
     var catalog_sources: [3]TestCatalogSource = undefined;
@@ -10159,8 +10153,7 @@ test "metadata http cluster simulation forwards public table io across split ran
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
-        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
-        try listeners[i].start();
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
@@ -10409,7 +10402,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
-    var listeners: [3]std_http_listener.StdHttpListener = undefined;
+    var listeners: [3]api_http_test_runtime.Runtime = undefined;
     var servers: [3]api_http_server.ApiHttpServer = undefined;
     var status_sources: [3]TestStatusSource = undefined;
     var catalog_sources: [3]TestCatalogSource = undefined;
@@ -10443,8 +10436,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
-        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
-        try listeners[i].start();
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
@@ -11481,7 +11473,7 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     defer http_io.deinit();
     var status_sources: [3]PublicApiStatusSource = undefined;
     var servers: [3]api_http_server.ApiHttpServer = undefined;
-    var listeners: [3]std_http_listener.StdHttpListener = undefined;
+    var listeners: [3]api_http_test_runtime.Runtime = undefined;
     var started: usize = 0;
     defer {
         for (listeners[0..started]) |*listener| listener.deinit();
@@ -11500,13 +11492,11 @@ test "metadata http cluster simulation load balanced backup retries a real elect
             null,
             writes[index].source(),
         );
-        listeners[index] = std_http_listener.StdHttpListener.initShared(
+        listeners[index] = try api_http_test_runtime.Runtime.startShared(
             leanSimHttpAllocator(),
-            lean_sim_http_listener_cfg,
-            servers[index].executor(),
             &http_io,
+            &servers[index],
         );
-        try listeners[index].start();
         started += 1;
     }
     var api_base_uris: [3][]u8 = undefined;

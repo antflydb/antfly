@@ -232,6 +232,14 @@ pub const Context = struct {
     /// Borrowed stream-local peer-cancellation signal for HTTP/2. Null for
     /// HTTP/1 where adapters may install their own socket watcher.
     cancellation: ?*const std.atomic.Value(bool) = null,
+    /// Optional transport-neutral cancellation source installed by adapters
+    /// that cannot expose their concrete listener state to the handler.
+    cancellation_probe: ?CancellationProbe = null,
+
+    /// Optional transport-neutral streaming sink. Linked runtime adapters use
+    /// this to preserve incremental response delivery without sharing socket
+    /// or HTTP/2 connection representations across a code-generation ABI.
+    stream_delegate: ?StreamDelegate = null,
 
     /// Streaming body reader for HTTP/2 requests where the body arrives
     /// incrementally (dispatch-on-HEADERS mode). Null for HTTP/1.1 or
@@ -245,6 +253,22 @@ pub const Context = struct {
     };
 
     const Self = @This();
+
+    pub const CancellationProbe = struct {
+        ptr: ?*const anyopaque,
+        is_cancelled: *const fn (?*const anyopaque) bool,
+
+        pub fn requested(self: CancellationProbe) bool {
+            return self.is_cancelled(self.ptr);
+        }
+    };
+
+    pub const StreamDelegate = struct {
+        ptr: ?*anyopaque,
+        start: *const fn (?*anyopaque, u16) anyerror!void,
+        write: *const fn (?*anyopaque, []const u8) anyerror!void,
+        close: *const fn (?*anyopaque) anyerror!void,
+    };
 
     /// Creates a new context for a request.
     pub fn init(allocator: Allocator, io: Io, req: *Request) Self {
@@ -551,6 +575,14 @@ pub const Context = struct {
         return null;
     }
 
+    pub fn isCancellationRequested(self: *const Self) bool {
+        if (self.cancellation) |signal| {
+            if (signal.load(.acquire)) return true;
+        }
+        if (self.cancellation_probe) |probe| return probe.requested();
+        return false;
+    }
+
     fn bodyFramingRequiresEndStream(self: *const Self) bool {
         if (self.request.headers.get(HeaderName.TRANSFER_ENCODING) != null) return true;
         const content_length = self.request.headers.getContentLength() orelse return false;
@@ -651,6 +683,7 @@ pub const Context = struct {
     pub const StreamWriter = struct {
         h1_sock: ?*Socket,
         h2_writer: ?H2StreamWriter,
+        delegate: ?StreamDelegate = null,
         closed: bool = false,
 
         /// Sends a chunk of data to the client.
@@ -658,7 +691,9 @@ pub const Context = struct {
             if (self.closed) return error.StreamClosed;
             if (data.len == 0) return;
 
-            if (self.h2_writer) |*w| {
+            if (self.delegate) |delegate| {
+                try delegate.write(delegate.ptr, data);
+            } else if (self.h2_writer) |*w| {
                 try w.write(data);
             } else if (self.h1_sock) |sock| {
                 // Write one HTTP/1.1 chunked frame: hex-size CRLF data CRLF
@@ -675,7 +710,9 @@ pub const Context = struct {
             if (self.closed) return;
             self.closed = true;
 
-            if (self.h2_writer) |*w| {
+            if (self.delegate) |delegate| {
+                try delegate.close(delegate.ptr);
+            } else if (self.h2_writer) |*w| {
                 try w.close();
             } else if (self.h1_sock) |sock| {
                 // Terminating chunk: "0\r\n\r\n"
@@ -758,6 +795,10 @@ pub const Context = struct {
     /// return ctx.response.build(); // return value is ignored for streams
     /// ```
     pub fn streamResponse(self: *Self, status_code: u16) !StreamWriter {
+        if (self.stream_delegate) |delegate| {
+            try delegate.start(delegate.ptr, status_code);
+            return .{ .h1_sock = null, .h2_writer = null, .delegate = delegate };
+        }
         if (self.h2 != null) {
             // HTTP/2 path — delegate to existing streamH2
             const h2w = try self.streamH2(status_code, &.{

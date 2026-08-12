@@ -24,6 +24,10 @@ const backend_erased = @import("../storage/backend_erased.zig");
 const ha_http_operation = @import("../storage/ha/http_operation.zig");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
+const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const metadata_openapi = @import("antfly_metadata_openapi");
+const usermgr_openapi = @import("antfly_usermgr_openapi");
+const http_common = @import("../common/http/http_common.zig");
 
 pub const CreateContext = abi.CreateContext;
 pub const CallContext = abi.CallContext;
@@ -49,6 +53,7 @@ const HandlerState = struct {
 const RouteState = struct {
     owner: *HandlerState,
     handler: httpx.Handler,
+    requires_cancellation_signal: bool,
 };
 
 const HttpResponseState = struct {
@@ -357,6 +362,14 @@ pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi
     var http_context = httpx.Context.init(alloc, io_impl.io(), &http_request);
     defer http_context.deinit();
     http_context.params = params;
+    runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.stream);
+    var cancellation: http_common.RequestCancellation = .{};
+    var cancellation_registration: handler_mod.PeerObserver.Registration = .{};
+    if (route.requires_cancellation_signal) {
+        state.handler.installLinkedCancellationMirror(&http_context, &cancellation, &cancellation_registration) catch |err| return fail(err);
+    }
+    defer cancellation_registration.deinit();
+    state.handler.api_server.recordHandledRequest();
     var response = route.handler.invoke(&http_context) catch |err| return fail(err);
     errdefer response.deinit();
 
@@ -443,6 +456,7 @@ fn ManifestServer(comptime prefix: []const u8) type {
         owner: *HandlerState,
 
         fn register(self: *const @This(), method: abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
+            const metadata = routeMetadata(method, path);
             self.owner.route_validator.add(switch (method) {
                 .get => .GET,
                 .post => .POST,
@@ -458,13 +472,24 @@ fn ManifestServer(comptime prefix: []const u8) type {
             };
             const route = try self.owner.alloc.create(RouteState);
             errdefer self.owner.alloc.destroy(route);
-            route.* = .{ .owner = self.owner, .handler = handler };
+            route.* = .{
+                .owner = self.owner,
+                .handler = handler,
+                .requires_cancellation_signal = metadata.streaming_response or
+                    std.mem.eql(u8, path, "/query") or
+                    std.mem.endsWith(u8, path, "/query") or
+                    std.mem.indexOf(u8, path, "/query-") != null or
+                    std.mem.indexOf(u8, path, "/vector-worker") != null or
+                    std.mem.indexOf(u8, path, "/graph-") != null,
+            };
             try self.owner.routes.append(self.owner.alloc, route);
             errdefer _ = self.owner.routes.pop();
             try self.owner.route_manifest.append(self.owner.alloc, .{
                 .route_handle = route,
                 .method = method,
                 .path = abi.Bytes.init(prefix ++ path),
+                .request_body = metadata.request_body,
+                .streaming_response = @intFromBool(metadata.streaming_response),
             });
         }
 
@@ -484,4 +509,58 @@ fn ManifestServer(comptime prefix: []const u8) type {
             try self.register(.delete, path, handler);
         }
     };
+}
+
+const RouteMetadata = struct {
+    request_body: abi.RequestBodyMode,
+    streaming_response: bool,
+};
+
+fn routeMetadata(method: abi.HttpMethod, path: []const u8) RouteMetadata {
+    const method_name = switch (method) {
+        .get => "GET",
+        .post => "POST",
+        .put => "PUT",
+        .delete => "DELETE",
+    };
+    inline for (.{ metadata_openapi.server.routes, usermgr_openapi.server.routes }) |routes| {
+        for (routes) |route| {
+            if (std.mem.eql(u8, route.method, method_name) and metadataPathMatches(route.path, path)) {
+                return .{
+                    .request_body = switch (route.request_body) {
+                        .none => .none,
+                        .buffered => .buffered,
+                    },
+                    .streaming_response = route.streaming_response,
+                };
+            }
+        }
+    }
+    // Contextual routes predate generated metadata. Conservatively buffer
+    // mutating methods; body-less operations remain correct and future manual
+    // handlers cannot accidentally observe a partial H2 body.
+    return .{
+        .request_body = if (method == .get) .none else .buffered,
+        .streaming_response = false,
+    };
+}
+
+fn metadataPathMatches(metadata_path: []const u8, registered_path: []const u8) bool {
+    var metadata_index: usize = 0;
+    var registered_index: usize = 0;
+    while (metadata_index < metadata_path.len and registered_index < registered_path.len) {
+        if (metadata_path[metadata_index] == '{') {
+            if (registered_path[registered_index] != ':') return false;
+            const close = std.mem.indexOfScalarPos(u8, metadata_path, metadata_index + 1, '}') orelse return false;
+            const name = metadata_path[metadata_index + 1 .. close];
+            if (!std.mem.startsWith(u8, registered_path[registered_index + 1 ..], name)) return false;
+            metadata_index = close + 1;
+            registered_index += name.len + 1;
+            continue;
+        }
+        if (metadata_path[metadata_index] != registered_path[registered_index]) return false;
+        metadata_index += 1;
+        registered_index += 1;
+    }
+    return metadata_index == metadata_path.len and registered_index == registered_path.len;
 }

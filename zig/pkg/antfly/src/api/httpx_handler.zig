@@ -21,7 +21,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const http_common = @import("../raft/transport/http_common.zig");
-const PeerObserver = @import("../common/http/peer_disconnect_observer.zig").Observer;
+pub const PeerObserver = @import("../common/http/peer_disconnect_observer.zig").Observer;
 const http_route_helpers = @import("http_route_helpers.zig");
 const http_server_mod = @import("http_server.zig");
 const operation_contract = @import("operation.zig");
@@ -789,16 +789,59 @@ pub const AntflyApiHandler = struct {
 
     fn operationContext(ctx: *httpx.Context, identity: ?AuthenticatedIdentity) operation_contract.RequestContext {
         return .{
-            .cancellation = if (ctx.cancellation) |signal|
-                operation_contract.CancellationToken.fromAtomic(signal)
-            else
-                .none,
+            .cancellation = if (ctx.cancellation != null or ctx.cancellation_probe != null) .{
+                .ptr = ctx,
+                .is_cancelled_fn = struct {
+                    fn call(raw: *const anyopaque) bool {
+                        const context: *const httpx.Context = @ptrCast(@alignCast(raw));
+                        return context.isCancellationRequested();
+                    }
+                }.call,
+            } else .none,
             .request_id = ctx.header("x-request-id") orelse "",
             .principal = if (identity) |authenticated| .{
                 .kind = .user,
                 .subject = authenticated.username,
             } else null,
         };
+    }
+
+    fn requestCancellation(ctx: *const httpx.Context) http_common.RequestCancellation {
+        return .{
+            .borrowed = ctx.cancellation,
+            .borrowed_context = if (ctx.cancellation_probe != null) ctx else null,
+            .borrowed_is_cancelled = if (ctx.cancellation_probe != null) struct {
+                fn call(raw: *const anyopaque) bool {
+                    const context: *const httpx.Context = @ptrCast(@alignCast(raw));
+                    return context.isCancellationRequested();
+                }
+            }.call else null,
+        };
+    }
+
+    /// Linked adapters expose cancellation as an ABI callback. Mirror that
+    /// callback through the existing multiplexed observer so older storage and
+    /// search internals that borrow an atomic signal retain cancellation too.
+    pub fn installLinkedCancellationMirror(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        cancellation: *http_common.RequestCancellation,
+        registration: *PeerObserver.Registration,
+    ) !void {
+        if (ctx.cancellation_probe == null) return;
+        if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+        const observer = if (self.peer_observer) |*value| value else return error.ObserverUnavailable;
+        registration.* = try observer.registerProbe(
+            cancellation,
+            ctx,
+            struct {
+                fn call(raw: *const anyopaque) bool {
+                    const context: *const httpx.Context = @ptrCast(@alignCast(raw));
+                    return context.isCancellationRequested();
+                }
+            }.call,
+        );
+        ctx.cancellation = cancellation.signal();
     }
 
     fn probeOperations(self: *AntflyApiHandler) probe_operations.Operations {
@@ -3293,7 +3336,7 @@ pub const AntflyApiHandler = struct {
         // slow ingress and query compute cannot starve one another.
         if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
         defer self.query_admission.release();
-        var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
+        var cancellation = requestCancellation(ctx);
         var peer_registration: PeerObserver.Registration = .{};
         self.startPeerCancellationWatcher(ctx, &cancellation, &peer_registration) catch
             return queryCancellationUnavailableResponse(ctx);
@@ -3829,7 +3872,7 @@ pub const AntflyApiHandler = struct {
         };
         if (!self.query_admission.tryAcquire()) return queryOverloadedResponse(ctx);
         defer self.query_admission.release();
-        var cancellation = http_common.RequestCancellation{ .borrowed = ctx.cancellation };
+        var cancellation = requestCancellation(ctx);
         var peer_registration: PeerObserver.Registration = .{};
         self.startPeerCancellationWatcher(ctx, &cancellation, &peer_registration) catch
             return queryCancellationUnavailableResponse(ctx);

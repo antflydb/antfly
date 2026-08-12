@@ -19,7 +19,7 @@
 const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 
-pub const abi_version: u32 = 4;
+pub const abi_version: u32 = 5;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -147,6 +147,8 @@ pub const RouteManifestEntry = extern struct {
     route_handle: *anyopaque,
     method: http_abi.HttpMethod,
     path: http_abi.Bytes,
+    request_body: http_abi.RequestBodyMode,
+    streaming_response: u8,
 };
 
 pub const RouteManifestContext = extern struct {
@@ -162,6 +164,8 @@ pub const HttpHandleContext = extern struct {
     struct_size: u32 = @sizeOf(@This()),
     route_handle: *anyopaque,
     request: *const http_abi.HttpRequestView,
+    cancellation: http_abi.CancellationView = .{},
+    stream: http_abi.StreamSink = .{},
     out_response_handle: *?*anyopaque,
     out_response: *http_abi.HttpResponseView,
 };
