@@ -36,13 +36,38 @@ def manifest_sources(root: Path, manifest: Path) -> list[Path]:
     return [(manifest.parent / imported).resolve() for imported in imports]
 
 
-def audit_manifest(root: Path, manifest: Path, filters: Sequence[str]) -> list[str]:
+def audit_manifest(
+    root: Path,
+    manifest: Path,
+    filters: Sequence[str],
+    dedicated_sources: Sequence[Path] = (),
+) -> list[str]:
     root = root.resolve()
     manifest = manifest.resolve()
     declared = {source.resolve(): names for source, names in test_modules(root)}
     imported = manifest_sources(root, manifest)
     counts = Counter(imported)
     failures: list[str] = []
+
+    dedicated_counts = Counter(
+        (source if source.is_absolute() else root / source).resolve()
+        for source in dedicated_sources
+    )
+    for source, count in sorted(dedicated_counts.items(), key=lambda item: str(item[0])):
+        try:
+            relative = source.relative_to(root)
+        except ValueError:
+            failures.append(f"dedicated test source escapes storage root: {source}")
+            continue
+        if not source.is_file():
+            failures.append(f"dedicated test source does not exist: {relative}")
+            continue
+        if count != 1:
+            failures.append(f"dedicated test source listed {count} times: {relative}")
+        if source not in declared:
+            failures.append(f"dedicated test source has no test declarations: {relative}")
+        if counts.get(source, 0) != 0:
+            failures.append(f"dedicated test source also imported by manifest: {relative}")
 
     for source, count in sorted(counts.items(), key=lambda item: str(item[0])):
         try:
@@ -60,6 +85,8 @@ def audit_manifest(root: Path, manifest: Path, filters: Sequence[str]) -> list[s
 
     for source, names in sorted(declared.items(), key=lambda item: str(item[0])):
         relative = source.relative_to(root)
+        if source in dedicated_counts:
+            continue
         count = counts.get(source, 0)
         if count == 0:
             failures.append(f"test source missing from manifest: {relative}")
@@ -80,11 +107,18 @@ def main() -> int:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--filter", action="append", default=[])
+    parser.add_argument(
+        "--dedicated",
+        type=Path,
+        action="append",
+        default=[],
+        help="test-bearing source owned by a separately linked focused suite",
+    )
     args = parser.parse_args()
     if not args.filter:
         parser.error("at least one --filter is required")
 
-    failures = audit_manifest(args.root, args.manifest, args.filter)
+    failures = audit_manifest(args.root, args.manifest, args.filter, args.dedicated)
     if not failures:
         return 0
     print("storage test shard audit failed:")

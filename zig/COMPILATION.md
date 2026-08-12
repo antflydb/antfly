@@ -4241,6 +4241,55 @@ requires repeated normal Linux runner timing/RSS and runtime smoke evidence
 before production enablement; a single local cross-build is not sufficient to
 close the goal loop.
 
+Normal-runner run `31623309087`, job `94203263678`, then built commit
+`ab2b0e6b7` successfully on the unchanged `arc-antfly-publish` runner. All
+39 cold ARM64 Linux musl `ReleaseFast` steps, both new graph/error gates, the
+artifact and private-symbol checks, memory reporting, and artifact upload
+passed. The build remained one stripped static executable with embedded
+inference, the C API remained below 20 MiB, and the process tree used zero
+swap:
+
+| Unit or artifact | Normal-runner result |
+|---|---:|
+| Storage + local query | 637.544 s / 624.562 s LLVM / 9 GiB MaxRSS |
+| Distributed/API control | 523.228 s / 510.797 s LLVM / 8 GiB MaxRSS |
+| Inference | 524.793 s / 465.939 s LLVM / 7 GiB MaxRSS |
+| Remote CLI | 71.667 s / 67.693 s LLVM / 2 GiB MaxRSS |
+| Enrichment compute | 37.538 s / 35.301 s LLVM / 1 GiB MaxRSS |
+| Complete cold archive | 19:22.35 / 9,453,004 KiB process-tree peak RSS |
+| Static executable | 65,522,800 B |
+| `libantfly.so` | 18,960,840 B |
+
+The authoritative runner graph contains 1,813 repository-file instances,
+1,256 unique files, and 557 duplicate instances. Storage/distributed emitted
+module overlap is 2,574,174 B; across all five objects, the module lower bound
+is 2,604,154 B and repeated named text is 1,909,216 B, consistent with the
+repaired local object analysis. This is
+strong reliability and ownership evidence, but it rejects the current
+composition as the final performance solution: storage, distributed, and
+inference all remain above the 380-second normal-runner gate.
+
+The default test workflow on the preceding head also exposed validation debt
+that narrow architecture suites had not covered. Four HTTP response tests
+still called the pre-source-selection `db_mod.testing` namespace, and nine
+new storage contract/wire/owner files were absent from bounded shard
+discovery. The repaired tests call the focused diagnostic facade directly;
+ordinary contract and wire tests are registered in the seven storage shards,
+while the two real provider/client suites are explicitly audited as dedicated
+cross-archive tests instead of being run without their linked provider. The
+exact four HTTP tests pass 4/4, the shard-audit tests pass 7/7, and all seven
+bounded storage shards compile and pass the selected new families.
+
+Revised decision: **keep the HA source-selection repair and continue the goal
+loop**. Another API facade or separate HTTPX/LMDB library cannot remove enough
+work. The runner and object evidence place the next meaningful split inside
+the physical owner: DB/index ownership, algebraic/index-manager/query,
+enrichment lifecycle, and aggregation dominate the storage object. The next
+experiment should measure a coarse independently owned local-index subsystem,
+with opaque handles and complete batch/query/lifecycle operations, before
+committing to that larger ABI. It must not duplicate DB/index implementation
+or introduce per-record/backend callbacks.
+
 ## Holistic target architecture
 
 The current structural candidate is the opt-in five-unit source-selected topology above:

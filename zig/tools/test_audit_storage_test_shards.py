@@ -29,8 +29,8 @@ class StorageTestShardAuditTest(unittest.TestCase):
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(contents, encoding="utf-8")
 
-    def audit(self, filters):
-        return audit.audit_manifest(self.root, self.manifest, filters)
+    def audit(self, filters, dedicated=()):
+        return audit.audit_manifest(self.root, self.manifest, filters, dedicated)
 
     def test_accepts_authoritative_exactly_once_ownership(self):
         self.write("db/query/scan.zig", 'test "scan" {}\n')
@@ -73,6 +73,31 @@ class StorageTestShardAuditTest(unittest.TestCase):
         self.assertEqual(
             ["manifest entry has no test declarations: db/query/helper.zig"],
             self.audit(["storage.db.query."]),
+        )
+
+    def test_accepts_test_owned_by_separately_linked_suite(self):
+        self.write("kernel_owner_test.zig", 'test "owner boundary" {}\n')
+        self.write("test_manifest.zig", "")
+        self.assertEqual(
+            [],
+            self.audit([], [Path("kernel_owner_test.zig")]),
+        )
+
+    def test_rejects_dedicated_test_also_imported_by_manifest(self):
+        self.write("kernel_owner_test.zig", 'test "owner boundary" {}\n')
+        self.write(
+            "test_manifest.zig",
+            '_ = @import("kernel_owner_test.zig");\n',
+        )
+        self.assertEqual(
+            [
+                "dedicated test source also imported by manifest: "
+                "kernel_owner_test.zig"
+            ],
+            self.audit(
+                ["storage.kernel_owner_test."],
+                [Path("kernel_owner_test.zig")],
+            ),
         )
 
 

@@ -17661,7 +17661,7 @@ test "api http server serves status" {
 test "api http query budget rejection response exposes stable sort reason" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
-    db_mod.testing.recordSortRejectionDiagnostic(
+    db_mod.recordSortRejectionDiagnostic(
         "full_text_index_v0",
         "candidate_budget_exceeded",
         "text_field_sort_candidate_window",
@@ -17725,7 +17725,7 @@ test "api http unsupported sorted query response exposes stable sort reason" {
 
 test "api http unsupported sorted query response surfaces exact sort diagnostics" {
     const alloc = std.testing.allocator;
-    db_mod.testing.recordSortRejectionDiagnostic(
+    db_mod.recordSortRejectionDiagnostic(
         "created_at",
         "missing_doc_values_coverage",
         "missing_doc_values_section",
@@ -17758,7 +17758,7 @@ test "api http unsupported sorted query response surfaces exact sort diagnostics
 
 test "api http unsupported count ordered page response exposes stable sort reason" {
     const alloc = std.testing.allocator;
-    db_mod.testing.recordSortRejectionDiagnostic(
+    db_mod.recordSortRejectionDiagnostic(
         "*",
         "unsupported_exact_sort",
         "count_only_ordered_page",
@@ -17774,6 +17774,7 @@ test "api http unsupported count ordered page response exposes stable sort reaso
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
+        message: []const u8,
         reason: []const u8,
         sort_rejection_reason: []const u8,
         sort_rejection_detail: []const u8,
@@ -17783,6 +17784,7 @@ test "api http unsupported count ordered page response exposes stable sort reaso
 
     try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
     try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
     try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.reason);
     try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_reason);
     try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_detail);
@@ -17792,7 +17794,7 @@ test "api http unsupported count ordered page response exposes stable sort reaso
 test "api http invalid query with sort diagnostic returns exact sort response" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
-    db_mod.testing.recordSortRejectionDiagnostic(
+    db_mod.recordSortRejectionDiagnostic(
         "_score",
         "invalid_sort_tuple",
         "non_numeric_score",

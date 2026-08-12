@@ -7115,6 +7115,7 @@ pub fn build(b: *std.Build) void {
         },
         &.{
             "storage.db.aggregations.",
+            "storage.db.aggregations_contract.",
             "storage.db.apply_rw_lock.",
             "storage.db.artifact_ids.",
             "storage.db.backfill_state.",
@@ -7131,6 +7132,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.lease.",
             "storage.db.mod.",
             "storage.db.ownership.",
+            "storage.db.planning_bindings.",
             "storage.db.planning_stats.",
             "storage.db.promotion_runtime.",
             "storage.db.query_metrics.",
@@ -7139,6 +7141,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.root_identity.",
             "storage.db.template_remote_stub.",
             "storage.db.template_stub.",
+            "storage.db.text_memory_stats.",
             "storage.db.transform.",
             "storage.db.typed_doc_values_coverage.",
             "storage.db.types.",
@@ -7158,12 +7161,15 @@ pub fn build(b: *std.Build) void {
             "storage.background_runtime.",
             "storage.backup_codec.",
             "storage.coverage_identity.",
+            "storage.data_raft_projection_wire.",
             "storage.derived_log_test_root.",
             "storage.docstore.",
             "storage.enrichment.",
             "storage.filesystem_capacity.",
             "storage.hbc_adapter.",
             "storage.internal_keys.",
+            "storage.kernel_owner_client.",
+            "storage.kernel_wal_wire.",
             "storage.lmdb.",
             "storage.lmdb_backend.",
             "storage.maintenance.",
@@ -7208,6 +7214,10 @@ pub fn build(b: *std.Build) void {
     unit_storage_shard_audit.addDirectoryArg(b.path("pkg/antfly/src/storage"));
     unit_storage_shard_audit.addArg("--manifest");
     unit_storage_shard_audit.addFileArg(b.path("pkg/antfly/src/storage/test_manifest.zig"));
+    unit_storage_shard_audit.addArg("--dedicated");
+    unit_storage_shard_audit.addFileArg(b.path("pkg/antfly/src/storage/kernel_owner_test.zig"));
+    unit_storage_shard_audit.addArg("--dedicated");
+    unit_storage_shard_audit.addFileArg(b.path("pkg/antfly/src/storage/kernel_owner_provisioned_source_test.zig"));
     for (unit_storage_shard_filters) |shard_filters| {
         for (shard_filters) |shard_filter| {
             unit_storage_shard_audit.addArgs(&.{ "--filter", shard_filter });
