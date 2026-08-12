@@ -4423,6 +4423,44 @@ pub const InferenceChunkResponse = struct {
     cache_hit: bool,
 };
 
+pub const InferenceClassifyObject = struct {
+    object: []const u8,
+    /// Original input text index.
+    index: i64,
+    /// Classification results for this input text.
+    classifications: []const InferenceClassifyResult,
+};
+
+pub const InferenceClassifyRequest = struct {
+    /// Name of classifier model from models_dir/classifiers/
+    model: []const u8,
+    /// Texts to classify
+    texts: []const []const u8,
+    /// Candidate labels for zero-shot classification. The model will predict which label(s) best describe each text.
+    labels: []const []const u8,
+    /// Custom hypothesis template for NLI-based classification. Use "{}" as placeholder for the label. Default: "This example is {}."
+    hypothesis_template: ?[]const u8 = null,
+    /// If true, allows multiple labels per text (independent scoring). If false (default), scores are normalized across labels.
+    multi_label: ?bool = null,
+};
+
+pub const InferenceClassifyResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Classification result objects, one per input text.
+    data: []const InferenceClassifyObject,
+    /// Name of model used for classification
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
+pub const InferenceClassifyResult = struct {
+    /// The predicted class/category
+    label: []const u8,
+    /// Confidence score (0.0 to 1.0)
+    score: f32,
+};
+
 pub const InferenceConfig = struct {
     /// URL of the Antfly inference embedding/chunking service
     api_url: []const u8,

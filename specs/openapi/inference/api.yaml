@@ -577,6 +577,48 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+  /classify:
+    post:
+      summary: Classify text against candidate labels
+      description: |
+        Classifies one or more texts with either a zero-shot NLI classifier or
+        a classification-capable extractor model. Candidate labels are supplied
+        per request, and `multi_label` controls whether their scores are
+        independent or normalized across labels.
+      operationId: classifyText
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClassifyRequest'
+      responses:
+        '200':
+          description: Text classified successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClassifyResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
   /read:
     post:
       summary: Read text from images (OCR/document understanding)

@@ -307,6 +307,17 @@ def test_generator_environment_override_preserves_curated_variant(monkeypatch):
     assert qwen.pull_ref == "hf:unsloth/Qwen3-1.7B-GGUF:gguf:Q4_K_M"
 
 
+def test_draft_generator_environment_override_is_bootstrapped(monkeypatch):
+    for env_name in models.GENERATOR_ENV_VARS:
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("ANTFLY_INFERENCE_DRAFT_MODEL", "unsloth/Qwen3-1.7B-GGUF")
+
+    specs = _env_model_specs()
+
+    assert [spec.repo for spec in specs] == ["unsloth/Qwen3-1.7B-GGUF"]
+    assert specs[0].pull_ref == "hf:unsloth/Qwen3-1.7B-GGUF:gguf:Q4_K_M"
+
+
 def test_generation_defaults_share_one_model():
     assert DEFAULT_GENERATOR_MODEL == DEFAULT_TOOL_GENERATOR_MODEL
     assert DEFAULT_GENERATOR_MODEL == DEFAULT_MULTIMODAL_GENERATOR_MODEL

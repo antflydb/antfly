@@ -2427,6 +2427,29 @@ fn loadedModelRequestIdentifier(canonical_models_dir: []const u8, canonical_mode
     return identifier;
 }
 
+fn loadedModelRequestIdentifierAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    canonical_models_dir: []const u8,
+    canonical_model_dir: []const u8,
+) !?[]u8 {
+    const managed_identifier = registry_mod.managedModelRequestNameAlloc(
+        allocator,
+        io,
+        canonical_model_dir,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    };
+    if (managed_identifier) |identifier| return identifier;
+
+    const relative = loadedModelRequestIdentifier(
+        canonical_models_dir,
+        canonical_model_dir,
+    ) orelse return null;
+    return try allocator.dupe(u8, relative);
+}
+
 test "loaded model listing uses model directories and safe relative identifiers" {
     const discovered = [_]registry_mod.ModelEntry{.{
         .name = "owner/model",
@@ -2449,6 +2472,39 @@ test "loaded model listing uses model directories and safe relative identifiers"
     try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/tmp/private-model") == null);
     try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/srv/models/owner/model\nbackend=metal") == null);
     try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/srv/models/owner/model:q4") == null);
+}
+
+test "loaded model listing hides managed variant cache leaves" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/owner/model--antfly-0123456789abcdef");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model--antfly-0123456789abcdef/model.gguf",
+        .data = "decoder",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model--antfly-0123456789abcdef/.antfly-download-complete.json",
+        .data =
+        \\{"version":2,"source":{"owner":"owner","name":"model","variant":"gguf:Q4_K_M"},"artifacts":[{"path":"model.gguf","size":7}]}
+        ,
+    });
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
+    defer allocator.free(models_dir);
+    const model_dir = try std.fs.path.join(allocator, &.{ models_dir, "owner", "model--antfly-0123456789abcdef" });
+    defer allocator.free(model_dir);
+
+    const identifier = (try loadedModelRequestIdentifierAlloc(
+        allocator,
+        io,
+        models_dir,
+        model_dir,
+    )).?;
+    defer allocator.free(identifier);
+    try std.testing.expectEqualStrings("owner/model", identifier);
 }
 
 const RequestModelResolutionErrorKind = enum { invalid, missing, internal };
@@ -9866,13 +9922,16 @@ pub const Node = struct {
         const LoadedListing = struct {
             model: *model_manager_mod.LoadedModel,
             canonical_model_dir: []u8,
-            identifier: []const u8,
+            identifier: []u8,
         };
         var loaded_listings = std.ArrayListUnmanaged(LoadedListing).empty;
         var selected_loaded_dirs = std.ArrayListUnmanaged([]const u8).empty;
         var canonical_discovered_dirs = std.ArrayListUnmanaged([]u8).empty;
         defer {
-            for (loaded_listings.items) |listing| a.free(listing.canonical_model_dir);
+            for (loaded_listings.items) |listing| {
+                a.free(listing.canonical_model_dir);
+                a.free(listing.identifier);
+            }
             for (canonical_discovered_dirs.items) |path| a.free(path);
             loaded_listings.deinit(a);
             selected_loaded_dirs.deinit(a);
@@ -9913,11 +9972,20 @@ pub const Node = struct {
                     a.free(canonical_model_dir);
                     continue;
                 }
-                const identifier = loadedModelRequestIdentifier(models_root, canonical_model_dir) orelse {
+                const identifier = loadedModelRequestIdentifierAlloc(
+                    a,
+                    io,
+                    models_root,
+                    canonical_model_dir,
+                ) catch |err| {
+                    a.free(canonical_model_dir);
+                    return err;
+                } orelse {
                     a.free(canonical_model_dir);
                     continue;
                 };
                 if (stringSliceContains(selected_loaded_dirs.items, canonical_model_dir)) {
+                    a.free(identifier);
                     a.free(canonical_model_dir);
                     continue;
                 }
@@ -9927,11 +9995,13 @@ pub const Node = struct {
                     .canonical_model_dir = canonical_model_dir,
                     .identifier = identifier,
                 }) catch |err| {
+                    a.free(identifier);
                     a.free(canonical_model_dir);
                     return err;
                 };
                 selected_loaded_dirs.append(a, canonical_model_dir) catch |err| {
                     loaded_listings.items.len -= 1;
+                    a.free(identifier);
                     a.free(canonical_model_dir);
                     return err;
                 };
@@ -9945,6 +10015,8 @@ pub const Node = struct {
             try body.appendSlice(a, "\":{");
 
             var model_count: usize = 0;
+            var listed_model_names = std.StringHashMapUnmanaged(void).empty;
+            defer listed_model_names.deinit(a);
 
             // Add built-in chunkers
             if (std.mem.eql(u8, task, "chunkers")) {
@@ -9964,6 +10036,8 @@ pub const Node = struct {
                 const has_visual = listing.manifest.visual_model_path != null or listing.manifest.visual_projection_path != null;
                 const has_audio = listing.manifest.audio_model_path != null or listing.manifest.audio_projection_path != null;
                 if (!taskMatchesModelListing(task, listing.kind, gliner_model_type, tasks, capabilities)) continue;
+                const listed = try listed_model_names.getOrPut(a, entry.name);
+                if (listed.found_existing) continue;
 
                 if (model_count > 0) try body.append(a, ',');
                 try jsonEncodeString(&body, a, entry.name);
@@ -10003,72 +10077,49 @@ pub const Node = struct {
                 model_count += 1;
             }
 
-            // Add loaded models not yet listed (loaded by path, not discovered by name)
-            {
-                self.model_manager.lockLoadedModels();
-                defer self.model_manager.unlockLoadedModels();
-                var loaded_paths_seen = std.ArrayListUnmanaged([]const u8).empty;
-                defer loaded_paths_seen.deinit(a);
-                var it = self.model_manager.loaded.iterator();
-                while (it.next()) |entry| {
-                    const model = entry.value_ptr.*;
-                    const model_task = @tagName(model.manifest.model_type);
-                    if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
+            // Add loaded models not currently visible to discovery. The
+            // snapshot keeps them alive, and each listing has already been
+            // canonicalized to a safe request identifier outside the lock.
+            for (loaded_listings.items) |listing| {
+                const model = listing.model;
+                const model_task = @tagName(model.manifest.model_type);
+                if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
+                const listed = try listed_model_names.getOrPut(a, listing.identifier);
+                if (listed.found_existing) continue;
 
-                    // Skip if already listed from discovery
-                    var already_listed = false;
-                    for (discovered) |d| {
-                        if (std.mem.eql(u8, d.path, model.model_dir)) {
-                            already_listed = true;
-                            break;
-                        }
-                    }
-                    if (!already_listed) {
-                        for (loaded_paths_seen.items) |path| {
-                            if (std.mem.eql(u8, path, model.model_dir)) {
-                                already_listed = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!already_listed) {
-                        try loaded_paths_seen.append(a, model.model_dir);
-                        if (model_count > 0) try body.append(a, ',');
-                        try jsonEncodeString(&body, a, model.model_dir);
-                        try body.append(a, ':');
-                        const loaded_compatibility = self.compatibilitySummaryForDir(a, model.model_dir) catch CompatibilitySummary{
-                            .level = .unknown,
-                            .code = .artifact_unreadable,
-                            .message = "model compatibility could not be determined",
-                        };
-                        try appendModelInfo(
-                            &body,
+                if (model_count > 0) try body.append(a, ',');
+                try jsonEncodeString(&body, a, listing.identifier);
+                try body.append(a, ':');
+                const loaded_compatibility = self.compatibilitySummaryForDir(a, listing.canonical_model_dir) catch CompatibilitySummary{
+                    .level = .unknown,
+                    .code = .artifact_unreadable,
+                    .message = "model compatibility could not be determined",
+                };
+                try appendModelInfo(
+                    &body,
+                    a,
+                    model_task,
+                    model.manifest.gliner_model_type,
+                    model.manifest.capabilities,
+                    model.manifest.inputs,
+                    model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
+                    model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
+                    model.chat_template_failed,
+                    @tagName(loaded_compatibility.level),
+                );
+                if (isOpenAiListTask(task)) {
+                    const enabled = loaded_compatibility.level == .compatible or
+                        (loaded_compatibility.level == .unknown and self.config.allow_unknown_models);
+                    if (enabled) {
+                        try appendUniqueOpenAiModelEntry(
+                            &openai_data,
                             a,
-                            model_task,
-                            model.manifest.gliner_model_type,
-                            model.manifest.capabilities,
-                            model.manifest.inputs,
-                            model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
-                            model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
-                            model.chat_template_failed,
+                            &openai_models,
+                            &openai_data_count,
+                            listing.identifier,
+                            list_created,
                             @tagName(loaded_compatibility.level),
                         );
-                        if (isOpenAiListTask(task)) {
-                            const enabled = loaded_compatibility.level == .compatible or
-                                (loaded_compatibility.level == .unknown and self.config.allow_unknown_models);
-                            if (enabled) {
-                                try appendUniqueOpenAiModelEntry(
-                                    &openai_data,
-                                    a,
-                                    &openai_models,
-                                    &openai_data_count,
-                                    model.model_dir,
-                                    list_created,
-                                    @tagName(loaded_compatibility.level),
-                                );
-                            }
-                        }
-                        model_count += 1;
                     }
                 }
                 model_count += 1;
@@ -13452,6 +13503,7 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
 
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/embed"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/embeddings"));
+    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/classify"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/generate/batch"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
@@ -13587,6 +13639,7 @@ test "registerAiRoutesOn excludes Traditional ML predictor routes" {
 
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/embed"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/embeddings"));
+    try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/classify"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/generate/batch"));
     try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/models"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/recognize"));
@@ -13637,6 +13690,7 @@ test "registerRoutesOn supports alternate prefixes through the shared router" {
 
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embed"));
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embeddings"));
+    try std.testing.expect(server.hasRoute(.post, "/custom/v9/classify"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/models"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/metrics"));
 }

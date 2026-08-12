@@ -1266,17 +1266,23 @@ fn macosLiveAdmissionGrace(total_bytes: usize) usize {
 
 /// Determine how much of the current availability sample must remain unused.
 ///
-/// Linux MemAvailable is designed as an allocation-availability estimate, so
-/// retain the complete node headroom there. macOS supplies a system pressure
-/// percentage, with raw Mach page queues as a conservative fallback. The stable
-/// shared admission limit already retains full node headroom against Antfly
-/// residency. For this second, live-pressure gate keep a bounded emergency
-/// reserve instead of subtracting the node reserve twice.
+/// Linux MemAvailable is an allocation-availability estimate. The stable shared
+/// admission limit already retains full node headroom against Antfly residency,
+/// so this second, live-pressure gate preserves at least half of both the node
+/// headroom and the currently available memory. This keeps a shared runner
+/// usable without permitting Antfly to consume the last reclaimable bytes when
+/// the host is already under severe pressure. macOS supplies a system pressure
+/// percentage, with raw Mach page queues as a conservative fallback, and uses a
+/// smaller bounded grace window because its availability sample omits some
+/// reclaimable memory.
 fn liveHostAdmissionReserve(info: SystemMemoryInfo) usize {
     const available = info.available_bytes orelse return 0;
     const node_headroom = liveHostMemoryHeadroom(info.total_bytes);
     return switch (info.availability_basis) {
-        .mem_available => @min(available, node_headroom),
+        .mem_available => @min(
+            available,
+            @min(node_headroom, @max(node_headroom / 2, available / 2)),
+        ),
         .macos_memory_pressure, .macos_reclaimable_pages => blk: {
             const normal_capacity = available -| node_headroom;
             const emergency_reserve = @min(
@@ -2595,12 +2601,38 @@ test "live memory headroom scales down for constrained containers" {
         .{ .total_bytes = gib(2), .available_bytes = gib(2) },
         mib(128),
     );
+    try checkLiveHostMemoryWithInfo(
+        .{ .total_bytes = gib(2), .available_bytes = gib(1) },
+        mib(128),
+    );
+}
+
+test "Linux live admission admits the CI model under shared-host pressure" {
+    // Reproduce the failing runner sample exactly: the old live gate retained
+    // the full 15.7 GiB node headroom a second time, leaving only 1.0 GiB for a
+    // 3.96 GiB model despite 16.7 GiB being available.
+    const info = SystemMemoryInfo{
+        .total_bytes = 67_428_634_624,
+        .available_bytes = 17_917_997_056,
+        .availability_basis = .mem_available,
+    };
+
+    try std.testing.expectEqual(@as(usize, 8_958_998_528), liveHostAdmissionReserve(info));
+    try checkLiveHostMemoryWithInfo(info, 4_248_561_560);
     try std.testing.expectError(
         error.ResourceTemporarilyUnavailable,
-        checkLiveHostMemoryWithInfo(
-            .{ .total_bytes = gib(2), .available_bytes = gib(1) },
-            mib(128),
-        ),
+        checkLiveHostMemoryWithInfo(info, 8_958_998_529),
+    );
+
+    const severe_pressure = SystemMemoryInfo{
+        .total_bytes = info.total_bytes,
+        .available_bytes = gib(7),
+        .availability_basis = .mem_available,
+    };
+    try std.testing.expectEqual(gib(7), liveHostAdmissionReserve(severe_pressure));
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        checkLiveHostMemoryWithInfo(severe_pressure, 1),
     );
 }
 
@@ -2891,15 +2923,15 @@ test "live memory admissions share one sampled capacity epoch" {
         .available_bytes = gib(20),
     };
 
-    _ = try controller.tryReserveLiveCapacityWithInfo(gib(3), info);
+    _ = try controller.tryReserveLiveCapacityWithInfo(gib(7), info);
     try std.testing.expectError(
         error.ResourceTemporarilyUnavailable,
-        controller.tryReserveLiveCapacityWithInfo(gib(2), info),
+        controller.tryReserveLiveCapacityWithInfo(gib(4), info),
     );
-    try std.testing.expectEqual(gib(3), controller.live_pending_bytes);
-    try std.testing.expectEqual(gib(4), controller.live_capacity_bytes);
+    try std.testing.expectEqual(gib(7), controller.live_pending_bytes);
+    try std.testing.expectEqual(gib(10), controller.live_capacity_bytes);
 
-    controller.releaseLiveReservation(gib(3));
+    controller.releaseLiveReservation(gib(7));
     _ = try controller.tryReserveLiveCapacityWithInfo(gib(2), info);
     controller.releaseLiveReservation(gib(2));
     try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
@@ -2918,10 +2950,10 @@ test "settled live residency remains committed during pressure epoch" {
     controller.settleLiveReservation(gib(3), gib(2));
 
     try std.testing.expectEqual(gib(1), controller.live_pending_bytes);
-    try std.testing.expectEqual(gib(2), controller.live_capacity_bytes);
+    try std.testing.expectEqual(gib(8), controller.live_capacity_bytes);
     try std.testing.expectError(
         error.ResourceTemporarilyUnavailable,
-        controller.tryReserveLiveCapacityWithInfo(gib(2), info),
+        controller.tryReserveLiveCapacityWithInfo(gib(8), info),
     );
 
     controller.releaseLiveReservation(gib(1));

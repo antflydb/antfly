@@ -45,6 +45,19 @@ def _first_generator_model(api):
     pytest.skip("No generator models available for /api/generate tests")
 
 
+def _target_and_draft_generator_models(api):
+    target = _first_generator_model(api)
+    draft = os.environ.get("ANTFLY_INFERENCE_DRAFT_MODEL", "").strip()
+    if not draft:
+        pytest.skip(
+            "Speculative decoding requires a distinct compatible draft model; "
+            "set ANTFLY_INFERENCE_DRAFT_MODEL"
+        )
+    if draft.casefold() == target.casefold():
+        pytest.skip("ANTFLY_INFERENCE_DRAFT_MODEL must differ from the target model")
+    return target, draft
+
+
 def _first_tool_generator_model(api):
     generators = api.models().get("generators", {})
     model = find_tool_model_name(set(generators.keys()))
@@ -210,12 +223,13 @@ def test_generate_invalid_grammar_rejected(api):
 
 
 def test_generate_with_draft_model_smoke(api):
-    model = _first_generator_model(api)
+    model, draft_model = _target_and_draft_generator_models(api)
     resp = _generate_or_skip_unsupported(api, {
         "model": model,
         "messages": [{"role": "user", "content": "Say hello briefly"}],
         "max_tokens": 8,
-        "draft_model": model,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "draft_model": draft_model,
         "speculative_k": 2,
     })
 
@@ -224,12 +238,12 @@ def test_generate_with_draft_model_smoke(api):
 
 
 def test_generate_json_schema_with_draft_model(api):
-    model = _first_generator_model(api)
+    model, draft_model = _target_and_draft_generator_models(api)
     resp = _generate_or_skip_unsupported(api, {
         "model": model,
         "messages": [{"role": "user", "content": "Return JSON with a string field named answer"}],
         "max_tokens": 128,
-        "draft_model": model,
+        "draft_model": draft_model,
         "speculative_k": 2,
         "response_format": {
             "type": "json_schema",
@@ -567,16 +581,21 @@ def test_stream_generate_with_tools_tool_model(api):
 def test_speculative_decode_matches_greedy(api):
     """Speculative decode with greedy sampling (temperature=0) should produce
     the same output as standard decode."""
-    model = _first_generator_model(api)
+    model, draft_model = _target_and_draft_generator_models(api)
     messages = [{"role": "user", "content": "Count from 1 to 5"}]
-    kwargs = dict(model=model, max_tokens=20, temperature=0, backend="native")
+    kwargs = dict(
+        model=model,
+        max_tokens=20,
+        temperature=0,
+        backend="native",
+        chat_template_kwargs={"enable_thinking": False},
+    )
 
     # Standard decode (no draft model)
     standard = api.generate(messages, **kwargs)
     standard_content = _message_content(standard) or ""
 
-    # Speculative decode (same model as draft)
-    speculative = api.generate(messages, draft_model=model, speculative_k=3, **kwargs)
+    speculative = api.generate(messages, draft_model=draft_model, speculative_k=3, **kwargs)
     speculative_content = _message_content(speculative) or ""
 
     assert standard_content, "Standard decode produced no content"
@@ -594,7 +613,13 @@ def test_generate_with_cache_dtype(api, cache_dtype):
     """Generation should succeed with each KV cache quantization format."""
     model = _first_generator_model(api)
     messages = [{"role": "user", "content": "Say hello"}]
-    resp = api.generate(messages, model=model, max_tokens=10, cache_dtype=cache_dtype)
+    resp = api.generate(
+        messages,
+        model=model,
+        max_tokens=10,
+        cache_dtype=cache_dtype,
+        chat_template_kwargs={"enable_thinking": False},
+    )
     content = _message_content(resp)
     assert content, f"No generated content with cache_dtype={cache_dtype}: {resp}"
 
@@ -606,7 +631,11 @@ def test_concurrent_requests_throughput(api):
     model = _first_generator_model(api)
     num_requests = 4
     messages = [{"role": "user", "content": "Say hello"}]
-    kwargs = dict(model=model, max_tokens=8)
+    kwargs = dict(
+        model=model,
+        max_tokens=8,
+        chat_template_kwargs={"enable_thinking": False},
+    )
 
     # Sequential baseline
     seq_start = time.monotonic()
