@@ -75,6 +75,7 @@ const table_router = @import("table_router.zig");
 const table_writes = if (builtin.is_test) @import("table_writes.zig") else @import("table_write_source.zig");
 const table_index_config = @import("table_index_config.zig");
 const ha_mutation_inventory = @import("../storage/ha/mutation_inventory.zig");
+const ha_http_operation = @import("../storage/ha/http_operation.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
@@ -632,11 +633,11 @@ pub const ApiHttpServerConfig = struct {
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
     session_store_scope: transactions_api.SessionStoreScope = .node_local,
-    ha_admin_executor: ?http_common.RequestExecutor = null,
+    ha_admin_executor: ?ha_http_operation.Executor = null,
     /// Dedicated HA administration credential. This is intentionally separate
     /// from native user authentication and other internal admin surfaces.
     ha_admin_bearer_token: ?[]const u8 = null,
-    ha_internal_executor: ?http_common.RequestExecutor = null,
+    ha_internal_executor: ?ha_http_operation.Executor = null,
     /// When continuous standalone HA is active, only mutations classified as
     /// synchronously replicated may reach their handler. Non-replicated
     /// security, catalog, restore, and workflow state fails closed before any
@@ -1950,7 +1951,7 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn setHAInternalExecutor(self: *ApiHttpServer, executor_value: ?http_common.RequestExecutor) void {
+    pub fn setHAInternalExecutor(self: *ApiHttpServer, executor_value: ?ha_http_operation.Executor) void {
         self.cfg.ha_internal_executor = executor_value;
     }
 
@@ -3819,48 +3820,47 @@ pub const ApiHttpServer = struct {
         body: []const u8,
     };
 
-    pub fn executeHaRoute(self: *ApiHttpServer, request: HaRouteRequest) !?http_common.HttpResponse {
+    pub fn executeHaRoute(self: *ApiHttpServer, request: HaRouteRequest) !?ha_http_operation.OwnedResponse {
         const path = splitTarget(request.target).path;
-        const method: http_common.Method = switch (request.method) {
-            .get => .GET,
-            .post => .POST,
-            .put => .PUT,
-            .delete => .DELETE,
-        };
-        const legacy_request = http_common.HttpRequest{
-            .method = method,
-            .uri = request.target,
+        const operation_request = ha_http_operation.Request{
+            .method = switch (request.method) {
+                .get => .get,
+                .post => .post,
+                .put => .put,
+                .delete => .delete,
+            },
+            .target = request.target,
             .authorization = request.authorization,
             .content_type = request.content_type,
             .body = request.body,
         };
         if (isHaAdminPath(path)) {
             const expected = (self.cfg.ha_admin_bearer_token orelse self.cfg.admin_bearer_token) orelse
-                return try textResponse(self.alloc, 403, "HA admin API disabled without authentication");
+                return try haOperationTextResponse(self.alloc, 403, "HA admin API disabled without authentication");
             if (expected.len == 0)
-                return try textResponse(self.alloc, 403, "HA admin API disabled without authentication");
-            const authorization = request.authorization orelse return try unauthorizedResponse(self.alloc);
+                return try haOperationTextResponse(self.alloc, 403, "HA admin API disabled without authentication");
+            const authorization = request.authorization orelse return try haOperationTextResponse(self.alloc, 401, "unauthorized");
             if (!std.mem.startsWith(u8, authorization, "Bearer ") or
                 !constantTimeEql(expected, authorization["Bearer ".len..]))
             {
-                return try unauthorizedResponse(self.alloc);
+                return try haOperationTextResponse(self.alloc, 401, "unauthorized");
             }
             const ha_exec = self.cfg.ha_admin_executor orelse return null;
-            return try ha_exec.execute(self.alloc, legacy_request);
+            return try ha_exec.execute(operation_request);
         }
         if (isHaInternalPath(path)) {
             const expected = self.cfg.admin_bearer_token orelse
-                return try textResponse(self.alloc, 403, "HA internal API disabled without authentication");
+                return try haOperationTextResponse(self.alloc, 403, "HA internal API disabled without authentication");
             if (expected.len == 0)
-                return try textResponse(self.alloc, 403, "HA internal API disabled without authentication");
-            const authorization = request.authorization orelse return try unauthorizedResponse(self.alloc);
+                return try haOperationTextResponse(self.alloc, 403, "HA internal API disabled without authentication");
+            const authorization = request.authorization orelse return try haOperationTextResponse(self.alloc, 401, "unauthorized");
             if (!std.mem.startsWith(u8, authorization, "Bearer ") or
                 !constantTimeEql(expected, authorization["Bearer ".len..]))
             {
-                return try unauthorizedResponse(self.alloc);
+                return try haOperationTextResponse(self.alloc, 401, "unauthorized");
             }
             const ha_exec = self.cfg.ha_internal_executor orelse return null;
-            return try ha_exec.execute(self.alloc, legacy_request);
+            return try ha_exec.execute(operation_request);
         }
         return null;
     }
@@ -14251,6 +14251,15 @@ fn contextualResponseFromLegacy(alloc: std.mem.Allocator, response: http_common.
     };
 }
 
+fn haOperationTextResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !ha_http_operation.OwnedResponse {
+    return .{
+        .owner_allocator = alloc,
+        .status = status,
+        .content_type = try alloc.dupe(u8, "text/plain"),
+        .body = try alloc.dupe(u8, body),
+    };
+}
+
 fn contextualRetryableTextResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !contextual_operations.OwnedResponse {
     const headers = try alloc.alloc(contextual_operations.Header, 1);
     errdefer alloc.free(headers);
@@ -21683,7 +21692,7 @@ fn executeHaRouteForTest(
     target: []const u8,
     authorization: ?[]const u8,
     body: []const u8,
-) !http_common.HttpResponse {
+) !ha_http_operation.OwnedResponse {
     return (try server.executeHaRoute(.{
         .method = method,
         .target = target,
@@ -21765,24 +21774,25 @@ test "typed HA route operation dispatches admin and internal executors" {
         alloc: std.mem.Allocator,
         body: []const u8,
         calls: usize = 0,
-        last_method: ?http_common.Method = null,
+        last_method: ?ha_http_operation.Method = null,
         last_uri: ?[]const u8 = null,
         last_body: ?[]const u8 = null,
 
-        fn executor(self: *@This()) http_common.RequestExecutor {
+        fn executor(self: *@This()) ha_http_operation.Executor {
             return .{
                 .ptr = self,
                 .vtable = &.{ .execute = execute },
             };
         }
 
-        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        fn execute(ptr: *anyopaque, req: ha_http_operation.Request) !ha_http_operation.OwnedResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             self.last_method = req.method;
-            self.last_uri = req.uri;
+            self.last_uri = req.target;
             self.last_body = req.body;
             return .{
+                .owner_allocator = self.alloc,
                 .status = 200,
                 .content_type = try self.alloc.dupe(u8, "application/json"),
                 .body = try self.alloc.dupe(u8, self.body),
@@ -21806,11 +21816,11 @@ test "typed HA route operation dispatches admin and internal executors" {
         "Bearer ha-internal-secret",
         "",
     );
-    defer admin_resp.deinit(alloc);
+    defer admin_resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
     try std.testing.expectEqualStrings("{\"handler\":\"ha-admin\"}", admin_resp.body);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
-    try std.testing.expectEqual(http_common.Method.GET, admin_exec.last_method.?);
+    try std.testing.expectEqual(ha_http_operation.Method.get, admin_exec.last_method.?);
     try std.testing.expectEqualStrings(admin_routes.ha_primary_status ++ "?max_lag_lsn=0", admin_exec.last_uri.?);
 
     var internal_resp = try executeHaRouteForTest(
@@ -21820,16 +21830,16 @@ test "typed HA route operation dispatches admin and internal executors" {
         "Bearer ha-internal-secret",
         "{\"slot_name\":\"standby-a\"}",
     );
-    defer internal_resp.deinit(alloc);
+    defer internal_resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
     try std.testing.expectEqualStrings("{\"handler\":\"ha-internal\"}", internal_resp.body);
     try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
-    try std.testing.expectEqual(http_common.Method.POST, internal_exec.last_method.?);
+    try std.testing.expectEqual(ha_http_operation.Method.post, internal_exec.last_method.?);
     try std.testing.expectEqualStrings(internal_api_routes.ha_replication_status, internal_exec.last_uri.?);
     try std.testing.expectEqualStrings("{\"slot_name\":\"standby-a\"}", internal_exec.last_body.?);
 
     var missing = try executeHaRouteForTest(&server, .get, admin_routes.ha, null, "");
-    defer missing.deinit(alloc);
+    defer missing.deinit();
     try std.testing.expectEqual(@as(u16, 401), missing.status);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
 }
@@ -21856,17 +21866,18 @@ test "typed HA route operation requires exact bearer token for internal replicat
         alloc: std.mem.Allocator,
         calls: usize = 0,
 
-        fn executor(self: *@This()) http_common.RequestExecutor {
+        fn executor(self: *@This()) ha_http_operation.Executor {
             return .{
                 .ptr = self,
                 .vtable = &.{ .execute = execute },
             };
         }
 
-        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+        fn execute(ptr: *anyopaque, _: ha_http_operation.Request) !ha_http_operation.OwnedResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             return .{
+                .owner_allocator = self.alloc,
                 .status = 200,
                 .content_type = try self.alloc.dupe(u8, "text/plain"),
                 .body = try self.alloc.dupe(u8, "ha"),
@@ -21902,26 +21913,26 @@ test "typed HA route operation requires exact bearer token for internal replicat
     }, source.iface(), null, null);
 
     var unauthorized = try executeHaRouteForTest(&server, .get, admin_routes.ha_primary_status, null, "");
-    defer unauthorized.deinit(alloc);
+    defer unauthorized.deinit();
     try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
     try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
     var forbidden = try executeHaRouteForTest(&server, .get, admin_routes.ha_primary_status, reader_auth, "");
-    defer forbidden.deinit(alloc);
+    defer forbidden.deinit();
     try std.testing.expectEqual(@as(u16, 401), forbidden.status);
     try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
     var native_admin_rejected = try executeHaRouteForTest(&server, .get, admin_routes.ha_primary_status, admin_auth, "");
-    defer native_admin_rejected.deinit(alloc);
+    defer native_admin_rejected.deinit();
     try std.testing.expectEqual(@as(u16, 401), native_admin_rejected.status);
     try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
 
     var authorized = try executeHaRouteForTest(&server, .get, admin_routes.ha_primary_status, "Bearer ha-internal-secret", "");
-    defer authorized.deinit(alloc);
+    defer authorized.deinit();
     try std.testing.expectEqual(@as(u16, 200), authorized.status);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
 
@@ -21933,18 +21944,18 @@ test "typed HA route operation requires exact bearer token for internal replicat
     };
     for (internal_routes) |path| {
         var internal_missing = try executeHaRouteForTest(&server, .get, path, null, "");
-        defer internal_missing.deinit(alloc);
+        defer internal_missing.deinit();
         try std.testing.expectEqual(@as(u16, 401), internal_missing.status);
         try std.testing.expectEqual(@as(usize, 0), internal_exec.calls);
 
         var internal_wrong = try executeHaRouteForTest(&server, .get, path, "Bearer wrong-token", "");
-        defer internal_wrong.deinit(alloc);
+        defer internal_wrong.deinit();
         try std.testing.expectEqual(@as(u16, 401), internal_wrong.status);
         try std.testing.expectEqual(@as(usize, 0), internal_exec.calls);
     }
 
     var internal = try executeHaRouteForTest(&server, .get, internal_api_routes.ha_replication_identify, "Bearer ha-internal-secret", "");
-    defer internal.deinit(alloc);
+    defer internal.deinit();
     try std.testing.expectEqual(@as(u16, 200), internal.status);
     try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
 
@@ -21952,7 +21963,7 @@ test "typed HA route operation requires exact bearer token for internal replicat
         .ha_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
     var disabled = try executeHaRouteForTest(&disabled_server, .get, internal_api_routes.ha_replication_identify, "Bearer ha-internal-secret", "");
-    defer disabled.deinit(alloc);
+    defer disabled.deinit();
     try std.testing.expectEqual(@as(u16, 403), disabled.status);
     try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
 
@@ -21961,7 +21972,7 @@ test "typed HA route operation requires exact bearer token for internal replicat
         .ha_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
     var empty_token = try executeHaRouteForTest(&empty_token_server, .get, internal_api_routes.ha_replication_identify, "Bearer ", "");
-    defer empty_token.deinit(alloc);
+    defer empty_token.deinit();
     try std.testing.expectEqual(@as(u16, 403), empty_token.status);
     try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
 }

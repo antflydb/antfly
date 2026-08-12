@@ -26,7 +26,7 @@ const table_writes = @import("table_writes.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
-const http_common = @import("../raft/transport/http_common.zig");
+const ha_http_operation = @import("../storage/ha/http_operation.zig");
 const httpx = @import("httpx");
 
 const CreateContext = abi.CreateContext;
@@ -105,9 +105,9 @@ const OpaqueApiHttpServer = struct {
         callInfallible(?managed_embedder.AntflyProvider, void, self.functions.set_provider, self.opaque_handle, &input, null);
     }
 
-    pub fn setHAInternalExecutor(self: *OpaqueApiHttpServer, executor_value: ?http_common.RequestExecutor) void {
+    pub fn setHAInternalExecutor(self: *OpaqueApiHttpServer, executor_value: ?ha_http_operation.Executor) void {
         var input = executor_value;
-        callInfallible(?http_common.RequestExecutor, void, self.functions.set_ha_executor, self.opaque_handle, &input, null);
+        callInfallible(?ha_http_operation.Executor, void, self.functions.set_ha_executor, self.opaque_handle, &input, null);
     }
 
     pub fn attachRestoreJobRuntimeStore(self: *OpaqueApiHttpServer, store: *backend_erased.Store) !void {

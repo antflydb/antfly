@@ -21,7 +21,7 @@ const table_writes = @import("table_write_source.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
-const http_common = @import("../raft/transport/http_common.zig");
+const ha_http_operation = @import("../storage/ha/http_operation.zig");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
 
@@ -171,8 +171,8 @@ pub fn setProvider(context: *const CallContext) callconv(.c) abi.Status {
 }
 
 pub fn setHAExecutor(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(?http_common.RequestExecutor, void, context)) |failure| return failure;
-    serverState(context).server.setHAInternalExecutor(input(?http_common.RequestExecutor, context).*);
+    if (validateCall(?ha_http_operation.Executor, void, context)) |failure| return failure;
+    serverState(context).server.setHAInternalExecutor(input(?ha_http_operation.Executor, context).*);
     return .ok;
 }
 

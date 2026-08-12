@@ -180,9 +180,12 @@ that end state:
 - HA administration and internal replication paths now use a dedicated
   registrar and typed method/target/body ingress instead of the global
   contextual fallback. This removes the last listener route that could enter
-  `ApiHttpServer.handle()`; the runtime-provided HA executors still use the
-  temporary request/response compatibility contract and remain an explicit
-  operation-extraction boundary.
+  `ApiHttpServer.handle()`. Runtime-provided HA servers now expose a typed
+  operation executor with explicitly owned content type and body results; the
+  public `httpx` route and API-kernel boundary no longer manufacture or return
+  legacy HTTP request/response values. The HA client-facing legacy executor is
+  retained only as an adapter over the same typed operation for internal HTTP
+  clients that have not moved to `httpx`.
 - Public transaction-session handlers now pass typed method/target/body values
   into the session-forwarding operation. Only the remote HTTP executor boundary
   constructs its wire request; `httpx.Context` is no longer converted into a

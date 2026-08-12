@@ -584,8 +584,11 @@ pub const AntflyApiHandler = struct {
             .content_type = ctx.header("content-type"),
             .body = body,
         })) orelse return textResponse(ctx, 404, "not found");
-        const response_alloc = response.owner_allocator orelse self.api_server.alloc;
-        return respondWithAllocator(ctx, &response, response_alloc);
+        defer response.deinit();
+        _ = ctx.status(response.status);
+        try ctx.setHeader("content-type", response.content_type);
+        _ = ctx.response.body(response.body);
+        return ctx.response.build();
     }
 
     fn extensionRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

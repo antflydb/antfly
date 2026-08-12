@@ -4892,7 +4892,7 @@ pub const DataServer = struct {
             self.ha_internal_server = antfly.ha.http_internal.Server.initWithOptions(platform.allocator.processAllocator(std.heap.smp_allocator), handle, .{
                 .state_mutex = &self.ha_state_mutex,
             });
-            self.api_server_cfg.ha_internal_executor = self.ha_internal_server.?.executor();
+            self.api_server_cfg.ha_internal_executor = self.ha_internal_server.?.operationExecutor();
         }
         if (self.http_server) |*server| {
             server.setHAInternalExecutor(self.api_server_cfg.ha_internal_executor);
@@ -5682,7 +5682,7 @@ pub const DataServer = struct {
                         .replication_failures_total = haStandbyReplicationFailuresTotalCallback,
                     },
                 });
-                api_server_cfg.ha_admin_executor = self.ha_admin_server.?.executor();
+                api_server_cfg.ha_admin_executor = self.ha_admin_server.?.operationExecutor();
             }
         }
         if (api_server_cfg.ha_internal_executor == null) {
@@ -5691,7 +5691,7 @@ pub const DataServer = struct {
                 self.ha_internal_server = antfly.ha.http_internal.Server.initWithOptions(platform.allocator.processAllocator(std.heap.smp_allocator), handle, .{
                     .state_mutex = &self.ha_state_mutex,
                 });
-                api_server_cfg.ha_internal_executor = self.ha_internal_server.?.executor();
+                api_server_cfg.ha_internal_executor = self.ha_internal_server.?.operationExecutor();
             }
         }
     }
