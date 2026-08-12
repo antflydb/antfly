@@ -5515,6 +5515,7 @@ pub fn build(b: *std.Build) void {
             "api http server preserves public query availability errors",
             "api http maps missing physical index only for rebuilding lifecycle",
             "api http missing index classification requires active rebuild evidence",
+            "api http lifecycle classification preserves catching-up writer beside fresh read snapshot",
             "remote rebuild quarantine preserves its source and index failure",
             "api http server create index waits for exact target config projection",
         },

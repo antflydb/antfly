@@ -2861,7 +2861,17 @@ pub const ApiHttpServer = struct {
             if (write_statuses) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
-                try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, &items, &item_indexes, &owned);
+                if (force_write_refresh) {
+                    // Lifecycle classification needs the writer observation in
+                    // addition to the best read/remote observation. A read DB
+                    // can legitimately be fresh for its retained generation
+                    // while the writer is catching up a newly admitted index;
+                    // coalescing those by group would discard the only proof
+                    // that IndexNotFound is a retryable publication window.
+                    try self.appendLocalRuntimeStatusCandidates(table_name, snapshot, snapshot_index, &items, &owned);
+                } else {
+                    try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, &items, &item_indexes, &owned);
+                }
             }
         }
         if (items.items.len == 0) {
@@ -2930,6 +2940,35 @@ pub const ApiHttpServer = struct {
             }
             var candidate = item;
             try upsertRuntimeStatus(self.alloc, items, item_indexes, &candidate);
+        }
+        if (owned.items.len > 0) self.alloc.free(owned.items);
+        owned.items = &.{};
+    }
+
+    fn appendLocalRuntimeStatusCandidates(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        snapshot: ?*const metadata_api.AdminSnapshot,
+        snapshot_index: ?*const RuntimeStatusSnapshotIndex,
+        items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
+        owned: *runtime_status.LocalTableRuntimeStatuses,
+    ) !void {
+        try items.ensureUnusedCapacity(self.alloc, owned.items.len);
+        for (owned.items) |item| {
+            const allowed = if (snapshot_index) |index|
+                index.statusAllowed(
+                    table_name,
+                    item,
+                    if (self.cfg.session_router) |router| router.localNodeId() else 0,
+                )
+            else
+                self.localRuntimeStatusAllowedBySnapshot(table_name, snapshot, item);
+            if (!allowed) {
+                var discard = item;
+                discard.deinit(self.alloc);
+                continue;
+            }
+            items.appendAssumeCapacity(item);
         }
         if (owned.items.len > 0) self.alloc.free(owned.items);
         owned.items = &.{};
@@ -10011,29 +10050,38 @@ pub const ApiHttpServer = struct {
         if (expected_group_ids.len == 0) return .unavailable;
         var observed_active_build = false;
         for (expected_group_ids) |group_id| {
-            const status = for (statuses) |candidate| {
-                if (candidate.group_id == group_id) break candidate;
-            } else return .unavailable;
-            if (!runtimeStatusHasCurrentLifecycleEvidence(status.metadata)) return .unavailable;
-            const index = for (status.stats.indexes) |item| {
-                if (std.mem.eql(u8, item.name, index_name)) break item;
-            } else return .unavailable;
-            if (index.load_error != null) return .unavailable;
-            // Terminal and operator-paused repairs are actionable failures,
-            // not retryable publication windows.
-            if (std.mem.eql(u8, index.index_repair_phase, "terminal") or
-                std.mem.eql(u8, index.index_repair_automation, "paused")) return .unavailable;
-            if (index.backfill_active or
-                index.replay_catch_up_required or
-                index.catch_up_active or
-                index.index_repair_id != null or
-                index.replay_applied_sequence < index.replay_target_sequence or
-                index.catch_up_applied_sequence < index.catch_up_target_sequence)
-            {
-                observed_active_build = true;
-            } else if (index.repair_degraded) {
-                return .unavailable;
+            var observed_group_index = false;
+            var group_active_build = false;
+            for (statuses) |status| {
+                if (status.group_id != group_id) continue;
+                // Quarantine is an explicit fail-closed owner observation and
+                // must dominate healthy or rebuilding candidates retained by
+                // another cache generation.
+                if (status.metadata.source == .rebuild_state_quarantine) return .unavailable;
+                if (!runtimeStatusHasCurrentLifecycleEvidence(status.metadata)) continue;
+                const index = for (status.stats.indexes) |item| {
+                    if (std.mem.eql(u8, item.name, index_name)) break item;
+                } else continue;
+                observed_group_index = true;
+                if (index.load_error != null) return .unavailable;
+                // Terminal and operator-paused repairs are actionable failures,
+                // not retryable publication windows.
+                if (std.mem.eql(u8, index.index_repair_phase, "terminal") or
+                    std.mem.eql(u8, index.index_repair_automation, "paused")) return .unavailable;
+                if (index.backfill_active or
+                    index.replay_catch_up_required or
+                    index.catch_up_active or
+                    index.index_repair_id != null or
+                    index.replay_applied_sequence < index.replay_target_sequence or
+                    index.catch_up_applied_sequence < index.catch_up_target_sequence)
+                {
+                    group_active_build = true;
+                } else if (index.repair_degraded) {
+                    return .unavailable;
+                }
             }
+            if (!observed_group_index) return .unavailable;
+            observed_active_build = observed_active_build or group_active_build;
         }
         return if (observed_active_build) .rebuilding else .healthy;
     }
@@ -18327,6 +18375,19 @@ test "api http missing index classification requires active rebuild evidence" {
         ApiHttpServer.runtimeIndexLifecycle(&.{}, &expected_group_ids, "semantic_idx"),
     );
 
+    const fresh_missing_and_active = [_]runtime_status.LocalTableRuntimeStatus{
+        .{
+            .group_id = 10,
+            .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+            .stats = .{},
+        },
+        active_statuses[0],
+    };
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.rebuilding,
+        ApiHttpServer.runtimeIndexLifecycle(fresh_missing_and_active[0..], &expected_group_ids, "semantic_idx"),
+    );
+
     const two_group_ids = [_]u64{ 10, 11 };
     try std.testing.expectEqual(
         ApiHttpServer.RuntimeIndexLifecycle.unavailable,
@@ -18418,6 +18479,140 @@ test "api http missing index classification requires active rebuild evidence" {
     try std.testing.expect(ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], &expected_group_ids, "building_idx", &observed_rebuilding));
     try std.testing.expect(observed_rebuilding);
     try std.testing.expect(!ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], &expected_group_ids, "failed_idx", &observed_rebuilding));
+}
+
+test "api http lifecycle classification preserves catching-up writer beside fresh read snapshot" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 10,
+                    .table_id = 1,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .local_runtime_statuses = localRuntimeStatuses,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.IndexNotFound;
+        }
+
+        fn localRuntimeStatuses(_: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+            const items = try inner_alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            items[0] = .{
+                .group_id = 10,
+                .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+                // The retained read generation is internally fresh but predates
+                // physical publication of the catalog-visible index.
+                .stats = .{},
+            };
+            return .{ .items = items };
+        }
+    };
+
+    const FakeWrites = struct {
+        fn source() table_writes.TableWriteSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .batch = batch,
+                    .local_runtime_statuses = localRuntimeStatuses,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return;
+        }
+
+        fn localRuntimeStatuses(_: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+            const indexes = try inner_alloc.alloc(db_mod.types.DBIndexStats, 1);
+            errdefer inner_alloc.free(indexes);
+            indexes[0] = .{
+                .name = try inner_alloc.dupe(u8, "semantic_idx"),
+                .kind = .dense_vector,
+                .index_repair_id = 42,
+                .index_repair_phase = "building",
+            };
+            const items = try inner_alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            errdefer {
+                db_mod.types.freeDBStats(inner_alloc, .{
+                    .index_count = 1,
+                    .indexes = indexes,
+                });
+                inner_alloc.free(items);
+            }
+            items[0] = .{
+                .group_id = 10,
+                .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up },
+                .stats = .{
+                    .index_count = 1,
+                    .indexes = indexes,
+                },
+            };
+            return .{ .items = items };
+        }
+    };
+
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), FakeWrites.source());
+    defer server.deinit();
+
+    try std.testing.expect(try server.queryHasRebuildingCatalogIndex("docs", .{
+        .index_name = "semantic_idx",
+    }));
 }
 
 test "api http plain public query preserves outer absolute request deadline" {
