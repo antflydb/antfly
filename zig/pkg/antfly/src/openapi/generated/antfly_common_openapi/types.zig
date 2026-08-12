@@ -114,6 +114,7 @@ pub const Config = struct {
     health_enabled: ?bool = null,
     /// Port for the health/metrics server. Defaults to 4200.
     health_port: ?i64 = null,
+    runtime: ?RuntimeConfig = null,
     storage: ?StorageConfig = null,
     transaction_sessions: ?TransactionSessionConfig = null,
     metadata: ?MetadataInfo = null,
@@ -464,6 +465,12 @@ pub const ObjectStorageLocation = struct {
     connection: ?[]const u8 = null,
     bucket: ?[]const u8 = null,
     prefix: ?[]const u8 = null,
+};
+
+/// Node-local serving-runtime admission settings.
+pub const RuntimeConfig = struct {
+    /// Maximum concurrent data-plane request admission units for each serving runtime in this process. Query and search requests currently consume one unit. Operational and control-plane routes remain outside this budget so they stay reachable during overload. Excess work is rejected immediately with a retryable overload response rather than retained in an in-process queue. Set to 0 to disable this admission limit. This setting is separate from transport connection limits and from inference.max_concurrent_requests.
+    max_concurrent_requests: ?i64 = null,
 };
 
 pub const S3ExternalIoConfig = struct {

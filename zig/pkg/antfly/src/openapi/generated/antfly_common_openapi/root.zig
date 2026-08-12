@@ -25,6 +25,7 @@ pub const NamedChainLink = types.NamedChainLink;
 pub const ObjectStorageConfig = types.ObjectStorageConfig;
 pub const ObjectStorageLanes = types.ObjectStorageLanes;
 pub const ObjectStorageLocation = types.ObjectStorageLocation;
+pub const RuntimeConfig = types.RuntimeConfig;
 pub const S3ExternalIoConfig = types.S3ExternalIoConfig;
 pub const StorageConfig = types.StorageConfig;
 pub const StorageEngine = types.StorageEngine;

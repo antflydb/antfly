@@ -267,7 +267,11 @@ pub fn handlerCreate(context: *const HandlerCreateContext) callconv(.c) abi.Stat
     const state = api_state.owner_alloc.create(HandlerState) catch |err| return fail(err);
     state.* = .{
         .alloc = api_state.owner_alloc,
-        .handler = .{ .api_server = &api_state.server },
+        .handler = .{
+            .api_server = &api_state.server,
+            .query_admission = handler_mod.QueryAdmission.init(api_state.server.cfg.max_concurrent_requests),
+            .query_body_admission = handler_mod.QueryAdmission.init(api_state.server.cfg.max_concurrent_requests),
+        },
     };
     context.out_handle.* = state;
     return .ok;

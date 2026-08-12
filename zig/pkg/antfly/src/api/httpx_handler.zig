@@ -21,6 +21,7 @@
 /// the respond() helper for methods that return http_common.HttpResponse.
 const std = @import("std");
 const httpx = @import("httpx");
+const common_config = @import("../common/config.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const PeerObserver = @import("../common/http/peer_disconnect_observer.zig").Observer;
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -94,7 +95,7 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
 pub const QueryAdmission = struct {
     /// Match the provisioned public listener's expensive-request budget so
     /// standalone and clustered deployments shed load at the same point.
-    capacity: usize = 32,
+    capacity: usize = common_config.default_max_concurrent_requests,
     in_flight: std.atomic.Value(usize) = .init(0),
     rejected_total: std.atomic.Value(u64) = .init(0),
     peak_in_flight: std.atomic.Value(usize) = .init(0),
@@ -105,7 +106,7 @@ pub const QueryAdmission = struct {
 
     pub fn tryAcquire(self: *QueryAdmission) bool {
         var observed = self.in_flight.load(.acquire);
-        while (observed < self.capacity) {
+        while (self.capacity == 0 or observed < self.capacity) {
             if (self.in_flight.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire) == null) {
                 const admitted = observed + 1;
                 var peak = self.peak_in_flight.load(.acquire);
@@ -4519,6 +4520,15 @@ test "httpx query admission releases a cancelled query slot" {
     admission.release();
     try std.testing.expect(admission.tryAcquire());
     admission.release();
+}
+
+test "httpx query admission treats zero capacity as unlimited" {
+    var admission = QueryAdmission.init(0);
+    for (0..64) |_| try std.testing.expect(admission.tryAcquire());
+    try std.testing.expectEqual(@as(usize, 64), admission.stats().in_flight);
+    for (0..64) |_| admission.release();
+    try std.testing.expectEqual(@as(usize, 0), admission.stats().in_flight);
+    try std.testing.expectEqual(@as(u64, 0), admission.stats().rejected_total);
 }
 
 test "httpx rejects pipelined H1 query work when disconnect ownership is ambiguous" {

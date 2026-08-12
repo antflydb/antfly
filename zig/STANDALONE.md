@@ -65,6 +65,27 @@ embedded standalone should resolve the same config to an in-process chunker inst
 The existing `.antfly` / `.mock` fixed chunkers are already local and do not
 need this migration.
 
+## Request Admission Ownership
+
+Serving admission and backend execution are separate concerns:
+
+- `runtime.max_concurrent_requests` bounds node-local database data-plane work.
+  Query and search routes consume the budget; operational and control-plane
+  routes remain available during overload.
+- `inference.max_concurrent_requests` is an independent weighted budget shared
+  by every embedded inference execution surface, including direct providers and
+  the public inference and traditional-ML prediction routes.
+- Listener connection limits remain transport safeguards. They do not express
+  executing-query capacity because HTTP/2 streams and keep-alive requests can
+  multiplex work over a smaller number of sockets.
+- `BackendRuntime` continues to own shared I/O executors and durable background
+  lanes. It does not classify public routes or return protocol-specific overload
+  responses; runtime/API adapters acquire admission before submitting work.
+
+Both request limits reject immediately when exhausted. A value of zero disables
+the corresponding admission budget for trusted environments, while underlying
+transport and memory safeguards remain in force.
+
 ## Shard DB Adapter
 
 `ShardDbAdapter` is the metadata-facing facade for local-or-remote shard DB

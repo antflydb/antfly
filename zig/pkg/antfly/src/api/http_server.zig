@@ -602,6 +602,8 @@ pub const RestoreExecutionGuard = struct {
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     experimental: bool = false,
+    /// Node-local query/search admission capacity. Zero disables the limit.
+    max_concurrent_requests: u32 = common_config.default_max_concurrent_requests,
     ard_base_url: ?[]const u8 = null,
     ard_publisher_domain: []const u8 = "antfly.local",
     ard_display_name: []const u8 = "Antfly",

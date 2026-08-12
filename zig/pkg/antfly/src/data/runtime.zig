@@ -318,7 +318,7 @@ const public_api_max_connection_threads: u32 = 64;
 // Leave half of the public connection slots available to parse, reject, and
 // drain overload traffic. Health has its own listener; this bound prevents
 // expensive public queries from consuming every worker under client timeouts.
-const public_api_max_active_requests: u32 = 32;
+const public_api_max_active_requests: u32 = antfly.common.config.default_max_concurrent_requests;
 
 const DataRaftBatchRoute = struct {
     allow_remote_forward: bool = true,
@@ -675,23 +675,26 @@ const ResolvedMetadataApiUrls = struct {
     }
 };
 
-fn publicApiListenerConfig(bind_host: []const u8, bind_port: u16) antfly.raft.transport.StdHttpListenerConfig {
+fn publicApiListenerConfig(bind_host: []const u8, bind_port: u16, max_concurrent_requests: u32) antfly.raft.transport.StdHttpListenerConfig {
     return .{
         .bind_host = bind_host,
         .bind_port = bind_port,
         .max_request_bytes = antfly.public_api.http_server.public_api_max_request_body_bytes,
         .serve_in_connection_threads = true,
         .max_connection_threads = public_api_max_connection_threads,
-        .max_active_requests = public_api_max_active_requests,
+        .max_active_requests = max_concurrent_requests,
     };
 }
 
 test "data public API listener uses public API request body limit" {
-    const cfg = publicApiListenerConfig("127.0.0.1", 8080);
+    const cfg = publicApiListenerConfig("127.0.0.1", 8080, public_api_max_active_requests);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
     try std.testing.expect(cfg.serve_in_connection_threads);
     try std.testing.expectEqual(public_api_max_connection_threads, cfg.max_connection_threads);
     try std.testing.expectEqual(public_api_max_active_requests, cfg.max_active_requests);
+
+    const configured = publicApiListenerConfig("127.0.0.1", 8080, 7);
+    try std.testing.expectEqual(@as(u32, 7), configured.max_active_requests);
 }
 
 const DataDescriptorFactory = struct {
@@ -4251,7 +4254,7 @@ pub const DataServer = struct {
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
-            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.max_concurrent_requests),
         };
     }
 
@@ -4288,7 +4291,7 @@ pub const DataServer = struct {
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
-            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.max_concurrent_requests),
         };
     }
 
@@ -4325,7 +4328,7 @@ pub const DataServer = struct {
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
-            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.max_concurrent_requests),
         };
     }
 
@@ -12990,7 +12993,7 @@ pub const DataServer = struct {
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
-            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.max_concurrent_requests),
         };
         owned_backend_runtime = null;
         return server;
@@ -15922,6 +15925,7 @@ pub fn runFromIterator(
         .api_server_cfg = .{
             .auth_enabled = effective_auth_enabled,
             .experimental = cli.experimental,
+            .max_concurrent_requests = if (loaded_config) |*cfg| cfg.runtime.max_concurrent_requests else antfly.common.config.default_max_concurrent_requests,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
             .ard_base_url = cli.ard_base_url,

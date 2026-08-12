@@ -4734,6 +4734,7 @@ pub fn build(b: *std.Build) void {
         "httpx owned response preserves retryable JSON metadata",
         "httpx query admission rejects saturated queries without blocking control routes",
         "httpx query admission releases a cancelled query slot",
+        "httpx query admission treats zero capacity as unlimited",
         "httpx rejects pipelined H1 query work when disconnect ownership is ambiguous",
         "httpx production path sheds 128 abandoned queries and preserves control recovery",
         "compiled stored filters honor canonical JSON pointer fields and escapes",

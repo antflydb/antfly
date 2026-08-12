@@ -306,7 +306,11 @@ const OpaqueHttpxHandler = struct {
 };
 
 pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
-    if (comptime direct_codegen) return .{ .api_server = server };
+    if (comptime direct_codegen) return .{
+        .api_server = server,
+        .query_admission = handler_mod.QueryAdmission.init(server.cfg.max_concurrent_requests),
+        .query_body_admission = handler_mod.QueryAdmission.init(server.cfg.max_concurrent_requests),
+    };
     var handle: ?*anyopaque = null;
     const status = antfly_api_kernel_handler_create(&.{
         .abi_version = abi.abi_version,

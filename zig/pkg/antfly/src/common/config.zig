@@ -35,6 +35,7 @@ const default_max_shards_per_table: u32 = 20;
 const default_config_shards_per_table: u32 = 3;
 const default_standalone_shards_per_table: u32 = 1;
 pub const default_health_port: u16 = 4200;
+pub const default_max_concurrent_requests: u32 = 32;
 pub const local_inference_connection_id = "local-inference";
 
 pub const DeploymentMode = enum {
@@ -64,6 +65,7 @@ pub const Config = struct {
     log: ?logging_openapi.Config = null,
     tls: ?TlsConfig = null,
     cors: ?CorsConfig = null,
+    runtime: RuntimeConfig = .{},
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
     transaction_sessions: TransactionSessionConfig = .{},
@@ -71,6 +73,12 @@ pub const Config = struct {
     remote_content: ?RemoteContentConfig = null,
     connections: ConnectionsConfig = .{},
     shard_allocation: ShardAllocationConfig = .{},
+
+    pub const RuntimeConfig = struct {
+        /// Zero disables data-plane request admission. Operational and control
+        /// routes do not consume this budget.
+        max_concurrent_requests: u32 = default_max_concurrent_requests,
+    };
 
     pub const MetadataConfig = struct {
         pub const NodeUrl = struct {
@@ -647,6 +655,12 @@ pub const Config = struct {
                 .key = if (tls.key) |value| try alloc.dupe(u8, value) else null,
             } else null,
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
+            .runtime = if (validated.value.runtime) |runtime| .{
+                .max_concurrent_requests = if (runtime.max_concurrent_requests) |value|
+                    std.math.cast(u32, value) orelse return error.InvalidConfig
+                else
+                    default_max_concurrent_requests,
+            } else .{},
             .metadata = try parseMetadataConfig(
                 alloc,
                 root,
@@ -2161,6 +2175,9 @@ test "common config extracts antfly settings" {
         \\  "default_shards_per_table": 1,
         \\  "max_shard_size_bytes": 1024,
         \\  "max_shards_per_table": 4,
+        \\  "runtime": {
+        \\    "max_concurrent_requests": 11
+        \\  },
         \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
@@ -2206,6 +2223,7 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.inference.api_url.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
+    try std.testing.expectEqual(@as(u32, 11), cfg.runtime.max_concurrent_requests);
     try std.testing.expectEqual(@as(?usize, 7), cfg.inference.max_concurrent_requests);
     try std.testing.expectEqual(Config.InferenceConfig.KernelJitConfig.Mode.shadow, cfg.inference.kernel_jit.mode);
     try std.testing.expectEqualStrings("/tmp/antfly-jit", cfg.inference.kernel_jit.cache_dir.?);
@@ -2985,6 +3003,7 @@ test "common config parses minimal config with runtime defaults" {
     try std.testing.expect(cfg.storage.local_base_dir == null);
     try std.testing.expect(cfg.health_enabled);
     try std.testing.expectEqual(@as(?u16, default_health_port), cfg.health_port);
+    try std.testing.expectEqual(default_max_concurrent_requests, cfg.runtime.max_concurrent_requests);
     try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
     try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
