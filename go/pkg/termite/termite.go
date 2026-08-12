@@ -606,6 +606,7 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 		MaxConcurrentRequests: maxConcurrentRequests,
 		MaxQueueSize:          config.MaxQueueSize,
 		RequestTimeout:        requestTimeout,
+		RejectWhenBusy:        true,
 	}, zl.Named("queue"))
 
 	// Initialize result caches for inference deduplication
