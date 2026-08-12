@@ -8,6 +8,7 @@
 const std = @import("std");
 const batch_api = @import("batch.zig");
 const distributed_txn = @import("distributed_txn.zig");
+const distributed_graph = @import("distributed_graph.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const metadata_mod = @import("../metadata/domain.zig");
@@ -597,6 +598,47 @@ pub const Operations = struct {
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
+    pub fn graphExpand(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphExpandRequest) Error!distributed_graph.GraphExpandResponse {
+        try request.ensureActive();
+        const reads = self.reads orelse return error.NotFound;
+        return (reads.graphExpandGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return error.InvalidArgument,
+            error.TopologyChanged => return error.TopologyChanged,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.UnknownGroup, error.TableNotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
+    pub fn graphHydrate(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphHydrateRequest) Error!distributed_graph.GraphHydrateResponse {
+        try request.ensureActive();
+        const reads = self.reads orelse return error.NotFound;
+        return (reads.graphHydrateGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
+            error.TopologyChanged => return error.TopologyChanged,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.UnknownGroup, error.TableNotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
+    pub fn graphEdges(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphEdgesRequest) Error!distributed_graph.GraphEdgesResponse {
+        try request.ensureActive();
+        const reads = self.reads orelse return error.NotFound;
+        return (reads.graphEdgesGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
+            error.InvalidQueryRequest, error.IndexNotFound => return error.InvalidArgument,
+            error.TopologyChanged => return error.TopologyChanged,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.UnknownGroup, error.TableNotFound => return error.NotFound,
             else => return error.Internal,
         }) orelse error.NotFound;
     }

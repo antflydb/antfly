@@ -141,6 +141,10 @@ that end state:
   call a typed scan operation returning owned NDJSON. The operation owns
   read-consistency selection and storage error classification; the manual
   scan branch has been removed.
+- Internal graph expand, hydrate, and edge workers are concrete `httpx`
+  adapters over typed group operations. Request ownership stays at ingress;
+  the operations own read consistency and storage error classification, and
+  all three manual-dispatch branches are gone.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

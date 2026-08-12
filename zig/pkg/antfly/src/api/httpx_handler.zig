@@ -51,6 +51,7 @@ const table_writes = @import("table_writes.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const transactions_api = @import("transactions.zig");
 const distributed_txn = @import("distributed_txn.zig");
+const distributed_graph = @import("distributed_graph.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
 const generating_runtime = @import("../generating/mod.zig");
 const query_api = @import("query.zig");
@@ -329,6 +330,9 @@ pub const AntflyApiHandler = struct {
         try server.post(group_prefix ++ routes.shard_ops_execute_suffix, httpx.Handler.bind(self, internalExecuteTransition));
         try server.post(table_prefix ++ routes.batch_suffix, httpx.Handler.bind(self, internalGroupBatch));
         try server.post(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
+        try server.post(table_prefix ++ routes.graph_expand_suffix, httpx.Handler.bind(self, internalGraphExpand));
+        try server.post(table_prefix ++ routes.graph_hydrate_suffix, httpx.Handler.bind(self, internalGraphHydrate));
+        try server.post(table_prefix ++ routes.graph_edges_suffix, httpx.Handler.bind(self, internalGraphEdges));
         try server.post(table_prefix ++ routes.routed_batch_suffix, httpx.Handler.bind(self, internalGroupRoutedBatch));
         try server.post(table_prefix ++ routes.txn_begin_suffix, httpx.Handler.bind(self, internalTxnBegin));
         try server.post(table_prefix ++ routes.txn_prepare_suffix, httpx.Handler.bind(self, internalTxnPrepare));
@@ -343,9 +347,6 @@ pub const AntflyApiHandler = struct {
         try server.post(document_artifact_prefix ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalDocumentArtifactReprocess));
         try server.post(table_prefix ++ routes.artifacts_marker ++ ":artifact_name" ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalTableArtifactReprocess));
         const internal_posts = [_][]const u8{
-            table_prefix ++ routes.graph_expand_suffix,
-            table_prefix ++ routes.graph_hydrate_suffix,
-            table_prefix ++ routes.graph_edges_suffix,
             table_prefix ++ routes.text_stats_suffix,
             table_prefix ++ routes.algebraic_partials_suffix,
             table_prefix ++ routes.query_suffix,
@@ -1430,6 +1431,42 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("content-type", "application/x-ndjson");
         _ = ctx.response.body(result.ndjson);
         return ctx.response.build();
+    }
+
+    fn internalGraphExpand(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid graph expand request");
+        var input = distributed_graph.parseGraphExpandRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid graph expand request");
+        defer input.deinit(ctx.allocator);
+        var result = self.internalGroupOperations().graphExpand(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+            return if (err == error.InvalidArgument) textResponse(ctx, 400, @errorName(err)) else internalGroupErrorResponse(ctx, err);
+        defer result.deinit(ctx.allocator);
+        return ctx.json(result);
+    }
+
+    fn internalGraphHydrate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid graph hydrate request");
+        var input = distributed_graph.parseGraphHydrateRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid graph hydrate request");
+        defer input.deinit(ctx.allocator);
+        var result = self.internalGroupOperations().graphHydrate(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+            return internalGroupErrorResponse(ctx, err);
+        defer result.deinit(ctx.allocator);
+        return ctx.json(result);
+    }
+
+    fn internalGraphEdges(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid graph edges request");
+        var input = distributed_graph.parseGraphEdgesRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid graph edges request");
+        defer input.deinit(ctx.allocator);
+        var result = self.internalGroupOperations().graphEdges(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+            return if (err == error.InvalidArgument) textResponse(ctx, 400, "invalid graph edges request") else internalGroupErrorResponse(ctx, err);
+        defer result.deinit(ctx.allocator);
+        return ctx.json(result);
     }
 
     fn internalGroupRoutedBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -5725,6 +5762,19 @@ test "httpx internal control routes call typed operations directly" {
     defer invalid_scan.deinit();
     try std.testing.expectEqual(@as(u16, 400), invalid_scan.status.code);
     try std.testing.expectEqualStrings("invalid scan request", invalid_scan.body.?);
+
+    inline for (.{
+        .{ "graph-expand", "invalid graph expand request" },
+        .{ "graph-hydrate", "invalid graph hydrate request" },
+        .{ "graph-edges", "invalid graph edges request" },
+    }) |case| {
+        const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/{s}", .{ base_url, case[0] });
+        defer alloc.free(url);
+        var response = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &headers, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expectEqualStrings(case[1], response.body.?);
+    }
 
     inline for (.{
         .{ "document_units_v1:placement", "invalid document artifact placement request" },

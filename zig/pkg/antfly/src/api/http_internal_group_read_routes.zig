@@ -454,32 +454,6 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
     const alloc = ctx.alloc;
     const source = ctx.reads;
     if (req.method == .POST) {
-        if (routes.Routes.matchGroupGraphExpand(path)) |graph_expand_route| {
-            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            var expand_req = distributed_graph.parseGraphExpandRequest(alloc, req.body) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return try http_route_helpers.textResponse(alloc, 400, "invalid graph expand request"),
-            };
-            defer expand_req.deinit(alloc);
-
-            var result = (reads.graphExpandGroupLocal(
-                alloc,
-                graph_expand_route.group_id,
-                graph_expand_route.table_name,
-                expand_req,
-                .read_index,
-            ) catch |err| switch (err) {
-                error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
-                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
-                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
-                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
-                error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
-                error.StorageReadTemporarilyUnavailable => return try http_route_helpers.textResponse(alloc, 503, "storage read temporarily unavailable"),
-                else => return err,
-            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            defer result.deinit(alloc);
-            return try http_route_helpers.jsonResponse(alloc, result);
-        }
         if (routes.Routes.matchGroupQuery(path)) |query_route| {
             const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             var semantic_resolver = SemanticStatusResolver{ .planning = ctx.queryPlanning() };
@@ -598,57 +572,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             defer summary.deinit(alloc);
             return try http_route_helpers.jsonResponse(alloc, summary);
         }
-        if (routes.Routes.matchGroupGraphHydrate(path)) |graph_hydrate_route| {
-            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            var hydrate_req = distributed_graph.parseGraphHydrateRequest(alloc, req.body) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return try http_route_helpers.textResponse(alloc, 400, "invalid graph hydrate request"),
-            };
-            defer hydrate_req.deinit(alloc);
 
-            var result = (reads.graphHydrateGroupLocal(
-                alloc,
-                graph_hydrate_route.group_id,
-                graph_hydrate_route.table_name,
-                hydrate_req,
-                .read_index,
-            ) catch |err| switch (err) {
-                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
-                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
-                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
-                error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
-                error.StorageReadTemporarilyUnavailable => return try http_route_helpers.textResponse(alloc, 503, "storage read temporarily unavailable"),
-                else => return err,
-            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            defer result.deinit(alloc);
-            return try http_route_helpers.jsonResponse(alloc, result);
-        }
-        if (routes.Routes.matchGroupGraphEdges(path)) |graph_edges_route| {
-            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            var edges_req = distributed_graph.parseGraphEdgesRequest(alloc, req.body) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return try http_route_helpers.textResponse(alloc, 400, "invalid graph edges request"),
-            };
-            defer edges_req.deinit(alloc);
-
-            var result = (reads.graphEdgesGroupLocal(
-                alloc,
-                graph_edges_route.group_id,
-                graph_edges_route.table_name,
-                edges_req,
-                .read_index,
-            ) catch |err| switch (err) {
-                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
-                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
-                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
-                error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
-                error.InvalidQueryRequest, error.IndexNotFound => return try http_route_helpers.textResponse(alloc, 400, "invalid graph edges request"),
-                error.StorageReadTemporarilyUnavailable => return try http_route_helpers.textResponse(alloc, 503, "storage read temporarily unavailable"),
-                else => return err,
-            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            defer result.deinit(alloc);
-            return try http_route_helpers.jsonResponse(alloc, result);
-        }
         if (routes.Routes.matchGroupTextStats(path)) |text_stats_route| {
             const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             var text_stats_result = reads.textStatsGroupLocal(alloc, text_stats_route.group_id, text_stats_route.table_name, req.body) catch |err| switch (err) {
