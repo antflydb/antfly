@@ -2203,29 +2203,29 @@ pub fn estimateGptGenerationForKvPolicy(
     const split_gemma_kv = kv_capacity_policy == .split_swa_ring and
         backend == .metal and
         config.supportsSplitSwaGlobalKvRing();
+    // KvPoolConfig has one row geometry for every packed layer. Budget that
+    // exact model-wide geometry even when individual layers expose narrower
+    // local-attention heads.
+    const pool_kv_heads = config.maxKvHeads();
+    const pool_head_dim = try estimateMaxHeadDim(config);
+    if (pool_kv_heads == 0 or pool_head_dim == 0) return error.InvalidModelConfig;
+    const kv_pair_bytes = kv_dtype.bytesForTokenPairChecked(pool_kv_heads, pool_head_dim) catch
+        return error.ResourceLimitExceeded;
     var kv_bytes: usize = 0;
     for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
         if (config.layerSharesKv(layer)) continue;
         var layer_capacity_tokens = if (backend == .metal) metal_capacity_tokens else page_aligned_tokens;
         if (split_gemma_kv and config.layerUsesSlidingAttention(layer)) {
             const ring_pages = storage_runtime.swaRingPageCount(
-                16,
+                generation_kv_page_size_tokens,
                 config.sliding_window,
                 generationMaxInflightTokens(prefill_chunk_size),
                 true,
             ) catch return error.ResourceLimitExceeded;
-            const ring_tokens = std.math.mul(usize, ring_pages, 16) catch
+            const ring_tokens = std.math.mul(usize, ring_pages, generation_kv_page_size_tokens) catch
                 return error.ResourceLimitExceeded;
-            layer_capacity_tokens = @max(layer_capacity_tokens, ring_tokens);
+            layer_capacity_tokens = ring_tokens;
         }
-        const kv_heads = config.effectiveKVHeadsForLayer(layer);
-        const head_dim = if (config.family == .deepseek_v4)
-            try estimateMaxHeadDim(config)
-        else
-            config.effectiveHeadDimForLayer(layer);
-        if (kv_heads == 0 or head_dim == 0) return error.InvalidModelConfig;
-        const kv_pair_bytes = kv_dtype.bytesForTokenPairChecked(kv_heads, head_dim) catch
-            return error.ResourceLimitExceeded;
         const layer_bytes = std.math.mul(usize, layer_capacity_tokens, kv_pair_bytes) catch
             return error.ResourceLimitExceeded;
         kv_bytes = std.math.add(usize, kv_bytes, layer_bytes) catch
@@ -3246,10 +3246,38 @@ test "gpt generation estimate keeps mixed Gemma global history" {
 
     const estimate = try estimateGptGeneration(.metal, .f16, cfg, 2000, 100, 512);
     try std.testing.expectEqual(@as(usize, 2100), estimate.retained_tokens);
-    // All 24 donor layers budget the 3168-token Metal growth capacity. The
-    // 18 shared tail layers do not own KV storage.
-    try std.testing.expectEqual(@as(usize, 181_665_792), estimate.kv_bytes);
+    // The packed pool uses the maximum 2 x 512 row geometry for all 24 donor
+    // layers and budgets geometric Metal growth. Shared tail layers do not
+    // own KV storage.
+    try std.testing.expectEqual(@as(usize, 311_427_072), estimate.kv_bytes);
     try std.testing.expectEqual(@as(usize, 76_546_048), estimate.scratch_bytes);
+
+    const ring_estimate = try estimateGptGenerationForKvPolicy(
+        .metal,
+        .f16,
+        cfg,
+        2000,
+        100,
+        512,
+        .split_swa_ring,
+    );
+    // Four global donor layers retain geometric full history. The other 20
+    // donor layers use the 1,040-token ring actually allocated at runtime.
+    try std.testing.expectEqual(@as(usize, 137_101_312), ring_estimate.kv_bytes);
+    try std.testing.expect(ring_estimate.kv_bytes < estimate.kv_bytes);
+
+    const long_full = try estimateGptGeneration(.metal, .f16, cfg, 65_536, 300, 256);
+    const long_ring = try estimateGptGenerationForKvPolicy(
+        .metal,
+        .f16,
+        cfg,
+        65_536,
+        300,
+        256,
+        .split_swa_ring,
+    );
+    try std.testing.expect(long_full.kv_bytes > gib(3));
+    try std.testing.expect(long_ring.kv_bytes < gib(3));
 }
 
 test "gpt generation estimate covers a sliding ring larger than global growth" {
@@ -3264,12 +3292,22 @@ test "gpt generation estimate covers a sliding ring larger than global growth" {
         .vocab_size = 1,
         .sliding_window = 512,
         .sliding_window_pattern = 2,
+        .ple_hidden_size = 2560,
         .position_encoding = .rope,
     };
 
-    const estimate = try estimateGptGeneration(.metal, .f16, cfg, 16, 1, 16);
-    // Local ring: 34 pages = 544 tokens. Global growth: 32 -> 48 tokens.
-    try std.testing.expectEqual(@as(usize, 1_310_720), estimate.kv_bytes);
+    const estimate = try estimateGptGenerationForKvPolicy(
+        .metal,
+        .f16,
+        cfg,
+        16,
+        1,
+        16,
+        .split_swa_ring,
+    );
+    // Local ring: 34 pages = 544 tokens. Global growth: 32 -> 48 tokens. Both
+    // layers use the packed pool's maximum 2 x 512 row geometry.
+    try std.testing.expectEqual(@as(usize, 2_424_832), estimate.kv_bytes);
 }
 
 test "generation budget downshifts target and draft together" {

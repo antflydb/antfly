@@ -343,14 +343,14 @@ pub const Config = struct {
         return self.family == .gemma and
             self.hasPle() and
             self.sliding_window > 0 and
-            self.hasGlobalAttentionLayers();
+            self.hasMixedSlidingAndGlobalAttentionLayers();
     }
 
     /// Retention window for a layer-packed KV pool. Mixed global/sliding
     /// attention keeps full history unless the lower-memory override is forced.
     pub fn kvPoolSlidingWindowSize(self: Config, force_sliding_trim: bool) ?u32 {
         if (self.position_encoding == .absolute) return null;
-        if (self.sliding_window > 0 and self.hasGlobalAttentionLayers() and !force_sliding_trim) return null;
+        if (self.sliding_window > 0 and self.hasMixedSlidingAndGlobalAttentionLayers() and !force_sliding_trim) return null;
         if (self.sliding_window > 0) return self.sliding_window;
         if (self.max_position_embeddings > 0) return self.max_position_embeddings;
         return null;

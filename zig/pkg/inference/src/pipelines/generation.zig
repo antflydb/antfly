@@ -114,7 +114,26 @@ pub fn nativeGenerationMediaTokenAllowance(messages: []const Message, config: gp
     return nativeGenerationImageCount(messages) *| (@as(usize, config.mm_tokens_per_image) + 1);
 }
 
-fn preliminaryTextMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
+/// Conservative media-token count used for scheduling and memory admission.
+/// Qwen image spans are dynamic, so derive their bound from the same
+/// preprocessor configuration that produces the final visual tokens.
+pub fn nativeGenerationAdmissionMediaTokenAllowance(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    messages: []const Message,
+    config: gpt_mod.Config,
+) !usize {
+    if (config.family != .qwen3_5) return nativeGenerationMediaTokenAllowance(messages, config);
+    const image_count = nativeGenerationImageCount(messages);
+    if (image_count == 0) return 0;
+    const prep_config = try qwen2vl_mm.loadPreprocessorConfig(allocator, model_dir);
+    const max_image_tokens = try qwen2vl_mm.maxImageTokenCount(prep_config);
+    return image_count *| (max_image_tokens +| 1);
+}
+
+/// Media allowance that can safely constrain the text-only encode before
+/// dynamic image preprocessing determines the exact expanded prompt length.
+pub fn nativeGenerationPreliminaryMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
     if (config.family == .qwen3_5) return 0;
     return nativeGenerationMediaTokenAllowance(messages, config);
 }
@@ -3135,7 +3154,7 @@ pub const NativeGenerationPipeline = struct {
         // below, then validates the fully expanded prompt. Reserving its
         // coarse media allowance during this preliminary text-only encode can
         // reject text that the real multimodal encode accepts.
-        const preliminary_media_allowance = preliminaryTextMediaTokenAllowance(messages, self.gpt_config);
+        const preliminary_media_allowance = nativeGenerationPreliminaryMediaTokenAllowance(messages, self.gpt_config);
         const text_prompt_token_limit = try nativeGenerationPromptTokenLimit(
             self.gpt_config,
             relevant_draft_config,
@@ -10365,6 +10384,20 @@ test "native generation prompt limit reserves output media and draft context" {
     try std.testing.expectEqual(
         @as(usize, 514),
         nativeGenerationMediaTokenAllowance(&messages, .{ .mm_tokens_per_image = 256 }),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        nativeGenerationPreliminaryMediaTokenAllowance(&messages, .{
+            .family = .qwen3_5,
+            .mm_tokens_per_image = 256,
+        }),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 514),
+        nativeGenerationPreliminaryMediaTokenAllowance(&messages, .{
+            .family = .gemma,
+            .mm_tokens_per_image = 256,
+        }),
     );
 }
 

@@ -846,7 +846,14 @@ pub const MetalKvStorage = struct {
             if (!active_frame) return err;
             break :blk null;
         };
-        if (!active_frame and binding.written_tokens < gather.token_count) return error.DeviceReadFallback;
+        // A fused operation may expose a reserved slot before it encodes the
+        // current suffix, but only while an ordered frame is active. Every
+        // token before that explicitly declared suffix must already be
+        // committed; otherwise the slot contains unreadable capacity.
+        if (gather.pending_suffix_token_count != 0 and !active_frame) return error.DeviceReadFallback;
+        if (!binding.coversBeforePendingSuffix(gather.token_count, gather.pending_suffix_token_count)) {
+            return error.DeviceReadFallback;
+        }
         if (info_opt) |info| {
             if (info.key_row_bytes != 0 and info.key_row_bytes != key_row_bytes) return error.DeviceReadFallback;
             if (info.v_row_stride != 0 and info.v_row_stride != token_width) return error.DeviceReadFallback;

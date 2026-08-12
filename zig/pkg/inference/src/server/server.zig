@@ -80,15 +80,6 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 pub const metrics_mod = @import("metrics.zig");
 const request_queue_mod = @import("request_queue.zig");
 
-fn requestedSpeculativeK(value: ?i64, draft_requested: bool) !u32 {
-    if (!draft_requested) return 4;
-    const candidate = value orelse 4;
-    if (candidate < 1 or candidate > runtime.tier.memory.generation_max_speculative_k) {
-        return error.InvalidSpeculativeK;
-    }
-    return @intCast(candidate);
-}
-
 fn spinLock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
 }
@@ -4586,6 +4577,7 @@ pub const Node = struct {
     fn estimateNativePromptTokens(
         self: *Node,
         allocator: std.mem.Allocator,
+        model_dir: []const u8,
         model: *model_manager_mod.LoadedModel,
         gpt_config: gpt_model_mod.Config,
         messages: []const generation.Message,
@@ -4599,13 +4591,19 @@ pub const Node = struct {
         else
             try generation.formatMessages(allocator, messages);
         defer allocator.free(prompt);
-        const media_allowance = generation.nativeGenerationMediaTokenAllowance(messages, gpt_config);
+        const media_allowance = try generation.nativeGenerationAdmissionMediaTokenAllowance(
+            allocator,
+            model_dir,
+            messages,
+            gpt_config,
+        );
+        const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(messages, gpt_config);
         const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
             gpt_config,
             null,
             @intCast(@max(max_tokens, 1)),
             speculative_bonus_tokens,
-            media_allowance,
+            preliminary_media_allowance,
         );
         var encoded = try generation.encodeNativeGenerationPrompt(
             model.getTokenizer(),
@@ -5839,6 +5837,7 @@ pub const Node = struct {
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
         const prompt_tokens = self.estimateNativePromptTokens(
             ctx.allocator,
+            model_path,
             model,
             gpt_config,
             messages.items,
@@ -5965,16 +5964,6 @@ pub const Node = struct {
                         draft_model.session,
                         actual_draft_backend,
                     );
-                    generation.validateNativeGenerationPromptTokenCount(
-                        prompt_tokens,
-                        gpt_config,
-                        draft_cfg,
-                        @intCast(@max(config.max_tokens, 1)),
-                        if (config.speculative_k > 0) 1 else 0,
-                    ) catch return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "prompt exceeds the draft model context window after reserving output tokens",
-                    });
                     draft_model_for_generation = draft_model;
                     draft_backend_kind = actual_draft_backend;
                     draft_kv_dtype = actual_draft_kv_dtype;
@@ -6015,7 +6004,10 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "requested output leaves no prompt capacity in the target or draft model context window",
             });
-            if (prompt_tokens > shared_prompt_limit) {
+            // Qwen visual spans are dynamic. `prompt_tokens` deliberately uses
+            // the conservative maximum for admission, so only the pipeline's
+            // post-preprocessing exact count may enforce its context limit.
+            if (gpt_config.family != .qwen3_5 and prompt_tokens > shared_prompt_limit) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
                     .message = "prompt exceeds the target or draft model context window",
@@ -7229,6 +7221,7 @@ pub const Node = struct {
                     };
                     prompt_tokens[pos] = self.estimateNativePromptTokens(
                         ctx.allocator,
+                        model_path,
                         model,
                         gpt_config,
                         owned_messages[idx].messages,

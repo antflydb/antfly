@@ -607,13 +607,19 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     else
         try generation.formatMessages(allocator, &messages);
     defer allocator.free(rendered_prompt);
-    const prompt_media_allowance = generation.nativeGenerationMediaTokenAllowance(&messages, gpt_config);
+    const prompt_media_allowance = try generation.nativeGenerationAdmissionMediaTokenAllowance(
+        allocator,
+        opts.model_dir,
+        &messages,
+        gpt_config,
+    );
+    const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(&messages, gpt_config);
     const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
         gpt_config,
         if (draft_model != null and opts.speculation_policy != .off) draft_gpt_config else null,
         @intCast(@max(opts.max_tokens, 1)),
         if (draft_model != null and opts.speculation_policy != .off and opts.speculative_k > 0) 1 else 0,
-        prompt_media_allowance,
+        preliminary_media_allowance,
     );
     var prompt_encoded = try generation.encodeNativeGenerationPrompt(
         tokenizer,
@@ -808,10 +814,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         budget_limits.backend_limit_bytes / (1024 * 1024),
         budget_limits.combined_limit_bytes / (1024 * 1024),
     });
-    const admission_prefill_chunk = if (opts.prefill_chunk_size > 0)
-        opts.prefill_chunk_size
-    else
-        runtime.tier.memory.generation_default_prefill_chunk_tokens;
     const kv_capacity_policy: runtime.tier.memory.GenerationKvCapacityPolicy = if (graph_mode and
         explicit_partition_backend == .metal and
         compiled_attachment_target == .whole_model and
@@ -821,20 +823,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .split_swa_ring
     else
         .full_history;
-    run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGenerationForKvPolicy(
-        backend_kind,
-        kv_dtype,
-        gpt_config,
-        prompt_tokens,
-        @intCast(@max(opts.max_tokens, 1)),
-        admission_prefill_chunk,
-        kv_capacity_policy,
-    )) catch |err| {
-        if (err == error.MemoryBudgetExceeded) {
-            printBudgetExceeded(model.session, &run_budget);
-        }
-        return err;
-    };
     const draft_kv_dtype = if (draft_model) |loaded| blk: {
         const requested_draft_kv_dtype = if (opts.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
@@ -852,7 +840,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             requested_draft_kv_dtype;
     } else null;
     var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
-    budget_components[0] = .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config };
+    budget_components[0] = .{
+        .backend = backend_kind,
+        .kv_dtype = kv_dtype,
+        .config = gpt_config,
+        .kv_capacity_policy = kv_capacity_policy,
+    };
     var budget_component_count: usize = 1;
     if (draft_gpt_config) |draft_cfg| {
         if (draft_backend_kind != null and draft_kv_dtype != null) {
