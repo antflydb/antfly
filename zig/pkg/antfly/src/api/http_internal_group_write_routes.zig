@@ -324,105 +324,6 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         defer result.deinit(ctx.alloc);
         return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 202, result);
     }
-    if (routes.Routes.matchGroupTableArtifactReprocess(path)) |artifact_route| {
-        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        const Request = struct {
-            from_key: []const u8 = "",
-            to_key: []const u8 = "",
-            limit: u32 = 100,
-            shard_cursors: []const db_mod.types.DocumentArtifactReprocessShardResume = &.{},
-        };
-        const FailureResponse = struct {
-            key: []const u8,
-            error_code: []const u8,
-        };
-        const ShardCursorResponse = struct {
-            group_id: ?u64,
-            next_key: []const u8,
-            scanned: usize,
-            reprocessed: usize,
-            skipped: usize,
-            failed: usize,
-            limit: u32,
-        };
-        const Response = struct {
-            reprocess: []const u8,
-            reprocess_status: []const u8,
-            artifact_name: []const u8,
-            scanned: usize,
-            reprocessed: usize,
-            skipped: usize,
-            failed: usize,
-            limit: u32,
-            next_key: ?[]const u8,
-            pending_shards: usize,
-            failures: []const FailureResponse,
-            shard_cursors: []const ShardCursorResponse,
-        };
-        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, artifact_route.artifact_name);
-        defer ctx.alloc.free(decoded_artifact_name);
-        var parsed = std.json.parseFromSlice(Request, ctx.alloc, if (req.body.len > 0) req.body else "{}", .{}) catch {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid document artifact reprocess request");
-        };
-        defer parsed.deinit();
-        var result = (writes.reprocessDocumentArtifactRangeGroupLocal(
-            ctx.alloc,
-            artifact_route.group_id,
-            artifact_route.table_name,
-            decoded_artifact_name,
-            .{
-                .from_key = parsed.value.from_key,
-                .to_key = parsed.value.to_key,
-                .limit = parsed.value.limit,
-                .shard_cursors = parsed.value.shard_cursors,
-            },
-        ) catch |err| switch (err) {
-            error.InvalidBatchRequest, error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid document artifact reprocess request"),
-            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
-            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
-            error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
-            else => return err,
-        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        defer result.deinit(ctx.alloc);
-        const failures = try ctx.alloc.alloc(FailureResponse, result.failures.len);
-        defer ctx.alloc.free(failures);
-        for (result.failures, failures) |failure, *out| {
-            out.* = .{ .key = failure.key, .error_code = failure.error_code };
-        }
-        const shard_cursors = try ctx.alloc.alloc(ShardCursorResponse, result.shard_cursors.len);
-        defer ctx.alloc.free(shard_cursors);
-        for (result.shard_cursors, shard_cursors) |cursor, *out| {
-            out.* = .{
-                .group_id = cursor.group_id,
-                .next_key = cursor.next_key,
-                .scanned = cursor.scanned,
-                .reprocessed = cursor.reprocessed,
-                .skipped = cursor.skipped,
-                .failed = cursor.failed,
-                .limit = cursor.limit,
-            };
-        }
-        const pending_shards = if (result.shard_cursors.len > 0)
-            result.shard_cursors.len
-        else if (result.next_key != null)
-            @as(usize, 1)
-        else
-            @as(usize, 0);
-        return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 202, Response{
-            .reprocess = "triggered",
-            .reprocess_status = if (pending_shards == 0) "complete" else "in_progress",
-            .artifact_name = decoded_artifact_name,
-            .scanned = result.scanned,
-            .reprocessed = result.reprocessed,
-            .skipped = result.skipped,
-            .failed = result.failed,
-            .limit = result.limit,
-            .next_key = result.next_key,
-            .pending_shards = pending_shards,
-            .failures = failures,
-            .shard_cursors = shard_cursors,
-        });
-    }
     return null;
 }
 
@@ -910,6 +811,26 @@ test "typed internal group operations apply document artifact child range batch"
     ));
 }
 
+test "typed internal group operations reprocess a document artifact range" {
+    const operations = internal_group_operations.Operations{
+        .reads = null,
+        .shard_db_adapter = null,
+        .writes = TestWriteSource.source(),
+    };
+    var result = try operations.reprocessDocumentArtifactRange(
+        std.testing.allocator,
+        .{},
+        7,
+        "docs",
+        "document_units_v1",
+        .{ .limit = 25 },
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), result.scanned);
+    try std.testing.expectEqual(@as(usize, 2), result.reprocessed);
+    try std.testing.expectEqual(@as(u32, 25), result.limit);
+}
+
 pub fn expectRejectsCallbackTokenWithoutCancelExecutorForTest() !void {
     const alloc = std.testing.allocator;
 
@@ -1125,6 +1046,7 @@ const TestWriteSource = struct {
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
                 .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
             },
@@ -1162,6 +1084,18 @@ const TestWriteSource = struct {
 
     fn txnStatusGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !?db_mod.types.TxnStatus {
         return .pending;
+    }
+
+    fn reprocessDocumentArtifactRangeGroupLocal(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        request: db_mod.types.DocumentArtifactTableReprocessRequest,
+    ) !?db_mod.types.DocumentArtifactTableReprocessResult {
+        if (group_id != 7 or !std.mem.eql(u8, table_name, "docs") or !std.mem.eql(u8, artifact_name, "document_units_v1")) return null;
+        return .{ .scanned = 3, .reprocessed = 2, .skipped = 1, .limit = request.limit };
     }
 
     fn updateDocumentArtifactChildRangePlacementGroupLocal(

@@ -335,6 +335,7 @@ pub const AntflyApiHandler = struct {
         try server.post(document_artifact_prefix ++ routes.placement_update_suffix, httpx.Handler.bind(self, internalDocumentArtifactPlacementUpdate));
         try server.post(document_artifact_prefix ++ routes.child_range_batch_suffix, httpx.Handler.bind(self, internalDocumentArtifactChildRangeBatch));
         try server.post(document_artifact_prefix ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalDocumentArtifactReprocess));
+        try server.post(table_prefix ++ routes.artifacts_marker ++ ":artifact_name" ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalTableArtifactReprocess));
         const internal_posts = [_][]const u8{
             table_prefix ++ routes.documents_suffix,
             table_prefix ++ routes.graph_expand_suffix,
@@ -1127,6 +1128,68 @@ pub const AntflyApiHandler = struct {
             params.artifact_name,
         ) catch |err| return internalArtifactWriteErrorResponse(ctx, err, "invalid document artifact reprocess request");
         return ctx.json(.{ .reprocess = "triggered" });
+    }
+
+    fn internalTableArtifactReprocess(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const artifact_name = (try decodePathParamOrBadRequest(ctx, ctx.param("artifact_name") orelse return textResponse(ctx, 400, "invalid path parameter"))) orelse
+            return textResponse(ctx, 400, "invalid path parameter");
+        defer ctx.allocator.free(artifact_name);
+        const body = (try ctx.body()) orelse "{}";
+        var input = std.json.parseFromSlice(db_mod.types.DocumentArtifactTableReprocessRequest, ctx.allocator, if (body.len > 0) body else "{}", .{ .allocate = .alloc_always }) catch
+            return textResponse(ctx, 400, "invalid document artifact reprocess request");
+        defer input.deinit();
+        var result = self.internalGroupOperations().reprocessDocumentArtifactRange(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            artifact_name,
+            input.value,
+        ) catch |err| return internalArtifactWriteErrorResponse(ctx, err, "invalid document artifact reprocess request");
+        defer result.deinit(ctx.allocator);
+
+        const FailureResponse = struct { key: []const u8, error_code: []const u8 };
+        const ShardCursorResponse = struct {
+            group_id: ?u64,
+            next_key: []const u8,
+            scanned: usize,
+            reprocessed: usize,
+            skipped: usize,
+            failed: usize,
+            limit: u32,
+        };
+        const failures = try ctx.allocator.alloc(FailureResponse, result.failures.len);
+        defer ctx.allocator.free(failures);
+        for (result.failures, failures) |failure, *out| out.* = .{ .key = failure.key, .error_code = failure.error_code };
+        const shard_cursors = try ctx.allocator.alloc(ShardCursorResponse, result.shard_cursors.len);
+        defer ctx.allocator.free(shard_cursors);
+        for (result.shard_cursors, shard_cursors) |cursor, *out| out.* = .{
+            .group_id = cursor.group_id,
+            .next_key = cursor.next_key,
+            .scanned = cursor.scanned,
+            .reprocessed = cursor.reprocessed,
+            .skipped = cursor.skipped,
+            .failed = cursor.failed,
+            .limit = cursor.limit,
+        };
+        const pending_shards = if (result.shard_cursors.len > 0) result.shard_cursors.len else if (result.next_key != null) @as(usize, 1) else 0;
+        _ = ctx.status(202);
+        return ctx.json(.{
+            .reprocess = "triggered",
+            .reprocess_status = if (pending_shards == 0) "complete" else "in_progress",
+            .artifact_name = artifact_name,
+            .scanned = result.scanned,
+            .reprocessed = result.reprocessed,
+            .skipped = result.skipped,
+            .failed = result.failed,
+            .limit = result.limit,
+            .next_key = result.next_key,
+            .pending_shards = pending_shards,
+            .failures = failures,
+            .shard_cursors = shard_cursors,
+        });
     }
 
     fn internalGroupId(ctx: *httpx.Context) !?u64 {
@@ -5487,6 +5550,13 @@ test "httpx internal control routes call typed operations directly" {
         try std.testing.expectEqual(@as(u16, 400), response.status.code);
         try std.testing.expectEqualStrings(case[1], response.body.?);
     }
+
+    const table_reprocess_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/artifacts/document_units_v1/reprocess", .{base_url});
+    defer alloc.free(table_reprocess_url);
+    var invalid_table_reprocess = try requestWithRetry(&client, client_io.io(), .POST, table_reprocess_url, "[]", &headers, 20);
+    defer invalid_table_reprocess.deinit();
+    try std.testing.expectEqual(@as(u16, 400), invalid_table_reprocess.status.code);
+    try std.testing.expectEqualStrings("invalid document artifact reprocess request", invalid_table_reprocess.body.?);
 
     inline for (.{ "txn-begin", "txn-prepare", "txn-resolve", "txn-status", "txn-acknowledge" }) |suffix| {
         const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/{s}", .{ base_url, suffix });

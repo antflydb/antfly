@@ -344,6 +344,34 @@ pub const Operations = struct {
         if (!handled) return error.NotFound;
     }
 
+    /// The returned result owns its nested allocations and must be deinitialized
+    /// with the same allocator by the caller.
+    pub fn reprocessDocumentArtifactRange(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        input: db_mod.types.DocumentArtifactTableReprocessRequest,
+    ) Error!db_mod.types.DocumentArtifactTableReprocessResult {
+        try request.ensureActive();
+        const writes = self.writes orelse return error.NotFound;
+        return (writes.reprocessDocumentArtifactRangeGroupLocal(
+            alloc,
+            group_id,
+            table_name,
+            artifact_name,
+            input,
+        ) catch |err| switch (err) {
+            error.InvalidBatchRequest, error.InvalidArgument => return error.InvalidArgument,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
     fn transitionActionMatchesGroup(action: @import("../metadata/domain.zig").TransitionAction, group_id: u64) bool {
         return switch (action) {
             .none => group_id == 0,

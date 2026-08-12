@@ -118,6 +118,9 @@ that end state:
   reprocessing now have concrete `httpx` adapters over typed group operations.
   Artifact key-scope validation lives below the transport, and the three
   synthetic-dispatch branches have been removed.
+- Table-range artifact reprocessing is also a typed operation with an owned
+  result and a concrete `httpx` adapter; its response projection remains at
+  the transport edge and its manual dispatcher branch has been deleted.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those
