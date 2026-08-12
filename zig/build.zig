@@ -603,6 +603,8 @@ const AntflyRootImports = struct {
     platform_target: std.Build.ResolvedTarget,
     filesystem_capacity_source_file: std.Build.LazyPath,
     standalone_runtime_options: *std.Build.Step.Options,
+    runtime_failure_abi: *std.Build.Module,
+    runtime_failure_identity: *std.Build.Module,
     kernel_owner_abi: *std.Build.Module,
     kernel_error_identity: *std.Build.Module,
     local_query_client: *std.Build.Module,
@@ -671,6 +673,8 @@ const AntflyRootImports = struct {
         .{ .name = "inference_server", .field = "inference_server" },
         .{ .name = "prometheus", .field = "prometheus" },
         .{ .name = "structlog", .field = "structlog" },
+        .{ .name = "runtime_failure_abi", .field = "runtime_failure_abi" },
+        .{ .name = "runtime_failure_identity", .field = "runtime_failure_identity" },
         .{ .name = "kernel_owner_abi", .field = "kernel_owner_abi" },
         .{ .name = "kernel_error_identity", .field = "kernel_error_identity" },
         .{ .name = "local_query_client", .field = "local_query_client" },
@@ -1772,24 +1776,30 @@ pub fn build(b: *std.Build) void {
     const standalone_runtime_options = b.addOptions();
     standalone_runtime_options.addOption(bool, "linked_inference", linked_runtime_libraries);
     standalone_runtime_options.addOption(bool, "linked_runtime_boundaries", linked_runtime_libraries);
+    const runtime_failure_abi_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_failure_abi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const kernel_owner_abi_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage/kernel_owner_abi.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const kernel_error_identity_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/storage/kernel_error_identity.zig"),
+    kernel_owner_abi_mod.addImport("runtime_failure_abi", runtime_failure_abi_mod);
+    const runtime_failure_identity_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_failure_identity.zig"),
         .target = target,
         .optimize = optimize,
     });
-    kernel_error_identity_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
+    runtime_failure_identity_mod.addImport("runtime_failure_abi", runtime_failure_abi_mod);
     const local_query_client_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage/local_query_client.zig"),
         .target = target,
         .optimize = optimize,
     });
     local_query_client_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
-    local_query_client_mod.addImport("kernel_error_identity", kernel_error_identity_mod);
+    local_query_client_mod.addImport("kernel_error_identity", runtime_failure_identity_mod);
 
     const hf_tokenizer_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1909,8 +1919,10 @@ pub fn build(b: *std.Build) void {
         .platform_target = target,
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
         .standalone_runtime_options = standalone_runtime_options,
+        .runtime_failure_abi = runtime_failure_abi_mod,
+        .runtime_failure_identity = runtime_failure_identity_mod,
         .kernel_owner_abi = kernel_owner_abi_mod,
-        .kernel_error_identity = kernel_error_identity_mod,
+        .kernel_error_identity = runtime_failure_identity_mod,
         .local_query_client = local_query_client_mod,
     };
 
@@ -2395,7 +2407,7 @@ pub fn build(b: *std.Build) void {
     capi_mod.addImport("antfly_storage_root", capi_root_mod);
     capi_mod.addImport("structlog", structlog_mod);
     capi_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
-    capi_mod.addImport("kernel_error_identity", kernel_error_identity_mod);
+    capi_mod.addImport("kernel_error_identity", runtime_failure_identity_mod);
     capi_mod.addImport("local_query_client", local_query_client_mod);
     const capi_build_options = b.addOptions();
     capi_build_options.addOption(bool, "storage_kernel_experiment", storage_kernel_experiment);
@@ -8099,7 +8111,7 @@ pub fn build(b: *std.Build) void {
     capi_bench_mod.addImport("antfly-zig", lib_mod);
     capi_bench_mod.addImport("antfly_storage_root", lib_mod);
     capi_bench_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
-    capi_bench_mod.addImport("kernel_error_identity", kernel_error_identity_mod);
+    capi_bench_mod.addImport("kernel_error_identity", runtime_failure_identity_mod);
     capi_bench_mod.addImport("local_query_client", local_query_client_mod);
     capi_bench_mod.addOptions("capi_build_options", capi_build_options);
     dense_stack_bench_mod.addImport("antfly_capi", capi_bench_mod);
@@ -9066,7 +9078,7 @@ pub fn build(b: *std.Build) void {
                     .link_libc = true,
                 });
                 owner_test_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
-                owner_test_mod.addImport("kernel_error_identity", kernel_error_identity_mod);
+                owner_test_mod.addImport("kernel_error_identity", runtime_failure_identity_mod);
                 owner_test_mod.addImport("local_query_client", local_query_client_mod);
                 owner_test_mod.addImport("antfly_platform", platform_mod);
                 owner_test_mod.addImport("raft_engine", raft_engine_mod);
@@ -9093,7 +9105,7 @@ pub fn build(b: *std.Build) void {
                     .link_libc = true,
                 });
                 kernel_wal_bench_adapter_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
-                kernel_wal_bench_adapter_mod.addImport("kernel_error_identity", kernel_error_identity_mod);
+                kernel_wal_bench_adapter_mod.addImport("kernel_error_identity", runtime_failure_identity_mod);
                 kernel_wal_bench_adapter_mod.addImport("antfly_platform", platform_mod);
                 const kernel_wal_bench_mod = b.createModule(.{
                     .root_source_file = b.path("bench/storage/wal_bench.zig"),

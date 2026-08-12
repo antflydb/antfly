@@ -16,6 +16,19 @@
 //! code-generated inference runtime. These are intermediate link boundaries,
 //! not a public or stable C API.
 
+const failure_abi = @import("runtime_failure_abi");
+
+pub const abi_version = failure_abi.abi_version;
+pub const Status = failure_abi.Status;
+pub const FailureIdentity = failure_abi.FailureIdentity;
+
+/// Append-only stage identity for inference lifecycle failures.
+pub const Operation = enum(u32) {
+    create = 1,
+    configure = 2,
+    register_routes = 3,
+};
+
 pub const String = extern struct {
     ptr: [*]const u8,
     len: usize,
@@ -67,12 +80,14 @@ pub const CreateContext = extern struct {
     preload_ptr: ?[*]const WarmModel,
     preload_len: usize,
     out_handle: *?*anyopaque,
+    out_failure: *FailureIdentity,
 };
 
 pub const ConfigureContext = extern struct {
     handle: *anyopaque,
     resource_manager: *anyopaque,
     io: ?*const anyopaque,
+    out_failure: *FailureIdentity,
 };
 
 pub const ProviderContext = extern struct {
@@ -83,10 +98,11 @@ pub const ProviderContext = extern struct {
 pub const RoutesContext = extern struct {
     handle: *anyopaque,
     server: *anyopaque,
+    out_failure: *FailureIdentity,
 };
 
-pub extern fn antfly_standalone_inference_create(context: *const CreateContext) callconv(.c) c_int;
-pub extern fn antfly_standalone_inference_configure(context: *const ConfigureContext) callconv(.c) c_int;
+pub extern fn antfly_standalone_inference_create(context: *const CreateContext) callconv(.c) Status;
+pub extern fn antfly_standalone_inference_configure(context: *const ConfigureContext) callconv(.c) Status;
 pub extern fn antfly_standalone_inference_provider(context: *const ProviderContext) callconv(.c) void;
-pub extern fn antfly_standalone_inference_register_routes(context: *const RoutesContext) callconv(.c) c_int;
+pub extern fn antfly_standalone_inference_register_routes(context: *const RoutesContext) callconv(.c) Status;
 pub extern fn antfly_standalone_inference_destroy(handle: *anyopaque) callconv(.c) void;

@@ -1,0 +1,235 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+//! Canonical failure contract shared by every internal compiled runtime ABI.
+//! Keep this module free of storage, inference, and control-runtime imports.
+
+pub const abi_version: u32 = 34;
+
+/// Stable semantic identities used for control flow across compiled runtime
+/// boundaries. Values are append-only. Distinct expected domain failures must
+/// never be folded together merely because they cross an ABI.
+pub const Status = enum(u32) {
+    ok = 0,
+    invalid_abi = 1,
+    invalid_argument = 2,
+    not_found = 3,
+    busy = 4,
+    version_conflict = 5,
+    intent_conflict = 6,
+    transaction_not_found = 7,
+    read_only = 8,
+    out_of_memory = 9,
+    corrupted = 10,
+    identity_namespace_mismatch = 11,
+    invalid_query = 12,
+    unsupported_query = 13,
+    index_not_found = 14,
+    identity_read_generation_changed = 15,
+    timeout = 16,
+    cancelled = 17,
+    restore_identity_mismatch = 18,
+    invalid_backup = 19,
+    backup_integrity = 20,
+    unsupported_backup_migration = 21,
+    restore_identity_namespace_mismatch = 22,
+    invalid_aggregation = 23,
+    unsupported_aggregation = 24,
+    query_candidate_budget_exceeded = 25,
+    invalid_index_config = 26,
+    algebraic_planner_scan_too_large = 27,
+    algebraic_result_bucket_limit = 28,
+    invalid_algebraic_tensor_expr = 29,
+    invalid_algebraic_tensor_row = 30,
+    invalid_arguments = 31,
+    file_not_found = 32,
+    decision_conflict = 33,
+    lsm_root_writer_already_open = 34,
+    generation_transition_active = 35,
+    would_block = 36,
+    table_visibility_timeout = 37,
+    canceled = 38,
+    snapshot_build_cancelled = 39,
+    backup_integrity_missing = 40,
+    backup_artifact_missing = 41,
+    backup_artifact_format_mismatch = 42,
+    backup_artifact_integrity_mismatch = 43,
+    active_node_finalize_rejected = 44,
+    applied_snapshot_index_mismatch = 45,
+    invalid_committed_entries_encoding = 46,
+    invalid_metadata_apply_batch = 47,
+    invalid_metadata_incarnation = 48,
+    invalid_metadata_record = 49,
+    invalid_metadata_snapshot = 50,
+    invalid_metadata_transition_encoding = 51,
+    invalid_replication_cutover_intent = 52,
+    invalid_restore_intent_identity = 53,
+    invalid_restore_job_record = 54,
+    invalid_restore_progress_record = 55,
+    invalid_split_admission = 56,
+    invalid_table_definition_replacement = 57,
+    invalid_table_id = 58,
+    invalid_table_transition_fence = 59,
+    metadata_snapshot_too_large = 60,
+    missing_metadata_batch = 61,
+    missing_metadata_snapshot_source = 62,
+    no_space_left = 63,
+    reserved_group_id = 64,
+    table_transition_count_exhausted = 65,
+    table_transition_generation_exhausted = 66,
+    unexpected_metadata_snapshot_artifact = 67,
+    invalid_backup_artifact_path = 68,
+    backup_artifact_too_large = 69,
+    unsupported_backup_artifact = 70,
+    file_busy = 71,
+    ha_read_only_standby = 72,
+    path_already_exists = 73,
+    snapshot_too_large = 74,
+    truncated_native_header = 75,
+    unsupported_native_format_version = 76,
+    missing_participant_resolver = 77,
+    missing_replicated_recovery_hooks = 78,
+    storage_kernel_callback_failed = 79,
+    storage_kernel_recovery_callback_failed = 80,
+    provider_internal = 81,
+    resource_budget_exceeded = 82,
+    table_not_found = 83,
+    conflicting_enrichment_config = 84,
+    invalid_table_index_metadata = 85,
+    invalid_table_schema = 86,
+    invalid_create_table_request = 87,
+    unsupported_create_table_request = 88,
+    storage_kernel_owner_unavailable = 89,
+    invalid_batch_request = 90,
+    unsupported_batch_request_encoding = 91,
+    value_too_long = 92,
+    invalid_filter_query_request = 93,
+    invalid_exclusion_query_request = 94,
+    unsupported_filter_query_request = 95,
+    unsupported_exclusion_query_request = 96,
+    invalid_native_snapshot_path = 97,
+    invalid_native_magic = 98,
+    invalid_native_header_size = 99,
+    native_header_checksum_mismatch = 100,
+    invalid_native_page_size = 101,
+    invalid_native_checkpoint = 102,
+    truncated_native_file = 103,
+    end_of_stream = 104,
+    truncated = 105,
+    invalid_magic = 106,
+    header_crc_mismatch = 107,
+    unsupported_version = 108,
+    block_crc_mismatch = 109,
+    writer_locked = 110,
+    corrupt_wal = 111,
+    unsupported_kernel_wal_options = 112,
+    wal_lsn_mismatch = 113,
+    read_only_transaction = 114,
+    arithmetic_overflow = 115,
+    access_denied = 116,
+    disk_quota = 117,
+    file_too_big = 118,
+    input_output = 119,
+    is_dir = 120,
+    link_quota_exceeded = 121,
+    name_too_long = 122,
+    no_device = 123,
+    not_dir = 124,
+    read_only_file_system = 125,
+    sym_link_loop = 126,
+    system_resources = 127,
+    write_zero = 128,
+    broken_pipe = 129,
+    storage_closed = 130,
+    backend_closing = 131,
+    wal_record_too_large = 132,
+    wal_retention_limit_exceeded = 133,
+    write_pressure_exceeded = 134,
+    corrupt_lsm_wal = 135,
+    corrupt_lsm_wal_index = 136,
+    truncated_lsm_wal_sparse_hole = 137,
+    truncated_lsm_wal_tail_junk = 138,
+    unsupported_lsm_wal_header = 139,
+    unsupported_lsm_wal_version = 140,
+    durable_atomic_rename_unsupported = 141,
+    durable_atomic_write_unsupported = 142,
+    durable_directory_sync_unsupported = 143,
+    durable_file_sync_unsupported = 144,
+    unsupported_platform = 145,
+    unsupported_evented_io_runtime = 146,
+    dense_repair_backpressure = 147,
+    invalid_document_extraction_config = 148,
+    bad_unit_input = 149,
+    document_extraction_chunk_range_missing = 150,
+    document_extraction_working_set_too_large = 151,
+    invalid_document_extraction_manifest = 152,
+    invalid_document_extraction_state = 153,
+    invalid_graph_asset_state = 154,
+    missing_docx_document_xml = 155,
+    pdf_extraction_unavailable = 156,
+    unsupported_compression_method = 157,
+    zip64_unsupported = 158,
+    zip_bad_cd_offset = 159,
+    zip_bad_file_offset = 160,
+    zip_cd_size_mismatch = 161,
+    zip_decompress_size_mismatch = 162,
+    zip_encryption_unsupported = 163,
+    zip_no_end_record = 164,
+    zip_truncated = 165,
+    invalid_boundary_failure_identity = 166,
+    invalid_boundary_query_response = 167,
+    invalid_config = 168,
+    invalid_inference_model_cache_config = 169,
+    resource_limit_exceeded = 170,
+    resource_temporarily_unavailable = 171,
+    unsupported_generator_provider = 172,
+    internal = 255,
+};
+
+/// Lossless failure metadata for compiled operation and per-item boundaries.
+/// `status` controls behavior; the remaining fields preserve provenance and
+/// exact diagnostic identity for undeclared provider defects.
+pub const failure_error_name_capacity: usize = 127;
+
+/// Stable origin of a failure. Wrappers forward a valid inner identity
+/// unchanged instead of relabeling it as the outermost boundary traversed.
+pub const FailureBoundary = enum(u32) {
+    none = 0,
+    storage_owner = 1,
+    enrichment_compute = 2,
+    local_query = 3,
+    inference_runtime = 4,
+};
+
+pub const FailureIdentity = extern struct {
+    status: Status = .ok,
+    boundary: FailureBoundary = .none,
+    boundary_version: u32 = abi_version,
+    operation: u32 = 0,
+    error_name_len: u8 = 0,
+    error_name_truncated: u8 = 0,
+    _reserved0: [2]u8 = @splat(0),
+    /// Stable FNV-1a hash of the complete (possibly longer) provider name.
+    error_name_hash: u64 = 0,
+    error_name: [failure_error_name_capacity]u8 = @splat(0),
+
+    pub fn errorName(self: *const FailureIdentity) []const u8 {
+        return self.error_name[0..self.error_name_len];
+    }
+
+    /// Safe for logging an untrusted envelope before validation.
+    pub fn boundedErrorName(self: *const FailureIdentity) []const u8 {
+        return self.error_name[0..@min(self.error_name_len, failure_error_name_capacity)];
+    }
+};

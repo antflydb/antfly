@@ -25,6 +25,7 @@ const owns_storage_kernel = unit_options.unit == .storage_kernel or unit_options
     unit_options.unit == .storage_runtime_pic_probe or unit_options.unit == .application_pic_probe or
     (unit_options.unit == .distributed and !unit_options.storage_kernel_experiment);
 const standalone_inference_bridge = @import("standalone/inference_bridge.zig");
+const boundary_error_identity = @import("runtime_failure_identity");
 const restore_staging_exports = if ((unit_options.unit == .distributed and !unit_options.storage_kernel_experiment) or
     unit_options.unit == .storage_kernel or unit_options.unit == .storage_runtime_pic_probe or
     unit_options.unit == .application_pic_probe)
@@ -509,38 +510,52 @@ comptime {
     }
 }
 
-fn standaloneInferenceCreate(context: *const standalone_inference_bridge.CreateContext) callconv(.c) c_int {
+fn standaloneInferenceCreate(context: *const standalone_inference_bridge.CreateContext) callconv(.c) standalone_inference_bridge.Status {
+    context.out_handle.* = null;
+    context.out_failure.* = .{};
     context.out_handle.* = standalone_inference_host.linkedInferenceCreate(context) catch |err| {
-        return reportStandaloneInferenceFailure("create", err);
+        return reportStandaloneInferenceFailure(context.out_failure, .create, err);
     };
-    return 0;
+    return .ok;
 }
 
-fn standaloneInferenceConfigure(context: *const standalone_inference_bridge.ConfigureContext) callconv(.c) c_int {
+fn standaloneInferenceConfigure(context: *const standalone_inference_bridge.ConfigureContext) callconv(.c) standalone_inference_bridge.Status {
+    context.out_failure.* = .{};
     standalone_inference_host.linkedInferenceConfigure(context) catch |err| {
-        return reportStandaloneInferenceFailure("configure", err);
+        return reportStandaloneInferenceFailure(context.out_failure, .configure, err);
     };
-    return 0;
+    return .ok;
 }
 
 fn standaloneInferenceProvider(context: *const standalone_inference_bridge.ProviderContext) callconv(.c) void {
     standalone_inference_host.linkedInferenceProvider(context);
 }
 
-fn standaloneInferenceRegisterRoutes(context: *const standalone_inference_bridge.RoutesContext) callconv(.c) c_int {
+fn standaloneInferenceRegisterRoutes(context: *const standalone_inference_bridge.RoutesContext) callconv(.c) standalone_inference_bridge.Status {
+    context.out_failure.* = .{};
     standalone_inference_host.linkedInferenceRegisterRoutes(context) catch |err| {
-        return reportStandaloneInferenceFailure("register_routes", err);
+        return reportStandaloneInferenceFailure(context.out_failure, .register_routes, err);
     };
-    return 0;
+    return .ok;
 }
 
 fn standaloneInferenceDestroy(handle: *anyopaque) callconv(.c) void {
     standalone_inference_host.linkedInferenceDestroy(handle);
 }
 
-fn reportStandaloneInferenceFailure(comptime operation: []const u8, err: anyerror) c_int {
-    std.log.err("standalone inference bridge failed operation={s} err={}", .{ operation, err });
-    return 1;
+fn reportStandaloneInferenceFailure(
+    out_failure: *standalone_inference_bridge.FailureIdentity,
+    operation: standalone_inference_bridge.Operation,
+    err: anyerror,
+) standalone_inference_bridge.Status {
+    out_failure.* = boundary_error_identity.failureFromError(
+        err,
+        .inference_runtime,
+        standalone_inference_bridge.abi_version,
+        @intFromEnum(operation),
+    );
+    std.log.err("standalone inference bridge failed operation={s} err={}", .{ @tagName(operation), err });
+    return out_failure.status;
 }
 
 fn runtimeInit(init: std.process.Init) std.process.Init {

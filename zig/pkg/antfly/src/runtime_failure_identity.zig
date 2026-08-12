@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Lossless semantic-error registry for the compiled storage boundary.
+//! Lossless semantic-error registry for every compiled runtime boundary.
 //!
 //! `Status` values are stable identities, not broad error classes. Provider and
 //! consumer must both use this table so adding an ABI boundary cannot silently
@@ -21,7 +21,7 @@
 //! `.internal`.
 
 const std = @import("std");
-const abi = @import("kernel_owner_abi");
+const abi = @import("runtime_failure_abi");
 
 const Mapping = struct {
     status: abi.Status,
@@ -173,6 +173,11 @@ const mappings = [_]Mapping{
     .{ .status = .zip_truncated, .err = error.ZipTruncated },
     .{ .status = .invalid_boundary_failure_identity, .err = error.InvalidBoundaryFailureIdentity },
     .{ .status = .invalid_boundary_query_response, .err = error.InvalidBoundaryQueryResponse },
+    .{ .status = .invalid_config, .err = error.InvalidConfig },
+    .{ .status = .invalid_inference_model_cache_config, .err = error.InvalidInferenceModelCacheConfig },
+    .{ .status = .resource_limit_exceeded, .err = error.ResourceLimitExceeded },
+    .{ .status = .resource_temporarily_unavailable, .err = error.ResourceTemporarilyUnavailable },
+    .{ .status = .unsupported_generator_provider, .err = error.UnsupportedGeneratorProvider },
     .{ .status = .active_node_finalize_rejected, .err = error.ActiveNodeFinalizeRejected },
     .{ .status = .applied_snapshot_index_mismatch, .err = error.AppliedSnapshotIndexMismatch },
     .{ .status = .invalid_committed_entries_encoding, .err = error.InvalidCommittedEntriesEncoding },
@@ -358,6 +363,24 @@ pub fn validateForTest() !void {
     try std.testing.expectEqual(@as(u8, 0), declared.error_name_truncated);
     try std.testing.expect(declared.error_name_hash != 0);
     try std.testing.expectError(error.HAReadOnlyStandby, statusToError(declared.status));
+
+    const inference_config = failureFromError(
+        error.InvalidInferenceModelCacheConfig,
+        .inference_runtime,
+        abi.abi_version,
+        1,
+    );
+    try std.testing.expectEqual(
+        abi.Status.invalid_inference_model_cache_config,
+        inference_config.status,
+    );
+    try std.testing.expectEqual(abi.FailureBoundary.inference_runtime, inference_config.boundary);
+    try std.testing.expectEqualStrings("InvalidInferenceModelCacheConfig", inference_config.errorName());
+    try validateFailureEnvelope(inference_config.status, &inference_config, abi.abi_version);
+    try std.testing.expectError(
+        error.InvalidInferenceModelCacheConfig,
+        statusToError(inference_config.status),
+    );
 
     const defect = failureFromError(error.UnregisteredProviderDefect, .local_query, 8, 42);
     try std.testing.expectEqual(abi.Status.internal, defect.status);

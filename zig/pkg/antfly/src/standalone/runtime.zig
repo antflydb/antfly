@@ -23,6 +23,7 @@ const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const inference_bridge = @import("inference_bridge.zig");
+const boundary_error_identity = @import("runtime_failure_identity");
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const storage_source_options = @import("storage_source_options");
 const standalone_runtime_options = @import("standalone_runtime_options");
@@ -1454,6 +1455,7 @@ pub fn runFromIterator(
     // implementation is code-generated in the inference archive and reached
     // through an opaque internal ABI; the shipped artifact remains one binary.
     var handle: ?*anyopaque = null;
+    var inference_create_failure: inference_bridge.FailureIdentity = .{};
     const inference_create_context = inference_bridge.CreateContext{
         .init = &init,
         .loaded_config = if (loaded_config) |*cfg| cfg else null,
@@ -1472,12 +1474,16 @@ pub fn runFromIterator(
             cli.inference_preload_models.items.ptr,
         .preload_len = cli.inference_preload_models.items.len,
         .out_handle = &handle,
+        .out_failure = &inference_create_failure,
     };
     const antfly_node = if (comptime inline_inference_codegen) blk: {
         break :blk try inference_host.linkedInferenceCreate(&inference_create_context);
     } else blk: {
-        if (inference_bridge.antfly_standalone_inference_create(&inference_create_context) != 0)
-            return error.InferenceRuntimeStartupFailed;
+        try consumeInferenceFailure(
+            inference_bridge.antfly_standalone_inference_create(&inference_create_context),
+            &inference_create_failure,
+            .create,
+        );
         break :blk handle orelse return error.InferenceRuntimeStartupFailed;
     };
     // Until DataServer exists, error cleanup is owned here. Once its
@@ -1752,10 +1758,12 @@ pub fn runFromIterator(
         attached_io = io;
         break :blk &attached_io;
     } else null;
+    var inference_configure_failure: inference_bridge.FailureIdentity = .{};
     const configure_context = inference_bridge.ConfigureContext{
         .handle = antfly_node,
         .resource_manager = &data_server.provisioned_storage.resource_manager,
         .io = io_ptr,
+        .out_failure = &inference_configure_failure,
     };
     if (comptime inline_inference_codegen) {
         try inference_host.linkedInferenceConfigure(&configure_context);
@@ -1766,8 +1774,11 @@ pub fn runFromIterator(
         });
         data_server.setAntflyProvider(provider);
     } else {
-        if (inference_bridge.antfly_standalone_inference_configure(&configure_context) != 0)
-            return error.InferenceRuntimeStartupFailed;
+        try consumeInferenceFailure(
+            inference_bridge.antfly_standalone_inference_configure(&configure_context),
+            &inference_configure_failure,
+            .configure,
+        );
 
         var provider: antfly.inference.managed_embedder.AntflyProvider = undefined;
         inference_bridge.antfly_standalone_inference_provider(&.{
@@ -2033,6 +2044,53 @@ fn serveUnifiedWithLinkedInference(
     lifecycle.publishStopped();
 }
 
+fn consumeInferenceFailure(
+    status: inference_bridge.Status,
+    failure: *const inference_bridge.FailureIdentity,
+    expected_operation: inference_bridge.Operation,
+) !void {
+    boundary_error_identity.validateFailureEnvelope(
+        status,
+        failure,
+        inference_bridge.abi_version,
+    ) catch |err| {
+        std.log.err(
+            "inference boundary returned malformed failure identity status={s} identity_status={s} boundary={d} version={d} operation={d} error={s} hash={x}",
+            .{
+                @tagName(status),
+                @tagName(failure.status),
+                @intFromEnum(failure.boundary),
+                failure.boundary_version,
+                failure.operation,
+                failure.boundedErrorName(),
+                failure.error_name_hash,
+            },
+        );
+        return err;
+    };
+    if (status == .ok) return;
+    if (failure.boundary != .inference_runtime or
+        failure.operation != @intFromEnum(expected_operation))
+    {
+        std.log.err(
+            "inference boundary returned failure from unexpected origin boundary={s} operation={d} expected_operation={d}",
+            .{ @tagName(failure.boundary), failure.operation, @intFromEnum(expected_operation) },
+        );
+        return error.InvalidBoundaryFailureIdentity;
+    }
+    std.log.err(
+        "inference boundary failure status={s} boundary={s} operation={s} provider_error={s} hash={x}",
+        .{
+            @tagName(status),
+            @tagName(failure.boundary),
+            @tagName(expected_operation),
+            failure.errorName(),
+            failure.error_name_hash,
+        },
+    );
+    return boundary_error_identity.statusToError(status);
+}
+
 fn serveUnifiedInner(
     comptime inline_inference: bool,
     alloc: std.mem.Allocator,
@@ -2052,15 +2110,19 @@ fn serveUnifiedInner(
 
     // Register inference AI routes under /ai/v1 and Traditional ML routes under /ml/v1.
     if (comptime inline_inference) {
+        var ignored_failure: inference_bridge.FailureIdentity = .{};
         try inference_host.linkedInferenceRegisterRoutes(&.{
             .handle = antfly_node,
             .server = &server,
+            .out_failure = &ignored_failure,
         });
     } else {
-        if (inference_bridge.antfly_standalone_inference_register_routes(&.{
+        var inference_routes_failure: inference_bridge.FailureIdentity = .{};
+        try consumeInferenceFailure(inference_bridge.antfly_standalone_inference_register_routes(&.{
             .handle = antfly_node,
             .server = &server,
-        }) != 0) return error.InferenceRouteRegistrationFailed;
+            .out_failure = &inference_routes_failure,
+        }), &inference_routes_failure, .register_routes);
     }
 
     // Register antfly public API routes under /db/v1

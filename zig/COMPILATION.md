@@ -3041,7 +3041,7 @@ hits and proves that invalid and unsupported aggregation errors make a full
 provider/client round trip without collapsing to a generic storage failure.
 
 ABI version 28 generalizes that rule across every compiled storage boundary.
-`storage/kernel_error_identity.zig` is the single bidirectional registry used
+`runtime_failure_identity.zig` is the single bidirectional registry used
 by providers, clients, callback adapters, the data-Raft apply client, and the
 low-volume system-store adapter. A status is a stable semantic identity, not a
 severity class: for example `LsmRootWriterAlreadyOpen`, `WouldBlock`, and
@@ -3324,7 +3324,7 @@ posting, candidate, or backend call may cross the ABI.
 
 The failure contract applies unchanged to that internal physical split. Every
 declared provider failure must receive a stable `Status` discriminant in
-`storage/kernel_error_identity.zig` and must map back to the exact original Zig
+`runtime_failure_identity.zig` and must map back to the exact original Zig
 error at the consumer. Distinct identities such as `ReadOnly`,
 `HAReadOnlyStandby`, `WouldBlock`, `StorageBusy`, `Canceled`, and `Cancelled`
 must not be normalized for convenience. Operation state—including admission,
@@ -3870,6 +3870,66 @@ that remain in distributed control while preserving inference as its own
 compiled safety boundary; rescheduling the same units cannot remove the
 measured LLVM work.
 
+### Phase 4v: shared failure identity and inference lifecycle hardening
+
+Failure identity is a runtime-wide ABI property, not storage-owned policy.
+ABI 34 moves the canonical append-only `Status`, `FailureBoundary`, and
+`FailureIdentity` declarations into the dependency-neutral
+`runtime_failure_abi.zig` module. Storage re-exports those exact types for
+source compatibility; inference and future compiled islands import the shared
+contract directly. This prevents either provider from defining a subtly
+different status vocabulary or envelope layout.
+
+The older standalone-to-inference lifecycle bridge exposed only `c_int`, so a
+linked create, configure, or route-registration failure became
+`InferenceRuntimeStartupFailed` or `InferenceRouteRegistrationFailed` at the
+first wrapper. It now returns the canonical status plus one caller-owned
+failure envelope. ABI 34 adds the `inference_runtime` origin, append-only
+create/configure/register-routes stages, and distinct registered identities
+for invalid configuration, invalid model-cache configuration, resource-limit
+exhaustion, temporary resource unavailability, and unsupported generator
+providers. The consumer validates the complete envelope, rejects a mismatched
+origin or stage as `InvalidBoundaryFailureIdentity`, maps every registered
+status back to its original Zig error, and logs the exact provider name/hash
+for an undeclared defect whose control-flow status must remain `internal`.
+
+This establishes the rule for every remaining experiment: a new compiled
+boundary is incomplete if it returns only a boolean, integer exit code, broad
+error class, or status without provenance. Existing legacy storage functions
+that return a stable `Status` retain their declared machine identity today,
+but when one is moved, broadened, or otherwise materially changed it must also
+gain the canonical envelope. Nested providers must forward a valid inner
+identity byte-for-byte. Call-level failure, per-item outcomes, cancellation,
+partial progress, and lifecycle state remain separate typed channels; none may
+overwrite another merely because an ABI was crossed.
+
+Validation passed in both composition modes: the focused standalone suite was
+43/43 with zero leaks, the linked five-unit Debug build completed, the opaque
+owner/status-registry suite was 92/92 with zero leaks, and the C API suite was
+11/11 with zero leaks. The registry canary now proves an inference model-cache
+failure round-trips through ABI 34 with its status, origin, operation, exact
+name, and hash intact.
+
+The same audit found one remaining transitional interface that prevents a
+production keep decision. `AntflyProvider` is currently populated by the
+inference archive as a Zig function table whose calls return raw `anyerror`
+unions and carry Zig allocators and slices. Those values have no supported
+stable ABI identity across independently code-generated units. The lifecycle
+fix above must not be mistaken for validation of that provider table.
+
+The next inference-root experiment must replace that crossing, not wrap it.
+The control unit may retain the convenient source-level `AntflyProvider`, but
+its callbacks must be consumer-local shims over a C-compatible coarse
+inference ABI. One complete embed batch, sparse-embed batch, rerank, generation,
+media read/transcription/extraction, or model-list request crosses at a time.
+The provider returns a stable status, canonical `FailureIdentity`, and
+provider-owned typed or versioned-wire result with an explicit destroy call.
+Cancellation/deadline state has its own request fields. No `anyerror`, error
+union, `std.mem.Allocator`, `std.Io`, generic Zig slice, or domain-owned
+container crosses the compiled boundary. This is both an identity-correctness
+requirement and the architectural cut needed to remove inference implementation
+roots from distributed control.
+
 ## Holistic target architecture
 
 The current structural candidate is the opt-in five-unit source-selected topology above:
@@ -3879,10 +3939,12 @@ distributed/API unit only control sources, co-generates physical local-query
 execution with its storage owner, and keeps compute-heavy
 inference/enrichment isolated.
 The local cold combined storage/query unit is now 313.334 seconds, below the
-350-second preferred gate. It is not yet the production baseline: the normal
-Linux runner measured only its six-unit predecessor, whose storage-query chain
-was 717.965 seconds and whose large units all exceeded 380 seconds under
-contention. The five-unit topology requires its own runner evidence.
+350-second preferred gate. On the normal Linux runner the five-unit candidate
+measured 599.665 seconds for storage/query, versus 664.411 seconds for the
+immediately preceding matched six-unit repeat. The topology therefore has
+runner reliability evidence and a controlled 64.746-second improvement, but
+is not yet the production baseline because it still misses the 380-second
+critical-unit gate.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:
@@ -3941,6 +4003,10 @@ The normal-runner and root-isolation results reopen the storage-kernel
 experiment. It must follow these rules and beat the current three-unit baseline
 before becoming the production architecture:
 
+The failure and state rules below apply equally to inference, enrichment, and
+any future compiled runtime island; storage is merely the largest current
+consumer.
+
 - Handles such as storage, table, shard, and snapshot handles are opaque.
 - ABI declarations use C-compatible layouts and explicit-width types.
 - Inputs are borrowed for the duration of a call unless explicitly documented
@@ -3948,6 +4014,11 @@ before becoming the production architecture:
 - Results allocated by the kernel are destroyed by the kernel.
 - Status values use explicit enums or tagged result structures, not exported
   arbitrary Zig error sets.
+- Raw Zig `anyerror`, error unions, allocators, `std.Io`, generic slices, and
+  domain-owned containers never cross independently code-generated units.
+  Source-level callback tables are allowed only when provider and consumer are
+  compiled in the same unit; linked units use C-compatible request/result
+  contracts and explicit ownership.
 - Each expected failure has one stable status identity in the shared
   bidirectional registry. Do not merge distinct failures into `busy`,
   `cancelled`, `invalid_argument`, or `internal` merely to shorten an adapter.
