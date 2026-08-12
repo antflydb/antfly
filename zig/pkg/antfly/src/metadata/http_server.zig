@@ -20,6 +20,7 @@ const metadata_authority = @import("authority.zig");
 const metadata_admin = @import("admin.zig");
 const admin_read_operations = @import("admin_read_operations.zig");
 const admin_mutation_operations = @import("admin_mutation_operations.zig");
+const extension_operations = @import("extension_operations.zig");
 const operation = @import("../api/operation.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
@@ -1128,22 +1129,23 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_reallocate, httpx.Handler.bind(self, metadataTriggerReallocate));
         try server.post(routes.Routes.internal_schema_progress, httpx.Handler.bind(self, metadataUpsertSchemaProgress));
+        try server.post(routes.Routes.internal_extension_restore, httpx.Handler.bind(self, metadataRestoreExtensions));
+        const extension_path = routes.Routes.internal_extensions_prefix ++ ":extension_name";
+        try server.post(extension_path, httpx.Handler.bind(self, metadataInstallExtension));
+        try server.post(extension_path ++ routes.Routes.internal_extension_update_suffix, httpx.Handler.bind(self, metadataUpdateExtension));
+        try server.post(extension_path ++ routes.Routes.internal_extension_drop_suffix, httpx.Handler.bind(self, metadataDropExtension));
+        try server.post(extension_path ++ routes.Routes.internal_extension_enable_suffix, httpx.Handler.bind(self, metadataEnableExtension));
+        try server.post(extension_path ++ routes.Routes.internal_extension_disable_suffix, httpx.Handler.bind(self, metadataDisableExtension));
+        try server.put(extension_path ++ routes.Routes.internal_extension_config_suffix, httpx.Handler.bind(self, metadataConfigureExtension));
 
         const static_paths = [_][]const u8{
             routes.Routes.internal_nodes,
-            routes.Routes.internal_extension_restore,
         };
         inline for (static_paths) |path| try server.any(path, handler);
 
         const dynamic_paths = [_][]const u8{
             routes.Routes.internal_nodes_prefix ++ ":node_id",
             routes.Routes.internal_nodes_prefix ++ ":node_id" ++ routes.Routes.internal_node_status_suffix,
-            routes.Routes.internal_extensions_prefix ++ ":extension_name",
-            routes.Routes.internal_extensions_prefix ++ ":extension_name" ++ routes.Routes.internal_extension_update_suffix,
-            routes.Routes.internal_extensions_prefix ++ ":extension_name" ++ routes.Routes.internal_extension_drop_suffix,
-            routes.Routes.internal_extensions_prefix ++ ":extension_name" ++ routes.Routes.internal_extension_enable_suffix,
-            routes.Routes.internal_extensions_prefix ++ ":extension_name" ++ routes.Routes.internal_extension_disable_suffix,
-            routes.Routes.internal_extensions_prefix ++ ":extension_name" ++ routes.Routes.internal_extension_config_suffix,
             routes.Routes.internal_tables_prefix ++ ":table_name",
             routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_restore_suffix,
             routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_definition_suffix,
@@ -1384,6 +1386,164 @@ pub const MetadataHttpServer = struct {
         return ctx.status(202).text("accepted");
     }
 
+    fn extensionOperations(self: *MetadataHttpServer) extension_operations.Operations {
+        return .{ .source = .{ .ptr = self, .vtable = &.{
+            .install = installExtensionOperation,
+            .update = updateExtensionOperation,
+            .drop = dropExtensionOperation,
+            .enable = enableExtensionOperation,
+            .disable = disableExtensionOperation,
+            .configure = configureExtensionOperation,
+            .restore = restoreExtensionsOperation,
+        } } };
+    }
+
+    fn installExtensionOperation(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, request: extension_domain.InstallExtensionRequest) !extension_domain.InstalledExtension {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.installExtension(alloc, name, request);
+    }
+
+    fn updateExtensionOperation(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, request: extension_domain.UpdateExtensionRequest) !extension_domain.InstalledExtension {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.updateExtension(alloc, name, request);
+    }
+
+    fn dropExtensionOperation(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, request: extension_domain.DropExtensionRequest) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.dropExtension(alloc, name, request);
+    }
+
+    fn enableExtensionOperation(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.enableExtension(alloc, name);
+    }
+
+    fn disableExtensionOperation(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.disableExtension(alloc, name);
+    }
+
+    fn configureExtensionOperation(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, request: extension_domain.ConfigureExtensionRequest) !extension_domain.InstalledExtension {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.configureExtension(alloc, name, request);
+    }
+
+    fn restoreExtensionsOperation(ptr: *anyopaque, alloc: std.mem.Allocator, installed: []const extension_domain.InstalledExtension, members: []const extension_domain.ExtensionMember, dependencies: []const extension_domain.ExtensionDependency) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.restoreExtensions(alloc, installed, members, dependencies);
+    }
+
+    fn extensionName(ctx: *httpx.Context) ![]const u8 {
+        const name = ctx.param("extension_name") orelse return error.InvalidArgument;
+        if (name.len == 0) return error.InvalidArgument;
+        return name;
+    }
+
+    fn extensionError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
+            error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => ctx.status(404).text("not found"),
+            error.ExtensionAlreadyInstalled => ctx.status(409).text("extension already installed"),
+            error.DependentExtensionExists => ctx.status(409).text("dependent extension exists"),
+            error.RequiredExtensionNotInstalled => ctx.status(409).text("required extension not installed"),
+            error.UnsupportedManifestApiVersion,
+            error.UnsupportedPackageKind,
+            error.UnsupportedExtensionScope,
+            error.UnsupportedObjectKindForV1,
+            error.PackageVersionMismatch,
+            error.UpdatePathNotFound,
+            error.ExtensionDisabled,
+            error.ExtensionLifecycleBusy,
+            error.InvalidCreateTableRequest,
+            error.InvalidCreateIndexRequest,
+            error.InvalidTableIndexMetadata,
+            error.InvalidExtensionEnrichment,
+            error.InvalidEnrichmentConfig,
+            error.ConflictingEnrichmentConfig,
+            error.UnrequestedCapabilityGrant,
+            error.InvalidJsonObject,
+            error.EmptyName,
+            error.InvalidIdentifier,
+            error.MemberTableOutsideScope,
+            => ctx.status(400).text("invalid extension lifecycle request"),
+            else => metadataReadError(ctx, err),
+        };
+    }
+
+    fn metadataInstallExtension(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const name = extensionName(ctx) catch |err| return extensionError(ctx, err);
+        var parsed = std.json.parseFromSlice(extension_domain.InstallExtensionRequest, ctx.allocator, jsonBodyOrEmptyObject((try ctx.body()) orelse ""), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch
+            return ctx.status(400).text("invalid extension install request");
+        defer parsed.deinit();
+        var installed = self.extensionOperations().install(ctx.allocator, requestContext(ctx), name, parsed.value) catch |err| return extensionError(ctx, err);
+        defer installed.deinitOwned(ctx.allocator);
+        return self.trackedJson(ctx, installed);
+    }
+
+    fn metadataUpdateExtension(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const name = extensionName(ctx) catch |err| return extensionError(ctx, err);
+        var parsed = std.json.parseFromSlice(extension_domain.UpdateExtensionRequest, ctx.allocator, jsonBodyOrEmptyObject((try ctx.body()) orelse ""), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch
+            return ctx.status(400).text("invalid extension update request");
+        defer parsed.deinit();
+        var installed = self.extensionOperations().update(ctx.allocator, requestContext(ctx), name, parsed.value) catch |err| return extensionError(ctx, err);
+        defer installed.deinitOwned(ctx.allocator);
+        return self.trackedJson(ctx, installed);
+    }
+
+    fn metadataDropExtension(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const name = extensionName(ctx) catch |err| return extensionError(ctx, err);
+        var parsed = std.json.parseFromSlice(extension_domain.DropExtensionRequest, ctx.allocator, jsonBodyOrEmptyObject((try ctx.body()) orelse ""), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch
+            return ctx.status(400).text("invalid extension drop request");
+        defer parsed.deinit();
+        self.extensionOperations().drop(ctx.allocator, requestContext(ctx), name, parsed.value) catch |err| return extensionError(ctx, err);
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataEnableExtension(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const name = extensionName(ctx) catch |err| return extensionError(ctx, err);
+        var installed = self.extensionOperations().enable(ctx.allocator, requestContext(ctx), name) catch |err| return extensionError(ctx, err);
+        defer installed.deinitOwned(ctx.allocator);
+        return self.trackedJson(ctx, installed);
+    }
+
+    fn metadataDisableExtension(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const name = extensionName(ctx) catch |err| return extensionError(ctx, err);
+        var installed = self.extensionOperations().disable(ctx.allocator, requestContext(ctx), name) catch |err| return extensionError(ctx, err);
+        defer installed.deinitOwned(ctx.allocator);
+        return self.trackedJson(ctx, installed);
+    }
+
+    fn metadataConfigureExtension(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const name = extensionName(ctx) catch |err| return extensionError(ctx, err);
+        var parsed = std.json.parseFromSlice(extension_domain.ConfigureExtensionRequest, ctx.allocator, jsonBodyOrEmptyObject((try ctx.body()) orelse ""), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch
+            return ctx.status(400).text("invalid extension config request");
+        defer parsed.deinit();
+        var installed = self.extensionOperations().configure(ctx.allocator, requestContext(ctx), name, parsed.value) catch |err| return extensionError(ctx, err);
+        defer installed.deinitOwned(ctx.allocator);
+        return self.trackedJson(ctx, installed);
+    }
+
+    fn metadataRestoreExtensions(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        var parsed = std.json.parseFromSlice(RestoreExtensionsRequest, ctx.allocator, (try ctx.body()) orelse "", .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return ctx.status(400).text("invalid extension restore request");
+        defer parsed.deinit();
+        self.extensionOperations().restore(ctx.allocator, requestContext(ctx), parsed.value.installed_extensions, parsed.value.extension_members, parsed.value.extension_dependencies) catch |err| switch (err) {
+            error.UnsupportedManifestApiVersion,
+            error.UnsupportedPackageKind,
+            error.UnsupportedExtensionScope,
+            error.UnsupportedObjectKindForV1,
+            error.InvalidJsonObject,
+            error.EmptyName,
+            error.InvalidIdentifier,
+            error.MemberTableOutsideScope,
+            => return ctx.status(400).text("invalid extension restore request"),
+            else => return extensionError(ctx, err),
+        };
+        return ctx.status(202).text("accepted");
+    }
+
     fn contextualRoute(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const method: http_common.Method = switch (ctx.request.method) {
             .GET => .GET,
@@ -1421,78 +1581,6 @@ pub const MetadataHttpServer = struct {
         switch (req.method) {
             .GET => {},
             .POST => {
-                if (std.mem.eql(u8, req.uri, routes.Routes.internal_extension_restore)) {
-                    var parsed = std.json.parseFromSlice(RestoreExtensionsRequest, alloc, req.body, .{
-                        .allocate = .alloc_always,
-                        .ignore_unknown_fields = true,
-                    }) catch return try textResponse(alloc, 400, "invalid extension restore request");
-                    defer parsed.deinit();
-                    self.source.restoreExtensions(
-                        alloc,
-                        parsed.value.installed_extensions,
-                        parsed.value.extension_members,
-                        parsed.value.extension_dependencies,
-                    ) catch |err| switch (err) {
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        error.UnsupportedManifestApiVersion,
-                        error.UnsupportedPackageKind,
-                        error.UnsupportedExtensionScope,
-                        error.UnsupportedObjectKindForV1,
-                        error.InvalidJsonObject,
-                        error.EmptyName,
-                        error.InvalidIdentifier,
-                        error.MemberTableOutsideScope,
-                        => return try textResponse(alloc, 400, "invalid extension restore request"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
-                if (routes.Routes.matchInternalExtensionUpdate(req.uri)) |extension_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.UpdateExtensionRequest, alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try textResponse(alloc, 400, "invalid extension update request");
-                    };
-                    defer parsed.deinit();
-                    var installed = self.source.updateExtension(alloc, extension_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(alloc, err);
-                    };
-                    defer installed.deinitOwned(alloc);
-                    return try jsonResponse(alloc, self.source, installed);
-                }
-                if (routes.Routes.matchInternalExtensionDrop(req.uri)) |extension_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.DropExtensionRequest, alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try textResponse(alloc, 400, "invalid extension drop request");
-                    };
-                    defer parsed.deinit();
-                    self.source.dropExtension(alloc, extension_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(alloc, err);
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
-                if (routes.Routes.matchInternalExtensionEnable(req.uri)) |extension_route| {
-                    var installed = self.source.enableExtension(alloc, extension_route.name) catch |err| {
-                        return try extensionLifecycleErrorResponse(alloc, err);
-                    };
-                    defer installed.deinitOwned(alloc);
-                    return try jsonResponse(alloc, self.source, installed);
-                }
-                if (routes.Routes.matchInternalExtensionDisable(req.uri)) |extension_route| {
-                    var installed = self.source.disableExtension(alloc, extension_route.name) catch |err| {
-                        return try extensionLifecycleErrorResponse(alloc, err);
-                    };
-                    defer installed.deinitOwned(alloc);
-                    return try jsonResponse(alloc, self.source, installed);
-                }
-                if (routes.Routes.matchInternalExtension(req.uri)) |extension_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.InstallExtensionRequest, alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try textResponse(alloc, 400, "invalid extension install request");
-                    };
-                    defer parsed.deinit();
-                    var installed = self.source.installExtension(alloc, extension_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(alloc, err);
-                    };
-                    defer installed.deinitOwned(alloc);
-                    return try jsonResponse(alloc, self.source, installed);
-                }
                 if (std.mem.eql(u8, req.uri, routes.Routes.internal_nodes)) {
                     var node = parseNodeRecord(alloc, req.body) catch return try textResponse(alloc, 400, "invalid node registration request");
                     var node_owned = true;
@@ -1622,17 +1710,6 @@ pub const MetadataHttpServer = struct {
                 }
             },
             .PUT => {
-                if (routes.Routes.matchInternalExtensionConfig(req.uri)) |extension_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.ConfigureExtensionRequest, alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try textResponse(alloc, 400, "invalid extension config request");
-                    };
-                    defer parsed.deinit();
-                    var installed = self.source.configureExtension(alloc, extension_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(alloc, err);
-                    };
-                    defer installed.deinitOwned(alloc);
-                    return try jsonResponse(alloc, self.source, installed);
-                }
                 if (routes.Routes.matchInternalNodeShutdown(req.uri)) |node_id| {
                     parseNodeShutdownRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid node shutdown request");
                     self.requestNodeShutdown(alloc, node_id) catch |err| switch (err) {
@@ -2982,37 +3059,6 @@ fn jsonResponse(alloc: std.mem.Allocator, source: AdminSource, value: anytype) !
 
 fn jsonBodyOrEmptyObject(body: []const u8) []const u8 {
     return if (body.len == 0) "{}" else body;
-}
-
-fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
-    return switch (err) {
-        error.UnsupportedOperation => try textResponse(alloc, 405, "unsupported operation"),
-        error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => try textResponse(alloc, 404, "not found"),
-        error.ExtensionAlreadyInstalled => try textResponse(alloc, 409, "extension already installed"),
-        error.DependentExtensionExists => try textResponse(alloc, 409, "dependent extension exists"),
-        error.RequiredExtensionNotInstalled => try textResponse(alloc, 409, "required extension not installed"),
-        error.UnsupportedManifestApiVersion,
-        error.UnsupportedPackageKind,
-        error.UnsupportedExtensionScope,
-        error.UnsupportedObjectKindForV1,
-        error.PackageVersionMismatch,
-        error.UpdatePathNotFound,
-        error.ExtensionDisabled,
-        error.ExtensionLifecycleBusy,
-        error.InvalidCreateTableRequest,
-        error.InvalidCreateIndexRequest,
-        error.InvalidTableIndexMetadata,
-        error.InvalidExtensionEnrichment,
-        error.InvalidEnrichmentConfig,
-        error.ConflictingEnrichmentConfig,
-        error.UnrequestedCapabilityGrant,
-        error.InvalidJsonObject,
-        error.EmptyName,
-        error.InvalidIdentifier,
-        error.MemberTableOutsideScope,
-        => try textResponse(alloc, 400, "invalid extension lifecycle request"),
-        else => err,
-    };
 }
 
 fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {

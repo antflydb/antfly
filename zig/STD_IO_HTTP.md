@@ -53,6 +53,9 @@ that end state:
   `httpx` handlers bypass the metadata method/path dispatcher. Catalog
   publication validation, reallocation, and schema-progress mutations use the
   same direct typed path.
+- Metadata extension install, update, drop, enable, disable, configure, and
+  restore are transport-neutral operations registered as concrete method/path
+  pairs; extension lifecycle no longer enters the metadata dispatcher.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

@@ -18,6 +18,7 @@ pub const storage = @import("storage/mod.zig");
 pub const api = @import("api.zig");
 pub const admin_read_operations = @import("admin_read_operations.zig");
 pub const admin_mutation_operations = @import("admin_mutation_operations.zig");
+pub const extension_operations = @import("extension_operations.zig");
 pub const authority = @import("authority.zig");
 pub const incarnation = @import("incarnation.zig");
 pub const admin = @import("admin.zig");

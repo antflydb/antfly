@@ -1339,17 +1339,34 @@ test "metadata admin maps retryable authority loss to service unavailable" {
 
     var source = FakeSource{};
     var admin = metadata_http_server.MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
-    var response = admin.handle(.{
+    var server_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer server_io.deinit();
+    var http_server = httpx.Server.initWithConfig(std.testing.allocator, server_io.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
+    defer http_server.deinit();
+    try admin.registerRoutes(&http_server);
+    var listener_task = httpx.ListenerTask.init(&http_server);
+    try listener_task.start();
+    defer {
+        listener_task.shutdown(30_000);
+        listener_task.join() catch unreachable;
+    }
+
+    const address = http_server.boundAddress() orelse return error.MissingAdminListener;
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/internal/v1/reallocate", .{address.ip4.port});
+    defer std.testing.allocator.free(uri);
+    var executor = raft_transport.StdHttpExecutor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+    var response = try executor.executor().execute(std.testing.allocator, .{
         .method = .POST,
-        .uri = "/internal/v1/reallocate",
-    }) catch |err| if (metadata_authority.isRetryableError(err))
-        try public_api_http_server.metadataNotLeaderResponse(std.testing.allocator)
-    else
-        return err;
+        .uri = uri,
+    });
     defer response.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 503), response.status);
-    try std.testing.expect(std.mem.indexOf(u8, response.body, "metadata leader unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "metadata authority unavailable") != null);
 }
 
 test "metadata public api server carries auth and restore configuration" {

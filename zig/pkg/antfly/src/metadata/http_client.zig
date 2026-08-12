@@ -1274,6 +1274,8 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectEqual(@as(usize, 1), active.value.merge.len);
 
     try client.triggerReallocate(base_uri);
+    try std.testing.expectError(error.UnsupportedOperation, client.restoreExtensions(base_uri, "{}"));
+    try std.testing.expectError(error.UnsupportedOperation, client.enableExtension(base_uri, "memoryaf"));
     try client.createTable(base_uri, "docs", "{\"description\":\"docs table\"}");
     try client.updateSchema(base_uri, "docs", "{\"kind\":\"demo\"}");
     try client.createIndex(base_uri, "docs", "embed_idx", "{\"type\":\"managed_embeddings\"}");
