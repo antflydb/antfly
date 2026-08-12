@@ -6275,7 +6275,6 @@ pub fn build(b: *std.Build) void {
             "durable session limits bound count and encoded record size",
             "common config rejects removed top-level storage backend fields",
             "common config parses bounded transaction session policy",
-            "standalone public listener lease is exclusive and immediately reusable",
             "parse cli accepts inference budget overrides",
             "standalone kernel JIT mode precedence is CLI then environment then config",
             "inference config falls back to common config",

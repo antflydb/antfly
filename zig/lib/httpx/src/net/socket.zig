@@ -959,14 +959,24 @@ pub const TcpListener = struct {
 
     const Self = @This();
 
+    pub const ListenOptions = struct {
+        kernel_backlog: u31 = net.default_kernel_backlog,
+        /// Allow rebinding after a prior listener has closed without allowing
+        /// two live listeners to share the same address.
+        reuse_address: bool = false,
+        /// Explicitly allow multiple live listeners to bind the same address.
+        /// This is intentionally separate from reuse_address and defaults off.
+        reuse_port: bool = false,
+    };
+
     /// Creates and binds a TCP listener to the address.
     pub fn init(addr: Address, io: Io) !Self {
         return initWithOptions(addr, io, .{ .reuse_address = true });
     }
 
     /// Creates and binds with explicit options.
-    pub fn initWithOptions(addr: Address, io: Io, options: Address.ListenOptions) !Self {
-        const server = try addr.listen(io, options);
+    pub fn initWithOptions(addr: Address, io: Io, options: ListenOptions) !Self {
+        const server = try listenWithOptions(addr, io, options);
         return .{ .server = server, .io = io };
     }
 
@@ -996,6 +1006,142 @@ pub const TcpListener = struct {
         return self.server.socket.address;
     }
 };
+
+fn listenWithOptions(addr: Address, io: Io, options: TcpListener.ListenOptions) !net.Server {
+    if (comptime is_windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
+        if (options.reuse_port) return error.OptionUnsupported;
+        return try addr.listen(io, .{
+            .kernel_backlog = options.kernel_backlog,
+            .reuse_address = options.reuse_address,
+        });
+    }
+    return try listenPosix(addr, io, options);
+}
+
+const PosixAddress = extern union {
+    any: posix.sockaddr,
+    in: posix.sockaddr.in,
+    in6: posix.sockaddr.in6,
+};
+
+fn addressToPosix(address: Address, storage: *PosixAddress) posix.socklen_t {
+    return switch (address) {
+        .ip4 => |ip4| {
+            storage.in = .{
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = @bitCast(ip4.bytes),
+            };
+            return @sizeOf(posix.sockaddr.in);
+        },
+        .ip6 => |ip6| {
+            storage.in6 = .{
+                .port = std.mem.nativeToBig(u16, ip6.port),
+                .flowinfo = ip6.flow,
+                .addr = ip6.bytes,
+                .scope_id = ip6.interface.index,
+            };
+            return @sizeOf(posix.sockaddr.in6);
+        },
+    };
+}
+
+fn addressFromPosix(storage: *const PosixAddress) Address {
+    return switch (storage.any.family) {
+        posix.AF.INET => .{ .ip4 = .{
+            .port = std.mem.bigToNative(u16, storage.in.port),
+            .bytes = @bitCast(storage.in.addr),
+        } },
+        posix.AF.INET6 => .{ .ip6 = .{
+            .port = std.mem.bigToNative(u16, storage.in6.port),
+            .bytes = storage.in6.addr,
+            .flow = storage.in6.flowinfo,
+            .interface = .{ .index = storage.in6.scope_id },
+        } },
+        else => unreachable,
+    };
+}
+
+fn listenPosix(addr: Address, io: Io, options: TcpListener.ListenOptions) !net.Server {
+    const family: posix.sa_family_t = switch (addr) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    };
+    const socket_flags = posix.SOCK.STREAM |
+        if (Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC;
+    const socket_fd: posix.socket_t = socket: while (true) {
+        const rc = posix.system.socket(family, socket_flags, @intFromEnum(net.Protocol.tcp));
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :socket @intCast(rc),
+            .INTR => continue,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .INVAL => return error.ProtocolUnsupportedBySystem,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
+            .PROTOTYPE => return error.SocketModeUnsupported,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    var owned_socket = net.Socket{ .handle = socket_fd, .address = addr };
+    errdefer owned_socket.close(io);
+
+    if (Io.Threaded.socket_flags_unsupported) {
+        while (true) switch (posix.errno(posix.system.fcntl(
+            socket_fd,
+            posix.F.SETFD,
+            @as(usize, posix.FD_CLOEXEC),
+        ))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        };
+    }
+
+    const enabled: c_int = 1;
+    if (options.reuse_address)
+        try posix.setsockopt(socket_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enabled));
+    if (options.reuse_port) {
+        if (comptime !@hasDecl(posix.SO, "REUSEPORT")) return error.OptionUnsupported;
+        try posix.setsockopt(socket_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&enabled));
+    }
+
+    var storage: PosixAddress = undefined;
+    const address_len = addressToPosix(addr, &storage);
+    while (true) switch (posix.errno(posix.system.bind(socket_fd, &storage.any, address_len))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .ADDRINUSE => return error.AddressInUse,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .NOMEM => return error.SystemResources,
+        else => |err| return posix.unexpectedErrno(err),
+    };
+    while (true) switch (posix.errno(posix.system.listen(socket_fd, options.kernel_backlog))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .ADDRINUSE => return error.AddressInUse,
+        .NOBUFS => return error.SystemResources,
+        else => |err| return posix.unexpectedErrno(err),
+    };
+
+    var bound_storage: PosixAddress = undefined;
+    var bound_len: posix.socklen_t = @sizeOf(PosixAddress);
+    while (true) switch (posix.errno(posix.system.getsockname(socket_fd, &bound_storage.any, &bound_len))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .NOBUFS => return error.SystemResources,
+        else => |err| return posix.unexpectedErrno(err),
+    };
+    owned_socket.address = addressFromPosix(&bound_storage);
+    return .{
+        .socket = owned_socket,
+        .options = if (net.Server.AcceptOptions != void) .{
+            .mode = .stream,
+            .protocol = .tcp,
+        },
+    };
+}
 
 /// UDP datagram socket abstraction backed by std.Io.net.
 pub const UdpSocket = struct {

@@ -21,11 +21,17 @@ that end state:
 
 - `httpx` handlers and generated routers carry explicit instance context.
 - Long-lived `httpx` listeners are owned Futures with synchronous bind,
-  explicit stop, fatal-error publication, and mandatory join.
+  explicit stop, fatal-error publication, and mandatory join. Futures capture
+  separately allocated run state rather than the address of a movable task
+  handle.
 - Data, metadata, standalone, serverless, inference, and health listeners use
   the common ownership pattern; storage-backed roles borrow leased API or
   control lanes from `BackendRuntime`.
 - Process roles share signal cancellation and one absolute shutdown deadline.
+- Listener address reuse and listener sharing are independent policies:
+  `SO_REUSEADDR` supports deterministic restart, while `SO_REUSEPORT` is an
+  explicit opt-in. Runtime listeners default to exclusive kernel ownership and
+  do not use process-local lock files.
 - Data, metadata, standalone, serverless, and the dedicated inference command
   compose their listener and control tasks under a common supervisor state
   machine. Readiness is gated on the supervisor reaching `ready`; the first
@@ -406,31 +412,86 @@ For the runtime-owned `httpx` listener, the basic shape is:
 
 ```zig
 const Listener = struct {
+    const RunState = struct {
+        server: *Server,
+        state: std.atomic.Value(RuntimeState),
+        failure: ?anyerror,
+    };
+
+    server: *Server,
     io: std.Io,
-    serve_future: ?std.Io.Future(void) = null,
+    run_state: ?*RunState = null,
+    serve_future: ?std.Io.Future(anyerror!void) = null,
 
     pub fn start(self: *Listener) !void {
         // Bind synchronously so startup failures are returned directly.
-        try self.bind();
-        self.serve_future = try self.io.concurrent(serve, .{self});
+        try self.server.bind();
+        const run_state = try self.server.allocator.create(RunState);
+        run_state.* = .{ .server = self.server, .state = .init(.running), .failure = null };
+        self.run_state = run_state;
+        self.serve_future = self.io.concurrent(serve, .{run_state}) catch |err| {
+            self.server.allocator.destroy(run_state);
+            self.run_state = null;
+            return err;
+        };
     }
 
-    pub fn stop(self: *Listener) void {
-        self.requestStop();
-        self.wakeAccept();
+    pub fn stopAndJoin(self: *Listener) !void {
+        self.server.requestStop();
         if (self.serve_future) |*future| {
-            future.await(self.io);
-            self.serve_future = null;
+            const run_state = self.run_state.?;
+            defer {
+                self.server.allocator.destroy(run_state);
+                self.serve_future = null;
+                self.run_state = null;
+            }
+            try future.await(self.io);
         }
     }
 };
 ```
+
+The Future must never capture the address of a task handle that can be returned
+by value, stored in a resizable collection, or otherwise moved after `start`.
+The handle owns a stable run-state allocation until `join`, while the run state
+borrows the server and publishes terminal state and failure. The handle is
+movable but logically unique: copying it would duplicate Future ownership and
+is not supported. The server, its allocator, and the executor lane must outlive
+the joined task.
 
 Use `std.Io.concurrent` for a listener that must progress concurrently with its
 caller. `std.Io.async` is appropriate for operations that can use its weaker
 scheduling guarantee. Under `Io.Threaded`, a long-lived concurrent listener
 still consumes a worker thread; the benefit is structured ownership rather than
 elimination of threads.
+
+## Listener bind ownership
+
+Fast restart and simultaneous listener sharing are different requirements and
+must not be represented by one flag:
+
+- `reuse_address = true` enables the platform's `SO_REUSEADDR` behavior so a
+  replacement process can promptly reclaim a released address. It must not
+  allow two live Antfly listeners to own the same bind tuple.
+- `reuse_port = false` is the production default. Enabling it requests
+  `SO_REUSEPORT` and is reserved for an explicitly designed multi-acceptor
+  deployment where connection distribution, graceful removal, and observability
+  have been validated.
+- Port `0` always asks the kernel for an independent ephemeral port and must not
+  be serialized across processes.
+
+The kernel is the authority for bind ownership. A path derived from a port in
+`/tmp` is neither namespace-aware nor equivalent to socket ownership: it can
+serialize unrelated ephemeral listeners, become stale, and cannot protect
+non-cooperating processes. Antfly therefore does not layer a file lease over
+listener binding. Bind remains synchronous, and `AddressInUse` is the startup
+failure surfaced to the supervisor.
+
+Zero-downtime replacement should be owned by the deployment system—readiness,
+load-balancer draining, or socket activation—not by accidentally permitting
+two generations to bind the same port. If a future runtime intentionally uses
+`SO_REUSEPORT`, that choice must be explicit in its configuration and covered
+by platform-specific integration tests.
 
 ## Executor topology
 
@@ -922,6 +983,10 @@ Lifecycle tests should cover:
 - Provider destruction while work is pending
 - Backend runtime destruction with an outstanding lease
 - Repeated start/stop and immediate port reuse
+- Exclusive rejection of a second live listener with `reuse_address` enabled
+- Independent simultaneous ephemeral listeners
+- Explicit `reuse_port` sharing on platforms that support it
+- Moving a started listener-task handle before stop and join
 - SIGINT and SIGTERM during startup, steady state, and drain
 - Thread, file-descriptor, task, and memory counts after repeated cycles
 

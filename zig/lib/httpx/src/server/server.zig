@@ -91,10 +91,12 @@ pub const ServerConfig = struct {
     /// EMFILE/ENFILE into a CPU-burning, unbounded log loop.
     accept_error_backoff_initial_ms: u32 = 5,
     accept_error_backoff_max_ms: u32 = 1_000,
-    /// Permit rebinding an address that has recently been used. Disable for
-    /// exclusive production listeners where two live servers must never share
-    /// an address (notably macOS SO_REUSEADDR semantics).
+    /// Permit rebinding an address that has recently been used without allowing
+    /// two live listeners to share the same bind tuple.
     reuse_address: bool = true,
+    /// Explicit multi-listener load balancing via SO_REUSEPORT. Production
+    /// listeners remain exclusive unless this is deliberately enabled.
+    reuse_port: bool = false,
     keep_alive: bool = true,
     max_requests_per_connection: u32 = 1000,
     /// Idle timeout for HTTP/2 connections (ms). The server initiates graceful
@@ -896,16 +898,26 @@ pub const Server = struct {
     /// Structured owner for a long-lived `Server.listen` task.
     ///
     /// The caller owns both the Server and the executor behind its Io value.
-    /// A ListenerTask owns only the submitted future: it binds before
-    /// returning from `start`, publishes shutdown to the listener, and makes
-    /// joining explicit before the server or executor can be destroyed.
+    /// A ListenerTask owns the submitted future and its separately allocated
+    /// run state: it binds before returning from `start`, publishes shutdown to
+    /// the listener, and makes joining explicit before the server or executor
+    /// can be destroyed. The Future captures only the stable RunState pointer,
+    /// so the ListenerTask handle itself remains safe to return or move after
+    /// start.
     pub const ListenerTask = struct {
         server: *Self,
         io: Io,
         future: ?Io.Future(anyerror!void) = null,
+        run_state: ?*RunState = null,
         state: State = .initialized,
-        runtime_state: std.atomic.Value(RuntimeState) = .init(.initialized),
-        failure: anyerror = error.Unexpected,
+        terminal_runtime_state: RuntimeState = .initialized,
+        terminal_failure: ?anyerror = null,
+
+        const RunState = struct {
+            server: *Self,
+            runtime_state: std.atomic.Value(RuntimeState) = .init(.running),
+            failure: anyerror = error.Unexpected,
+        };
 
         pub const State = enum {
             initialized,
@@ -927,11 +939,17 @@ pub const Server = struct {
         pub fn start(self: *ListenerTask) !void {
             if (self.state != .initialized) return error.ListenerTaskAlreadyStarted;
             try self.server.bind();
+            const run_state = try self.server.allocator.create(RunState);
+            run_state.* = .{ .server = self.server };
+            self.run_state = run_state;
             self.state = .running;
-            self.runtime_state.store(.running, .release);
-            self.future = self.io.concurrent(run, .{self}) catch |err| {
+            self.terminal_runtime_state = .running;
+            self.terminal_failure = null;
+            self.future = self.io.concurrent(run, .{run_state}) catch |err| {
+                self.server.allocator.destroy(run_state);
+                self.run_state = null;
                 self.state = .initialized;
-                self.runtime_state.store(.initialized, .release);
+                self.terminal_runtime_state = .initialized;
                 return err;
             };
         }
@@ -949,12 +967,20 @@ pub const Server = struct {
                 defer {
                     self.future = null;
                     self.state = .joined;
+                    const run_state = self.run_state.?;
+                    self.terminal_runtime_state = run_state.runtime_state.load(.acquire);
+                    self.server.allocator.destroy(run_state);
+                    self.run_state = null;
                 }
-                return try future.await(self.io);
+                future.await(self.io) catch |err| {
+                    self.terminal_failure = err;
+                    return err;
+                };
+                return;
             }
             if (self.state == .initialized) self.state = .joined;
-            if (self.runtime_state.load(.acquire) == .initialized)
-                self.runtime_state.store(.stopped, .release);
+            if (self.terminal_runtime_state == .initialized)
+                self.terminal_runtime_state = .stopped;
         }
 
         pub fn isRunning(self: *const ListenerTask) bool {
@@ -964,16 +990,24 @@ pub const Server = struct {
         /// Publish an unexpected terminal listener error without consuming the
         /// Future. The owner still must call `join` before deinitialization.
         pub fn runtimeFailure(self: *const ListenerTask) ?anyerror {
-            return if (self.runtime_state.load(.acquire) == .failed) self.failure else null;
+            if (self.run_state) |run_state| {
+                return if (run_state.runtime_state.load(.acquire) == .failed) run_state.failure else null;
+            }
+            return if (self.terminal_runtime_state == .failed) self.terminal_failure else null;
         }
 
-        fn run(self: *ListenerTask) anyerror!void {
-            self.server.listen() catch |err| {
-                self.failure = err;
-                self.runtime_state.store(.failed, .release);
+        pub fn runtimeState(self: *const ListenerTask) RuntimeState {
+            if (self.run_state) |run_state| return run_state.runtime_state.load(.acquire);
+            return self.terminal_runtime_state;
+        }
+
+        fn run(run_state: *RunState) anyerror!void {
+            run_state.server.listen() catch |err| {
+                run_state.failure = err;
+                run_state.runtime_state.store(.failed, .release);
                 return err;
             };
-            self.runtime_state.store(.stopped, .release);
+            run_state.runtime_state.store(.stopped, .release);
         }
     };
 
@@ -1145,6 +1179,7 @@ pub const Server = struct {
         self.listener = try TcpListener.initWithOptions(addr, self.io, .{
             .kernel_backlog = backlog,
             .reuse_address = self.config.reuse_address,
+            .reuse_port = self.config.reuse_port,
         });
         const bound = self.listener.?.getLocalAddress();
         const port = switch (bound) {
@@ -3520,6 +3555,124 @@ test "listener task binds synchronously and joins before executor teardown" {
     try std.testing.expect(!server.running);
     // Joining is idempotent for cleanup paths.
     try task.join();
+}
+
+test "listener task remains valid after its owning handle moves" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+
+    const Factory = struct {
+        fn start(s: *Server) !Server.ListenerTask {
+            var task = Server.ListenerTask.init(s);
+            try task.start();
+            return task;
+        }
+    };
+    var task = try Factory.start(&server);
+    try std.testing.expectEqual(Server.ListenerTask.RuntimeState.running, task.runtimeState());
+    task.shutdown(1000);
+    try task.join();
+    try std.testing.expectEqual(Server.ListenerTask.RuntimeState.stopped, task.runtimeState());
+}
+
+test "reuse address preserves exclusive live listener ownership" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var first = Server.initWithConfig(allocator, io, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .reuse_address = true,
+    });
+    defer first.deinit();
+    try first.bind();
+    const port = first.boundAddress().?.ip4.port;
+
+    var second = Server.initWithConfig(allocator, io, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .reuse_address = true,
+    });
+    defer second.deinit();
+    try std.testing.expectError(error.AddressInUse, second.bind());
+}
+
+test "reuse address permits an immediate listener restart" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var first = Server.initWithConfig(allocator, io, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .reuse_address = true,
+    });
+    try first.bind();
+    const port = first.boundAddress().?.ip4.port;
+    // Exercise an accepted connection so the replacement covers the socket
+    // states for which SO_REUSEADDR is needed, not merely a never-used bind.
+    var client = try Socket.connect(first.boundAddress().?, io);
+    var accepted = try first.listener.?.accept();
+    accepted.socket.close();
+    client.close();
+    first.deinit();
+
+    var replacement = Server.initWithConfig(allocator, io, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .reuse_address = true,
+    });
+    defer replacement.deinit();
+    try replacement.bind();
+}
+
+test "ephemeral listeners remain independently bindable" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var first = Server.initWithConfig(allocator, io, .{ .host = "127.0.0.1", .port = 0 });
+    defer first.deinit();
+    var second = Server.initWithConfig(allocator, io, .{ .host = "127.0.0.1", .port = 0 });
+    defer second.deinit();
+    try first.bind();
+    try second.bind();
+    try std.testing.expect(first.boundAddress().?.ip4.port != second.boundAddress().?.ip4.port);
+}
+
+test "reuse port is an explicit live listener opt in" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        builtin.os.tag == .freestanding or !@hasDecl(posix.SO, "REUSEPORT")) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var first = Server.initWithConfig(allocator, io, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .reuse_address = true,
+        .reuse_port = true,
+    });
+    defer first.deinit();
+    try first.bind();
+
+    var second = Server.initWithConfig(allocator, io, .{
+        .host = "127.0.0.1",
+        .port = first.boundAddress().?.ip4.port,
+        .reuse_address = true,
+        .reuse_port = true,
+    });
+    defer second.deinit();
+    try second.bind();
 }
 
 test "cross-thread graceful shutdown is listener-owned" {
