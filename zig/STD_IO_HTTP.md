@@ -86,6 +86,10 @@ that end state:
   returns an owned typed state. JSON request decoding and response encoding are
   confined to its concrete `httpx` handler; the old join route dispatcher no
   longer recognizes this path.
+- Join finalize, rows, unmatched, and partition workers now expose typed
+  request execution beneath their retained wire helpers. The concrete `httpx`
+  routes decode into those owned requests and call typed operations directly;
+  the separate internal join HTTP dispatcher has been deleted.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

@@ -5622,8 +5622,6 @@ pub const ApiHttpServer = struct {
                 },
                 .query_planning = self.internalQueryPlanningContext(),
             },
-            .join_ctx = self.joinContext(),
-            .join_job_store = &self.join_job_store,
             .write_ctx = .{
                 .alloc = self.alloc,
                 .shard_ops = self.cfg.shard_ops,

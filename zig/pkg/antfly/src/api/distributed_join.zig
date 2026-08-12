@@ -2823,6 +2823,18 @@ pub fn executeJoinFinalizeWorkerLocal(
 ) !JoinPartitionExecutionResult {
     var req = try parseJoinFinalizeRequest(alloc, body);
     defer req.deinit(alloc);
+    return try executeJoinFinalizeWorkerLocalTyped(ctx, job_store, alloc, source, finalizer_group_id, table_name, req);
+}
+
+pub fn executeJoinFinalizeWorkerLocalTyped(
+    ctx: JoinContext,
+    job_store: *JoinJobStore,
+    alloc: std.mem.Allocator,
+    source: table_reads.TableReadSource,
+    finalizer_group_id: u64,
+    table_name: []const u8,
+    req: JoinFinalizeRequest,
+) !JoinPartitionExecutionResult {
     const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
@@ -2875,6 +2887,17 @@ fn executeJoinRowsLocal(
 ) ![]std.json.Value {
     var req = try parseJoinRowsRequest(alloc, body);
     defer req.deinit(alloc);
+    return try executeJoinRowsLocalTyped(ctx, alloc, source, group_id, table_name, req);
+}
+
+pub fn executeJoinRowsLocalTyped(
+    ctx: JoinContext,
+    alloc: std.mem.Allocator,
+    source: table_reads.TableReadSource,
+    group_id: u64,
+    table_name: []const u8,
+    req: JoinRowsRequest,
+) ![]std.json.Value {
     const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
@@ -2927,6 +2950,17 @@ fn executeJoinUnmatchedLocal(
 ) !EncodedJoinUnmatchedResponse {
     var req = try parseJoinUnmatchedRequest(alloc, body);
     defer req.deinit(alloc);
+    return try executeJoinUnmatchedLocalTyped(ctx, alloc, source, group_id, table_name, req);
+}
+
+pub fn executeJoinUnmatchedLocalTyped(
+    ctx: JoinContext,
+    alloc: std.mem.Allocator,
+    source: table_reads.TableReadSource,
+    group_id: u64,
+    table_name: []const u8,
+    req: JoinUnmatchedRequest,
+) !EncodedJoinUnmatchedResponse {
     const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
@@ -3037,6 +3071,18 @@ pub fn executeJoinPartitionWorkerLocal(
         return err;
     };
     defer req.deinit(alloc);
+    return try executeJoinPartitionWorkerLocalTyped(ctx, job_store, alloc, source, worker_group_id, table_name, req);
+}
+
+pub fn executeJoinPartitionWorkerLocalTyped(
+    ctx: JoinContext,
+    job_store: *JoinJobStore,
+    alloc: std.mem.Allocator,
+    source: table_reads.TableReadSource,
+    worker_group_id: u64,
+    table_name: []const u8,
+    req: JoinPartitionRequest,
+) !JoinPartitionExecutionResult {
     const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
@@ -4344,7 +4390,7 @@ fn encodeJoinJobStateRequest(
     return try stringifyJsonValueAlloc(alloc, root);
 }
 
-fn parseJoinPartitionRequest(
+pub fn parseJoinPartitionRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !JoinPartitionRequest {
@@ -4455,7 +4501,7 @@ pub fn encodeJoinFinalizeRequest(
     return try stringifyJsonValueAlloc(alloc, root);
 }
 
-fn parseJoinRowsRequest(
+pub fn parseJoinRowsRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !JoinRowsRequest {
@@ -4482,7 +4528,7 @@ fn parseJoinRowsRequest(
     };
 }
 
-fn parseJoinUnmatchedRequest(
+pub fn parseJoinUnmatchedRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !JoinUnmatchedRequest {
@@ -4504,7 +4550,7 @@ fn parseJoinUnmatchedRequest(
     };
 }
 
-fn parseJoinFinalizeRequest(
+pub fn parseJoinFinalizeRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !JoinFinalizeRequest {
@@ -4542,7 +4588,7 @@ fn parseJoinJobStateRequest(
     return parsed.value.job_id;
 }
 
-fn encodeJoinRowsResponse(
+pub fn encodeJoinRowsResponse(
     alloc: std.mem.Allocator,
     hits: []const std.json.Value,
 ) ![]u8 {
@@ -4557,7 +4603,7 @@ fn encodeJoinRowsResponse(
     return try stringifyJsonValueAlloc(alloc, root);
 }
 
-fn encodeJoinUnmatchedResponse(
+pub fn encodeJoinUnmatchedResponse(
     alloc: std.mem.Allocator,
     hits: []const std.json.Value,
     right_rows_scanned: u64,

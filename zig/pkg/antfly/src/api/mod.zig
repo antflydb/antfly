@@ -60,7 +60,6 @@ pub const internal_repair_operations = @import("internal_repair_operations.zig")
 pub const restore_jobs = @import("restore_jobs.zig");
 pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 pub const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
-pub const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
 pub const http_server = @import("http_server.zig");
 pub const kernel_bridge = @import("kernel_bridge.zig");
 pub const http_client = @import("http_client.zig");
@@ -252,7 +251,6 @@ test "api module compiles" {
     _ = distributed_graph;
     _ = http_internal_group_read_routes;
     _ = http_internal_group_write_routes;
-    _ = http_internal_group_join_routes;
     _ = http_server;
     _ = http_client;
     _ = httpx_handler;

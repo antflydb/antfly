@@ -13,9 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const distributed_join = @import("distributed_join.zig");
 const http_common = @import("../raft/transport/http_common.zig");
-const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
 const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
 
@@ -33,8 +31,6 @@ pub const Context = struct {
     path: []const u8,
     query: []const u8,
     read_ctx: http_internal_group_read_routes.Context,
-    join_ctx: distributed_join.JoinContext,
-    join_job_store: *distributed_join.JoinJobStore,
     write_ctx: http_internal_group_write_routes.Context,
     retrieval_executor: RetrievalExecutor,
 };
@@ -42,12 +38,6 @@ pub const Context = struct {
 pub fn handle(ctx: Context, req: http_common.HttpRequest) !?http_common.HttpResponse {
     if (try ctx.retrieval_executor.run(req, ctx.path)) |resp| return resp;
     if (try http_internal_group_read_routes.handle(ctx.read_ctx, req, ctx.path, ctx.query)) |resp| return resp;
-    if (try http_internal_group_join_routes.handle(.{
-        .alloc = ctx.alloc,
-        .reads = ctx.read_ctx.reads,
-        .join_ctx = ctx.join_ctx,
-        .join_job_store = ctx.join_job_store,
-    }, req, ctx.path)) |resp| return resp;
     if (try http_internal_group_write_routes.handle(ctx.write_ctx, req, ctx.path)) |resp| return resp;
     return null;
 }

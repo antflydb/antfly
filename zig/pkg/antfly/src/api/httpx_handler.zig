@@ -313,6 +313,10 @@ pub const AntflyApiHandler = struct {
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
         try server.get(internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix, httpx.Handler.bind(self, internalRepairCancelState));
         try server.post(table_prefix ++ routes.join_job_state_suffix, httpx.Handler.bind(self, internalJoinJobState));
+        try server.post(table_prefix ++ routes.join_finalize_suffix, httpx.Handler.bind(self, internalJoinFinalize));
+        try server.post(table_prefix ++ routes.join_rows_suffix, httpx.Handler.bind(self, internalJoinRows));
+        try server.post(table_prefix ++ routes.join_unmatched_suffix, httpx.Handler.bind(self, internalJoinUnmatched));
+        try server.post(table_prefix ++ routes.join_partition_suffix, httpx.Handler.bind(self, internalJoinPartition));
         const internal_posts = [_][]const u8{
             internal_table_prefix ++ routes.corrupt_embedding_artifact_suffix,
             group_prefix ++ routes.shard_ops_observe_split_suffix,
@@ -322,10 +326,6 @@ pub const AntflyApiHandler = struct {
             table_prefix ++ routes.graph_expand_suffix,
             table_prefix ++ routes.graph_hydrate_suffix,
             table_prefix ++ routes.text_stats_suffix,
-            table_prefix ++ routes.join_finalize_suffix,
-            table_prefix ++ routes.join_rows_suffix,
-            table_prefix ++ routes.join_unmatched_suffix,
-            table_prefix ++ routes.join_partition_suffix,
             table_prefix ++ routes.query_suffix,
             table_prefix ++ routes.batch_suffix,
             table_prefix ++ routes.txn_begin_suffix,
@@ -855,6 +855,130 @@ pub const AntflyApiHandler = struct {
         };
         defer result.deinit();
         return ctx.json(result.parsed.value);
+    }
+
+    fn internalJoinOperations(self: *AntflyApiHandler) internal_join_operations.Operations {
+        return .{
+            .job_store = &self.api_server.join_job_store,
+            .join_context = self.api_server.joinContext(),
+            .reads = self.api_server.table_reads,
+        };
+    }
+
+    const InternalGroupTableParams = struct {
+        group_id: u64,
+        table_name: []u8,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.table_name);
+        }
+    };
+
+    fn internalGroupTableParams(ctx: *httpx.Context) !?InternalGroupTableParams {
+        const group_id_raw = ctx.param("group_id") orelse return null;
+        const group_id = std.fmt.parseUnsigned(u64, group_id_raw, 10) catch return null;
+        const encoded_table_name = ctx.param("table_name") orelse return null;
+        const table_name = (try decodePathParamOrBadRequest(ctx, encoded_table_name)) orelse return null;
+        return .{ .group_id = group_id, .table_name = table_name };
+    }
+
+    fn internalJoinErrorResponse(ctx: *httpx.Context, err: internal_join_operations.Error, invalid_message: []const u8) !httpx.Response {
+        return switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => textResponse(ctx, 400, invalid_message),
+            error.NotFound => textResponse(ctx, 404, "not found"),
+            error.Timeout, error.Canceled => textResponse(ctx, 408, "query timeout"),
+            error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
+            error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
+            error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            error.Unavailable => textResponse(ctx, 503, "join unavailable"),
+            else => textResponse(ctx, 500, "internal server error"),
+        };
+    }
+
+    fn internalJoinFinalize(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid join finalize request");
+        var input = @import("distributed_join.zig").parseJoinFinalizeRequest(ctx.allocator, body) catch
+            return textResponse(ctx, 400, "invalid join finalize request");
+        defer input.deinit(ctx.allocator);
+        var result = self.internalJoinOperations().finalize(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            input,
+        ) catch |err| return internalJoinErrorResponse(ctx, err, "invalid join finalize request");
+        defer result.deinit(ctx.allocator);
+        const encoded = try self.api_server.join_job_store.encodeJoinPartitionResponse(ctx.allocator, result);
+        defer ctx.allocator.free(encoded);
+        return jsonResponse(ctx, 200, encoded);
+    }
+
+    fn internalJoinRows(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid join rows request");
+        var input = @import("distributed_join.zig").parseJoinRowsRequest(ctx.allocator, body) catch
+            return textResponse(ctx, 400, "invalid join rows request");
+        defer input.deinit(ctx.allocator);
+        const hits = self.internalJoinOperations().rows(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            input,
+        ) catch |err| return internalJoinErrorResponse(ctx, err, "invalid join rows request");
+        defer {
+            for (hits) |*hit| @import("distributed_join.zig").deinitJsonValue(ctx.allocator, hit);
+            if (hits.len > 0) ctx.allocator.free(hits);
+        }
+        const encoded = try @import("distributed_join.zig").encodeJoinRowsResponse(ctx.allocator, hits);
+        defer ctx.allocator.free(encoded);
+        return jsonResponse(ctx, 200, encoded);
+    }
+
+    fn internalJoinUnmatched(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid join unmatched request");
+        var input = @import("distributed_join.zig").parseJoinUnmatchedRequest(ctx.allocator, body) catch
+            return textResponse(ctx, 400, "invalid join unmatched request");
+        defer input.deinit(ctx.allocator);
+        const result = self.internalJoinOperations().unmatched(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            input,
+        ) catch |err| return internalJoinErrorResponse(ctx, err, "invalid join unmatched request");
+        defer {
+            for (result.hits) |*hit| @import("distributed_join.zig").deinitJsonValue(ctx.allocator, @constCast(hit));
+            if (result.hits.len > 0) ctx.allocator.free(@constCast(result.hits));
+        }
+        const encoded = try @import("distributed_join.zig").encodeJoinUnmatchedResponse(ctx.allocator, result.hits, result.right_rows_scanned);
+        defer ctx.allocator.free(encoded);
+        return jsonResponse(ctx, 200, encoded);
+    }
+
+    fn internalJoinPartition(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid join partition request");
+        var input = @import("distributed_join.zig").parseJoinPartitionRequest(ctx.allocator, body) catch
+            return textResponse(ctx, 400, "invalid join partition request");
+        defer input.deinit(ctx.allocator);
+        var result = self.internalJoinOperations().partition(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            input,
+        ) catch |err| return internalJoinErrorResponse(ctx, err, "invalid join partition request");
+        defer result.deinit(ctx.allocator);
+        const encoded = try self.api_server.join_job_store.encodeJoinPartitionResponse(ctx.allocator, result);
+        defer ctx.allocator.free(encoded);
+        return jsonResponse(ctx, 200, encoded);
     }
 
     // ---------------------------------------------------------------
@@ -4978,6 +5102,20 @@ test "httpx internal group GET routes call typed operations directly" {
     defer invalid_join_state.deinit();
     try std.testing.expectEqual(@as(u16, 400), invalid_join_state.status.code);
     try std.testing.expectEqualStrings("invalid join job state request", invalid_join_state.body.?);
+
+    inline for (.{
+        .{ "join-finalize", "invalid join finalize request" },
+        .{ "join-rows", "invalid join rows request" },
+        .{ "join-unmatched", "invalid join unmatched request" },
+        .{ "join-partition", "invalid join partition request" },
+    }) |case| {
+        const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/{s}", .{ base_url, case[0] });
+        defer alloc.free(url);
+        var response = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &headers, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expectEqualStrings(case[1], response.body.?);
+    }
 }
 
 test "httpx storage maintenance routes call typed operations directly" {
