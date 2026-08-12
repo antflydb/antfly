@@ -9975,18 +9975,24 @@ pub const ApiHttpServer = struct {
         return true;
     }
 
-    fn runtimeIndexStillBuilding(statuses: []const runtime_status.LocalTableRuntimeStatus, index_name: []const u8) bool {
-        if (statuses.len == 0) return false;
+    const RuntimeIndexLifecycle = enum {
+        healthy,
+        rebuilding,
+        unavailable,
+    };
+
+    fn runtimeIndexLifecycle(statuses: []const runtime_status.LocalTableRuntimeStatus, index_name: []const u8) RuntimeIndexLifecycle {
+        if (statuses.len == 0) return .unavailable;
         var observed_active_build = false;
         for (statuses) |status| {
             const index = for (status.stats.indexes) |item| {
                 if (std.mem.eql(u8, item.name, index_name)) break item;
-            } else return false;
-            if (index.load_error != null) return false;
+            } else return .unavailable;
+            if (index.load_error != null) return .unavailable;
             // Terminal and operator-paused repairs are actionable failures,
             // not retryable publication windows.
             if (std.mem.eql(u8, index.index_repair_phase, "terminal") or
-                std.mem.eql(u8, index.index_repair_automation, "paused")) return false;
+                std.mem.eql(u8, index.index_repair_automation, "paused")) return .unavailable;
             if (index.backfill_active or
                 index.replay_catch_up_required or
                 index.catch_up_active or
@@ -9995,9 +10001,26 @@ pub const ApiHttpServer = struct {
                 index.catch_up_applied_sequence < index.catch_up_target_sequence)
             {
                 observed_active_build = true;
+            } else if (index.repair_degraded) {
+                return .unavailable;
             }
         }
-        return observed_active_build;
+        return if (observed_active_build) .rebuilding else .healthy;
+    }
+
+    fn observeRuntimeIndexLifecycle(
+        statuses: []const runtime_status.LocalTableRuntimeStatus,
+        index_name: []const u8,
+        observed_rebuilding: *bool,
+    ) bool {
+        return switch (runtimeIndexLifecycle(statuses, index_name)) {
+            .healthy => true,
+            .rebuilding => blk: {
+                observed_rebuilding.* = true;
+                break :blk true;
+            },
+            .unavailable => false,
+        };
     }
 
     fn queryHasRebuildingCatalogIndex(
@@ -10042,12 +10065,26 @@ pub const ApiHttpServer = struct {
         var statuses = (try write_source.localRuntimeStatuses(self.alloc, table_name)) orelse return false;
         defer statuses.deinit(self.alloc);
 
-        if (req.index_name) |name| if (runtimeIndexStillBuilding(statuses.items, name)) return true;
-        for (req.full_text_queries) |query| if (runtimeIndexStillBuilding(statuses.items, query.index_name)) return true;
-        for (req.dense_queries) |query| if (runtimeIndexStillBuilding(statuses.items, query.index_name)) return true;
-        for (req.sparse_queries) |query| if (runtimeIndexStillBuilding(statuses.items, query.index_name)) return true;
-        for (req.graph_queries) |query| if (runtimeIndexStillBuilding(statuses.items, query.query.index_name)) return true;
-        return false;
+        // IndexNotFound is retryable only when every referenced catalog index
+        // has usable runtime state and at least one is actively rebuilding. A
+        // failed or missing sibling must retain the actionable original error.
+        var observed_rebuilding = false;
+        if (req.index_name) |name| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, name, &observed_rebuilding)) return false;
+        }
+        for (req.full_text_queries) |query| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, query.index_name, &observed_rebuilding)) return false;
+        }
+        for (req.dense_queries) |query| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, query.index_name, &observed_rebuilding)) return false;
+        }
+        for (req.sparse_queries) |query| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, query.index_name, &observed_rebuilding)) return false;
+        }
+        for (req.graph_queries) |query| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, query.query.index_name, &observed_rebuilding)) return false;
+        }
+        return observed_rebuilding;
     }
 
     const MissingIndexLifecycle = union(enum) {
@@ -10441,18 +10478,31 @@ pub const ApiHttpServer = struct {
             // barrier; embedded sources preserve their synchronous contract.
             // Generic reconciliation is separate because the same queue also
             // repairs index deletion.
-            _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
-                error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
-                error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
-                error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded => return error.Backpressured,
-                else => {
-                    std.log.err("public create index local admission failed table={s} index={s} err={}", .{ table_name, index_name, err });
-                    return error.InternalFailure;
-                },
+            _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| {
+                // The catalog mutation is already committed. Even if this
+                // synchronous O(groups) barrier only reached a prefix of local
+                // shards, hand the exact desired-state edge to the bounded
+                // reconciler before preserving the admission error for the
+                // caller.
+                _ = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |reconcile_err| {
+                    std.log.warn("public create index structural reconcile enqueue after admission failure deferred table={s} index={s} err={}", .{ table_name, index_name, reconcile_err });
+                };
+                switch (err) {
+                    error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+                    error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+                    error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded => return error.Backpressured,
+                    else => {
+                        std.log.err("public create index local admission failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                        return error.InternalFailure;
+                    },
+                }
             };
+            // Local write capability is the request's commit boundary. Queue
+            // insertion is an idempotent repair accelerator, so queue pressure
+            // after successful admission must not turn a committed create into
+            // a false HTTP failure that invites ambiguous client retries.
             _ = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| {
-                std.log.err("public create index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, err });
-                return error.InternalFailure;
+                std.log.warn("public create index structural reconcile enqueue deferred table={s} index={s} err={}", .{ table_name, index_name, err });
             };
         }
     }
@@ -18231,9 +18281,15 @@ test "api http missing index classification requires active rebuild evidence" {
     const active_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
         .stats = .{ .indexes = @constCast(active_indexes[0..]) },
     }};
-    try std.testing.expect(ApiHttpServer.runtimeIndexStillBuilding(active_statuses[0..], "semantic_idx"));
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.rebuilding,
+        ApiHttpServer.runtimeIndexLifecycle(active_statuses[0..], "semantic_idx"),
+    );
 
-    try std.testing.expect(!ApiHttpServer.runtimeIndexStillBuilding(&.{}, "semantic_idx"));
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(&.{}, "semantic_idx"),
+    );
 
     const terminal_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "semantic_idx",
@@ -18245,7 +18301,10 @@ test "api http missing index classification requires active rebuild evidence" {
     const terminal_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
         .stats = .{ .indexes = @constCast(terminal_indexes[0..]) },
     }};
-    try std.testing.expect(!ApiHttpServer.runtimeIndexStillBuilding(terminal_statuses[0..], "semantic_idx"));
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(terminal_statuses[0..], "semantic_idx"),
+    );
 
     const paused_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "semantic_idx",
@@ -18257,7 +18316,10 @@ test "api http missing index classification requires active rebuild evidence" {
     const paused_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
         .stats = .{ .indexes = @constCast(paused_indexes[0..]) },
     }};
-    try std.testing.expect(!ApiHttpServer.runtimeIndexStillBuilding(paused_statuses[0..], "semantic_idx"));
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(paused_statuses[0..], "semantic_idx"),
+    );
 
     const degraded_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "semantic_idx",
@@ -18267,8 +18329,39 @@ test "api http missing index classification requires active rebuild evidence" {
     const degraded_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
         .stats = .{ .indexes = @constCast(degraded_indexes[0..]) },
     }};
-    try std.testing.expect(!ApiHttpServer.runtimeIndexStillBuilding(degraded_statuses[0..], "semantic_idx"));
-    try std.testing.expect(!ApiHttpServer.runtimeIndexStillBuilding(degraded_statuses[0..], "missing_idx"));
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(degraded_statuses[0..], "semantic_idx"),
+    );
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(degraded_statuses[0..], "missing_idx"),
+    );
+
+    // An active build cannot mask an actionable failure from another index in
+    // the same query, regardless of reference order.
+    const mixed_indexes = [_]db_mod.types.DBIndexStats{
+        .{
+            .name = "building_idx",
+            .kind = .dense_vector,
+            .index_repair_id = 43,
+            .index_repair_phase = "building",
+        },
+        .{
+            .name = "failed_idx",
+            .kind = .dense_vector,
+            .repair_degraded = true,
+            .index_repair_id = 44,
+            .index_repair_phase = "terminal",
+        },
+    };
+    const mixed_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .stats = .{ .indexes = @constCast(mixed_indexes[0..]) },
+    }};
+    var observed_rebuilding = false;
+    try std.testing.expect(ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], "building_idx", &observed_rebuilding));
+    try std.testing.expect(observed_rebuilding);
+    try std.testing.expect(!ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], "failed_idx", &observed_rebuilding));
 }
 
 test "api http plain public query preserves outer absolute request deadline" {
@@ -29050,12 +29143,18 @@ test "api http server create index waits for exact target config projection" {
     };
 
     const FakeWrites = struct {
+        create_error: ?anyerror = null,
+        enqueue_error: ?anyerror = null,
+        create_calls: usize = 0,
+        enqueue_calls: usize = 0,
+
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
                     .batch = batch,
                     .create_index = createIndex,
+                    .request_table_index_structural_reconcile = requestTableIndexStructuralReconcile,
                 },
             };
         }
@@ -29064,7 +29163,22 @@ test "api http server create index waits for exact target config projection" {
             return error.UnsupportedOperation;
         }
 
-        fn createIndex(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!?void {}
+        fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.create_calls += 1;
+            if (self.create_error) |err| return err;
+        }
+
+        fn requestTableIndexStructuralReconcile(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.enqueue_calls += 1;
+            if (self.enqueue_error) |err| return err;
+        }
     };
 
     var source = FakeSource{};
@@ -29103,6 +29217,36 @@ test "api http server create index waits for exact target config projection" {
     var retry_lookup = (try indexes_api.lookupSingleIndexConfig(alloc, source.indexes_json, "embed_idx")).?;
     defer retry_lookup.deinit();
     try std.testing.expectEqual(first_incarnation, coverage_policy.incarnation(retry_lookup.config).?);
+    try std.testing.expectEqual(@as(usize, 2), writes.create_calls);
+    try std.testing.expectEqual(@as(usize, 2), writes.enqueue_calls);
+
+    // Metadata is already committed when local capacity rejects the barrier.
+    // The response preserves backpressure, while convergence is still handed
+    // off for any shards admitted before the failure.
+    writes.create_error = error.ResourceBudgetExceeded;
+    var backpressured_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/embed_idx",
+        .content_type = "application/json",
+        .body = create_index_body,
+    });
+    defer backpressured_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), backpressured_resp.status);
+    try std.testing.expectEqual(@as(usize, 3), writes.enqueue_calls);
+
+    // Queue pressure after the local capability barrier is not a false create
+    // failure: durable state and foreground write admission have both won.
+    writes.create_error = null;
+    writes.enqueue_error = error.ResourceBudgetExceeded;
+    var enqueue_deferred_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/embed_idx",
+        .content_type = "application/json",
+        .body = create_index_body,
+    });
+    defer enqueue_deferred_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), enqueue_deferred_resp.status);
+    try std.testing.expectEqual(@as(usize, 4), writes.enqueue_calls);
 }
 
 test "api http server create index expands schema-derived algebraic config" {

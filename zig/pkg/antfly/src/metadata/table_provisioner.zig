@@ -319,6 +319,84 @@ pub fn reconcileDbIndexesWithOptions(
     };
 }
 
+/// Reconcile one catalog index without applying sibling index, resolver, or
+/// table-schema changes carried by the same metadata snapshot.
+/// This is the storage boundary used by online index DDL after its foreground
+/// write-capability barrier has completed (or partially completed).
+pub fn reconcileDbIndexTarget(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    index_name: []const u8,
+) !ProvisionSummary {
+    if (!dbIndexReconciliationCanMutate(db)) return .{};
+    if (index_name.len == 0 or
+        std.mem.eql(u8, index_name, "resolvers") or
+        std.mem.eql(u8, index_name, "enrichments")) return error.InvalidTableIndexMetadata;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidTableIndexMetadata,
+    };
+
+    const current = try db.listIndexes(alloc);
+    defer db_mod.types.freeIndexConfigs(alloc, current);
+    var target_summary: IndexEnsureSummary = .{};
+    var found = false;
+
+    if (object.get("indexes")) |indexes_value| {
+        const items = switch (indexes_value) {
+            .array => |array| array.items,
+            else => return error.InvalidTableIndexMetadata,
+        };
+        for (items) |item| {
+            const name = try indexDefinitionName(item);
+            if (!std.mem.eql(u8, name, index_name)) continue;
+            if (found) return error.InvalidTableIndexMetadata;
+            found = true;
+            try ensureIndexDefinition(
+                alloc,
+                db,
+                current,
+                &target_summary,
+                name,
+                try parseIndexKind(item),
+                indexDefinitionConfigValue(item),
+                true,
+            );
+        }
+    } else {
+        if (object.get(index_name)) |config_value| {
+            found = true;
+            try ensureIndexDefinition(
+                alloc,
+                db,
+                current,
+                &target_summary,
+                index_name,
+                try parseIndexKind(config_value),
+                config_value,
+                false,
+            );
+        }
+    }
+
+    if (!found) {
+        if (try db.deleteIndex(index_name)) target_summary.removed += 1;
+    }
+    if (target_summary.added > 0 or target_summary.removed > 0) {
+        const pending = db.pendingWorkStats();
+        if (pending.enrichment.error_count == 0) try db.core.index_manager.syncAll(false);
+    }
+    return .{
+        .indexes_added = target_summary.added,
+        .indexes_removed = target_summary.removed,
+        .indexes_pending = target_summary.pending,
+    };
+}
+
 pub fn collectLocalSchemaProgress(
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
@@ -1680,6 +1758,43 @@ test "table provisioner materializes array-form metadata indexes" {
     try std.testing.expect(findIndexConfig(configs, "dense_idx").?.kind == .dense_vector);
     try std.testing.expect(findIndexConfig(configs, "sparse_idx").?.kind == .sparse_vector);
     try std.testing.expect(findIndexConfig(configs, "full_text_index_v0").?.kind == .full_text);
+}
+
+test "target index reconciliation never mutates sibling indexes" {
+    const path = "/tmp/antfly-metadata-table-provisioner-target-index";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(std.testing.allocator, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    _ = try reconcileDbIndexes(std.testing.allocator, &db,
+        \\{"keep_idx":{"type":"full_text"}}
+    );
+    const desired =
+        \\{"target_idx":{"type":"full_text"},"unrelated_new":{"type":"full_text"}}
+    ;
+    const admitted = try reconcileDbIndexTarget(std.testing.allocator, &db, desired, "target_idx");
+    try std.testing.expectEqual(@as(usize, 1), admitted.indexes_added);
+
+    var configs = try db.listIndexes(std.testing.allocator);
+    try std.testing.expect(findIndexConfig(configs, "keep_idx") != null);
+    try std.testing.expect(findIndexConfig(configs, "target_idx") != null);
+    try std.testing.expect(findIndexConfig(configs, "unrelated_new") == null);
+    db_mod.types.freeIndexConfigs(std.testing.allocator, configs);
+
+    const removed = try reconcileDbIndexTarget(std.testing.allocator, &db, desired, "keep_idx");
+    try std.testing.expectEqual(@as(usize, 1), removed.indexes_removed);
+    configs = try db.listIndexes(std.testing.allocator);
+    defer db_mod.types.freeIndexConfigs(std.testing.allocator, configs);
+    try std.testing.expect(findIndexConfig(configs, "keep_idx") == null);
+    try std.testing.expect(findIndexConfig(configs, "target_idx") != null);
+    try std.testing.expect(findIndexConfig(configs, "unrelated_new") == null);
 }
 
 test "table provisioner durably enqueues existing corpus full text backfill" {

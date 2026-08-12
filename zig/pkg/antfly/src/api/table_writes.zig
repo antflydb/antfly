@@ -6960,12 +6960,27 @@ pub const ProvisionedTableWriteSource = struct {
         self.endStructuralTableActivity(table_name);
     }
 
-    fn abortLocalStructuralIndexCacheUpdate(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    fn abortLocalStructuralIndexCacheUpdate(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) void {
         self.invalidateWriteCache(table_name);
         self.invalidateReadCache(table_name);
         self.invalidateRuntimeStatusCache(table_name);
         self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
         self.endStructuralTableActivity(table_name);
+        // Some groups may already have committed the target mutation. Hand
+        // that exact desired-state edge to the bounded reconciler before the
+        // synchronous caller observes the failure.
+        self.enqueueTableIndexStructuralReconcile(table_name, index_name) catch |err| {
+            std.log.err("failed to enqueue targeted structural recovery after index mutation failure table={s} index={s} err={s}", .{
+                table_name,
+                index_name,
+                @errorName(err),
+            });
+        };
     }
 
     fn abortLocalStructuralCacheUpdate(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -11529,11 +11544,9 @@ pub const ProvisionedTableWriteSource = struct {
         } else {
             std.log.info("structural reconcile begin table={s}", .{table_name});
         }
-        // The structural reservation has already drained foreground writes.
-        // Keep the current generation owner resident: reconciliation mutates
-        // only unpublished schema/index state and readers safely lease this DB
-        // until activation. Retiring it here creates a writerless handoff in
-        // which both repair and reads race to reopen the same physical root.
+        // Whole-table work has already drained foreground writes. Targeted
+        // index work instead owns only its per-group compatible operation and
+        // is constrained below to that one index's desired state.
     }
 
     fn reconcileTableStructureStep(
@@ -11781,6 +11794,7 @@ pub const ProvisionedTableWriteSource = struct {
         const lsm_root_generation = self.visibleRootGeneration(group_id);
         const identity_namespace = metadata.identity_namespace orelse
             try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+        const target_index_name = metadata.target_index_name;
 
         var configured_indexes_storage: ?StartupConfiguredIndexes = null;
         if (metadata.indexes_json) |value| configured_indexes_storage = try parseStartupConfiguredIndexes(alloc, value);
@@ -11789,9 +11803,11 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, .{
                 .indexes_json = metadata.indexes_json,
-                .schema_json = metadata.schema_json,
+                .schema_json = if (target_index_name == null) metadata.schema_json else null,
                 .identity_namespace = identity_namespace,
-            }, .{}) catch |err| {
+            }, .{
+                .reconcile_target_index_name = target_index_name,
+            }) catch |err| {
                 if (isTransientWriterOpenConflict(err)) return .busy;
                 return err;
             };
@@ -11804,7 +11820,9 @@ pub const ProvisionedTableWriteSource = struct {
                 cached_active = false;
             };
 
-            if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+            if (target_index_name == null) {
+                if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+            }
             if (metadata.indexes_json) |indexes_json| {
                 const managed_config_matches = matches: {
                     lockAtomic(&self.local_db_mutex);
@@ -11826,21 +11844,26 @@ pub const ProvisionedTableWriteSource = struct {
                     ProvisionedTableWriteCache.publishEntryManagedConfig(cached.entry.?, indexes_json);
                     self.local_db_mutex.unlock();
                 }
-                if (metadata.schema_json) |schema_json| {
-                    lockAtomic(&self.local_db_mutex);
-                    defer self.local_db_mutex.unlock();
-                    try cache.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
-                    try cache.replaceEntrySchemaLocked(cached.entry.?, schema_json);
-                    cached.schema_json = cached.entry.?.schema_json;
+                if (target_index_name == null) {
+                    if (metadata.schema_json) |schema_json| {
+                        lockAtomic(&self.local_db_mutex);
+                        defer self.local_db_mutex.unlock();
+                        try cache.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
+                        try cache.replaceEntrySchemaLocked(cached.entry.?, schema_json);
+                        cached.schema_json = cached.entry.?.schema_json;
+                    }
                 }
             }
             if (metadata.indexes_json) |indexes_json| {
                 // Reconciliation owns the desired-state diff. Pre-deleting
                 // configured names would turn an unchanged generation into a
                 // destructive rebuild and race its durable cleanup fence.
-                const reconcile_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
-                    .drain_resolver_backfill = false,
-                });
+                const reconcile_summary = if (target_index_name) |target|
+                    try metadata_table_provisioner.reconcileDbIndexTarget(alloc, cached.db, indexes_json, target)
+                else
+                    try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
+                        .drain_resolver_backfill = false,
+                    });
                 if (reconcile_summary.indexes_pending != 0) {
                     _ = try cached.db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
                     if (try cached.db.hasPendingIndexRepairIntents(alloc)) {
@@ -11874,8 +11897,8 @@ pub const ProvisionedTableWriteSource = struct {
             }
             if (configured_indexes_storage) |configured_indexes| {
                 for (configured_indexes.items) |item| {
-                    if (metadata.target_index_name) |target_index_name| {
-                        if (!std.mem.eql(u8, item.name, target_index_name)) continue;
+                    if (metadata.target_index_name) |target| {
+                        if (!std.mem.eql(u8, item.name, target)) continue;
                     }
                     const catch_up = catchUpManagedIndexCreate(
                         alloc,
@@ -11964,6 +11987,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .ha_async_effect_mirror = self.ha_async_mirror,
                     .ha_async_batch_mirror = self.ha_async_mirror,
                     .ha_async_metadata_mirror = self.ha_async_mirror,
+                    .reconcile_target_index_name = target_index_name,
                 },
             ) catch |err| {
                 if (isTransientWriterOpenConflict(err)) return .busy;
@@ -11986,13 +12010,18 @@ pub const ProvisionedTableWriteSource = struct {
             };
         defer db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
-        if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, &db, schema_json);
+        if (target_index_name == null) {
+            if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, &db, schema_json);
+        }
         if (metadata.indexes_json) |indexes_json| {
             // Preserve matching generations and let the provisioner retire
             // only definitions whose desired configuration actually changed.
-            const reconcile_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
-                .drain_resolver_backfill = false,
-            });
+            const reconcile_summary = if (target_index_name) |target|
+                try metadata_table_provisioner.reconcileDbIndexTarget(alloc, &db, indexes_json, target)
+            else
+                try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
+                    .drain_resolver_backfill = false,
+                });
             if (reconcile_summary.indexes_pending != 0) {
                 _ = try db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
                 if (try db.hasPendingIndexRepairIntents(alloc)) {
@@ -12016,8 +12045,8 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (configured_indexes_storage) |configured_indexes| {
             for (configured_indexes.items) |item| {
-                if (metadata.target_index_name) |target_index_name| {
-                    if (!std.mem.eql(u8, item.name, target_index_name)) continue;
+                if (metadata.target_index_name) |target| {
+                    if (!std.mem.eql(u8, item.name, target)) continue;
                 }
                 switch (try catchUpManagedIndexCreate(
                     alloc,
@@ -12740,7 +12769,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !void {
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralIndexCacheUpdate(table_name);
-        errdefer self.abortLocalStructuralIndexCacheUpdate(table_name);
+        errdefer self.abortLocalStructuralIndexCacheUpdate(table_name, index_name);
         const managed_visibility_changed = try reconcileLocalTableIndexCreate(self, alloc, table_name, index_name);
         self.finishLocalStructuralCacheUpdate(table_name);
         self.notifyLocalChange(table_name, .structural);
@@ -12775,7 +12804,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.localWriteOwnerSource()) |owner| return try owner.dropIndex(alloc, table_name, index_name);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralIndexCacheUpdate(table_name);
-        errdefer self.abortLocalStructuralIndexCacheUpdate(table_name);
+        errdefer self.abortLocalStructuralIndexCacheUpdate(table_name, index_name);
         runTestBeforeDropIndexWorkHook();
         if (self.write_cache) |cache| {
             _ = try reconcileCachedLocalTableIndexDrop(self, alloc, cache, table_name, index_name);
@@ -18960,6 +18989,10 @@ const ManagedDbOpenOptions = struct {
     staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration = null,
     identity_validation: StartupCatchUpMetadata.IdentityValidation = .exact,
     transaction_recovery: db_mod.transaction_runtime.Config = .{},
+    /// Restrict metadata reconciliation during a cold open to one index. The
+    /// full JSON remains available to construct managed producer runtimes, but
+    /// sibling index and resolver catalogs are left untouched.
+    reconcile_target_index_name: ?[]const u8 = null,
 };
 
 const ManagedDbEnrichmentSet = struct {
@@ -19394,9 +19427,12 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
         return db;
     }
 
-    const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
-        .drain_resolver_backfill = options.drain_resolver_backfill,
-    });
+    const summary = if (options.reconcile_target_index_name) |target_index_name|
+        try metadata_table_provisioner.reconcileDbIndexTarget(alloc, &db, indexes_json, target_index_name)
+    else
+        try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
+            .drain_resolver_backfill = options.drain_resolver_backfill,
+        });
     if (summary.indexManagerCatalogChanged() or options.reconcile_for_replicated_apply) {
         // First-open provisioning can mutate the live index manager. Reopen so
         // request work runs against the stabilized post-reconcile state.

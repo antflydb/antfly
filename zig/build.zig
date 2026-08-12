@@ -5586,6 +5586,7 @@ pub fn build(b: *std.Build) void {
             "db managed vector admission captures writes while durable repair is pending",
             "db managed admission rejects algebraic repair without poisoning ordinary admission",
             "table provisioner admits algebraic index on a non-empty table without repair debt",
+            "target index reconciliation never mutates sibling indexes",
             "managed db open modes never drain resolver backfill on raft apply",
             "replica root reconcile enqueues newly admitted managed full text repair",
             "managed repair visibility edges retire cached readers and runtime status",
