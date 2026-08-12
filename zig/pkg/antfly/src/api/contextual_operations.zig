@@ -14,13 +14,27 @@ pub const Method = enum {
     delete,
 };
 
+pub const Header = struct {
+    name: []u8,
+    value: []u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.value);
+        self.* = undefined;
+    }
+};
+
 pub const OwnedResponse = struct {
     status: u16 = 200,
     content_type: []const u8,
     body: []u8,
     public_cors: bool = false,
+    headers: []Header = &.{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.headers) |*header| header.deinit(alloc);
+        if (self.headers.len > 0) alloc.free(self.headers);
         alloc.free(self.body);
         self.* = undefined;
     }
@@ -38,6 +52,14 @@ pub fn bytes(content_type: []const u8, body: []u8) OwnedResponse {
     return .{
         .content_type = content_type,
         .body = body,
+    };
+}
+
+pub fn textAlloc(alloc: std.mem.Allocator, status: u16, body: []const u8) !OwnedResponse {
+    return .{
+        .status = status,
+        .content_type = "text/plain",
+        .body = try alloc.dupe(u8, body),
     };
 }
 

@@ -181,6 +181,12 @@ that end state:
   result. The old buffered `HttpRequest`/`HttpResponse` adapter has been
   deleted. The live streaming executor is retained only until the public
   listener streaming cutover is complete.
+- MCP GET, POST, DELETE, extension-scoped, and profile routes now use a direct
+  `httpx` registrar with typed method/body/session inputs. The owned contextual
+  result carries cloned MCP session/protocol headers, so ingress no longer
+  constructs a legacy request or response and the protocol dispatcher has
+  been deleted. MCP tool implementations that still synthesize REST calls are
+  the next, separate operation-extraction boundary.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

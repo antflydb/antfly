@@ -32,6 +32,7 @@ const internal_group_operations = @import("internal_group_operations.zig");
 const internal_query_operations = @import("internal_query_operations.zig");
 const contextual_operations = @import("contextual_operations.zig");
 const protocol_adapters = @import("protocol_adapters.zig");
+const mcp = @import("antfly_mcp");
 const internal_join_operations = @import("internal_join_operations.zig");
 const internal_repair_operations = @import("internal_repair_operations.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
@@ -262,10 +263,11 @@ pub const AntflyApiHandler = struct {
         const handler = httpx.Handler.bind(self, contextualRoute);
 
         const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*" };
+        const mcp_handler = httpx.Handler.bind(self, mcpRoute);
         inline for (mcp_paths) |path| {
-            try server.get(path, handler);
-            try server.post(path, handler);
-            try server.delete(path, handler);
+            try server.get(path, mcp_handler);
+            try server.post(path, mcp_handler);
+            try server.delete(path, mcp_handler);
         }
         if (self.api_server.cfg.experimental) {
             try server.post(routes.a2a, httpx.Handler.bind(self, a2aRoute));
@@ -685,6 +687,49 @@ pub const AntflyApiHandler = struct {
         defer response.deinit(self.api_server.alloc);
         _ = ctx.status(response.status);
         try ctx.setHeader("content-type", response.content_type);
+        _ = ctx.response.body(response.body);
+        return ctx.response.build();
+    }
+
+    fn mcpRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |response| return response;
+        const method: contextual_operations.Method = switch (ctx.request.method) {
+            .GET => .get,
+            .POST => .post,
+            .DELETE => .delete,
+            else => .put,
+        };
+        const path = ctx.request.uri.path;
+        var extension_name: ?[]const u8 = null;
+        var endpoint_path: []const u8 = routes.mcp_v1;
+        if (std.mem.startsWith(u8, path, routes.mcp_v1_extension_profiles_prefix)) {
+            const profile = path[routes.mcp_v1_extension_profiles_prefix.len..];
+            if (!std.mem.eql(u8, profile, "copilot"))
+                return jsonResponse(ctx, 404, "{\"error\":\"not found\"}");
+        } else if (routes.matchMcpExtension(path)) |extension| {
+            extension_name = extension.name;
+            endpoint_path = ctx.request.uri.raw;
+        }
+        const body = (try ctx.body()) orelse "";
+        const request = protocol_adapters.McpRequest{
+            .method = method,
+            .endpoint_path = endpoint_path,
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+            .session_id = ctx.header(mcp.session_id_header),
+            .last_event_id = ctx.header(mcp.last_event_id_header),
+            .body = body,
+        };
+        var response = if (extension_name) |name|
+            try protocol_adapters.executeExtensionMcpRequest(self.api_server, request, authenticated_identity, name)
+        else
+            try protocol_adapters.executeMcpRequest(self.api_server, request, authenticated_identity);
+        defer response.deinit(self.api_server.alloc);
+        _ = ctx.status(response.status);
+        try ctx.setHeader("content-type", response.content_type);
+        for (response.headers) |header| try ctx.setHeader(header.name, header.value);
         _ = ctx.response.body(response.body);
         return ctx.response.build();
     }
@@ -5855,23 +5900,37 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
     try std.testing.expectEqual(@as(usize, 2), writes.acknowledge_calls);
 }
 
-test "httpx contextual request conversion preserves protocol headers" {
+test "httpx MCP route preserves protocol session headers" {
     const alloc = std.testing.allocator;
-
-    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/mcp/v1/extensions/memoryaf");
-    defer request.deinit();
-    try request.setHeader("Content-Type", "application/json");
-    try request.setHeader("Mcp-Session-Id", "session-123");
-
-    var ctx = httpx.Context.init(alloc, undefined, &request);
-    defer ctx.deinit();
-
-    var converted = try AntflyApiHandler.operationRequestFromContext(&ctx, "{}");
-    defer converted.deinit();
-
-    try std.testing.expectEqualStrings("session-123", converted.value.header("mcp-session-id") orelse return error.MissingHeader);
-    try std.testing.expectEqualStrings("application/json", converted.value.content_type orelse return error.MissingContentType);
-    try std.testing.expectEqualStrings("{}", converted.value.body);
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer api_server.deinit();
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const url = try std.fmt.allocPrint(alloc, "{s}/mcp/v1", .{base_url});
+    defer alloc.free(url);
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    var response = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        url,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        &headers,
+        20,
+    );
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expect(response.header(mcp.session_id_header) != null);
+    try std.testing.expectEqualStrings("2025-06-18", response.header("Mcp-Protocol-Version").?);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"protocolVersion\":\"2025-06-18\"") != null);
 }
 
 test "httpx shared registrar keeps root probes and rejects removed data aliases" {

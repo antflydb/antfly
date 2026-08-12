@@ -314,15 +314,25 @@ const ExtensionRuntimeBinding = struct {
     }
 };
 
-pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authenticated_identity: anytype) !http_common.HttpResponse {
-    return try handleMcpRequestFiltered(server_ptr, req, authenticated_identity, routes.Routes.mcp_v1, null);
+pub const McpRequest = struct {
+    method: contextual_operations.Method,
+    endpoint_path: []const u8,
+    authorization: ?[]const u8 = null,
+    trusted_principal: ?[]const u8 = null,
+    session_id: ?[]const u8 = null,
+    last_event_id: ?[]const u8 = null,
+    body: []const u8 = "",
+};
+
+pub fn executeMcpRequest(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype) !contextual_operations.OwnedResponse {
+    return try executeMcpRequestFiltered(server_ptr, request, authenticated_identity, null);
 }
 
-pub fn handleExtensionMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authenticated_identity: anytype, extension_name: []const u8) !http_common.HttpResponse {
-    return try handleMcpRequestFiltered(server_ptr, req, authenticated_identity, req.uri, extension_name);
+pub fn executeExtensionMcpRequest(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype, extension_name: []const u8) !contextual_operations.OwnedResponse {
+    return try executeMcpRequestFiltered(server_ptr, request, authenticated_identity, extension_name);
 }
 
-fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, authenticated_identity: anytype, endpoint_path: []const u8, extension_name_filter: ?[]const u8) !http_common.HttpResponse {
+fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype, extension_name_filter: ?[]const u8) !contextual_operations.OwnedResponse {
     const Server = @TypeOf(server_ptr);
     const ToolContext = struct {
         server: Server,
@@ -573,8 +583,8 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
     for (&contexts, mcp_tool_specs) |*ctx, spec| {
         ctx.* = .{
             .server = server_ptr,
-            .authorization = req.authorization,
-            .trusted_principal = req.header(trusted_principal_header),
+            .authorization = request.authorization,
+            .trusted_principal = request.trusted_principal,
             .permissions = if (authenticated_identity) |identity| identity.permissions else null,
             .spec = spec,
         };
@@ -591,7 +601,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
     if (snapshot_opt) |*snapshot| {
         if (extension_name_filter) |extension_name| {
             if (!extensionRuntimeMemberVisible(snapshot.installed_extensions, extension_name)) {
-                return try textResponse(server_ptr.alloc, 404, "extension not found");
+                return try contextual_operations.textAlloc(server_ptr.alloc, 404, "extension not found");
             }
         }
         for (snapshot.extension_members) |*member| {
@@ -603,16 +613,16 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             try extension_tools.append(server_ptr.alloc, try extensionMcpToolFromMemberAlloc(server_ptr.alloc, member, snapshot));
         }
     } else if (extension_name_filter != null) {
-        return try textResponse(server_ptr.alloc, 404, "extension not found");
+        return try contextual_operations.textAlloc(server_ptr.alloc, 404, "extension not found");
     }
     const extension_contexts = try server_ptr.alloc.alloc(ExtensionToolContext, extension_tools.items.len);
     defer if (extension_contexts.len > 0) server_ptr.alloc.free(extension_contexts);
     for (extension_contexts, 0..) |*ctx, i| {
-        const installed = findInstalledExtensionForRuntimeTool(snapshot_opt.?.installed_extensions, extension_tools.items[i].member.extension_name) orelse return try textResponse(server_ptr.alloc, 404, "extension not found");
+        const installed = findInstalledExtensionForRuntimeTool(snapshot_opt.?.installed_extensions, extension_tools.items[i].member.extension_name) orelse return try contextual_operations.textAlloc(server_ptr.alloc, 404, "extension not found");
         ctx.* = .{
             .server = server_ptr,
-            .authorization = req.authorization,
-            .trusted_principal = req.header(trusted_principal_header),
+            .authorization = request.authorization,
+            .trusted_principal = request.trusted_principal,
             .permissions = if (authenticated_identity) |identity| identity.permissions else null,
             .installed = installed,
             .tool = &extension_tools.items[i],
@@ -655,30 +665,30 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         });
     }
 
-    var transport = switch (req.method) {
-        .GET => protocol_server.handleStreamableHttpGetWithSession(
+    var transport = switch (request.method) {
+        .get => protocol_server.handleStreamableHttpGetWithSession(
             server_ptr.alloc,
-            endpoint_path,
-            req.header(mcp.session_id_header),
-            req.header(mcp.last_event_id_header),
+            request.endpoint_path,
+            request.session_id,
+            request.last_event_id,
         ) catch |err| switch (err) {
-            error.InvalidLastEventId => return try textResponse(server_ptr.alloc, 400, "invalid Last-Event-ID"),
-            error.McpEventIdExhausted => return try textResponse(server_ptr.alloc, 409, "MCP event sequence exhausted"),
+            error.InvalidLastEventId => return try contextual_operations.textAlloc(server_ptr.alloc, 400, "invalid Last-Event-ID"),
+            error.McpEventIdExhausted => return try contextual_operations.textAlloc(server_ptr.alloc, 409, "MCP event sequence exhausted"),
             else => return err,
         },
-        .POST => protocol_server.handleStreamableHttpPostWithSession(
+        .post => protocol_server.handleStreamableHttpPostWithSession(
             server_ptr.alloc,
-            req.body,
-            req.header(mcp.session_id_header),
+            request.body,
+            request.session_id,
         ) catch |err| switch (err) {
-            error.McpSessionCapacityExceeded => return try textResponse(server_ptr.alloc, 429, "MCP session capacity exceeded"),
+            error.McpSessionCapacityExceeded => return try contextual_operations.textAlloc(server_ptr.alloc, 429, "MCP session capacity exceeded"),
             else => return err,
         },
-        .DELETE => try protocol_server.handleStreamableHttpDelete(server_ptr.alloc, req.header(mcp.session_id_header)),
-        else => return try textResponse(server_ptr.alloc, 405, "method not allowed"),
+        .delete => try protocol_server.handleStreamableHttpDelete(server_ptr.alloc, request.session_id),
+        else => return try contextual_operations.textAlloc(server_ptr.alloc, 405, "method not allowed"),
     };
     defer transport.deinit(server_ptr.alloc);
-    return try mcpBodyResponseWithStatus(server_ptr.alloc, transport);
+    return try contextualResponseFromMcpResult(server_ptr.alloc, transport);
 }
 
 fn mcpToolVisibleForIdentity(spec: McpToolSpec, authenticated_identity: anytype) bool {
@@ -1610,8 +1620,8 @@ fn bodyResponseWithStatus(alloc: std.mem.Allocator, status: u16, content_type: [
     };
 }
 
-fn mcpBodyResponseWithStatus(alloc: std.mem.Allocator, result: mcp.HttpResult) !http_common.HttpResponse {
-    var headers = try alloc.alloc(http_common.Header, result.headers.len);
+fn contextualResponseFromMcpResult(alloc: std.mem.Allocator, result: mcp.HttpResult) !contextual_operations.OwnedResponse {
+    var headers = try alloc.alloc(contextual_operations.Header, result.headers.len);
     var initialized: usize = 0;
     errdefer {
         for (headers[0..initialized]) |*header| header.deinit(alloc);
@@ -1629,12 +1639,10 @@ fn mcpBodyResponseWithStatus(alloc: std.mem.Allocator, result: mcp.HttpResult) !
         };
         initialized += 1;
     }
-    const content_type = try alloc.dupe(u8, result.content_type);
-    errdefer alloc.free(content_type);
     const body = try alloc.dupe(u8, result.body);
     return .{
         .status = result.status,
-        .content_type = content_type,
+        .content_type = result.content_type,
         .headers = headers,
         .body = body,
     };

@@ -3794,7 +3794,6 @@ pub const ApiHttpServer = struct {
                 .body = body,
             };
         }
-        if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         const extension_resp = self.dispatchExtensionRoutes(req, uri_parts) catch |err| {
             if (metadata_authority.isRetryableError(err)) {
                 if (publicExtensionRouteMutatesMetadata(req.method, uri_parts.path)) {
@@ -3851,23 +3850,6 @@ pub const ApiHttpServer = struct {
             }
             const ha_exec = self.cfg.ha_internal_executor orelse return null;
             return try ha_exec.execute(self.alloc, req);
-        }
-        return null;
-    }
-
-    fn dispatchProtocolRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        if (req.method == .GET or req.method == .POST or req.method == .DELETE) {
-            if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.mcp_v1_extension_profiles_prefix)) {
-                const profile = uri_parts.path[routes.Routes.mcp_v1_extension_profiles_prefix.len..];
-                if (!std.mem.eql(u8, profile, "copilot")) return try jsonErrorResponse(self.alloc, 404, "not found");
-                return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
-            }
-            if (routes.Routes.matchMcpExtension(uri_parts.path)) |mcp_extension| {
-                return try protocol_adapters.handleExtensionMcpRequest(self, req, authenticated_identity, mcp_extension.name);
-            }
-        }
-        if ((req.method == .GET or req.method == .POST or req.method == .DELETE) and (std.mem.eql(u8, uri_parts.path, routes.Routes.mcp_v1) or std.mem.startsWith(u8, uri_parts.path, routes.Routes.mcp_v1_prefix))) {
-            return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
         }
         return null;
     }
