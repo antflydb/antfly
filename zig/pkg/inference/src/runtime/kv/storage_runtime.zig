@@ -181,7 +181,25 @@ pub const KvLayerGather = struct {
     head_dim: u32,
 };
 
-pub const DeviceKvLayerGather = KvLayerGather;
+pub const DeviceKvLayerGather = struct {
+    sequence_id: SequenceId,
+    layer_index: usize,
+    token_count: usize,
+    num_kv_heads: u32,
+    head_dim: u32,
+    /// A fused backend operation may need the paged slot descriptor before it
+    /// encodes the suffix that makes the full logical span readable. This is
+    /// valid only while the backend owns an ordered active frame. Ordinary
+    /// gathers leave this at zero and therefore require full written coverage.
+    pending_suffix_token_count: usize = 0,
+};
+
+pub const DeviceKvLayerWriteCommit = struct {
+    sequence_id: SequenceId,
+    layer_index: usize,
+    total_token_count: usize,
+    position_offset: usize,
+};
 
 pub const DeviceKvLayerReserve = struct {
     sequence_id: SequenceId,
@@ -271,6 +289,13 @@ pub const DeviceWriteHook = struct {
             ctx: *anyopaque,
             reserve: DeviceKvLayerReserve,
         ) anyerror!void = null,
+        /// Commit metadata for a suffix write encoded by a fused backend
+        /// operation. The fused operation owns the device write; this callback
+        /// advances readable coverage only after encoding succeeded.
+        commitLayerKvDeviceWrite: ?*const fn (
+            ctx: *anyopaque,
+            commit: DeviceKvLayerWriteCommit,
+        ) anyerror!void = null,
         /// Optional notification that a sequence has been released — the hook
         /// can reclaim any per-sequence resources (device slot reservations,
         /// cache entries, etc.). Called from `releaseSequence` before the
@@ -311,6 +336,11 @@ pub const DeviceWriteHook = struct {
     pub fn reserveLayerKvDevice(self: DeviceWriteHook, reserve: DeviceKvLayerReserve) !void {
         const reserve_fn = self.vtable.reserveLayerKvDevice orelse return error.DeviceWriteUnsupported;
         return reserve_fn(self.ctx, reserve);
+    }
+
+    pub fn commitLayerKvDeviceWrite(self: DeviceWriteHook, commit: DeviceKvLayerWriteCommit) !void {
+        const commit_fn = self.vtable.commitLayerKvDeviceWrite orelse return error.DeviceWriteUnsupported;
+        return commit_fn(self.ctx, commit);
     }
 
     pub fn releaseSequence(self: DeviceWriteHook, sequence_id: SequenceId) void {
@@ -423,6 +453,24 @@ pub const KvStorageRuntime = struct {
             .allow_swa_ring = allow_swa_ring and sequence_state.block_table.shared_prefix_blocks == 0,
             .logical_blocks = try self.logicalBlocksWithReservations(sequence_id),
             .page_size_tokens = self.storage.config.page_size_tokens,
+        });
+    }
+
+    /// Advance backend-readable coverage after a fused device operation has
+    /// successfully encoded its KV suffix into the reserved slot.
+    pub fn commitLayerKvDeviceWrite(
+        self: *KvStorageRuntime,
+        sequence_id: SequenceId,
+        layer_index: usize,
+        total_token_count: usize,
+        position_offset: usize,
+    ) !void {
+        const hook = self.device_write_hook orelse return error.DeviceWriteUnsupported;
+        try hook.commitLayerKvDeviceWrite(.{
+            .sequence_id = sequence_id,
+            .layer_index = layer_index,
+            .total_token_count = total_token_count,
+            .position_offset = position_offset,
         });
     }
 

@@ -27,6 +27,7 @@ const platform = @import("antfly_platform");
 const ortgenai = if (build_options.enable_onnx) @import("../backends/ortgenai.zig") else struct {};
 const tokenizer_mod = @import("inference_tokenizer");
 const gpt_arch = @import("../architectures/gpt.zig");
+const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
 const contracts = @import("../graph/backend_contracts.zig");
@@ -237,18 +238,26 @@ pub fn kvSlidingTrimForced() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
 }
 
+pub fn metalSplitSwaRingRequestEligible(
+    model_config: gpt_mod.Config,
+    generation_config: GenerationConfig,
+) bool {
+    return model_config.supportsSplitSwaGlobalKvRing() and
+        !gemma4_runtime.wholeFramePrefillExplicitlyDisabled() and
+        !generation_config.prompt_cache_enabled and
+        generation_config.cache_compaction_ratio == null and
+        !kvSlidingTrimForced() and
+        backends.metal_kv_storage.MetalKvStorage.splitSwaKvRingEnabled();
+}
+
 pub fn metalSplitSwaRingEligible(
     model_config: gpt_mod.Config,
     generation_config: GenerationConfig,
     kv_dtype: runtime.kv.pool.KvDType,
 ) bool {
     if (comptime !build_options.enable_metal) return false;
-    return model_config.supportsSplitSwaGlobalKvRing() and
-        !generation_config.prompt_cache_enabled and
-        generation_config.cache_compaction_ratio == null and
-        !kvSlidingTrimForced() and
-        backends.metal_kv_storage.KeyFormat.fromKvDType(kv_dtype) != null and
-        backends.metal_kv_storage.MetalKvStorage.splitSwaKvRingEnabled();
+    return metalSplitSwaRingRequestEligible(model_config, generation_config) and
+        backends.metal_kv_storage.KeyFormat.fromKvDType(kv_dtype) != null;
 }
 
 pub fn kvPoolConfig(
@@ -2923,9 +2932,7 @@ pub const NativeGenerationPipeline = struct {
             self.graph_cache != null and
             decode_state.isPaged() and
             self.cb.kind() == .metal and
-            self.gpt_config.supportsSplitSwaGlobalKvRing() and
-            !config.prompt_cache_enabled and
-            config.cache_compaction_ratio == null)
+            metalSplitSwaRingRequestEligible(self.gpt_config, config))
             wholeModelPrefillChunkSize(
                 config.prefill_chunk_size,
                 if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
@@ -3832,9 +3839,7 @@ pub const NativeGenerationPipeline = struct {
             if (prefilled_tokens != 0) return error.UnsupportedShape;
             const bounded_swa_prefill = self.cb.kind() == .metal and
                 decode_state.isPaged() and
-                self.gpt_config.supportsSplitSwaGlobalKvRing() and
-                !config.prompt_cache_enabled and
-                config.cache_compaction_ratio == null;
+                metalSplitSwaRingRequestEligible(self.gpt_config, config);
             const prefill_chunk_size = if (bounded_swa_prefill)
                 wholeModelPrefillChunkSize(
                     config.prefill_chunk_size,

@@ -108,6 +108,18 @@ const SlotBinding = struct {
     fn covers(self: SlotBinding, token_count: usize) bool {
         return self.written_tokens >= token_count;
     }
+
+    fn coversBeforePendingSuffix(self: SlotBinding, token_count: usize, pending_suffix_token_count: usize) bool {
+        if (pending_suffix_token_count > token_count) return false;
+        return self.covers(token_count - pending_suffix_token_count);
+    }
+
+    fn commitWrite(self: *SlotBinding, total_token_count: usize, position_offset: usize) bool {
+        if (total_token_count < self.written_tokens or position_offset < self.position_offset) return false;
+        self.written_tokens = total_token_count;
+        self.position_offset = position_offset;
+        return true;
+    }
 };
 
 pub const MetalKvStorage = struct {
@@ -630,6 +642,18 @@ pub const MetalKvStorage = struct {
         );
     }
 
+    fn commitLayerKvDeviceWrite(
+        ctx: *anyopaque,
+        commit: storage_runtime.DeviceKvLayerWriteCommit,
+    ) anyerror!void {
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        const binding = self.slot_map.getPtr(.{
+            .sequence_id = commit.sequence_id,
+            .layer_index = @intCast(commit.layer_index),
+        }) orelse return error.DeviceWriteFallback;
+        if (!binding.commitWrite(commit.total_token_count, commit.position_offset)) return error.DeviceWriteFallback;
+    }
+
     fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
         for (&self.leased_slots, 0..) |*leased, slot| {
@@ -814,22 +838,36 @@ pub const MetalKvStorage = struct {
             .layer_index = @intCast(gather.layer_index),
         };
         const active_frame = metal_runtime.hasActiveFrame(self.runtime);
-        const binding = self.slot_map.get(key) orelse return error.DeviceReadFallback;
+        const binding = self.slot_map.get(key) orelse {
+            if (traceKvGather()) std.debug.print("kv-paged-read-fallback: seq={d} layer={d} reason=no-binding\n", .{ gather.sequence_id, gather.layer_index });
+            return error.DeviceReadFallback;
+        };
         const slot = binding.slot;
         const ring_page_count = binding.ring_page_count;
         const info_opt = self.slotInfo(slot) catch |err| blk: {
             if (!active_frame) return err;
             break :blk null;
         };
-        // An active frame may not expose queued slot metadata through
-        // slotInfo yet, but the sequence-local binding must still cover the
-        // requested logical span. Its count advances only after the device
-        // write was encoded successfully on this frame's ordered command
-        // buffer.
-        if (!binding.covers(gather.token_count)) return error.DeviceReadFallback;
+        // An active frame may request a reserved slot immediately before a
+        // fused operation encodes its suffix. Only that explicitly declared
+        // suffix may be pending; all preceding tokens must already be covered.
+        if (gather.pending_suffix_token_count != 0 and !active_frame) {
+            if (traceKvGather()) std.debug.print("kv-paged-read-fallback: seq={d} layer={d} reason=pending-without-frame pending={d}\n", .{ gather.sequence_id, gather.layer_index, gather.pending_suffix_token_count });
+            return error.DeviceReadFallback;
+        }
+        if (!binding.coversBeforePendingSuffix(gather.token_count, gather.pending_suffix_token_count)) {
+            if (traceKvGather()) std.debug.print("kv-paged-read-fallback: seq={d} layer={d} reason=coverage written={d} requested={d} pending={d}\n", .{ gather.sequence_id, gather.layer_index, binding.written_tokens, gather.token_count, gather.pending_suffix_token_count });
+            return error.DeviceReadFallback;
+        }
         if (info_opt) |info| {
-            if (info.key_row_bytes != 0 and info.key_row_bytes != key_row_bytes) return error.DeviceReadFallback;
-            if (info.v_row_stride != 0 and info.v_row_stride != token_width) return error.DeviceReadFallback;
+            if (info.key_row_bytes != 0 and info.key_row_bytes != key_row_bytes) {
+                if (traceKvGather()) std.debug.print("kv-paged-read-fallback: seq={d} layer={d} reason=key-row-bytes actual={d} expected={d}\n", .{ gather.sequence_id, gather.layer_index, info.key_row_bytes, key_row_bytes });
+                return error.DeviceReadFallback;
+            }
+            if (info.v_row_stride != 0 and info.v_row_stride != token_width) {
+                if (traceKvGather()) std.debug.print("kv-paged-read-fallback: seq={d} layer={d} reason=value-row-stride actual={d} expected={d}\n", .{ gather.sequence_id, gather.layer_index, info.v_row_stride, token_width });
+                return error.DeviceReadFallback;
+            }
         }
         return .{
             .runtime = @ptrCast(self.runtime),
@@ -901,12 +939,20 @@ test "Metal KV rollout flags recognize common false values" {
 }
 
 test "Metal KV binding only covers successfully encoded tokens" {
-    const binding = SlotBinding{
+    var binding = SlotBinding{
         .slot = 0,
         .written_tokens = 32,
     };
     try std.testing.expect(binding.covers(32));
     try std.testing.expect(!binding.covers(33));
+    try std.testing.expect(binding.coversBeforePendingSuffix(40, 8));
+    try std.testing.expect(!binding.coversBeforePendingSuffix(40, 7));
+    try std.testing.expect(!binding.coversBeforePendingSuffix(32, 33));
+    try std.testing.expect(binding.commitWrite(40, 4));
+    try std.testing.expectEqual(@as(usize, 40), binding.written_tokens);
+    try std.testing.expectEqual(@as(usize, 4), binding.position_offset);
+    try std.testing.expect(!binding.commitWrite(39, 4));
+    try std.testing.expect(!binding.commitWrite(40, 3));
 }
 
 const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{
@@ -915,6 +961,7 @@ const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{
     .gatherLayerKvDevice = MetalKvStorage.gatherLayerKvDevice,
     .pagedLayerKvDevice = MetalKvStorage.pagedLayerKvDevice,
     .reserveLayerKvDevice = MetalKvStorage.reserveLayerKvDevice,
+    .commitLayerKvDeviceWrite = MetalKvStorage.commitLayerKvDeviceWrite,
     .releaseSequence = MetalKvStorage.releaseSequenceOp,
     .deinit = MetalKvStorage.hookDeinit,
 };
