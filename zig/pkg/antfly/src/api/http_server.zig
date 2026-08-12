@@ -90,6 +90,7 @@ const admin_routes = @import("../admin/routes.zig");
 const internal_api_routes = @import("../internal/routes.zig");
 const internal_query_operations = @import("internal_query_operations.zig");
 const internal_group_operations = @import("internal_group_operations.zig");
+const contextual_operations = @import("contextual_operations.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const transactions_api = @import("transactions.zig");
 const docstore_mod = if (builtin.is_test) @import("../storage/docstore.zig") else struct {};
@@ -3793,7 +3794,6 @@ pub const ApiHttpServer = struct {
                 .body = body,
             };
         }
-        if (try self.dispatchArdRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchExtensionAgentRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         const extension_resp = self.dispatchExtensionRoutes(req, uri_parts) catch |err| {
@@ -3888,26 +3888,29 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
-    fn dispatchArdRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_openapi)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            return try self.bodyResponse(200, "application/yaml", build_options.ard_openapi_ard_yaml, false);
+    pub fn executeArd(
+        self: *ApiHttpServer,
+        path: []const u8,
+        query: []const u8,
+        request_body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        if (std.mem.eql(u8, path, routes.Routes.ard_v1_openapi)) {
+            return contextual_operations.bytes("application/yaml", try self.alloc.dupe(u8, build_options.ard_openapi_ard_yaml));
         }
-        if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_openapi_prefix)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            const name = uri_parts.path[routes.Routes.ard_v1_openapi_prefix.len..];
-            const spec = ardOpenApiSpec(name) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+        if (std.mem.startsWith(u8, path, routes.Routes.ard_v1_openapi_prefix)) {
+            const name = path[routes.Routes.ard_v1_openapi_prefix.len..];
+            const spec = ardOpenApiSpec(name) orelse return error.NotFound;
             if (spec.admin_only and self.cfg.auth_enabled and !authenticatedIdentityIsAdmin(authenticated_identity)) {
-                if (authenticated_identity == null) return try unauthorizedResponse(self.alloc);
-                return try textResponse(self.alloc, 403, "forbidden");
+                if (authenticated_identity == null) return error.Unauthorized;
+                return error.Forbidden;
             }
-            return try self.bodyResponse(200, "application/yaml", spec.body, false);
+            return contextual_operations.bytes("application/yaml", try self.alloc.dupe(u8, spec.body));
         }
         var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer query_arena_impl.deinit();
         const query_alloc = query_arena_impl.allocator();
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        if (std.mem.eql(u8, path, routes.Routes.ai_catalog)) {
             const mode: ard_catalog.CatalogMode = if (authenticated_identity != null) .tenant else .public_bootstrap;
             var snapshot_opt: ?metadata_api.AdminSnapshot = null;
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
@@ -3917,88 +3920,73 @@ pub const ApiHttpServer = struct {
             } else null;
             const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
                 self.alloc,
-                try self.ardCatalogOptions(query_alloc, mode, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, mode, query, authenticated_identity),
                 extension_context,
             );
-            return try self.ardCatalogResponse(200, body, mode == .public_bootstrap);
+            return contextual_operations.json(body, mode == .public_bootstrap);
         }
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_catalog)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        if (std.mem.eql(u8, path, routes.Routes.ard_v1_catalog)) {
             var snapshot_opt = try self.source.adminSnapshot();
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
                 self.alloc,
-                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity),
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
             );
-            return try self.ardCatalogResponse(200, body, false);
+            return contextual_operations.json(body, false);
         }
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_search)) {
-            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        if (std.mem.eql(u8, path, routes.Routes.ard_v1_search)) {
             var snapshot_opt = try self.source.adminSnapshot();
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
-            const body = ard_catalog.searchJsonWithExtensionsAlloc(
+            const response_body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
-                req.body,
+                try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity),
+                request_body,
                 false,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
-            ) catch |err| switch (err) {
-                error.InvalidArdSearchRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD search request"),
-                else => return err,
-            };
-            return try self.ardCatalogResponse(200, body, false);
+            ) catch |err| return err;
+            return contextual_operations.json(response_body, false);
         }
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_explore)) {
-            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        if (std.mem.eql(u8, path, routes.Routes.ard_v1_explore)) {
             var snapshot_opt = try self.source.adminSnapshot();
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
-            const body = ard_catalog.searchJsonWithExtensionsAlloc(
+            const response_body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
-                req.body,
+                try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity),
+                request_body,
                 true,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
-            ) catch |err| switch (err) {
-                error.InvalidArdSearchRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD explore request"),
-                else => return err,
-            };
-            return try self.ardCatalogResponse(200, body, false);
+            ) catch |err| return err;
+            return contextual_operations.json(response_body, false);
         }
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_agents)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        if (std.mem.eql(u8, path, routes.Routes.ard_v1_agents)) {
             var snapshot_opt = try self.source.adminSnapshot();
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
-            const body = ard_catalog.agentsJsonWithExtensionsQueryAlloc(
+            const response_body = ard_catalog.agentsJsonWithExtensionsQueryAlloc(
                 self.alloc,
-                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
-                uri_parts.query,
+                try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity),
+                query,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
-            ) catch |err| switch (err) {
-                error.InvalidArdAgentsRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD agents request"),
-                else => return err,
-            };
-            return try self.ardCatalogResponse(200, body, false);
+            ) catch |err| return err;
+            return contextual_operations.json(response_body, false);
         }
-        if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_skills_prefix)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            const slug = uri_parts.path[routes.Routes.ard_v1_skills_prefix.len..];
-            const options = try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity);
-            const body = (try ard_catalog.skillMarkdownAlloc(self.alloc, options, slug)) orelse blk: {
+        if (std.mem.startsWith(u8, path, routes.Routes.ard_v1_skills_prefix)) {
+            const slug = path[routes.Routes.ard_v1_skills_prefix.len..];
+            const options = try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity);
+            const response_body = (try ard_catalog.skillMarkdownAlloc(self.alloc, options, slug)) orelse blk: {
                 var snapshot_opt = try self.source.adminSnapshot();
                 defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
                 break :blk (try ard_catalog.extensionSkillMarkdownAlloc(
                     self.alloc,
                     options,
                     slug,
-                    self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity) orelse return try jsonErrorResponse(self.alloc, 404, "not found"),
-                )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+                    self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity) orelse return error.NotFound,
+                )) orelse return error.NotFound;
             };
-            return try self.bodyResponseOwned(200, "text/markdown; charset=utf-8", body, false);
+            return contextual_operations.bytes("text/markdown; charset=utf-8", response_body);
         }
-        if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_resources_prefix)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            const rest = uri_parts.path[routes.Routes.ard_v1_resources_prefix.len..];
+        if (std.mem.startsWith(u8, path, routes.Routes.ard_v1_resources_prefix)) {
+            const rest = path[routes.Routes.ard_v1_resources_prefix.len..];
             if (std.mem.startsWith(u8, rest, "mcp/")) {
                 const name = rest["mcp/".len..];
                 var snapshot_opt = if (std.mem.eql(u8, name, "default") or std.mem.startsWith(u8, name, "extensions/") or std.mem.startsWith(u8, name, "profiles/")) try self.source.adminSnapshot() else null;
@@ -4006,10 +3994,10 @@ pub const ApiHttpServer = struct {
                 const body = (try ard_catalog.mcpDescriptorJsonAlloc(
                     self.alloc,
                     name,
-                    try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
+                    try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity),
                     if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
-                )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
-                return try self.ardCatalogResponse(200, body, false);
+                )) orelse return error.NotFound;
+                return contextual_operations.json(body, false);
             }
             if (std.mem.startsWith(u8, rest, "agents/")) {
                 const name = rest["agents/".len..];
@@ -4018,18 +4006,17 @@ pub const ApiHttpServer = struct {
                 const body = (try ard_catalog.agentDescriptorJsonAlloc(
                     self.alloc,
                     name,
-                    try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
+                    try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity),
                     if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
-                )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
-                return try self.ardCatalogResponse(200, body, false);
+                )) orelse return error.NotFound;
+                return contextual_operations.json(body, false);
             }
-            return try jsonErrorResponse(self.alloc, 404, "not found");
+            return error.NotFound;
         }
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            return try self.ardCatalogResponse(200, try self.ardRegistryRootJsonAlloc(), false);
+        if (std.mem.eql(u8, path, routes.Routes.ard_v1)) {
+            return contextual_operations.json(try self.ardRegistryRootJsonAlloc(), false);
         }
-        return null;
+        return error.NotFound;
     }
 
     fn dispatchExtensionAgentRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
@@ -4152,33 +4139,6 @@ pub const ApiHttpServer = struct {
         if (std.mem.eql(u8, name, "extensions.yaml")) return .{ .body = build_options.ard_openapi_extensions_yaml, .admin_only = true };
         if (std.mem.eql(u8, name, "auth.yaml")) return .{ .body = build_options.ard_openapi_auth_yaml, .admin_only = true };
         return null;
-    }
-
-    fn ardCatalogResponse(self: *ApiHttpServer, status: u16, body: []u8, public_cors: bool) !http_common.HttpResponse {
-        errdefer self.alloc.free(body);
-        var headers: []http_common.Header = &.{};
-        errdefer {
-            for (headers) |*header| header.deinit(self.alloc);
-            if (headers.len > 0) self.alloc.free(headers);
-        }
-        if (public_cors) {
-            headers = try self.alloc.dupe(http_common.Header, &[_]http_common.Header{
-                .{
-                    .name = try self.alloc.dupe(u8, "Access-Control-Allow-Origin"),
-                    .value = try self.alloc.dupe(u8, "*"),
-                },
-            });
-        }
-        return .{
-            .status = status,
-            .content_type = try self.alloc.dupe(u8, "application/json"),
-            .headers = headers,
-            .body = body,
-        };
-    }
-
-    fn bodyResponse(self: *ApiHttpServer, status: u16, content_type: []const u8, body: []const u8, public_cors: bool) !http_common.HttpResponse {
-        return try self.bodyResponseOwned(status, content_type, try self.alloc.dupe(u8, body), public_cors);
     }
 
     fn bodyResponseOwned(self: *ApiHttpServer, status: u16, content_type: []const u8, body: []u8, public_cors: bool) !http_common.HttpResponse {

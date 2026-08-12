@@ -161,6 +161,12 @@ that end state:
   retry-after, JSON, and event-stream adaptation remain at ingress. The last
   `http_internal_routes` request/response dispatcher and its executor function
   table have been deleted.
+- ARD discovery, catalog, search, explore, skill, resource, and OpenAPI routes
+  now share an explicit `httpx` adapter over a transport-neutral owned response
+  contract. The service accepts path/query/body values rather than a synthetic
+  HTTP request; authentication, status/error mapping, content type, and public
+  CORS headers remain at ingress. ARD no longer enters
+  `ApiHttpServer.handle()` or allocates a legacy `HttpResponse`.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

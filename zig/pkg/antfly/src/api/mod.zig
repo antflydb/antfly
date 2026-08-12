@@ -55,6 +55,7 @@ pub const distributed_graph = @import("distributed_graph.zig");
 pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 pub const repair_jobs = @import("repair_jobs.zig");
 pub const internal_group_operations = @import("internal_group_operations.zig");
+pub const contextual_operations = @import("contextual_operations.zig");
 pub const internal_join_operations = @import("internal_join_operations.zig");
 pub const internal_repair_operations = @import("internal_repair_operations.zig");
 pub const restore_jobs = @import("restore_jobs.zig");
@@ -230,6 +231,7 @@ test "api module compiles" {
     _ = query_builder_agent;
     _ = distributed_txn;
     _ = internal_group_operations;
+    _ = contextual_operations;
     _ = internal_join_operations;
     _ = internal_repair_operations;
     _ = transactions;

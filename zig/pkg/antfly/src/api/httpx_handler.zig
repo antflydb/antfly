@@ -271,11 +271,12 @@ pub const AntflyApiHandler = struct {
             try server.get(routes.agent_card_legacy, handler);
         }
 
-        try server.get(routes.ai_catalog, handler);
-        try server.get(routes.ard_v1, handler);
-        try server.get(routes.ard_v1 ++ "/*", handler);
-        try server.post(routes.ard_v1_search, handler);
-        try server.post(routes.ard_v1_explore, handler);
+        const ard_handler = httpx.Handler.bind(self, ardRoute);
+        try server.get(routes.ai_catalog, ard_handler);
+        try server.get(routes.ard_v1, ard_handler);
+        try server.get(routes.ard_v1 ++ "/*", ard_handler);
+        try server.post(routes.ard_v1_search, ard_handler);
+        try server.post(routes.ard_v1_explore, ard_handler);
 
         const extension_paths = [_][]const u8{
             routes.extensions_v1,
@@ -587,6 +588,42 @@ pub const AntflyApiHandler = struct {
         var response = try self.api_server.handle(request.value);
         const response_alloc = response.owner_allocator orelse self.api_server.alloc;
         return respondWithAllocator(ctx, &response, response_alloc);
+    }
+
+    fn ardRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const path = ctx.request.uri.path;
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        const public_catalog = std.mem.eql(u8, path, routes.ai_catalog) and self.api_server.cfg.ard_public_catalog_enabled;
+        const carries_authentication = ctx.header("authorization") != null or
+            ctx.header(http_server_mod.trusted_principal_header) != null;
+        if (!public_catalog or carries_authentication) {
+            if (try self.authorizeRequest(ctx, &authenticated_identity)) |response| return response;
+        }
+
+        const body = (try ctx.body()) orelse "";
+        var response = self.api_server.executeArd(
+            path,
+            ctx.request.uri.query orelse "",
+            body,
+            authenticated_identity,
+        ) catch |err| return switch (err) {
+            error.Unauthorized => unauthorizedResponse(ctx),
+            error.Forbidden => textResponse(ctx, 403, "forbidden"),
+            error.NotFound => jsonResponse(ctx, 404, "{\"error\":\"not found\"}"),
+            error.InvalidArdSearchRequest => if (std.mem.eql(u8, path, routes.ard_v1_explore))
+                jsonResponse(ctx, 400, "{\"error\":\"invalid ARD explore request\"}")
+            else
+                jsonResponse(ctx, 400, "{\"error\":\"invalid ARD search request\"}"),
+            error.InvalidArdAgentsRequest => jsonResponse(ctx, 400, "{\"error\":\"invalid ARD agents request\"}"),
+            else => return err,
+        };
+        defer response.deinit(self.api_server.alloc);
+        _ = ctx.status(response.status);
+        try ctx.setHeader("content-type", response.content_type);
+        if (response.public_cors) try ctx.setHeader("Access-Control-Allow-Origin", "*");
+        _ = ctx.response.body(response.body);
+        return ctx.response.build();
     }
 
     fn authorizeStorageMaintenance(
@@ -6039,6 +6076,42 @@ test "httpx internal control routes call typed operations directly" {
         try std.testing.expectEqual(@as(u16, 400), response.status.code);
         try std.testing.expectEqualStrings("invalid transaction request", response.body.?);
     }
+}
+
+test "httpx ARD routes call typed contextual operations directly" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .ard_public_catalog_enabled = true,
+        .ard_publisher_domain = "tenant.example.com",
+        .ard_display_name = "Tenant Antfly",
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+
+    const registry_url = try std.fmt.allocPrint(alloc, "{s}/ard/v1", .{base_url});
+    defer alloc.free(registry_url);
+    var registry = try getWithRetry(&client, client_io.io(), registry_url, null, 20);
+    defer registry.deinit();
+    try std.testing.expectEqual(@as(u16, 200), registry.status.code);
+    try std.testing.expectEqualStrings("application/json", registry.header("content-type").?);
+    try std.testing.expect(std.mem.indexOf(u8, registry.body.?, "\"catalog\"") != null);
+
+    const public_url = try std.fmt.allocPrint(alloc, "{s}/.well-known/ai-catalog.json", .{base_url});
+    defer alloc.free(public_url);
+    var public_catalog = try getWithRetry(&client, client_io.io(), public_url, null, 20);
+    defer public_catalog.deinit();
+    try std.testing.expectEqual(@as(u16, 200), public_catalog.status.code);
+    try std.testing.expectEqualStrings("*", public_catalog.header("Access-Control-Allow-Origin").?);
+    try std.testing.expect(std.mem.indexOf(u8, public_catalog.body.?, "application/ai-registry+json") != null);
 }
 
 test "httpx storage maintenance routes call typed operations directly" {
