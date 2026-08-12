@@ -20,6 +20,7 @@ const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
+const internal_group_operations = @import("internal_group_operations.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -242,26 +243,13 @@ fn validateDocumentArtifactChildRangeBatchScope(
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
     if (req.method != .POST) return null;
 
-    const routed_batch_route = routes.Routes.matchGroupRoutedBatch(path);
-    if (routed_batch_route orelse routes.Routes.matchGroupBatch(path)) |batch_route| {
-        if (routed_batch_route == null and ctx.routed_raft_batch_writer != null) {
-            // The legacy endpoint has no end-to-end outcome contract. Reject it
-            // solely by route, before trusting headers or parsing the request,
-            // so forwarding semantics cannot bypass protocol negotiation. The
-            // 404 is deliberate: pre-protocol nodes classify it as terminal
-            // instead of replaying a transform after an ambiguous response.
-            return try http_route_helpers.textResponse(ctx.alloc, 404, "legacy raft batch forwarding unsupported");
-        }
+    if (routes.Routes.matchGroupRoutedBatch(path)) |batch_route| {
         const forwarding = internal_batch_forwarding.parse(req) catch {
             return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid raft batch forwarding headers");
         };
-        if (routed_batch_route != null and forwarding == null) {
+        if (forwarding == null) {
             return try http_route_helpers.textResponse(ctx.alloc, 400, "missing raft batch forwarding headers");
         }
-        if (routed_batch_route == null and forwarding != null) {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "raft batch forwarding headers require routed endpoint");
-        }
-        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         var batch_req = batch_api.parseInternalBatchRequest(ctx.alloc, req.body) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
             error.ValueTooLong => return try http_route_helpers.textResponse(ctx.alloc, 413, "value too large"),
@@ -273,18 +261,15 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             else => return err,
         };
 
-        _ = ((if (forwarding) |forwarding_context|
-            if (ctx.routed_raft_batch_writer) |writer|
-                writer.run(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req, forwarding_context, req.cancellation)
-            else
-                return try raftBatchOutcomeResponse(
-                    ctx.alloc,
-                    503,
-                    "routed raft batch unavailable",
-                    internal_batch_forwarding.outcome_not_proposed_v1,
-                )
+        _ = ((if (ctx.routed_raft_batch_writer) |writer|
+            writer.run(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req, forwarding.?, req.cancellation)
         else
-            writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req)) catch |err| switch (err) {
+            return try raftBatchOutcomeResponse(
+                ctx.alloc,
+                503,
+                "routed raft batch unavailable",
+                internal_batch_forwarding.outcome_not_proposed_v1,
+            )) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             error.RaftBatchWriteOutcomeUnknown => {
@@ -994,10 +979,10 @@ pub fn freeMergeTransitionRecordOwned(alloc: std.mem.Allocator, record: *metadat
     record.* = undefined;
 }
 
-test "internal group write routes validate batch requests" {
+test "legacy internal write dispatcher no longer handles unrouted batch requests" {
     const alloc = std.testing.allocator;
 
-    var resp = (try handle(.{
+    const resp = try handle(.{
         .alloc = alloc,
         .shard_ops = null,
         .writes = TestWriteSource.source(),
@@ -1007,11 +992,24 @@ test "internal group write routes validate batch requests" {
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/batch",
         .body = "{\"inserts\":[]}",
-    }, "/internal/v1/groups/7/tables/docs/batch")).?;
-    defer resp.deinit(alloc);
+    }, "/internal/v1/groups/7/tables/docs/batch");
+    try std.testing.expect(resp == null);
 
-    try std.testing.expectEqual(@as(u16, 400), resp.status);
-    try std.testing.expectEqualStrings("invalid batch request", resp.body);
+    var input = try batch_api.parseInternalBatchRequest(alloc, "{}");
+    defer input.deinit(alloc);
+    const operations = internal_group_operations.Operations{
+        .reads = null,
+        .shard_db_adapter = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = .{ .ptr = undefined, .validate_fn = TestWriteSource.validateBatch },
+    };
+    try std.testing.expectError(error.NotFound, operations.batch(
+        alloc,
+        .{},
+        7,
+        "docs",
+        input.req,
+    ));
 }
 
 test "internal group write route dispatches bounded raft forwarding context" {
@@ -1065,27 +1063,6 @@ test "internal group write route dispatches bounded raft forwarding context" {
     try std.testing.expectEqual(@as(u32, 425), capture.forwarding.?.remaining_ms);
     try std.testing.expectEqual(@as(u8, 1), capture.forwarding.?.forwards_remaining);
     try std.testing.expect(!capture.forwarding.?.campaign_allowed);
-
-    capture.forwarding = null;
-    var legacy_resp = (try handle(.{
-        .alloc = std.testing.allocator,
-        .shard_ops = null,
-        .writes = TestWriteSource.source(),
-        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
-        .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
-    }, .{
-        .method = .POST,
-        .uri = "/internal/v1/groups/7/tables/docs/batch",
-        .headers = &headers,
-        .body = "{}",
-        .cancellation = &cancellation,
-    }, "/internal/v1/groups/7/tables/docs/batch")).?;
-    defer legacy_resp.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(u16, 404), legacy_resp.status);
-    try std.testing.expectEqualStrings("legacy raft batch forwarding unsupported", legacy_resp.body);
-    try std.testing.expect(capture.forwarding == null);
 
     capture.forwarding = null;
     var missing_headers_resp = (try handle(.{
@@ -1151,40 +1128,6 @@ test "internal group write route dispatches bounded raft forwarding context" {
         internal_batch_forwarding.outcome_not_proposed_v1,
         unavailable_resp.header(internal_batch_forwarding.outcome_header).?,
     );
-
-    var local_fallback_resp = (try handle(.{
-        .alloc = std.testing.allocator,
-        .shard_ops = null,
-        .writes = TestWriteSource.source(),
-        .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
-    }, .{
-        .method = .POST,
-        .uri = "/internal/v1/groups/7/tables/docs/batch",
-        .body = "{}",
-    }, "/internal/v1/groups/7/tables/docs/batch")).?;
-    defer local_fallback_resp.deinit(std.testing.allocator);
-
-    // The fake source reports no matching group, proving the request reached
-    // batchGroupLocal instead of the absent routed writer.
-    try std.testing.expectEqual(@as(u16, 404), local_fallback_resp.status);
-
-    var legacy_headers_resp = (try handle(.{
-        .alloc = std.testing.allocator,
-        .shard_ops = null,
-        .writes = TestWriteSource.source(),
-        .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
-    }, .{
-        .method = .POST,
-        .uri = "/internal/v1/groups/7/tables/docs/batch",
-        .headers = &headers,
-        .body = "{}",
-    }, "/internal/v1/groups/7/tables/docs/batch")).?;
-    defer legacy_headers_resp.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(u16, 400), legacy_headers_resp.status);
-    try std.testing.expectEqualStrings("raft batch forwarding headers require routed endpoint", legacy_headers_resp.body);
 }
 
 test "internal group write routes validate transaction status requests" {
@@ -1282,7 +1225,7 @@ test "internal group artifact repair rejects callback token without cancel execu
     try expectRejectsCallbackTokenWithoutCancelExecutorForTest();
 }
 
-test "internal group write routes reject mismatched shard execute requests" {
+test "typed internal group operations reject mismatched shard execute requests" {
     const alloc = std.testing.allocator;
     const body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(
         EncodedTransitionAction{
@@ -1298,21 +1241,14 @@ test "internal group write routes reject mismatched shard execute requests" {
     )});
     defer alloc.free(body);
 
-    var resp = (try handle(.{
-        .alloc = alloc,
+    var action = try parseTransitionAction(alloc, body);
+    defer freeTransitionActionOwned(alloc, &action);
+    const operations = internal_group_operations.Operations{
+        .reads = null,
+        .shard_db_adapter = null,
         .shard_ops = TestShardOps.adapter(),
-        .writes = null,
-        .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
-    }, .{
-        .method = .POST,
-        .uri = "/internal/v1/groups/7/shard-ops/execute",
-        .body = body,
-    }, "/internal/v1/groups/7/shard-ops/execute")).?;
-    defer resp.deinit(alloc);
-
-    try std.testing.expectEqual(@as(u16, 400), resp.status);
-    try std.testing.expectEqualStrings("group does not match transition action", resp.body);
+    };
+    try std.testing.expectError(error.InvalidArgument, operations.executeTransition(.{}, 7, action));
 }
 
 test "internal group write routes allow source-hosted split destination actions" {
@@ -1380,7 +1316,7 @@ test "internal group write routes reject incomplete transition contracts" {
     );
 }
 
-test "internal group write routes map shard doc identity mismatch to conflict" {
+test "typed internal group operations preserve shard doc identity conflicts" {
     const alloc = std.testing.allocator;
     const ConflictShardOps = struct {
         fn adapter() raft_mod.ShardOperationAdapter {
@@ -1452,40 +1388,22 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
         }
     };
 
-    const ctx: Context = .{
-        .alloc = alloc,
+    const operations = internal_group_operations.Operations{
+        .reads = null,
+        .shard_db_adapter = null,
         .shard_ops = ConflictShardOps.adapter(),
-        .writes = null,
-        .batch_validator = TestWriteSource.batchValidator(),
-        .txn_validator = TestWriteSource.txnValidator(),
     };
+    var split = try parseSplitTransitionRecord(alloc, "{\"transition_id\":1,\"attempt_epoch\":1,\"source_group_id\":7,\"destination_group_id\":8,\"split_key\":\"doc:m\",\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}");
+    defer freeSplitTransitionRecordOwned(alloc, &split);
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, operations.observeSplit(.{}, 7, split));
 
-    var split_resp = (try handle(ctx, .{
-        .method = .POST,
-        .uri = "/internal/v1/groups/7/shard-ops/observe-split",
-        .body = "{\"transition_id\":1,\"attempt_epoch\":1,\"source_group_id\":7,\"destination_group_id\":8,\"split_key\":\"doc:m\",\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}",
-    }, "/internal/v1/groups/7/shard-ops/observe-split")).?;
-    defer split_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 409), split_resp.status);
-    try std.testing.expectEqualStrings("doc identity namespace mismatch", split_resp.body);
+    var merge = try parseMergeTransitionRecord(alloc, "{\"transition_id\":2,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true,\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}");
+    defer freeMergeTransitionRecordOwned(alloc, &merge);
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, operations.observeMerge(.{}, 7, merge));
 
-    var merge_resp = (try handle(ctx, .{
-        .method = .POST,
-        .uri = "/internal/v1/groups/7/shard-ops/observe-merge",
-        .body = "{\"transition_id\":2,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true,\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}",
-    }, "/internal/v1/groups/7/shard-ops/observe-merge")).?;
-    defer merge_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 409), merge_resp.status);
-    try std.testing.expectEqualStrings("doc identity namespace mismatch", merge_resp.body);
-
-    var execute_resp = (try handle(ctx, .{
-        .method = .POST,
-        .uri = "/internal/v1/groups/7/shard-ops/execute",
-        .body = "{\"kind\":\"finalize_merge\",\"transition_id\":3,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true,\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}",
-    }, "/internal/v1/groups/7/shard-ops/execute")).?;
-    defer execute_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 409), execute_resp.status);
-    try std.testing.expectEqualStrings("doc identity namespace mismatch", execute_resp.body);
+    var action = try parseTransitionAction(alloc, "{\"kind\":\"finalize_merge\",\"transition_id\":3,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true,\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}");
+    defer freeTransitionActionOwned(alloc, &action);
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, operations.executeTransition(.{}, 7, action));
 }
 
 const TestWriteSource = struct {

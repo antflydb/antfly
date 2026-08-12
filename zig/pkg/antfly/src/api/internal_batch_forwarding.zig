@@ -33,9 +33,18 @@ pub const Context = struct {
 };
 
 pub fn parse(req: http_common.HttpRequest) !?Context {
-    const remaining_raw = req.header(remaining_ms_header);
-    const forwards_raw = req.header(forwards_remaining_header);
-    const campaign_raw = req.header(campaign_allowed_header);
+    return parseValues(
+        req.header(remaining_ms_header),
+        req.header(forwards_remaining_header),
+        req.header(campaign_allowed_header),
+    );
+}
+
+pub fn parseValues(
+    remaining_raw: ?[]const u8,
+    forwards_raw: ?[]const u8,
+    campaign_raw: ?[]const u8,
+) !?Context {
     if (remaining_raw == null and forwards_raw == null and campaign_raw == null) return null;
     if (remaining_raw == null or forwards_raw == null or campaign_raw == null) {
         return error.InvalidRaftBatchForwardingHeaders;

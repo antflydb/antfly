@@ -6,6 +6,7 @@
 //! Transport-neutral operations for internal group coordination.
 
 const std = @import("std");
+const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const operation = @import("operation.zig");
@@ -19,6 +20,16 @@ pub const Error = operation.ApiError || error{
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
     GroupLeaderUnavailable,
+    RaftBatchWriteOutcomeUnknown,
+};
+
+pub const BatchValidator = struct {
+    ptr: *anyopaque,
+    validate_fn: *const fn (*anyopaque, []const u8, []const db_mod.types.BatchWrite) anyerror!void,
+
+    fn validate(self: BatchValidator, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
+        return self.validate_fn(self.ptr, table_name, writes);
+    }
 };
 
 pub const LookupInput = struct {
@@ -33,6 +44,8 @@ pub const Operations = struct {
     shard_db_adapter: ?metadata_mod.ShardDbAdapter,
     writes: ?table_writes.TableWriteSource = null,
     shard_ops: ?raft_mod.ShardOperationAdapter = null,
+    batch_validator: ?BatchValidator = null,
+    reject_unrouted_batch: bool = false,
 
     pub fn corruptEmbeddingArtifact(
         self: Operations,
@@ -132,6 +145,36 @@ pub const Operations = struct {
             error.TransitionOperationBusy,
             => return error.GroupLeaderUnavailable,
             else => return error.Internal,
+        };
+    }
+
+    pub fn batch(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        input: db_mod.types.BatchRequest,
+    ) Error!batch_api.BatchResult {
+        try request.ensureActive();
+        if (self.reject_unrouted_batch) return error.Unsupported;
+        const writes = self.writes orelse return error.NotFound;
+        const validator = self.batch_validator orelse return error.Unavailable;
+        validator.validate(table_name, input.writes) catch |err| switch (err) {
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            else => return error.Internal,
+        };
+        _ = (writes.batchGroupLocal(alloc, group_id, table_name, input) catch |err| switch (err) {
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,
+            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
+            else => return error.Internal,
+        }) orelse return error.NotFound;
+        return .{
+            .inserted = @intCast(input.writes.len),
+            .deleted = @intCast(input.deletes.len),
+            .transformed = @intCast(input.transforms.len),
         };
     }
 

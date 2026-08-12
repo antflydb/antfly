@@ -102,6 +102,12 @@ that end state:
   batch, and retrieval-agent route. This preserves reachability during
   extraction without a global fallback or any legacy public alias; router
   registration still rejects duplicate route shapes.
+- The ordinary internal group batch route now decodes directly into an owned
+  batch request and invokes a typed operation for schema validation, local
+  group write, cancellation, and outcome classification. Only the explicitly
+  versioned routed-forwarding endpoint retains the temporary legacy
+  cancellation adapter; forwarding headers on the ordinary route are rejected
+  directly from `httpx` headers without manufacturing an `HttpRequest`.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

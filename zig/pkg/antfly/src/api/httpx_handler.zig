@@ -31,6 +31,7 @@ const storage_maintenance_operations = @import("storage_maintenance_operations.z
 const internal_group_operations = @import("internal_group_operations.zig");
 const internal_join_operations = @import("internal_join_operations.zig");
 const internal_repair_operations = @import("internal_repair_operations.zig");
+const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const ApiHttpServer = http_server_mod.ApiHttpServer;
 const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
 
@@ -38,6 +39,7 @@ const common_secrets = @import("../common/secrets.zig");
 const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const backups_api = @import("backups.zig");
+const batch_api = @import("batch.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const public_table_http = @import("public_table_http.zig");
 const tables_api = @import("tables.zig");
@@ -323,6 +325,7 @@ pub const AntflyApiHandler = struct {
         try server.post(group_prefix ++ routes.shard_ops_observe_split_suffix, httpx.Handler.bind(self, internalObserveSplit));
         try server.post(group_prefix ++ routes.shard_ops_observe_merge_suffix, httpx.Handler.bind(self, internalObserveMerge));
         try server.post(group_prefix ++ routes.shard_ops_execute_suffix, httpx.Handler.bind(self, internalExecuteTransition));
+        try server.post(table_prefix ++ routes.batch_suffix, httpx.Handler.bind(self, internalGroupBatch));
         const internal_posts = [_][]const u8{
             table_prefix ++ routes.documents_suffix,
             table_prefix ++ routes.graph_expand_suffix,
@@ -333,7 +336,6 @@ pub const AntflyApiHandler = struct {
             table_prefix ++ routes.query_suffix,
             table_prefix ++ routes.query_preflight_suffix,
             table_prefix ++ routes.vector_worker_suffix,
-            table_prefix ++ routes.batch_suffix,
             table_prefix ++ routes.routed_batch_suffix,
             table_prefix ++ routes.artifact_repair_suffix,
             table_prefix ++ routes.artifact_repair_run_suffix,
@@ -788,6 +790,16 @@ pub const AntflyApiHandler = struct {
             .shard_db_adapter = self.api_server.cfg.shard_db_adapter,
             .writes = self.api_server.table_writes,
             .shard_ops = self.api_server.cfg.shard_ops,
+            .batch_validator = .{
+                .ptr = self.api_server,
+                .validate_fn = struct {
+                    fn call(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
+                        const server: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+                        return server.validateTableWritesAgainstSchema(table_name, writes);
+                    }
+                }.call,
+            },
+            .reject_unrouted_batch = self.api_server.cfg.routed_raft_batch_writer != null,
         };
     }
 
@@ -1079,6 +1091,56 @@ pub const AntflyApiHandler = struct {
             action,
         ) catch |err| return internalTransitionErrorResponse(ctx, err, "group does not match transition action");
         return ctx.json(struct {}{});
+    }
+
+    fn internalGroupBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        if (self.api_server.cfg.routed_raft_batch_writer != null)
+            return textResponse(ctx, 404, "legacy raft batch forwarding unsupported");
+        const forwarding = internal_batch_forwarding.parseValues(
+            ctx.header(internal_batch_forwarding.remaining_ms_header),
+            ctx.header(internal_batch_forwarding.forwards_remaining_header),
+            ctx.header(internal_batch_forwarding.campaign_allowed_header),
+        ) catch return textResponse(ctx, 400, "invalid raft batch forwarding headers");
+        if (forwarding != null)
+            return textResponse(ctx, 400, "raft batch forwarding headers require routed endpoint");
+        const body = (try ctx.body()) orelse "";
+        var input = batch_api.parseInternalBatchRequest(ctx.allocator, body) catch |err| return switch (err) {
+            error.InvalidBatchRequest => textResponse(ctx, 400, "invalid batch request"),
+            error.ValueTooLong => textResponse(ctx, 413, "value too large"),
+            else => textResponse(ctx, 500, "internal server error"),
+        };
+        defer input.deinit(ctx.allocator);
+        const result = self.internalGroupOperations().batch(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            input.req,
+        ) catch |err| return switch (err) {
+            error.InvalidArgument => textResponse(ctx, 400, "invalid batch request"),
+            error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
+            error.RaftBatchWriteOutcomeUnknown => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+                break :blk textResponse(ctx, 409, "write outcome unknown");
+            },
+            error.GroupLeaderUnavailable => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
+                break :blk textResponse(ctx, 503, "group leader unavailable");
+            },
+            error.Unsupported => textResponse(ctx, 404, "legacy raft batch forwarding unsupported"),
+            error.NotFound => textResponse(ctx, 404, "not found"),
+            error.Canceled => textResponse(ctx, 408, "request canceled"),
+            error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            else => textResponse(ctx, 500, "internal server error"),
+        };
+        _ = ctx.status(201);
+        return ctx.json(.{
+            .inserted = result.inserted,
+            .deleted = result.deleted,
+            .transformed = result.transformed,
+        });
     }
 
     // ---------------------------------------------------------------
@@ -5236,6 +5298,13 @@ test "httpx internal control routes call typed operations directly" {
         try std.testing.expectEqual(@as(u16, 400), response.status.code);
         try std.testing.expectEqualStrings(case[1], response.body.?);
     }
+
+    const batch_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/batch", .{base_url});
+    defer alloc.free(batch_url);
+    var invalid_batch = try requestWithRetry(&client, client_io.io(), .POST, batch_url, "[]", &headers, 20);
+    defer invalid_batch.deinit();
+    try std.testing.expectEqual(@as(u16, 400), invalid_batch.status.code);
+    try std.testing.expectEqualStrings("invalid batch request", invalid_batch.body.?);
 }
 
 test "httpx storage maintenance routes call typed operations directly" {
