@@ -47,6 +47,10 @@ that end state:
   storage-maintenance jobs are the first completed vertical slices: their
   concrete `httpx` handlers call typed operations directly and no longer enter
   `ApiHttpServer.handle()`.
+- Metadata health, head, status, snapshot, active-transition, table-range,
+  group-placement, and node-shutdown status reads now use transport-neutral
+  operations with owned aggregate results. Their concrete, method-specific
+  `httpx` handlers bypass the metadata method/path dispatcher.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those
