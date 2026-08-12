@@ -7131,6 +7131,7 @@ pub fn build(b: *std.Build) void {
             "metadata.admin_mutation_operations.",
             "metadata.extension_operations.",
             "metadata.node_operations.",
+            "metadata.table_operations.",
             "metadata.http_client.",
             "metadata.http_routes.",
             "metadata.http_server.",

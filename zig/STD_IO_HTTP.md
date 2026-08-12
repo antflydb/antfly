@@ -60,6 +60,12 @@ that end state:
   shutdown finalization are transport-neutral operations with explicit source
   capabilities and ownership transfer. Node lifecycle no longer enters the
   metadata dispatcher.
+- Metadata table create, definition replacement, drop, schema update, index
+  create/drop, and artifact-enrichment put/delete are transport-neutral
+  operations registered as concrete method/path pairs. Their direct-operation
+  tests cover cancellation, while the real `httpx` client/server round trip
+  covers the canonical wire contract without restoring a compatibility
+  dispatcher.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

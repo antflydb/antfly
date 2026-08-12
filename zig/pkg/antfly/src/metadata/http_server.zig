@@ -22,6 +22,7 @@ const admin_read_operations = @import("admin_read_operations.zig");
 const admin_mutation_operations = @import("admin_mutation_operations.zig");
 const extension_operations = @import("extension_operations.zig");
 const node_operations = @import("node_operations.zig");
+const table_operations = @import("table_operations.zig");
 const operation = @import("../api/operation.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
@@ -1143,18 +1144,21 @@ pub const MetadataHttpServer = struct {
         try server.post(extension_path ++ routes.Routes.internal_extension_disable_suffix, httpx.Handler.bind(self, metadataDisableExtension));
         try server.put(extension_path ++ routes.Routes.internal_extension_config_suffix, httpx.Handler.bind(self, metadataConfigureExtension));
 
-        const dynamic_paths = [_][]const u8{
-            routes.Routes.internal_tables_prefix ++ ":table_name",
-            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_restore_suffix,
-            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_definition_suffix,
-            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_schema_suffix,
-            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_indexes_infix ++ ":index_name",
-            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_enrichments_infix ++ ":enrichment_name",
-            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_replication_sources_infix ++ ":source_ordinal" ++ routes.Routes.internal_table_reseed_exact_cutover_suffix,
-            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_split_suffix,
-            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_merge_suffix,
-        };
-        inline for (dynamic_paths) |path| try server.any(path, handler);
+        const table_path = routes.Routes.internal_tables_prefix ++ ":table_name";
+        try server.post(table_path, httpx.Handler.bind(self, metadataCreateTable));
+        try server.delete(table_path, httpx.Handler.bind(self, metadataDropTable));
+        try server.put(table_path ++ routes.Routes.internal_table_definition_suffix, httpx.Handler.bind(self, metadataReplaceTableDefinition));
+        try server.put(table_path ++ routes.Routes.internal_table_schema_suffix, httpx.Handler.bind(self, metadataUpdateTableSchema));
+        const index_path = table_path ++ routes.Routes.internal_table_indexes_infix ++ ":index_name";
+        try server.put(index_path, httpx.Handler.bind(self, metadataCreateTableIndex));
+        try server.delete(index_path, httpx.Handler.bind(self, metadataDropTableIndex));
+        const enrichment_path = table_path ++ routes.Routes.internal_table_enrichments_infix ++ ":enrichment_name";
+        try server.put(enrichment_path, httpx.Handler.bind(self, metadataPutTableEnrichment));
+        try server.delete(enrichment_path, httpx.Handler.bind(self, metadataDeleteTableEnrichment));
+        try server.post(table_path ++ routes.Routes.internal_table_restore_suffix, handler);
+        try server.post(table_path ++ routes.Routes.internal_table_replication_sources_infix ++ ":source_ordinal" ++ routes.Routes.internal_table_reseed_exact_cutover_suffix, handler);
+        try server.post(table_path ++ routes.Routes.internal_split_suffix, handler);
+        try server.post(table_path ++ routes.Routes.internal_merge_suffix, handler);
     }
 
     fn requestContext(ctx: *httpx.Context) operation.RequestContext {
@@ -1660,6 +1664,206 @@ pub const MetadataHttpServer = struct {
         return ctx.status(202).text("accepted");
     }
 
+    fn tableOperations(self: *MetadataHttpServer) table_operations.Operations {
+        return .{ .source = .{ .ptr = self, .vtable = &.{
+            .create_table = createTableOperation,
+            .replace_definition = replaceTableDefinitionOperation,
+            .drop_table = dropTableOperation,
+            .update_schema = updateTableSchemaOperation,
+            .create_index = createTableIndexOperation,
+            .drop_index = dropTableIndexOperation,
+            .put_enrichment = putTableEnrichmentOperation,
+            .delete_enrichment = deleteTableEnrichmentOperation,
+        } } };
+    }
+
+    fn createTableOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, request: tables_api.CreateTableRequest) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.createTable(alloc, table_name, request);
+    }
+
+    fn replaceTableDefinitionOperation(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.replaceTableDefinition(expected, replacement);
+    }
+
+    fn dropTableOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.dropTable(alloc, table_name);
+    }
+
+    fn updateTableSchemaOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.updateSchema(alloc, table_name, schema_json);
+    }
+
+    fn createTableIndexOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.createIndex(alloc, table_name, index_name, index_json);
+    }
+
+    fn dropTableIndexOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.dropIndex(alloc, table_name, index_name);
+    }
+
+    fn putTableEnrichmentOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.putArtifactEnrichment(alloc, table_name, enrichment_name, enrichment_json);
+    }
+
+    fn deleteTableEnrichmentOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.deleteArtifactEnrichment(alloc, table_name, enrichment_name);
+    }
+
+    fn requiredParam(ctx: *httpx.Context, name: []const u8) ![]const u8 {
+        const value = ctx.param(name) orelse return error.InvalidArgument;
+        if (value.len == 0) return error.InvalidArgument;
+        return value;
+    }
+
+    fn metadataCreateTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        var request = parseCreateTableRequest(ctx.allocator, (try ctx.body()) orelse "") catch
+            return ctx.status(400).text("invalid create table request");
+        defer request.deinit(ctx.allocator);
+        self.tableOperations().create(ctx.allocator, requestContext(ctx), table_name, request) catch |err| switch (err) {
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.InvalidArgument => return ctx.status(400).text("invalid create table request"),
+            error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
+            else => return metadataReadError(ctx, err),
+        };
+        return ctx.status(201).text("created");
+    }
+
+    fn metadataReplaceTableDefinition(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        var parsed = std.json.parseFromSlice(ReplaceTableDefinitionRequest, ctx.allocator, (try ctx.body()) orelse "", .{ .allocate = .alloc_always }) catch
+            return ctx.status(400).text("invalid table definition replacement");
+        defer parsed.deinit();
+        self.tableOperations().replaceDefinition(requestContext(ctx), table_name, parsed.value.expected, parsed.value.definition) catch |err| switch (err) {
+            error.TableNameMismatch => return ctx.status(400).text("table definition name mismatch"),
+            error.ExpectedTableNameMismatch => return ctx.status(400).text("expected table definition name mismatch"),
+            error.TableNotFound => return ctx.status(404).text("table not found"),
+            error.TableGenerationChanged => return ctx.status(409).text("table generation changed"),
+            error.TableTransitionActive => return ctx.status(409).text("table transition active"),
+            error.ExtensionOwnedObject, error.UnsupportedOperation => return ctx.status(405).text("method not allowed"),
+            else => return metadataReadError(ctx, err),
+        };
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataDropTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        self.tableOperations().drop(ctx.allocator, requestContext(ctx), table_name) catch |err| switch (err) {
+            error.TableNotFound => return ctx.status(404).text("table not found"),
+            error.TableTransitionActive => return ctx.status(409).text("table transition active"),
+            error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
+            error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
+            else => return metadataReadError(ctx, err),
+        };
+        return ctx.status(204).text("");
+    }
+
+    fn metadataUpdateTableSchema(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        self.tableOperations().updateSchema(ctx.allocator, requestContext(ctx), table_name, (try ctx.body()) orelse "") catch |err| switch (err) {
+            error.TableNotFound => return ctx.status(404).text("table not found"),
+            error.TableGenerationChanged => return ctx.status(409).text("table generation changed"),
+            error.TableTransitionActive => return ctx.status(409).text("table transition active"),
+            error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
+            error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
+            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return ctx.status(400).text("invalid schema update request"),
+            else => return metadataReadError(ctx, err),
+        };
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataCreateTableIndex(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        const index_name = requiredParam(ctx, "index_name") catch return ctx.status(400).text("invalid index name");
+        self.tableOperations().createIndex(ctx.allocator, requestContext(ctx), table_name, index_name, (try ctx.body()) orelse "") catch |err| switch (err) {
+            error.TableNotFound => return ctx.status(404).text("table not found"),
+            error.TableGenerationChanged => return ctx.status(409).text("table generation changed"),
+            error.TableTransitionActive => return ctx.status(409).text("table transition active"),
+            error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
+            error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
+            error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return ctx.status(400).text("unsupported index configuration"),
+            else => return metadataReadError(ctx, err),
+        };
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataDropTableIndex(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        const index_name = requiredParam(ctx, "index_name") catch return ctx.status(400).text("invalid index name");
+        self.tableOperations().dropIndex(ctx.allocator, requestContext(ctx), table_name, index_name) catch |err| switch (err) {
+            error.TableNotFound, error.IndexNotFound => return ctx.status(404).text("index not found"),
+            error.TableGenerationChanged => return ctx.status(409).text("table generation changed"),
+            error.TableTransitionActive => return ctx.status(409).text("table transition active"),
+            error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
+            error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
+            else => return metadataReadError(ctx, err),
+        };
+        return ctx.status(204).text("");
+    }
+
+    fn decodedEnrichmentParams(ctx: *httpx.Context) !struct { table_name: []u8, enrichment_name: []u8 } {
+        const raw_table = requiredParam(ctx, "table_name") catch return error.InvalidTableName;
+        const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.allocator, raw_table) catch |err| switch (err) {
+            error.InvalidArgument => return error.InvalidTableName,
+            else => return err,
+        };
+        errdefer ctx.allocator.free(table_name);
+        const raw_enrichment = requiredParam(ctx, "enrichment_name") catch return error.InvalidEnrichmentName;
+        return .{
+            .table_name = table_name,
+            .enrichment_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.allocator, raw_enrichment) catch |err| switch (err) {
+                error.InvalidArgument => return error.InvalidEnrichmentName,
+                else => return err,
+            },
+        };
+    }
+
+    fn metadataPutTableEnrichment(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const params = decodedEnrichmentParams(ctx) catch |err| switch (err) {
+            error.InvalidTableName => return ctx.status(400).text("invalid table name"),
+            error.InvalidEnrichmentName => return ctx.status(400).text("invalid artifact enrichment name"),
+            else => return err,
+        };
+        defer ctx.allocator.free(params.table_name);
+        defer ctx.allocator.free(params.enrichment_name);
+        self.tableOperations().putEnrichment(ctx.allocator, requestContext(ctx), params.table_name, params.enrichment_name, (try ctx.body()) orelse "") catch |err|
+            return tableEnrichmentError(ctx, err, false);
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataDeleteTableEnrichment(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const params = decodedEnrichmentParams(ctx) catch |err| switch (err) {
+            error.InvalidTableName => return ctx.status(400).text("invalid table name"),
+            error.InvalidEnrichmentName => return ctx.status(400).text("invalid artifact enrichment name"),
+            else => return err,
+        };
+        defer ctx.allocator.free(params.table_name);
+        defer ctx.allocator.free(params.enrichment_name);
+        self.tableOperations().deleteEnrichment(ctx.allocator, requestContext(ctx), params.table_name, params.enrichment_name) catch |err|
+            return tableEnrichmentError(ctx, err, true);
+        return ctx.status(204).text("");
+    }
+
+    fn tableEnrichmentError(ctx: *httpx.Context, err: anyerror, deleting: bool) !httpx.Response {
+        return switch (err) {
+            error.TableNotFound => ctx.status(404).text(if (deleting) "artifact enrichment not found" else "table not found"),
+            error.EnrichmentNotFound => ctx.status(404).text(if (deleting) "artifact enrichment not found" else "table not found"),
+            error.TableGenerationChanged => ctx.status(409).text("table generation changed"),
+            error.TableTransitionActive => ctx.status(409).text("table transition active"),
+            error.ExtensionOwnedObject => ctx.status(405).text("method not allowed"),
+            error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
+            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => ctx.status(400).text("unsupported artifact enrichment configuration"),
+            else => metadataReadError(ctx, err),
+        };
+    }
+
     fn contextualRoute(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const method: http_common.Method = switch (ctx.request.method) {
             .GET => .GET,
@@ -1697,16 +1901,6 @@ pub const MetadataHttpServer = struct {
         switch (req.method) {
             .GET => {},
             .POST => {
-                if (routes.Routes.matchInternalTable(req.uri)) |table| {
-                    var create_req = parseCreateTableRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid create table request");
-                    defer create_req.deinit(alloc);
-                    self.source.createTable(alloc, table.table_name, create_req) catch |err| switch (err) {
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(alloc, 400, "invalid create table request"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 201, "created");
-                }
                 if (routes.Routes.matchInternalTableRestore(req.uri)) |table| {
                     var restore_req = parseInternalTableRestoreRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid restore request");
                     defer restore_req.deinit();
@@ -1786,119 +1980,8 @@ pub const MetadataHttpServer = struct {
                     };
                 }
             },
-            .PUT => {
-                if (routes.Routes.matchInternalTableDefinition(req.uri)) |table| {
-                    var parsed = std.json.parseFromSlice(ReplaceTableDefinitionRequest, alloc, req.body, .{ .allocate = .alloc_always }) catch {
-                        return try textResponse(alloc, 400, "invalid table definition replacement");
-                    };
-                    defer parsed.deinit();
-                    if (!std.mem.eql(u8, parsed.value.definition.name, table.table_name)) {
-                        return try textResponse(alloc, 400, "table definition name mismatch");
-                    }
-                    if (!std.mem.eql(u8, parsed.value.expected.name, table.table_name)) {
-                        return try textResponse(alloc, 400, "expected table definition name mismatch");
-                    }
-                    self.source.replaceTableDefinition(parsed.value.expected, parsed.value.definition) catch |err| switch (err) {
-                        error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
-                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
-                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
-                        error.ExtensionOwnedObject, error.UnsupportedOperation => return try textResponse(alloc, 405, "method not allowed"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
-                if (routes.Routes.matchInternalTableSchema(req.uri)) |table| {
-                    self.source.updateSchema(alloc, table.table_name, req.body) catch |err| switch (err) {
-                        error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
-                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
-                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
-                        error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(alloc, 400, "invalid schema update request"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
-                if (routes.Routes.matchInternalTableIndex(req.uri)) |table_index| {
-                    self.source.createIndex(alloc, table_index.table_name, table_index.index_name, req.body) catch |err| switch (err) {
-                        error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
-                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
-                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
-                        error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return try textResponse(alloc, 400, "unsupported index configuration"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
-                if (routes.Routes.matchInternalTableEnrichment(req.uri)) |table_enrichment| {
-                    const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, table_enrichment.table_name) catch |err| switch (err) {
-                        error.InvalidArgument => return try textResponse(alloc, 400, "invalid table name"),
-                        else => return err,
-                    };
-                    defer alloc.free(table_name);
-                    const enrichment_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, table_enrichment.enrichment_name) catch |err| switch (err) {
-                        error.InvalidArgument => return try textResponse(alloc, 400, "invalid artifact enrichment name"),
-                        else => return err,
-                    };
-                    defer alloc.free(enrichment_name);
-                    self.source.putArtifactEnrichment(alloc, table_name, enrichment_name, req.body) catch |err| switch (err) {
-                        error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
-                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
-                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
-                        error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return try textResponse(alloc, 400, "unsupported artifact enrichment configuration"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
-            },
-            .DELETE => {
-                if (routes.Routes.matchInternalTable(req.uri)) |table| {
-                    self.source.dropTable(alloc, table.table_name) catch |err| switch (err) {
-                        error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
-                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
-                        error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 204, "");
-                }
-                if (routes.Routes.matchInternalTableIndex(req.uri)) |table_index| {
-                    self.source.dropIndex(alloc, table_index.table_name, table_index.index_name) catch |err| switch (err) {
-                        error.TableNotFound, error.IndexNotFound => return try textResponse(alloc, 404, "index not found"),
-                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
-                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
-                        error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 204, "");
-                }
-                if (routes.Routes.matchInternalTableEnrichment(req.uri)) |table_enrichment| {
-                    const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, table_enrichment.table_name) catch |err| switch (err) {
-                        error.InvalidArgument => return try textResponse(alloc, 400, "invalid table name"),
-                        else => return err,
-                    };
-                    defer alloc.free(table_name);
-                    const enrichment_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, table_enrichment.enrichment_name) catch |err| switch (err) {
-                        error.InvalidArgument => return try textResponse(alloc, 400, "invalid artifact enrichment name"),
-                        else => return err,
-                    };
-                    defer alloc.free(enrichment_name);
-                    self.source.deleteArtifactEnrichment(alloc, table_name, enrichment_name) catch |err| switch (err) {
-                        error.TableNotFound, error.EnrichmentNotFound => return try textResponse(alloc, 404, "artifact enrichment not found"),
-                        error.TableGenerationChanged => return try textResponse(alloc, 409, "table generation changed"),
-                        error.TableTransitionActive => return try textResponse(alloc, 409, "table transition active"),
-                        error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return try textResponse(alloc, 400, "unsupported artifact enrichment configuration"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 204, "");
-                }
-            },
+            .PUT => {},
+            .DELETE => {},
         }
         return try textResponse(alloc, 404, "not found");
     }
@@ -3272,22 +3355,27 @@ test "metadata http server maps extension-owned object mutations to method not a
 
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    const table_params = [_]httpx.RouteParam{.{ .name = "table_name", .value = "memories" }};
+    const index_params = [_]httpx.RouteParam{
+        .{ .name = "table_name", .value = "memories" },
+        .{ .name = "index_name", .value = "memory_text" },
+    };
 
-    var schema_resp = try server.handle(.{ .method = .PUT, .uri = "/internal/v1/tables/memories/schema", .body = "{}" });
-    defer schema_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 405), schema_resp.status);
+    var schema_resp = try server.executeTypedHandlerWithBodyForTest(.PUT, "/internal/v1/tables/memories/schema", &table_params, "{}", MetadataHttpServer.metadataUpdateTableSchema);
+    defer schema_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 405), schema_resp.status.code);
 
-    var create_index_resp = try server.handle(.{ .method = .PUT, .uri = "/internal/v1/tables/memories/indexes/memory_text", .body = "{\"type\":\"full_text\"}" });
-    defer create_index_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 405), create_index_resp.status);
+    var create_index_resp = try server.executeTypedHandlerWithBodyForTest(.PUT, "/internal/v1/tables/memories/indexes/memory_text", &index_params, "{\"type\":\"full_text\"}", MetadataHttpServer.metadataCreateTableIndex);
+    defer create_index_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 405), create_index_resp.status.code);
 
-    var drop_index_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/tables/memories/indexes/memory_text" });
-    defer drop_index_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 405), drop_index_resp.status);
+    var drop_index_resp = try server.executeTypedHandlerForTest(.DELETE, "/internal/v1/tables/memories/indexes/memory_text", &index_params, MetadataHttpServer.metadataDropTableIndex);
+    defer drop_index_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 405), drop_index_resp.status.code);
 
-    var drop_table_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/tables/memories" });
-    defer drop_table_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 405), drop_table_resp.status);
+    var drop_table_resp = try server.executeTypedHandlerForTest(.DELETE, "/internal/v1/tables/memories", &table_params, MetadataHttpServer.metadataDropTable);
+    defer drop_table_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 405), drop_table_resp.status.code);
 }
 
 test "metadata http server replaces a table definition through compare-and-swap" {
@@ -3336,16 +3424,18 @@ test "metadata http server replaces a table definition through compare-and-swap"
 
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
-    var response = try server.handle(.{
-        .method = .PUT,
-        .uri = "/internal/v1/tables/docs/definition",
-        .body =
+    const table_params = [_]httpx.RouteParam{.{ .name = "table_name", .value = "docs" }};
+    var response = try server.executeTypedHandlerWithBodyForTest(
+        .PUT,
+        "/internal/v1/tables/docs/definition",
+        &table_params,
         \\{"expected":{"table_id":42,"name":"docs","description":"original"},"definition":{"table_id":42,"name":"docs","description":"restored"}}
-        ,
-    });
-    defer response.deinit(std.testing.allocator);
+    ,
+        MetadataHttpServer.metadataReplaceTableDefinition,
+    );
+    defer response.deinit();
 
-    try std.testing.expectEqual(@as(u16, 202), response.status);
+    try std.testing.expectEqual(@as(u16, 202), response.status.code);
     try std.testing.expect(source.replaced);
 }
 
@@ -4798,21 +4888,11 @@ test "metadata http server returns retryable authority response when reconcile l
 
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
-    var resp = try server.executor().execute(std.testing.allocator, .{
-        .method = .POST,
-        .uri = "/internal/v1/tables/docs",
-        .content_type = "application/json",
-        .body = "{}",
-    });
-    defer resp.deinit(std.testing.allocator);
+    const table_params = [_]httpx.RouteParam{.{ .name = "table_name", .value = "docs" }};
+    var resp = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/docs", &table_params, "{}", MetadataHttpServer.metadataCreateTable);
+    defer resp.deinit();
 
-    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqual(@as(u16, 503), resp.status.code);
     try std.testing.expectEqual(@as(usize, 1), source.create_calls);
-    var authority_header_found = false;
-    for (resp.headers) |header| {
-        if (!std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header)) continue;
-        try std.testing.expectEqualStrings(http_common.metadata_not_leader_value, header.value);
-        authority_header_found = true;
-    }
-    try std.testing.expect(authority_header_found);
+    try std.testing.expectEqualStrings(http_common.metadata_not_leader_value, resp.headers.get(http_common.metadata_not_leader_header).?);
 }
