@@ -242,6 +242,46 @@ func TestBatchReportsAcceptedPendingStatusForLegacyResponse(t *testing.T) {
 	}
 }
 
+func TestBatchSerializesMinTransformFromGeneratedSDKType(t *testing.T) {
+	var gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll request body: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"transformed":1}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	result, err := client.Batch(context.Background(), "scores", BatchRequest{
+		Transforms: []Transform{{
+			Key: "doc-1",
+			Operations: []TransformOp{{
+				Op:    TransformOpTypeMin,
+				Path:  "score",
+				Value: 4,
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Batch: %v", err)
+	}
+	if result.Transformed != 1 {
+		t.Fatalf("Transformed = %d, want 1", result.Transformed)
+	}
+	if !strings.Contains(gotBody, `"op":"$min"`) || !strings.Contains(gotBody, `"value":4`) {
+		t.Fatalf("request body = %q, want generated $min transform", gotBody)
+	}
+}
+
 func TestMultiBatchPreservesAcceptedRecoveryStatus(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

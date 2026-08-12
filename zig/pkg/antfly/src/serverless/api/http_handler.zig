@@ -8387,7 +8387,7 @@ test "http handler serves the table public lifecycle and consistency routes" {
         .method = .put,
         .path = "/tables/docs/ingest-batch",
         .body =
-        \\{"timestamp_ns":600,"mutations":[{"kind":"upsert","doc_id":"doc-a","body":"{\"body\":\"bravo\",\"version\":1,\"embedding\":[1,0,0]}"}]}
+        \\{"timestamp_ns":600,"mutations":[{"kind":"upsert","doc_id":"doc-a","body":"{\"body\":\"bravo\",\"priority\":10,\"version\":1,\"embedding\":[1,0,0]}"}]}
         ,
     });
     defer text_only_update.deinit(alloc);
@@ -8498,7 +8498,7 @@ test "http handler serves the table public lifecycle and consistency routes" {
         .method = .post,
         .path = "/tables/docs/batch",
         .body =
-        \\{"transforms":[{"key":"doc-a","operations":[{"op":"$set","path":"status","value":"updated"},{"op":"$max","path":"version","value":3}]}]}
+        \\{"transforms":[{"key":"doc-a","operations":[{"op":"$set","path":"status","value":"updated"},{"op":"$min","path":"priority","value":4},{"op":"$max","path":"version","value":3}]}]}
         ,
     });
     defer transformed_batch.deinit(alloc);
@@ -8520,12 +8520,14 @@ test "http handler serves the table public lifecycle and consistency routes" {
     try std.testing.expectEqualStrings("doc-b", parsed_transformed_latest.value.documents[1].doc_id);
     const TransformedDocument = struct {
         body: []const u8,
+        priority: i64,
         version: i64,
         status: []const u8,
     };
     var parsed_transformed_document = try parseJsonTestBody(TransformedDocument, alloc, parsed_transformed_latest.value.documents[0].body);
     defer parsed_transformed_document.deinit();
     try std.testing.expectEqualStrings("bravo", parsed_transformed_document.value.body);
+    try std.testing.expectEqual(@as(i64, 4), parsed_transformed_document.value.priority);
     try std.testing.expectEqual(@as(i64, 3), parsed_transformed_document.value.version);
     try std.testing.expectEqualStrings("updated", parsed_transformed_document.value.status);
 }
