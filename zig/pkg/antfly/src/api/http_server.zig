@@ -22885,6 +22885,7 @@ test "api http server serves table batch transforms" {
     const alloc = std.testing.allocator;
     const StoredTransform = struct {
         status: []const u8,
+        priority: i64,
         version: i64,
     };
     const path = "/tmp/antfly-api-http-batch-transform";
@@ -22920,7 +22921,7 @@ test "api http server serves table batch transforms" {
 
     const insert_body = try test_contract_helpers.normalizeBatchRequest(
         std.testing.allocator,
-        "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"version\":1}}}",
+        "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"priority\":10,\"version\":1}}}",
     );
     defer std.testing.allocator.free(insert_body);
     var insert_resp = try executeHttpxTestRequest(&server, .{
@@ -22938,7 +22939,7 @@ test "api http server serves table batch transforms" {
 
     const transform_body = try test_contract_helpers.normalizeBatchRequest(
         std.testing.allocator,
-        "{\"transforms\":[{\"key\":\"doc:a\",\"operations\":[{\"op\":\"$set\",\"path\":\"status\",\"value\":\"updated\"},{\"op\":\"$max\",\"path\":\"version\",\"value\":3}]}]}",
+        "{\"transforms\":[{\"key\":\"doc:a\",\"operations\":[{\"op\":\"$set\",\"path\":\"status\",\"value\":\"updated\"},{\"op\":\"$min\",\"path\":\"priority\",\"value\":4},{\"op\":\"$max\",\"path\":\"version\",\"value\":3}]}]}",
     );
     defer std.testing.allocator.free(transform_body);
     var transform_resp = try executeHttpxTestRequest(&server, .{
@@ -22964,6 +22965,7 @@ test "api http server serves table batch transforms" {
     defer parsed_stored.deinit();
     const stored = parsed_stored.value;
     try std.testing.expectEqualStrings("updated", stored.status);
+    try std.testing.expectEqual(@as(i64, 4), stored.priority);
     try std.testing.expectEqual(@as(i64, 3), stored.version);
 }
 

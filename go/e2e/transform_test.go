@@ -29,6 +29,61 @@ const (
 	transformTestNumShards = 4
 )
 
+// TestE2E_Transform_MinKeepsLowestValue smoke-tests the public Go SDK against
+// the server's $min implementation, including missing fields and upserts.
+func TestE2E_Transform_MinKeepsLowestValue(t *testing.T) {
+	skipInShortMode(t)
+	ctx := testContext(t, 3*time.Minute)
+
+	cluster := setupClusterWithTable(t, ctx, transformTestTableName, transformTestNumShards)
+
+	_, err := cluster.Client.Batch(ctx, transformTestTableName, antfly.BatchRequest{
+		Inserts: map[string]any{
+			"min-item": map[string]any{"priority": 10},
+		},
+		SyncLevel: antfly.SyncLevelWrite,
+	})
+	require.NoError(t, err)
+	require.NoError(t, cluster.WaitForKeyAvailable(ctx, transformTestTableName, "min-item", 10*time.Second))
+
+	_, err = cluster.Client.Batch(ctx, transformTestTableName, antfly.BatchRequest{
+		Transforms: []antfly.Transform{{
+			Key: "min-item",
+			Operations: []antfly.TransformOp{
+				{Op: antfly.TransformOpTypeMin, Path: "priority", Value: 20},
+				{Op: antfly.TransformOpTypeMin, Path: "retry_after", Value: 30},
+				{Op: antfly.TransformOpTypeMin, Path: "priority", Value: 4},
+			},
+		}},
+		SyncLevel: antfly.SyncLevelWrite,
+	})
+	require.NoError(t, err)
+
+	doc, err := cluster.Client.LookupKey(ctx, transformTestTableName, "min-item")
+	require.NoError(t, err)
+	require.Equal(t, float64(4), doc["priority"], "$min should keep the lower numeric value")
+	require.Equal(t, float64(30), doc["retry_after"], "$min should initialize a missing field")
+
+	_, err = cluster.Client.Batch(ctx, transformTestTableName, antfly.BatchRequest{
+		Transforms: []antfly.Transform{{
+			Key:    "min-upsert-item",
+			Upsert: true,
+			Operations: []antfly.TransformOp{
+				{Op: antfly.TransformOpTypeSetOnInsert, Path: "name", Value: "created"},
+				{Op: antfly.TransformOpTypeMin, Path: "priority", Value: 7},
+			},
+		}},
+		SyncLevel: antfly.SyncLevelWrite,
+	})
+	require.NoError(t, err)
+	require.NoError(t, cluster.WaitForKeyAvailable(ctx, transformTestTableName, "min-upsert-item", 10*time.Second))
+
+	doc, err = cluster.Client.LookupKey(ctx, transformTestTableName, "min-upsert-item")
+	require.NoError(t, err)
+	require.Equal(t, "created", doc["name"])
+	require.Equal(t, float64(7), doc["priority"], "$min should initialize an upserted document")
+}
+
 // TestE2E_Transform_MaxKeepsLatestValue tests that using $max operator
 // ensures the latest (highest) version value is always kept, regardless
 // of operation order.
