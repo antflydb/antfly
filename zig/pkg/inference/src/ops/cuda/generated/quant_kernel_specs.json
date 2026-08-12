@@ -1,0 +1,1522 @@
+{
+  "schema": "antfly.quant_kernel_specs.v1",
+  "format_count": 28,
+  "specs": [
+    {
+      "format": "q1_0",
+      "reference_tensor_type": "Q1_0",
+      "block_values": 128,
+      "block_bytes": 18,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "qs",
+          "offset": 2,
+          "bytes": 16
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_q1_0 {d,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d)"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = bit(qs[lane]) ? 1 : -1"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [
+        "metal"
+      ],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "i2_s",
+      "reference_tensor_type": "I2_S",
+      "block_values": 128,
+      "block_bytes": 32,
+      "block_fields": [
+        {
+          "name": "qs",
+          "offset": 0,
+          "bytes": 32
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_i2_s {qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = 1.0"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = ternary(two_bit(qs[group]))"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "i8_s",
+      "reference_tensor_type": "I8_S",
+      "block_values": 1,
+      "block_bytes": 1,
+      "block_fields": [
+        {
+          "name": "q",
+          "offset": 0,
+          "bytes": 1
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_i8_s {q}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = 1.0"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = i8(q)"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "q4_0",
+      "reference_tensor_type": "Q4_0",
+      "block_values": 32,
+      "block_bytes": 18,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "qs",
+          "offset": 2,
+          "bytes": 16
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_q4_0 {d,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d)"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = low_or_high_nibble(qs[lane]) - 8"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none",
+        "pair",
+        "argmax",
+        "pair_activation",
+        "gated_down"
+      ],
+      "supported_backends": [
+        "cuda",
+        "metal"
+      ],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "q4_1",
+      "reference_tensor_type": "Q4_1",
+      "block_values": 32,
+      "block_bytes": 20,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "m",
+          "offset": 2,
+          "bytes": 2
+        },
+        {
+          "name": "qs",
+          "offset": 4,
+          "bytes": 16
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_q4_1 {d,m,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d)"
+        },
+        {
+          "kind": "extract_min",
+          "expression": "min = fp16(m)"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = low_or_high_nibble(qs[lane])"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q + min"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [
+        "metal"
+      ],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "q5_0",
+      "reference_tensor_type": "Q5_0",
+      "block_values": 32,
+      "block_bytes": 22,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "qh",
+          "offset": 2,
+          "bytes": 4
+        },
+        {
+          "name": "qs",
+          "offset": 6,
+          "bytes": 16
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_q5_0 {d,qh,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d)"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = (low_or_high_nibble(qs[lane]) | high_bit(qh[lane])) - 16"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [
+        "metal"
+      ],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "q5_1",
+      "reference_tensor_type": "Q5_1",
+      "block_values": 32,
+      "block_bytes": 24,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "m",
+          "offset": 2,
+          "bytes": 2
+        },
+        {
+          "name": "qh",
+          "offset": 4,
+          "bytes": 4
+        },
+        {
+          "name": "qs",
+          "offset": 8,
+          "bytes": 16
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_q5_1 {d,m,qh,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d)"
+        },
+        {
+          "kind": "extract_min",
+          "expression": "min = fp16(m)"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = low_or_high_nibble(qs[lane]) | high_bit(qh[lane])"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q + min"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [
+        "metal"
+      ],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "q8_0",
+      "reference_tensor_type": "Q8_0",
+      "block_values": 32,
+      "block_bytes": 34,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "qs",
+          "offset": 2,
+          "bytes": 32
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_q8_0 {d,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d)"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = i8(qs[lane])"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none",
+        "bias",
+        "bias_gelu",
+        "pair",
+        "relu"
+      ],
+      "supported_backends": [
+        "cuda",
+        "metal"
+      ],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "q8_1",
+      "reference_tensor_type": "Q8_1",
+      "block_values": 32,
+      "block_bytes": 36,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "sum",
+          "offset": 2,
+          "bytes": 2
+        },
+        {
+          "name": "qs",
+          "offset": 4,
+          "bytes": 32
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_q8_1 {d,sum,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d)"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = i8(qs[lane])"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [
+        "metal"
+      ],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "q2_k",
+      "reference_tensor_type": "Q2_K",
+      "block_values": 256,
+      "block_bytes": 84,
+      "block_fields": [
+        {
+          "name": "scales",
+          "offset": 0,
+          "bytes": 16
+        },
+        {
+          "name": "d",
+          "offset": 16,
+          "bytes": 2
+        },
+        {
+          "name": "dmin",
+          "offset": 18,
+          "bytes": 2
+        },
+        {
+          "name": "qs",
+          "offset": 20,
+          "bytes": 64
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_q2_K {scales,d,dmin,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d) * packed_scale[subblock]"
+        },
+        {
+          "kind": "extract_min",
+          "expression": "min = fp16(dmin) * packed_min[subblock]"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = two_bit(qs[lane])"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q - min"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none",
+        "bias",
+        "bias_gelu"
+      ],
+      "supported_backends": [
+        "metal"
+      ],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "q3_k",
+      "reference_tensor_type": "Q3_K",
+      "block_values": 256,
+      "block_bytes": 110,
+      "block_fields": [
+        {
+          "name": "hmask",
+          "offset": 0,
+          "bytes": 32
+        },
+        {
+          "name": "qs",
+          "offset": 32,
+          "bytes": 64
+        },
+        {
+          "name": "scales",
+          "offset": 96,
+          "bytes": 12
+        },
+        {
+          "name": "d",
+          "offset": 108,
+          "bytes": 2
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_q3_K {hmask,qs,scales,d}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d) * packed_i6_scale[subblock]"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = two_bit(qs[lane]) | high_bit(hmask[lane])"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * (q - 4)"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none",
+        "bias",
+        "bias_gelu"
+      ],
+      "supported_backends": [
+        "metal"
+      ],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "q4_k",
+      "reference_tensor_type": "Q4_K",
+      "block_values": 256,
+      "block_bytes": 144,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "dmin",
+          "offset": 2,
+          "bytes": 2
+        },
+        {
+          "name": "scales",
+          "offset": 4,
+          "bytes": 12
+        },
+        {
+          "name": "qs",
+          "offset": 16,
+          "bytes": 128
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_q4_K {d,dmin,scales,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d) * packed_scale[subblock]"
+        },
+        {
+          "kind": "extract_min",
+          "expression": "min = fp16(dmin) * packed_min[subblock]"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = low_or_high_nibble(qs[lane])"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q - min"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none",
+        "bias",
+        "bias_gelu",
+        "pair"
+      ],
+      "supported_backends": [
+        "cuda",
+        "metal"
+      ],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "q5_k",
+      "reference_tensor_type": "Q5_K",
+      "block_values": 256,
+      "block_bytes": 176,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "dmin",
+          "offset": 2,
+          "bytes": 2
+        },
+        {
+          "name": "scales",
+          "offset": 4,
+          "bytes": 12
+        },
+        {
+          "name": "qh",
+          "offset": 16,
+          "bytes": 32
+        },
+        {
+          "name": "ql",
+          "offset": 48,
+          "bytes": 128
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_q5_K {d,dmin,scales,qh,ql}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d) * packed_scale[subblock]"
+        },
+        {
+          "kind": "extract_min",
+          "expression": "min = fp16(dmin) * packed_min[subblock]"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = low_or_high_nibble(ql[lane]) | high_bit(qh[lane])"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q - min"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none",
+        "bias",
+        "bias_gelu"
+      ],
+      "supported_backends": [
+        "metal"
+      ],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "q6_k",
+      "reference_tensor_type": "Q6_K",
+      "block_values": 256,
+      "block_bytes": 210,
+      "block_fields": [
+        {
+          "name": "ql",
+          "offset": 0,
+          "bytes": 128
+        },
+        {
+          "name": "qh",
+          "offset": 128,
+          "bytes": 64
+        },
+        {
+          "name": "scales",
+          "offset": 192,
+          "bytes": 16
+        },
+        {
+          "name": "d",
+          "offset": 208,
+          "bytes": 2
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_q6_K {ql,qh,scales,d}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d) * i8(scales[subblock])"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = (low4(ql[lane]) | high2(qh[lane])) - 32"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none",
+        "bias",
+        "bias_gelu",
+        "argmax"
+      ],
+      "supported_backends": [
+        "cuda",
+        "metal"
+      ],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "q8_k",
+      "reference_tensor_type": "Q8_K",
+      "block_values": 256,
+      "block_bytes": 292,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 4
+        },
+        {
+          "name": "qs",
+          "offset": 4,
+          "bytes": 256
+        },
+        {
+          "name": "bsums",
+          "offset": 260,
+          "bytes": 32
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_q8_K {d,qs,bsums}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = f32(d)"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = i8(qs[lane])"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [
+        "metal"
+      ],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "tq1_0",
+      "reference_tensor_type": "TQ1_0",
+      "block_values": 256,
+      "block_bytes": 54,
+      "block_fields": [
+        {
+          "name": "qs",
+          "offset": 0,
+          "bytes": 48
+        },
+        {
+          "name": "qh",
+          "offset": 48,
+          "bytes": 4
+        },
+        {
+          "name": "d",
+          "offset": 52,
+          "bytes": 2
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_tq1_0 {qs,qh,d}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d)"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = ternary_base3(qs,qh,lane) - 1"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "tq2_0",
+      "reference_tensor_type": "TQ2_0",
+      "block_values": 256,
+      "block_bytes": 66,
+      "block_fields": [
+        {
+          "name": "qs",
+          "offset": 0,
+          "bytes": 64
+        },
+        {
+          "name": "d",
+          "offset": 64,
+          "bytes": 2
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_tq2_0 {qs,d}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d)"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = two_bit(qs[lane]) - 1"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "iq2_xxs",
+      "reference_tensor_type": "IQ2_XXS",
+      "block_values": 256,
+      "block_bytes": 66,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "qs",
+          "offset": 2,
+          "bytes": 64
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_iq2_xxs {d,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d) * packed_4bit_scale[group] * 0.25"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = iq2_xxs_grid[packed_grid] * sign_mask"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "iq2_xs",
+      "reference_tensor_type": "IQ2_XS",
+      "block_values": 256,
+      "block_bytes": 74,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "qs",
+          "offset": 2,
+          "bytes": 64
+        },
+        {
+          "name": "scales",
+          "offset": 66,
+          "bytes": 8
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_iq2_xs {d,qs,scales}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d) * packed_nibble_scale[pair] * 0.25"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = iq2_xs_grid[packed_grid] * sign_mask"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "iq2_s",
+      "reference_tensor_type": "IQ2_S",
+      "block_values": 256,
+      "block_bytes": 82,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "qs",
+          "offset": 2,
+          "bytes": 64
+        },
+        {
+          "name": "qh",
+          "offset": 66,
+          "bytes": 8
+        },
+        {
+          "name": "scales",
+          "offset": 74,
+          "bytes": 8
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_iq2_s {d,qs,qh,scales}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d) * packed_nibble_scale[pair] * 0.25"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = iq2_s_grid[grid_low|high_bits] * sign_bits"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "iq3_xxs",
+      "reference_tensor_type": "IQ3_XXS",
+      "block_values": 256,
+      "block_bytes": 98,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "qs",
+          "offset": 2,
+          "bytes": 96
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_iq3_xxs {d,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d) * packed_4bit_scale[group] * 0.5"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = iq3_xxs_grid[grid_index] * sign_mask"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "iq3_s",
+      "reference_tensor_type": "IQ3_S",
+      "block_values": 256,
+      "block_bytes": 110,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "qs",
+          "offset": 2,
+          "bytes": 64
+        },
+        {
+          "name": "qh",
+          "offset": 66,
+          "bytes": 8
+        },
+        {
+          "name": "signs",
+          "offset": 74,
+          "bytes": 32
+        },
+        {
+          "name": "scales",
+          "offset": 106,
+          "bytes": 4
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_iq3_s {d,qs,qh,signs,scales}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d) * packed_nibble_scale[pair]"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = iq3_s_grid[grid_low|high_bits] * sign_bits"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "iq1_s",
+      "reference_tensor_type": "IQ1_S",
+      "block_values": 256,
+      "block_bytes": 50,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "qs",
+          "offset": 2,
+          "bytes": 32
+        },
+        {
+          "name": "qh",
+          "offset": 34,
+          "bytes": 16
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_iq1_s {d,qs,qh}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d) * packed_scale[group]"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = iq1_s_grid[grid_low|high_bits] + delta"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "iq1_m",
+      "reference_tensor_type": "IQ1_M",
+      "block_values": 256,
+      "block_bytes": 56,
+      "block_fields": [
+        {
+          "name": "qs",
+          "offset": 0,
+          "bytes": 32
+        },
+        {
+          "name": "qh",
+          "offset": 32,
+          "bytes": 16
+        },
+        {
+          "name": "scales",
+          "offset": 48,
+          "bytes": 8
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_iq1_m {qs,qh,scales}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = packed_fp16(scales) * subscale[group]"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = iq1_s_grid[grid_low|high_bits] + delta"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "iq4_nl",
+      "reference_tensor_type": "IQ4_NL",
+      "block_values": 32,
+      "block_bytes": 18,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "qs",
+          "offset": 2,
+          "bytes": 16
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_iq4_nl {d,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d)"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = iq4_nl_table[low_or_high_nibble(qs[lane])]"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "iq4_xs",
+      "reference_tensor_type": "IQ4_XS",
+      "block_values": 256,
+      "block_bytes": 136,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 2
+        },
+        {
+          "name": "scales_h",
+          "offset": 2,
+          "bytes": 2
+        },
+        {
+          "name": "scales_l",
+          "offset": 4,
+          "bytes": 4
+        },
+        {
+          "name": "qs",
+          "offset": 8,
+          "bytes": 128
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_iq4_xs {d,scales_h,scales_l,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = fp16(d) * (packed_i6_scale[group] - 32)"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = iq4_nl_table[low_or_high_nibble(qs[lane])]"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "mxfp4",
+      "reference_tensor_type": "MXFP4",
+      "block_values": 32,
+      "block_bytes": 17,
+      "block_fields": [
+        {
+          "name": "d",
+          "offset": 0,
+          "bytes": 1
+        },
+        {
+          "name": "qs",
+          "offset": 1,
+          "bytes": 16
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_mxfp4 {d,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = e8m0_half(d)"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = e2m1_table[low_or_high_nibble(qs[lane])]"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    },
+    {
+      "format": "nvfp4",
+      "reference_tensor_type": "NVFP4",
+      "block_values": 64,
+      "block_bytes": 36,
+      "block_fields": [
+        {
+          "name": "scales",
+          "offset": 0,
+          "bytes": 4
+        },
+        {
+          "name": "qs",
+          "offset": 4,
+          "bytes": 32
+        }
+      ],
+      "decode_ops": [
+        {
+          "kind": "load_packed_bytes",
+          "expression": "load block_nvfp4 {scales,qs}"
+        },
+        {
+          "kind": "extract_scale",
+          "expression": "scale = ue4m3_half(scales[subblock])"
+        },
+        {
+          "kind": "extract_quant_lane",
+          "expression": "q = e2m1_table[low_or_high_nibble(qs[lane])]"
+        },
+        {
+          "kind": "dequant_lane",
+          "expression": "value = scale * q"
+        }
+      ],
+      "supported_schedules": [
+        "mmv",
+        "small_batch",
+        "mm"
+      ],
+      "supported_epilogues": [
+        "none"
+      ],
+      "supported_backends": [],
+      "accumulator_dtype": "f32",
+      "output_dtype": "f32"
+    }
+  ]
+}

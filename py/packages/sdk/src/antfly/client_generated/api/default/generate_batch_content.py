@@ -44,6 +44,16 @@ def _parse_response(
 
         return response_400
 
+    if response.status_code == 401:
+        response_401 = InferenceError.from_dict(response.json())
+
+        return response_401
+
+    if response.status_code == 413:
+        response_413 = InferenceError.from_dict(response.json())
+
+        return response_413
+
     if response.status_code == 500:
         response_500 = InferenceError.from_dict(response.json())
 
@@ -83,8 +93,18 @@ def sync_detailed(
     native batched KV decoder; unsupported per-item options are returned as
     per-item errors without failing sibling requests.
 
+    A syntactically valid batch envelope returns HTTP 200 even when some or
+    all items fail. Clients must inspect each item's mutually exclusive
+    `response` and `error` fields, plus `summary`, rather than treating HTTP
+    200 as success for every item. Fatal service or envelope failures still
+    use non-2xx responses.
+
     This endpoint implements the synchronous form only. Future async durable
     batching will use the same request item shape with `mode: async`.
+
+    Batch generation is text-only. Image or other multimodal content parts are
+    rejected per item as `UNSUPPORTED_MULTIMODAL` before media fetch or model loading;
+    other item failures remain independently reported.
 
     Args:
         body (InferenceGenerateBatchRequest):
@@ -120,8 +140,18 @@ def sync(
     native batched KV decoder; unsupported per-item options are returned as
     per-item errors without failing sibling requests.
 
+    A syntactically valid batch envelope returns HTTP 200 even when some or
+    all items fail. Clients must inspect each item's mutually exclusive
+    `response` and `error` fields, plus `summary`, rather than treating HTTP
+    200 as success for every item. Fatal service or envelope failures still
+    use non-2xx responses.
+
     This endpoint implements the synchronous form only. Future async durable
     batching will use the same request item shape with `mode: async`.
+
+    Batch generation is text-only. Image or other multimodal content parts are
+    rejected per item as `UNSUPPORTED_MULTIMODAL` before media fetch or model loading;
+    other item failures remain independently reported.
 
     Args:
         body (InferenceGenerateBatchRequest):
@@ -152,8 +182,18 @@ async def asyncio_detailed(
     native batched KV decoder; unsupported per-item options are returned as
     per-item errors without failing sibling requests.
 
+    A syntactically valid batch envelope returns HTTP 200 even when some or
+    all items fail. Clients must inspect each item's mutually exclusive
+    `response` and `error` fields, plus `summary`, rather than treating HTTP
+    200 as success for every item. Fatal service or envelope failures still
+    use non-2xx responses.
+
     This endpoint implements the synchronous form only. Future async durable
     batching will use the same request item shape with `mode: async`.
+
+    Batch generation is text-only. Image or other multimodal content parts are
+    rejected per item as `UNSUPPORTED_MULTIMODAL` before media fetch or model loading;
+    other item failures remain independently reported.
 
     Args:
         body (InferenceGenerateBatchRequest):
@@ -187,8 +227,18 @@ async def asyncio(
     native batched KV decoder; unsupported per-item options are returned as
     per-item errors without failing sibling requests.
 
+    A syntactically valid batch envelope returns HTTP 200 even when some or
+    all items fail. Clients must inspect each item's mutually exclusive
+    `response` and `error` fields, plus `summary`, rather than treating HTTP
+    200 as success for every item. Fatal service or envelope failures still
+    use non-2xx responses.
+
     This endpoint implements the synchronous form only. Future async durable
     batching will use the same request item shape with `mode: async`.
+
+    Batch generation is text-only. Image or other multimodal content parts are
+    rejected per item as `UNSUPPORTED_MULTIMODAL` before media fetch or model loading;
+    other item failures remain independently reported.
 
     Args:
         body (InferenceGenerateBatchRequest):

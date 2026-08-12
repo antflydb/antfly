@@ -56,6 +56,7 @@ pub const http_internal_group_read_routes = @import("http_internal_group_read_ro
 pub const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
 pub const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
 pub const http_server = @import("http_server.zig");
+pub const kernel_bridge = @import("kernel_bridge.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
 pub const connections = @import("connections.zig");
@@ -83,7 +84,7 @@ pub const ProvisionedTableWriteCache = table_writes.ProvisionedTableWriteCache;
 pub const ProvisionedTableWriteSource = table_writes.ProvisionedTableWriteSource;
 pub const HostedProvisionedTableWriteSource = table_writes.HostedProvisionedTableWriteSource;
 pub const HostedGroupRouter = table_router.HostedGroupRouter;
-pub const ApiHttpServer = http_server.ApiHttpServer;
+pub const ApiHttpServer = kernel_bridge.ApiHttpServer;
 pub const ApiHttpClient = http_client.ApiHttpClient;
 
 test "api restore jobs module compiles" {

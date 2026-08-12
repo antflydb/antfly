@@ -1377,7 +1377,7 @@ tags:
          - Allowed host whitelist
          - Private IP blocking (prevents SSRF attacks)
          - Download size limits (default: 100MB)
-         - Download timeouts (default: 30s)
+         - HTTP downloads time out after 30 seconds by default; zero disables the deadline
          - Image dimension limits (default: 2048px, auto-resized)
 
          See: https://antfly.io/docs/configuration#security--cors
@@ -3329,6 +3329,7 @@ paths:
           application/x-ndjson:
             schema:
               type: string
+              format: binary
       responses:
         '200':
           description: Query successful
@@ -3804,6 +3805,7 @@ paths:
           application/x-ndjson:
             schema:
               type: string
+              format: binary
       responses:
         '200':
           description: Query successful
@@ -4153,6 +4155,7 @@ paths:
             application/x-ndjson:
               schema:
                 type: string
+                format: binary
                 description: Newline-delimited JSON, each line is a JSON object with an "_id" field
         '400':
           $ref: '#/components/responses/BadRequest'
@@ -6128,7 +6131,11 @@ paths:
 
         response envelope. For sparse-capable models, `data[i].embedding` is a sparse
 
-        vector object instead of a dense float array.
+        vector object instead of a dense float array. Dense image inputs are header-validated
+
+        and admitted against the aggregate decoded-pixel budget before model loading. Remote
+
+        URL byte potential is reserved before fetch; inline sources use their actual encoded size.
       operationId: generateEmbeddings
       requestBody:
         required: true
@@ -6149,16 +6156,43 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Encoded media, image dimensions, or aggregate decoded pixels exceed the configured
+            limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
         '500':
           description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '502':
+          description: Remote content fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
           content:
             application/json:
               schema:
@@ -6223,6 +6257,14 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/rerank_multimodal:
     post:
       summary: Rerank multimodal documents by relevance
@@ -6237,6 +6279,10 @@ paths:
         contract for native ColQwen-style late-interaction reranking as that encoder lands.
 
         Image-bearing requests already run native Zig image preprocessing and grid preparation.
+
+        Remote URL byte potential is reserved before fetch, and image headers plus aggregate
+
+        decoded pixels are admitted before model loading.
       operationId: rerankMultimodalPrompts
       requestBody:
         required: true
@@ -6257,8 +6303,27 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Encoded media, image dimensions, or aggregate decoded pixels exceed the configured
+            limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '502':
+          description: Remote content fetch failed
           content:
             application/json:
               schema:
@@ -6271,6 +6336,14 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/rerank:
     post:
       summary: Rerank prompts by relevance
@@ -6350,6 +6423,14 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/generate:
     post:
       summary: Generate text using LLM (OpenAI-compatible)
@@ -6374,7 +6455,13 @@ paths:
 
         token deltas. Each event contains a `ChatCompletionChunk` object.
 
-        The stream ends with `data: [DONE]`.
+        A successful stream ends with `data: [DONE]`. If generation or stream
+
+        writing fails after the HTTP response starts, the server instead emits
+
+        an `event: error` frame whose data is a plain-text error message, then
+
+        closes the stream without a `[DONE]` frame.
 
 
         ## Input Format
@@ -6383,6 +6470,31 @@ paths:
         Uses OpenAI-compatible chat format with messages array containing role
 
         (system, user, assistant) and content. Set `stream: true` for streaming responses.
+
+
+        Downloaded and inline encoded media is limited cumulatively across the request
+
+        to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
+
+        `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+
+        download limit disables nonempty media. Remote URL byte potential is reserved before
+
+        fetch; inline sources reserve their actual encoded size without adding it to the
+
+        existing request-body reservation. Accepted image headers are then validated and
+
+        decoded source pixels are admitted at a conservative 16 bytes per pixel against
+
+        the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+
+        concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
+
+        limits each source edge. Malformed images return 400, while dimension or aggregate
+
+        excess returns 413 before model loading. Initial capacity admission occurs before
+
+        media fetch, so an overloaded server returns 503 without fetching content.
       operationId: generateContent
       requestBody:
         required: true
@@ -6409,8 +6521,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Media content exceeds the per-object or aggregate decoded request size limit
           content:
             application/json:
               schema:
@@ -6421,8 +6545,28 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '502':
+          description: Remote content fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '507':
+          description: Generation request exceeds the configured memory budget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/generate/batch:
     post:
       summary: Generate text for a synchronous batch of requests
@@ -6436,9 +6580,27 @@ paths:
         per-item errors without failing sibling requests.
 
 
+        A syntactically valid batch envelope returns HTTP 200 even when some or
+
+        all items fail. Clients must inspect each item's mutually exclusive
+
+        `response` and `error` fields, plus `summary`, rather than treating HTTP
+
+        200 as success for every item. Fatal service or envelope failures still
+
+        use non-2xx responses.
+
+
         This endpoint implements the synchronous form only. Future async durable
 
         batching will use the same request item shape with `mode: async`.
+
+
+        Batch generation is text-only. Image or other multimodal content parts are
+
+        rejected per item as `UNSUPPORTED_MULTIMODAL` before media fetch or model loading;
+
+        other item failures remain independently reported.
       operationId: generateBatchContent
       requestBody:
         required: true
@@ -6448,13 +6610,19 @@ paths:
               $ref: '#/components/schemas/InferenceGenerateBatchRequest'
       responses:
         '200':
-          description: Batch generation results in request order
+          description: Batch generation results in request order; item failures are represented in `data[].error`
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceGenerateBatchResponse'
         '400':
           description: Invalid batch envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Batch envelope contains more than 128 request items
           content:
             application/json:
               schema:
@@ -6467,6 +6635,14 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/chat/completions:
     post:
       summary: OpenAI Chat Completions endpoint
@@ -6500,8 +6676,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Media content exceeds the configured size limit
           content:
             application/json:
               schema:
@@ -6512,8 +6700,28 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '502':
+          description: Remote content fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '507':
+          description: Generation request exceeds the configured memory budget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/rewrite:
     post:
       summary: Rewrite text using Seq2Seq models
@@ -6575,6 +6783,14 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/read:
     post:
       summary: Read text from images (OCR/document understanding)
@@ -6619,6 +6835,36 @@ paths:
         - **Pix2Struct**: natural-language questions like `What type of document is this?`
 
         - **Moondream**: natural-language prompts like `Describe this image.`
+
+
+        Image admission reserves the effective downloaded-byte ceiling at 16 MiB per
+
+        weighted capacity unit and at least one unit per two declared images. The effective
+
+        ceiling is the minimum of the configured per-image limit times image count, the
+
+        read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
+
+        `max_concurrent_requests`. Admission happens before model resolution or download.
+
+
+        After download, image headers are validated before model loading. Decoded source
+
+        pixels are admitted at a conservative 16 bytes per pixel against the lower of
+
+        512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+
+        setting still uses the finite 512 MiB ceiling. The reservation grows atomically
+
+        from downloaded-byte admission before inference. `max_image_dimension` limits
+
+        each source edge; malformed images return 400 and dimension or aggregate excess
+
+        returns 413. The same decoded-pixel policy covers generate/chat, dense embedding,
+
+        multimodal reranking, image `/extract`, and the embedded read, extract, and dense
+
+        embedding APIs. Batch generation rejects multimodal content before media fetch.
       operationId: readImages
       requestBody:
         required: true
@@ -6639,8 +6885,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Media content exceeds the configured size limit
           content:
             application/json:
               schema:
@@ -6651,8 +6909,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '502':
+          description: Remote content fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/transcribe:
     post:
       summary: Transcribe audio to text (speech-to-text)
@@ -6747,6 +7019,14 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/extract:
     post:
       summary: Extract entities, relations, classifications, and structures
@@ -6758,6 +7038,13 @@ paths:
         text/document classification, token classification, and structured
 
         document extraction.
+
+
+        Image-backed extraction uses the same byte-reserving and image-count-weighted
+
+        admission policy as `/read`, before model resolution or download. Text-only
+
+        extraction consumes one admission unit.
       operationId: extract
       requestBody:
         required: true
@@ -6778,8 +7065,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Media content exceeds the configured size limit
           content:
             application/json:
               schema:
@@ -6790,8 +7089,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '502':
+          description: Remote content fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/models:
     get:
       summary: List available models
@@ -6888,6 +7201,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/embeddings:
     post:
       summary: Create embeddings (OpenAI-compatible)
@@ -6900,7 +7226,13 @@ paths:
 
         field, but its value is a sparse vector object instead of a dense float array.
 
-        Use this endpoint for drop-in compatibility with OpenAI SDKs.
+        Dense image inputs are header-validated and admitted against the aggregate
+
+        decoded-pixel budget before model loading. Remote URL byte potential is reserved
+
+        before fetch; inline sources use their actual encoded size. Use this endpoint for
+
+        drop-in compatibility with OpenAI SDKs.
       operationId: createEmbedding
       requestBody:
         required: true
@@ -6921,16 +7253,43 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '403':
+          description: Remote content blocked by the configured content security policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Encoded media, image dimensions, or aggregate decoded pixels exceed the configured
+            limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
         '500':
           description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '502':
+          description: Remote content fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
           content:
             application/json:
               schema:
@@ -6954,6 +7313,19 @@ paths:
                 $ref: '#/components/schemas/InferencePredictorsResponse'
         '500':
           description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
           content:
             application/json:
               schema:
@@ -6997,6 +7369,19 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '413':
           description: Batch too large (> 10000 rows)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
           content:
             application/json:
               schema:
@@ -8024,6 +8409,27 @@ components:
         chunk_count:
           type: integer
           description: Number of indexable chunks derived from the units.
+        ocr_attempted_count:
+          type: integer
+          description: Number of pages for which OCR was attempted.
+        ocr_selected_count:
+          type: integer
+          description: Number of pages where OCR text was selected over embedded text.
+        ocr_retained_embedded_count:
+          type: integer
+          description: Number of attempted pages where embedded text remained preferable.
+        ocr_failed_count:
+          type: integer
+          description: Number of pages whose OCR rendering or recognition failed.
+        ocr_failed_page_numbers:
+          type: array
+          description: Up to 32 one-based page numbers where OCR failed.
+          items:
+            type: integer
+            format: uint32
+        ocr_failed_pages_truncated:
+          type: boolean
+          description: Whether additional failed page numbers were omitted from the summary.
         child_ranges:
           type: array
           description: Parsed child range descriptors for this artifact generation.
@@ -9655,9 +10061,7 @@ components:
           description: Minimum document count for a bucket to be included
           example: 1
         background_filter:
-          allOf:
-            - $ref: '#/components/schemas/Query'
-            - x-go-type: json.RawMessage
+          $ref: '#/components/schemas/RawQuery'
           description: Background filter for significant_terms aggregations
         algorithm:
           x-go-type-skip-optional-pointer: false
@@ -10250,9 +10654,7 @@ components:
             - author
             - metadata.tags
         filter_query:
-          allOf:
-            - $ref: '#/components/schemas/Query'
-            - x-go-type: json.RawMessage
+          $ref: '#/components/schemas/RawQuery'
           description: >
             Structured subset of the Antfly query AST used to filter a primary-key
 
@@ -12535,6 +12937,11 @@ components:
             Packed sparse embedding with base64-encoded indices and values.
 
             Same semantics as the sparse object format but more compact on the wire.
+    RawQuery:
+      oneOf:
+        - $ref: '#/components/schemas/Query'
+      x-go-type: json.RawMessage
+      description: A validated Antfly query retained as raw JSON by Go servers and clients.
     QueryRequest:
       type: object
       properties:
@@ -12578,11 +12985,7 @@ components:
                 - exists:
                     path: /deleted_at
         full_text_search:
-          allOf:
-            - $ref: '#/components/schemas/Query'
-            - x-go-type: json.RawMessage
-              type: object
-              additionalProperties: true
+          $ref: '#/components/schemas/RawQuery'
           description: >
             Antfly query for full-text search. Supports all Antfly query types.
 
@@ -12690,9 +13093,7 @@ components:
 
             - Document type filtering: `"article:"`
         filter_query:
-          allOf:
-            - $ref: '#/components/schemas/Query'
-            - x-go-type: json.RawMessage
+          $ref: '#/components/schemas/RawQuery'
           description: >
             Antfly query applied as an AND condition. Documents must match both the main query
 
@@ -12720,9 +13121,7 @@ components:
             query: +category:technology +year:>2020
             boost: 1.0
         exclusion_query:
-          allOf:
-            - $ref: '#/components/schemas/Query'
-            - x-go-type: json.RawMessage
+          $ref: '#/components/schemas/RawQuery'
           description: >
             Antfly query applied as a NOT condition. Documents matching this query are excluded
 
@@ -13398,9 +13797,7 @@ components:
       description: Filters to apply to a table before joining.
       properties:
         filter_query:
-          allOf:
-            - $ref: '#/components/schemas/Query'
-            - x-go-type: json.RawMessage
+          $ref: '#/components/schemas/RawQuery'
           description: Antfly query to filter rows before joining.
         filter_prefix:
           type: string
@@ -14644,9 +15041,7 @@ components:
               path: active
               value: false
         publication_filter:
-          allOf:
-            - $ref: '#/components/schemas/Query'
-            - x-go-type: json.RawMessage
+          $ref: '#/components/schemas/RawQuery'
           description: >
             Bleve-style filter query that gets translated to SQL and applied as a
 
@@ -14777,9 +15172,7 @@ components:
             already exist.
           example: premium_users
         where:
-          allOf:
-            - $ref: '#/components/schemas/Query'
-            - x-go-type: json.RawMessage
+          $ref: '#/components/schemas/RawQuery'
           description: >
             Bleve-style filter query evaluated against each CDC row. Only rows
 
@@ -14863,8 +15256,10 @@ components:
       enum:
         - table
         - user
+        - inference
         - '*'
-      description: Type of the resource, e.g., table, user, or global ('*').
+      description: 'Type of resource: table, user, inference, or global (''*''). Use inference with resource
+        ''*'' to grant access to unified inference routes.'
       example: table
     PermissionType:
       type: string
@@ -14879,7 +15274,8 @@ components:
       properties:
         resource:
           type: string
-          description: Resource name (e.g., table name, target username, or '*' for global).
+          description: Resource name (e.g., table name, target username, or '*' for all inference operations
+            or a global grant).
           example: orders_table
         resource_type:
           $ref: '#/components/schemas/ResourceType'
@@ -15590,7 +15986,7 @@ components:
            - Allowed host whitelist
            - Private IP blocking (prevents SSRF attacks)
            - Download size limits (default: 100MB)
-           - Download timeouts (default: 30s)
+           - HTTP downloads time out after 30 seconds by default; zero disables the deadline
            - Image dimension limits (default: 2048px, auto-resized)
 
            See: https://antfly.io/docs/configuration#security--cors
@@ -16773,481 +17169,6 @@ components:
             that don't have explicit mappings and dynamic mapping is enabled, templates are
 
             evaluated in order to determine how those fields should be indexed.
-    Boost:
-      type: number
-      format: double
-      description: A floating-point number used to decrease or increase the relevance scores of a query.
-      default: 1.0
-      nullable: true
-    TermQuery:
-      type: object
-      properties:
-        term:
-          type: string
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - term
-    MatchQuery:
-      type: object
-      properties:
-        match:
-          type: string
-        field:
-          type: string
-        analyzer:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - match
-    MultiMatchBody:
-      type: object
-      properties:
-        query:
-          type: string
-        fields:
-          type: array
-          items:
-            type: string
-          minItems: 1
-        type:
-          type: string
-          enum:
-            - bool_prefix
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - query
-        - fields
-        - type
-    MultiMatchQuery:
-      type: object
-      properties:
-        multi_match:
-          $ref: '#/components/schemas/MultiMatchBody'
-      required:
-        - multi_match
-    Fuzziness:
-      description: The fuzziness of the query. Can be an integer or "auto".
-      anyOf:
-        - type: integer
-          format: int32
-          minimum: 0
-          maximum: 2
-        - type: string
-          enum:
-            - auto
-    MatchPhraseQuery:
-      type: object
-      properties:
-        match_phrase:
-          type: string
-        field:
-          type: string
-        analyzer:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-        fuzziness:
-          $ref: '#/components/schemas/Fuzziness'
-      required:
-        - match_phrase
-    PhraseQuery:
-      type: object
-      properties:
-        terms:
-          type: array
-          items:
-            type: string
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-        fuzziness:
-          $ref: '#/components/schemas/Fuzziness'
-      required:
-        - terms
-    MultiPhraseQuery:
-      type: object
-      properties:
-        terms:
-          type: array
-          items:
-            type: array
-            items:
-              type: string
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-        fuzziness:
-          $ref: '#/components/schemas/Fuzziness'
-      required:
-        - terms
-    FuzzyQuery:
-      type: object
-      properties:
-        term:
-          type: string
-        prefix_length:
-          type: integer
-          format: int32
-          minimum: 0
-          maximum: 255
-        fuzziness:
-          $ref: '#/components/schemas/Fuzziness'
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - term
-    PrefixQuery:
-      type: object
-      properties:
-        prefix:
-          type: string
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - prefix
-    RegexpQuery:
-      type: object
-      properties:
-        regexp:
-          type: string
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - regexp
-    WildcardQuery:
-      type: object
-      properties:
-        wildcard:
-          type: string
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - wildcard
-    QueryStringQuery:
-      type: object
-      properties:
-        query:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - query
-    NumericRangeQuery:
-      type: object
-      properties:
-        min:
-          type: number
-          format: double
-          nullable: true
-        max:
-          type: number
-          format: double
-          nullable: true
-        inclusive_min:
-          type: boolean
-          nullable: true
-        inclusive_max:
-          type: boolean
-          nullable: true
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-    TermRangeQuery:
-      type: object
-      properties:
-        min:
-          type: string
-          nullable: true
-        max:
-          type: string
-          nullable: true
-        inclusive_min:
-          type: boolean
-          nullable: true
-        inclusive_max:
-          type: boolean
-          nullable: true
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-    DateRangeStringQuery:
-      type: object
-      properties:
-        start:
-          type: string
-          format: date-time
-        end:
-          type: string
-          format: date-time
-        inclusive_start:
-          type: boolean
-          nullable: true
-        inclusive_end:
-          type: boolean
-          nullable: true
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-        datetime_parser:
-          type: string
-    ConjunctionQuery:
-      type: object
-      properties:
-        conjuncts:
-          type: array
-          items:
-            $ref: '#/components/schemas/Query'
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - conjuncts
-    DisjunctionQuery:
-      type: object
-      properties:
-        disjuncts:
-          type: array
-          items:
-            $ref: '#/components/schemas/Query'
-        boost:
-          $ref: '#/components/schemas/Boost'
-        min:
-          type: number
-          format: double
-      required:
-        - disjuncts
-    BooleanQuery:
-      type: object
-      properties:
-        must:
-          $ref: '#/components/schemas/ConjunctionQuery'
-        should:
-          $ref: '#/components/schemas/DisjunctionQuery'
-        must_not:
-          $ref: '#/components/schemas/DisjunctionQuery'
-        filter:
-          $ref: '#/components/schemas/Query'
-        boost:
-          $ref: '#/components/schemas/Boost'
-    MatchAllQuery:
-      type: object
-      properties:
-        match_all:
-          type: object
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - match_all
-    MatchNoneQuery:
-      type: object
-      properties:
-        match_none:
-          type: object
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - match_none
-    DocIdQuery:
-      type: object
-      properties:
-        ids:
-          type: array
-          items:
-            type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - ids
-    BoolFieldQuery:
-      type: object
-      properties:
-        bool:
-          type: boolean
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - bool
-    IPRangeQuery:
-      type: object
-      properties:
-        cidr:
-          type: string
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - cidr
-    GeoBoundingBoxQuery:
-      type: object
-      description: >
-        Geographic bounding box filter. The public query shape uses scalar latitude and longitude bounds
-        to match structured filter_query.geo_bbox. Longitude ranges may cross the antimeridian by specifying
-        a western/min longitude that is greater than the eastern/max longitude; for example, min_lon 179.5
-        and max_lon -179.5 matches points near +/-180 degrees longitude. Latitude bounds must be ordered
-        with min_lat <= max_lat.
-      properties:
-        field:
-          type: string
-          description: Field or path containing geo_point values.
-        min_lat:
-          type: number
-          format: double
-          minimum: -90
-          maximum: 90
-          description: Southern latitude bound.
-        min_lon:
-          type: number
-          format: double
-          minimum: -180
-          maximum: 180
-          description: Western longitude bound. If greater than max_lon, the box crosses the antimeridian.
-        max_lat:
-          type: number
-          format: double
-          minimum: -90
-          maximum: 90
-          description: Northern latitude bound. Must be greater than or equal to min_lat.
-        max_lon:
-          type: number
-          format: double
-          minimum: -180
-          maximum: 180
-          description: Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - field
-        - min_lat
-        - min_lon
-        - max_lat
-        - max_lon
-    GeoDistanceQuery:
-      type: object
-      properties:
-        location:
-          type: array
-          items:
-            type: number
-            format: double
-          minItems: 2
-          maxItems: 2
-          description: '[lon, lat]'
-        distance:
-          type: string
-          example: 10km
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - location
-        - distance
-    GeoPoint:
-      type: object
-      properties:
-        lon:
-          type: number
-          format: double
-        lat:
-          type: number
-          format: double
-    GeoBoundingPolygonQuery:
-      type: object
-      properties:
-        polygon_points:
-          type: array
-          items:
-            $ref: '#/components/schemas/GeoPoint'
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - polygon_points
-    GeoShape:
-      type: object
-      description: A GeoJSON shape object. This is a simplified representation.
-      properties:
-        type:
-          type: string
-        coordinates:
-          type: array
-      required:
-        - type
-        - coordinates
-    GeoShapeGeometry:
-      type: object
-      properties:
-        shape:
-          $ref: '#/components/schemas/GeoShape'
-        relation:
-          type: string
-          enum:
-            - intersects
-            - contains
-            - within
-      required:
-        - shape
-        - relation
-    GeoShapeQuery:
-      type: object
-      properties:
-        geometry:
-          $ref: '#/components/schemas/GeoShapeGeometry'
-        field:
-          type: string
-        boost:
-          $ref: '#/components/schemas/Boost'
-      required:
-        - geometry
-    Query:
-      oneOf:
-        - $ref: '#/components/schemas/TermQuery'
-        - $ref: '#/components/schemas/MatchQuery'
-        - $ref: '#/components/schemas/MultiMatchQuery'
-        - $ref: '#/components/schemas/MatchPhraseQuery'
-        - $ref: '#/components/schemas/PhraseQuery'
-        - $ref: '#/components/schemas/MultiPhraseQuery'
-        - $ref: '#/components/schemas/FuzzyQuery'
-        - $ref: '#/components/schemas/PrefixQuery'
-        - $ref: '#/components/schemas/RegexpQuery'
-        - $ref: '#/components/schemas/WildcardQuery'
-        - $ref: '#/components/schemas/QueryStringQuery'
-        - $ref: '#/components/schemas/NumericRangeQuery'
-        - $ref: '#/components/schemas/TermRangeQuery'
-        - $ref: '#/components/schemas/DateRangeStringQuery'
-        - $ref: '#/components/schemas/BooleanQuery'
-        - $ref: '#/components/schemas/ConjunctionQuery'
-        - $ref: '#/components/schemas/DisjunctionQuery'
-        - $ref: '#/components/schemas/MatchAllQuery'
-        - $ref: '#/components/schemas/MatchNoneQuery'
-        - $ref: '#/components/schemas/DocIdQuery'
-        - $ref: '#/components/schemas/BoolFieldQuery'
-        - $ref: '#/components/schemas/IPRangeQuery'
-        - $ref: '#/components/schemas/GeoBoundingBoxQuery'
-        - $ref: '#/components/schemas/GeoDistanceQuery'
-        - $ref: '#/components/schemas/GeoBoundingPolygonQuery'
-        - $ref: '#/components/schemas/GeoShapeQuery'
     IndexRepairStatus:
       type: object
       description: Compact user-facing state for an automatic index repair. Detailed diagnostics are available
@@ -19760,6 +19681,482 @@ components:
         duration_ms:
           type: integer
           description: Total evaluation duration in milliseconds
+    Boost:
+      type: number
+      format: double
+      description: A floating-point number used to decrease or increase the relevance scores of a query.
+      default: 1.0
+      nullable: true
+    TermQuery:
+      type: object
+      properties:
+        term:
+          type: string
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - term
+    MatchQuery:
+      type: object
+      properties:
+        match:
+          type: string
+        field:
+          type: string
+        analyzer:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - match
+    MultiMatchBody:
+      type: object
+      properties:
+        query:
+          type: string
+        fields:
+          type: array
+          items:
+            type: string
+          minItems: 1
+        type:
+          type: string
+          enum:
+            - bool_prefix
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - query
+        - fields
+        - type
+    MultiMatchQuery:
+      type: object
+      properties:
+        multi_match:
+          $ref: '#/components/schemas/MultiMatchBody'
+      required:
+        - multi_match
+    Fuzziness:
+      description: The fuzziness of the query. Can be an integer or "auto".
+      anyOf:
+        - type: integer
+          format: int32
+          minimum: 0
+          maximum: 2
+        - type: string
+          enum:
+            - auto
+    MatchPhraseQuery:
+      type: object
+      properties:
+        match_phrase:
+          type: string
+        field:
+          type: string
+        analyzer:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+        fuzziness:
+          $ref: '#/components/schemas/Fuzziness'
+      required:
+        - match_phrase
+    PhraseQuery:
+      type: object
+      properties:
+        terms:
+          type: array
+          items:
+            type: string
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+        fuzziness:
+          $ref: '#/components/schemas/Fuzziness'
+      required:
+        - terms
+    MultiPhraseQuery:
+      type: object
+      properties:
+        terms:
+          type: array
+          items:
+            type: array
+            items:
+              type: string
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+        fuzziness:
+          $ref: '#/components/schemas/Fuzziness'
+      required:
+        - terms
+    FuzzyQuery:
+      type: object
+      properties:
+        term:
+          type: string
+        prefix_length:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 255
+        fuzziness:
+          $ref: '#/components/schemas/Fuzziness'
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - term
+    PrefixQuery:
+      type: object
+      properties:
+        prefix:
+          type: string
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - prefix
+    RegexpQuery:
+      type: object
+      properties:
+        regexp:
+          type: string
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - regexp
+    WildcardQuery:
+      type: object
+      properties:
+        wildcard:
+          type: string
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - wildcard
+    QueryStringQuery:
+      type: object
+      properties:
+        query:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - query
+    NumericRangeQuery:
+      type: object
+      properties:
+        min:
+          type: number
+          format: double
+          nullable: true
+        max:
+          type: number
+          format: double
+          nullable: true
+        inclusive_min:
+          type: boolean
+          nullable: true
+        inclusive_max:
+          type: boolean
+          nullable: true
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+    TermRangeQuery:
+      type: object
+      properties:
+        min:
+          type: string
+          nullable: true
+        max:
+          type: string
+          nullable: true
+        inclusive_min:
+          type: boolean
+          nullable: true
+        inclusive_max:
+          type: boolean
+          nullable: true
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+    DateRangeStringQuery:
+      type: object
+      properties:
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        inclusive_start:
+          type: boolean
+          nullable: true
+        inclusive_end:
+          type: boolean
+          nullable: true
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+        datetime_parser:
+          type: string
+    ConjunctionQuery:
+      type: object
+      properties:
+        conjuncts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Query'
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - conjuncts
+    DisjunctionQuery:
+      type: object
+      properties:
+        disjuncts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Query'
+        boost:
+          $ref: '#/components/schemas/Boost'
+        min:
+          type: number
+          format: double
+      required:
+        - disjuncts
+    BooleanQuery:
+      type: object
+      properties:
+        must:
+          $ref: '#/components/schemas/ConjunctionQuery'
+        should:
+          $ref: '#/components/schemas/DisjunctionQuery'
+        must_not:
+          $ref: '#/components/schemas/DisjunctionQuery'
+        filter:
+          $ref: '#/components/schemas/Query'
+        boost:
+          $ref: '#/components/schemas/Boost'
+    MatchAllQuery:
+      type: object
+      properties:
+        match_all:
+          type: object
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - match_all
+    MatchNoneQuery:
+      type: object
+      properties:
+        match_none:
+          type: object
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - match_none
+    DocIdQuery:
+      type: object
+      properties:
+        ids:
+          type: array
+          items:
+            type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - ids
+    BoolFieldQuery:
+      type: object
+      properties:
+        bool:
+          type: boolean
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - bool
+    IPRangeQuery:
+      type: object
+      properties:
+        cidr:
+          type: string
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - cidr
+    GeoBoundingBoxQuery:
+      type: object
+      description: >
+        Geographic bounding box filter. The public query shape uses scalar latitude and longitude bounds
+        to match structured filter_query.geo_bbox. Longitude ranges may cross the antimeridian by specifying
+        a western/min longitude that is greater than the eastern/max longitude; for example, min_lon 179.5
+        and max_lon -179.5 matches points near +/-180 degrees longitude. Latitude bounds must be ordered
+        with min_lat <= max_lat.
+      properties:
+        field:
+          type: string
+          description: Field or path containing geo_point values.
+        min_lat:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+          description: Southern latitude bound.
+        min_lon:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+          description: Western longitude bound. If greater than max_lon, the box crosses the antimeridian.
+        max_lat:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+          description: Northern latitude bound. Must be greater than or equal to min_lat.
+        max_lon:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+          description: Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - field
+        - min_lat
+        - min_lon
+        - max_lat
+        - max_lon
+    GeoDistanceQuery:
+      type: object
+      properties:
+        location:
+          type: array
+          items:
+            type: number
+            format: double
+          minItems: 2
+          maxItems: 2
+          description: '[lon, lat]'
+        distance:
+          type: string
+          example: 10km
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - location
+        - distance
+    GeoPoint:
+      type: object
+      properties:
+        lon:
+          type: number
+          format: double
+        lat:
+          type: number
+          format: double
+    GeoBoundingPolygonQuery:
+      type: object
+      properties:
+        polygon_points:
+          type: array
+          items:
+            $ref: '#/components/schemas/GeoPoint'
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - polygon_points
+    GeoShape:
+      type: object
+      description: A GeoJSON shape object. This is a simplified representation.
+      properties:
+        type:
+          type: string
+        coordinates:
+          type: array
+          items: {}
+      required:
+        - type
+        - coordinates
+    GeoShapeGeometry:
+      type: object
+      properties:
+        shape:
+          $ref: '#/components/schemas/GeoShape'
+        relation:
+          type: string
+          enum:
+            - intersects
+            - contains
+            - within
+      required:
+        - shape
+        - relation
+    GeoShapeQuery:
+      type: object
+      properties:
+        geometry:
+          $ref: '#/components/schemas/GeoShapeGeometry'
+        field:
+          type: string
+        boost:
+          $ref: '#/components/schemas/Boost'
+      required:
+        - geometry
+    Query:
+      oneOf:
+        - $ref: '#/components/schemas/TermQuery'
+        - $ref: '#/components/schemas/MatchQuery'
+        - $ref: '#/components/schemas/MultiMatchQuery'
+        - $ref: '#/components/schemas/MatchPhraseQuery'
+        - $ref: '#/components/schemas/PhraseQuery'
+        - $ref: '#/components/schemas/MultiPhraseQuery'
+        - $ref: '#/components/schemas/FuzzyQuery'
+        - $ref: '#/components/schemas/PrefixQuery'
+        - $ref: '#/components/schemas/RegexpQuery'
+        - $ref: '#/components/schemas/WildcardQuery'
+        - $ref: '#/components/schemas/QueryStringQuery'
+        - $ref: '#/components/schemas/NumericRangeQuery'
+        - $ref: '#/components/schemas/TermRangeQuery'
+        - $ref: '#/components/schemas/DateRangeStringQuery'
+        - $ref: '#/components/schemas/BooleanQuery'
+        - $ref: '#/components/schemas/ConjunctionQuery'
+        - $ref: '#/components/schemas/DisjunctionQuery'
+        - $ref: '#/components/schemas/MatchAllQuery'
+        - $ref: '#/components/schemas/MatchNoneQuery'
+        - $ref: '#/components/schemas/DocIdQuery'
+        - $ref: '#/components/schemas/BoolFieldQuery'
+        - $ref: '#/components/schemas/IPRangeQuery'
+        - $ref: '#/components/schemas/GeoBoundingBoxQuery'
+        - $ref: '#/components/schemas/GeoDistanceQuery'
+        - $ref: '#/components/schemas/GeoBoundingPolygonQuery'
+        - $ref: '#/components/schemas/GeoShapeQuery'
     MergeStrategy:
       type: string
       enum:
@@ -20416,7 +20813,8 @@ components:
             - request_queue
         retryable:
           type: boolean
-          description: Whether retrying the same request may succeed
+          x-go-type-skip-optional-pointer: false
+          description: Whether retrying the request may succeed
         retry_after_ms:
           type: integer
           minimum: 0
@@ -21378,13 +21776,15 @@ components:
               enum:
                 - function
             function:
-              type: object
-              required:
-                - name
-              properties:
-                name:
-                  type: string
-                  description: The name of the function to call
+              $ref: '#/components/schemas/InferenceToolChoiceFunction'
+    InferenceToolChoiceFunction:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: The name of the function to call
     InferenceRole:
       $ref: '#/components/schemas/ChatMessageRole'
     InferenceFinishReason:
@@ -21413,6 +21813,31 @@ components:
         tool_call_id:
           type: string
           description: ID of the tool call this message is responding to (only for role=tool)
+    InferenceGenerateStreamOptions:
+      type: object
+      description: Options that apply only to streamed generation responses.
+      properties:
+        include_usage:
+          type: boolean
+          description: >
+            When true, emit a final usage-only chunk before the `[DONE]` sentinel.
+
+            All preceding chunks carry null or omitted usage.
+          default: false
+    InferenceGenerateChatTemplateKwargs:
+      type: object
+      additionalProperties: false
+      description: Typed options passed to the model's chat template.
+      properties:
+        enable_thinking:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: >
+            Controls templates that support an `enable_thinking` variable. False asks the
+
+            template to open a public/final response channel directly. Omitted preserves the
+
+            model template's default behavior.
     InferenceGenerateRequest:
       type: object
       required:
@@ -21430,27 +21855,51 @@ components:
           description: Conversation messages (OpenAI-compatible format)
         max_tokens:
           type: integer
+          minimum: 1
+          maximum: 2147483647
           description: Maximum tokens to generate
           default: 256
           example: 256
         temperature:
           type: number
           format: float
+          x-go-type-skip-optional-pointer: false
           description: Sampling temperature (0.0 = deterministic, higher = more random)
-          default: 1
+          minimum: 0
+          maximum: 2
+          default: 0
           example: 0.7
         top_p:
           type: number
           format: float
+          x-go-type-skip-optional-pointer: false
           description: Nucleus sampling probability
-          default: 1
+          minimum: 0
+          maximum: 1
+          default: 0
         top_k:
           type: integer
+          x-go-type-skip-optional-pointer: false
+          minimum: 0
+          maximum: 2147483647
           description: Top-k sampling (inference extension, not in OpenAI API)
-          default: 50
+          default: 0
         stream:
           type: boolean
           description: If true, partial message deltas will be sent as SSE events
+          default: false
+        stream_options:
+          $ref: '#/components/schemas/InferenceGenerateStreamOptions'
+        chat_template_kwargs:
+          $ref: '#/components/schemas/InferenceGenerateChatTemplateKwargs'
+        ignore_eos:
+          type: boolean
+          description: >
+            inference-native benchmarking and controlled-generation extension. When true, generation
+
+            does not stop on the model's end-of-sequence token and continues until another stop
+
+            condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
           default: false
         tools:
           type: array
@@ -21465,24 +21914,32 @@ components:
           format: float
           description: Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative
             to top_p.
+          minimum: 0
+          maximum: 1
           default: 0
         repetition_penalty:
           type: number
           format: float
           description: Repetition penalty factor applied to previously generated tokens (1.0 = disabled,
             >1.0 penalizes, <1.0 encourages)
+          minimum: 0
+          exclusiveMinimum: true
           default: 1
         frequency_penalty:
           type: number
           format: float
           description: Additive penalty based on token frequency in context (logit -= frequency_penalty
             * count)
+          minimum: -2
+          maximum: 2
           default: 0
         presence_penalty:
           type: number
           format: float
           description: Additive penalty for tokens that appeared at all in context (logit -= presence_penalty
             if count > 0)
+          minimum: -2
+          maximum: 2
           default: 0
         response_format:
           $ref: '#/components/schemas/InferenceGenerateResponseFormat'
@@ -21504,10 +21961,33 @@ components:
             model.
         speculative_k:
           type: integer
+          minimum: 1
+          maximum: 16
           description: >
             inference-native speculative decoding extension. Number of draft tokens proposed per verification
             round.
-          default: 4
+        speculation_policy:
+          type: string
+          enum:
+            - auto
+            - force
+            - 'off'
+          description: >
+            inference-native speculative decoding policy: `auto`, `force`, or `off`.
+
+            Defaults to `auto` when a draft model is requested.
+        speculation_calibration:
+          type: string
+          enum:
+            - none
+            - probe
+            - positive
+          description: >
+            inference-native speculative decoding calibration state: `none`, `probe`, or `positive`.
+
+            Defaults to `probe` for `auto` draft requests so they are measured instead of silently disabled,
+
+            and to `none` for `force` or `off`.
         cache_dtype:
           type: string
           enum:
@@ -21524,6 +22004,7 @@ components:
           type: number
           format: float
           minimum: 0.0
+          exclusiveMinimum: true
           maximum: 1.0
           description: >
             inference-native KV cache compaction ratio applied after prefill via Attention Matching.
@@ -21531,6 +22012,10 @@ components:
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
 
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+
+            The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
+
+            device-backed compaction is not yet supported.
         prompt_cache_key:
           type: string
           maxLength: 256
@@ -21544,6 +22029,12 @@ components:
           type: boolean
           description: >
             inference-native prompt prefix cache control. False bypasses prompt cache for this request.
+
+            On Metal, an eligible cache request stays on the eager paged-attention path instead of
+
+            automatically selecting whole-model compiled execution. Explicit `mode: compiled` is
+
+            rejected while prompt caching is active.
         backend:
           $ref: '#/components/schemas/InferenceModelBackend'
         mode:
@@ -21632,6 +22123,28 @@ components:
           description: List of completion choices (currently always 1)
         usage:
           $ref: '#/components/schemas/InferenceGenerateUsage'
+        speculation:
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/InferenceGenerateSpeculationStatus'
+    InferenceGenerateSpeculationStatus:
+      type: object
+      description: Effective speculative-decoding decision for this completion.
+      required:
+        - policy
+        - calibration
+        - decision
+      properties:
+        policy:
+          type: string
+        calibration:
+          type: string
+        decision:
+          type: string
+        disabled_reason:
+          type: string
+          nullable: true
     InferenceGenerateBatchMode:
       type: string
       enum:
@@ -21670,6 +22183,8 @@ components:
       properties:
         code:
           type: string
+          description: Stable machine-readable item error code, including `CONTENT_TOO_LARGE` for aggregate
+            media-budget failures.
         message:
           type: string
         retryable:
@@ -21802,6 +22317,22 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/InferenceGenerateChunkChoice'
+        usage:
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          description: >
+            Authoritative token accounting. When `stream_options.include_usage` is true,
+
+            streaming responses emit this only on the final chunk, after the finish chunk
+
+            and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
+          allOf:
+            - $ref: '#/components/schemas/InferenceGenerateUsage'
+        speculation:
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/InferenceGenerateSpeculationStatus'
     InferenceGenerateChunkChoice:
       type: object
       required:
@@ -21975,17 +22506,26 @@ components:
           description: >
             Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
 
-            full KV blocks under prompt_cache_key with O(1) block lookup and is the
+            full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an
 
-            scalable production mode. `simple` keeps the linear-scan retained-prefix
+            opt-in page-aligned compressed radix tree with shared-prefix ownership and
 
-            cache and is only suitable for small caches or debugging.
+            leaf-only LRU eviction; it is currently qualified for native and Metal
+
+            backends. Eligible Metal requests use eager paged attention; explicit compiled
+
+            generation is incompatible with prompt caching. `simple` keeps the linear-scan
+
+            retained-prefix cache and is only suitable for small caches or debugging.
           enum:
             - simple
             - block_hash
+            - radix
           default: block_hash
         max_bytes_mb:
           type: integer
+          minimum: 0
+          maximum: 17592186044415
           description: >
             Node-wide target for live prompt-cache entries. The runtime divides it
 
@@ -21997,10 +22537,13 @@ components:
           default: 512
         min_tokens:
           type: integer
+          minimum: 0
           description: Minimum prompt length eligible for prompt KV caching.
           default: 64
         ttl_ms:
           type: integer
+          minimum: 0
+          maximum: 9223372036854775807
           description: >
             Idle time-to-live for prompt KV cache entries. Refreshed on every cache
 
@@ -22050,8 +22593,22 @@ components:
           example: ~/.antfly/inference/ml
         content_security:
           $ref: '#/components/schemas/InferenceContentSecurityConfig'
-          description: Security settings for downloading content from URLs (e.g., images for CLIP models).
-            Controls allowed hosts, private IP blocking, download limits, and timeouts.
+          description: Configured fields are merged individually over a fail-closed inference baseline.
+            Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts
+            and allowed_paths remain explicit deny-all lists even when another field is configured. Enable
+            remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled,
+            IP literals and every address resolved from an allowlisted DNS hostname must be globally routable,
+            and the connection is pinned to a vetted address. Setting it to false explicitly opts into
+            private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded
+            and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes,
+            and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes
+            disables nonempty media. Remote URL byte potential is reserved before fetch, while inline
+            sources use their actual encoded size. Accepted image inputs also undergo header-only dimension
+            and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal
+            content before fetch. Embedded direct transcription and extraction use the configured encoded-media
+            per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image
+            admission. In unified Antfly configuration, an empty inference policy may first inherit a
+            nonempty remote_content security policy, which is then merged over this baseline.
         s3_credentials:
           $ref: '#/components/schemas/InferenceCredentials'
           description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
@@ -22084,15 +22641,10 @@ components:
         pool_size:
           type: integer
           description: >
-            Number of concurrent inference pipelines per model. Each pipeline loads
+            Legacy compatibility field. The current Zig inference runtime does not
 
-            a copy of the model, so higher values use more memory but allow more
-
-            concurrent requests. Note: pool_size multiplies per-model memory
-
-            independently of max_loaded_models.
-          default: 1
-          example: 1
+            create per-model pipeline pools from this setting; configuring it has no effect.
+          deprecated: true
         prompt_cache:
           $ref: '#/components/schemas/InferencePromptCacheConfig'
           description: Native generator prompt KV cache settings.
@@ -22101,60 +22653,55 @@ components:
           items:
             $ref: '#/components/schemas/InferenceBackendPriorityEntry'
           description: >
-            Backend priority order for model loading with optional device specifiers.
+            Legacy compatibility field. The current Zig inference runtime selects a
 
-            Format: `backend` or `backend:device` where device defaults to `auto`.
+            backend from model metadata, explicit preload settings, and compiled capabilities;
 
-
-            Antfly inference tries entries in order and uses the first available backend+device
-
-            combination that supports the model.
-
-
-            **Examples**:
-
-            - `["native", "onnx", "xla"]` - Try backends with auto device detection
-
-            - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
-          default:
-            - native
-            - onnx
-            - xla
-          example:
-            - cuda
-            - onnx:cuda
-            - xla:tpu
-            - native
+            configuring this list has no effect.
+          deprecated: true
         max_concurrent_requests:
           type: integer
           description: >
-            Maximum number of concurrent inference requests allowed.
+            Maximum concurrent weighted inference admission units in the Zig runtime.
 
-            Additional requests will be queued up to max_queue_size.
+            Request body size, generation workload, and image byte/count reservations
 
-            Set to 0 for unlimited (default).
-          default: 0
-          example: 4
+            can consume more than one unit. Read and image-extraction admission reserves the
+
+            effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per
+
+            two images. A positive capacity also clamps each such request's downloaded-image
+
+            ceiling to 16 MiB times this value. Set to 0 disables both admission accounting
+
+            and that capacity-derived clamp.
+
+            When a positive limit is exhausted, new requests are rejected immediately
+
+            with 503 Service Unavailable and Retry-After: 1; they are not retained in
+
+            an in-process queue. Set to 0 only as an operational escape hatch for
+
+            trusted testing environments; unlimited admission is not recommended for
+
+            production native generation. Use a positive production limit. The default is 32.
+          minimum: 0
+          default: 32
+          example: 32
         max_queue_size:
           type: integer
           description: >
-            Maximum number of requests to queue when max_concurrent_requests is reached.
+            Legacy Go-runtime queue setting. The current Zig runtime does not retain
 
-            When the queue is full, new requests receive 503 Service Unavailable with Retry-After header.
-
-            Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
-          default: 0
-          example: 100
+            excess inference requests in memory and ignores this field.
+          deprecated: true
         request_timeout:
           type: string
           description: >
-            Maximum time to wait for a request to complete, including queue wait time.
+            Legacy Go-runtime queue/request timeout. The current Zig runtime ignores
 
-            Use Go duration format: "30s", "1m", "0" (no timeout, default).
-
-            Requests exceeding this timeout receive 504 Gateway Timeout.
-          default: '0'
-          example: 30s
+            this field; its HTTP listener applies a separate fixed transport timeout.
+          deprecated: true
         preload:
           type: array
           description: >
@@ -22176,17 +22723,10 @@ components:
         max_memory_mb:
           type: integer
           description: >
-            Maximum memory (in MB) to use for loaded models.
+            Legacy compatibility field. The current Zig runtime uses explicit host,
 
-            When this limit is approached, least recently used models are unloaded.
-
-            Set to 0 for unlimited (default). This is an advisory limit - actual memory
-
-            usage depends on model sizes and may temporarily exceed this value.
-
-            Works alongside max_loaded_models for fine-grained control.
-          default: 0
-          example: 4096
+            backend, combined, KV, and scratch budgets instead and ignores this field.
+          deprecated: true
         model_strategies:
           type: object
           additionalProperties:
@@ -22217,13 +22757,17 @@ components:
         allow_downloads:
           type: boolean
           description: >
-            Whether the dashboard should show model download commands.
+            Legacy compatibility field controlling whether dashboards show model
 
-            Defaults to true for standalone inference and Antfly standalone deployments. Set to false
-            in managed
+            download commands. It defaults to true for standalone deployments;
 
-            deployments (e.g., Kubernetes operator) where models are managed externally.
+            managed deployments historically set it to false. Download-command
+
+            availability is a build-time setting in the current Zig runtime, so
+
+            configuring this field has no effect.
           default: true
+          deprecated: true
         log:
           $ref: '#/components/schemas/Inferenceschemas-Config'
     InferenceBackendRuntimes:
@@ -22295,21 +22839,25 @@ components:
           description: 'Animation: display delay in milliseconds'
     InferenceContentSecurityConfig:
       type: object
+      description: Inference merges configured fields over a fail-closed baseline. HTTP(S), file, and
+        S3 content require explicit allowlists; data URIs remain allowed within the configured size budget.
       properties:
         allowed_hosts:
           type: array
-          description: Whitelist of allowed hostnames/IPs for link downloads. If empty, all hosts are
-            allowed (except private IPs if block_private_ips is true).
+          description: Explicit HTTP(S) host allowlist for inference downloads. Omission and an explicit
+            empty list both deny all hosts. With block_private_ips enabled, IP literals and every address
+            resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned
+            to a vetted address.
           items:
             type: string
           example:
-            - example.com
-            - cdn.example.com
-            - 192.0.2.1
+            - 93.184.216.34
         block_private_ips:
           type: boolean
-          description: Block requests to private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
-            169.254.0.0/16)
+          description: Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast
+            destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy,
+            and the connection is pinned to a vetted address. Set false only as an explicit opt-out that
+            permits private and special destinations.
           default: true
         max_download_size_bytes:
           type: integer
@@ -22320,21 +22868,22 @@ components:
           x-go-type: int64
         download_timeout_seconds:
           type: integer
-          description: Timeout for individual download operations in seconds
+          description: Maximum HTTP download duration in seconds. Defaults to 30; 0 disables the deadline.
           default: 30
-          minimum: 1
-          example: 30
+          minimum: 0
         max_image_dimension:
           type: integer
-          description: Maximum image width/height in pixels (images will be resized)
-          default: 2048
+          description: Maximum source-image width or height for accepted inference image inputs, including
+            generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded
+            direct APIs. Headers exceeding this limit are rejected before model execution; images are
+            not resized. Batch generation rejects multimodal content before fetch. Non-inference scraping
+            consumers do not enforce this setting.
           minimum: 1
-          example: 2048
         allowed_paths:
           type: array
-          description: Whitelist of allowed path prefixes for file:// and s3:// URLs. If empty, all paths
-            are allowed. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix
-            (e.g., my-bucket/uploads/).
+          description: Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission and
+            an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g.,
+            /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
           items:
             type: string
           example:
@@ -22395,7 +22944,9 @@ components:
       example: terminal
     Inferenceschemas-Config:
       type: object
-      description: Logging configuration for inference services
+      description: Legacy inference-local logging configuration. The current unified Zig runtime ignores
+        it; configure the top-level `log` object instead.
+      deprecated: true
       properties:
         level:
           $ref: '#/components/schemas/InferenceLevel'

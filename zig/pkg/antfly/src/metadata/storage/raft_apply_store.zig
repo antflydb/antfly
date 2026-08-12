@@ -19,7 +19,7 @@ const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const group_ids = @import("../../common/group_ids.zig");
 const docstore = @import("../../storage/docstore.zig");
 const lsm_backend = @import("../../storage/lsm_backend.zig");
-const metadata = @import("../mod.zig");
+const metadata = @import("../domain.zig");
 const metadata_incarnation = @import("../incarnation.zig");
 const transition_state = @import("../transition_state.zig");
 const extension_domain = @import("../../extensions/mod.zig");
@@ -1164,6 +1164,10 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn listPlacementIntents(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]raft_reconciler.PlacementIntent {
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
+
         try self.ensurePlacementIntentsLoaded(alloc, group_id);
 
         var count: usize = 0;
@@ -1174,11 +1178,7 @@ pub const RaftApplyStore = struct {
         const out = try alloc.alloc(raft_reconciler.PlacementIntent, count);
         var initialized: usize = 0;
         errdefer {
-            for (out[0..initialized]) |intent| {
-                var record = intent.record;
-                record.deinit(alloc);
-                if (intent.peer_node_ids.len > 0) alloc.free(intent.peer_node_ids);
-            }
+            for (out[0..initialized]) |intent| freePlacementIntent(alloc, intent);
             alloc.free(out);
         }
 
@@ -1191,6 +1191,10 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn listLocalPlacementIntents(self: *RaftApplyStore, alloc: std.mem.Allocator, metadata_group_id: u64, local_node_id: u64) ![]raft_reconciler.PlacementIntent {
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
+
         try self.ensurePlacementIntentsLoaded(alloc, metadata_group_id);
 
         var count: usize = 0;
@@ -4438,9 +4442,7 @@ fn clonePlacementIntent(alloc: std.mem.Allocator, intent: raft_reconciler.Placem
 }
 
 fn freePlacementIntent(alloc: std.mem.Allocator, intent: raft_reconciler.PlacementIntent) void {
-    var record = intent.record;
-    record.deinit(alloc);
-    if (intent.peer_node_ids.len > 0) alloc.free(intent.peer_node_ids);
+    raft_reconciler.freeIntentOwned(alloc, intent);
 }
 
 fn decodeNodeRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.NodeRecord {

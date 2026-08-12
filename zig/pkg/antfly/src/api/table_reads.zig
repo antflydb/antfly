@@ -19,7 +19,7 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const scraping = @import("antfly_scraping");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
-const metadata_mod = @import("../metadata/mod.zig");
+const metadata_mod = @import("../metadata/domain.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const common_secrets = @import("../common/secrets.zig");
 const threaded_io_limits = @import("../common/threaded_io_limits.zig");
@@ -55,6 +55,7 @@ const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
+const table_read_source = @import("table_read_source.zig");
 
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
@@ -148,58 +149,13 @@ fn nsToUsFloat(ns: u64) f64 {
 const algebraic_law = db_mod.algebraic.law;
 const algebraic_planner = db_mod.algebraic.planner;
 
-pub const LookupResponse = struct {
-    json: []u8,
-    version: u64,
-
-    pub fn deinit(self: *LookupResponse, alloc: std.mem.Allocator) void {
-        alloc.free(self.json);
-        self.* = undefined;
-    }
-};
-
-pub const ScanResponse = struct {
-    ndjson: []u8,
-
-    pub fn deinit(self: *ScanResponse, alloc: std.mem.Allocator) void {
-        alloc.free(self.ndjson);
-        self.* = undefined;
-    }
-};
-
-pub const TextStatsResponse = struct {
-    fields: []const distributed_stats_mod.TextFieldStats,
-
-    pub fn deinit(self: *TextStatsResponse, alloc: std.mem.Allocator) void {
-        distributed_stats_mod.deinitTextFieldStats(alloc, self.fields);
-        self.* = undefined;
-    }
-};
-
-pub const BackgroundTextStatsResponse = struct {
-    background_fields: []const db_mod.aggregations.DistributedBackgroundTextStats,
-
-    pub fn deinit(self: *BackgroundTextStatsResponse, alloc: std.mem.Allocator) void {
-        db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, self.background_fields);
-        self.* = undefined;
-    }
-};
-
-pub const LsmStorageStats = runtime_status.LsmStorageStats;
-pub const ObservedDynamicFieldCapabilitySet = db_mod.IndexManager.ObservedDynamicFieldCapabilitySet;
-
-pub const ParsedTextStatsHttpResponse = union(enum) {
-    fields: TextStatsResponse,
-    background_fields: BackgroundTextStatsResponse,
-
-    pub fn deinit(self: *ParsedTextStatsHttpResponse, alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .fields => |*value| value.deinit(alloc),
-            .background_fields => |*value| value.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
+pub const LookupResponse = table_read_source.LookupResponse;
+pub const ScanResponse = table_read_source.ScanResponse;
+pub const TextStatsResponse = table_read_source.TextStatsResponse;
+pub const BackgroundTextStatsResponse = table_read_source.BackgroundTextStatsResponse;
+pub const LsmStorageStats = table_read_source.LsmStorageStats;
+pub const ObservedDynamicFieldCapabilitySet = table_read_source.ObservedDynamicFieldCapabilitySet;
+pub const ParsedTextStatsHttpResponse = table_read_source.ParsedTextStatsHttpResponse;
 
 pub const testing = if (builtin.is_test) struct {
     pub fn rejectResolvedDocFilterForCrossGroup(req: db_mod.types.SearchRequest, group_count: usize) !void {
@@ -1751,599 +1707,7 @@ const ParsedTextStatsRequest = union(TextStatsRequestMode) {
     }
 };
 
-pub const TableReadSource = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        lookup: *const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            key: []const u8,
-            opts: db_mod.types.LookupOptions,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?LookupResponse,
-        scan: *const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            from_key: []const u8,
-            to_key: []const u8,
-            opts: db_mod.types.ScanOptions,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?ScanResponse,
-        query: *const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            req: db_mod.types.SearchRequest,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?query_api.QueryResponse,
-        preflight_query: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            req: db_mod.types.SearchRequest,
-            consistency: raft_mod.ReadConsistency,
-            max_work: u32,
-        ) anyerror!?db_mod.RuntimePreflightSummary = null,
-        preflight_query_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            req: db_mod.types.SearchRequest,
-            consistency: raft_mod.ReadConsistency,
-            max_work: u32,
-        ) anyerror!?db_mod.RuntimePreflightSummary = null,
-        lookup_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            key: []const u8,
-            opts: db_mod.types.LookupOptions,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?LookupResponse = null,
-        scan_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            from_key: []const u8,
-            to_key: []const u8,
-            opts: db_mod.types.ScanOptions,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?ScanResponse = null,
-        query_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            req: db_mod.types.SearchRequest,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?query_api.QueryResponse = null,
-        search_result_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            req: db_mod.types.SearchRequest,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?db_mod.types.SearchResult = null,
-        text_stats_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            body: []const u8,
-        ) anyerror!?query_api.QueryResponse = null,
-        algebraic_partials_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            body: []const u8,
-        ) anyerror!?query_api.QueryResponse = null,
-        join_partition_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            body: []const u8,
-        ) anyerror!?query_api.QueryResponse = null,
-        join_rows_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            body: []const u8,
-        ) anyerror!?query_api.QueryResponse = null,
-        join_unmatched_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            body: []const u8,
-        ) anyerror!?query_api.QueryResponse = null,
-        join_finalize_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            body: []const u8,
-        ) anyerror!?query_api.QueryResponse = null,
-        join_partition_group_local_with_timeout: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            body: []const u8,
-            timeout_ms: ?u32,
-        ) anyerror!?query_api.QueryResponse = null,
-        join_rows_group_local_with_timeout: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            body: []const u8,
-            timeout_ms: ?u32,
-        ) anyerror!?query_api.QueryResponse = null,
-        join_unmatched_group_local_with_timeout: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            body: []const u8,
-            timeout_ms: ?u32,
-        ) anyerror!?query_api.QueryResponse = null,
-        join_finalize_group_local_with_timeout: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            body: []const u8,
-            timeout_ms: ?u32,
-        ) anyerror!?query_api.QueryResponse = null,
-        join_job_state_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            body: []const u8,
-        ) anyerror!?query_api.QueryResponse = null,
-        graph_expand_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            req: distributed_graph.GraphExpandRequest,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?distributed_graph.GraphExpandResponse = null,
-        graph_hydrate_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            req: distributed_graph.GraphHydrateRequest,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?distributed_graph.GraphHydrateResponse = null,
-        graph_edges_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            req: distributed_graph.GraphEdgesRequest,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?distributed_graph.GraphEdgesResponse = null,
-        local_runtime_statuses: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-        ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
-        lsm_storage_stats: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-        ) anyerror!?LsmStorageStats = null,
-        observed_dynamic_field_capability_sets: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-        ) anyerror!?[]ObservedDynamicFieldCapabilitySet = null,
-        document_artifact_manifest: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            doc_key: []const u8,
-            artifact_name: []const u8,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?db_mod.types.DocumentArtifactManifest = null,
-        document_artifact_manifests: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            doc_key: []const u8,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?db_mod.types.DocumentArtifactManifestList = null,
-        document_artifact_manifest_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            doc_key: []const u8,
-            artifact_name: []const u8,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?db_mod.types.DocumentArtifactManifest = null,
-        document_artifact_manifests_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            doc_key: []const u8,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?db_mod.types.DocumentArtifactManifestList = null,
-    };
-
-    pub fn lookup(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        key: []const u8,
-        opts: db_mod.types.LookupOptions,
-        consistency: raft_mod.ReadConsistency,
-    ) !?LookupResponse {
-        return try self.vtable.lookup(self.ptr, alloc, table_name, key, opts, consistency);
-    }
-
-    pub fn scan(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        from_key: []const u8,
-        to_key: []const u8,
-        opts: db_mod.types.ScanOptions,
-        consistency: raft_mod.ReadConsistency,
-    ) !?ScanResponse {
-        return try self.vtable.scan(self.ptr, alloc, table_name, from_key, to_key, opts, consistency);
-    }
-
-    pub fn documentArtifactManifest(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-        consistency: raft_mod.ReadConsistency,
-    ) !?db_mod.types.DocumentArtifactManifest {
-        const fn_ptr = self.vtable.document_artifact_manifest orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name, consistency);
-    }
-
-    pub fn documentArtifactManifestGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-        consistency: raft_mod.ReadConsistency,
-    ) !?db_mod.types.DocumentArtifactManifest {
-        const fn_ptr = self.vtable.document_artifact_manifest_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency);
-    }
-
-    pub fn documentArtifactManifests(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        doc_key: []const u8,
-        consistency: raft_mod.ReadConsistency,
-    ) !?db_mod.types.DocumentArtifactManifestList {
-        const fn_ptr = self.vtable.document_artifact_manifests orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, doc_key, consistency);
-    }
-
-    pub fn documentArtifactManifestsGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        doc_key: []const u8,
-        consistency: raft_mod.ReadConsistency,
-    ) !?db_mod.types.DocumentArtifactManifestList {
-        const fn_ptr = self.vtable.document_artifact_manifests_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, consistency);
-    }
-
-    pub fn query(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        req: db_mod.types.SearchRequest,
-        consistency: raft_mod.ReadConsistency,
-    ) !?query_api.QueryResponse {
-        return try self.vtable.query(self.ptr, alloc, table_name, req, consistency);
-    }
-
-    pub fn preflightQuery(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        req: db_mod.types.SearchRequest,
-        consistency: raft_mod.ReadConsistency,
-        max_work: u32,
-    ) !?db_mod.RuntimePreflightSummary {
-        const fn_ptr = self.vtable.preflight_query orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, req, consistency, max_work);
-    }
-
-    pub fn preflightQueryGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        req: db_mod.types.SearchRequest,
-        consistency: raft_mod.ReadConsistency,
-        max_work: u32,
-    ) !?db_mod.RuntimePreflightSummary {
-        const fn_ptr = self.vtable.preflight_query_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, consistency, max_work);
-    }
-
-    pub fn lookupGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        key: []const u8,
-        opts: db_mod.types.LookupOptions,
-        consistency: raft_mod.ReadConsistency,
-    ) !?LookupResponse {
-        const fn_ptr = self.vtable.lookup_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, key, opts, consistency);
-    }
-
-    pub fn scanGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        from_key: []const u8,
-        to_key: []const u8,
-        opts: db_mod.types.ScanOptions,
-        consistency: raft_mod.ReadConsistency,
-    ) !?ScanResponse {
-        const fn_ptr = self.vtable.scan_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, from_key, to_key, opts, consistency);
-    }
-
-    pub fn queryGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        req: db_mod.types.SearchRequest,
-        consistency: raft_mod.ReadConsistency,
-    ) !?query_api.QueryResponse {
-        const fn_ptr = self.vtable.query_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, consistency);
-    }
-
-    pub fn searchResultGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        req: db_mod.types.SearchRequest,
-        consistency: raft_mod.ReadConsistency,
-    ) !?db_mod.types.SearchResult {
-        const fn_ptr = self.vtable.search_result_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, consistency);
-    }
-
-    pub fn textStatsGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        body: []const u8,
-    ) !?query_api.QueryResponse {
-        const fn_ptr = self.vtable.text_stats_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
-    }
-
-    pub fn algebraicPartialsGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        body: []const u8,
-    ) !?query_api.QueryResponse {
-        const fn_ptr = self.vtable.algebraic_partials_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
-    }
-
-    pub fn joinPartitionGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        body: []const u8,
-    ) !?query_api.QueryResponse {
-        const fn_ptr = self.vtable.join_partition_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
-    }
-
-    pub fn joinRowsGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        body: []const u8,
-    ) !?query_api.QueryResponse {
-        const fn_ptr = self.vtable.join_rows_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
-    }
-
-    pub fn joinUnmatchedGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        body: []const u8,
-    ) !?query_api.QueryResponse {
-        const fn_ptr = self.vtable.join_unmatched_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
-    }
-
-    pub fn joinFinalizeGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        body: []const u8,
-    ) !?query_api.QueryResponse {
-        const fn_ptr = self.vtable.join_finalize_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
-    }
-
-    pub fn joinPartitionGroupLocalWithTimeout(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        body: []const u8,
-        timeout_ms: ?u32,
-    ) !?query_api.QueryResponse {
-        if (self.vtable.join_partition_group_local_with_timeout) |fn_ptr| {
-            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
-        }
-        if (timeout_ms != null) return error.UnsupportedDeadline;
-        return try self.joinPartitionGroupLocal(alloc, group_id, table_name, body);
-    }
-
-    pub fn joinRowsGroupLocalWithTimeout(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        body: []const u8,
-        timeout_ms: ?u32,
-    ) !?query_api.QueryResponse {
-        if (self.vtable.join_rows_group_local_with_timeout) |fn_ptr| {
-            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
-        }
-        if (timeout_ms != null) return error.UnsupportedDeadline;
-        return try self.joinRowsGroupLocal(alloc, group_id, table_name, body);
-    }
-
-    pub fn joinUnmatchedGroupLocalWithTimeout(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        body: []const u8,
-        timeout_ms: ?u32,
-    ) !?query_api.QueryResponse {
-        if (self.vtable.join_unmatched_group_local_with_timeout) |fn_ptr| {
-            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
-        }
-        if (timeout_ms != null) return error.UnsupportedDeadline;
-        return try self.joinUnmatchedGroupLocal(alloc, group_id, table_name, body);
-    }
-
-    pub fn joinFinalizeGroupLocalWithTimeout(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        body: []const u8,
-        timeout_ms: ?u32,
-    ) !?query_api.QueryResponse {
-        if (self.vtable.join_finalize_group_local_with_timeout) |fn_ptr| {
-            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
-        }
-        if (timeout_ms != null) return error.UnsupportedDeadline;
-        return try self.joinFinalizeGroupLocal(alloc, group_id, table_name, body);
-    }
-
-    pub fn joinJobStateGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        body: []const u8,
-    ) !?query_api.QueryResponse {
-        const fn_ptr = self.vtable.join_job_state_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
-    }
-
-    pub fn graphExpandGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        req: distributed_graph.GraphExpandRequest,
-        consistency: raft_mod.ReadConsistency,
-    ) !?distributed_graph.GraphExpandResponse {
-        const fn_ptr = self.vtable.graph_expand_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, consistency);
-    }
-
-    pub fn graphHydrateGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        req: distributed_graph.GraphHydrateRequest,
-        consistency: raft_mod.ReadConsistency,
-    ) !?distributed_graph.GraphHydrateResponse {
-        const fn_ptr = self.vtable.graph_hydrate_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, consistency);
-    }
-
-    pub fn graphEdgesGroupLocal(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        req: distributed_graph.GraphEdgesRequest,
-        consistency: raft_mod.ReadConsistency,
-    ) !?distributed_graph.GraphEdgesResponse {
-        const fn_ptr = self.vtable.graph_edges_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, consistency);
-    }
-
-    pub fn localRuntimeStatuses(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-    ) !?runtime_status.LocalTableRuntimeStatuses {
-        const fn_ptr = self.vtable.local_runtime_statuses orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name);
-    }
-
-    pub fn lsmStorageStats(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-    ) !?LsmStorageStats {
-        const fn_ptr = self.vtable.lsm_storage_stats orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name);
-    }
-
-    pub fn observedDynamicFieldCapabilitySets(
-        self: TableReadSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-    ) !?[]ObservedDynamicFieldCapabilitySet {
-        const fn_ptr = self.vtable.observed_dynamic_field_capability_sets orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name);
-    }
-};
-
+pub const TableReadSource = table_read_source.TableReadSource;
 pub fn searchRequestFromVectorWorkerEnvelope(envelope: *const query_contract.OwnedAlgebraicVectorWorkerRequestEnvelope) db_mod.types.SearchRequest {
     var req = switch (envelope.query) {
         .dense => |dense| db_mod.types.SearchRequest{
@@ -14123,6 +13487,12 @@ const RemoteDocumentArtifactManifest = struct {
     unsupported_reason: ?[]const u8 = null,
     unit_count: usize = 0,
     chunk_count: usize = 0,
+    ocr_attempted_count: usize = 0,
+    ocr_selected_count: usize = 0,
+    ocr_retained_embedded_count: usize = 0,
+    ocr_failed_count: usize = 0,
+    ocr_failed_page_numbers: []const i64 = &.{},
+    ocr_failed_pages_truncated: bool = false,
     child_ranges: []const ChildRange = &.{},
     child_range_count: usize = 0,
     merge_status: []const u8 = "",
@@ -14205,6 +13575,11 @@ fn remoteDocumentArtifactManifestAlloc(alloc: std.mem.Allocator, remote: RemoteD
     errdefer if (last_error_code) |value| alloc.free(value);
     const last_error_message = if (remote.last_error_message) |value| try alloc.dupe(u8, value) else null;
     errdefer if (last_error_message) |value| alloc.free(value);
+    const ocr_failed_page_numbers: []i64 = if (remote.ocr_failed_page_numbers.len > 0)
+        try alloc.dupe(i64, remote.ocr_failed_page_numbers)
+    else
+        @constCast(&.{});
+    errdefer if (ocr_failed_page_numbers.len > 0) alloc.free(ocr_failed_page_numbers);
 
     return .{
         .document_id = document_id,
@@ -14221,6 +13596,12 @@ fn remoteDocumentArtifactManifestAlloc(alloc: std.mem.Allocator, remote: RemoteD
         .unsupported_reason = unsupported_reason,
         .unit_count = remote.unit_count,
         .chunk_count = remote.chunk_count,
+        .ocr_attempted_count = remote.ocr_attempted_count,
+        .ocr_selected_count = remote.ocr_selected_count,
+        .ocr_retained_embedded_count = remote.ocr_retained_embedded_count,
+        .ocr_failed_count = remote.ocr_failed_count,
+        .ocr_failed_page_numbers = ocr_failed_page_numbers,
+        .ocr_failed_pages_truncated = remote.ocr_failed_pages_truncated,
         .child_ranges = child_ranges,
         .child_range_count = if (remote.child_range_count > 0) remote.child_range_count else child_ranges.len,
         .merge_status = merge_status,

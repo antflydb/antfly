@@ -5,11 +5,13 @@ on:
     branches: [main]
     paths:
       - "py/**"
+      - "openapi.yaml"
       - ".github/workflows/py-ci.yml"
   pull_request:
     branches: [main]
     paths:
       - "py/**"
+      - "openapi.yaml"
       - ".github/workflows/py-ci.yml"
 
 env:

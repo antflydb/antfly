@@ -30,7 +30,6 @@ const backend_scan = @import("backend_scan.zig");
 const docstore = @import("docstore.zig");
 const DocStore = docstore.DocStore;
 const internal_keys = @import("internal_keys.zig");
-const lmdb = @import("lmdb.zig");
 const platform_time = @import("antfly_platform").time;
 
 pub const TtlConfig = struct {
@@ -59,7 +58,7 @@ pub fn readTimestamp(store: *DocStore, alloc: Allocator, key: []const u8) !?u64 
     const ts_key = try internal_keys.ttlKeyAlloc(alloc, key);
     defer alloc.free(ts_key);
     const val = store.get(alloc, ts_key) catch |err| switch (err) {
-        lmdb.Error.NotFound => return null,
+        error.NotFound => return null,
         else => return err,
     };
     defer alloc.free(val);
@@ -256,7 +255,7 @@ test "cleanupExpired deletes expired, preserves unexpired" {
 
     // doc1 should be gone
     const doc1 = store.get(alloc, doc1_key) catch |err| switch (err) {
-        lmdb.Error.NotFound => null,
+        error.NotFound => null,
         else => return err,
     };
     try std.testing.expect(doc1 == null);
@@ -293,7 +292,7 @@ test "ttl timestamp keys support arbitrary document ids" {
         .grace_period_ns = 0,
     }, 7_000_000_000, 100);
     try std.testing.expectEqual(@as(u32, 1), deleted);
-    try std.testing.expectError(lmdb.Error.NotFound, store.get(alloc, doc_key));
+    try std.testing.expectError(error.NotFound, store.get(alloc, doc_key));
 }
 
 test "grace period prevents premature cleanup" {

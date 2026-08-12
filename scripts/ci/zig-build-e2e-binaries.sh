@@ -28,15 +28,26 @@ export ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$repo_root/zig/.zig-cache}"
 export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-/tmp/antfly-ci-zig-global}"
 mkdir -p "$HOME" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 
-target="${ANTFLY_CI_ZIG_TARGET:-x86_64-linux-gnu}"
 cpu="${ANTFLY_CI_ZIG_CPU:-baseline}"
 optimize="${ANTFLY_CI_ZIG_OPTIMIZE:-Debug}"
+target_args=()
+if [[ -n "${ANTFLY_CI_ZIG_TARGET:-}" ]]; then
+  target_args+=("-Dtarget=$ANTFLY_CI_ZIG_TARGET")
+fi
 strip="${ANTFLY_CI_ZIG_STRIP:-false}"
+build_capi="${ANTFLY_CI_BUILD_CAPI:-false}"
 
 case "$strip" in
   true|false) ;;
   *)
     echo "ANTFLY_CI_ZIG_STRIP must be true or false, got: $strip" >&2
+    exit 2
+    ;;
+esac
+case "$build_capi" in
+  true|false) ;;
+  *)
+    echo "ANTFLY_CI_BUILD_CAPI must be true or false, got: $build_capi" >&2
     exit 2
     ;;
 esac
@@ -46,12 +57,20 @@ cd "$repo_root/zig"
 uname -a
 zig version
 
-zig build \
-  -Dtarget="$target" \
+build_steps=(antfly)
+if [[ "$build_capi" == "true" ]]; then
+  build_steps+=(capi capi-smoke)
+fi
+
+python3 tools/run_bounded_zig_build.py --zig zig -- build \
+  "${target_args[@]}" \
   -Dcpu="$cpu" \
   -Doptimize="$optimize" \
   -Dstrip="$strip" \
-  -Dedition=full \
-  install
+  "${build_steps[@]}"
 
 chmod +x zig-out/bin/antfly
+
+if [[ "$build_capi" == "true" ]]; then
+  "$script_dir/zig-production-runtime-smoke.sh" zig-out/bin/antfly
+fi

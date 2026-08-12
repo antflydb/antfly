@@ -19,7 +19,7 @@ class InferenceError:
         error (str): Stable machine-readable error code
         message (str | Unset): Human-readable error description
         reason (InferenceErrorReason | Unset): Machine-readable capacity source when the failure is retryable
-        retryable (bool | Unset): Whether retrying the same request may succeed
+        retryable (bool | Unset): Whether retrying the request may succeed
         retry_after_ms (int | Unset): Minimum retry delay in milliseconds
     """
 

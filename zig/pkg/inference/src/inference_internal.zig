@@ -30,6 +30,8 @@ pub const runtime = @import("runtime/root.zig");
 pub const util = @import("util/util.zig");
 pub const native_backend_guard = @import("native_backend_guard.zig");
 pub const native_backend_choice = @import("native_backend_choice.zig");
+pub const metal_generated_quant_stats = @import("metal_generated_quant_stats.zig");
+pub const kernel_jit_profile_output = @import("kernel_jit_profile_output.zig");
 pub const server = struct {
     pub const model_manager = @import("server/model_manager.zig");
 };

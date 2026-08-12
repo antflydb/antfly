@@ -1,0 +1,25 @@
+{
+  "schema": "antfly.prompt_fixture.v1",
+  "id": "gemma4-search-retrieval-long-v1",
+  "description": "Search-style indexed-file evidence prompt used by the Gemma 4 long-context production benchmark.",
+  "segment": "You answer questions about indexed files using only evidence. Evidence: Spella Caffe Logo.pdf is in /Users/timkaye/Downloads. Spella Caffe Logo Two Color.pdf is in /Users/timkaye/Downloads. Ignore unrelated source code. ",
+  "repeat": 36,
+  "suffix": "\n\nUsing only this evidence, write a detailed asset-location handoff of 220 to 260 words. Name both Spella files and their exact directory, distinguish the two variants, explain the evidence limitations, and give concise verification steps without inventing any other path.",
+  "expected_user_utf8_bytes": 8192,
+  "expected_user_sha256": "622d1cf25efdaa8717d9a200e6aee381a5f7b3f5f60dae268c66bc04204e251b",
+  "reference_chat_prefix": "<|turn>user\n",
+  "reference_chat_suffix": "<turn|>\n<|turn>model\n<|channel>final\n<channel|>",
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
+  "response_channel": "public_final",
+  "expected_output_substrings": [
+    "Spella Caffe Logo.pdf",
+    "Spella Caffe Logo Two Color.pdf",
+    "/Users/timkaye/Downloads"
+  ],
+  "minimum_visible_utf8_bytes": 800,
+  "expected_reference_prompt_utf8_bytes": 8251,
+  "expected_reference_prompt_sha256": "0f9791a0344f4e302f60a6ad2cdaee80efe9212f00d49bfccd499c21cf64a6ef",
+  "expected_reference_prompt_tokens": 2051
+}

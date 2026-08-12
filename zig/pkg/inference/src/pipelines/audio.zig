@@ -29,6 +29,8 @@ pub const detectFormat = generic.detectFormat;
 pub const detectFormatFromMime = generic.detectFormatFromMime;
 pub const detectFormatFromFilename = generic.detectFormatFromFilename;
 pub const decode = generic.decode;
+pub const decodeBounded = generic.decodeBounded;
+pub const default_decode_working_bytes = generic.default_decode_working_bytes;
 pub const decodeInterleaved = generic.decodeInterleaved;
 pub const canDecodeFormat = generic.canDecodeFormat;
 pub const canDecodeMime = generic.canDecodeMime;
@@ -45,6 +47,9 @@ pub const WHISPER_HOP_LENGTH: u32 = 160;
 pub const WHISPER_N_MELS: u32 = 80;
 pub const WHISPER_CHUNK_LENGTH: u32 = 30;
 pub const WHISPER_N_FRAMES: u32 = 3000;
+/// CLAP keeps long-audio fusion semantics, but rejects inputs beyond this
+/// finite duration before resampling or building a full-duration mel tensor.
+pub const CLAP_MAX_INPUT_SECONDS: u32 = 60;
 
 pub const WHISPER_CONFIG = AudioConfig{
     .sample_rate = WHISPER_SAMPLE_RATE,
@@ -89,9 +94,20 @@ pub fn whisperMelFromPcm(
     samples: []const f32,
     sample_rate: u32,
 ) ![]f32 {
-    const prepared = try copyOrResample(allocator, samples, sample_rate, WHISPER_SAMPLE_RATE);
+    const window = try whisperInputWindow(samples, sample_rate);
+    const prepared = try copyOrResample(allocator, window, sample_rate, WHISPER_SAMPLE_RATE);
     defer allocator.free(prepared);
     return logMelSpectrogram(allocator, prepared);
+}
+
+fn whisperInputWindow(samples: []const f32, sample_rate: u32) ![]const f32 {
+    if (sample_rate == 0 or samples.len == 0) return error.UnsupportedAudioFormat;
+    const max_samples = std.math.mul(
+        usize,
+        @as(usize, sample_rate),
+        @as(usize, WHISPER_CHUNK_LENGTH),
+    ) catch return error.UnsupportedAudioFormat;
+    return samples[0..@min(samples.len, max_samples)];
 }
 
 pub fn clapFeaturesFromPcm(
@@ -100,9 +116,20 @@ pub fn clapFeaturesFromPcm(
     sample_rate: u32,
     channels: usize,
 ) !ClapFeatures {
+    try validateClapInput(samples, sample_rate);
     const prepared = try copyOrResample(allocator, samples, sample_rate, CLAP_CONFIG.sample_rate);
     defer allocator.free(prepared);
     return clapInputFeatures(allocator, prepared, channels);
+}
+
+fn validateClapInput(samples: []const f32, sample_rate: u32) !void {
+    if (sample_rate == 0 or samples.len == 0) return error.UnsupportedAudioFormat;
+    const max_source_samples = std.math.mul(
+        usize,
+        @as(usize, sample_rate),
+        @as(usize, CLAP_MAX_INPUT_SECONDS),
+    ) catch return error.AudioInputTooLong;
+    if (samples.len > max_source_samples) return error.AudioInputTooLong;
 }
 
 /// Build official-style short-audio CLAP inputs.
@@ -422,6 +449,13 @@ test "whisper mel from pcm returns whisper-shaped output" {
     try std.testing.expectEqual(@as(usize, WHISPER_N_MELS * WHISPER_N_FRAMES), mel.len);
 }
 
+test "whisper input is validated and sliced before resampling" {
+    const samples = [_]f32{0.0} ** 31;
+    try std.testing.expectEqual(@as(usize, 30), (try whisperInputWindow(&samples, 1)).len);
+    try std.testing.expectError(error.UnsupportedAudioFormat, whisperInputWindow(&.{}, 16_000));
+    try std.testing.expectError(error.UnsupportedAudioFormat, whisperInputWindow(&samples, 0));
+}
+
 test "clap long fusion features crops and downsamples" {
     const mel = [_]f32{
         0,  1,
@@ -458,6 +492,15 @@ test "clap input features marks long audio and returns 4 channels" {
     try std.testing.expectEqual(@as(usize, CLAP_CONFIG.n_mels), features.mel_bins);
     try std.testing.expectEqual(@as(usize, clapFrameCount(CLAP_CONFIG.chunk_length_s * CLAP_CONFIG.sample_rate)), features.time_frames);
     try std.testing.expectEqual(features.channels * features.time_frames * features.mel_bins, features.data.len);
+}
+
+test "clap source duration is bounded before resampling" {
+    const allowed = [_]f32{0.0} ** CLAP_MAX_INPUT_SECONDS;
+    try validateClapInput(&allowed, 1);
+    const too_long = [_]f32{0.0} ** (CLAP_MAX_INPUT_SECONDS + 1);
+    try std.testing.expectError(error.AudioInputTooLong, validateClapInput(&too_long, 1));
+    try std.testing.expectError(error.UnsupportedAudioFormat, validateClapInput(&.{}, 48_000));
+    try std.testing.expectError(error.UnsupportedAudioFormat, validateClapInput(&allowed, 0));
 }
 
 test "clap frame count matches centered STFT convention" {

@@ -12,6 +12,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+// The user-manager storage adapter deliberately resolves these through the
+// compilation root so its erased backend types retain one Zig type identity.
+pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
+pub const storage_backend_erased = @import("storage/backend_erased.zig");
+
 test {
     _ = @import("cmd/lite.zig");
     _ = @import("cmd/cli/backup.zig");

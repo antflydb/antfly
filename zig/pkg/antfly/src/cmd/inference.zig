@@ -13,14 +13,14 @@
 // limitations.
 
 const std = @import("std");
-const antfly = @import("antfly-zig");
+const inference_runtime = @import("../inference_runtime/runtime.zig");
 
 pub fn run(init: std.process.Init) !void {
-    return try antfly.inference_runtime.run(init);
+    return try inference_runtime.run(init);
 }
 
 pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.process.Args.Iterator) !void {
-    return try antfly.inference_runtime.runFromIterator(init, argv0, args);
+    return try inference_runtime.runFromIterator(init, argv0, args);
 }
 
 test "inference cmd compiles" {

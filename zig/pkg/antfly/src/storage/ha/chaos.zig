@@ -210,6 +210,7 @@ test "storage.ha chaos crash during base backup preserves slot pin and catch-up 
     };
     _ = try bootstrap.bootstrapFromManifest(alloc, &standby, manifest, &contents);
     try std.testing.expectEqual(@as(u64, 3), standby.nextReceiveLsn());
+    try primary.activateSeededSlot("standby-a", identity.timeline_id, 2, 2, 2);
 
     var capture = ApplyCapture{ .alloc = alloc };
     defer capture.deinit();
@@ -643,17 +644,14 @@ test "storage.ha chaos network partition requires fence before standby promotion
         .retained_from_lsn = 1,
         .allow_rewind_after_forced_promotion = true,
     });
-    try std.testing.expectEqual(rejoin.Action.rewind, rejoin_allowed.action);
-    try std.testing.expect(rejoin_allowed.data_loss_discarded);
-
-    const rewind = try rejoin.rewindReplicationLog(alloc, &primary.log, rejoin_allowed);
-    try std.testing.expectEqual(@as(u64, 1), rewind.fork_lsn);
-    try std.testing.expectEqual(@as(u64, 2), rewind.previous_last_lsn);
-    try std.testing.expectEqual(@as(u64, 1), rewind.current_last_lsn);
-    try std.testing.expectEqual(@as(u64, 2), rewind.next_lsn);
-    try std.testing.expectEqual(@as(u64, 1), rewind.discarded_lsn_count);
-    try std.testing.expect(rewind.data_loss_discarded);
-    try std.testing.expect((try primary.log.entryAt(alloc, 2)) == null);
+    try std.testing.expectEqual(rejoin.Action.reseed, rejoin_allowed.action);
+    try std.testing.expect(!rejoin_allowed.data_loss_discarded);
+    try std.testing.expectError(
+        error.RejoinRewindNotAllowed,
+        rejoin.rewindReplicationLog(alloc, &primary.log, rejoin_allowed),
+    );
+    var retained_divergent = (try primary.log.entryAt(alloc, 2)) orelse return error.TestExpectedEqual;
+    defer retained_divergent.deinit(alloc);
 
     try std.testing.expectError(error.WrongTimeline, standby.receive(baseRecord(identity, 3, "old-timeline-after-promotion")));
 }

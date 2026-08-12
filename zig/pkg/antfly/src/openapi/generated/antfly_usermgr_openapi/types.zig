@@ -77,7 +77,7 @@ pub const Error = struct {
 };
 
 pub const Permission = struct {
-    /// Resource name (e.g., table name, target username, or '*' for global).
+    /// Resource name (e.g., table name, target username, or '*' for all inference operations or a global grant).
     resource: []const u8,
     resource_type: ResourceType,
     type: PermissionType,
@@ -112,16 +112,18 @@ pub const PermissionType = enum {
     }
 };
 
-/// Type of the resource, e.g., table, user, or global ('*').
+/// Type of resource: table, user, inference, or global ('*'). Use inference with resource '*' to grant access to unified inference routes.
 pub const ResourceType = enum {
     table,
     user,
+    inference,
     @"*",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .table => "table",
             .user => "user",
+            .inference => "inference",
             .@"*" => "*",
         };
         try jw.write(s);
@@ -135,6 +137,7 @@ pub const ResourceType = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "table", .table },
             .{ "user", .user },
+            .{ "inference", .inference },
             .{ "*", .@"*" },
         });
         return map.get(s) orelse error.UnexpectedToken;

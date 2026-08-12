@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fs_paths = @import("../../common/fs_paths.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const raft_engine = @import("raft_engine");
@@ -25,6 +26,11 @@ const replica_catalog_digest_domain = "antfly-replica-catalog-v2\x00";
 const max_replica_catalog_record_bytes = 64 * 1024;
 const max_replica_catalog_records = 1_000_000;
 const max_replica_catalog_bytes = 256 * 1024 * 1024;
+
+const TestPersistFailureBoundary = enum {
+    before_publish,
+    after_publish,
+};
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
@@ -468,6 +474,7 @@ pub const FileReplicaCatalog = struct {
     mutex: std.atomic.Mutex = .unlocked,
     current_revision: u64 = 1,
     records: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
+    test_persist_failure_boundary: if (builtin.is_test) ?TestPersistFailureBoundary else void = if (builtin.is_test) null else {},
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileReplicaCatalog {
         var self = FileReplicaCatalog{
@@ -678,7 +685,13 @@ pub const FileReplicaCatalog = struct {
                 return lhs.group_id < rhs.group_id;
             }
         }.lessThan);
-        try writeCatalogAtomicallyDurable(self.alloc, self.io(), self.path, records);
+        try writeCatalogAtomicallyDurableWithFailure(
+            self.alloc,
+            self.io(),
+            self.path,
+            records,
+            if (comptime builtin.is_test) self.test_persist_failure_boundary else {},
+        );
     }
 
     fn io(self: *FileReplicaCatalog) std.Io {
@@ -775,6 +788,22 @@ fn writeCatalogAtomicallyDurable(
     path: []const u8,
     records: []const *const ReplicaRecord,
 ) !void {
+    return writeCatalogAtomicallyDurableWithFailure(
+        alloc,
+        io,
+        path,
+        records,
+        if (comptime builtin.is_test) null else {},
+    );
+}
+
+fn writeCatalogAtomicallyDurableWithFailure(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    records: []const *const ReplicaRecord,
+    failure_boundary: if (builtin.is_test) ?TestPersistFailureBoundary else void,
+) !void {
     if (records.len > max_replica_catalog_records) return error.ReplicaCatalogTooLarge;
     // A process-local counter can collide with a temp file left by a crash
     // after restart. A 128-bit random suffix keeps stale files harmless while
@@ -845,12 +874,21 @@ fn writeCatalogAtomicallyDurable(
             try file.sync(io);
         }
 
+        if (comptime builtin.is_test) {
+            if (failure_boundary == .before_publish)
+                return error.TestCatalogPersistBeforePublish;
+        }
+
         if (std.fs.path.isAbsolute(path)) {
             try std.Io.Dir.renameAbsolute(tmp_path, path, io);
         } else {
             try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
         }
         tmp_exists = false;
+        if (comptime builtin.is_test) {
+            if (failure_boundary == .after_publish)
+                return error.TestCatalogPersistAfterPublish;
+        }
         try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
         return;
     }

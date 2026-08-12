@@ -4,8 +4,8 @@ Pure-Zig implementation of ISO/IEC 15444-1 Part 1. Public entry points live in `
 
 ## Running the tests
 
-- `zig build test` — full lib suite. Includes every jpeg2000 module wired through `mod.zig` (box, markers, arithmetic, codeblock, wavelet, tagtree, tile, upsample, quantization, color_transform, tier1_encode, tier2_encode, encode, decode, rate_control, codestream_write, codestream, reconstruct, packet, cross_validation) and the ISO Part 1 conformance matrix through `lib-image-test`. The ISO matrix self-skips when `/tmp/openjpeg-data` is absent.
-- `zig build unit-test` — same as above minus simulation/chaos suites; fastest way to iterate on jpeg2000 changes.
+- `make test` — full lib suite. Includes every jpeg2000 module wired through `mod.zig` (box, markers, arithmetic, codeblock, wavelet, tagtree, tile, upsample, quantization, color_transform, tier1_encode, tier2_encode, encode, decode, rate_control, codestream_write, codestream, reconstruct, packet, cross_validation) and the ISO Part 1 conformance matrix through `lib-image-test`. The ISO matrix self-skips when `/tmp/openjpeg-data` is absent.
+- `make unit-test` — same as above minus simulation/chaos suites; fastest way to iterate on jpeg2000 changes.
 - `zig build lib-image-test` — shared image tests.
 - `zig build lib-image-conformance-run` — checked-in JPEG 2000 conformance plus the external ISO matrix without fetching. The external matrix self-skips when `/tmp/openjpeg-data` is absent. Current baseline when fixtures are present: `pass=4, fail=1, skip=18` of 23 fixtures.
 - `zig build lib-image-conformance-fetch` — one-time populate `/tmp/openjpeg-data` via shallow clone of `openjpeg-data` at a pinned commit.

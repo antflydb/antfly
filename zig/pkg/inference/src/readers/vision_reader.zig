@@ -23,6 +23,7 @@ const image = @import("../pipelines/image.zig");
 const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
 const reader_types = @import("types.zig");
 const c_file = @import("../util/c_file.zig");
+const metal_generated_quant_stats = @import("../metal_generated_quant_stats.zig");
 
 pub const PreprocessorConfig = struct {
     image_size: usize = 384,
@@ -201,6 +202,14 @@ pub const LoadedVisionReader = struct {
         return reader_pipeline.readDecoded(img);
     }
 
+    pub fn snapshotMetalGeneratedQuantStats(self: *LoadedVisionReader, allocator: std.mem.Allocator) metal_generated_quant_stats.Stats {
+        var stats = metal_generated_quant_stats.snapshotForSession(allocator, self.encoder_session);
+        if (self.decoder_session.ptr != self.encoder_session.ptr or self.decoder_session.vtable != self.encoder_session.vtable) {
+            stats = stats.add(metal_generated_quant_stats.snapshotForSession(allocator, self.decoder_session));
+        }
+        return stats;
+    }
+
     fn pipeline(self: *LoadedVisionReader, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadingPipeline {
         const prefix_len: usize = if (self.dec_config.forced_bos_token_id == null) 1 else 2;
         const max_length = try resolveMaxLength(self.dec_config.max_length, options.max_tokens, prefix_len);
@@ -226,6 +235,7 @@ pub const LoadedVisionReader = struct {
                 .pix2struct_patch_width = self.preproc.pix2struct_patch_width,
                 .pix2struct_do_normalize = self.preproc.pix2struct_do_normalize,
                 .prompt = options.prompt,
+                .source_fingerprint = options.source_fingerprint,
             },
             &self.florence_final_logits_bias_zero,
         );

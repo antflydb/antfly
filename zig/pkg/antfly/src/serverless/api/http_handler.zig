@@ -1484,22 +1484,30 @@ pub const HttpHandler = struct {
             };
         }
 
-        var execution = self.executePublishedSearch(namespace, table_name, body) catch |err| switch (err) {
-            error.InvalidQueryRequest,
-            error.UnsupportedQueryRequest,
-            error.EmbeddingIndexNotFound,
-            error.InvalidEmbeddingDimensions,
-            error.PermanentPromptFailure,
-            error.TransientPromptFailure,
-            error.VectorQueryRequired,
-            error.VectorDimsMismatch,
-            error.SparseQueryRequired,
-            => return error.InvalidQueryRequest,
-            error.FileNotFound,
-            error.VectorSegmentNotFound,
-            error.SparseSegmentNotFound,
-            => return error.FileNotFound,
-            else => return error.InternalQueryFailure,
+        var execution = self.executePublishedSearch(namespace, table_name, body) catch |err| {
+            switch (err) {
+                error.InvalidQueryRequest,
+                error.UnsupportedQueryRequest,
+                error.EmbeddingIndexNotFound,
+                error.InvalidEmbeddingDimensions,
+                error.PermanentPromptFailure,
+                error.TransientPromptFailure,
+                error.VectorQueryRequired,
+                error.VectorDimsMismatch,
+                error.SparseQueryRequired,
+                => {
+                    std.log.warn("serverless public table search rejected table={s} err={}", .{ table_name, err });
+                    return error.InvalidQueryRequest;
+                },
+                error.FileNotFound,
+                error.VectorSegmentNotFound,
+                error.SparseSegmentNotFound,
+                => return error.FileNotFound,
+                else => {
+                    std.log.err("serverless public table search failed table={s} err={}", .{ table_name, err });
+                    return error.InternalQueryFailure;
+                },
+            }
         };
         defer execution.deinit(self.alloc);
 

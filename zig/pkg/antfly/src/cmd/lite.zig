@@ -13,10 +13,11 @@
 // limitations.
 
 const std = @import("std");
-const antfly = @import("antfly-zig");
+const antfly = @import("../cli_root.zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("cli/mod.zig");
 const httpx = @import("httpx");
+const standalone_runtime = @import("../standalone/runtime.zig");
 const fs_paths = antfly.common.fs_paths;
 
 const Allocator = std.mem.Allocator;
@@ -965,7 +966,7 @@ fn serve(init: std.process.Init, args: *std.process.Args.Iterator) !void {
 fn serveWithOptions(init: std.process.Init, opts: ServeOptions) !void {
     try requireAflitePath(opts.path);
     const listen = try parseLiteListenAddress(opts.addr);
-    return try antfly.standalone.runtime.runLite(init, opts.path, listen.host, listen.port, opts.fsync, opts.standalone_args.items);
+    return try standalone_runtime.runLite(init, opts.path, listen.host, listen.port, opts.fsync, opts.standalone_args.items);
 }
 
 fn parseServeOptions(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !ServeOptions {

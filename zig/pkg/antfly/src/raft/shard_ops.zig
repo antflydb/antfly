@@ -482,7 +482,7 @@ test "shard operation adapter metadata runtime dispatches actions" {
         }
 
         fn observeMerge(_: *anyopaque, _: u64, record: metadata_state.MergeTransitionRecord) !metadata_state.MergeObservation {
-            const status = @import("../data/mod.zig").MergeTransitionStatus{
+            const status = @import("../data/domain.zig").MergeTransitionStatus{
                 .phase = .prepare,
                 .donor_group_id = record.donor_group_id,
                 .receiver_group_id = record.receiver_group_id,

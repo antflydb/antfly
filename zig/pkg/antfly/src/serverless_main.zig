@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const antfly = @import("antfly-zig");
+const antfly = @import("cli_root.zig");
 
 const serverless = antfly.serverless;
 const serverless_default_max_request_bytes: usize = antfly.public_api.http_server.public_api_max_request_body_bytes;

@@ -272,13 +272,28 @@ pub fn verifyFileContents(view: ManifestView, contents: []const FileContent) !vo
 
 fn validateFiles(files: []const FileEntry) !void {
     for (files, 0..) |file, idx| {
-        if (file.path.len == 0) return error.InvalidManifestPath;
+        try validatePath(file.path);
         if (file.path.len > std.math.maxInt(u32)) return error.ManifestPathTooLong;
-        if (std.fs.path.isAbsolute(file.path)) return error.InvalidManifestPath;
-        if (std.mem.indexOf(u8, file.path, "..") != null) return error.InvalidManifestPath;
         for (files[0..idx]) |prior| {
             if (std.mem.eql(u8, prior.path, file.path)) return error.DuplicateManifestPath;
         }
+    }
+}
+
+/// Validate a manifest-relative path before joining it to a local staging root
+/// or an object-store generation prefix.
+pub fn validatePath(path: []const u8) !void {
+    if (path.len == 0) return error.InvalidManifestPath;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidManifestPath;
+    if (std.fs.path.isAbsolute(path)) return error.InvalidManifestPath;
+    // Artifact manifests are portable and always use canonical POSIX-style
+    // relative paths. Reject ambiguous spellings rather than normalizing them:
+    // the exact bytes are bound into object keys and aggregate digests.
+    if (path[path.len - 1] == '/' or std.mem.indexOfScalar(u8, path, '\\') != null) return error.InvalidManifestPath;
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, ".."))
+            return error.InvalidManifestPath;
     }
 }
 
@@ -420,6 +435,30 @@ test "storage.ha backup manifest rejects unsafe paths and invalid wal bounds" {
         .checkpoint_lsn = 1,
         .files = &dupes,
     }));
+}
+
+test "storage.ha backup manifest accepts only canonical portable relative paths" {
+    for ([_][]const u8{
+        "catalog/manifest",
+        "tables/1/sst-0001",
+        "catalog/file..name",
+    }) |path| try validatePath(path);
+
+    for ([_][]const u8{
+        "",
+        ".",
+        "..",
+        "/absolute",
+        "./catalog",
+        "catalog/./manifest",
+        "catalog/../escape",
+        "catalog//manifest",
+        "catalog/",
+        "catalog\\..\\escape",
+        "catalog\\manifest",
+    }) |path| {
+        try std.testing.expectError(error.InvalidManifestPath, validatePath(path));
+    }
 }
 
 test "storage.ha backup manifest detects body and header corruption" {

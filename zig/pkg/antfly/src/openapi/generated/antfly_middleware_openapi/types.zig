@@ -6,13 +6,13 @@ const std = @import("std");
 pub const CORSConfig = struct {
     /// Controls whether CORS is enabled
     enabled: ?bool = null,
-    /// List of allowed origins for CORS requests. Use ['*'] to allow all origins. Defaults to ['*'] if empty and enabled is true.
+    /// List of allowed origins for CORS requests. Use ['*'] to allow all origins. Defaults to ['*'] if empty and enabled is true. Credentialed CORS rejects both '*' and the opaque 'null' origin.
     allowed_origins: ?[]const []const u8 = null,
     /// HTTP methods allowed for CORS requests
     allowed_methods: ?[]const []const u8 = null,
-    /// Headers that can be used in CORS requests
+    /// Headers that can be used in CORS requests. ['*'] allows any valid requested header; when credentials are enabled, the server reflects the validated requested header names because browsers treat '*' as a literal name in credentialed CORS.
     allowed_headers: ?[]const []const u8 = null,
-    /// Headers exposed to the client. Useful if your API returns custom headers that the frontend needs to read.
+    /// Headers exposed to the client. Useful if your API returns custom headers that the frontend needs to read. ['*'] is rejected when credentials are enabled because browsers treat it as a literal header name.
     exposed_headers: ?[]const []const u8 = null,
     /// Indicates whether credentials (cookies, auth headers) are allowed. Note: If true, allowed_origins cannot be ['*'].
     allow_credentials: ?bool = null,

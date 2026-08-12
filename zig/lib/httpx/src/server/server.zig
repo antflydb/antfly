@@ -204,6 +204,8 @@ pub const Context = struct {
     request: *Request,
     response: ResponseBuilder,
     params: []const RouteParam = &.{},
+    /// Borrowed opaque value associated with the matched route.
+    route_data: ?*anyopaque = null,
     data: ?std.StringHashMap(DataEntry) = null,
     decoded_query_values: std.ArrayListUnmanaged([]u8) = .empty,
     max_file_size: usize = types.default_max_body_size,
@@ -681,40 +683,63 @@ pub const Context = struct {
 
         /// Convenience: write a complete SSE event (formats `event:`, `data:`, trailing newline).
         pub fn writeEvent(self: *StreamWriter, event_name: ?[]const u8, data: []const u8) !void {
-            // Build the SSE text in a stack buffer to send as one chunk.
+            return writeEventTo(self, event_name, data);
+        }
+
+        fn writeEventTo(writer: anytype, event_name: ?[]const u8, data: []const u8) !void {
+            var required: usize = 1;
+            if (event_name) |name| {
+                required = std.math.add(usize, required, "event: ".len + 1) catch return error.EventTooLarge;
+                required = std.math.add(usize, required, name.len) catch return error.EventTooLarge;
+            }
+            var size_lines = mem.splitScalar(u8, data, '\n');
+            while (size_lines.next()) |line| {
+                required = std.math.add(usize, required, "data: ".len + 1) catch return error.EventTooLarge;
+                required = std.math.add(usize, required, line.len) catch return error.EventTooLarge;
+            }
+
+            // Keep the normal per-token path to one transport write. Oversized
+            // completion/tool events fall back to equivalent incremental SSE
+            // framing instead of failing an otherwise successful stream.
             var buf: [8192]u8 = undefined;
-            var pos: usize = 0;
+            if (required <= buf.len) {
+                var pos: usize = 0;
+                if (event_name) |name| {
+                    @memcpy(buf[pos..][0.."event: ".len], "event: ");
+                    pos += "event: ".len;
+                    @memcpy(buf[pos..][0..name.len], name);
+                    pos += name.len;
+                    buf[pos] = '\n';
+                    pos += 1;
+                }
+                var lines = mem.splitScalar(u8, data, '\n');
+                while (lines.next()) |line| {
+                    @memcpy(buf[pos..][0.."data: ".len], "data: ");
+                    pos += "data: ".len;
+                    @memcpy(buf[pos..][0..line.len], line);
+                    pos += line.len;
+                    buf[pos] = '\n';
+                    pos += 1;
+                }
+                buf[pos] = '\n';
+                pos += 1;
+                std.debug.assert(pos == required);
+                return writer.write(buf[0..pos]);
+            }
 
             if (event_name) |name| {
-                const prefix = "event: ";
-                if (pos + prefix.len + name.len + 1 > buf.len) return error.EventTooLarge;
-                @memcpy(buf[pos..][0..prefix.len], prefix);
-                pos += prefix.len;
-                @memcpy(buf[pos..][0..name.len], name);
-                pos += name.len;
-                buf[pos] = '\n';
-                pos += 1;
+                try writer.write("event: ");
+                try writer.write(name);
+                try writer.write("\n");
             }
 
-            // Write data lines
             var lines = mem.splitScalar(u8, data, '\n');
             while (lines.next()) |line| {
-                const prefix = "data: ";
-                if (pos + prefix.len + line.len + 1 > buf.len) return error.EventTooLarge;
-                @memcpy(buf[pos..][0..prefix.len], prefix);
-                pos += prefix.len;
-                @memcpy(buf[pos..][0..line.len], line);
-                pos += line.len;
-                buf[pos] = '\n';
-                pos += 1;
+                try writer.write("data: ");
+                try writer.write(line);
+                try writer.write("\n");
             }
-
-            // Trailing blank line to terminate the event
-            if (pos + 1 > buf.len) return error.EventTooLarge;
-            buf[pos] = '\n';
-            pos += 1;
-
-            try self.write(buf[0..pos]);
+            try writer.write("\n");
         }
     };
 
@@ -910,6 +935,11 @@ pub const Server = struct {
         try self.router.add(method, path, handler);
     }
 
+    /// Registers a route with borrowed opaque data copied into Context.
+    pub fn routeWithData(self: *Self, method: types.Method, path: []const u8, handler: Handler, data: *anyopaque) !void {
+        try self.router.addWithData(method, path, handler, data);
+    }
+
     /// Registers a GET route.
     pub fn get(self: *Self, path: []const u8, handler: Handler) !void {
         try self.route(.GET, path, handler);
@@ -989,10 +1019,19 @@ pub const Server = struct {
     /// the Io backend supports it (Kqueue on macOS, io_uring on Linux).
     /// Falls back to synchronous handling if concurrency is unavailable.
     pub fn listen(self: *Self) !void {
+        // A server is single-use once stopped. In particular, do not let a
+        // startup/shutdown race re-bind a listener after its owner has begun
+        // tearing down the handler state referenced by this server.
+        if (self.shutdown_mode.load(.acquire) != 0) return;
         if (self.listener == null) try self.bind();
+        if (self.shutdown_mode.load(.acquire) != 0) return;
         self.running = true;
         self.listen_started.store(true, .release);
         defer self.listen_started.store(false, .release);
+        if (self.shutdown_mode.load(.acquire) != 0) {
+            self.running = false;
+            return;
+        }
 
         if (self.config.tls_cert_path != null or self.config.tls_key_path != null) {
             std.debug.print("Warning: tls_cert_path/tls_key_path are set but server TLS is not yet supported (Zig 0.16). Use a TLS-terminating reverse proxy.\n", .{});
@@ -1384,6 +1423,7 @@ pub const Server = struct {
 
             if (route_result) |r| {
                 ctx.params = r.params;
+                ctx.route_data = r.data;
             }
 
             var response: Response = undefined;
@@ -2069,6 +2109,7 @@ pub const Server = struct {
 
         if (route_result) |r| {
             ctx.params = r.params;
+            ctx.route_data = r.data;
         }
 
         var response: Response = undefined;
@@ -3171,6 +3212,19 @@ test "stop publishes synchronized listener-thread shutdown" {
     try std.testing.expect(server.running);
     try std.testing.expectEqual(@as(u8, 2), server.shutdown_mode.load(.acquire));
     try std.testing.expect(server.listener == null);
+
+    // The running flag belongs to an already-started listener and is cleared
+    // when that listener observes the stop. Exercise the distinct
+    // stop-before-listen race with a server that has not started yet.
+    var not_started = Server.init(allocator, std.testing.io);
+    defer not_started.deinit();
+    not_started.stop();
+
+    // A concurrent owner may call stop before the listener thread reaches
+    // listen(). That late listen must not resurrect the server.
+    try not_started.listen();
+    try std.testing.expect(!not_started.running);
+    try std.testing.expect(not_started.listener == null);
 }
 
 test "requestStop only publishes synchronized listener-thread work" {
@@ -3470,6 +3524,33 @@ test "containsTraversal allows safe paths" {
     try std.testing.expect(!containsTraversal("assets/style.css"));
     try std.testing.expect(!containsTraversal("images/photo.jpg"));
     try std.testing.expect(!containsTraversal("file.txt"));
+}
+
+test "stream writer preserves small SSE write density and supports oversized events" {
+    const Capture = struct {
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        writes: usize = 0,
+
+        fn write(self: *@This(), data: []const u8) !void {
+            try self.bytes.appendSlice(std.testing.allocator, data);
+            self.writes += 1;
+        }
+    };
+
+    var capture = Capture{};
+    defer capture.bytes.deinit(std.testing.allocator);
+    try Context.StreamWriter.writeEventTo(&capture, null, "small");
+    try std.testing.expectEqual(@as(usize, 1), capture.writes);
+    try std.testing.expectEqualStrings("data: small\n\n", capture.bytes.items);
+
+    capture.bytes.clearRetainingCapacity();
+    capture.writes = 0;
+    const large = [_]u8{'x'} ** 9000;
+    try Context.StreamWriter.writeEventTo(&capture, "message", &large);
+    try std.testing.expect(capture.writes > 1);
+    try std.testing.expect(std.mem.startsWith(u8, capture.bytes.items, "event: message\ndata: "));
+    try std.testing.expect(std.mem.endsWith(u8, capture.bytes.items, "\n\n"));
+    try std.testing.expectEqual(@as(usize, "event: message\ndata: ".len + large.len + 2), capture.bytes.items.len);
 }
 
 test "SSE rejects CR in id field" {

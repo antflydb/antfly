@@ -334,6 +334,8 @@ pub const Runtime = struct {
 /// a working credential snapshot.
 fn validateRemoteContentConfig(config: *const config_mod.Config) !void {
     const cfg = if (config.remote_content) |*remote_content| remote_content else return;
+    if (cfg.security) |security| validateContentSecurityConfig(security) catch
+        return error.InvalidRemoteContentConfig;
 
     if (cfg.default_s3) |name| {
         if (name.len == 0 or cfg.getS3(name) == null) return error.InvalidRemoteContentConfig;
@@ -343,6 +345,8 @@ fn validateRemoteContentConfig(config: *const config_mod.Config) !void {
     while (s3_it.next()) |entry| {
         if (entry.key_ptr.*.len == 0) return error.InvalidRemoteContentConfig;
         const credential = entry.value_ptr;
+        if (credential.security) |security| validateContentSecurityConfig(security) catch
+            return error.InvalidRemoteContentConfig;
         if (credential.access_key_id) |value| if (value.len == 0) return error.InvalidRemoteContentConfig;
         if (credential.secret_access_key) |value| if (value.len == 0) return error.InvalidRemoteContentConfig;
         if (credential.buckets) |patterns| {
@@ -361,6 +365,8 @@ fn validateRemoteContentConfig(config: *const config_mod.Config) !void {
     while (http_it.next()) |entry| {
         if (entry.key_ptr.*.len == 0) return error.InvalidRemoteContentConfig;
         const credential = entry.value_ptr;
+        if (credential.security) |security| validateContentSecurityConfig(security) catch
+            return error.InvalidRemoteContentConfig;
         if (credential.base_url) |base_url| {
             const parsed = std.Uri.parse(base_url) catch return error.InvalidRemoteContentConfig;
             if ((!std.ascii.eqlIgnoreCase(parsed.scheme, "http") and
@@ -368,6 +374,8 @@ fn validateRemoteContentConfig(config: *const config_mod.Config) !void {
             {
                 return error.InvalidRemoteContentConfig;
             }
+            if (parsed.user != null or parsed.password != null or parsed.query != null or parsed.fragment != null)
+                return error.InvalidRemoteContentConfig;
         }
         var header_it = credential.headers.iterator();
         while (header_it.next()) |header| {
@@ -378,6 +386,10 @@ fn validateRemoteContentConfig(config: *const config_mod.Config) !void {
             }
         }
     }
+}
+
+fn validateContentSecurityConfig(security: scraping.ContentSecurityConfig) !void {
+    try scraping.validateNat64Prefixes(security);
 }
 
 fn validHttpHeaderName(name: []const u8) bool {
@@ -621,6 +633,17 @@ test "remote content runtime rejects incomplete and startup-only replacements" {
     var after_incomplete = facade.acquire();
     defer after_incomplete.deinit();
     try std.testing.expectEqualStrings("primary", after_incomplete.config.default_s3.?);
+    try std.testing.expect(runtime.health().stale_snapshot);
+
+    // Translation prefixes are security policy, so an invalid or ambiguous
+    // prefix must fail closed without replacing the last working snapshot.
+    try writeTestConfigAtomically(path,
+        \\{"health_port":8081,"remote_content":{"security":{"nat64_prefixes":["2001:470::/72"]},"default_s3":"archive","s3":{"archive":{}}}}
+    );
+    try std.testing.expect(!runtime.refreshIfChanged());
+    var after_invalid_nat64 = facade.acquire();
+    defer after_invalid_nat64.deinit();
+    try std.testing.expectEqualStrings("primary", after_invalid_nat64.config.default_s3.?);
     try std.testing.expect(runtime.health().stale_snapshot);
 
     // Once a complete remote-content-only candidate arrives, publication and

@@ -553,7 +553,7 @@ test "transition controller treats observed finalization as authoritative over l
     try std.testing.expectEqual(transition_state.TransitionPhase.finalized, split.next_phase);
     try std.testing.expect(split.action == .none);
 
-    const finalized_merge_status: @import("../data/mod.zig").MergeTransitionStatus = .{
+    const finalized_merge_status: @import("../data/domain.zig").MergeTransitionStatus = .{
         .phase = .finalized,
         .donor_group_id = 81,
         .receiver_group_id = 82,

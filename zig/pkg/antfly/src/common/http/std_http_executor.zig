@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const httpx = @import("httpx");
 const common = @import("http_common.zig");
 const std_http_listener = @import("std_http_listener.zig");
 const threaded_connect_io = @import("threaded_connect_io.zig");
@@ -30,6 +31,11 @@ pub const StdHttpExecutorConfig = struct {
     /// permanently growing the owned Threaded executor without bound.
     io_concurrent_limit: u32 = std_http_listener.default_process_io_concurrent_limit,
     keep_alive: bool = false,
+    /// Resolve host names before opening a concrete IP socket. Zig 0.16's
+    /// `HostName.connect` can corrupt its nested lookup future when a winning
+    /// connection cancels the remaining attempts. This transport avoids that
+    /// cancellation path and is required for long-lived HA replication loops.
+    resolve_before_connect: bool = false,
     /// Proactively retire pooled HTTP/1.1 connections before a server-side
     /// keep-alive cap closes them. 0 means unlimited client-side reuse.
     max_requests_per_connection: u32 = 32,
@@ -47,6 +53,8 @@ pub const StdHttpExecutor = struct {
     io_vtable: *std.Io.VTable,
     io_owner: IoOwner,
     client: std.http.Client,
+    resolved_client: httpx.Client,
+    resolved_client_mutex: std.Io.Mutex,
     lifecycle_mutex: std.Io.Mutex,
     idle_cond: std.Io.Condition,
     closing: bool,
@@ -69,6 +77,8 @@ pub const StdHttpExecutor = struct {
             .io_vtable = io_vtable,
             .io_owner = .owned,
             .client = undefined,
+            .resolved_client = undefined,
+            .resolved_client_mutex = .init,
             .lifecycle_mutex = .init,
             .idle_cond = .init,
             .closing = false,
@@ -83,6 +93,7 @@ pub const StdHttpExecutor = struct {
             .read_buffer_size = cfg.read_buffer_size,
             .write_buffer_size = cfg.write_buffer_size,
         };
+        self.resolved_client = httpx.Client.initWithConfig(alloc, io_impl.io(), resolvedClientConfig(cfg));
     }
 
     pub fn initSharedInPlace(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig, io_impl: *std.Io.Threaded) void {
@@ -94,6 +105,8 @@ pub const StdHttpExecutor = struct {
             .io_vtable = io_vtable,
             .io_owner = .shared,
             .client = undefined,
+            .resolved_client = undefined,
+            .resolved_client_mutex = .init,
             .lifecycle_mutex = .init,
             .idle_cond = .init,
             .closing = false,
@@ -108,6 +121,7 @@ pub const StdHttpExecutor = struct {
             .read_buffer_size = cfg.read_buffer_size,
             .write_buffer_size = cfg.write_buffer_size,
         };
+        self.resolved_client = httpx.Client.initWithConfig(alloc, io_impl.io(), resolvedClientConfig(cfg));
     }
 
     pub fn init(alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig) StdHttpExecutor {
@@ -126,6 +140,7 @@ pub const StdHttpExecutor = struct {
         self.lifecycle_mutex.unlock(io);
 
         self.client.deinit();
+        self.resolved_client.deinit();
         self.alloc.destroy(self.io_vtable);
         if (self.io_owner == .owned) {
             self.io_impl.deinit();
@@ -152,9 +167,106 @@ pub const StdHttpExecutor = struct {
         if (req.cancellation) |cancellation| {
             if (cancellation.isCancelled()) return error.Cancelled;
         }
+        if (self.cfg.resolve_before_connect) return try self.executeResolved(alloc, req);
         if (req.timeout_ms != null or req.cancellation != null)
             return try self.executeWithControl(alloc, req);
         return try self.executeDirect(alloc, req);
+    }
+
+    fn executeResolved(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
+        const io = self.io_impl.io();
+        self.resolved_client_mutex.lockUncancelable(io);
+        defer self.resolved_client_mutex.unlock(io);
+
+        const extra_count = @as(usize, @intFromBool(req.content_type != null)) +
+            @as(usize, @intFromBool(req.authorization != null));
+        const header_pairs = try alloc.alloc([2][]const u8, req.headers.len + extra_count);
+        defer alloc.free(header_pairs);
+        var header_index: usize = 0;
+        if (req.content_type) |content_type| {
+            header_pairs[header_index] = .{ "content-type", content_type };
+            header_index += 1;
+        }
+        if (req.authorization) |authorization| {
+            header_pairs[header_index] = .{ "authorization", authorization };
+            header_index += 1;
+        }
+        for (req.headers) |header| {
+            header_pairs[header_index] = .{ header.name, header.value };
+            header_index += 1;
+        }
+
+        const method: httpx.Method = switch (req.method) {
+            .GET => .GET,
+            .POST => .POST,
+            .PUT => .PUT,
+            .DELETE => .DELETE,
+        };
+        var response = try self.resolved_client.request(method, req.uri, .{
+            .headers = header_pairs,
+            .body = if (req.body.len == 0) null else req.body,
+            .timeout_ms = if (req.timeout_ms) |timeout_ms| timeout_ms else null,
+            .cancellation = if (req.cancellation) |cancellation| cancellation.signal() else null,
+            .follow_redirects = false,
+        });
+        defer response.deinit();
+
+        const content_type = if (response.contentType()) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (content_type) |value| alloc.free(value);
+
+        var header_count: usize = 0;
+        for (response.headers.iterator()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
+            header_count += 1;
+        }
+        const headers: []common.Header = if (header_count > 0)
+            try alloc.alloc(common.Header, header_count)
+        else
+            @constCast((&[_]common.Header{})[0..]);
+        var copied_headers: usize = 0;
+        errdefer {
+            for (headers[0..copied_headers]) |*header| header.deinit(alloc);
+            if (header_count > 0) alloc.free(headers);
+        }
+        for (response.headers.iterator()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
+            const owned_name = try alloc.dupe(u8, header.name);
+            errdefer alloc.free(owned_name);
+            headers[copied_headers] = .{
+                .name = owned_name,
+                .value = try alloc.dupe(u8, header.value),
+            };
+            copied_headers += 1;
+        }
+
+        const body = if (response.body) |value|
+            if (value.len > 0) try alloc.dupe(u8, value) else @constCast((&[_]u8{})[0..])
+        else
+            @constCast((&[_]u8{})[0..]);
+        return .{
+            .status = response.status.code,
+            .content_type = content_type,
+            .headers = headers,
+            .body = body,
+        };
+    }
+
+    fn resolvedClientConfig(cfg: StdHttpExecutorConfig) httpx.ClientConfig {
+        return .{
+            .timeouts = .{
+                .connect_ms = 30_000,
+                .read_ms = 30_000,
+                .write_ms = 30_000,
+            },
+            .retry_policy = .{ .max_retries = 0 },
+            .redirect_policy = .{ .follow_redirects = false },
+            .max_response_size = cfg.max_response_bytes,
+            .keep_alive = false,
+            .cache_resolved_addresses = true,
+        };
     }
 
     fn executeWithControl(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {

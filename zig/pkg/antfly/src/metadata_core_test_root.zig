@@ -6,9 +6,6 @@
 
 const state = @import("metadata/state.zig");
 const runtime = @import("metadata/runtime.zig");
-const server = @import("metadata/server.zig");
-const api = @import("metadata/api.zig");
-const admin = @import("metadata/admin.zig");
 const authority = @import("metadata/authority.zig");
 const incarnation = @import("metadata/incarnation.zig");
 const reconcile_lease = @import("metadata/reconcile_lease.zig");
@@ -17,9 +14,6 @@ const store_observer = @import("metadata/store_observer.zig");
 test {
     _ = state;
     _ = runtime;
-    _ = server;
-    _ = api;
-    _ = admin;
     _ = authority;
     _ = incarnation;
     _ = reconcile_lease;

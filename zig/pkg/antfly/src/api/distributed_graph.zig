@@ -13,8 +13,14 @@
 // limitations.
 
 const std = @import("std");
-const raft_mod = @import("../raft/mod.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const raft_mod = struct {
+    pub const ReadConsistency = @import("../raft/read_gate.zig").ReadConsistency;
+};
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+    pub const doc_filter_wire = @import("../storage/db/doc_filter_wire.zig");
+    pub const algebraic = @import("../storage/db/algebraic/mod.zig");
+};
 const graph_query_mod = @import("../graph/query.zig");
 const graph_mod = @import("../graph/graph.zig");
 const graph_node_admission = @import("../graph/node_admission.zig");

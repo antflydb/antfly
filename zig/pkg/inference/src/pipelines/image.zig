@@ -28,6 +28,12 @@ pub const IMAGENET_STD = [3]f32{ 0.26862954, 0.26130258, 0.27577711 };
 pub const Resample = shared.Resample;
 pub const PixelFormat = shared.PixelFormat;
 pub const ImageU8 = shared.ImageU8;
+pub const DecodeLimits = antfly_image.DecodeLimits;
+
+pub const EncodedImageInfo = struct {
+    width: u32,
+    height: u32,
+};
 
 /// Decoded image in HWC u8 format.
 pub const Image = struct {
@@ -73,32 +79,46 @@ fn validateImageDimensions(width: u32, height: u32) !void {
     };
 }
 
-fn validateEncodedImageDimensions(image_bytes: []const u8) !void {
+/// Inspect untrusted image headers without allocating decoded pixels. The
+/// server uses this before model loading/inference to account aggregate pixel
+/// pressure and to distinguish malformed input from configured size limits.
+pub fn inspectEncodedForInference(image_bytes: []const u8, max_dimension: ?u32) !EncodedImageInfo {
+    const info = try inspectEncoded(image_bytes);
+    try antfly_image.DecodeLimits.inference_default.validate(info.width, info.height);
+    if (max_dimension) |limit| {
+        if (info.width > limit or info.height > limit) return error.ImageTooLarge;
+    }
+    return info;
+}
+
+fn inspectEncoded(image_bytes: []const u8) !EncodedImageInfo {
     switch (antfly_image.detectFormat(image_bytes)) {
         .png => {
             if (image_bytes.len < 24) return error.ImageDecodeFailed;
             const width = std.mem.readInt(u32, image_bytes[16..20], .big);
             const height = std.mem.readInt(u32, image_bytes[20..24], .big);
-            try validateImageDimensions(width, height);
+            if (width == 0 or height == 0) return error.ImageDecodeFailed;
+            return .{ .width = width, .height = height };
         },
         .jpeg => {
             const info = antfly_image.jpeg.probe(image_bytes) catch |err| switch (err) {
                 error.JpegDecodeFailed, error.UnsupportedJpegFormat => return error.ImageDecodeFailed,
             };
-            try validateImageDimensions(info.width, info.height);
+            return .{ .width = info.width, .height = info.height };
         },
         .gif => {
             if (image_bytes.len < 10) return error.ImageDecodeFailed;
             const width = std.mem.readInt(u16, image_bytes[6..8], .little);
             const height = std.mem.readInt(u16, image_bytes[8..10], .little);
-            try validateImageDimensions(width, height);
+            if (width == 0 or height == 0) return error.ImageDecodeFailed;
+            return .{ .width = width, .height = height };
         },
         .bmp => {
             const info = antfly_image.bmp.probe(image_bytes) catch |err| switch (err) {
                 error.BmpDecodeFailed, error.UnsupportedBmpFormat => return error.ImageDecodeFailed,
                 else => return err,
             };
-            try validateImageDimensions(info.width, info.height);
+            return .{ .width = info.width, .height = info.height };
         },
         .webp => {
             const info = antfly_image.webp.probe(image_bytes) catch |err| switch (err) {
@@ -106,10 +126,17 @@ fn validateEncodedImageDimensions(image_bytes: []const u8) !void {
             };
             const width = info.width orelse return error.ImageDecodeFailed;
             const height = info.height orelse return error.ImageDecodeFailed;
-            try validateImageDimensions(width, height);
+            return .{ .width = width, .height = height };
         },
         else => return error.ImageDecodeFailed,
     }
+}
+
+fn validateEncodedImageDimensions(image_bytes: []const u8) !void {
+    _ = inspectEncodedForInference(image_bytes, null) catch |err| switch (err) {
+        error.ImageTooLarge => return error.ImageDecodeFailed,
+        else => return err,
+    };
 }
 
 fn decodePng(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
@@ -131,16 +158,12 @@ fn decodeJpeg(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
 }
 
 fn decodeGif(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
-    const frames = antfly_image.gif.decodeFramesAlloc(allocator, image_bytes) catch |err| switch (err) {
+    const frame = antfly_image.gif.decodeFirstFrameAlloc(allocator, image_bytes) catch |err| switch (err) {
         error.GifDecodeFailed, error.UnsupportedGifFormat => return error.ImageDecodeFailed,
         else => return err,
     };
-    defer {
-        for (frames) |frame| allocator.free(frame.rgba);
-        allocator.free(frames);
-    }
-    if (frames.len == 0) return error.ImageDecodeFailed;
-    return try imageFromRgbaNoFree(allocator, frames[0].rgba, frames[0].width, frames[0].height);
+    defer allocator.free(frame.rgba);
+    return try imageFromRgbaNoFree(allocator, frame.rgba, frame.width, frame.height);
 }
 
 fn decodeBmp(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
@@ -201,21 +224,11 @@ fn decodeRgba(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
             return try imageFromOwnedRgba(allocator, decoded.rgba, decoded.width, decoded.height);
         },
         .gif => {
-            const frames = antfly_image.gif.decodeFramesAlloc(allocator, image_bytes) catch |err| switch (err) {
+            const frame = antfly_image.gif.decodeFirstFrameAlloc(allocator, image_bytes) catch |err| switch (err) {
                 error.GifDecodeFailed, error.UnsupportedGifFormat => return error.ImageDecodeFailed,
                 else => return err,
             };
-            var cleanup_frames = true;
-            errdefer if (cleanup_frames) {
-                for (frames) |frame| allocator.free(frame.rgba);
-                allocator.free(frames);
-            };
-            if (frames.len == 0) return error.ImageDecodeFailed;
-            const first = frames[0];
-            for (frames[1..]) |frame| allocator.free(frame.rgba);
-            allocator.free(frames);
-            cleanup_frames = false;
-            return try imageFromOwnedRgba(allocator, first.rgba, first.width, first.height);
+            return try imageFromOwnedRgba(allocator, frame.rgba, frame.width, frame.height);
         },
         .bmp => {
             const decoded = antfly_image.bmp.decodeRgbaLimited(allocator, image_bytes, antfly_image.DecodeLimits.inference_default) catch |err| switch (err) {
@@ -366,6 +379,25 @@ test "decode rejects oversized image dimensions before full decode" {
     std.mem.writeInt(i32, bmp[18..22], 100_000, .little);
     std.mem.writeInt(i32, bmp[22..26], 100_000, .little);
     try std.testing.expectError(error.ImageDecodeFailed, decode(std.testing.allocator, &bmp));
+}
+
+test "encoded image inspection distinguishes malformed and configured limits" {
+    try std.testing.expectError(error.ImageDecodeFailed, inspectEncodedForInference("not-an-image", null));
+    try std.testing.expectError(error.ImageDecodeFailed, inspectEncodedForInference(red_png_2x2[0..20], null));
+
+    var png = red_png_2x2;
+    std.mem.writeInt(u32, png[16..20], 2049, .big);
+    try std.testing.expectError(error.ImageTooLarge, inspectEncodedForInference(&png, 2048));
+
+    std.mem.writeInt(u32, png[16..20], 0, .big);
+    try std.testing.expectError(error.ImageDecodeFailed, inspectEncodedForInference(&png, null));
+    std.mem.writeInt(u32, png[16..20], std.math.maxInt(u32), .big);
+    std.mem.writeInt(u32, png[20..24], std.math.maxInt(u32), .big);
+    try std.testing.expectError(error.ImageTooLarge, inspectEncodedForInference(&png, null));
+
+    const info = try inspectEncodedForInference(&red_png_2x2, 2);
+    try std.testing.expectEqual(@as(u32, 2), info.width);
+    try std.testing.expectEqual(@as(u32, 2), info.height);
 }
 
 test "decode webp fixture returns rgb image" {

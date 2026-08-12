@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -393,6 +394,36 @@ class HACluster:
             "manifest_path": manifest_path,
         }
 
+    def activate_seeded_slot(
+        self,
+        seed: dict[str, Any],
+        bootstrapped: dict[str, Any],
+    ) -> dict[str, Any]:
+        generation = f"seed-{self.standby.node_id}-{seed['backup_lsn']}"
+        seed_receipt_sha256 = _canonical_json_sha256(bootstrapped)
+        capture_receipt_sha256 = _canonical_json_sha256(seed["finished"])
+        manifest_sha256 = hashlib.sha256(seed["manifest_path"].read_bytes()).hexdigest()
+        aggregate_sha256 = hashlib.sha256(
+            b"antfly-ha-seed-activation-v1\0"
+            + bytes.fromhex(seed_receipt_sha256)
+            + bytes.fromhex(capture_receipt_sha256)
+            + bytes.fromhex(manifest_sha256)
+        ).hexdigest()
+        return self.primary.admin_post(
+            "/base-backups/activate",
+            {
+                "slot_name": self.standby.node_id,
+                "generation": generation,
+                "manifest_id": seed["manifest_id"],
+                "timeline_id": self.primary.timeline_id,
+                "checkpoint_lsn": seed["backup_lsn"],
+                "seed_receipt_sha256": seed_receipt_sha256,
+                "capture_receipt_sha256": capture_receipt_sha256,
+                "manifest_sha256": manifest_sha256,
+                "aggregate_sha256": aggregate_sha256,
+            },
+        )
+
     def close(self, *, test_failed: bool = False) -> None:
         self.standby.close()
         self.primary.close()
@@ -475,6 +506,44 @@ def _wait_for_promoted_write_check(
     )
 
 
+def _wait_for_promoted_primary_missing_lookup(
+    cluster: HACluster,
+    table_name: str,
+    key: str,
+    *,
+    timeout_s: float = 20.0,
+) -> requests.Response:
+    """Wait for the asynchronous promotion handoff to reach the public gate."""
+    deadline = time.monotonic() + timeout_s
+    last_response: str | None = None
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if cluster.standby.proc is not None and cluster.standby.proc.poll() is not None:
+            break
+        try:
+            response = requests.get(
+                f"{cluster.standby.url}{DB_API_ROOT}{lookup_key_path(table_name, key)}",
+                timeout=30,
+            )
+        except requests.RequestException as err:
+            last_error = err
+            time.sleep(0.1)
+            continue
+        if response.status_code == 404:
+            return response
+        last_response = f"{response.status_code}: {response.text}"
+        if response.status_code != 503 or response.text != "read requires primary":
+            cluster.standby._check(response)
+            raise AssertionError(f"promoted primary unexpectedly contained {key!r}")
+        time.sleep(0.1)
+    exit_code = cluster.standby.proc.poll() if cluster.standby.proc is not None else None
+    raise AssertionError(
+        "promoted standby did not publish primary read authority before the deadline; "
+        f"exit_code={exit_code}; last_response={last_response}; last_error={last_error}\n"
+        f"{cluster.debug_logs()}"
+    )
+
+
 def _wait_for_standby_lookup(
     cluster: HACluster,
     table_name: str,
@@ -550,6 +619,11 @@ def _identity(cluster: HACluster) -> dict[str, int]:
         "timeline_id": cluster.primary.timeline_id,
         "epoch": cluster.primary.epoch,
     }
+
+
+def _canonical_json_sha256(value: dict[str, Any]) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _encode_ha_backup_manifest(
@@ -665,6 +739,21 @@ def _assert_admin_requires_bearer(node: HAStandaloneNode, path: str) -> None:
     assert wrong.status_code == 401
 
 
+def _assert_internal_replication_requires_bearer(node: HAStandaloneNode) -> None:
+    url = f"{node.url}/internal/v1/ha/replication/identify"
+    missing = requests.get(url, timeout=10)
+    assert missing.status_code == 401
+    wrong = requests.get(
+        url,
+        headers={"Authorization": "Bearer wrong-token"},
+        timeout=10,
+    )
+    assert wrong.status_code == 401
+    authorized = requests.get(url, headers=node.admin_headers(), timeout=10)
+    assert authorized.status_code == 200
+    assert authorized.json()["identity"]["cluster_id"] == node.cluster_id
+
+
 def _sync_policy(mode: str, *, failure_policy: str = "block", standby_name: str = "standby-a") -> dict[str, Any]:
     return {
         "mode": mode,
@@ -693,6 +782,7 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     ha_cluster.configure_table_identity(shard_id=shard_id, table_id=table_id)
     ha_cluster.primary.start()
     _assert_admin_requires_bearer(ha_cluster.primary, "/primary/status")
+    _assert_internal_replication_requires_bearer(ha_cluster.primary)
 
     seed = ha_cluster.seed_standby_catalog_from_primary()
     assert seed["backup_lsn"] >= 1
@@ -713,6 +803,47 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         target=seed["manifest_id"],
         state="applied",
         node_id="standby-a",
+    )
+
+    seeding_slot = _slot_by_name(ha_cluster.primary.admin_get("/primary/status"), "standby-a")
+    assert seeding_slot["active"] is False
+    blocked_stream = requests.post(
+        f"{ha_cluster.primary.url}/internal/v1/ha/replication/start",
+        headers=ha_cluster.primary.admin_headers(),
+        json={
+            "slot_name": "standby-a",
+            "from_lsn": seed["backup_lsn"] + 1,
+            "max_records": 1,
+            "max_encoded_bytes": 1024 * 1024,
+        },
+        timeout=10,
+    )
+    assert blocked_stream.status_code == 409
+    assert blocked_stream.text == "SlotSeeding"
+
+    activated = ha_cluster.activate_seeded_slot(seed, bootstrapped)
+    generation = f"seed-standby-a-{seed['backup_lsn']}"
+    _assert_action_receipt(
+        activated,
+        action_id=f"seeded_slot_activate:{generation}",
+        action_kind="seeded_slot_activate",
+        target=generation,
+        state="applied",
+        node_id="primary-a",
+    )
+    assert activated["slot_name"] == "standby-a"
+    assert int(activated["checkpoint_lsn"]) == seed["backup_lsn"]
+    activated_slot = _slot_by_name(ha_cluster.primary.admin_get("/primary/status"), "standby-a")
+    assert activated_slot["active"] is True
+
+    activated_retry = ha_cluster.activate_seeded_slot(seed, bootstrapped)
+    _assert_action_receipt(
+        activated_retry,
+        action_id=f"seeded_slot_activate:{generation}",
+        action_kind="seeded_slot_activate",
+        target=generation,
+        state="already_applied",
+        node_id="primary-a",
     )
 
     ha_cluster.standby.restart()
@@ -931,7 +1062,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         action_kind="fence_acquire",
         target="standby-a",
         state="applied",
-        node_id="standby-a",
+        # Receipts identify the node-local endpoint that performed the action;
+        # the promoted standby remains the separately asserted action target.
+        node_id="primary-a",
     )
     assert primary_fence["receipt"]["promoted_node_id"] == "standby-a"
     fenced_write_check = ha_cluster.primary.admin_post(
@@ -1011,10 +1144,20 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         ha_cluster.primary.lookup_key(table_name, "doc:old-primary", consistency="stale")
     assert missing_old_primary_doc.value.response is not None
     assert missing_old_primary_doc.value.response.status_code == 404
-    with pytest.raises(requests.HTTPError) as missing_promoted_primary_doc:
-        ha_cluster.standby.lookup_key(table_name, "doc:old-primary")
-    assert missing_promoted_primary_doc.value.response is not None
-    assert missing_promoted_primary_doc.value.response.status_code == 404
+    missing_promoted_primary_doc = _wait_for_promoted_primary_missing_lookup(
+        ha_cluster,
+        table_name,
+        "doc:old-primary",
+    )
+    assert missing_promoted_primary_doc.status_code == 404
+
+    ha_cluster.standby.batch_write(table_name, {"doc:promoted": {"title": "promoted"}})
+    promoted_doc = ha_cluster.standby.lookup_key(table_name, "doc:promoted")
+    assert promoted_doc["title"] == "promoted"
+    with pytest.raises(requests.HTTPError) as missing_former_primary_copy:
+        ha_cluster.primary.lookup_key(table_name, "doc:promoted", consistency="stale")
+    assert missing_former_primary_copy.value.response is not None
+    assert missing_former_primary_copy.value.response.status_code == 404
 
 
 def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HACluster):

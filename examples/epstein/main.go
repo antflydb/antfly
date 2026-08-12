@@ -4487,7 +4487,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  epstein entities [flags]  - Add Antfly inference entity metadata to prepared JSON\n")
 		fmt.Fprintf(os.Stderr, "\nQuick Start:\n")
 		fmt.Fprintf(os.Stderr, "  # 1. Build and start Zig Antfly\n")
-		fmt.Fprintf(os.Stderr, "  cd zig && zig build install && ./zig-out/bin/antfly standalone\n\n")
+		fmt.Fprintf(os.Stderr, "  cd zig && zig build antfly && ./zig-out/bin/antfly standalone\n\n")
 		fmt.Fprintf(os.Stderr, "  # 2. Download documents (choose dataset)\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset court-2024    # ~23MB, 943 pages\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset doj-complete  # ~4.8GB, 8 datasets (Dec 2025)\n")

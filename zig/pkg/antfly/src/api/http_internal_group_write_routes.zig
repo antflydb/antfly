@@ -21,13 +21,13 @@ const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
-const metadata_mod = @import("../metadata/mod.zig");
+const metadata_mod = @import("../metadata/domain.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const raft_mod = @import("../raft/mod.zig");
 const repair_jobs = @import("repair_jobs.zig");
 const routes = @import("http_routes.zig");
-const table_writes = @import("table_writes.zig");
+const table_writes = @import("table_write_source.zig");
 const platform_time = @import("antfly_platform").time;
 
 pub const BatchValidator = struct {

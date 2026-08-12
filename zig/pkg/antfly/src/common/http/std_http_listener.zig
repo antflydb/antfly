@@ -1388,6 +1388,78 @@ test "std http executor deinit drains the complete timed operation" {
     try std.testing.expect(!request.failed.load(.acquire));
 }
 
+test "HA hostname requests survive successful connect cleanup" {
+    const std_http_executor = @import("std_http_executor.zig");
+
+    const NotFoundApp = struct {
+        fn iface(self: *@This()) common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return .{
+                .status = 404,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, "{}"),
+            };
+        }
+    };
+
+    var app = NotFoundApp{};
+    var listener = StdHttpListener.init(std.testing.allocator, .{}, app.iface());
+    defer listener.deinit();
+    try listener.start();
+
+    const bound = listener.boundAddress().?;
+    var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{
+        .resolve_before_connect = true,
+    });
+    defer executor.deinit();
+
+    // A short response repeatedly exercises hostname resolution followed by a
+    // successful connection cleanup. The HA transport must never enter Zig
+    // 0.16's racy HostName.connect cancellation path.
+    for (0..2_000) |_| {
+        const uri = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "http://localhost:{d}/internal/ha/identify-system",
+            .{bound.getPort()},
+        );
+        defer std.testing.allocator.free(uri);
+        var response = try executor.executor().execute(std.testing.allocator, .{
+            .method = .GET,
+            .uri = uri,
+        });
+        defer response.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 404), response.status);
+    }
+}
+
+test "HA resolved transport soaks an external wrong-route endpoint" {
+    const std_http_executor = @import("std_http_executor.zig");
+    const url_c = std.c.getenv("ANTFLY_HA_HTTP_SOAK_URL") orelse return error.SkipZigTest;
+    const url = std.mem.span(url_c);
+
+    var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{
+        .resolve_before_connect = true,
+    });
+    defer executor.deinit();
+
+    for (0..10_000) |_| {
+        const request_uri = try std.testing.allocator.dupe(u8, url);
+        defer std.testing.allocator.free(request_uri);
+        var response = try executor.executor().execute(std.testing.allocator, .{
+            .method = .GET,
+            .uri = request_uri,
+        });
+        defer response.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 404), response.status);
+    }
+}
+
 test "std http listener and executor round-trip snapshot routes" {
     const raft_engine = @import("raft_engine");
     const http_server = @import("../../raft/transport/http_server.zig");
@@ -2231,6 +2303,57 @@ test "std http listener header timeout releases accepted idle connection slot" {
     try std.testing.expect(stats.deadline_expirations_total >= 1);
     try std.testing.expectEqual(@as(u64, 0), stats.deadline_observer_failures_total);
     try std.testing.expectEqual(@as(usize, 0), stats.active_deadline_observers);
+}
+
+test "std http listener ready request does not wait for async timeout budget" {
+    const std_http_executor = @import("std_http_executor.zig");
+
+    const App = struct {
+        fn executor(self: *@This()) common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "text/plain; charset=utf-8"),
+                .body = try alloc.dupe(u8, "ok"),
+            };
+        }
+    };
+
+    // Reproduce a saturated async budget deterministically. Connection
+    // handlers are concurrent tasks; a ready request must not execute its
+    // timeout inline merely because no bounded async slot remains.
+    var server_io = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .async_limit = .nothing,
+    });
+    defer server_io.deinit();
+
+    var app = App{};
+    var listener = StdHttpListener.initShared(std.heap.page_allocator, .{
+        .serve_in_connection_threads = true,
+        .max_connection_threads = 4,
+        .header_read_timeout_ms = 1_000,
+    }, app.executor(), &server_io);
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
+    defer executor.deinit();
+    var response = try executor.executor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = base_uri,
+        .timeout_ms = 250,
+    });
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
 }
 
 test "std http listener body timeout releases accepted slow body connection slot" {

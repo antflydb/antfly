@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ const (
 	AdminV1Path                       = "/admin/v1"
 	HAPath                            = AdminV1Path + "/ha"
 	HAPrimaryStatusPath               = HAPath + "/primary/status"
+	HAWatchdogProofPath               = HAPath + "/watchdog-proof"
 	HAStandbyStatusPath               = HAPath + "/standby/status"
 	HACommitCheckPath                 = HAPath + "/commit/check"
 	HACommitAppendPath                = HAPath + "/commit/append"
@@ -30,6 +32,9 @@ const (
 	HAReplicationSlotResumePathSuffix = "/resume"
 	HABaseBackupsPath                 = HAPath + "/base-backups"
 	HABaseBackupsFinishPath           = HABaseBackupsPath + "/finish"
+	HABaseBackupsCapturePath          = HABaseBackupsPath + "/capture"
+	HABaseBackupsActivatePath         = HABaseBackupsPath + "/activate"
+	HASeedLifecycleReceiptsPath       = HAPath + "/seed-lifecycle/receipts"
 	HAStandbyBootstrapPath            = HAPath + "/standby/bootstrap"
 	HAFencePath                       = HAPath + "/fence"
 	HAFenceCurrentPath                = HAFencePath + "/current"
@@ -51,6 +56,11 @@ type (
 	HAActionReceiptState               = oapi.HAActionReceiptState
 	HABaseBackupBeginResponse          = oapi.HABaseBackupBeginResponse
 	HABaseBackupFinishResponse         = oapi.HABaseBackupFinishResponse
+	HASeedArtifactCaptureResponse      = oapi.HASeedArtifactCaptureResponse
+	HASeedLifecycleReceiptEvent        = oapi.HASeedLifecycleReceiptEvent
+	HASeedLifecycleReceiptInventory    = oapi.HASeedLifecycleReceiptInventoryResponse
+	HARuntimeLifecycleObservation      = oapi.HARuntimeLifecycleObservation
+	HASeededSlotActivateResponse       = oapi.HASeededSlotActivateResponse
 	HACommitAppendResponse             = oapi.HACommitAppendResponse
 	HACommitCheckResponse              = oapi.HACommitCheckResponse
 	HACommitGate                       = oapi.HACommitGate
@@ -63,6 +73,8 @@ type (
 	HAFenceReceipt                     = oapi.HAFenceReceipt
 	HAFenceResponse                    = oapi.HAFenceResponse
 	HAIdentity                         = oapi.HAIdentity
+	HALeaseWatchdogProof               = oapi.HALeaseWatchdogProof
+	HAWatchdogProofResponse            = oapi.HAWatchdogProofResponse
 	HAOwnerJobCheckResponse            = oapi.HAOwnerJobCheckResponse
 	HAOwnerJobDecision                 = oapi.HAOwnerJobDecision
 	HAOwnerJobDecisionAction           = oapi.HAOwnerJobDecisionAction
@@ -128,13 +140,24 @@ type (
 	RejoinAssessRequest           = oapi.RejoinAssessRequest
 	ReplicationSlotCreateRequest  = oapi.ReplicationSlotCreateRequest
 	StandbyBootstrapRequest       = oapi.StandbyBootstrapRequest
+	SeededSlotActivateRequest     = oapi.SeededSlotActivateRequest
+	SeedArtifactCaptureRequest    = oapi.SeedArtifactCaptureRequest
+	HASeedLifecycleReceiptParams  = oapi.GetHASeedLifecycleReceiptsParams
+	HASeedLifecycleReceiptKind    = oapi.GetHASeedLifecycleReceiptsParamsKind
 	WriteCheckRequest             = oapi.WriteCheckRequest
 	WriteCheckRequestRole         = oapi.WriteCheckRequestRole
 )
 
 const (
+	HASeedLifecycleReceiptKindCapture    = oapi.GetHASeedLifecycleReceiptsParamsKindCapture
+	HASeedLifecycleReceiptKindActivation = oapi.GetHASeedLifecycleReceiptsParamsKindActivation
+)
+
+const (
 	HAActionKindBaseBackupBegin       = oapi.HAActionReceiptActionKindBaseBackupBegin
 	HAActionKindBaseBackupFinish      = oapi.HAActionReceiptActionKindBaseBackupFinish
+	HAActionKindSeedCapture           = oapi.HAActionReceiptActionKindSeedCapture
+	HAActionKindSeededSlotActivate    = oapi.HAActionReceiptActionKindSeededSlotActivate
 	HAActionKindFenceAcquire          = oapi.HAActionReceiptActionKindFenceAcquire
 	HAActionKindPromotion             = oapi.HAActionReceiptActionKindPromotion
 	HAActionKindPromotionAssess       = oapi.HAActionReceiptActionKindPromotionAssess
@@ -488,6 +511,234 @@ func ValidateHABaseBackupFinishResponseEvidence(raw []byte) error {
 	return nil
 }
 
+func ValidateHASeedArtifactCaptureResponse(response HASeedArtifactCaptureResponse) error {
+	if response.SchemaVersion == 0 || !HAActionReceiptPresent(response.Action) {
+		return fmt.Errorf("missing seed capture schema or action receipt")
+	}
+	if err := validateHAReplicationSlotNameForRequest("seed capture", response.SlotName); err != nil {
+		return err
+	}
+	if !validHAIdentifier(response.Generation) || strings.TrimSpace(response.ManifestId) == "" {
+		return fmt.Errorf("invalid seed capture generation or manifest")
+	}
+	for field, value := range map[string]string{
+		"topology_id":     response.TopologyId,
+		"node_id":         response.NodeId,
+		"target_pvc_name": response.TargetPvcName,
+		"target_pvc_uid":  response.TargetPvcUid,
+	} {
+		if err := validateHAIdentifierForRequest("seed capture", field, value); err != nil {
+			return err
+		}
+	}
+	if response.TopologyGeneration == 0 {
+		return fmt.Errorf("missing seed capture topology_generation")
+	}
+	if response.ClusterId == 0 || response.TimelineId == 0 || response.Epoch == 0 ||
+		response.BackupLsn == 0 || response.CheckpointLsn == 0 || response.EndRecordLsn == 0 || response.FileCount == 0 {
+		return fmt.Errorf("missing seed capture identity, checkpoint, or file evidence")
+	}
+	if !validSHA256Hex(response.SourcePlanSha256) || !validSHA256Hex(response.ManifestSha256) ||
+		!validSHA256Hex(response.CaptureReceiptSha256) {
+		return fmt.Errorf("invalid seed capture digest evidence")
+	}
+	for field, value := range map[string]string{
+		"generation_root": response.GenerationRoot,
+		"content_root":    response.ContentRoot,
+		"manifest_path":   response.ManifestPath,
+	} {
+		if err := validateHAPathForRequest("seed capture", field, value); err != nil {
+			return err
+		}
+	}
+	if err := validateHAActionReceiptTarget(response.Action, HASeedCaptureReceiptExpectation(), response.Generation, "seed capture"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ValidateHASeedArtifactCaptureResponseEvidence(raw []byte) error {
+	var response haSeedArtifactCaptureResponseEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if response.ClusterId == nil || response.ShardId == nil || response.TableId == nil ||
+		response.TimelineId == nil || response.Epoch == nil || response.BackupLsn == nil ||
+		response.CheckpointLsn == nil || response.EndRecordLsn == nil || response.FileCount == nil ||
+		response.TotalBytes == nil || response.AlreadyCaptured == nil || response.TopologyId == nil ||
+		response.TopologyGeneration == nil || response.NodeId == nil || response.TargetPvcName == nil ||
+		response.TargetPvcUid == nil || response.CaptureReceiptSha256 == nil {
+		return fmt.Errorf("missing seed capture field evidence")
+	}
+	return nil
+}
+
+func ValidateHASeedLifecycleReceiptInventory(response HASeedLifecycleReceiptInventory) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing seed lifecycle inventory schema_version")
+	}
+	if response.Runtime.ObservedAtUnixNs == 0 {
+		return fmt.Errorf("missing seed lifecycle runtime observation timestamp")
+	}
+	if response.Runtime.NodeId != "" && !validHAIdentifier(response.Runtime.NodeId) {
+		return fmt.Errorf("invalid seed lifecycle runtime node_id")
+	}
+	if response.Runtime.PodUid != "" && !validHAIdentifier(response.Runtime.PodUid) {
+		return fmt.Errorf("invalid seed lifecycle runtime pod_uid")
+	}
+	switch response.Runtime.Role {
+	case oapi.HARuntimeLifecycleObservationRolePrimary, oapi.HARuntimeLifecycleObservationRoleStandby, oapi.HARuntimeLifecycleObservationRoleUnknown:
+	default:
+		return fmt.Errorf("invalid seed lifecycle runtime role %q", response.Runtime.Role)
+	}
+	if response.EndCursor == 0 {
+		if response.FirstCursor != 0 || len(response.Entries) != 0 {
+			return fmt.Errorf("invalid empty seed lifecycle cursor range")
+		}
+	} else if response.FirstCursor == 0 || response.FirstCursor > response.EndCursor {
+		return fmt.Errorf("invalid seed lifecycle cursor range")
+	}
+	if response.HistoryTruncated != (response.FirstCursor > 1) {
+		return fmt.Errorf("inconsistent seed lifecycle truncation evidence")
+	}
+	var previous uint64
+	for i, event := range response.Entries {
+		if event.Cursor == 0 || event.Cursor <= previous || event.Cursor > response.EndCursor {
+			return fmt.Errorf("invalid seed lifecycle event cursor at index %d", i)
+		}
+		previous = event.Cursor
+		if err := validateHASeedLifecycleReceiptEvent(event); err != nil {
+			return fmt.Errorf("seed lifecycle event %d: %w", i, err)
+		}
+	}
+	if len(response.Entries) > 0 && response.NextCursor != response.Entries[len(response.Entries)-1].Cursor {
+		return fmt.Errorf("seed lifecycle next_cursor does not match returned page")
+	}
+	return nil
+}
+
+func validateHASeedLifecycleReceiptEvent(event HASeedLifecycleReceiptEvent) error {
+	for field, value := range map[string]string{
+		"generation":      event.Generation,
+		"slot_name":       event.SlotName,
+		"topology_id":     event.TopologyId,
+		"node_id":         event.NodeId,
+		"target_pvc_name": event.TargetPvcName,
+		"target_pvc_uid":  event.TargetPvcUid,
+	} {
+		if !validHAIdentifier(value) {
+			return fmt.Errorf("invalid %s", field)
+		}
+	}
+	if event.TopologyGeneration == 0 || event.RecordedAtUnixNs == 0 || !validSHA256Hex(event.ReceiptSha256) {
+		return fmt.Errorf("missing topology, timestamp, or digest evidence")
+	}
+	if event.PodUid != "" && !validHAIdentifier(event.PodUid) {
+		return fmt.Errorf("invalid pod_uid")
+	}
+	switch event.AuthoritativeState {
+	case oapi.HASeedLifecycleReceiptEventAuthoritativeStateRetained, oapi.HASeedLifecycleReceiptEventAuthoritativeStateMissing:
+	default:
+		return fmt.Errorf("invalid authoritative_state %q", event.AuthoritativeState)
+	}
+	var receipt struct {
+		FormatVersion      uint16 `json:"format_version"`
+		Generation         string `json:"generation"`
+		SlotName           string `json:"slot_name"`
+		TopologyId         string `json:"topology_id"`
+		TopologyGeneration uint64 `json:"topology_generation"`
+		NodeId             string `json:"node_id"`
+		TargetPvcName      string `json:"target_pvc_name"`
+		TargetPvcUid       string `json:"target_pvc_uid"`
+	}
+	if err := json.Unmarshal([]byte(event.ReceiptJson), &receipt); err != nil {
+		return fmt.Errorf("invalid receipt_json: %w", err)
+	}
+	digest := sha256.Sum256([]byte(event.ReceiptJson))
+	if fmt.Sprintf("%x", digest[:]) != event.ReceiptSha256 {
+		return fmt.Errorf("receipt_json digest mismatch")
+	}
+	if receipt.Generation != event.Generation || receipt.SlotName != event.SlotName ||
+		receipt.TopologyId != event.TopologyId || receipt.TopologyGeneration != event.TopologyGeneration ||
+		receipt.NodeId != event.NodeId || receipt.TargetPvcName != event.TargetPvcName || receipt.TargetPvcUid != event.TargetPvcUid {
+		return fmt.Errorf("receipt_json lifecycle binding mismatch")
+	}
+	switch event.Kind {
+	case oapi.HASeedLifecycleReceiptEventKindCapture:
+		if receipt.FormatVersion != 2 {
+			return fmt.Errorf("invalid capture receipt format_version")
+		}
+	case oapi.HASeedLifecycleReceiptEventKindActivation:
+		if receipt.FormatVersion != 1 {
+			return fmt.Errorf("invalid activation receipt format_version")
+		}
+	default:
+		return fmt.Errorf("invalid lifecycle receipt kind %q", event.Kind)
+	}
+	return nil
+}
+
+func ValidateHASeedLifecycleReceiptInventoryEvidence(raw []byte) error {
+	var response haSeedLifecycleReceiptInventoryEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if response.SchemaVersion == nil || response.Entries == nil || response.FirstCursor == nil ||
+		response.EndCursor == nil || response.NextCursor == nil || response.HistoryTruncated == nil ||
+		response.Gap == nil || response.HasMore == nil || response.Runtime.Role == nil ||
+		response.Runtime.Fenced == nil || response.Runtime.ObservedAtUnixNs == nil {
+		return fmt.Errorf("missing seed lifecycle inventory field evidence")
+	}
+	for _, event := range *response.Entries {
+		if event.Cursor == nil || event.Kind == nil || event.Generation == nil || event.SlotName == nil ||
+			event.TopologyId == nil || event.TopologyGeneration == nil || event.NodeId == nil ||
+			event.TargetPvcName == nil || event.TargetPvcUid == nil || event.ReceiptSha256 == nil ||
+			event.ReceiptJson == nil || event.RecordedAtUnixNs == nil || event.AuthoritativeState == nil {
+			return fmt.Errorf("missing seed lifecycle event field evidence")
+		}
+	}
+	return nil
+}
+
+func ValidateHASeededSlotActivateResponse(response HASeededSlotActivateResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing seeded slot activate schema_version")
+	}
+	if !HAActionReceiptPresent(response.Action) {
+		return fmt.Errorf("missing seeded slot activate action receipt")
+	}
+	if err := validateHAReplicationSlotNameForRequest("seeded slot activate", response.SlotName); err != nil {
+		return err
+	}
+	if !validHAIdentifier(response.Generation) {
+		return fmt.Errorf("invalid seeded slot activate generation")
+	}
+	if strings.TrimSpace(response.ManifestId) == "" || response.TimelineId == 0 || response.CheckpointLsn == 0 {
+		return fmt.Errorf("missing seeded slot activate identity or checkpoint")
+	}
+	if !validSHA256Hex(response.SeedReceiptSha256) || !validSHA256Hex(response.CaptureReceiptSha256) ||
+		!validSHA256Hex(response.ManifestSha256) || !validSHA256Hex(response.AggregateSha256) {
+		return fmt.Errorf("invalid seeded slot activate digest evidence")
+	}
+	if err := validateHAActionReceiptTarget(response.Action, HASeededSlotActivateReceiptExpectation(), response.Generation, "seeded slot activate"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ValidateHASeededSlotActivateResponseEvidence(raw []byte) error {
+	var response haSeededSlotActivateResponseEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if response.TimelineId == nil || response.CheckpointLsn == nil || response.SeedReceiptSha256 == nil ||
+		response.CaptureReceiptSha256 == nil ||
+		response.ManifestSha256 == nil || response.AggregateSha256 == nil {
+		return fmt.Errorf("missing seeded slot activate field evidence")
+	}
+	return nil
+}
+
 func ValidateHAStandbyBootstrapResponse(response HAStandbyBootstrapResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing standby bootstrap schema_version")
@@ -571,6 +822,20 @@ func ValidateHAPrimaryStatusResponse(response HAPrimaryStatusResponse) error {
 		if err := validateHADurabilityDecision(snapshot.Durability); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func ValidateHAWatchdogProofResponse(response HAWatchdogProofResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing watchdog proof schema_version")
+	}
+	proof := response.Proof
+	if proof.CapabilityVersion == 0 || strings.TrimSpace(proof.LeaseName) == "" ||
+		strings.TrimSpace(proof.LeaseNamespace) == "" || strings.TrimSpace(proof.StableTopologyId) == "" ||
+		strings.TrimSpace(proof.LocalNodeId) == "" || strings.TrimSpace(proof.PodUid) == "" ||
+		strings.TrimSpace(proof.ProcessBootId) == "" || proof.MaxFenceLatencyMs == 0 {
+		return fmt.Errorf("missing watchdog capability proof fields")
 	}
 	return nil
 }
@@ -728,7 +993,11 @@ func validateHAFenceActionCorrelation(action HAActionReceipt, receipt HAFenceRec
 	if action.State != HAActionStateApplied && action.State != HAActionStateAlreadyApplied {
 		return fmt.Errorf("fence response action state mismatch")
 	}
-	if !validHAIdentifier(action.Target) || action.Target != promoted || action.NodeId != promoted {
+	// A fence receipt can be persisted first on the old writer and then on the
+	// candidate. The target is always the promoted node, while node_id identifies
+	// the endpoint that durably recorded this copy of the receipt.
+	if !validHAIdentifier(action.Target) || action.Target != promoted ||
+		(action.NodeId != promoted && action.NodeId != receipt.OldPrimaryId) {
 		return fmt.Errorf("fence response action node mismatch")
 	}
 	if action.ActionId != string(action.ActionKind)+":"+promoted {
@@ -1095,6 +1364,67 @@ type haBaseBackupBeginResponseEvidence struct {
 type haBaseBackupFinishResponseEvidence struct {
 	BackupLsn    *uint64 `json:"backup_lsn"`
 	EndRecordLsn *uint64 `json:"end_record_lsn"`
+}
+
+type haSeededSlotActivateResponseEvidence struct {
+	TimelineId           *uint64 `json:"timeline_id"`
+	CheckpointLsn        *uint64 `json:"checkpoint_lsn"`
+	SeedReceiptSha256    *string `json:"seed_receipt_sha256"`
+	CaptureReceiptSha256 *string `json:"capture_receipt_sha256"`
+	ManifestSha256       *string `json:"manifest_sha256"`
+	AggregateSha256      *string `json:"aggregate_sha256"`
+}
+
+type haSeedArtifactCaptureResponseEvidence struct {
+	ClusterId            *uint64 `json:"cluster_id"`
+	ShardId              *uint64 `json:"shard_id"`
+	TableId              *uint64 `json:"table_id"`
+	TimelineId           *uint64 `json:"timeline_id"`
+	Epoch                *uint64 `json:"epoch"`
+	BackupLsn            *uint64 `json:"backup_lsn"`
+	CheckpointLsn        *uint64 `json:"checkpoint_lsn"`
+	EndRecordLsn         *uint64 `json:"end_record_lsn"`
+	FileCount            *uint64 `json:"file_count"`
+	TotalBytes           *uint64 `json:"total_bytes"`
+	AlreadyCaptured      *bool   `json:"already_captured"`
+	TopologyId           *string `json:"topology_id"`
+	TopologyGeneration   *uint64 `json:"topology_generation"`
+	NodeId               *string `json:"node_id"`
+	TargetPvcName        *string `json:"target_pvc_name"`
+	TargetPvcUid         *string `json:"target_pvc_uid"`
+	CaptureReceiptSha256 *string `json:"capture_receipt_sha256"`
+}
+
+type haSeedLifecycleReceiptEventEvidence struct {
+	Cursor             *uint64 `json:"cursor"`
+	Kind               *string `json:"kind"`
+	Generation         *string `json:"generation"`
+	SlotName           *string `json:"slot_name"`
+	TopologyId         *string `json:"topology_id"`
+	TopologyGeneration *uint64 `json:"topology_generation"`
+	NodeId             *string `json:"node_id"`
+	TargetPvcName      *string `json:"target_pvc_name"`
+	TargetPvcUid       *string `json:"target_pvc_uid"`
+	ReceiptSha256      *string `json:"receipt_sha256"`
+	ReceiptJson        *string `json:"receipt_json"`
+	RecordedAtUnixNs   *uint64 `json:"recorded_at_unix_ns"`
+	AuthoritativeState *string `json:"authoritative_state"`
+}
+
+type haSeedLifecycleReceiptInventoryEvidence struct {
+	SchemaVersion    *uint32                                `json:"schema_version"`
+	Entries          *[]haSeedLifecycleReceiptEventEvidence `json:"entries"`
+	FirstCursor      *uint64                                `json:"first_cursor"`
+	EndCursor        *uint64                                `json:"end_cursor"`
+	NextCursor       *uint64                                `json:"next_cursor"`
+	HistoryTruncated *bool                                  `json:"history_truncated"`
+	Gap              *bool                                  `json:"gap"`
+	HasMore          *bool                                  `json:"has_more"`
+	Runtime          struct {
+		Role             *string `json:"role"`
+		Fenced           *bool   `json:"fenced"`
+		ObservedAtUnixNs *uint64 `json:"observed_at_unix_ns"`
+	} `json:"runtime"`
 }
 
 type haStandbyBootstrapResponseEvidence struct {
@@ -1880,6 +2210,14 @@ func HAFinishBaseBackupOperation() HAOperation {
 	return HAOperation{Method: http.MethodPost, Path: HABaseBackupsFinishPath}
 }
 
+func HASeedCaptureOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HABaseBackupsCapturePath}
+}
+
+func HAActivateSeededSlotOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HABaseBackupsActivatePath}
+}
+
 func HABootstrapStandbyOperation() HAOperation {
 	return HAOperation{Method: http.MethodPost, Path: HAStandbyBootstrapPath}
 }
@@ -1948,6 +2286,18 @@ func validHAIdentifier(value string) bool {
 	return true
 }
 
+func validSHA256Hex(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if (value[i] < '0' || value[i] > '9') && (value[i] < 'a' || value[i] > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func HAReplicationSlotCreateReceiptExpectation() HAReceiptExpectation {
 	return HAReceiptExpectation{ActionKind: HAActionKindReplicationSlotCreate, State: HAActionStateApplied}
 }
@@ -1970,6 +2320,14 @@ func HABaseBackupBeginReceiptExpectation() HAReceiptExpectation {
 
 func HABaseBackupFinishReceiptExpectation() HAReceiptExpectation {
 	return HAReceiptExpectation{ActionKind: HAActionKindBaseBackupFinish, State: HAActionStateApplied}
+}
+
+func HASeedCaptureReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindSeedCapture, State: HAActionStateApplied}
+}
+
+func HASeededSlotActivateReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindSeededSlotActivate, State: HAActionStateApplied}
 }
 
 func HAStandbyBootstrapReceiptExpectation() HAReceiptExpectation {
@@ -2260,6 +2618,18 @@ func (c *HAClient) PrimaryStatus(ctx context.Context, params *HAPrimaryStatusPar
 	return haResponseValue(c.PrimaryStatusResponse(ctx, params))
 }
 
+func (c *HAClient) WatchdogProofResponse(ctx context.Context) (*HAResponse[HAWatchdogProofResponse], error) {
+	resp, err := c.client.GetHAWatchdogProofWithResponse(ctx, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200Validated("get HA watchdog proof", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAWatchdogProofResponse)
+}
+
+func (c *HAClient) WatchdogProof(ctx context.Context) (*HAWatchdogProofResponse, error) {
+	return haResponseValue(c.WatchdogProofResponse(ctx))
+}
+
 func (c *HAClient) PrimaryStatusParsedResponse(ctx context.Context, params *HAPrimaryStatusParams) (*HAResponse[ParsedHAPrimaryStatus], error) {
 	if err := validateHAPrimaryStatusParamsForRequest("get HA primary status", params); err != nil {
 		return nil, err
@@ -2306,6 +2676,10 @@ func haPrimaryStatusQueryEditor(params *HAPrimaryStatusParams) oapi.RequestEdito
 		removeZeroQueryParam(query, "max_retained_bytes")
 		removeZeroQueryParam(query, "max_retained_age_ns")
 		removeZeroQueryParam(query, "sync_required")
+		removeEmptyQueryParam(query, "sync_mode")
+		removeEmptyQueryParam(query, "sync_selection")
+		removeEmptyQueryParam(query, "sync_standby")
+		removeEmptyQueryParam(query, "sync_failure")
 		if params.SyncSelection == HAPrimaryStatusSyncSelectionAll {
 			query.Del("sync_required")
 		}
@@ -2317,6 +2691,13 @@ func haPrimaryStatusQueryEditor(params *HAPrimaryStatusParams) oapi.RequestEdito
 func removeZeroQueryParam(query url.Values, key string) {
 	values, ok := query[key]
 	if ok && len(values) == 1 && values[0] == "0" {
+		query.Del(key)
+	}
+}
+
+func removeEmptyQueryParam(query url.Values, key string) {
+	values, ok := query[key]
+	if ok && len(values) == 1 && values[0] == "" {
 		query.Del(key)
 	}
 }
@@ -2610,6 +2991,102 @@ func (c *HAClient) FinishBaseBackupResponse(ctx context.Context, body BaseBackup
 
 func (c *HAClient) FinishBaseBackup(ctx context.Context, body BaseBackupManifestPathRequest) (*HABaseBackupFinishResponse, error) {
 	return haResponseValue(c.FinishBaseBackupResponse(ctx, body))
+}
+
+func (c *HAClient) CaptureSeedArtifactResponse(ctx context.Context, body SeedArtifactCaptureRequest) (*HAResponse[HASeedArtifactCaptureResponse], error) {
+	if err := validateHAReplicationSlotNameForRequest("capture HA seed artifact", body.SlotName); err != nil {
+		return nil, err
+	}
+	if !validHAIdentifier(body.Generation) {
+		return nil, fmt.Errorf("capture HA seed artifact requires a valid generation")
+	}
+	for field, value := range map[string]string{
+		"topology_id":     body.TopologyId,
+		"node_id":         body.NodeId,
+		"target_pvc_name": body.TargetPvcName,
+		"target_pvc_uid":  body.TargetPvcUid,
+	} {
+		if err := validateHAIdentifierForRequest("capture HA seed artifact", field, value); err != nil {
+			return nil, err
+		}
+	}
+	if body.TopologyGeneration == 0 {
+		return nil, fmt.Errorf("capture HA seed artifact requires topology_generation")
+	}
+	resp, err := c.client.CaptureHASeedArtifactWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	result, err := requireHAJSON200ValidatedEvidence("capture HA seed artifact", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHASeedArtifactCaptureResponse, ValidateHASeedArtifactCaptureResponseEvidence)
+	if err != nil {
+		return nil, err
+	}
+	value := result.Value
+	if value.SlotName != body.SlotName || value.Generation != body.Generation ||
+		value.TopologyId != body.TopologyId || value.TopologyGeneration != body.TopologyGeneration ||
+		value.NodeId != body.NodeId || value.TargetPvcName != body.TargetPvcName || value.TargetPvcUid != body.TargetPvcUid {
+		return nil, &HAResponseValidationError{Operation: "capture HA seed artifact", Err: fmt.Errorf("response lifecycle binding does not match request")}
+	}
+	return result, nil
+}
+
+func (c *HAClient) CaptureSeedArtifact(ctx context.Context, body SeedArtifactCaptureRequest) (*HASeedArtifactCaptureResponse, error) {
+	return haResponseValue(c.CaptureSeedArtifactResponse(ctx, body))
+}
+
+func (c *HAClient) SeedLifecycleReceiptsResponse(ctx context.Context, params *HASeedLifecycleReceiptParams) (*HAResponse[HASeedLifecycleReceiptInventory], error) {
+	if params == nil {
+		return nil, fmt.Errorf("get HA seed lifecycle receipts requires kind")
+	}
+	if params.Kind != HASeedLifecycleReceiptKindCapture && params.Kind != HASeedLifecycleReceiptKindActivation {
+		return nil, fmt.Errorf("get HA seed lifecycle receipts requires capture or activation kind")
+	}
+	if params.Limit > 1000 {
+		return nil, fmt.Errorf("get HA seed lifecycle receipts limit exceeds 1000")
+	}
+	resp, err := c.client.GetHASeedLifecycleReceiptsWithResponse(ctx, params, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	result, err := requireHAJSON200ValidatedEvidence("get HA seed lifecycle receipts", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHASeedLifecycleReceiptInventory, ValidateHASeedLifecycleReceiptInventoryEvidence)
+	if err != nil {
+		return nil, err
+	}
+	for _, event := range result.Value.Entries {
+		if string(event.Kind) != string(params.Kind) {
+			return nil, &HAResponseValidationError{Operation: "get HA seed lifecycle receipts", Err: fmt.Errorf("response kind does not match request")}
+		}
+		if event.Cursor <= params.After {
+			return nil, &HAResponseValidationError{Operation: "get HA seed lifecycle receipts", Err: fmt.Errorf("response cursor is not after request cursor")}
+		}
+	}
+	return result, nil
+}
+
+func (c *HAClient) SeedLifecycleReceipts(ctx context.Context, params *HASeedLifecycleReceiptParams) (*HASeedLifecycleReceiptInventory, error) {
+	return haResponseValue(c.SeedLifecycleReceiptsResponse(ctx, params))
+}
+
+func (c *HAClient) ActivateSeededSlotResponse(ctx context.Context, body SeededSlotActivateRequest) (*HAResponse[HASeededSlotActivateResponse], error) {
+	if err := validateHAReplicationSlotNameForRequest("activate HA seeded slot", body.SlotName); err != nil {
+		return nil, err
+	}
+	if !validHAIdentifier(body.Generation) || strings.TrimSpace(body.ManifestId) == "" || body.TimelineId == 0 || body.CheckpointLsn == 0 {
+		return nil, fmt.Errorf("activate HA seeded slot requires generation, manifest, timeline and checkpoint evidence")
+	}
+	if !validSHA256Hex(body.SeedReceiptSha256) || !validSHA256Hex(body.CaptureReceiptSha256) ||
+		!validSHA256Hex(body.ManifestSha256) || !validSHA256Hex(body.AggregateSha256) {
+		return nil, fmt.Errorf("activate HA seeded slot requires lowercase SHA-256 digest evidence")
+	}
+	resp, err := c.client.ActivateHASeededSlotWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200ValidatedEvidence("activate HA seeded slot", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHASeededSlotActivateResponse, ValidateHASeededSlotActivateResponseEvidence)
+}
+
+func (c *HAClient) ActivateSeededSlot(ctx context.Context, body SeededSlotActivateRequest) (*HASeededSlotActivateResponse, error) {
+	return haResponseValue(c.ActivateSeededSlotResponse(ctx, body))
 }
 
 func (c *HAClient) BootstrapStandbyResponse(ctx context.Context, body StandbyBootstrapRequest) (*HAResponse[HAStandbyBootstrapResponse], error) {

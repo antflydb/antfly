@@ -17,15 +17,15 @@ limitations under the License.
 package sdk
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
+	"unsafe"
 
 	chunking "github.com/antflydb/antfly/go/pkg/libaf/chunking"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
@@ -118,17 +118,19 @@ func (e *InferenceCapacityError) Error() string {
 // Temporary reports that the request can be retried after RetryAfter.
 func (e *InferenceCapacityError) Temporary() bool { return true }
 
-func inferenceCapacityError(body *oapi.TransientCapacity) error {
+func validInferenceCapacityError(body *oapi.TransientCapacity) bool {
 	reason := string(body.Reason)
 	retryAfterMs := int64(body.RetryAfterMs)
 	const maxDurationMillis = int64((1<<63 - 1) / int64(time.Millisecond))
-	if !bool(body.Retryable) ||
-		body.Message == "" ||
-		(reason != "inference_capacity" && reason != "request_queue") ||
-		retryAfterMs <= 0 || retryAfterMs > maxDurationMillis {
-		// Preserve compatibility with older servers that returned an untyped 503.
-		return fmt.Errorf("service unavailable: %s", body.Error)
-	}
+	return bool(body.Retryable) &&
+		body.Message != "" &&
+		(reason == "inference_capacity" || reason == "request_queue") &&
+		retryAfterMs > 0 && retryAfterMs <= maxDurationMillis
+}
+
+func inferenceCapacityError(body *oapi.TransientCapacity) error {
+	reason := string(body.Reason)
+	retryAfterMs := int64(body.RetryAfterMs)
 	return &InferenceCapacityError{
 		Code:       body.Error,
 		Message:    body.Message,
@@ -137,28 +139,31 @@ func inferenceCapacityError(body *oapi.TransientCapacity) error {
 	}
 }
 
+func inferenceResponseErrorWithCapacity(
+	statusCode int,
+	body []byte,
+	capacity *oapi.TransientCapacity,
+) error {
+	if capacity != nil && validInferenceCapacityError(capacity) {
+		return inferenceCapacityError(capacity)
+	}
+	return inferenceResponseError(statusCode, body)
+}
+
 // NewInferenceClient creates a new inference client.
 // The baseURL should be the server address (e.g., "http://localhost:8080").
 // Legacy base URLs ending in /ai/v1 are accepted and normalized.
 func NewInferenceClient(baseURL string, httpClient *http.Client) (*InferenceClient, error) {
-	apiURL := normalizeInferenceBaseURL(baseURL)
-
 	var opts []oapi.ClientOption
 	if httpClient != nil {
 		opts = append(opts, oapi.WithHTTPClient(httpClient))
 	}
-
-	client, err := oapi.NewClientWithResponses(apiURL, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return &InferenceClient{
-		client:  client,
-		baseURL: apiURL,
-	}, nil
+	return NewInferenceClientWithOptions(baseURL, opts...)
 }
 
 // Client returns the underlying oapi-codegen client for direct API access.
+// Requests made through it retain the inference response-size limits configured
+// by NewInferenceClientWithOptions.
 func (c *InferenceClient) Client() *oapi.ClientWithResponses {
 	return c.client
 }
@@ -167,8 +172,19 @@ func normalizeInferenceBaseURL(baseURL string) string {
 	return strings.TrimSuffix(strings.TrimRight(baseURL, "/"), "/ai/v1")
 }
 
-// Embed generates embeddings for the given text strings.
-// Returns embeddings in binary format (most efficient).
+func inferenceErrorDetail(err *oapi.InferenceError) string {
+	if err.Message == "" || err.Message == err.Error {
+		return err.Error
+	}
+	if err.Error == "" {
+		return err.Message
+	}
+	return fmt.Sprintf("%s (%s)", err.Message, err.Error)
+}
+
+// Embed generates embeddings for the given text strings. Current servers return
+// JSON; bounded application/octet-stream responses from legacy servers remain
+// supported for compatibility.
 func (c *InferenceClient) Embed(ctx context.Context, model string, input []string) ([][]float32, error) {
 	// Build the input union type
 	var inputUnion oapi.InferenceEmbedRequest_Input
@@ -181,52 +197,40 @@ func (c *InferenceClient) Embed(ctx context.Context, model string, input []strin
 		Input: inputUnion,
 	}
 
-	// Make request - server defaults to binary response (most efficient)
 	resp, err := c.client.GenerateEmbeddingsWithResponse(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	// Check for error responses
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
 	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, inferenceCapacityError(resp.JSON503)
-	}
-
-	// Check content type to determine response format
-	contentType := resp.HTTPResponse.Header.Get("Content-Type")
-	if strings.Contains(contentType, "application/json") {
-		// JSON response
-		if resp.JSON200 != nil {
-			return denseEmbeddings(resp.JSON200)
-		}
-		return nil, fmt.Errorf("unexpected JSON response: %s", string(resp.Body))
-	}
-
-	// Binary response (default)
 	if resp.StatusCode() != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
 	}
 
-	embeddings, err := deserializeFloatArrays(bytes.NewReader(resp.Body))
-	if err != nil {
-		return nil, fmt.Errorf("deserializing embeddings: %w", err)
+	contentType := inferenceMediaType(resp.HTTPResponse.Header.Get("Content-Type"))
+	switch contentType {
+	case "application/json":
+		if resp.JSON200 != nil {
+			return denseEmbeddings(resp.JSON200)
+		}
+		return nil, fmt.Errorf("unexpected JSON response: %s", string(resp.Body))
+	case "application/octet-stream":
+		embeddings, err := deserializeFloatArrays(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("deserializing embeddings: %w", err)
+		}
+		return embeddings, nil
+	default:
+		return nil, fmt.Errorf("unexpected embedding response content type %q", contentType)
 	}
-
-	return embeddings, nil
 }
 
 // EmbedMultimodal generates embeddings for multimodal content parts (text, images, audio).
 // Each ContentPart can be a TextContentPart or ImageURLContentPart (with URL or data URI).
-// Returns embeddings in binary format (most efficient).
+// Current servers return JSON; bounded application/octet-stream responses from
+// legacy servers remain supported for compatibility.
 func (c *InferenceClient) EmbedMultimodal(ctx context.Context, model string, input []oapi.ContentPart) ([][]float32, error) {
 	var inputUnion oapi.InferenceEmbedRequest_Input
 	if err := inputUnion.FromInferenceEmbedRequestInput2(input); err != nil {
@@ -243,37 +247,29 @@ func (c *InferenceClient) EmbedMultimodal(ctx context.Context, model string, inp
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
 	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, inferenceCapacityError(resp.JSON503)
-	}
-
-	contentType := resp.HTTPResponse.Header.Get("Content-Type")
-	if strings.Contains(contentType, "application/json") {
-		if resp.JSON200 != nil {
-			return denseEmbeddings(resp.JSON200)
-		}
-		return nil, fmt.Errorf("unexpected JSON response: %s", string(resp.Body))
-	}
-
 	if resp.StatusCode() != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
 	}
 
-	embeddings, err := deserializeFloatArrays(bytes.NewReader(resp.Body))
-	if err != nil {
-		return nil, fmt.Errorf("deserializing embeddings: %w", err)
+	contentType := inferenceMediaType(resp.HTTPResponse.Header.Get("Content-Type"))
+	switch contentType {
+	case "application/json":
+		if resp.JSON200 != nil {
+			return denseEmbeddings(resp.JSON200)
+		}
+		return nil, fmt.Errorf("unexpected JSON response: %s", string(resp.Body))
+	case "application/octet-stream":
+		embeddings, err := deserializeFloatArrays(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("deserializing embeddings: %w", err)
+		}
+		return embeddings, nil
+	default:
+		return nil, fmt.Errorf("unexpected embedding response content type %q", contentType)
 	}
-
-	return embeddings, nil
 }
 
 // EmbedJSON generates embeddings and returns JSON response (includes model name).
@@ -296,17 +292,12 @@ func (c *InferenceClient) EmbedJSON(ctx context.Context, model string, input []s
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
 	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, inferenceCapacityError(resp.JSON503)
+	contentType := inferenceMediaType(resp.HTTPResponse.Header.Get("Content-Type"))
+	if contentType != "application/json" {
+		return nil, fmt.Errorf("unexpected embedding response content type %q", contentType)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -351,14 +342,8 @@ func (c *InferenceClient) Chunk(ctx context.Context, text string, config ChunkCo
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, inferenceCapacityError(resp.JSON503)
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -411,14 +396,8 @@ func (c *InferenceClient) ChunkMedia(ctx context.Context, data []byte, mimeType 
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, inferenceCapacityError(resp.JSON503)
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -440,17 +419,8 @@ func (c *InferenceClient) Rerank(ctx context.Context, model string, query string
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, inferenceCapacityError(resp.JSON503)
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -466,8 +436,8 @@ func (c *InferenceClient) ListModels(ctx context.Context) (*oapi.InferenceModels
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
+	if err := inferenceResponseError(resp.StatusCode(), resp.Body); err != nil {
+		return nil, err
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -484,17 +454,8 @@ func (c *InferenceClient) Extract(ctx context.Context, req oapi.ExtractionReques
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, inferenceCapacityError(resp.JSON503)
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -642,17 +603,8 @@ func (c *InferenceClient) RewriteText(ctx context.Context, model string, inputs 
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, inferenceCapacityError(resp.JSON503)
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -677,17 +629,8 @@ func (c *InferenceClient) Transcribe(ctx context.Context, model string, audio []
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, inferenceCapacityError(resp.JSON503)
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -698,12 +641,29 @@ func (c *InferenceClient) Transcribe(ctx context.Context, model string, audio []
 
 // GenerateConfig contains configuration for text generation.
 type GenerateConfig struct {
-	MaxTokens   int
+	MaxTokens int
+	// Temperature preserves the legacy non-zero convenience setting.
 	Temperature float32
-	TopP        float32
-	TopK        int
-	Tools       []oapi.InferenceTool
-	ToolChoice  oapi.InferenceToolChoice
+	// TemperatureOverride sends the exact value, including zero, and takes precedence over Temperature.
+	TemperatureOverride *float32
+	// TopP preserves the legacy non-zero convenience setting.
+	TopP float32
+	// TopPOverride sends the exact value, including zero, and takes precedence over TopP.
+	TopPOverride *float32
+	// TopK preserves the legacy positive convenience setting.
+	TopK int
+	// TopKOverride sends the exact value, including zero, and takes precedence over TopK.
+	TopKOverride *int
+	// EnableThinking controls chat templates that expose the Hugging Face-
+	// compatible enable_thinking variable. Nil preserves the model default;
+	// a pointer to false explicitly opens the public final response channel.
+	EnableThinking         *bool
+	DraftModel             string
+	SpeculativeK           int
+	SpeculationPolicy      oapi.InferenceGenerateRequestSpeculationPolicy
+	SpeculationCalibration oapi.InferenceGenerateRequestSpeculationCalibration
+	Tools                  []oapi.InferenceTool
+	ToolChoice             oapi.InferenceToolChoice
 }
 
 // ToolChoiceAuto returns a ToolChoice that lets the model decide whether to call a tool.
@@ -750,14 +710,37 @@ func (c *InferenceClient) Generate(ctx context.Context, model string, messages [
 		if config.MaxTokens > 0 {
 			req.MaxTokens = config.MaxTokens
 		}
-		if config.Temperature > 0 {
-			req.Temperature = config.Temperature
+		if config.TemperatureOverride != nil {
+			req.Temperature = config.TemperatureOverride
+		} else if config.Temperature > 0 {
+			req.Temperature = &config.Temperature
 		}
-		if config.TopP > 0 {
-			req.TopP = config.TopP
+		if config.TopPOverride != nil {
+			req.TopP = config.TopPOverride
+		} else if config.TopP > 0 {
+			req.TopP = &config.TopP
 		}
-		if config.TopK > 0 {
-			req.TopK = config.TopK
+		if config.TopKOverride != nil {
+			req.TopK = config.TopKOverride
+		} else if config.TopK > 0 {
+			req.TopK = &config.TopK
+		}
+		if config.EnableThinking != nil {
+			req.ChatTemplateKwargs = oapi.InferenceGenerateChatTemplateKwargs{
+				EnableThinking: config.EnableThinking,
+			}
+		}
+		if config.DraftModel != "" {
+			req.DraftModel = config.DraftModel
+		}
+		if config.SpeculativeK != 0 {
+			req.SpeculativeK = config.SpeculativeK
+		}
+		if config.SpeculationPolicy != "" {
+			req.SpeculationPolicy = config.SpeculationPolicy
+		}
+		if config.SpeculationCalibration != "" {
+			req.SpeculationCalibration = config.SpeculationCalibration
 		}
 		if len(config.Tools) > 0 {
 			req.Tools = config.Tools
@@ -770,17 +753,8 @@ func (c *InferenceClient) Generate(ctx context.Context, model string, messages [
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, inferenceCapacityError(resp.JSON503)
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -795,8 +769,9 @@ type SparseVector struct {
 	Values  []float32 `json:"values"`
 }
 
-// SparseEmbed generates sparse embeddings for the given text strings.
-// Returns sparse vectors in binary format (most efficient).
+// SparseEmbed generates sparse embeddings for the given text strings. Current
+// servers return JSON; bounded application/x-sparse-vectors responses from
+// legacy servers remain supported for compatibility.
 // Only valid for models with the "sparse" capability.
 func (c *InferenceClient) SparseEmbed(ctx context.Context, model string, input []string) ([]SparseVector, error) {
 	// Build the input union type
@@ -810,41 +785,29 @@ func (c *InferenceClient) SparseEmbed(ctx context.Context, model string, input [
 		Input: inputUnion,
 	}
 
-	// Make request - server returns sparse binary format for sparse models
 	resp, err := c.client.GenerateEmbeddingsWithResponse(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
 	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
+	if resp.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
 	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, inferenceCapacityError(resp.JSON503)
-	}
-
-	contentType := resp.HTTPResponse.Header.Get("Content-Type")
-
-	if strings.Contains(contentType, "application/json") {
-		// JSON response.
+	contentType := inferenceMediaType(resp.HTTPResponse.Header.Get("Content-Type"))
+	switch contentType {
+	case "application/json":
 		if resp.JSON200 != nil {
 			return sparseEmbeddings(resp.JSON200)
 		}
 		return nil, fmt.Errorf("unexpected JSON response: %s", string(resp.Body))
+	case "application/x-sparse-vectors":
+		return deserializeSparseVectors(resp.Body)
+	default:
+		return nil, fmt.Errorf("unexpected sparse embedding response content type %q", contentType)
 	}
-
-	// Binary response (application/x-sparse-vectors)
-	if resp.StatusCode() != 200 {
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
-	}
-
-	return deserializeSparseVectors(bytes.NewReader(resp.Body))
 }
 
 // SparseEmbedJSON generates sparse embeddings and returns JSON response.
@@ -867,17 +830,12 @@ func (c *InferenceClient) SparseEmbedJSON(ctx context.Context, model string, inp
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
 	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, inferenceCapacityError(resp.JSON503)
+	contentType := inferenceMediaType(resp.HTTPResponse.Header.Get("Content-Type"))
+	if contentType != "application/json" {
+		return nil, fmt.Errorf("unexpected sparse embedding response content type %q", contentType)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -935,33 +893,89 @@ func rerankScores(resp *oapi.InferenceRerankResponse) []float32 {
 	return scores
 }
 
+const maxInferenceBinaryDecodedBytes = uint64(maxInferenceBinaryResponseBytes)
+
+func checkedUint64Mul(a, b uint64) (uint64, bool) {
+	if a != 0 && b > ^uint64(0)/a {
+		return 0, false
+	}
+	return a * b, true
+}
+
+func checkedUint64Add(a, b uint64) (uint64, bool) {
+	if b > ^uint64(0)-a {
+		return 0, false
+	}
+	return a + b, true
+}
+
+func binaryCountToInt(value uint64, field string) (int, error) {
+	if value > uint64(^uint(0)>>1) {
+		return 0, fmt.Errorf("invalid binary embedding response: %s exceeds platform limits", field)
+	}
+	return int(value), nil
+}
+
 // deserializeSparseVectors reads sparse vectors from binary format.
 // Format: [uint64 num_vectors] per vector: [uint32 nnz] [int32*nnz indices] [float32*nnz values]
-func deserializeSparseVectors(r io.Reader) ([]SparseVector, error) {
-	var numVectors uint64
-	if err := binary.Read(r, binary.LittleEndian, &numVectors); err != nil {
-		return nil, fmt.Errorf("reading num vectors: %w", err)
+func deserializeSparseVectors(data []byte) ([]SparseVector, error) {
+	if len(data) < 8 {
+		return nil, fmt.Errorf("invalid sparse embedding response: missing vector count")
 	}
+	numVectors := binary.LittleEndian.Uint64(data[:8])
 	if numVectors == 0 {
+		if len(data) != 8 {
+			return nil, fmt.Errorf("invalid sparse embedding response: unexpected data after empty header")
+		}
 		return []SparseVector{}, nil
 	}
-	result := make([]SparseVector, numVectors)
-	for i := range numVectors {
-		var nnz uint32
-		if err := binary.Read(r, binary.LittleEndian, &nnz); err != nil {
-			return nil, fmt.Errorf("reading nnz for vector %d: %w", i, err)
+
+	numVectorsInt, err := binaryCountToInt(numVectors, "vector count")
+	if err != nil {
+		return nil, err
+	}
+	vectorOverhead, ok := checkedUint64Mul(numVectors, uint64(unsafe.Sizeof(SparseVector{})))
+	if !ok || vectorOverhead > maxInferenceBinaryDecodedBytes {
+		return nil, fmt.Errorf("sparse embedding response exceeds decoded size limit of %d bytes", maxInferenceBinaryDecodedBytes)
+	}
+
+	offset := 8
+	decodedBytes := vectorOverhead
+	for i := 0; i < numVectorsInt; i++ {
+		if len(data)-offset < 4 {
+			return nil, fmt.Errorf("invalid sparse embedding response: missing nnz for vector %d", i)
 		}
-		indices := make([]int32, nnz)
-		for j := range nnz {
-			if err := binary.Read(r, binary.LittleEndian, &indices[j]); err != nil {
-				return nil, fmt.Errorf("reading index %d for vector %d: %w", j, i, err)
-			}
+		nnz := binary.LittleEndian.Uint32(data[offset : offset+4])
+		offset += 4
+		entryBytes := uint64(nnz) * 8
+		if entryBytes > uint64(len(data)-offset) {
+			return nil, fmt.Errorf("invalid sparse embedding response: vector %d declares %d values beyond payload", i, nnz)
 		}
-		values := make([]float32, nnz)
-		for j := range nnz {
-			if err := binary.Read(r, binary.LittleEndian, &values[j]); err != nil {
-				return nil, fmt.Errorf("reading value %d for vector %d: %w", j, i, err)
-			}
+		decodedBytes, ok = checkedUint64Add(decodedBytes, entryBytes)
+		if !ok || decodedBytes > maxInferenceBinaryDecodedBytes {
+			return nil, fmt.Errorf("sparse embedding response exceeds decoded size limit of %d bytes", maxInferenceBinaryDecodedBytes)
+		}
+		offset += int(entryBytes)
+	}
+	if offset != len(data) {
+		return nil, fmt.Errorf("invalid sparse embedding response: unexpected trailing data")
+	}
+
+	result := make([]SparseVector, numVectorsInt)
+	offset = 8
+	for i := range result {
+		nnz := binary.LittleEndian.Uint32(data[offset : offset+4])
+		offset += 4
+		nnzInt := int(nnz)
+		indices := make([]int32, nnzInt)
+		for j := range indices {
+			indices[j] = int32(binary.LittleEndian.Uint32(data[offset : offset+4]))
+			offset += 4
+		}
+		values := make([]float32, nnzInt)
+		for j := range values {
+			values[j] = math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
+			offset += 4
 		}
 		result[i] = SparseVector{
 			Indices: indices,
@@ -973,25 +987,62 @@ func deserializeSparseVectors(r io.Reader) ([]SparseVector, error) {
 
 // deserializeFloatArrays reconstructs a 2D float32 array from binary format.
 // Format: uint64(numVectors) + uint64(dimension) + float32 values in little endian
-func deserializeFloatArrays(r io.Reader) ([][]float32, error) {
-	var numVectors uint64
-	if err := binary.Read(r, binary.LittleEndian, &numVectors); err != nil {
-		return nil, fmt.Errorf("reading number of vectors: %w", err)
+func deserializeFloatArrays(data []byte) ([][]float32, error) {
+	if len(data) < 8 {
+		return nil, fmt.Errorf("invalid binary embedding response: missing vector count")
 	}
+	numVectors := binary.LittleEndian.Uint64(data[:8])
 	if numVectors == 0 {
+		if len(data) != 8 {
+			return nil, fmt.Errorf("invalid binary embedding response: unexpected data after empty header")
+		}
 		return [][]float32{}, nil
 	}
-	var dimension uint64
-	if err := binary.Read(r, binary.LittleEndian, &dimension); err != nil {
-		return nil, fmt.Errorf("reading dimension: %w", err)
+	if len(data) < 16 {
+		return nil, fmt.Errorf("invalid binary embedding response: missing vector dimension")
 	}
-	result := make([][]float32, numVectors)
-	for i := range numVectors {
-		result[i] = make([]float32, dimension)
-		for j := range dimension {
-			if err := binary.Read(r, binary.LittleEndian, &result[i][j]); err != nil {
-				return nil, fmt.Errorf("reading vector %d, dimension %d: %w", i, j, err)
-			}
+	dimension := binary.LittleEndian.Uint64(data[8:16])
+	if dimension == 0 {
+		return nil, fmt.Errorf("invalid binary embedding response: non-empty response has zero dimension")
+	}
+
+	elements, ok := checkedUint64Mul(numVectors, dimension)
+	if !ok {
+		return nil, fmt.Errorf("invalid binary embedding response: vector shape overflows")
+	}
+	payloadBytes, ok := checkedUint64Mul(elements, 4)
+	if !ok {
+		return nil, fmt.Errorf("invalid binary embedding response: payload size overflows")
+	}
+	expectedBytes, ok := checkedUint64Add(16, payloadBytes)
+	if !ok || expectedBytes != uint64(len(data)) {
+		return nil, fmt.Errorf("invalid binary embedding response: header declares %d bytes, received %d", expectedBytes, len(data))
+	}
+
+	numVectorsInt, err := binaryCountToInt(numVectors, "vector count")
+	if err != nil {
+		return nil, err
+	}
+	dimensionInt, err := binaryCountToInt(dimension, "vector dimension")
+	if err != nil {
+		return nil, err
+	}
+	vectorOverhead, ok := checkedUint64Mul(numVectors, uint64(unsafe.Sizeof([]float32(nil))))
+	if !ok {
+		return nil, fmt.Errorf("invalid binary embedding response: decoded size overflows")
+	}
+	decodedBytes, ok := checkedUint64Add(payloadBytes, vectorOverhead)
+	if !ok || decodedBytes > maxInferenceBinaryDecodedBytes {
+		return nil, fmt.Errorf("binary embedding response exceeds decoded size limit of %d bytes", maxInferenceBinaryDecodedBytes)
+	}
+
+	result := make([][]float32, numVectorsInt)
+	offset := 16
+	for i := range result {
+		result[i] = make([]float32, dimensionInt)
+		for j := range result[i] {
+			result[i][j] = math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
+			offset += 4
 		}
 	}
 	return result, nil

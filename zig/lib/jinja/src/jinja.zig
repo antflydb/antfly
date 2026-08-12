@@ -118,6 +118,9 @@ pub fn chatTemplateContext(
     try ctx.put(arena, "eos_token", Value.str(options.eos_token));
     try ctx.put(arena, "unk_token", Value.str(options.unk_token));
     try ctx.put(arena, "pad_token", Value.str(options.pad_token));
+    if (options.enable_thinking) |enabled| {
+        try ctx.put(arena, "enable_thinking", Value.bln(enabled));
+    }
 
     return ctx;
 }
@@ -140,6 +143,9 @@ pub const ChatTemplateOptions = struct {
     eos_token: []const u8 = "",
     unk_token: []const u8 = "",
     pad_token: []const u8 = "",
+    /// Optional Hugging Face/llama.cpp-compatible template variable. Omit it
+    /// to preserve each model template's own default reasoning behavior.
+    enable_thinking: ?bool = null,
 };
 
 // --- Tests ---

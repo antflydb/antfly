@@ -799,20 +799,44 @@ fn validateFenceReceipt(receipt: admin_api.HAFenceReceipt) !void {
     if (!validation.isIdentifier(receipt.old_primary_id) or !validation.isIdentifier(receipt.promoted_node_id) or receipt.token.len == 0) {
         return error.AdminFenceResponseMismatch;
     }
+    if (std.mem.eql(u8, receipt.old_primary_id, receipt.promoted_node_id)) return error.AdminFenceResponseMismatch;
     if (receipt.parent_timeline_id <= 0 or receipt.parent_epoch <= 0 or receipt.new_timeline_id <= 0 or receipt.new_epoch <= 0) {
         return error.AdminFenceResponseMismatch;
     }
     if (receipt.required_lsn <= 0 or receipt.observed_lsn < 0 or receipt.generation <= 0) return error.AdminFenceResponseMismatch;
+    if (receipt.identity.timeline_id != receipt.new_timeline_id or receipt.identity.epoch != receipt.new_epoch) {
+        return error.AdminFenceResponseMismatch;
+    }
+    if (receipt.new_timeline_id <= receipt.parent_timeline_id or receipt.new_epoch <= receipt.parent_epoch) {
+        return error.AdminFenceResponseMismatch;
+    }
+    if (!receipt.forced and receipt.observed_lsn < receipt.required_lsn) return error.AdminFenceResponseMismatch;
 }
 
 fn validateFenceResponse(response: admin_api.HAFenceResponse, request: admin_api.FenceAcquireRequest) !void {
     try validateSchemaVersion(response.schema_version, error.AdminFenceResponseMismatch);
     try validateActionReceipt(response.action, "fence_acquire", "applied", request.promoted_node_id, error.AdminFenceResponseMismatch);
     try validateFenceReceipt(response.receipt);
+    if (response.receipt.identity.cluster_id != request.identity.cluster_id or
+        response.receipt.identity.shard_id != request.identity.shard_id or
+        response.receipt.identity.table_id != request.identity.table_id or
+        response.receipt.identity.timeline_id != request.new_timeline_id or
+        response.receipt.identity.epoch != request.new_epoch or
+        response.receipt.parent_timeline_id != request.identity.timeline_id or
+        response.receipt.parent_epoch != request.identity.epoch)
+    {
+        return error.AdminFenceResponseMismatch;
+    }
     if (!std.mem.eql(u8, response.receipt.promoted_node_id, request.promoted_node_id)) return error.AdminFenceResponseMismatch;
     if (!std.mem.eql(u8, response.receipt.old_primary_id, request.old_primary_id)) return error.AdminFenceResponseMismatch;
     if (response.receipt.new_timeline_id != request.new_timeline_id or response.receipt.new_epoch != request.new_epoch) return error.AdminFenceResponseMismatch;
-    if (response.receipt.required_lsn != request.required_lsn or response.receipt.observed_lsn < request.observed_lsn) return error.AdminFenceResponseMismatch;
+    if (response.receipt.required_lsn < request.required_lsn or
+        response.receipt.observed_lsn < request.observed_lsn or
+        response.receipt.forced != request.force or
+        (!response.receipt.forced and response.receipt.observed_lsn < response.receipt.required_lsn))
+    {
+        return error.AdminFenceResponseMismatch;
+    }
 }
 
 fn validateCurrentFenceResponse(response: admin_api.HACurrentFenceResponse) !void {
@@ -1071,7 +1095,16 @@ fn validateRejoinResponse(
     if (!std.mem.eql(u8, assessment.former_node_id, request.node_id)) {
         return error.AdminRejoinResponseMismatch;
     }
-    if (assessment.former_last_lsn != request.last_lsn) return error.AdminRejoinResponseMismatch;
+    if (assessment.target_timeline_id <= 0 or assessment.target_epoch <= 0 or
+        assessment.parent_cluster_id <= 0 or assessment.parent_shard_id < 0 or assessment.parent_table_id < 0 or
+        assessment.parent_timeline_id <= 0 or assessment.parent_epoch <= 0 or
+        assessment.fork_lsn < 0 or assessment.former_last_lsn < 0 or assessment.retained_from_lsn < 0)
+    {
+        return error.AdminRejoinResponseMismatch;
+    }
+    // last_lsn in the request is a controller observation, not authority. A
+    // former primary with local log access replaces it with its durable tail so
+    // writes racing the promotion boundary cannot be hidden by stale status.
     if (assessment.retained_from_lsn != request.retained_from_lsn) return error.AdminRejoinResponseMismatch;
 
     switch (expected) {
@@ -1091,6 +1124,7 @@ fn validateRejoinResponse(
         if (assessment.fork_lsn != receipt.observed_lsn) return error.AdminRejoinResponseMismatch;
     } else {
         if (!std.mem.eql(u8, assessment.action, "reject_unfenced")) return error.AdminRejoinResponseMismatch;
+        if (!std.mem.eql(u8, assessment.reason, "no_fence")) return error.AdminRejoinResponseMismatch;
         if (assessment.target_timeline_id != request.identity.timeline_id) return error.AdminRejoinResponseMismatch;
         if (assessment.target_epoch != request.identity.epoch) return error.AdminRejoinResponseMismatch;
         if (assessment.parent_cluster_id != request.identity.cluster_id) return error.AdminRejoinResponseMismatch;
@@ -1098,7 +1132,9 @@ fn validateRejoinResponse(
         if (assessment.parent_table_id != request.identity.table_id) return error.AdminRejoinResponseMismatch;
         if (assessment.parent_timeline_id != request.identity.timeline_id) return error.AdminRejoinResponseMismatch;
         if (assessment.parent_epoch != request.identity.epoch) return error.AdminRejoinResponseMismatch;
-        if (assessment.fork_lsn != request.last_lsn) return error.AdminRejoinResponseMismatch;
+        if (assessment.fork_lsn != assessment.former_last_lsn or assessment.data_loss_discarded) {
+            return error.AdminRejoinResponseMismatch;
+        }
     }
 
     switch (expected) {
@@ -1243,6 +1279,22 @@ fn testFenceReceipt() admin_api.HAFenceReceipt {
         .forced = false,
         .token = "token",
         .reason = "http-client-test",
+    };
+}
+
+fn testFenceResponse() admin_api.HAFenceResponse {
+    return .{
+        .schema_version = 1,
+        .action = .{
+            .action_id = "fence_acquire:standby-a",
+            .action_kind = "fence_acquire",
+            .target = "standby-a",
+            .state = "applied",
+            // The endpoint actor is the former primary; the promoted standby
+            // remains the action target.
+            .node_id = "primary-a",
+        },
+        .receipt = testFenceReceipt(),
     };
 }
 
@@ -1854,7 +1906,7 @@ test "storage.ha http client round trips typed safety operations" {
         .receipt = fence.parsed.value.receipt,
     });
     defer rejoin.deinit(alloc);
-    try std.testing.expectEqualStrings("rewind", rejoin.parsed.value.assessment.action);
+    try std.testing.expectEqualStrings("reseed", rejoin.parsed.value.assessment.action);
     try std.testing.expectEqual(@as(i64, 2), rejoin.parsed.value.assessment.target_timeline_id);
     try std.testing.expectEqual(@as(i64, 100), rejoin.parsed.value.assessment.parent_cluster_id);
     try std.testing.expectEqual(@as(i64, 10), rejoin.parsed.value.assessment.parent_shard_id);
@@ -1862,23 +1914,7 @@ test "storage.ha http client round trips typed safety operations" {
     try std.testing.expectEqual(@as(i64, 1), rejoin.parsed.value.assessment.parent_timeline_id);
     try std.testing.expectEqual(@as(i64, 1), rejoin.parsed.value.assessment.parent_epoch);
 
-    var rewind = try client.rewindRejoin("http://ha-admin.test", .{
-        .node_id = "primary-a",
-        .identity = testAdminIdentity(),
-        .last_lsn = 2,
-        .retained_from_lsn = 0,
-        .allow_rewind_after_forced_promotion = false,
-        .receipt = fence.parsed.value.receipt,
-    });
-    defer rewind.deinit(alloc);
-    try std.testing.expectEqualStrings("rewind", rewind.parsed.value.assessment.action);
-    try std.testing.expectEqual(@as(i64, 1), rewind.parsed.value.assessment.parent_timeline_id);
-    try std.testing.expect(rewind.parsed.value.rewind != null);
-    try std.testing.expectEqual(@as(i64, 2), rewind.parsed.value.rewind.?.previous_last_lsn);
-    try std.testing.expectEqual(@as(i64, 1), rewind.parsed.value.rewind.?.current_last_lsn);
-    try std.testing.expectEqual(@as(i64, 1), rewind.parsed.value.rewind.?.discarded_lsn_count);
-
-    try std.testing.expectError(error.HaCommandConflict, client.reseedRejoin("http://ha-admin.test", .{
+    try std.testing.expectError(error.HaCommandConflict, client.rewindRejoin("http://ha-admin.test", .{
         .node_id = "primary-a",
         .identity = testAdminIdentity(),
         .last_lsn = 2,
@@ -1886,6 +1922,45 @@ test "storage.ha http client round trips typed safety operations" {
         .allow_rewind_after_forced_promotion = false,
         .receipt = fence.parsed.value.receipt,
     }));
+
+    var reseed = try client.reseedRejoin("http://ha-admin.test", .{
+        .node_id = "primary-a",
+        .identity = testAdminIdentity(),
+        .last_lsn = 2,
+        .retained_from_lsn = 0,
+        .allow_rewind_after_forced_promotion = false,
+        .receipt = fence.parsed.value.receipt,
+    });
+    defer reseed.deinit(alloc);
+    try std.testing.expectEqualStrings("reseed", reseed.parsed.value.assessment.action);
+    try std.testing.expectEqual(@as(i64, 1), reseed.parsed.value.assessment.parent_timeline_id);
+    try std.testing.expect(reseed.parsed.value.reseed != null);
+    try std.testing.expect(reseed.parsed.value.reseed.?.reseed_required);
+    try std.testing.expect(reseed.parsed.value.reseed.?.base_backup_required);
+}
+
+test "storage.ha http client accepts authoritative former primary tail in rejoin assessment" {
+    const alloc = std.testing.allocator;
+    var executor = StaticJsonExecutor{
+        .body =
+        \\{"schema_version":1,"action":{"action_id":"rejoin_assess:primary-a","action_kind":"rejoin_assess","target":"primary-a","state":"assessed","node_id":"primary-a"},"assessment":{"action":"reject_unfenced","reason":"no_fence","former_node_id":"primary-a","target_timeline_id":1,"target_epoch":1,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":1,"parent_epoch":1,"required_lsn":0,"fork_lsn":4,"former_last_lsn":4,"retained_from_lsn":8,"forced":false,"data_loss_discarded":false}}
+        ,
+    };
+    var client = Client.init(alloc, executor.executor());
+
+    // The controller observation may be stale in either direction. The local
+    // former-primary endpoint reports its durable tail as the authority.
+    var response = try client.assessRejoin("http://ha-admin.test", .{
+        .node_id = "primary-a",
+        .identity = testAdminIdentity(),
+        .last_lsn = 12,
+        .retained_from_lsn = 8,
+        .allow_rewind_after_forced_promotion = false,
+        .receipt = null,
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 4), response.parsed.value.assessment.former_last_lsn);
+    try std.testing.expectEqual(response.parsed.value.assessment.former_last_lsn, response.parsed.value.assessment.fork_lsn);
 }
 
 test "storage.ha http client rejects mismatched rejoin admin responses" {
@@ -1990,6 +2065,51 @@ test "storage.ha http client accepts empty fence receipt reason" {
     defer response.deinit(alloc);
 
     try std.testing.expectEqualStrings("", response.parsed.value.receipt.reason);
+}
+
+test "storage.ha http client validates live upgraded fence boundary and topology binding" {
+    const request = admin_api.FenceAcquireRequest{
+        .identity = testAdminIdentity(),
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 1,
+        .observed_lsn = 1,
+        .force = false,
+        .reason = "operator-observation",
+    };
+
+    // A former primary freezes its live durable tail under the append mutex.
+    // The returned boundary can therefore be stronger than the stale
+    // control-plane observation carried by the request.
+    var upgraded = testFenceResponse();
+    upgraded.receipt.required_lsn = 4;
+    upgraded.receipt.observed_lsn = 4;
+    try validateFenceResponse(upgraded, request);
+
+    var downgraded = testFenceResponse();
+    downgraded.receipt.required_lsn = 1;
+    downgraded.receipt.observed_lsn = 0;
+    downgraded.receipt.forced = true;
+    try std.testing.expectError(error.AdminFenceResponseMismatch, validateFenceResponse(downgraded, request));
+
+    var cross_cluster = upgraded;
+    cross_cluster.receipt.identity.cluster_id += 1;
+    try std.testing.expectError(error.AdminFenceResponseMismatch, validateFenceResponse(cross_cluster, request));
+
+    var wrong_parent = upgraded;
+    wrong_parent.receipt.parent_epoch += 1;
+    try std.testing.expectError(error.AdminFenceResponseMismatch, validateFenceResponse(wrong_parent, request));
+
+    var unrequested_force = upgraded;
+    unrequested_force.receipt.forced = true;
+    try std.testing.expectError(error.AdminFenceResponseMismatch, validateFenceResponse(unrequested_force, request));
+
+    var unsafe_unforced = upgraded;
+    unsafe_unforced.receipt.required_lsn = 4;
+    unsafe_unforced.receipt.observed_lsn = 3;
+    try std.testing.expectError(error.AdminFenceResponseMismatch, validateFenceResponse(unsafe_unforced, request));
 }
 
 test "storage.ha http client accepts already applied idempotent admin receipts" {

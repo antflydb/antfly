@@ -82,13 +82,91 @@ pub const EmbeddingConfig = struct {
     /// Enable the direct resident Qwen3/Jina embedding encoder. This is set
     /// from Jina/Qwen3 embedding manifests, not merely from the backbone family.
     resident_qwen3_embedding: bool = false,
+    /// Keep a supported text encoder, pooling, and normalization on the GPU.
+    resident_text_encoder: bool = false,
     /// For CLIP/SigLIP multimodal models: image size for vision encoder.
     image_size: u32 = 224,
     /// Model-selected image preprocessing contract.
     image_preprocess_profile: ImagePreprocessProfile = .default,
     /// For CLAP audio models: mel spectrogram configuration.
     audio_config: audio.AudioConfig = audio.CLAP_CONFIG,
+    /// Aggregate audio working-set budget shared by retained decoded PCM,
+    /// CLAP preprocessing, and duplicated backend input tensors. The field
+    /// retains its decode-specific name for source compatibility.
+    max_audio_decode_working_bytes: usize = audio.default_decode_working_bytes,
 };
+
+/// CLAP preprocessing handles clips sequentially, but its peak includes the
+/// resampled 60-second window, centered-STFT padding, mel buffers, and FFT
+/// scratch while the batch feature buffer remains resident. This conservative
+/// bound is shared by every batch item rather than multiplied by batch size.
+const clap_per_clip_preprocess_working_bytes: usize = 32 * 1024 * 1024;
+
+const ClapBatchFeatureWorkingSet = struct {
+    elements: usize,
+    reserve_bytes: usize,
+};
+
+fn clapBatchFeatureWorkingSet(
+    batch: usize,
+    channels: usize,
+    frames: usize,
+    mels: usize,
+) !ClapBatchFeatureWorkingSet {
+    const batch_channels = std.math.mul(usize, batch, channels) catch return error.AudioTooLarge;
+    const batch_frames = std.math.mul(usize, batch_channels, frames) catch return error.AudioTooLarge;
+    const elements = std.math.mul(usize, batch_frames, mels) catch return error.AudioTooLarge;
+    const feature_bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return error.AudioTooLarge;
+
+    // clapFeaturesFromPcm's temporary output coexists with all_mels while each
+    // clip is copied into the aggregate batch buffer.
+    const preprocessing_reserve = std.math.add(usize, feature_bytes, clap_per_clip_preprocess_working_bytes) catch
+        return error.AudioTooLarge;
+
+    // Tensor.initFloat32 and Tensor.initBool duplicate their inputs, so both
+    // the original and backend-owned copies coexist until session execution.
+    const duplicated_feature_bytes = std.math.mul(usize, feature_bytes, 2) catch return error.AudioTooLarge;
+    const duplicated_flags_bytes = std.math.mul(usize, batch, 2) catch return error.AudioTooLarge;
+    const tensor_reserve = std.math.add(usize, duplicated_feature_bytes, duplicated_flags_bytes) catch
+        return error.AudioTooLarge;
+
+    return .{ .elements = elements, .reserve_bytes = @max(preprocessing_reserve, tensor_reserve) };
+}
+
+fn ensureClapWorkingSet(retained_pcm_bytes: usize, feature_reserve_bytes: usize, max_working_bytes: usize) !void {
+    const peak = std.math.add(usize, retained_pcm_bytes, feature_reserve_bytes) catch return error.AudioTooLarge;
+    if (peak > max_working_bytes) return error.AudioTooLarge;
+}
+
+const ClapBatchPlan = struct {
+    channels: usize,
+    frames: usize,
+    mels: usize,
+    feature_elements: usize,
+    feature_reserve_bytes: usize,
+    fusion_enabled: bool,
+};
+
+fn clapBatchPlan(session: backends.Session, batch: usize) !ClapBatchPlan {
+    var channels: usize = 1;
+    const fusion_enabled = if (session_factory.getClapConfig(session)) |clap_cfg| blk: {
+        channels = if (clap_cfg.audio_config.enable_fusion and batch == 1) 4 else 1;
+        break :blk clap_cfg.audio_config.enable_fusion;
+    } else false;
+    const default_frames = audio.CLAP_CONFIG.chunk_length_s * audio.CLAP_CONFIG.sample_rate / audio.CLAP_CONFIG.hop_length + 1;
+    const frames = clapInputFeatureFrames(session, default_frames);
+    const mels = audio.CLAP_CONFIG.n_mels;
+    const working = try clapBatchFeatureWorkingSet(batch, channels, frames, mels);
+
+    return .{
+        .channels = channels,
+        .frames = frames,
+        .mels = mels,
+        .feature_elements = working.elements,
+        .feature_reserve_bytes = working.reserve_bytes,
+        .fusion_enabled = fusion_enabled,
+    };
+}
 
 pub const ResidentProjectionModality = enum { text, image, audio };
 pub const ResidentProjectionOutcome = enum { success, fallback };
@@ -164,10 +242,6 @@ pub const EmbeddingPipeline = struct {
     session: backends.Session,
     tok: Tokenizer,
     config: EmbeddingConfig,
-    /// Optional owner-provided gate for stateful backend sessions. Metal and
-    /// CUDA sessions share mutable backend state across request pipelines and
-    /// must not execute overlapping forward passes.
-    execution_lock: ?*std.atomic.Mutex = null,
     /// Optional vision encoder session for CLIP/SigLIP multimodal embedding.
     vision_session: ?backends.Session = null,
     /// Optional audio encoder session for CLAP multimodal embedding.
@@ -180,6 +254,10 @@ pub const EmbeddingPipeline = struct {
     audio_projection: ?backends.Session = null,
     /// Optional caller-owned resident path counters for benchmark/service use.
     resident_projection_stats: ?*AtomicResidentProjectionStats = null,
+    /// Optional caller-owned guard for backend state shared by pipelines made
+    /// from the same loaded model. Tokenization and tensor preparation remain
+    /// parallel; only device/session execution is serialized.
+    execution_lock: ?*std.atomic.Mutex = null,
     /// Print phase timings for CLI/debug callers. TERMITE_EMBED_TIMING still
     /// enables the same logs for server and legacy workflows.
     print_timing: bool = false,
@@ -218,13 +296,21 @@ pub const EmbeddingPipeline = struct {
     /// Caller owns the returned slices and must free them with the allocator.
     pub fn embed(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
         if (texts.len == 0) return try self.allocator.alloc([]f32, 0);
-        self.lockExecution();
-        defer self.unlockExecution();
         const text_session = self.textEncodingSession();
         if (textSessionBatchPlan(text_session, texts.len)) |plan| {
             return try self.embedWithBatchPlan(texts, plan);
         }
 
+        return embedTextBatchAdaptive(
+            self.allocator,
+            self,
+            texts,
+            runDirectTextBatch,
+        );
+    }
+
+    fn runDirectTextBatch(ctx: *anyopaque, texts: []const []const u8) anyerror![][]f32 {
+        const self: *EmbeddingPipeline = @ptrCast(@alignCast(ctx));
         return self.embedDirect(texts, texts.len);
     }
 
@@ -313,7 +399,69 @@ pub const EmbeddingPipeline = struct {
 
         var input_set = try textInputTensorSet(alloc, input_info, input_ids_tensor, attention_mask_tensor, &shape);
         defer input_set.deinit();
-        const inputs = input_set.slice();
+        return self.embedPreparedTextInputs(
+            input_set.slice(),
+            all_mask,
+            ids_i64,
+            batch,
+            effective_len,
+            &run_permit,
+        );
+    }
+
+    /// Benchmark-facing encoder contract without tokenization or model load.
+    pub fn embedTokenized(
+        self: *EmbeddingPipeline,
+        input_ids: []const i64,
+        attention_mask: []const i64,
+        batch: usize,
+        seq_len: usize,
+    ) ![][]f32 {
+        if (batch == 0 or seq_len == 0) return error.InvalidInputShape;
+        const total = std.math.mul(usize, batch, seq_len) catch return error.InvalidInputShape;
+        if (input_ids.len != total or attention_mask.len != total) return error.InvalidInputShape;
+
+        const alloc = self.allocator;
+        const text_session = self.textEncodingSession();
+        const shape = [_]i64{ @intCast(batch), @intCast(seq_len) };
+        var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape, input_ids);
+        defer input_ids_tensor.deinit();
+        var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape, attention_mask);
+        defer attention_mask_tensor.deinit();
+        var input_set = try textInputTensorSet(alloc, text_session.inputInfo(), input_ids_tensor, attention_mask_tensor, &shape);
+        defer input_set.deinit();
+
+        const mask_i32 = try alloc.alloc(i32, total);
+        defer alloc.free(mask_i32);
+        for (attention_mask, 0..) |value, index| {
+            mask_i32[index] = std.math.cast(i32, value) orelse return error.InvalidInputShape;
+        }
+        var run_permit = try text_session.admit(.{
+            .batch = batch,
+            .sequence = seq_len,
+            .input_bytes = std.math.mul(usize, total, 24) catch
+                return error.ResourceLimitExceeded,
+            .host_preprocess_bytes = std.math.mul(usize, total, 32) catch
+                return error.ResourceLimitExceeded,
+        });
+        defer run_permit.deinit();
+        return self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, &run_permit);
+    }
+
+    fn embedPreparedTextInputs(
+        self: *EmbeddingPipeline,
+        inputs: []const Tensor,
+        all_mask: []const i32,
+        ids_i64: []const i64,
+        batch: usize,
+        effective_len: usize,
+        run_permit: *session_mod.RunPermit,
+    ) ![][]f32 {
+        const alloc = self.allocator;
+        if (self.execution_lock) |lock| {
+            platform.sync.lockYielding(lock);
+        }
+        defer if (self.execution_lock) |lock| lock.unlock();
 
         if (self.text_projection) |proj| {
             if (try self.tryEmbedTextResidentProjection(
@@ -322,8 +470,12 @@ pub const EmbeddingPipeline = struct {
                 batch,
                 effective_len,
                 proj,
-                &run_permit,
+                run_permit,
             )) |resident_embeddings| {
+                return resident_embeddings;
+            }
+        } else if (self.config.resident_text_encoder) {
+            if (try self.tryEmbedTextResidentEncoder(inputs, all_mask, batch, effective_len, run_permit)) |resident_embeddings| {
                 return resident_embeddings;
             }
         } else if (try self.tryEmbedTextResidentQwen3(all_mask, ids_i64, batch, effective_len)) |resident_embeddings| {
@@ -716,6 +868,11 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of supported encoded audio clips, returning [batch][embed_dim] embeddings.
     /// Requires an audio_session (CLAP model).
     pub fn embedAudio(self: *EmbeddingPipeline, audio_clips: []const []const u8) ![][]f32 {
+        if (audio_clips.len > 0) {
+            const audio_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+            const feature_plan = try clapBatchPlan(audio_session, audio_clips.len);
+            try ensureClapWorkingSet(0, feature_plan.feature_reserve_bytes, self.config.max_audio_decode_working_bytes);
+        }
         const alloc = self.allocator;
         const clips = try alloc.alloc(EncodedAudioClip, audio_clips.len);
         defer alloc.free(clips);
@@ -733,6 +890,10 @@ pub const EmbeddingPipeline = struct {
     ) ![][]f32 {
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
 
+        const audio_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        const feature_plan = try clapBatchPlan(audio_session, audio_clips.len);
+        try ensureClapWorkingSet(0, feature_plan.feature_reserve_bytes, self.config.max_audio_decode_working_bytes);
+
         const alloc = self.allocator;
         const decoded = try alloc.alloc(audio.Audio, audio_clips.len);
         var initialized: usize = 0;
@@ -745,9 +906,19 @@ pub const EmbeddingPipeline = struct {
         defer alloc.free(pcm_inputs);
 
         const decode_start = embedTimingStart(self.print_timing);
+        var remaining_decode_bytes = self.config.max_audio_decode_working_bytes - feature_plan.feature_reserve_bytes;
         for (audio_clips, 0..) |clip, i| {
-            decoded[i] = try audio.decode(alloc, clip.bytes, clip.decode_options);
+            decoded[i] = try audio.decodeBounded(
+                alloc,
+                clip.bytes,
+                clip.decode_options,
+                remaining_decode_bytes,
+            );
             initialized += 1;
+            const retained_bytes = std.math.mul(usize, decoded[i].samples.len, @sizeOf(f32)) catch
+                return error.AudioTooLarge;
+            if (retained_bytes > remaining_decode_bytes) return error.AudioTooLarge;
+            remaining_decode_bytes -= retained_bytes;
             pcm_inputs[i] = .{
                 .samples = decoded[i].samples,
                 .sample_rate = decoded[i].sample_rate,
@@ -765,6 +936,22 @@ pub const EmbeddingPipeline = struct {
         audio_clips: []const audio.PcmAudioInterleaved,
     ) ![][]f32 {
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
+
+        const audio_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        const feature_plan = try clapBatchPlan(audio_session, audio_clips.len);
+        try ensureClapWorkingSet(0, feature_plan.feature_reserve_bytes, self.config.max_audio_decode_working_bytes);
+        var retained_mono_bytes: usize = 0;
+        for (audio_clips) |clip| {
+            if (clip.channels == 0 or clip.samples.len % clip.channels != 0) return error.UnsupportedAudioFormat;
+            const mono_samples = clip.samples.len / clip.channels;
+            const mono_bytes = std.math.mul(usize, mono_samples, @sizeOf(f32)) catch return error.AudioTooLarge;
+            retained_mono_bytes = std.math.add(usize, retained_mono_bytes, mono_bytes) catch return error.AudioTooLarge;
+        }
+        try ensureClapWorkingSet(
+            retained_mono_bytes,
+            feature_plan.feature_reserve_bytes,
+            self.config.max_audio_decode_working_bytes,
+        );
 
         const alloc = self.allocator;
         var mono_storage = try alloc.alloc([]f32, audio_clips.len);
@@ -822,52 +1009,37 @@ pub const EmbeddingPipeline = struct {
 
         const alloc = self.allocator;
         const batch = audio_clips.len;
-        var clap_channels: usize = 1;
-        const clap_fusion_enabled = if (session_factory.getClapConfig(as)) |clap_cfg| blk: {
-            clap_channels = if (clap_cfg.audio_config.enable_fusion and audio_clips.len == 1) 4 else 1;
-            break :blk clap_cfg.audio_config.enable_fusion;
-        } else false;
-        var is_longer = try alloc.alloc(u8, batch);
-        defer alloc.free(is_longer);
+        const feature_plan = try clapBatchPlan(as, batch);
+        try ensureClapWorkingSet(0, feature_plan.feature_reserve_bytes, self.config.max_audio_decode_working_bytes);
 
         // Process each audio clip to official CLAP input features and concatenate.
-        const default_frames = audio.CLAP_CONFIG.chunk_length_s * audio.CLAP_CONFIG.sample_rate / audio.CLAP_CONFIG.hop_length + 1;
-        const n_frames = clapInputFeatureFrames(as, default_frames);
-        const n_mels = audio.CLAP_CONFIG.n_mels;
-        const feature_elements = std.math.mul(
-            usize,
-            std.math.mul(
-                usize,
-                std.math.mul(usize, batch, clap_channels) catch
-                    return error.ResourceLimitExceeded,
-                n_frames,
-            ) catch return error.ResourceLimitExceeded,
-            n_mels,
-        ) catch return error.ResourceLimitExceeded;
-        const feature_bytes = std.math.mul(usize, feature_elements, @sizeOf(f32)) catch
-            return error.ResourceLimitExceeded;
-        var pcm_bytes: usize = 0;
+        var retained_pcm_bytes: usize = 0;
         for (audio_clips) |clip| {
-            pcm_bytes = std.math.add(
-                usize,
-                pcm_bytes,
-                std.math.mul(usize, clip.samples.len, @sizeOf(f32)) catch
-                    return error.ResourceLimitExceeded,
-            ) catch return error.ResourceLimitExceeded;
+            const clip_bytes = std.math.mul(usize, clip.samples.len, @sizeOf(f32)) catch return error.AudioTooLarge;
+            retained_pcm_bytes = std.math.add(usize, retained_pcm_bytes, clip_bytes) catch return error.AudioTooLarge;
         }
+        try ensureClapWorkingSet(
+            retained_pcm_bytes,
+            feature_plan.feature_reserve_bytes,
+            self.config.max_audio_decode_working_bytes,
+        );
+
+        var is_longer = try alloc.alloc(u8, batch);
+        defer alloc.free(is_longer);
+        const feature_bytes = std.math.mul(usize, feature_plan.feature_elements, @sizeOf(f32)) catch
+            return error.ResourceLimitExceeded;
         var run_permit = try as.admit(.{
             .batch = batch,
-            .sequence = n_frames,
+            .sequence = feature_plan.frames,
             .input_bytes = feature_bytes,
             .host_preprocess_bytes = std.math.add(
                 usize,
-                pcm_bytes,
-                std.math.mul(usize, feature_bytes, 2) catch
-                    return error.ResourceLimitExceeded,
+                retained_pcm_bytes,
+                feature_plan.feature_reserve_bytes,
             ) catch return error.ResourceLimitExceeded,
         });
         defer run_permit.deinit();
-        const all_mels = try alloc.alloc(f32, feature_elements);
+        const all_mels = try alloc.alloc(f32, feature_plan.feature_elements);
         @memset(all_mels, 0.0);
         defer alloc.free(all_mels);
 
@@ -877,27 +1049,28 @@ pub const EmbeddingPipeline = struct {
                 alloc,
                 audio_clips[b].samples,
                 audio_clips[b].sample_rate,
-                clap_channels,
+                feature_plan.channels,
             );
             defer features.deinit();
 
-            const dst = all_mels[b * clap_channels * n_frames * n_mels ..][0 .. clap_channels * n_frames * n_mels];
-            const src_frames = @min(features.time_frames, n_frames);
-            const src_channels = @min(features.channels, clap_channels);
+            const per_clip_elements = feature_plan.feature_elements / batch;
+            const dst = all_mels[b * per_clip_elements ..][0..per_clip_elements];
+            const src_frames = @min(features.time_frames, feature_plan.frames);
+            const src_channels = @min(features.channels, feature_plan.channels);
             const src_plane = features.time_frames * features.mel_bins;
-            const dst_plane = n_frames * n_mels;
+            const dst_plane = feature_plan.frames * feature_plan.mels;
             for (0..src_channels) |ch| {
                 for (0..src_frames) |frame| {
                     const src_off = ch * src_plane + frame * features.mel_bins;
-                    const dst_off = ch * dst_plane + frame * n_mels;
-                    @memcpy(dst[dst_off..][0..n_mels], features.data[src_off..][0..n_mels]);
+                    const dst_off = ch * dst_plane + frame * feature_plan.mels;
+                    @memcpy(dst[dst_off..][0..feature_plan.mels], features.data[src_off..][0..feature_plan.mels]);
                 }
             }
             is_longer[b] = if (features.is_longer) 1 else 0;
         }
         logEmbedTiming("audio.features", batch, features_start);
 
-        if (clap_fusion_enabled) {
+        if (feature_plan.fusion_enabled) {
             var any_long = false;
             for (is_longer) |flag| {
                 if (flag != 0) {
@@ -915,7 +1088,7 @@ pub const EmbeddingPipeline = struct {
         }
 
         // Build input tensor: [batch, channels, n_frames, n_mels]
-        const mel_shape = [_]i64{ @intCast(batch), @intCast(clap_channels), @intCast(n_frames), @intCast(n_mels) };
+        const mel_shape = [_]i64{ @intCast(batch), @intCast(feature_plan.channels), @intCast(feature_plan.frames), @intCast(feature_plan.mels) };
         var mel_tensor = try Tensor.initFloat32(alloc, "input_features", &mel_shape, all_mels);
         defer mel_tensor.deinit();
         const longer_shape = [_]i64{ @intCast(batch), 1 };
@@ -1397,6 +1570,44 @@ pub const EmbeddingPipeline = struct {
         return embeddings;
     }
 
+    fn tryEmbedTextResidentEncoder(
+        self: *EmbeddingPipeline,
+        inputs: []const Tensor,
+        mask: []const i32,
+        batch: usize,
+        seq_len: usize,
+        permit: *session_mod.RunPermit,
+    ) !?[][]f32 {
+        const encoder_start = embedTimingStart(self.print_timing);
+        var encoder_outputs = (try permit.runResident(inputs, self.allocator)) orelse
+            return self.residentProjectionFallback(.text, "text.encoder.resident", batch, "unsupported");
+        logEmbedTiming("text.encoder.resident", batch, encoder_start);
+        defer encoder_outputs.deinit();
+        if (encoder_outputs.outputs.len == 0) return error.NoOutputTensors;
+
+        var pooled = self.residentPoolTextOutput(&encoder_outputs, mask, batch, seq_len) catch |err| switch (err) {
+            error.UnsupportedResidentTextPooling,
+            error.UnsupportedPrimitiveOp,
+            error.UnsupportedOperation,
+            error.UnsupportedShape,
+            => return self.residentProjectionFallback(.text, "text.pool.resident", batch, @errorName(err)),
+            else => return err,
+        };
+        defer pooled.deinit();
+
+        const pooled_storage = try self.allocator.alloc(ops_mod.CT, 1);
+        defer self.allocator.free(pooled_storage);
+        pooled_storage[0] = pooled.value;
+        var pooled_outputs = session_mod.ResidentOutputs{
+            .outputs = pooled_storage,
+            .backend = pooled.backend,
+            .allocator = self.allocator,
+        };
+        const embeddings = try self.resident2DToEmbeddings(&pooled_outputs, batch);
+        self.recordResidentProjection(.text, .success, "text.encoder.resident", batch, null);
+        return embeddings;
+    }
+
     fn tryEmbedResidentProjection(
         self: *EmbeddingPipeline,
         inputs: []const Tensor,
@@ -1476,7 +1687,8 @@ pub const EmbeddingPipeline = struct {
                 shape[0] == @as(i64, @intCast(expected_batch)) and
                 shape[2] == @as(i64, @intCast(expected_dim)))
             {
-                return try residentClsPool(outputs.backend, output, expected_batch, expected_dim);
+                if (shape[1] <= 0) return error.ShapeMismatch;
+                return try residentClsPool(outputs.allocator, outputs.backend, output, expected_batch, @intCast(shape[1]), expected_dim);
             }
         }
         return error.UnsupportedResidentProjectionInput;
@@ -1505,7 +1717,7 @@ pub const EmbeddingPipeline = struct {
                 defer backend.free(reshaped);
                 return switch (self.config.pooling) {
                     .mean => try residentMaskedMeanPool(outputs.allocator, backend, reshaped, mask, batch, seq_len, hidden),
-                    .cls => try residentClsPool(backend, reshaped, batch, hidden),
+                    .cls => try residentClsPool(outputs.allocator, backend, reshaped, batch, seq_len, hidden),
                     .last => try residentLastTokenPool(outputs.allocator, backend, reshaped, mask, batch, seq_len, hidden),
                     .max => error.UnsupportedResidentTextPooling,
                 };
@@ -1519,7 +1731,7 @@ pub const EmbeddingPipeline = struct {
 
         return switch (self.config.pooling) {
             .mean => try residentMaskedMeanPool(outputs.allocator, backend, output, mask, batch, seq_len, @intCast(shape[2])),
-            .cls => try residentClsPool(backend, output, batch, @intCast(shape[2])),
+            .cls => try residentClsPool(outputs.allocator, backend, output, batch, seq_len, @intCast(shape[2])),
             .last => try residentLastTokenPool(outputs.allocator, backend, output, mask, batch, seq_len, @intCast(shape[2])),
             .max => error.UnsupportedResidentTextPooling,
         };
@@ -1567,12 +1779,31 @@ pub const EmbeddingPipeline = struct {
     }
 
     fn residentClsPool(
+        allocator: std.mem.Allocator,
         backend: *const ops_mod.ComputeBackend,
         output: ops_mod.CT,
         batch: usize,
+        seq_len: usize,
         hidden: usize,
     ) !ResidentPooled {
-        const input_shape = [_]i64{ @intCast(batch), -1, @intCast(hidden) };
+        const flat_rows = std.math.mul(usize, batch, seq_len) catch return error.ShapeMismatch;
+        const flat_shape = [_]i64{
+            std.math.cast(i64, flat_rows) orelse return error.ShapeMismatch,
+            std.math.cast(i64, hidden) orelse return error.ShapeMismatch,
+        };
+        const flat = try backend.primReshape(output, &flat_shape);
+        defer backend.free(flat);
+        const row_ids = try allocator.alloc(u32, batch);
+        defer allocator.free(row_ids);
+        for (row_ids, 0..) |*row_id, b| {
+            const row = std.math.mul(usize, b, seq_len) catch return error.ShapeMismatch;
+            row_id.* = std.math.cast(u32, row) orelse return error.ShapeMismatch;
+        }
+        if (try backend.takeRows(flat, row_ids, batch, hidden)) |pooled| {
+            return .{ .value = pooled, .backend = backend, .owns_value = true };
+        }
+
+        const input_shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(hidden) };
         const starts = [_]i64{ 0, 0, 0 };
         const limits = [_]i64{ @intCast(batch), 1, @intCast(hidden) };
         const strides = [_]i64{ 1, 1, 1 };
@@ -1775,6 +2006,30 @@ fn hasFixedTextSequenceLength(input_info: []const backends.TensorInfo) bool {
         return info.shape.len >= 2 and info.shape[1] > 0;
     }
     return false;
+}
+
+test "clap aggregate feature working set is checked before allocation" {
+    const frames = audio.CLAP_CONFIG.chunk_length_s * audio.CLAP_CONFIG.sample_rate / audio.CLAP_CONFIG.hop_length + 1;
+    const mels = audio.CLAP_CONFIG.n_mels;
+    const one = try clapBatchFeatureWorkingSet(1, 1, frames, mels);
+    try std.testing.expectEqual(frames * mels, one.elements);
+    try ensureClapWorkingSet(0, one.reserve_bytes, audio.default_decode_working_bytes);
+
+    const feature_bytes_per_clip = frames * mels * @sizeOf(f32);
+    const oversized_batch = audio.default_decode_working_bytes / (2 * feature_bytes_per_clip) + 1;
+    const oversized = try clapBatchFeatureWorkingSet(oversized_batch, 1, frames, mels);
+    try std.testing.expectError(
+        error.AudioTooLarge,
+        ensureClapWorkingSet(0, oversized.reserve_bytes, audio.default_decode_working_bytes),
+    );
+    try std.testing.expectError(
+        error.AudioTooLarge,
+        ensureClapWorkingSet(audio.default_decode_working_bytes, one.reserve_bytes, audio.default_decode_working_bytes),
+    );
+    try std.testing.expectError(
+        error.AudioTooLarge,
+        clapBatchFeatureWorkingSet(std.math.maxInt(usize), 2, frames, mels),
+    );
 }
 
 test "embedding text inputs follow declared model arity" {
@@ -2081,6 +2336,115 @@ fn clapInputFeatureFrames(session: backends.Session, default_frames: usize) usiz
 fn freeEmbeddingSlices(allocator: std.mem.Allocator, embeddings: [][]f32) void {
     for (embeddings) |emb| allocator.free(emb);
     allocator.free(embeddings);
+}
+
+const TextBatchRunner = *const fn (
+    ctx: *anyopaque,
+    texts: []const []const u8,
+) anyerror![][]f32;
+
+/// Preserve the requested batch on the fast path, but split an over-budget
+/// dynamic batch until it fits. A single-row resource failure is returned
+/// unchanged so a model that cannot fit at all still fails closed.
+fn embedTextBatchAdaptive(
+    allocator: std.mem.Allocator,
+    ctx: *anyopaque,
+    texts: []const []const u8,
+    run_batch: TextBatchRunner,
+) anyerror![][]f32 {
+    return run_batch(ctx, texts) catch |err| {
+        if (err != error.ResourceLimitExceeded or texts.len <= 1) return err;
+
+        const midpoint = (texts.len + 1) / 2;
+        const left = try embedTextBatchAdaptive(
+            allocator,
+            ctx,
+            texts[0..midpoint],
+            run_batch,
+        );
+        var left_owned = true;
+        defer if (left_owned) freeEmbeddingSlices(allocator, left);
+        if (left.len != midpoint) return error.UnexpectedOutputShape;
+
+        const right = try embedTextBatchAdaptive(
+            allocator,
+            ctx,
+            texts[midpoint..],
+            run_batch,
+        );
+        var right_owned = true;
+        defer if (right_owned) freeEmbeddingSlices(allocator, right);
+        if (right.len != texts.len - midpoint) return error.UnexpectedOutputShape;
+
+        const combined = try allocator.alloc([]f32, texts.len);
+        @memcpy(combined[0..left.len], left);
+        @memcpy(combined[left.len..], right);
+        allocator.free(left);
+        left_owned = false;
+        allocator.free(right);
+        right_owned = false;
+        return combined;
+    };
+}
+
+test "embedding text batch adaptively splits resource-limited requests" {
+    const allocator = std.testing.allocator;
+    const Probe = struct {
+        allocator: std.mem.Allocator,
+        max_batch: usize,
+        calls: usize = 0,
+        largest_success: usize = 0,
+
+        fn run(ctx: *anyopaque, texts: []const []const u8) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (texts.len > self.max_batch) return error.ResourceLimitExceeded;
+            self.largest_success = @max(self.largest_success, texts.len);
+
+            const vectors = try self.allocator.alloc([]f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (vectors[0..initialized]) |vector| self.allocator.free(vector);
+                self.allocator.free(vectors);
+            }
+            for (texts, 0..) |text, index| {
+                vectors[index] = try self.allocator.dupe(f32, &.{@floatFromInt(text.len)});
+                initialized += 1;
+            }
+            return vectors;
+        }
+    };
+
+    var probe = Probe{ .allocator = allocator, .max_batch = 1 };
+    const texts = [_][]const u8{ "a", "bb", "ccc", "dddd" };
+    const vectors = try embedTextBatchAdaptive(allocator, &probe, &texts, Probe.run);
+    defer freeEmbeddingSlices(allocator, vectors);
+
+    try std.testing.expectEqual(@as(usize, 4), vectors.len);
+    try std.testing.expectEqualSlices(f32, &.{1}, vectors[0]);
+    try std.testing.expectEqualSlices(f32, &.{2}, vectors[1]);
+    try std.testing.expectEqualSlices(f32, &.{3}, vectors[2]);
+    try std.testing.expectEqualSlices(f32, &.{4}, vectors[3]);
+    try std.testing.expectEqual(@as(usize, 1), probe.largest_success);
+    try std.testing.expectEqual(@as(usize, 7), probe.calls);
+}
+
+test "embedding text batch preserves a single-row resource limit" {
+    const Probe = struct {
+        fn run(_: *anyopaque, _: []const []const u8) ![][]f32 {
+            return error.ResourceLimitExceeded;
+        }
+    };
+    var context: u8 = 0;
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        embedTextBatchAdaptive(
+            std.testing.allocator,
+            &context,
+            &.{"too large"},
+            Probe.run,
+        ),
+    );
 }
 
 const ProjectionSelection = struct {

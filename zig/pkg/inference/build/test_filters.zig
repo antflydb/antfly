@@ -71,6 +71,9 @@ pub fn select(
             std.mem.eql(u8, arg, "--listen=-"))
         {
             // Runtime-only controls do not participate in compile reachability.
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            filters.deinit(alloc);
+            return default_filters;
         } else {
             filters.appendAssumeCapacity(arg);
         }
@@ -123,6 +126,8 @@ pub fn addRuntimeControls(
             std.mem.eql(u8, arg, "--listen=-"))
         {
             run.addArg(arg);
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return;
         }
         i += 1;
     }
@@ -151,6 +156,18 @@ test "select accepts repeated filters and ignores runtime controls" {
 test "empty skip filters are rejected before compiling a zero-test selection" {
     try std.testing.expectError(error.EmptySkipTestFilter, validateSkipTestFilter(""));
     try validateSkipTestFilter("known flaky test");
+}
+
+test "select ignores forwarded non-test options" {
+    const defaults = [_][]const u8{"default"};
+    const filters = select(
+        std.testing.allocator,
+        &.{ "--check-model", "model.gguf" },
+        &defaults,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), filters.len);
+    try std.testing.expectEqualStrings("default", filters[0]);
 }
 
 test "select leaves foreign executable arguments untouched" {

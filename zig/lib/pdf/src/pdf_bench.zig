@@ -68,6 +68,16 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, subcommand, "render-pages")) {
+        const path = args.next() orelse {
+            printUsage(argv0);
+            return BenchError.InvalidArguments;
+        };
+        const dpi: u16 = @intCast(try parseIterations(args.next(), 150));
+        try renderAllPages(alloc, path, dpi);
+        return;
+    }
+
     printUsage(argv0);
     return BenchError.InvalidArguments;
 }
@@ -78,8 +88,9 @@ fn printUsage(argv0: []const u8) void {
         \\  {s} suite <pdf-path> [iterations]
         \\  {s} extract-text <pdf-path> [iterations]
         \\  {s} render-first-page <pdf-path> [iterations]
+        \\  {s} render-pages <pdf-path> [dpi]
         \\
-    , .{ argv0, argv0, argv0 });
+    , .{ argv0, argv0, argv0, argv0 });
 }
 
 fn parseIterations(maybe_value: ?[]const u8, default_value: usize) !usize {
@@ -125,6 +136,29 @@ fn benchRenderFirstPage(alloc: std.mem.Allocator, path: []const u8, iterations: 
     const backend = pdf.Backend.native();
     const result = try timeRenderFirstPage(alloc, backend, bytes, iterations);
     printBenchLine("pdf-render-first-page", path, iterations, result.elapsed_ns, bytes.len, result.total_output_bytes);
+}
+
+fn renderAllPages(alloc: std.mem.Allocator, path: []const u8, dpi: u16) !void {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_pdf_input_bytes));
+    defer alloc.free(bytes);
+    var parsed = try pdf.reader.Reader.init(alloc, bytes);
+    defer parsed.deinit();
+    var total_output_bytes: usize = 0;
+    const start_ns = monotonicNowNs();
+    var page_number: usize = 1;
+    while (page_number <= 100_000) : (page_number += 1) {
+        const png = pdf.renderParsedPagePngAdaptiveAlloc(alloc, &parsed, page_number, dpi, 16_000_000, 4096) catch |err| switch (err) {
+            error.InvalidPageNumber => break,
+            else => return err,
+        };
+        total_output_bytes += png.png.len;
+        alloc.free(png.png);
+    }
+    const page_count = page_number - 1;
+    if (page_count == 0) return error.EmptyPdfPageTree;
+    printBenchLine("pdf-render-pages", path, page_count, monotonicNowNs() - start_ns, bytes.len, total_output_bytes);
 }
 
 fn timeExtractText(
