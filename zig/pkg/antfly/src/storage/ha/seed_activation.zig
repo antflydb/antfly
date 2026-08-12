@@ -32,6 +32,7 @@ const local_generation_gc = @import("local_generation_gc.zig");
 const object_storage = @import("../object_storage.zig");
 const seed_artifact = @import("seed_artifact.zig");
 const seed_capture = @import("seed_capture.zig");
+const contract = @import("seed_activation_contract.zig");
 const seed_materialization = @import("seed_materialization.zig");
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
@@ -43,37 +44,10 @@ pub const live_generations_dir_name = "live-generations";
 pub const active_receipt_name = "ACTIVE.json";
 pub const generation_receipt_name = ".antfly-ha-active-generation.json";
 
-pub const ActivateRequest = struct {
-    staging_root: []const u8,
-    target_root: []const u8,
-    expected: seed_artifact.ExpectedArtifact,
-    binding: ?ActivationBinding = null,
-    materialization: ?MaterializationTarget = null,
-    pod_uid: ?[]const u8 = null,
-    limits: seed_artifact.Limits = .{},
-};
-
-pub const MaterializationTarget = struct {
-    target_local_node_id: u64,
-    target_replica_id: u64 = 1,
-};
-
-pub const ActivationBinding = seed_artifact.LifecycleBinding;
-
-pub const StartupExpectation = struct {
-    target_root: []const u8,
-    expected: seed_artifact.ExpectedArtifact,
-    binding: ActivationBinding,
-    manifest_sha256: ?[]const u8 = null,
-    aggregate_sha256: ?[]const u8 = null,
-    seed_receipt_sha256: ?[]const u8 = null,
-    capture_receipt_sha256: ?[]const u8 = null,
-    materialized_receipt_sha256: ?[]const u8 = null,
-    materialized_aggregate_sha256: ?[]const u8 = null,
-    target_local_node_id: ?u64 = null,
-    target_replica_id: ?u64 = null,
-    limits: seed_artifact.Limits = .{},
-};
+pub const ActivateRequest = contract.ActivateRequest;
+pub const MaterializationTarget = contract.MaterializationTarget;
+pub const ActivationBinding = contract.ActivationBinding;
+pub const StartupExpectation = contract.StartupExpectation;
 
 pub const ActivationResult = struct {
     /// Absolute path of the mutable, identity-validated generation that the
@@ -89,15 +63,7 @@ pub const ActivationResult = struct {
     }
 };
 
-pub const ActivatedGenerationGCRequest = struct {
-    target_root: []const u8,
-    /// Durable controller-owned copy of HASeededSlotActivateResponse.
-    slot_activation_receipt_path: []const u8,
-    protected_generations: []const []const u8 = &.{},
-    retain_generations: usize = 2,
-    limits: seed_artifact.Limits = .{},
-    max_local_generations: usize = 10_000,
-};
+pub const ActivatedGenerationGCRequest = contract.ActivatedGenerationGCRequest;
 
 pub const ActivationReceipt = struct {
     format_version: u16 = format_version,

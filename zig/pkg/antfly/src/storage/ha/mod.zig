@@ -23,6 +23,7 @@ pub const seed_artifact = @import("seed_artifact.zig");
 pub const seed_namespace_control = @import("seed_namespace_control.zig");
 pub const seed_prefix_cleanup = @import("seed_prefix_cleanup.zig");
 pub const seed_activation = @import("seed_activation.zig");
+pub const seed_topology = @import("seed_topology.zig");
 pub const seed_materialization = @import("seed_materialization.zig");
 pub const seed_capture = @import("seed_capture.zig");
 pub const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
@@ -68,6 +69,7 @@ test {
     _ = seed_namespace_control;
     _ = seed_prefix_cleanup;
     _ = seed_activation;
+    _ = seed_topology;
     _ = seed_materialization;
     _ = seed_capture;
     _ = lifecycle_receipt_ledger;

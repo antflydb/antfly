@@ -27,6 +27,7 @@ const inference_bridge = @import("inference_bridge.zig");
 const inference_client = @import("inference_client.zig");
 const boundary_error_identity = @import("runtime_failure_identity");
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
+const seed_activation_contract = @import("../storage/ha/seed_activation_contract.zig");
 const storage_source_options = @import("storage_source_options");
 const standalone_runtime_options = @import("standalone_runtime_options");
 const inline_inference_codegen = !standalone_runtime_options.linked_inference;
@@ -2139,13 +2140,20 @@ pub fn runFromIterator(
 
     try validateHAPathsUnderRoot(cli, data_dir);
     const ha_startup_expectation = try haStartupExpectationFromCli(cli);
-    const ha_startup_checkpoint_lsn = if (ha_startup_expectation) |expectation|
-        antfly.ha.seed_activation.validateActivatedGeneration(alloc, expectation) catch |err| {
+    const ha_startup_checkpoint_lsn = if (ha_startup_expectation) |expectation| blk: {
+        if (comptime storage_kernel_experiment) {
+            const request_json = try std.json.Stringify.valueAlloc(alloc, expectation, .{});
+            defer alloc.free(request_json);
+            break :blk kernel_owner_client.haSeedValidateActivatedGeneration(request_json) catch |err| {
+                std.log.err("standalone startup failed step=validate_ha_active_generation err={}", .{err});
+                return err;
+            };
+        }
+        break :blk antfly.ha.seed_activation.validateActivatedGeneration(alloc, expectation) catch |err| {
             std.log.err("standalone startup failed step=validate_ha_active_generation err={}", .{err});
             return err;
-        }
-    else
-        null;
+        };
+    } else null;
     // A reseed may rotate a persisted Lease fence only after the complete,
     // immutable activation chain on this exact target volume has validated.
     // A generic checkpoint or caller-selected startup generation never reaches
@@ -4390,10 +4398,10 @@ fn validateHAPathsUnderRoot(cli: CliConfig, data_root: []const u8) !void {
     }
 }
 
-fn haStartupExpectationFromCli(cli: CliConfig) !?antfly.ha.seed_activation.StartupExpectation {
+fn haStartupExpectationFromCli(cli: CliConfig) !?seed_activation_contract.StartupExpectation {
     if (!haStartupGateRequested(cli)) return null;
     if (!haStandbyRequested(cli)) return error.HAStartupGateRequiresStandby;
-    const binding = antfly.ha.seed_activation.ActivationBinding{
+    const binding = seed_activation_contract.ActivationBinding{
         .topology_id = try requireHAIdentifier(cli.ha_startup_topology_id, error.HAStartupTopologyIdMissing, error.HAStartupTopologyIdInvalid),
         .topology_generation = cli.ha_startup_topology_generation orelse return error.HAStartupTopologyGenerationMissing,
         .node_id = try requireHAIdentifier(cli.ha_standby_node_id, error.HAStandbyNodeIdMissing, error.HAStandbyNodeIdInvalid),

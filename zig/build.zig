@@ -2599,6 +2599,7 @@ pub fn build(b: *std.Build) void {
         "packed dense response exposes public ids not doc ordinals",
         "dense response identity generation footer",
         "capi aggregate hits rejects stale identity generation before aggregation materialization",
+        "storage HA seed boundary preserves status and exact failure identity",
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_mod,

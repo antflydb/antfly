@@ -28,6 +28,7 @@ pub const geo = @import("search/geo.zig");
 pub const graph = @import("graph/graph.zig");
 pub const graph_pattern = @import("graph/pattern.zig");
 pub const graph_query = @import("graph/query.zig");
+pub const ha_seed_activation = @import("storage/ha/seed_activation.zig");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const lite = @import("storage/lite/mod.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");

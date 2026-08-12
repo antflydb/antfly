@@ -125,6 +125,7 @@ pub const geo = @import("search/geo.zig");
 pub const graph = @import("graph/graph.zig");
 pub const graph_pattern = @import("graph/pattern.zig");
 pub const graph_query = @import("graph/query.zig");
+pub const ha_seed_activation = @import("storage/ha/seed_activation.zig");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const lite = @import("storage/lite/mod.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
@@ -529,6 +530,9 @@ comptime {
             exportInternal(&storage_kernel_exports.storageOwnerLocalTransition, "antfly_storage_owner_local_transition");
             exportInternal(&storage_kernel_exports.storageOwnerOpen, "antfly_storage_owner_open");
             exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
+            exportInternal(&storage_kernel_exports.storageHASeedActivateJson, "antfly_storage_ha_seed_activate_json");
+            exportInternal(&storage_kernel_exports.storageHASeedValidateJson, "antfly_storage_ha_seed_validate_json");
+            exportInternal(&storage_kernel_exports.storageHASeedPruneJson, "antfly_storage_ha_seed_prune_json");
             exportInternal(&storage_kernel_exports.storageOwnerConfigure, "antfly_storage_owner_configure");
             exportInternal(&storage_kernel_exports.storageOwnerReconcile, "antfly_storage_owner_reconcile");
             exportInternal(&storage_kernel_exports.storageOwnerPreflightWriteAdmission, "antfly_storage_owner_preflight_write_admission");

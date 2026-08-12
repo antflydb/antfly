@@ -845,6 +845,30 @@ pub const JsonOperationRequest = extern struct {
     request_json: BorrowedBytes = .{},
 };
 
+/// Complete offline HA-seed operations that must remain beside physical DB
+/// restore/validation code. Values are append-only because they are recorded
+/// in `FailureIdentity.operation` for cross-unit diagnostics.
+pub const HASeedOperation = enum(u32) {
+    activate = 100,
+    validate_activated_generation = 101,
+    prune_activated_generations = 102,
+};
+
+/// The request JSON is borrowed for one synchronous coarse operation. Its
+/// schema is the corresponding `storage/ha/seed_activation.zig` request type;
+/// no allocator, Zig error union, or storage handle crosses the ABI.
+pub const HASeedJsonRequest = extern struct {
+    version: u32 = abi_version,
+    operation: HASeedOperation,
+    request_json: BorrowedBytes = .{},
+};
+
+pub const HASeedValidationResult = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    checkpoint_lsn: u64 = 0,
+};
+
 /// One already-merged hit borrowed for a synchronous coarse aggregation
 /// operation. The kernel reads `stored_data` only for the duration of the call.
 pub const AggregationHit = extern struct {
@@ -1388,6 +1412,24 @@ pub extern fn antfly_storage_owner_open(
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_close(owner: ?*anyopaque) callconv(.c) void;
+
+pub extern fn antfly_storage_ha_seed_activate_json(
+    request: *const HASeedJsonRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_ha_seed_validate_json(
+    request: *const HASeedJsonRequest,
+    out_result: *HASeedValidationResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_ha_seed_prune_json(
+    request: *const HASeedJsonRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_configure(
     owner: ?*anyopaque,

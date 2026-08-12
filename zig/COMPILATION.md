@@ -4156,6 +4156,91 @@ the goal loop with the repeated named-section evidence, led by API/query
 contracts shared by distributed control and local-query storage, without
 merging inference back into the critical unit.
 
+### Phase 4y: post-main HA seed source-selection repair
+
+Merging main introduced HA seed activation and startup validation into the
+distributed command and standalone paths. The first cold post-merge control
+made the regression explicit: storage remained 310.367 seconds, while
+distributed grew to 348.370 seconds, 860 imported files, and 39,973
+declarations. Distributed and storage co-emitted 6.47 MB, including physical
+`storage.db.db`, `index_manager`, and enrichment-runtime sections. This was a
+source-selection leak, not evidence that the five-unit topology itself had
+stopped paying off.
+
+The repair keeps capture-side portable seed topology in distributed control
+and moves complete activation, materialization, live-DB validation, and local
+generation pruning behind the existing compiled storage owner:
+
+```text
+distributed HA command / standalone startup
+    -> versioned JSON request plus stable operation ID
+    -> compiled storage owner
+    -> complete activation, validation, or prune operation
+    -> owned response or lossless FailureIdentity
+```
+
+`seed_topology.zig` is now the single portable schema and validation source.
+It deliberately imports no DB, LSM, index, or physical materialization code.
+`seed_activation_contract.zig` similarly contains only request data. The
+physical `seed_activation.zig` and `seed_materialization.zig` remain selected
+only by the storage owner. An authoritative compiler-graph gate now rejects
+distributed analysis of those implementations and their DB/core/index,
+enrichment, and persistent-storage dependencies.
+
+The boundary does not erase error identity. ABI version 39 assigns append-only
+statuses to every expected HA activation/materialization lifecycle failure;
+provider envelopes retain boundary, operation, exact error name, and stable
+name hash. Malformed JSON maps to `InvalidArgument`, while valid domain
+failures round-trip to their original Zig errors. The cross-archive owner test
+proves both `InvalidArgument` and `InvalidStagingRoot` through the real
+consumer/provider link, and the registry exhaustively verifies every status.
+
+A genuinely cold Apple-Silicon cross-build used Zig 0.16.0, fresh local and
+global caches, ARM64 Linux musl `ReleaseFast`, stripping, baseline CPU,
+production LSM-only mode, the five-unit topology, and normal concurrency. All
+39 build steps succeeded:
+
+| Unit | Post-main control | HA owner repair | Change |
+|---|---:|---:|---:|
+| Storage + local query | 310.367 s | 321.719 s | +11.352 s |
+| Distributed/API control | 348.370 s | 267.599 s | -80.771 s |
+| Inference | 236.780 s | 251.509 s | +14.729 s |
+| Remote CLI | 37.669 s | 40.468 s | +2.799 s |
+| Enrichment compute | 19.182 s | 19.524 s | +0.342 s |
+
+Distributed fell from 860 to 756 imported files and from 39,973 to 31,814
+declarations. The authoritative report contains `seed_topology.zig`, but not
+`seed_activation.zig`, `seed_materialization.zig`, `storage/db/db.zig`, DB
+core, index manager, enrichment runtime, or persistent storage. The new
+critical unit is storage at 321.719 seconds, below the preferred 350-second
+local gate without cache priming or reduced parallelism.
+
+Object-level analysis confirms that this is an emitted-code repair rather
+than only a source-graph improvement. Storage/distributed co-emission fell
+from the regressed 6.47 MB to a 2.57 MB module lower bound. The remaining
+overlap is led by query contracts, schemas, configuration, and shared LSM
+interfaces; physical DB, index-manager, and enrichment-runtime modules are no
+longer emitted by distributed control.
+
+An immediately preceding clean candidate, before completing the exhaustive HA
+status registry, measured storage/distributed at 311.542/261.885 seconds with
+the same compiler graph. The exact final-tree repeat above is the acceptance
+measurement; the pair bounds ordinary local host variance without weakening
+the result.
+
+The stripped static AArch64 executable shrank from 71,860,000 to 65,522,864
+bytes. Stripped `libantfly.so` changed only from 18,924,744 to 18,960,856 bytes
+and remains below 20 MiB. The executable has no dynamic section and contains no
+LMDB entry-point strings. Focused validation passed 101/101 cross-archive
+storage-owner tests, 12/12 CAPI tests, 102/102 data-runtime tests, 367/367 HA
+compatibility tests, and 22/22 graph-analyzer tests with zero leaks.
+
+Decision: **keep**. This repairs the main-merge regression and restores a local
+cold critical path well below the architectural target. The experiment still
+requires repeated normal Linux runner timing/RSS and runtime smoke evidence
+before production enablement; a single local cross-build is not sufficient to
+close the goal loop.
+
 ## Holistic target architecture
 
 The current structural candidate is the opt-in five-unit source-selected topology above:
@@ -4164,13 +4249,14 @@ inference, and remote CLI. Unlike the rejected source-only coalescing probes, it
 distributed/API unit only control sources, co-generates physical local-query
 execution with its storage owner, and keeps compute-heavy
 inference/enrichment isolated.
-The local cold combined storage/query unit is now 313.334 seconds, below the
+The local cold combined storage/query unit is now 321.719 seconds, below the
 350-second preferred gate. On the normal Linux runner the five-unit candidate
 measured 599.665 seconds for storage/query, versus 664.411 seconds for the
 immediately preceding matched six-unit repeat. The topology therefore has
-runner reliability evidence and a controlled 64.746-second improvement, but
-is not yet the production baseline because it still misses the 380-second
-critical-unit gate.
+runner reliability evidence and a controlled 64.746-second improvement. The
+Phase 4y source-selection repair has not yet been measured on that runner, so
+it is not yet the production baseline despite meeting the local critical-unit
+gate.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:
@@ -4483,6 +4569,12 @@ python3 zig/tools/analyze_zig_import_graph.py \
   --check-runtime-boundary \
   --check-codegen-boundary \
   --check-api-kernel-boundary \
+  --json
+
+python3 zig/tools/analyze_zig_import_graph.py \
+  --time-report distributed=reports/distributed.json \
+  --check-compiled-storage-boundary \
+  --check-ha-seed-failure-registry \
   --json
 
 python3 -m unittest zig/tools/test_analyze_zig_import_graph.py

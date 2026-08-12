@@ -141,6 +141,65 @@ class ImportGraphTest(unittest.TestCase):
 
         self.assertEqual([entry, left, target], graph.shortest_path(entry, target))
 
+    def test_compiled_storage_boundary_accepts_control_only_report(self):
+        control = self.write("storage/db/control_root.zig", "pub const value = 1;\n")
+        report = analyzer.TimeReport(
+            "distributed",
+            self.root / "distributed.json",
+            {},
+            frozenset({control}),
+            True,
+        )
+
+        self.assertTrue(
+            analyzer.check_compiled_storage_boundary(
+                {"distributed": report}, self.root
+            )
+        )
+
+    def test_compiled_storage_boundary_rejects_physical_db_report(self):
+        physical = self.write("storage/db/db.zig", "pub const value = 1;\n")
+        report = analyzer.TimeReport(
+            "distributed",
+            self.root / "distributed.json",
+            {},
+            frozenset({physical}),
+            True,
+        )
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            clean = analyzer.check_compiled_storage_boundary(
+                {"distributed": report}, self.root
+            )
+
+        self.assertFalse(clean)
+        self.assertIn("distributed analyzes storage/db/db.zig", diagnostics.getvalue())
+
+    def write_ha_seed_failure_fixture(self, registry: str, activation: str) -> None:
+        self.write("runtime_failure_identity.zig", registry)
+        for relative in analyzer.HA_SEED_FAILURE_SOURCE_FILES:
+            self.write(relative, activation if relative.endswith("seed_activation.zig") else "")
+
+    def test_ha_seed_failure_registry_accepts_exact_mapping(self):
+        self.write_ha_seed_failure_fixture(
+            ".{ .status = .invalid_staging_root, .err = error.InvalidStagingRoot },\n",
+            "fn validate() !void { return error.InvalidStagingRoot; }\n",
+        )
+
+        self.assertTrue(analyzer.check_ha_seed_failure_registry(self.root))
+
+    def test_ha_seed_failure_registry_rejects_unmapped_domain_error(self):
+        self.write_ha_seed_failure_fixture(
+            "",
+            "fn validate() !void { return error.NewLifecycleFailure; }\n",
+        )
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            clean = analyzer.check_ha_seed_failure_registry(self.root)
+
+        self.assertFalse(clean)
+        self.assertIn("error.NewLifecycleFailure has no stable status", diagnostics.getvalue())
+
     def test_resolve_source_rejects_escape(self):
         self.write("entry.zig", "pub const value = 1;\n")
         graph = analyzer.ImportGraph(self.root)

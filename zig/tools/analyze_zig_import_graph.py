@@ -107,6 +107,42 @@ API_KERNEL_IMPLEMENTATIONS = (
     "storage/lmdb_backend.zig",
 )
 
+# Authoritative compiler-report gate for the linked distributed/control unit.
+# These modules own physical local storage and must be compiled only by the
+# storage unit. Lexical reachability is intentionally not enough here because
+# Zig source selectors and lazy declarations make the compiler's `all_files`
+# set the relevant evidence.
+DISTRIBUTED_FORBIDDEN_STORAGE_FILES = (
+    "storage/db/db.zig",
+    "storage/db/core.zig",
+    "storage/db/catalog/index_manager.zig",
+    "storage/db/enrichment/enrichment_runtime.zig",
+    "storage/ha/seed_activation.zig",
+    "storage/ha/seed_materialization.zig",
+    "storage/persistent.zig",
+)
+
+HA_SEED_FAILURE_SOURCE_FILES = (
+    "storage/ha/seed_activation.zig",
+    "storage/ha/seed_materialization.zig",
+    "storage/ha/seed_topology.zig",
+    "storage/ha/seed_artifact.zig",
+    "storage/ha/local_generation_gc.zig",
+    "storage/ha/lifecycle_receipt_ledger.zig",
+)
+
+# Deliberate test-only failures must remain unexpected provider defects rather
+# than becoming stable production ABI statuses.
+HA_SEED_TEST_ONLY_ERRORS = frozenset(
+    {
+        "InjectedActivationFailure",
+        "InjectedArtifactFailure",
+        "InjectedLocalGCFailure",
+        "InjectedPairedLocalGCFailure",
+        "TestExpectedEqual",
+    }
+)
+
 
 @dataclass(frozen=True)
 class GraphStats:
@@ -314,6 +350,22 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "fail on direct storage/table implementation imports from API ABI files"
+        ),
+    )
+    parser.add_argument(
+        "--check-compiled-storage-boundary",
+        action="store_true",
+        help=(
+            "fail if the distributed compiler time report analyzes physical "
+            "storage implementation files"
+        ),
+    )
+    parser.add_argument(
+        "--check-ha-seed-failure-registry",
+        action="store_true",
+        help=(
+            "fail if an HA seed lifecycle error lacks a stable runtime failure "
+            "status and inverse mapping"
         ),
     )
     parser.add_argument("--largest", type=int, default=0, metavar="N", help="show the N largest files per graph")
@@ -1002,6 +1054,58 @@ def check_api_kernel_boundary(graph: ImportGraph) -> bool:
     return clean
 
 
+def check_compiled_storage_boundary(
+    reports: dict[str, TimeReport],
+    source_root: Path = DEFAULT_SOURCE_ROOT,
+) -> bool:
+    report = reports.get("distributed")
+    if report is None:
+        print(
+            "compiled storage boundary check requires --time-report distributed=PATH",
+            file=sys.stderr,
+        )
+        return False
+    if not report.has_file_list:
+        print(
+            "distributed compiler report has no authoritative all_files list",
+            file=sys.stderr,
+        )
+        return False
+
+    forbidden = {
+        (source_root / relative).resolve(): relative
+        for relative in DISTRIBUTED_FORBIDDEN_STORAGE_FILES
+    }
+    leaked = sorted(
+        (forbidden[path] for path in report.repo_files if path in forbidden)
+    )
+    for relative in leaked:
+        print(
+            f"compiled storage boundary violation: distributed analyzes {relative}",
+            file=sys.stderr,
+        )
+    return not leaked
+
+
+def check_ha_seed_failure_registry(source_root: Path = DEFAULT_SOURCE_ROOT) -> bool:
+    error_pattern = re.compile(r"\berror\.([A-Za-z][A-Za-z0-9_]*)")
+    mapping_pattern = re.compile(
+        r"\.err\s*=\s*error\.([A-Za-z][A-Za-z0-9_]*)"
+    )
+    registry_path = source_root / "runtime_failure_identity.zig"
+    registered = set(mapping_pattern.findall(registry_path.read_text()))
+    required: set[str] = set()
+    for relative in HA_SEED_FAILURE_SOURCE_FILES:
+        required.update(error_pattern.findall((source_root / relative).read_text()))
+    missing = sorted(required - registered - HA_SEED_TEST_ONLY_ERRORS)
+    for name in missing:
+        print(
+            f"HA seed failure registry violation: error.{name} has no stable status mapping",
+            file=sys.stderr,
+        )
+    return not missing
+
+
 def main(argv: list[str] | None = None) -> int:
     args = arguments(argv)
     try:
@@ -1049,6 +1153,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.check_codegen_boundary and not check_codegen_boundary(graph):
             return 1
         if args.check_api_kernel_boundary and not check_api_kernel_boundary(graph):
+            return 1
+        if args.check_compiled_storage_boundary and not check_compiled_storage_boundary(
+            reports, graph.source_root
+        ):
+            return 1
+        if args.check_ha_seed_failure_registry and not check_ha_seed_failure_registry(
+            graph.source_root
+        ):
             return 1
         return 0
     except ValueError as error:

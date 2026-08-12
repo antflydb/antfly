@@ -59,6 +59,19 @@ test "local query identity relay preserves origin and attributes protocol defect
     try std.testing.expectEqualStrings("InvalidBoundaryFailureIdentity", replacement.errorName());
 }
 
+test "HA seed storage-owner boundary preserves exact operational errors" {
+    try std.testing.expectError(
+        error.InvalidArgument,
+        client.haSeedActivate("{"),
+    );
+    try std.testing.expectError(
+        error.InvalidStagingRoot,
+        client.haSeedActivate(
+            \\{"staging_root":"relative","target_root":"/valid","expected":{"generation":"gen","slot_name":"slot","identity":{"cluster_id":1,"timeline_id":1,"epoch":1}}}
+        ),
+    );
+}
+
 fn cleanup(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();

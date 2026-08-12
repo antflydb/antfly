@@ -2784,15 +2784,15 @@ pub const HASeedSnapshotProvider = struct {
     }
 };
 
-const ha_seed_snapshot_format_version = antfly.ha.seed_materialization.topology_format_version;
-const ha_seed_snapshot_topology_name = antfly.ha.seed_materialization.topology_name;
+const ha_seed_snapshot_format_version = antfly.ha.seed_topology.topology_format_version;
+const ha_seed_snapshot_topology_name = antfly.ha.seed_topology.topology_name;
 const ha_seed_snapshot_max_topology_bytes = 16 * 1024 * 1024;
 const ha_seed_snapshot_max_store_bytes: u64 = 64 * 1024 * 1024 * 1024;
 
-const HASeedSnapshotTopologyReplica = antfly.ha.seed_materialization.ReplicaSnapshot;
-const HASeedSnapshotExtensionArtifact = antfly.ha.seed_materialization.ExtensionArtifact;
-const HASeedSnapshotAuthArtifact = antfly.ha.seed_materialization.AuthArtifact;
-const HASeedSnapshotTopology = antfly.ha.seed_materialization.Topology;
+const HASeedSnapshotTopologyReplica = antfly.ha.seed_topology.ReplicaSnapshot;
+const HASeedSnapshotExtensionArtifact = antfly.ha.seed_topology.ExtensionArtifact;
+const HASeedSnapshotAuthArtifact = antfly.ha.seed_topology.AuthArtifact;
+const HASeedSnapshotTopology = antfly.ha.seed_topology.Topology;
 
 const HASeedExtensionCaptureProbe = struct {
     ptr: *anyopaque,
@@ -5443,7 +5443,7 @@ pub const DataServer = struct {
         while (try walker.next(io)) |entry| {
             if (entry.kind == .directory) continue;
             if (entry.kind != .file) return error.HASeedExtensionUnsafeArtifact;
-            if (artifacts.items.len >= antfly.ha.seed_materialization.max_files)
+            if (artifacts.items.len >= antfly.ha.seed_topology.max_files)
                 return error.HASeedExtensionTooManyArtifacts;
 
             const source_path = try std.fs.path.join(alloc, &.{ store_root, entry.path });
@@ -5451,7 +5451,7 @@ pub const DataServer = struct {
             const entry_index = try haSeedExtensionEntryForPath(source_path, entries);
             const package = packages[catalog_index_by_entry[entry_index]];
             const source_before = try std.Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
-            if (source_before.kind != .file or source_before.size > antfly.ha.seed_materialization.max_file_bytes)
+            if (source_before.kind != .file or source_before.size > antfly.ha.seed_topology.max_file_bytes)
                 return error.HASeedExtensionUnsafeArtifact;
             const digest_before = try haSeedSnapshotFileSha256HexAlloc(alloc, io, source_path);
             errdefer alloc.free(digest_before);
@@ -5568,7 +5568,7 @@ pub const DataServer = struct {
         if (topology.format_version != ha_seed_snapshot_format_version or
             !std.mem.eql(u8, topology.generation, generation) or topology.replicas.len == 0)
             return error.InvalidHASeedSnapshotTopology;
-        antfly.ha.seed_materialization.validateTopology(
+        antfly.ha.seed_topology.validate(
             alloc,
             io,
             prepared_root,

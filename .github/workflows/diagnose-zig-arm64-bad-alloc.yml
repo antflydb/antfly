@@ -232,6 +232,8 @@ jobs:
             --object "enrichment=$enrichment_object" \
             --object "inference=$inference_object" \
             --object "cli=$cli_object" \
+            --check-compiled-storage-boundary \
+            --check-ha-seed-failure-registry \
             --top-groups 30 \
             --json | tee "$RUNNER_TEMP/linked-runtime-reports/summary.json"
 

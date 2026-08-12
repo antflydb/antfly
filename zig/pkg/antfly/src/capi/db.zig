@@ -43,6 +43,7 @@ const traversal_mod = antfly.traversal;
 const paths_mod = antfly.paths;
 const graph_query_mod = antfly.graph_query;
 const graph_pattern_mod = antfly.graph_pattern;
+const ha_seed_activation = antfly.ha_seed_activation;
 const transactions_mod = antfly.transactions;
 const aggregations_mod = db_mod.aggregations;
 const aggregations_contract = aggregations_mod.contract;
@@ -3913,6 +3914,126 @@ fn storageOwnerOperationTableName(
     request: *const kernel_owner_abi.JsonOperationRequest,
 ) ?[]const u8 {
     return storageOwnerTableName(handle, request.table_name);
+}
+
+fn storageHASeedFailure(
+    err: anyerror,
+    operation: kernel_owner_abi.HASeedOperation,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) kernel_owner_abi.Status {
+    out_failure.* = kernel_error_identity.failureFromError(
+        err,
+        .storage_owner,
+        kernel_owner_abi.abi_version,
+        @intFromEnum(operation),
+    );
+    return out_failure.status;
+}
+
+fn validateHASeedRequest(
+    request: *const kernel_owner_abi.HASeedJsonRequest,
+    expected_operation: kernel_owner_abi.HASeedOperation,
+) ![]const u8 {
+    if (request.version != kernel_owner_abi.abi_version)
+        return error.InvalidAbiVersion;
+    if (request.operation != expected_operation)
+        return error.InvalidArgument;
+    const json = request.request_json.slice();
+    if (json.len == 0) return error.InvalidArgument;
+    return json;
+}
+
+pub fn storageHASeedActivateJson(
+    request: *const kernel_owner_abi.HASeedJsonRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    const operation = kernel_owner_abi.HASeedOperation.activate;
+    const request_json = validateHASeedRequest(request, operation) catch |err|
+        return storageHASeedFailure(err, operation, out_failure);
+    const alloc = std.heap.c_allocator;
+    var parsed = std.json.parseFromSlice(ha_seed_activation.ActivateRequest, alloc, request_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
+    defer parsed.deinit();
+    var result = ha_seed_activation.activate(alloc, parsed.value) catch |err|
+        return storageHASeedFailure(err, operation, out_failure);
+    alloc.free(result.generation_path);
+    const response = result.active_receipt_json;
+    result = undefined;
+    out_response.* = .{
+        .ptr = if (response.len == 0) null else response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
+pub fn storageHASeedValidateJson(
+    request: *const kernel_owner_abi.HASeedJsonRequest,
+    out_result: *kernel_owner_abi.HASeedValidationResult,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    out_failure.* = .{};
+    const operation = kernel_owner_abi.HASeedOperation.validate_activated_generation;
+    const request_json = validateHASeedRequest(request, operation) catch |err|
+        return storageHASeedFailure(err, operation, out_failure);
+    const alloc = std.heap.c_allocator;
+    var parsed = std.json.parseFromSlice(ha_seed_activation.StartupExpectation, alloc, request_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
+    defer parsed.deinit();
+    out_result.checkpoint_lsn = ha_seed_activation.validateActivatedGeneration(alloc, parsed.value) catch |err|
+        return storageHASeedFailure(err, operation, out_failure);
+    return .ok;
+}
+
+pub fn storageHASeedPruneJson(
+    request: *const kernel_owner_abi.HASeedJsonRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    const operation = kernel_owner_abi.HASeedOperation.prune_activated_generations;
+    const request_json = validateHASeedRequest(request, operation) catch |err|
+        return storageHASeedFailure(err, operation, out_failure);
+    const alloc = std.heap.c_allocator;
+    var parsed = std.json.parseFromSlice(ha_seed_activation.ActivatedGenerationGCRequest, alloc, request_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
+    defer parsed.deinit();
+    var result = ha_seed_activation.pruneActivatedGenerations(alloc, parsed.value) catch |err|
+        return storageHASeedFailure(err, operation, out_failure);
+    const response = result.result_json;
+    result = undefined;
+    out_response.* = .{
+        .ptr = if (response.len == 0) null else response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
+test "storage HA seed boundary preserves status and exact failure identity" {
+    var response: kernel_owner_abi.OwnedBytes = .{};
+    var failure: kernel_owner_abi.FailureIdentity = .{};
+    const status = storageHASeedActivateJson(&.{
+        .version = 0,
+        .operation = .activate,
+        .request_json = .fromSlice("{}"),
+    }, &response, &failure);
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_abi, status);
+    try std.testing.expectEqual(status, failure.status);
+    try std.testing.expectEqual(kernel_owner_abi.FailureBoundary.storage_owner, failure.boundary);
+    try std.testing.expectEqual(@intFromEnum(kernel_owner_abi.HASeedOperation.activate), failure.operation);
+    try std.testing.expectEqualStrings("InvalidAbiVersion", failure.errorName());
+    try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+    try std.testing.expectEqual(@as(u64, 0), response.len);
 }
 
 const StorageOwnerDocumentChildRangeDispatch = struct {
