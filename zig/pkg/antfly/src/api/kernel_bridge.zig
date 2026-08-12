@@ -110,18 +110,6 @@ const OpaqueApiHttpServer = struct {
         callInfallible(?http_common.RequestExecutor, void, self.functions.set_ha_executor, self.opaque_handle, &input, null);
     }
 
-    pub fn executor(self: *OpaqueApiHttpServer) http_common.RequestExecutor {
-        var out: http_common.RequestExecutor = undefined;
-        callInfallible(void, http_common.RequestExecutor, self.functions.executor, self.opaque_handle, null, &out);
-        return out;
-    }
-
-    pub fn streamingExecutor(self: *OpaqueApiHttpServer) http_common.StreamingRequestExecutor {
-        var out: http_common.StreamingRequestExecutor = undefined;
-        callInfallible(void, http_common.StreamingRequestExecutor, self.functions.streaming_executor, self.opaque_handle, null, &out);
-        return out;
-    }
-
     pub fn attachRestoreJobRuntimeStore(self: *OpaqueApiHttpServer, store: *backend_erased.Store) !void {
         try callFallible(backend_erased.Store, void, self.functions.attach_runtime_restore_store, self.opaque_handle, store, null);
     }
@@ -154,6 +142,10 @@ const OpaqueApiHttpServer = struct {
         return out;
     }
 
+    pub fn checkReady(self: *OpaqueApiHttpServer) !void {
+        try callFallible(void, void, self.functions.check_ready, self.opaque_handle, null, null);
+    }
+
     pub fn authorizeInferenceRequest(
         self: *OpaqueApiHttpServer,
         request: server_mod.AuthenticatedRequest,
@@ -169,20 +161,6 @@ const OpaqueApiHttpServer = struct {
             .out_decision = &decision,
         }));
         return decision;
-    }
-
-    pub fn handle(self: *OpaqueApiHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
-        var input = req;
-        var out: http_common.HttpResponse = undefined;
-        try callFallible(http_common.HttpRequest, http_common.HttpResponse, self.functions.handle, self.opaque_handle, &input, &out);
-        return out;
-    }
-
-    pub fn handleInternalRoute(self: *OpaqueApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        var input = req;
-        var out: ?http_common.HttpResponse = null;
-        try callFallible(http_common.HttpRequest, ?http_common.HttpResponse, self.functions.handle_internal, self.opaque_handle, &input, &out);
-        return out;
     }
 };
 
@@ -267,6 +245,12 @@ fn callInfallible(
 pub const HandlerStats = abi.HandlerStats;
 
 const OpaqueHttpxHandler = struct {
+    const RouteSelection = enum {
+        all,
+        all_without_probes,
+        generated_with_probes,
+    };
+
     handle: *anyopaque,
     functions: *const abi.FunctionTable,
     alloc: ?std.mem.Allocator = null,
@@ -284,6 +268,18 @@ const OpaqueHttpxHandler = struct {
     }
 
     pub fn registerRoutes(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
+        return self.registerRoutesWithOptions(server, .all);
+    }
+
+    pub fn registerRoutesWithoutProbes(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
+        return self.registerRoutesWithOptions(server, .all_without_probes);
+    }
+
+    pub fn registerGeneratedRoutesWithProbes(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
+        return self.registerRoutesWithOptions(server, .generated_with_probes);
+    }
+
+    fn registerRoutesWithOptions(self: *OpaqueHttpxHandler, server: *httpx.Server, selection: RouteSelection) !void {
         if (!abi.validFunctionTable(self.functions, abi.Capability.route_manifest)) return error.UnsupportedVersion;
         if (self.runtime_routes.items.len != 0) return error.RoutesAlreadyRegistered;
         const alloc = self.alloc orelse return error.ApiKernelNotInitialized;
@@ -297,6 +293,17 @@ const OpaqueHttpxHandler = struct {
         }));
         const entries = if (entries_ptr) |ptr| ptr[0..entries_len] else &.{};
         for (entries) |entry| {
+            const path = entry.path.slice();
+            const is_probe = std.mem.eql(u8, path, "/healthz") or std.mem.eql(u8, path, "/readyz");
+            const is_generated = std.mem.eql(u8, path, "/db/v1") or
+                std.mem.startsWith(u8, path, "/db/v1/") or
+                std.mem.eql(u8, path, "/auth/v1") or
+                std.mem.startsWith(u8, path, "/auth/v1/");
+            switch (selection) {
+                .all => {},
+                .all_without_probes => if (is_probe) continue,
+                .generated_with_probes => if (!is_generated and !is_probe) continue,
+            }
             const route = try alloc.create(RuntimeRoute);
             errdefer alloc.destroy(route);
             route.* = .{ .functions = self.functions, .kernel_route_handle = entry.route_handle };
@@ -307,7 +314,7 @@ const OpaqueHttpxHandler = struct {
                 .post => .POST,
                 .put => .PUT,
                 .delete => .DELETE,
-            }, entry.path.slice(), runtimeApiHttpHandler, route);
+            }, path, runtimeApiHttpHandler, route);
         }
     }
 

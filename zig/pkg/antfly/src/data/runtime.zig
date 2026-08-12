@@ -757,18 +757,8 @@ const DataPublicHttpRuntime = struct {
         try runtime.handler.initRuntime(alloc);
         runtime.listener_task = httpx.ListenerTask.init(&runtime.server);
         try runtime.handler.registerRoutes(&runtime.server);
-        try antfly.public_api.httpx_handler.registerLegacyCompatibilityRoutes(
-            &runtime.server,
-            httpx.Handler.bind(runtime, legacyFallback),
-            .data_public,
-        );
         try runtime.listener_task.start();
         return runtime;
-    }
-
-    fn legacyFallback(self: *DataPublicHttpRuntime, ctx: *httpx.Context) anyerror!httpx.Response {
-        const Handler = antfly.public_api.httpx_handler.AntflyApiHandler;
-        return Handler.executeLegacyCompatibility(ctx, self.api_server.executor());
     }
 
     fn deinit(self: *DataPublicHttpRuntime) void {

@@ -93,6 +93,10 @@ pub const Router = struct {
     /// Adds a route with borrowed opaque request data.
     pub fn addWithData(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, data: ?*anyopaque) !void {
         const segments = try self.parsePattern(pattern);
+        errdefer self.allocator.free(segments);
+        for (self.routesForConst(method)) |route| {
+            if (sameRouteShape(route.segments, segments)) return error.DuplicateRoute;
+        }
         try self.routesFor(method).append(self.allocator, .{
             .method = method,
             .pattern = pattern,
@@ -107,6 +111,10 @@ pub const Router = struct {
         const owned = try self.allocator.dupe(u8, pattern);
         errdefer self.allocator.free(owned);
         const segments = try self.parsePattern(owned);
+        errdefer self.allocator.free(segments);
+        for (self.routesForConst(method)) |route| {
+            if (sameRouteShape(route.segments, segments)) return error.DuplicateRoute;
+        }
         try self.routesFor(method).append(self.allocator, .{
             .method = method,
             .pattern = owned,
@@ -114,6 +122,29 @@ pub const Router = struct {
             .segments = segments,
             .handler = handler,
         });
+    }
+
+    fn sameRouteShape(left: []const Segment, right: []const Segment) bool {
+        if (left.len != right.len) return false;
+        for (left, right) |left_segment, right_segment| switch (left_segment) {
+            .literal => |left_literal| switch (right_segment) {
+                .literal => |right_literal| if (!mem.eql(u8, left_literal, right_literal)) return false,
+                else => return false,
+            },
+            .param => switch (right_segment) {
+                .param => {},
+                else => return false,
+            },
+            .param_suffix => |left_param| switch (right_segment) {
+                .param_suffix => |right_param| if (!mem.eql(u8, left_param.suffix, right_param.suffix)) return false,
+                else => return false,
+            },
+            .wildcard => switch (right_segment) {
+                .wildcard => {},
+                else => return false,
+            },
+        };
+        return true;
     }
 
     fn parsePattern(self: *Self, pattern: []const u8) ![]const Segment {
@@ -597,6 +628,28 @@ test "Router no routes registered" {
 
     const result3 = router.find(.DELETE, "/some/deep/path", &pbuf);
     try std.testing.expect(result3 == null);
+}
+
+test "Router rejects duplicate method and pattern registrations" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            return error.TestUnexpectedResult;
+        }
+    }.h;
+
+    try router.add(.GET, "/healthz", handler);
+    try std.testing.expectError(error.DuplicateRoute, router.add(.GET, "/healthz", handler));
+    try router.add(.POST, "/healthz", handler);
+
+    try router.add(.GET, "/tables/:table_name/indexes/:index_name", handler);
+    try std.testing.expectError(
+        error.DuplicateRoute,
+        router.add(.GET, "/tables/:table/indexes/:index", handler),
+    );
 }
 
 test "RouteGroup routes use owned pattern strings" {

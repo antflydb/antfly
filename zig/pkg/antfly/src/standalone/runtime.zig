@@ -28,7 +28,6 @@ const runtime_http_abi = @import("../runtime_http_abi.zig");
 const inline_inference_codegen = builtin.is_test;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
 
-const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
 const ApiHttpServer = antfly.public_api.ApiHttpServer;
 const ApiKernelHandler = antfly.public_api.kernel_bridge.HttpxHandler;
 const http_common = antfly.common.http;
@@ -2461,24 +2460,16 @@ fn serveUnifiedInner(
     }
 
     // Runtime roles consume the shared direct/linked kernel registrar instead
-    // of carrying copies of the generated route manifest.
-    try handler.registerRoutes(&server);
+    // of carrying copies of the generated route manifest. Standalone supplies
+    // its stronger Kubernetes-style root readiness contract locally.
+    try server.get(antfly.public_api.http_routes.Routes.healthz, healthzHandler);
+    try server.get(
+        antfly.public_api.http_routes.Routes.readyz,
+        httpx.Handler.bind(&route_context, readyzHandler),
+    );
+    try handler.registerRoutesWithoutProbes(&server);
 
-    // Health/ready at root level
-    try server.get("/healthz", healthzHandler);
-    try server.get("/readyz", httpx.Handler.bind(&route_context, readyzHandler));
-
-    // Internal group routes are still served by the legacy ApiHttpServer
-    // implementation, but the shared httpx server owns the route table.
     try server.use(httpx.Middleware.bind("storage-maintenance-admission", &route_context, storageMaintenanceAdmission));
-    try registerStorageMaintenanceRoutes(&server, &route_context);
-    try registerHAAdminRoutes(&server, &route_context);
-    try registerHAInternalRoutes(&server, &route_context);
-    try registerMcpRoutes(&server, &route_context);
-    try registerExperimentalRoutes(&server, &route_context, api_server.cfg.experimental);
-    try registerArdRoutes(&server, &route_context);
-    try registerExtensionRoutes(&server, &route_context);
-    try registerInternalGroupRoutes(&server, &route_context);
     try registerAntfarmRoutes(&server);
 
     try server.bind();
@@ -2656,9 +2647,11 @@ fn readyzHandler(route_context: *StandaloneHttpContext, ctx: *httpx.Context) any
         try ctx.setHeader("Retry-After", "1");
         return ctx.status(503).json(.{ .status = "maintenance" });
     }
-    var response = try server.handle(.{ .method = .GET, .uri = antfly.public_api.http_routes.Routes.readyz });
-    if (response.status == 503) try ctx.setHeader("Retry-After", "1");
-    return AntflyApiHandler.respond(ctx, &response);
+    server.checkReady() catch {
+        try ctx.setHeader("Retry-After", "1");
+        return ctx.status(503).json(.{ .status = "not_ready" });
+    };
+    return ctx.json(.{ .status = "ready" });
 }
 
 fn storageMaintenanceAdmission(route_context: *StandaloneHttpContext, ctx: *httpx.Context, next: *httpx.Next) anyerror!httpx.Response {
@@ -2985,97 +2978,6 @@ fn inferenceNotReadyResponse(ctx: *httpx.Context) !httpx.Response {
     });
 }
 
-fn registerMcpRoutes(server: anytype, route_context: *StandaloneHttpContext) !void {
-    const routes = antfly.public_api.http_routes.Routes;
-    const handler = httpx.Handler.bind(route_context, legacyApiBridgeHandler);
-    const mcp_paths = [_][]const u8{
-        routes.mcp_v1,
-        routes.mcp_v1_prefix ++ "*",
-    };
-    inline for (mcp_paths) |path| {
-        try server.get(path, handler);
-        try server.post(path, handler);
-        try server.delete(path, handler);
-    }
-}
-
-fn registerA2aRoutes(server: anytype, route_context: *StandaloneHttpContext) !void {
-    const routes = antfly.public_api.http_routes.Routes;
-    const handler = httpx.Handler.bind(route_context, legacyApiBridgeHandler);
-    try server.post(routes.a2a, handler);
-    try server.get(routes.agent_card, handler);
-    try server.get(routes.agent_card_legacy, handler);
-}
-
-fn registerExperimentalRoutes(server: anytype, route_context: *StandaloneHttpContext, enabled: bool) !void {
-    if (!enabled) return;
-    try registerA2aRoutes(server, route_context);
-}
-
-fn registerArdRoutes(server: anytype, route_context: *StandaloneHttpContext) !void {
-    const routes = antfly.public_api.http_routes.Routes;
-    const handler = httpx.Handler.bind(route_context, legacyApiBridgeHandler);
-    try server.get(routes.ai_catalog, handler);
-    try server.get(routes.ard_v1, handler);
-    try server.get(routes.ard_v1 ++ "/*", handler);
-    try server.post(routes.ard_v1_search, handler);
-    try server.post(routes.ard_v1_explore, handler);
-}
-
-fn registerHAAdminRoutes(server: anytype, route_context: *StandaloneHttpContext) !void {
-    const handler = httpx.Handler.bind(route_context, legacyApiBridgeHandler);
-    const ha_paths = [_][]const u8{
-        antfly.admin.routes.ha,
-        antfly.admin.routes.ha ++ "/*",
-    };
-    inline for (ha_paths) |path| {
-        try server.get(path, handler);
-        try server.post(path, handler);
-        try server.put(path, handler);
-        try server.delete(path, handler);
-    }
-}
-
-fn registerStorageMaintenanceRoutes(server: anytype, route_context: *StandaloneHttpContext) !void {
-    const handler = httpx.Handler.bind(route_context, legacyApiBridgeHandler);
-    try server.post(antfly.admin.routes.maintenance_check, handler);
-    try server.post(antfly.admin.routes.maintenance_compact, handler);
-    try server.post(antfly.admin.routes.maintenance_vacuum, handler);
-    try server.get(antfly.admin.routes.maintenance_jobs_prefix ++ "*", handler);
-    try server.delete(antfly.admin.routes.maintenance_jobs_prefix ++ "*", handler);
-}
-
-fn registerHAInternalRoutes(server: anytype, route_context: *StandaloneHttpContext) !void {
-    const handler = httpx.Handler.bind(route_context, legacyApiBridgeHandler);
-    const ha_paths = [_][]const u8{
-        antfly.internal.routes.ha,
-        antfly.internal.routes.ha ++ "/*",
-    };
-    inline for (ha_paths) |path| {
-        try server.get(path, handler);
-        try server.post(path, handler);
-        try server.put(path, handler);
-        try server.delete(path, handler);
-    }
-}
-
-fn registerExtensionRoutes(server: anytype, route_context: *StandaloneHttpContext) !void {
-    const routes = antfly.public_api.http_routes.Routes;
-    const handler = httpx.Handler.bind(route_context, legacyApiBridgeHandler);
-    const extension_paths = [_][]const u8{
-        routes.extensions_v1,
-        routes.extensions_v1_packages,
-        routes.extensions_v1_packages_prefix ++ "*",
-        routes.extensions_v1_installed,
-        routes.extensions_v1_installed_prefix ++ "*",
-    };
-    inline for (extension_paths) |path| {
-        try server.get(path, handler);
-        try server.post(path, handler);
-        try server.put(path, handler);
-    }
-}
-
 fn registerAntfarmRoutes(server: anytype) !void {
     try server.get("/", antfarmIndexHandler);
     try server.get("/assets/*", antfarmAssetHandler);
@@ -3337,76 +3239,6 @@ fn writeFileAtomically(alloc: std.mem.Allocator, path: []const u8, contents: []c
     };
     const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
     try fs_paths.syncDirPortable(io, parent);
-}
-
-fn registerInternalGroupRoutes(server: anytype, route_context: *StandaloneHttpContext) !void {
-    const routes = antfly.public_api.http_routes.Routes;
-    const handler = httpx.Handler.bind(route_context, internalBridgeHandler);
-    const group_prefix = routes.internal_groups_prefix ++ ":group_id";
-    const table_prefix = group_prefix ++ "/tables/:table_name";
-    const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
-    const internal_table_repair_cancel_state = internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix;
-
-    const get_routes = [_][]const u8{
-        group_prefix ++ routes.group_db_median_key_suffix,
-        table_prefix ++ routes.documents_marker ++ ":key",
-        internal_table_repair_cancel_state,
-    };
-    inline for (get_routes) |path| {
-        try server.get(path, handler);
-    }
-
-    const post_routes = [_][]const u8{
-        internal_table_prefix ++ routes.corrupt_embedding_artifact_suffix,
-        group_prefix ++ routes.shard_ops_observe_split_suffix,
-        group_prefix ++ routes.shard_ops_observe_merge_suffix,
-        group_prefix ++ routes.shard_ops_execute_suffix,
-        table_prefix ++ routes.documents_suffix,
-        table_prefix ++ routes.graph_expand_suffix,
-        table_prefix ++ routes.graph_hydrate_suffix,
-        table_prefix ++ routes.text_stats_suffix,
-        table_prefix ++ routes.join_job_state_suffix,
-        table_prefix ++ routes.join_finalize_suffix,
-        table_prefix ++ routes.join_rows_suffix,
-        table_prefix ++ routes.join_unmatched_suffix,
-        table_prefix ++ routes.join_partition_suffix,
-        table_prefix ++ routes.query_suffix,
-        table_prefix ++ routes.batch_suffix,
-        table_prefix ++ routes.txn_begin_suffix,
-        table_prefix ++ routes.txn_prepare_suffix,
-        table_prefix ++ routes.txn_resolve_suffix,
-        table_prefix ++ routes.txn_status_suffix,
-    };
-    inline for (post_routes) |path| {
-        try server.post(path, handler);
-    }
-}
-
-fn internalBridgeHandler(route_context: *StandaloneHttpContext, ctx: *httpx.Context) anyerror!httpx.Response {
-    const path = ctx.request.uri.path;
-    const routes = antfly.public_api.http_routes.Routes;
-    if (!std.mem.startsWith(u8, path, routes.internal_groups_prefix) and
-        routes.matchInternalTableCorruptEmbeddingArtifact(path) == null and
-        routes.matchInternalTableRepairCancelState(path) == null)
-    {
-        _ = ctx.status(404);
-        return ctx.text("not found");
-    }
-
-    const server = route_context.api_server orelse {
-        _ = ctx.status(503);
-        return ctx.text("not ready");
-    };
-    return AntflyApiHandler.executeLegacyInternalCompatibility(ctx, server);
-}
-
-fn legacyApiBridgeHandler(route_context: *StandaloneHttpContext, ctx: *httpx.Context) anyerror!httpx.Response {
-    const server = route_context.api_server orelse {
-        _ = ctx.status(503);
-        return ctx.text("not ready");
-    };
-
-    return AntflyApiHandler.executeLegacyCompatibility(ctx, server.executor());
 }
 
 // ---------------------------------------------------------------
@@ -5398,61 +5230,6 @@ test "standalone CORS middleware enforces dynamic configuration" {
     try std.testing.expectError(error.InvalidCorsHeader, validateCorsConfig(&unsafe_header));
 }
 
-test "standalone shared compatibility adapter preserves protocol headers and absent body" {
-    const alloc = std.testing.allocator;
-
-    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/mcp/v1/extensions/memoryaf");
-    defer request.deinit();
-    try request.setHeader("Mcp-Session-Id", "session-123");
-
-    var ctx = httpx.Context.init(alloc, undefined, &request);
-    defer ctx.deinit();
-
-    var converted = try AntflyApiHandler.httpRequestFromContext(&ctx, null);
-    defer converted.deinit();
-
-    try std.testing.expectEqualStrings("session-123", converted.value.header("mcp-session-id") orelse return error.MissingHeader);
-    try std.testing.expectEqualStrings("", converted.value.body);
-}
-
-test "standalone shared compatibility adapter releases converted request headers" {
-    const FakeSource = struct {
-        fn iface(_: *@This()) antfly.public_api.http_server.StatusSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{ .status = status },
-            };
-        }
-
-        fn status(_: *anyopaque) !antfly.metadata.MetadataStatus {
-            return .{ .metadata_group_id = 1, .metrics = .{} };
-        }
-    };
-
-    var source = FakeSource{};
-    var api_server = ApiHttpServer.init(
-        std.testing.allocator,
-        .{},
-        source.iface(),
-        null,
-        null,
-    );
-    defer api_server.deinit();
-
-    var route_context = StandaloneHttpContext{ .api_server = &api_server };
-
-    var request = try httpx.Request.init(std.testing.allocator, .GET, "http://127.0.0.1/mcp/v1");
-    defer request.deinit();
-    try request.setHeader("Mcp-Protocol-Version", "2025-06-18");
-
-    var ctx = httpx.Context.init(std.testing.allocator, undefined, &request);
-    defer ctx.deinit();
-
-    var response = try legacyApiBridgeHandler(&route_context, &ctx);
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 404), response.status.code);
-}
-
 test "standalone runtime local replica reconcile permit blocks only active startup catch-up" {
     var data_server = antfly.data.runtime.DataServer{
         .alloc = std.testing.allocator,
@@ -5484,162 +5261,6 @@ test "standalone runtime local replica reconcile permit blocks only active start
     data_server.provisioned_startup_catch_up_active.store(false, .monotonic);
     data_server.provisioned_startup_catch_up_dirty.store(false, .monotonic);
     try std.testing.expect(runLocalReplicaRootReconcilePermitHook(&data_server));
-}
-
-test "standalone runtime registers internal group routes explicitly" {
-    var server = RecordingServer{ .allocator = std.testing.allocator };
-    defer server.deinit();
-    var route_context = StandaloneHttpContext{ .api_server = null };
-
-    try registerInternalGroupRoutes(&server, &route_context);
-
-    const routes = antfly.public_api.http_routes.Routes;
-    const group_prefix = routes.internal_groups_prefix ++ ":group_id";
-    const table_prefix = group_prefix ++ "/tables/:table_name";
-    const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
-
-    try std.testing.expect(server.hasRoute(.get, group_prefix ++ routes.group_db_median_key_suffix));
-    try std.testing.expect(server.hasRoute(.get, table_prefix ++ routes.documents_marker ++ ":key"));
-    try std.testing.expect(server.hasRoute(.get, internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix));
-
-    try std.testing.expect(server.hasRoute(.post, internal_table_prefix ++ routes.corrupt_embedding_artifact_suffix));
-    try std.testing.expect(server.hasRoute(.post, group_prefix ++ routes.shard_ops_observe_split_suffix));
-    try std.testing.expect(server.hasRoute(.post, group_prefix ++ routes.shard_ops_observe_merge_suffix));
-    try std.testing.expect(server.hasRoute(.post, group_prefix ++ routes.shard_ops_execute_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.documents_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.graph_expand_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.graph_hydrate_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.text_stats_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.join_job_state_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.join_finalize_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.join_rows_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.join_unmatched_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.join_partition_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.query_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.batch_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_begin_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_prepare_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_resolve_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_status_suffix));
-}
-
-test "standalone runtime registers HA admin bridge routes before antfarm catch-all" {
-    var server = RecordingServer{ .allocator = std.testing.allocator };
-    defer server.deinit();
-    var route_context = StandaloneHttpContext{ .api_server = null };
-
-    try registerHAAdminRoutes(&server, &route_context);
-    try registerAntfarmRoutes(&server);
-
-    const ha_base = antfly.admin.routes.ha;
-    const ha_prefix = antfly.admin.routes.ha ++ "/*";
-    try std.testing.expect(server.hasRoute(.get, ha_base));
-    try std.testing.expect(server.hasRoute(.post, ha_base));
-    try std.testing.expect(server.hasRoute(.put, ha_base));
-    try std.testing.expect(server.hasRoute(.delete, ha_base));
-    try std.testing.expect(server.hasRoute(.get, ha_prefix));
-    try std.testing.expect(server.hasRoute(.post, ha_prefix));
-    try std.testing.expect(server.hasRoute(.put, ha_prefix));
-    try std.testing.expect(server.hasRoute(.delete, ha_prefix));
-    try std.testing.expect(server.hasRoute(.get, "/*"));
-}
-
-test "standalone runtime registers HA internal replication bridge routes before antfarm catch-all" {
-    var server = RecordingServer{ .allocator = std.testing.allocator };
-    defer server.deinit();
-    var route_context = StandaloneHttpContext{ .api_server = null };
-
-    try registerHAInternalRoutes(&server, &route_context);
-    try registerAntfarmRoutes(&server);
-
-    const ha_base = antfly.internal.routes.ha;
-    const ha_prefix = antfly.internal.routes.ha ++ "/*";
-    try std.testing.expect(server.hasRoute(.get, ha_base));
-    try std.testing.expect(server.hasRoute(.post, ha_base));
-    try std.testing.expect(server.hasRoute(.put, ha_base));
-    try std.testing.expect(server.hasRoute(.delete, ha_base));
-    try std.testing.expect(server.hasRoute(.get, ha_prefix));
-    try std.testing.expect(server.hasRoute(.post, ha_prefix));
-    try std.testing.expect(server.hasRoute(.put, ha_prefix));
-    try std.testing.expect(server.hasRoute(.delete, ha_prefix));
-    try std.testing.expect(server.hasRoute(.get, "/*"));
-}
-
-test "standalone runtime registers mcp routes before antfarm catch-all" {
-    var server = RecordingServer{ .allocator = std.testing.allocator };
-    defer server.deinit();
-    var route_context = StandaloneHttpContext{ .api_server = null };
-
-    try registerMcpRoutes(&server, &route_context);
-    try registerAntfarmRoutes(&server);
-
-    const routes = antfly.public_api.http_routes.Routes;
-    try std.testing.expect(server.hasRoute(.get, routes.mcp_v1));
-    try std.testing.expect(server.hasRoute(.post, routes.mcp_v1));
-    try std.testing.expect(server.hasRoute(.delete, routes.mcp_v1));
-    try std.testing.expect(server.hasRoute(.get, routes.mcp_v1_prefix ++ "*"));
-    try std.testing.expect(server.hasRoute(.post, routes.mcp_v1_prefix ++ "*"));
-    try std.testing.expect(server.hasRoute(.delete, routes.mcp_v1_prefix ++ "*"));
-    try std.testing.expect(server.hasRoute(.get, "/*"));
-}
-
-test "standalone runtime registers A2A routes before antfarm catch-all" {
-    const routes = antfly.public_api.http_routes.Routes;
-    var route_context = StandaloneHttpContext{ .api_server = null };
-
-    var disabled = RecordingServer{ .allocator = std.testing.allocator };
-    defer disabled.deinit();
-    try registerExperimentalRoutes(&disabled, &route_context, false);
-    try registerAntfarmRoutes(&disabled);
-    try std.testing.expect(!disabled.hasRoute(.post, routes.a2a));
-    try std.testing.expect(!disabled.hasRoute(.get, routes.agent_card));
-    try std.testing.expect(!disabled.hasRoute(.get, routes.agent_card_legacy));
-    try std.testing.expect(disabled.hasRoute(.get, "/*"));
-
-    var enabled = RecordingServer{ .allocator = std.testing.allocator };
-    defer enabled.deinit();
-    try registerExperimentalRoutes(&enabled, &route_context, true);
-    try registerAntfarmRoutes(&enabled);
-    try std.testing.expect(enabled.hasRoute(.post, routes.a2a));
-    try std.testing.expect(enabled.hasRoute(.get, routes.agent_card));
-    try std.testing.expect(enabled.hasRoute(.get, routes.agent_card_legacy));
-    try std.testing.expect(enabled.hasRoute(.get, "/*"));
-}
-
-test "standalone runtime registers ARD routes before antfarm catch-all" {
-    var server = RecordingServer{ .allocator = std.testing.allocator };
-    defer server.deinit();
-    var route_context = StandaloneHttpContext{ .api_server = null };
-
-    try registerArdRoutes(&server, &route_context);
-    try registerAntfarmRoutes(&server);
-
-    const routes = antfly.public_api.http_routes.Routes;
-    try std.testing.expect(server.hasRoute(.get, routes.ai_catalog));
-    try std.testing.expect(server.hasRoute(.get, routes.ard_v1));
-    try std.testing.expect(server.hasRoute(.get, routes.ard_v1 ++ "/*"));
-    try std.testing.expect(server.hasRoute(.post, routes.ard_v1_search));
-    try std.testing.expect(server.hasRoute(.post, routes.ard_v1_explore));
-    try std.testing.expect(server.hasRoute(.get, "/*"));
-}
-
-test "standalone runtime registers extension routes before antfarm catch-all" {
-    var server = RecordingServer{ .allocator = std.testing.allocator };
-    defer server.deinit();
-    var route_context = StandaloneHttpContext{ .api_server = null };
-
-    try registerExtensionRoutes(&server, &route_context);
-    try registerAntfarmRoutes(&server);
-
-    const routes = antfly.public_api.http_routes.Routes;
-    try std.testing.expect(server.hasRoute(.get, routes.extensions_v1));
-    try std.testing.expect(server.hasRoute(.get, routes.extensions_v1_packages));
-    try std.testing.expect(server.hasRoute(.get, routes.extensions_v1_packages_prefix ++ "*"));
-    try std.testing.expect(server.hasRoute(.get, routes.extensions_v1_installed));
-    try std.testing.expect(server.hasRoute(.get, routes.extensions_v1_installed_prefix ++ "*"));
-    try std.testing.expect(server.hasRoute(.post, routes.extensions_v1_installed_prefix ++ "*"));
-    try std.testing.expect(server.hasRoute(.put, routes.extensions_v1_installed_prefix ++ "*"));
-    try std.testing.expect(server.hasRoute(.get, "/*"));
 }
 
 test "standalone runtime registers antfarm static routes" {

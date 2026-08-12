@@ -27,7 +27,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 6;
+pub const abi_version: u32 = 7;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -140,7 +140,6 @@ pub const HandlerStats = extern struct {
 /// portion of the function table.
 pub const Capability = struct {
     pub const core: u64 = 1 << 0;
-    pub const legacy_http_dispatch: u64 = 1 << 1;
     pub const route_manifest: u64 = 1 << 3;
 };
 
@@ -157,8 +156,6 @@ pub const FunctionTable = extern struct {
     request_stats: *const fn (*const CallContext) callconv(.c) Status,
     set_provider: *const fn (*const CallContext) callconv(.c) Status,
     set_ha_executor: *const fn (*const CallContext) callconv(.c) Status,
-    executor: *const fn (*const CallContext) callconv(.c) Status,
-    streaming_executor: *const fn (*const CallContext) callconv(.c) Status,
     attach_runtime_restore_store: *const fn (*const CallContext) callconv(.c) Status,
     attach_replicated_restore_store: *const fn (u32, *anyopaque, *const anyopaque) callconv(.c) Status,
     resume_restore_jobs: *const fn (*const CallContext) callconv(.c) Status,
@@ -166,9 +163,8 @@ pub const FunctionTable = extern struct {
     prepare_restore_leadership: *const fn (*const CallContext) callconv(.c) Status,
     schedule_session_maintenance: *const fn (*const CallContext) callconv(.c) Status,
     storage_maintenance_active: *const fn (*const CallContext) callconv(.c) Status,
+    check_ready: *const fn (*const CallContext) callconv(.c) Status,
     authorize_inference: *const fn (*const AuthorizeInferenceContext) callconv(.c) Status,
-    handle: *const fn (*const CallContext) callconv(.c) Status,
-    handle_internal: *const fn (*const CallContext) callconv(.c) Status,
     handler_create: *const fn (*const HandlerCreateContext) callconv(.c) Status,
     handler_init: *const fn (*const CallContext) callconv(.c) Status,
     handler_stats: *const fn (*const CallContext) callconv(.c) Status,

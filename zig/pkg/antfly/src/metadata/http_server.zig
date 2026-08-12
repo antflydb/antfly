@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const httpx = @import("httpx");
 const group_ids = @import("../common/group_ids.zig");
 const metadata_api = @import("api.zig");
 const metadata_authority = @import("authority.zig");
@@ -1114,6 +1115,79 @@ pub const MetadataHttpServer = struct {
 
     pub fn deinit(self: *MetadataHttpServer) void {
         self.* = undefined;
+    }
+
+    /// Registers the metadata administration contract as concrete contextual
+    /// routes. Unknown paths are rejected by httpx and never enter the
+    /// metadata operation layer.
+    pub fn registerRoutes(self: *MetadataHttpServer, server: *httpx.Server) !void {
+        const handler = httpx.Handler.bind(self, contextualRoute);
+        const static_paths = [_][]const u8{
+            routes.Routes.health,
+            routes.Routes.head,
+            routes.Routes.status,
+            routes.Routes.admin_snapshot,
+            routes.Routes.active_transitions,
+            routes.Routes.internal_catalog_publication_check,
+            routes.Routes.internal_catalog_table_publication_check,
+            routes.Routes.internal_reallocate,
+            routes.Routes.internal_nodes,
+            routes.Routes.internal_schema_progress,
+            routes.Routes.internal_extension_restore,
+        };
+        inline for (static_paths) |path| try server.any(path, handler);
+
+        const dynamic_paths = [_][]const u8{
+            routes.Routes.table_ranges_prefix ++ ":table_id" ++ routes.Routes.table_ranges_suffix,
+            routes.Routes.group_placement_prefix ++ ":group_id" ++ routes.Routes.group_placement_suffix,
+            routes.Routes.internal_nodes_prefix ++ ":node_id",
+            routes.Routes.internal_nodes_prefix ++ ":node_id" ++ routes.Routes.internal_node_shutdown_suffix,
+            routes.Routes.internal_nodes_prefix ++ ":node_id" ++ routes.Routes.internal_node_status_suffix,
+            routes.Routes.internal_extensions_prefix ++ ":extension_name",
+            routes.Routes.internal_extensions_prefix ++ ":extension_name" ++ routes.Routes.internal_extension_update_suffix,
+            routes.Routes.internal_extensions_prefix ++ ":extension_name" ++ routes.Routes.internal_extension_drop_suffix,
+            routes.Routes.internal_extensions_prefix ++ ":extension_name" ++ routes.Routes.internal_extension_enable_suffix,
+            routes.Routes.internal_extensions_prefix ++ ":extension_name" ++ routes.Routes.internal_extension_disable_suffix,
+            routes.Routes.internal_extensions_prefix ++ ":extension_name" ++ routes.Routes.internal_extension_config_suffix,
+            routes.Routes.internal_tables_prefix ++ ":table_name",
+            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_restore_suffix,
+            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_definition_suffix,
+            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_schema_suffix,
+            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_indexes_infix ++ ":index_name",
+            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_enrichments_infix ++ ":enrichment_name",
+            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_replication_sources_infix ++ ":source_ordinal" ++ routes.Routes.internal_table_reseed_exact_cutover_suffix,
+            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_split_suffix,
+            routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_merge_suffix,
+        };
+        inline for (dynamic_paths) |path| try server.any(path, handler);
+    }
+
+    fn contextualRoute(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const method: http_common.Method = switch (ctx.request.method) {
+            .GET => .GET,
+            .POST => .POST,
+            .PUT => .PUT,
+            .DELETE => .DELETE,
+            else => return ctx.status(405).text("method not allowed"),
+        };
+        const headers = try ctx.allocator.alloc(http_common.RequestHeader, ctx.request.headers.entries.items.len);
+        defer ctx.allocator.free(headers);
+        for (ctx.request.headers.entries.items, 0..) |entry, index|
+            headers[index] = .{ .name = entry.name, .value = entry.value };
+        var response = try self.handleWithAllocator(ctx.allocator, .{
+            .method = method,
+            .uri = ctx.request.uri.raw,
+            .headers = headers,
+            .authorization = ctx.header("authorization"),
+            .content_type = ctx.header("content-type"),
+            .body = (try ctx.body()) orelse "",
+        });
+        defer response.deinit(ctx.allocator);
+        _ = ctx.status(response.status);
+        if (response.content_type) |content_type| try ctx.setHeader("content-type", content_type);
+        for (response.headers) |header| try ctx.setHeader(header.name, header.value);
+        _ = ctx.response.body(response.body);
+        return ctx.response.build();
     }
 
     pub fn handle(self: *MetadataHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {

@@ -176,18 +176,6 @@ pub fn setHAExecutor(context: *const CallContext) callconv(.c) abi.Status {
     return .ok;
 }
 
-pub fn executor(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(void, http_common.RequestExecutor, context)) |failure| return failure;
-    output(http_common.RequestExecutor, context).* = serverState(context).server.executor();
-    return .ok;
-}
-
-pub fn streamingExecutor(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(void, http_common.StreamingRequestExecutor, context)) |failure| return failure;
-    output(http_common.StreamingRequestExecutor, context).* = serverState(context).server.streamingExecutor();
-    return .ok;
-}
-
 pub fn attachRuntimeRestoreStore(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(backend_erased.Store, void, context)) |failure| return failure;
     serverState(context).server.attachRestoreJobRuntimeStore(@constCast(input(backend_erased.Store, context))) catch |err|
@@ -240,6 +228,12 @@ pub fn storageMaintenanceActive(context: *const CallContext) callconv(.c) abi.St
     return .ok;
 }
 
+pub fn checkReady(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, void, context)) |failure| return failure;
+    serverState(context).server.checkReady() catch |err| return fail(err);
+    return .ok;
+}
+
 pub fn authorizeInference(context: *const abi.AuthorizeInferenceContext) callconv(.c) abi.Status {
     if (validateContext(abi.AuthorizeInferenceContext, context.abi_version, context.struct_size)) |failure| return failure;
     const state: *ServerState = @ptrCast(@alignCast(context.handle));
@@ -247,20 +241,6 @@ pub fn authorizeInference(context: *const abi.AuthorizeInferenceContext) callcon
         .authorization = context.authorization.slice(),
         .trusted_principal = context.trusted_principal.slice(),
     }, context.permission) catch |err| return fail(err);
-    return .ok;
-}
-
-pub fn handle(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(http_common.HttpRequest, http_common.HttpResponse, context)) |failure| return failure;
-    output(http_common.HttpResponse, context).* = serverState(context).server.handle(input(http_common.HttpRequest, context).*) catch |err|
-        return fail(err);
-    return .ok;
-}
-
-pub fn handleInternal(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(http_common.HttpRequest, ?http_common.HttpResponse, context)) |failure| return failure;
-    output(?http_common.HttpResponse, context).* = serverState(context).server.handleInternalRoute(input(http_common.HttpRequest, context).*) catch |err|
-        return fail(err);
     return .ok;
 }
 
@@ -323,7 +303,7 @@ pub fn handlerRouteManifest(context: *const abi.RouteManifestContext) callconv(.
         const handler = &state.handler;
         var public_manifest = ManifestServer("/db/v1"){ .owner = state };
         var root_manifest = ManifestServer(""){ .owner = state };
-        handler.registerRouteSets(&public_manifest, &root_manifest) catch |err| {
+        handler.registerRouteSets(&public_manifest, &root_manifest, true, true) catch |err| {
             for (state.routes.items[routes_start..]) |route| state.alloc.destroy(route);
             state.routes.shrinkRetainingCapacity(routes_start);
             state.route_manifest.shrinkRetainingCapacity(manifest_start);
@@ -425,16 +405,12 @@ pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
 const function_table: abi.FunctionTable = .{
     .abi_version = abi.abi_version,
     .struct_size = @sizeOf(abi.FunctionTable),
-    .capabilities = abi.Capability.core |
-        abi.Capability.legacy_http_dispatch |
-        abi.Capability.route_manifest,
+    .capabilities = abi.Capability.core | abi.Capability.route_manifest,
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
     .set_provider = &setProvider,
     .set_ha_executor = &setHAExecutor,
-    .executor = &executor,
-    .streaming_executor = &streamingExecutor,
     .attach_runtime_restore_store = &attachRuntimeRestoreStore,
     .attach_replicated_restore_store = &attachReplicatedRestoreStore,
     .resume_restore_jobs = &resumeRestoreJobs,
@@ -442,9 +418,8 @@ const function_table: abi.FunctionTable = .{
     .prepare_restore_leadership = &prepareRestoreLeadership,
     .schedule_session_maintenance = &scheduleSessionMaintenance,
     .storage_maintenance_active = &storageMaintenanceActive,
+    .check_ready = &checkReady,
     .authorize_inference = &authorizeInference,
-    .handle = &handle,
-    .handle_internal = &handleInternal,
     .handler_create = &handlerCreate,
     .handler_init = &handlerInit,
     .handler_stats = &handlerStats,

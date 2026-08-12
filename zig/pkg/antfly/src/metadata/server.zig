@@ -29,7 +29,6 @@ const api_table_reads = @import("../api/table_reads.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
 const restore_jobs = @import("../api/restore_jobs.zig");
-const http_common = @import("../raft/transport/http_common.zig");
 const raft = @import("../raft/mod.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_managed_host = @import("../raft/managed_host.zig");
@@ -503,12 +502,8 @@ const MetadataAdminHttpRuntime = struct {
         try runtime.handler.initRuntime(alloc);
         runtime.listener_task = httpx.ListenerTask.init(&runtime.server);
         try runtime.server.use(httpx.Middleware.bind("metadata-authority", runtime, authorityMiddleware));
-        try runtime.handler.registerRoutes(&runtime.server);
-        try public_api_httpx_handler.registerLegacyCompatibilityRoutes(
-            &runtime.server,
-            httpx.Handler.bind(runtime, legacyAdminFallback),
-            .metadata_admin,
-        );
+        try runtime.handler.registerGeneratedRoutesWithProbes(&runtime.server);
+        try runtime.mux.admin.registerRoutes(&runtime.server);
         return runtime;
     }
 
@@ -566,10 +561,6 @@ const MetadataAdminHttpRuntime = struct {
         var response = try public_api_http_server.metadataNotLeaderResponse(ctx.allocator);
         return public_api_httpx_handler.AntflyApiHandler.respondWithAllocator(ctx, &response, ctx.allocator);
     }
-
-    fn legacyAdminFallback(self: *MetadataAdminHttpRuntime, ctx: *httpx.Context) anyerror!httpx.Response {
-        return public_api_httpx_handler.AntflyApiHandler.executeLegacyCompatibility(ctx, self.mux.executor());
-    }
 };
 
 const MetadataAdminMux = struct {
@@ -578,40 +569,6 @@ const MetadataAdminMux = struct {
     svc: *service.MetadataHttpService,
     restore_leadership_mutex: std.atomic.Mutex = .unlocked,
     restore_leadership_term: u64 = 0,
-
-    fn executor(self: *MetadataAdminMux) http_common.RequestExecutor {
-        return .{
-            .ptr = self,
-            .vtable = &.{ .execute = execute },
-        };
-    }
-
-    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-        const self: *MetadataAdminMux = @ptrCast(@alignCast(ptr));
-        if (isPublicApiRequest(req.uri)) {
-            if (isRestoreApiRequest(req.uri)) {
-                const local_leader = self.ensureRestoreLeadershipIfLocalLeader() catch |err| {
-                    if (metadata_authority.isRetryableError(err)) {
-                        return try public_api_http_server.metadataNotLeaderResponse(alloc);
-                    }
-                    return err;
-                };
-                // Mutations and collection reads stay leader-serialized. A
-                // follower can refresh one replicated job by key, but it has
-                // no linearizable snapshot for collection pagination.
-                if (!local_leader and (req.method != .GET or isRestoreJobCollectionRequest(req.uri)))
-                    return try public_api_http_server.metadataNotLeaderResponse(alloc);
-            }
-            var response = self.public_api.handle(req) catch |err| {
-                if (metadata_authority.isRetryableError(err))
-                    return try public_api_http_server.metadataNotLeaderResponse(alloc);
-                return err;
-            };
-            if (response.owner_allocator == null) response.owner_allocator = self.public_api.alloc;
-            return response;
-        }
-        return try self.admin.executor().execute(alloc, req);
-    }
 
     fn ensureRestoreLeadershipIfLocalLeader(self: *MetadataAdminMux) !bool {
         const term = self.svc.localMetadataLeadershipTerm() orelse {
@@ -627,12 +584,6 @@ const MetadataAdminMux = struct {
         try self.public_api.prepareRestoreLeadership(term);
         self.restore_leadership_term = term;
         return true;
-    }
-
-    fn isPublicApiRequest(uri: []const u8) bool {
-        return std.mem.eql(u8, uri, "/db/v1") or
-            std.mem.startsWith(u8, uri, "/db/v1/") or
-            std.mem.startsWith(u8, uri, "/db/v1?");
     }
 
     fn isRestoreApiRequest(uri: []const u8) bool {
@@ -1320,6 +1271,24 @@ test "metadata server can expose admin listener endpoints" {
     defer executor.deinit();
     var client = metadata_http_client.MetadataHttpClient.init(std.heap.page_allocator, executor.executor());
 
+    const healthz_uri = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/healthz", .{admin_base_uri});
+    defer std.heap.page_allocator.free(healthz_uri);
+    var healthz = try executor.executor().execute(std.heap.page_allocator, .{ .method = .GET, .uri = healthz_uri });
+    defer healthz.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 200), healthz.status);
+
+    const readyz_uri = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/readyz", .{admin_base_uri});
+    defer std.heap.page_allocator.free(readyz_uri);
+    var readyz = try executor.executor().execute(std.heap.page_allocator, .{ .method = .GET, .uri = readyz_uri });
+    defer readyz.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 200), readyz.status);
+
+    const mcp_uri = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/mcp/v1", .{admin_base_uri});
+    defer std.heap.page_allocator.free(mcp_uri);
+    var mcp = try executor.executor().execute(std.heap.page_allocator, .{ .method = .GET, .uri = mcp_uri });
+    defer mcp.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 404), mcp.status);
+
     const status = try client.fetchStatus(admin_base_uri);
     try std.testing.expectEqual(@as(u64, 1990), status.metadata_group_id);
 
@@ -1329,7 +1298,7 @@ test "metadata server can expose admin listener endpoints" {
     try std.testing.expectEqualStrings("docs", snapshot.value.tables[0].name);
 }
 
-test "metadata admin mux maps admin not leader through metadata executor" {
+test "metadata admin maps retryable authority loss to service unavailable" {
     const FakeSource = struct {
         fn iface(self: *@This()) metadata_http_server.AdminSource {
             return .{
@@ -1370,23 +1339,20 @@ test "metadata admin mux maps admin not leader through metadata executor" {
 
     var source = FakeSource{};
     var admin = metadata_http_server.MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
-    var mux = MetadataAdminMux{
-        .admin = &admin,
-        .public_api = undefined,
-        .svc = undefined,
-    };
-
-    var response = try mux.executor().execute(std.testing.allocator, .{
+    var response = admin.handle(.{
         .method = .POST,
         .uri = "/internal/v1/reallocate",
-    });
+    }) catch |err| if (metadata_authority.isRetryableError(err))
+        try public_api_http_server.metadataNotLeaderResponse(std.testing.allocator)
+    else
+        return err;
     defer response.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 503), response.status);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "metadata leader unavailable") != null);
 }
 
-test "metadata admin mux routes public db v1 requests through public api server" {
+test "metadata public api server carries auth and restore configuration" {
     const raft_engine = @import("raft_engine");
 
     const Factory = struct {
@@ -1482,33 +1448,9 @@ test "metadata admin mux routes public db v1 requests through public api server"
     try std.testing.expect(server.owned_admin_mux != null);
     try std.testing.expect(server.owned_public_http_server.?.cfg.auth_enabled);
     try std.testing.expectEqualStrings("shared-secret", server.owned_public_http_server.?.cfg.trusted_principal_secret.?);
-    try std.testing.expect(MetadataAdminMux.isPublicApiRequest("/db/v1/status"));
-
-    var response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
-        .method = .GET,
-        .uri = "/db/v1/status",
-    });
-    defer response.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 401), response.status);
 
     try std.testing.expectError(
         error.NotLeader,
         metadataRestoreJobGet(server.svc, std.testing.allocator, "\x00\x00__api_restore_jobs__:0000000000000001"),
     );
-
-    var list_response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
-        .method = .GET,
-        .uri = "/db/v1/restore/jobs",
-    });
-    defer list_response.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 503), list_response.status);
-
-    // Point reads may proceed to authorization on a follower because the
-    // replicated persistence adapter refreshes the requested key directly.
-    var item_response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
-        .method = .GET,
-        .uri = "/db/v1/restore/jobs/1",
-    });
-    defer item_response.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 401), item_response.status);
 }

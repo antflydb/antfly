@@ -66,73 +66,6 @@ const routes = @import("http_routes.zig").Routes;
 const admin_routes = @import("../admin/routes.zig");
 const internal_routes = @import("../internal/routes.zig");
 
-/// Temporary, explicit ownership boundaries for route families that still
-/// cross the legacy request/response adapter. Keeping these paths in one
-/// manifest prevents native listeners from using an unbounded global fallback
-/// and makes each remaining migration target mechanically discoverable.
-pub const LegacyCompatibilitySurface = enum {
-    data_public,
-    metadata_admin,
-};
-
-pub const data_public_legacy_paths = [_][]const u8{
-    routes.healthz,
-    routes.readyz,
-    routes.status,
-    routes.cluster,
-    routes.connections,
-    routes.secrets,
-    routes.secrets_prefix ++ "*",
-    routes.eval,
-    routes.agents_query_builder,
-    routes.agents_retrieval,
-    routes.agents_v1_extensions_prefix ++ "*",
-    routes.mcp_v1,
-    routes.mcp_v1_prefix ++ "*",
-    routes.a2a,
-    routes.ai_catalog,
-    routes.agent_card,
-    routes.agent_card_legacy,
-    routes.ard_v1,
-    routes.ard_v1 ++ "/*",
-    routes.extensions_v1,
-    routes.extensions_v1 ++ "/*",
-    routes.backup,
-    routes.backups,
-    routes.restore,
-    routes.restore ++ "/*",
-    routes.tables,
-    routes.tables_prefix ++ "*",
-    routes.transactions,
-    routes.transactions_prefix ++ "*",
-    admin_routes.base,
-    admin_routes.base ++ "/*",
-    internal_routes.base,
-    internal_routes.base ++ "/*",
-};
-
-pub const metadata_admin_legacy_paths = [_][]const u8{
-    "/metadata/v1",
-    "/metadata/v1/*",
-    internal_routes.base,
-    internal_routes.base ++ "/*",
-};
-
-/// Registers every standard HTTP method so a request within an owned legacy
-/// namespace reaches the compatibility adapter and receives its established
-/// 404/405 behavior. Requests outside this manifest use httpx's native 404.
-pub fn registerLegacyCompatibilityRoutes(
-    server: anytype,
-    handler: anytype,
-    surface: LegacyCompatibilitySurface,
-) !void {
-    const paths: []const []const u8 = switch (surface) {
-        .data_public => &data_public_legacy_paths,
-        .metadata_admin => &metadata_admin_legacy_paths,
-    };
-    for (paths) |path| try server.any(path, handler);
-}
-
 const ParsedGlobalQueryTable = struct {
     parsed: std.json.Parsed(metadata_openapi.QueryRequest),
     table_name: []const u8,
@@ -256,18 +189,148 @@ pub const AntflyApiHandler = struct {
     /// instance. Runtime roles call this common registrar instead of carrying
     /// their own duplicate route arrays or active-handler globals.
     pub fn registerRoutes(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        return self.registerRoutesWithOptions(server, true, true);
+    }
+
+    /// Standalone owns a stronger readiness contract than the shared API
+    /// kernel (listener publication, maintenance admission, and initialized
+    /// API state), so it supplies the two root probe handlers itself.
+    pub fn registerRoutesWithoutProbes(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        return self.registerRoutesWithOptions(server, true, false);
+    }
+
+    /// Metadata owns a distinct administration surface and must not expose
+    /// data-node protocol or internal-group routes on its admin listener.
+    pub fn registerGeneratedRoutesWithProbes(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        return self.registerRoutesWithOptions(server, false, true);
+    }
+
+    fn registerRoutesWithOptions(
+        self: *AntflyApiHandler,
+        server: *httpx.Server,
+        include_contextual: bool,
+        include_probes: bool,
+    ) !void {
         var prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = server };
-        try self.registerRouteSets(&prefixed, server);
+        try self.registerRouteSets(&prefixed, server, include_contextual, include_probes);
     }
 
     /// One generated route manifest shared by native servers and the linked
     /// kernel registrar boundary. `public_server` already represents the
     /// `/db/v1` namespace; `root_server` owns root-level APIs such as auth.
-    pub fn registerRouteSets(self: *AntflyApiHandler, public_server: anytype, root_server: anytype) !void {
+    pub fn registerRouteSets(
+        self: *AntflyApiHandler,
+        public_server: anytype,
+        root_server: anytype,
+        include_contextual: bool,
+        include_probes: bool,
+    ) !void {
         const metadata_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(self);
         try metadata_router.register(public_server);
         const usermgr_router = usermgr_openapi.server.ServerRouter(AntflyApiHandler).init(self);
         try usermgr_router.register(root_server);
+        if (include_contextual) {
+            try self.registerContextualRoutes(root_server, include_probes);
+        } else if (include_probes) {
+            const handler = httpx.Handler.bind(self, contextualRoute);
+            try root_server.get(routes.healthz, handler);
+            try root_server.get(routes.readyz, handler);
+        }
+    }
+
+    /// Hand-written protocol, operational, administrative, and internal
+    /// routes share this registrar in every runtime role. The generated data
+    /// API remains available only below `/db/v1`; historical root aliases are
+    /// intentionally not registered.
+    fn registerContextualRoutes(self: *AntflyApiHandler, server: anytype, include_probes: bool) !void {
+        const handler = httpx.Handler.bind(self, contextualRoute);
+
+        if (include_probes) {
+            try server.get(routes.healthz, handler);
+            try server.get(routes.readyz, handler);
+        }
+
+        const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*" };
+        inline for (mcp_paths) |path| {
+            try server.get(path, handler);
+            try server.post(path, handler);
+            try server.delete(path, handler);
+        }
+        if (self.api_server.cfg.experimental) {
+            try server.post(routes.a2a, handler);
+            try server.get(routes.agent_card, handler);
+            try server.get(routes.agent_card_legacy, handler);
+        }
+
+        try server.get(routes.ai_catalog, handler);
+        try server.get(routes.ard_v1, handler);
+        try server.get(routes.ard_v1 ++ "/*", handler);
+        try server.post(routes.ard_v1_search, handler);
+        try server.post(routes.ard_v1_explore, handler);
+
+        const extension_paths = [_][]const u8{
+            routes.extensions_v1,
+            routes.extensions_v1_packages,
+            routes.extensions_v1_packages_prefix ++ "*",
+            routes.extensions_v1_installed,
+            routes.extensions_v1_installed_prefix ++ "*",
+            routes.agents_v1_extensions_prefix ++ "*",
+        };
+        inline for (extension_paths) |path| {
+            try server.get(path, handler);
+            try server.post(path, handler);
+            try server.put(path, handler);
+        }
+
+        const ha_admin_paths = [_][]const u8{ admin_routes.ha, admin_routes.ha ++ "/*" };
+        inline for (ha_admin_paths) |path| {
+            try server.get(path, handler);
+            try server.post(path, handler);
+            try server.put(path, handler);
+            try server.delete(path, handler);
+        }
+        try server.post(admin_routes.maintenance_check, handler);
+        try server.post(admin_routes.maintenance_compact, handler);
+        try server.post(admin_routes.maintenance_vacuum, handler);
+        try server.get(admin_routes.maintenance_jobs_prefix ++ "*", handler);
+        try server.delete(admin_routes.maintenance_jobs_prefix ++ "*", handler);
+
+        const ha_internal_paths = [_][]const u8{ internal_routes.ha, internal_routes.ha ++ "/*" };
+        inline for (ha_internal_paths) |path| {
+            try server.get(path, handler);
+            try server.post(path, handler);
+            try server.put(path, handler);
+            try server.delete(path, handler);
+        }
+
+        const group_prefix = routes.internal_groups_prefix ++ ":group_id";
+        const table_prefix = group_prefix ++ "/tables/:table_name";
+        const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
+        try server.get(group_prefix ++ routes.group_db_median_key_suffix, handler);
+        try server.get(table_prefix ++ routes.documents_marker ++ ":key", handler);
+        try server.get(internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix, handler);
+        const internal_posts = [_][]const u8{
+            internal_table_prefix ++ routes.corrupt_embedding_artifact_suffix,
+            group_prefix ++ routes.shard_ops_observe_split_suffix,
+            group_prefix ++ routes.shard_ops_observe_merge_suffix,
+            group_prefix ++ routes.shard_ops_execute_suffix,
+            table_prefix ++ routes.documents_suffix,
+            table_prefix ++ routes.graph_expand_suffix,
+            table_prefix ++ routes.graph_hydrate_suffix,
+            table_prefix ++ routes.text_stats_suffix,
+            table_prefix ++ routes.join_job_state_suffix,
+            table_prefix ++ routes.join_finalize_suffix,
+            table_prefix ++ routes.join_rows_suffix,
+            table_prefix ++ routes.join_unmatched_suffix,
+            table_prefix ++ routes.join_partition_suffix,
+            table_prefix ++ routes.query_suffix,
+            table_prefix ++ routes.batch_suffix,
+            table_prefix ++ routes.txn_begin_suffix,
+            table_prefix ++ routes.txn_prepare_suffix,
+            table_prefix ++ routes.txn_resolve_suffix,
+            table_prefix ++ routes.txn_status_suffix,
+        };
+        inline for (internal_posts) |path| try server.post(path, handler);
     }
 
     pub fn deinitRuntime(self: *AntflyApiHandler) void {
@@ -446,7 +509,7 @@ pub const AntflyApiHandler = struct {
         return respondApiResponseBody(ctx, resp.status, resp.body);
     }
 
-    pub const ConvertedHttpRequest = struct {
+    const ContextOperationRequest = struct {
         value: http_common.HttpRequest,
         alloc: std.mem.Allocator,
 
@@ -456,7 +519,7 @@ pub const AntflyApiHandler = struct {
         }
     };
 
-    pub fn httpRequestFromContext(ctx: *httpx.Context, body_data_opt: ?[]const u8) !ConvertedHttpRequest {
+    fn operationRequestFromContext(ctx: *httpx.Context, body_data_opt: ?[]const u8) !ContextOperationRequest {
         const method: http_common.Method = switch (ctx.request.method) {
             .GET => .GET,
             .POST => .POST,
@@ -485,15 +548,8 @@ pub const AntflyApiHandler = struct {
         };
     }
 
-    /// One deletion-scoped adapter for route families that have not yet been
-    /// extracted into typed kernel operations. Keeping conversion here avoids
-    /// independent fallback handlers drifting on headers, body ownership, and
-    /// response allocator selection while those routes migrate.
-    pub fn executeLegacyCompatibility(
-        ctx: *httpx.Context,
-        executor: http_common.RequestExecutor,
-    ) !httpx.Response {
-        var request = httpRequestFromContext(ctx, null) catch |err| switch (err) {
+    fn contextualRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var request = operationRequestFromContext(ctx, null) catch |err| switch (err) {
             error.UnsupportedMethod => {
                 _ = ctx.status(405);
                 return ctx.text("method not allowed");
@@ -501,32 +557,9 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         defer request.deinit();
-        var response = try executor.execute(ctx.allocator, request.value);
-        const response_alloc = response.owner_allocator orelse ctx.allocator;
+        var response = try self.api_server.handle(request.value);
+        const response_alloc = response.owner_allocator orelse self.api_server.alloc;
         return respondWithAllocator(ctx, &response, response_alloc);
-    }
-
-    /// Compatibility adapter for the legacy internal dispatcher, whose null
-    /// result distinguishes an unowned route from an application response.
-    /// This remains centralized with the public adapter so standalone cannot
-    /// grow an independent request conversion or allocator policy.
-    pub fn executeLegacyInternalCompatibility(
-        ctx: *httpx.Context,
-        api_server: anytype,
-    ) !httpx.Response {
-        var request = httpRequestFromContext(ctx, null) catch |err| switch (err) {
-            error.UnsupportedMethod => {
-                _ = ctx.status(405);
-                return ctx.text("method not allowed");
-            },
-            else => return err,
-        };
-        defer request.deinit();
-        var response = (try api_server.handleInternalRoute(request.value)) orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        };
-        return respondWithAllocator(ctx, &response, api_server.alloc);
     }
 
     // ---------------------------------------------------------------
@@ -1096,7 +1129,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = httpRequestFromContext(ctx, "") catch {
+        var converted_req = operationRequestFromContext(ctx, "") catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
@@ -1136,7 +1169,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = operationRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
@@ -1191,7 +1224,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = operationRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
@@ -1313,7 +1346,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = operationRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
@@ -1371,7 +1404,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = operationRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
@@ -1421,7 +1454,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid savepoint id");
         };
-        var converted_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = operationRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
@@ -1467,7 +1500,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = operationRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
@@ -1789,7 +1822,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = operationRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
@@ -3800,51 +3833,6 @@ pub const AntflyApiHandler = struct {
     }
 };
 
-test "legacy compatibility routes are explicit and exclude generated namespaces" {
-    const RecordingServer = struct {
-        paths: [64][]const u8 = undefined,
-        len: usize = 0,
-
-        fn any(self: *@This(), path: []const u8, _: anytype) !void {
-            self.paths[self.len] = path;
-            self.len += 1;
-        }
-
-        fn hasPath(self: *const @This(), expected: []const u8) bool {
-            for (self.paths[0..self.len]) |path| {
-                if (std.mem.eql(u8, path, expected)) return true;
-            }
-            return false;
-        }
-    };
-
-    var data = RecordingServer{};
-    try registerLegacyCompatibilityRoutes(&data, {}, .data_public);
-    for (data.paths[0..data.len], 0..) |path, index| {
-        for (data.paths[index + 1 .. data.len]) |other|
-            try std.testing.expect(!std.mem.eql(u8, path, other));
-    }
-    try std.testing.expect(data.hasPath(routes.healthz));
-    try std.testing.expect(data.hasPath(routes.tables_prefix ++ "*"));
-    try std.testing.expect(data.hasPath(admin_routes.base ++ "/*"));
-    try std.testing.expect(data.hasPath(internal_routes.base ++ "/*"));
-    try std.testing.expect(!data.hasPath("/db/v1"));
-    try std.testing.expect(!data.hasPath("/db/v1/*"));
-    try std.testing.expect(!data.hasPath("/auth/v1"));
-    try std.testing.expect(!data.hasPath("/*"));
-
-    var metadata = RecordingServer{};
-    try registerLegacyCompatibilityRoutes(&metadata, {}, .metadata_admin);
-    for (metadata.paths[0..metadata.len], 0..) |path, index| {
-        for (metadata.paths[index + 1 .. metadata.len]) |other|
-            try std.testing.expect(!std.mem.eql(u8, path, other));
-    }
-    try std.testing.expect(metadata.hasPath("/metadata/v1/*"));
-    try std.testing.expect(metadata.hasPath(internal_routes.base ++ "/*"));
-    try std.testing.expect(!metadata.hasPath("/db/v1/*"));
-    try std.testing.expect(!metadata.hasPath("/*"));
-}
-
 fn sleepNs(duration_ns: u64) void {
     var req = std.posix.timespec{
         .sec = @intCast(duration_ns / std.time.ns_per_s),
@@ -4541,7 +4529,7 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
     try std.testing.expectEqual(@as(usize, 2), writes.acknowledge_calls);
 }
 
-test "httpx internal request conversion preserves protocol headers" {
+test "httpx contextual request conversion preserves protocol headers" {
     const alloc = std.testing.allocator;
 
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/mcp/v1/extensions/memoryaf");
@@ -4552,12 +4540,46 @@ test "httpx internal request conversion preserves protocol headers" {
     var ctx = httpx.Context.init(alloc, undefined, &request);
     defer ctx.deinit();
 
-    var converted = try AntflyApiHandler.httpRequestFromContext(&ctx, "{}");
+    var converted = try AntflyApiHandler.operationRequestFromContext(&ctx, "{}");
     defer converted.deinit();
 
     try std.testing.expectEqualStrings("session-123", converted.value.header("mcp-session-id") orelse return error.MissingHeader);
     try std.testing.expectEqualStrings("application/json", converted.value.content_type orelse return error.MissingContentType);
     try std.testing.expectEqualStrings("{}", converted.value.body);
+}
+
+test "httpx shared registrar keeps root probes and rejects removed data aliases" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer api_server.deinit();
+
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+
+    inline for (.{ "/healthz", "/readyz" }) |path| {
+        const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, path });
+        defer alloc.free(url);
+        var response = try getWithRetry(&client, client_io.io(), url, null, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    }
+
+    inline for (.{ "/status", "/tables", "/secrets", "/transactions", "/backup", "/restore" }) |path| {
+        const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, path });
+        defer alloc.free(url);
+        var response = try getWithRetry(&client, client_io.io(), url, null, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 404), response.status.code);
+    }
 }
 
 test "httpx owned response preserves retryable JSON metadata" {

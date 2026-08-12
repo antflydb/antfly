@@ -2814,6 +2814,12 @@ pub const ApiHttpServer = struct {
         return coordinator.isExclusiveActive();
     }
 
+    /// Transport-neutral readiness operation used by root probe adapters in
+    /// both direct and independently linked runtimes.
+    pub fn checkReady(self: *ApiHttpServer) !void {
+        _ = try self.source.status();
+    }
+
     fn localTableRuntimeStatuses(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -3677,17 +3683,10 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn handleInternalRoute(self: *ApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        const uri_parts = splitTarget(req.uri);
-        if (!std.mem.startsWith(u8, uri_parts.path, routes.Routes.internal_groups_prefix) and
-            routes.Routes.matchInternalTableCorruptEmbeddingArtifact(uri_parts.path) == null and
-            routes.Routes.matchInternalTableRepairCancelState(uri_parts.path) == null)
-        {
-            return null;
-        }
-        return try http_internal_routes.handle(self.internalRoutesContext(uri_parts), req);
-    }
-
+    /// Executes one explicitly registered non-OpenAPI route. Runtime roles
+    /// reach this only through AntflyApiHandler's contextual route manifest;
+    /// unprefixed aliases for generated `/db/v1` operations are never
+    /// registered and therefore cannot enter this operation surface.
     pub fn handle(self: *ApiHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
         self.recordHandledRequest();
         const raw_path = rawPathOnly(req.uri);
@@ -3699,7 +3698,7 @@ pub const ApiHttpServer = struct {
             return try jsonResponse(self.alloc, .{ .status = "ok" });
         }
         if (req.method == .GET and std.mem.eql(u8, raw_path, routes.Routes.readyz)) {
-            _ = self.source.status() catch {
+            self.checkReady() catch {
                 return try jsonResponseWithStatus(self.alloc, 503, .{ .status = "not_ready" });
             };
             return try jsonResponse(self.alloc, .{ .status = "ready" });
@@ -27419,17 +27418,17 @@ test "api http server keeps session maintenance off internal request paths" {
     defer parsed_begin.deinit();
     _ = try distributed_txn.parseTxnIdHex(parsed_begin.value.transaction_id);
     owner.last_session_lease_renew_ns.store(0, .release);
-    var internal_resp = (try owner.handleInternalRoute(.{
+    var internal_resp = try owner.handle(.{
         .method = .GET,
         .uri = "/internal/v1/groups/7/db/median-key",
         .body = "",
-    })).?;
+    });
     defer internal_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 404), internal_resp.status);
     try std.testing.expectEqual(@as(u64, 0), owner.last_session_lease_renew_ns.load(.acquire));
 }
 
-test "api http server handleInternalRoute matches handle for internal group lookups" {
+test "api http server contextual operation handles internal group lookups" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
@@ -27522,18 +27521,12 @@ test "api http server handleInternalRoute matches handle for internal group look
         .uri = "/internal/v1/groups/7/tables/docs/documents/doc:a?fields=title",
     };
 
-    var via_handle = try server.handle(req);
-    defer via_handle.deinit(alloc);
-    var via_internal = (try server.handleInternalRoute(req)).?;
-    defer via_internal.deinit(alloc);
+    var response = try server.handle(req);
+    defer response.deinit(alloc);
 
-    try std.testing.expectEqual(via_handle.status, via_internal.status);
-    try std.testing.expectEqualStrings(via_handle.content_type.?, via_internal.content_type.?);
-    try std.testing.expectEqualStrings(via_handle.body, via_internal.body);
-    try std.testing.expectEqual(@as(usize, 1), via_handle.headers.len);
-    try std.testing.expectEqual(@as(usize, 1), via_internal.headers.len);
-    try std.testing.expectEqualStrings(via_handle.headers[0].name, via_internal.headers[0].name);
-    try std.testing.expectEqualStrings(via_handle.headers[0].value, via_internal.headers[0].value);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqualStrings("application/json", response.content_type.?);
+    try std.testing.expectEqual(@as(usize, 1), response.headers.len);
 }
 
 test "api http server preserves public query availability errors" {

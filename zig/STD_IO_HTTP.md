@@ -280,18 +280,17 @@ stopping and awaiting its tasks before releasing the lease.
 
 ### Data and metadata
 
-Data and metadata should move their public and admin APIs from
-`StdHttpListener` to the common `httpx.Server` lifecycle and borrow the API
-executor from `BackendRuntime`. The public migration should not depend on a
-large structured-concurrency retrofit of the listener that is being retired.
-Only safety fixes needed by its remaining temporary consumers should be made to
-the legacy listener.
+Data and metadata public and admin APIs use the common `httpx.Server` lifecycle
+and borrow the API executor from `BackendRuntime`. This migration does not
+depend on a large structured-concurrency retrofit of `StdHttpListener`; that
+listener remains only for explicitly internal consumers that have not yet
+migrated.
 
 Their public, admin, health, and Raft listeners must all participate in the
 same process supervisor and shutdown deadline. Existing background threads
 should be migrated separately based on their semantics rather than folded into
-the public HTTP transport change. Raft or other internal users may retain the
-legacy listener temporarily behind an explicit compatibility boundary.
+the public HTTP transport change. Raft or other internal users may retain an
+internal-only listener temporarily behind an explicit compatibility boundary.
 
 ### Standalone
 
@@ -301,8 +300,8 @@ listener Future and must await it before destroying the API adapter, API
 kernel, inference provider, data server, or backend runtime.
 
 Standalone's protocol, internal, HA, maintenance, ARD, MCP, extension, and
-other routes should use contextual route registrars. They must not convert an
-`httpx.Context` back into a legacy request and dispatch through a global active
+other routes use the same contextual registrar as data. The remaining adapter
+must be replaced with typed operations; it must not regress to a global active
 API server. Standalone-specific termination and active-server globals should be
 replaced with supervisor-owned cancellation and explicit route context.
 
@@ -555,26 +554,47 @@ every operation through a fully materialized byte slice.
 
 ## Legacy public HTTP removal
 
-The migration boundary is guarded in code, not only by convention. A shared
-manifest names every data-public and metadata-admin path family still allowed
-to invoke legacy dispatch. Generated `/db/v1` and `/auth/v1` namespaces are
-excluded, duplicate manifest entries fail tests, and neither listener installs
-a global fallback. Adding a compatibility route therefore requires an explicit
-reviewable manifest change. Removing a family means registering its contextual
-or generated `httpx` adapter first, deleting it from the manifest, and deleting
-the corresponding legacy dispatch branch once all in-process callers use the
-typed operation.
+Historical root aliases are not part of the target contract. `/tables`,
+`/secrets`, `/transactions`, `/backup`, `/restore`, `/status`, and similar data
+routes are removed rather than registered as compatibility aliases. Generated
+data routes are canonical only below `/db/v1`; generated authentication routes
+remain below `/auth/v1`.
 
-The current residual families are operational aliases, secrets and agents,
-MCP/A2A/ARD, extensions, backup/restore, tables and transactions, admin and
-internal data routes, plus metadata `/metadata/v1` and `/internal/v1` routes.
-This inventory is temporary and may only shrink; new public APIs must enter
-through generated or contextual `httpx` registration.
+The two Kubernetes probes are deliberately not namespaced. Every runtime serves
+exactly `/healthz` and `/readyz` at the root. A runtime may provide a stricter
+readiness operation than the common data implementation—for example standalone
+also checks API initialization and exclusive storage maintenance—but it must not
+move the probe or add a prefixed alias. Linked standalone calls the typed
+`check_ready` kernel operation instead of restoring a generic HTTP-dispatch ABI
+just to implement its probe.
 
-After route migration, remove:
+The first cutover removes both global fallback layers and the public legacy
+dispatch ABI. Data, standalone, and metadata listeners install concrete
+generated or contextual `httpx` routes. The API-kernel ABI no longer advertises
+`legacy_http_dispatch` and no longer exports request-executor, streaming-
+executor, generic-handle, or internal-handle function-table entries. Unknown
+and removed alias paths are rejected by the router before application code.
 
-- `ApiHttpServer.handle()` and `handleInternalRoute()`
-- The manual method/path dispatcher
+That boundary cleanup must not be confused with completion of the operation
+extraction. The remaining contextual adapters must be reduced in this order:
+
+1. Give MCP, A2A, ARD, extensions, HA, storage maintenance, health, and
+   readiness shared contextual registrars, with runtime-specific dependencies
+   supplied explicitly.
+2. Split metadata administration into typed operations and bind each concrete
+   route directly to its operation; remove the method/path dispatcher.
+3. Convert internal group and table modules to typed inputs and results, then
+   adapt their real internal HTTP routes at the edge.
+4. Replace MCP, A2A, and extension-host calls that construct an `HttpRequest`
+   with direct calls to the same table, query, batch, backup, restore, and agent
+   operations used by public handlers.
+5. Delete the residual contextual request/response conversion and manual data
+   dispatcher once the last route and in-process caller uses typed operations.
+
+At completion, remove:
+
+- The residual `ApiHttpServer.handle()` adapter
+- The manual method/path dispatcher behind that adapter
 - Business logic in the current `AntflyApiHandler`, replacing it with a thin
   generated transport adapter
 - Public `RequestExecutor` and `StreamingRequestExecutor` adapters
@@ -590,6 +610,14 @@ After route migration, remove:
 The underlying kernel state and extracted operations remain. Legacy transport
 types may be deleted only after Raft and any other internal consumers either
 migrate or adopt an explicitly supported internal-only compatibility module.
+
+Migration enforcement belongs in ordinary Zig behavior and invariant tests,
+not in a checked-in source-scanning shell script or an extra build dependency.
+The `httpx` router rejects duplicate method-and-route-shape registration (even
+when duplicate parameter names differ), wire tests assert that root probes
+remain and removed aliases return 404, and ABI tests
+validate the supported function-table prefix. These gates test actual behavior
+and types while avoiding a fragile list of forbidden source spellings.
 
 The removal is complete when every public wire operation has exactly one kernel
 implementation, every runtime serves it through `httpx`, no generated or
@@ -703,37 +731,38 @@ HTTP and kernel migration tests should also cover:
 - A generated inventory proving every OpenAPI operation is registered exactly
   once
 - Route precedence and absence of accidental catch-all shadowing
-- Legacy-versus-`httpx` wire parity while both implementations coexist
+- Canonical `/db/v1` behavior and explicit 404 coverage for removed root aliases
 - Status, headers, content type, and body parity for success and error cases
 - Malformed parameters and bodies, authentication, authorization, and overload
 - Buffered and streaming response parity
 - Direct kernel tests without an HTTP server
 - Multiple simultaneous server instances with independent handler context
-- API-kernel route-manifest and dispatch ABI compatibility
+- API-kernel route-manifest ABI compatibility
 
 The CI matrix should include sanitizer and stress coverage, supported operating
 systems and architectures, and the real ARM64 `ReleaseFast` linked build. The
 linked-runtime bridge needs both ABI-focused tests and an executable smoke test;
 a host Debug build alone does not validate the original compiler-memory issue.
 
-## Migration order
+## Remaining migration order
 
 1. Define common lifecycle states, shutdown deadlines, supervisor failure
    propagation, `RequestContext`, `ApiError`, and typed operation results.
-2. Add contextual handlers to `httpx`; regenerate routers without
+2. Keep contextual handlers on `httpx`; regenerate routers without
    `active_impl` globals.
 3. Make the `httpx.Server` listener an owned Future on the appropriate executor
    lane, with an owned connection Group and deterministic shutdown.
 4. Extract one vertical route family at a time into transport-independent
-   `ApiKernel` operations. Run legacy and `httpx` wire-parity tests during this
-   phase.
+   `ApiKernel` operations. Run canonical wire-contract and direct-operation
+   parity tests during this phase.
 5. Move internal, HA, protocol, extension, and maintenance routes to explicit
    contextual registrars and typed operations.
-6. Move data and metadata public and admin listeners to `httpx.Server`.
-7. Move health listeners to `httpx` on a control or reserved API lane.
-8. Move standalone's unified listener to `BackendRuntime`'s API lane and delete
-   its legacy bridge handlers and active-server global.
-9. Remove the legacy public dispatcher, public executors, request/response
+6. Preserve data and metadata public and admin listeners on `httpx.Server` while
+   removing their residual transport conversions.
+7. Keep `/healthz` and `/readyz` at the root on a control or reserved API lane.
+8. Move standalone's unified listener to `BackendRuntime`'s API lane; its
+   duplicated bridge handlers are already removed.
+9. Remove the residual public dispatcher, public executors, request/response
    conversions, duplicated handler logic, and public `StdHttpListener` use.
 10. Replace the embedded inference server's detached thread with an owned
     Future.
