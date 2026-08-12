@@ -97,11 +97,10 @@ that end state:
   concrete `httpx` routes over typed shard operations. Route-group invariants,
   local-leader projection, and operational error classification now live below
   the transport; their former method/path dispatcher branches are gone.
-- The temporary internal compatibility registrar now enumerates every
-  remaining canonical internal read and retrieval-agent route. This preserves
-  reachability during
-  extraction without a global fallback or any legacy public alias; router
-  registration still rejects duplicate route shapes.
+- The temporary internal compatibility registrar now enumerates only the
+  remaining artifact-management and retrieval-agent routes. This preserves
+  reachability during extraction without a global fallback or any legacy
+  public alias; router registration still rejects duplicate route shapes.
 - The ordinary internal group batch route now decodes directly into an owned
   batch request and invokes a typed operation for schema validation, local
   group write, cancellation, and outcome classification. The explicitly
@@ -149,6 +148,13 @@ that end state:
   operations from concrete handlers. Their raw JSON is an intentional worker
   protocol payload, while consistency and storage errors are transport-free;
   both manual branches have been removed.
+- Internal query, query-preflight, and vector-worker routes are now concrete
+  `httpx` adapters over a transport-neutral query-planning service and typed
+  group-local read operations. Schema routing, read consistency, cancellation,
+  and storage error classification no longer depend on a synthetic HTTP
+  request. The old internal read dispatcher and its dispatcher-only tests have
+  been deleted; semantic planning retains a direct service test and the real
+  router test covers all three wire adapters.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

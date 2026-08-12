@@ -58,7 +58,7 @@ pub const internal_group_operations = @import("internal_group_operations.zig");
 pub const internal_join_operations = @import("internal_join_operations.zig");
 pub const internal_repair_operations = @import("internal_repair_operations.zig");
 pub const restore_jobs = @import("restore_jobs.zig");
-pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
+pub const internal_query_operations = @import("internal_query_operations.zig");
 pub const internal_transition_wire = @import("internal_transition_wire.zig");
 pub const http_server = @import("http_server.zig");
 pub const kernel_bridge = @import("kernel_bridge.zig");
@@ -249,7 +249,7 @@ test "api module compiles" {
     _ = distributed_entity_sink;
     _ = distributed_join;
     _ = distributed_graph;
-    _ = http_internal_group_read_routes;
+    _ = internal_query_operations;
     _ = internal_transition_wire;
     _ = http_server;
     _ = http_client;

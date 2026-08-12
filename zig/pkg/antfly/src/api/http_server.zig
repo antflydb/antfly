@@ -89,7 +89,7 @@ const repair_jobs = @import("repair_jobs.zig");
 const admin_routes = @import("../admin/routes.zig");
 const internal_api_routes = @import("../internal/routes.zig");
 const http_internal_routes = @import("http_internal_routes.zig");
-const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
+const internal_query_operations = @import("internal_query_operations.zig");
 const internal_group_operations = @import("internal_group_operations.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const transactions_api = @import("transactions.zig");
@@ -715,7 +715,7 @@ pub const SemanticStatusResolver = struct {
     ) !db_mod.types.DenseKnnQuery {
         const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
         try ensureRequestActive(self.query_cancellation);
-        const planned = try http_internal_group_read_routes.planSemanticQuery(.{
+        const planned = try internal_query_operations.planSemanticQuery(.{
             .ptr = self.source.ptr,
             .admin_snapshot = self.source.vtable.admin_snapshot orelse return error.UnsupportedQueryRequest,
             .free_admin_snapshot = self.source.vtable.free_admin_snapshot orelse return error.UnsupportedQueryRequest,
@@ -5585,7 +5585,7 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
-    fn internalQueryPlanningContext(self: *ApiHttpServer) ?http_internal_group_read_routes.QueryPlanningContext {
+    fn internalQueryPlanningContext(self: *ApiHttpServer) ?internal_query_operations.QueryPlanningContext {
         return .{
             .ptr = self.source.ptr,
             .admin_snapshot = self.source.vtable.admin_snapshot orelse return null,
@@ -5603,25 +5603,24 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    pub fn internalQueryContext(self: *ApiHttpServer) internal_query_operations.Context {
+        return .{
+            .catalog = .{
+                .ptr = self.source.ptr,
+                .admin_snapshot = self.source.vtable.admin_snapshot,
+                .free_admin_snapshot = self.source.vtable.free_admin_snapshot,
+            },
+            .query_router = .{
+                .ptr = self,
+                .route_query_to_read_schema = routeInternalGroupQueryToReadSchema,
+            },
+            .query_planning = self.internalQueryPlanningContext(),
+        };
+    }
+
     fn internalRoutesContext(self: *ApiHttpServer, uri_parts: UriParts) http_internal_routes.Context {
         return .{
-            .alloc = self.alloc,
             .path = uri_parts.path,
-            .query = uri_parts.query,
-            .read_ctx = .{
-                .alloc = self.alloc,
-                .reads = self.table_reads,
-                .catalog = .{
-                    .ptr = self.source.ptr,
-                    .admin_snapshot = self.source.vtable.admin_snapshot,
-                    .free_admin_snapshot = self.source.vtable.free_admin_snapshot,
-                },
-                .query_router = .{
-                    .ptr = self,
-                    .route_query_to_read_schema = routeInternalGroupQueryToReadSchema,
-                },
-                .query_planning = self.internalQueryPlanningContext(),
-            },
             .retrieval_executor = .{
                 .ptr = self,
                 .execute = executeInternalRetrievalRoute,

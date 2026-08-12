@@ -17,6 +17,7 @@ const raft_mod = @import("../raft/mod.zig");
 const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_write_source.zig");
 const query_api = @import("query.zig");
+const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const platform_time = @import("antfly_platform").time;
 
@@ -603,6 +604,54 @@ pub const Operations = struct {
         }) orelse error.NotFound;
     }
 
+    /// Execute a schema-routed group-local query. The returned response owns
+    /// its JSON buffer and must be deinitialized with `alloc`.
+    pub fn query(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        input: db_mod.types.SearchRequest,
+    ) Error!query_api.QueryResponse {
+        try request.ensureActive();
+        const reads = self.reads orelse return error.NotFound;
+        return (reads.queryGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return error.InvalidArgument,
+            error.TopologyChanged => return error.TopologyChanged,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.UnknownGroup, error.TableNotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
+    /// Execute a schema-routed group-local query preflight. The returned
+    /// summary owns its nested allocations and must be deinitialized with
+    /// `alloc`.
+    pub fn queryPreflight(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        input: db_mod.types.SearchRequest,
+        max_work: u32,
+    ) Error!runtime_preflight.RuntimePreflightSummary {
+        try request.ensureActive();
+        const reads = self.reads orelse return error.NotFound;
+        return (reads.preflightQueryGroupLocal(alloc, group_id, table_name, input, .read_index, max_work) catch |err| switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return error.InvalidArgument,
+            error.TopologyChanged => return error.TopologyChanged,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.UnknownGroup, error.TableNotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
     pub fn graphExpand(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphExpandRequest) Error!distributed_graph.GraphExpandResponse {
         try request.ensureActive();
         const reads = self.reads orelse return error.NotFound;
@@ -766,6 +815,71 @@ fn validateDocumentArtifactChildRangeBatchScope(
     for (child_batch.sparse_embeddings) |embedding| if (embedding.artifact_key) |key| {
         if (!matches(prefixes, key)) return error.InvalidArgument;
     };
+}
+
+test "typed internal group reads preserve retryable resident storage failures" {
+    const alloc = std.testing.allocator;
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = publicQuery,
+                .query_group_local = groupQuery,
+                .preflight_query_group_local = groupPreflight,
+                .scan_group_local = groupScan,
+                .text_stats_group_local = auxiliary,
+                .algebraic_partials_group_local = auxiliary,
+                .document_artifact_manifest_group_local = artifact,
+                .document_artifact_manifests_group_local = artifacts,
+            } };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn publicQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn groupQuery(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+
+        fn groupPreflight(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency, _: u32) !?runtime_preflight.RuntimePreflightSummary {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+
+        fn groupScan(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+
+        fn auxiliary(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8) !?query_api.QueryResponse {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+
+        fn artifact(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+
+        fn artifacts(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+    };
+
+    const operations = Operations{ .reads = FakeReads.source(), .shard_db_adapter = null };
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.scan(alloc, .{}, 7, "docs", "", "", .{}));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.query(alloc, .{}, 7, "docs", .{}));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.queryPreflight(alloc, .{}, 7, "docs", .{}, 0));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.textStats(alloc, .{}, 7, "docs", "{}"));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.algebraicPartials(alloc, .{}, 7, "docs", "{}"));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifest(alloc, .{}, 7, "docs", "doc:a", "chunks"));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifests(alloc, .{}, 7, "docs", "doc:a"));
 }
 
 test "internal group reads are callable without an HTTP request" {

@@ -12,9 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const std = @import("std");
 const http_common = @import("../raft/transport/http_common.zig");
-const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 
 pub const RetrievalExecutor = struct {
     ptr: *anyopaque,
@@ -26,15 +24,11 @@ pub const RetrievalExecutor = struct {
 };
 
 pub const Context = struct {
-    alloc: std.mem.Allocator,
     path: []const u8,
-    query: []const u8,
-    read_ctx: http_internal_group_read_routes.Context,
     retrieval_executor: RetrievalExecutor,
 };
 
 pub fn handle(ctx: Context, req: http_common.HttpRequest) !?http_common.HttpResponse {
     if (try ctx.retrieval_executor.run(req, ctx.path)) |resp| return resp;
-    if (try http_internal_group_read_routes.handle(ctx.read_ctx, req, ctx.path, ctx.query)) |resp| return resp;
     return null;
 }

@@ -29,6 +29,7 @@ const operation_contract = @import("operation.zig");
 const probe_operations = @import("probe_operations.zig");
 const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 const internal_group_operations = @import("internal_group_operations.zig");
+const internal_query_operations = @import("internal_query_operations.zig");
 const internal_join_operations = @import("internal_join_operations.zig");
 const internal_repair_operations = @import("internal_repair_operations.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
@@ -330,6 +331,9 @@ pub const AntflyApiHandler = struct {
         try server.post(group_prefix ++ routes.shard_ops_execute_suffix, httpx.Handler.bind(self, internalExecuteTransition));
         try server.post(table_prefix ++ routes.batch_suffix, httpx.Handler.bind(self, internalGroupBatch));
         try server.post(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
+        try server.post(table_prefix ++ routes.query_suffix, httpx.Handler.bind(self, internalGroupQuery));
+        try server.post(table_prefix ++ routes.query_preflight_suffix, httpx.Handler.bind(self, internalGroupQueryPreflight));
+        try server.post(table_prefix ++ routes.vector_worker_suffix, httpx.Handler.bind(self, internalGroupVectorWorker));
         try server.post(table_prefix ++ routes.graph_expand_suffix, httpx.Handler.bind(self, internalGraphExpand));
         try server.post(table_prefix ++ routes.graph_hydrate_suffix, httpx.Handler.bind(self, internalGraphHydrate));
         try server.post(table_prefix ++ routes.graph_edges_suffix, httpx.Handler.bind(self, internalGraphEdges));
@@ -349,9 +353,6 @@ pub const AntflyApiHandler = struct {
         try server.post(document_artifact_prefix ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalDocumentArtifactReprocess));
         try server.post(table_prefix ++ routes.artifacts_marker ++ ":artifact_name" ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalTableArtifactReprocess));
         const internal_posts = [_][]const u8{
-            table_prefix ++ routes.query_suffix,
-            table_prefix ++ routes.query_preflight_suffix,
-            table_prefix ++ routes.vector_worker_suffix,
             table_prefix ++ routes.artifacts_marker ++ "*",
             table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ "*",
         };
@@ -1406,6 +1407,156 @@ pub const AntflyApiHandler = struct {
             .deleted = result.deleted,
             .transformed = result.transformed,
         });
+    }
+
+    fn internalQueryContext(self: *AntflyApiHandler, ctx: *httpx.Context) internal_query_operations.Context {
+        var result = self.api_server.internalQueryContext();
+        if (result.query_planning) |*planning| {
+            planning.query_cancellation = ctx.cancellation;
+        }
+        return result;
+    }
+
+    fn internalQueryPlanningErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.InvalidQueryRequest or err == error.UnsupportedQueryRequest)
+            return textResponse(ctx, 400, @errorName(err));
+        const normalized = internal_query_operations.normalizeQueryEmbeddingOperationalError(err) orelse return err;
+        return switch (normalized) {
+            error.QueryEmbeddingInputTooLarge => textResponse(ctx, 413, "query embedding input too large"),
+            error.QueryEmbeddingOverloaded => textResponse(ctx, 429, "query embedding overloaded"),
+            error.EmbedRateLimited => textResponse(ctx, 429, "query embedding rate limited"),
+            error.EmbedTransientFailure => textResponse(ctx, 503, "query embedding temporarily unavailable"),
+            error.EmbedUpstreamFailure => textResponse(ctx, 502, "query embedding provider failed"),
+            error.Timeout => textResponse(ctx, 504, "query embedding timed out"),
+            else => unreachable,
+        };
+    }
+
+    fn routeInternalQuery(
+        query_context: internal_query_operations.Context,
+        ctx: *httpx.Context,
+        table_name: []const u8,
+        request: *db_mod.types.SearchRequest,
+    ) !?httpx.Response {
+        query_context.routeQuery(table_name, request) catch |err| {
+            const response = switch (err) {
+                error.TableNotFound => try textResponse(ctx, 404, @errorName(err)),
+                error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => try textResponse(ctx, 500, "invalid table metadata"),
+                else => return err,
+            };
+            return @as(?httpx.Response, response);
+        };
+        return null;
+    }
+
+    fn internalQueryResponse(ctx: *httpx.Context, result: *const query_api.QueryResponse) !httpx.Response {
+        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena_impl.deinit();
+        const response = try std.json.parseFromSliceLeaky(metadata_openapi.QueryResponses, arena_impl.allocator(), result.json, .{
+            .allocate = .alloc_always,
+        });
+        return ctx.json(response);
+    }
+
+    fn internalGroupQuery(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse "";
+        const query_context = self.internalQueryContext(ctx);
+        var query_request = query_context.planQuery(ctx.allocator, params.table_name, body) catch |err|
+            return internalQueryPlanningErrorResponse(ctx, err);
+        defer query_request.deinit(ctx.allocator);
+        query_request.req.cancellation = ctx.cancellation;
+        if (try routeInternalQuery(query_context, ctx, params.table_name, &query_request.req)) |response| return response;
+        var result = self.internalGroupOperations().query(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            query_request.req,
+        ) catch |err| return if (err == error.InvalidArgument)
+            textResponse(ctx, 400, @errorName(err))
+        else
+            internalGroupErrorResponse(ctx, err);
+        defer result.deinit(ctx.allocator);
+        return internalQueryResponse(ctx, &result);
+    }
+
+    const InternalQueryPreflightWire = struct {
+        query_request: std.json.Value,
+        max_work: u32 = 0,
+    };
+
+    fn parseInternalQueryPreflight(
+        alloc: std.mem.Allocator,
+        body: []const u8,
+    ) !struct { query_request_body: []u8, max_work: u32 } {
+        var parsed = std.json.parseFromSlice(InternalQueryPreflightWire, alloc, body, .{ .allocate = .alloc_always }) catch {
+            return .{
+                .query_request_body = try alloc.dupe(u8, body),
+                .max_work = 0,
+            };
+        };
+        defer parsed.deinit();
+        return .{
+            .query_request_body = try std.json.Stringify.valueAlloc(alloc, parsed.value.query_request, .{}),
+            .max_work = parsed.value.max_work,
+        };
+    }
+
+    fn internalGroupQueryPreflight(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse "";
+        const preflight = try parseInternalQueryPreflight(ctx.allocator, body);
+        defer ctx.allocator.free(preflight.query_request_body);
+        const query_context = self.internalQueryContext(ctx);
+        var query_request = query_context.planQuery(ctx.allocator, params.table_name, preflight.query_request_body) catch |err|
+            return internalQueryPlanningErrorResponse(ctx, err);
+        defer query_request.deinit(ctx.allocator);
+        query_request.req.cancellation = ctx.cancellation;
+        if (try routeInternalQuery(query_context, ctx, params.table_name, &query_request.req)) |response| return response;
+        var summary = self.internalGroupOperations().queryPreflight(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            query_request.req,
+            preflight.max_work,
+        ) catch |err| return if (err == error.InvalidArgument)
+            textResponse(ctx, 400, @errorName(err))
+        else
+            internalGroupErrorResponse(ctx, err);
+        defer summary.deinit(ctx.allocator);
+        return ctx.json(summary);
+    }
+
+    fn internalGroupVectorWorker(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse "";
+        var envelope = query_contract.parseAlgebraicVectorWorkerRequestEnvelopeAlloc(ctx.allocator, body) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return textResponse(ctx, 400, "invalid vector worker request"),
+        };
+        defer envelope.deinit(ctx.allocator);
+        var query_request = table_reads.searchRequestFromVectorWorkerEnvelope(&envelope);
+        defer if (query_request.primary_text_index_name) |index_name| ctx.allocator.free(index_name);
+        query_request.cancellation = ctx.cancellation;
+        const query_context = self.internalQueryContext(ctx);
+        if (try routeInternalQuery(query_context, ctx, params.table_name, &query_request)) |response| return response;
+        var result = self.internalGroupOperations().query(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            query_request,
+        ) catch |err| return if (err == error.InvalidArgument)
+            textResponse(ctx, 400, @errorName(err))
+        else
+            internalGroupErrorResponse(ctx, err);
+        defer result.deinit(ctx.allocator);
+        return internalQueryResponse(ctx, &result);
     }
 
     fn internalGroupScan(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -5790,6 +5941,19 @@ test "httpx internal control routes call typed operations directly" {
     defer invalid_scan.deinit();
     try std.testing.expectEqual(@as(u16, 400), invalid_scan.status.code);
     try std.testing.expectEqualStrings("invalid scan request", invalid_scan.body.?);
+
+    inline for (.{
+        .{ "query", "InvalidQueryRequest" },
+        .{ "query-preflight", "InvalidQueryRequest" },
+        .{ "vector-worker", "invalid vector worker request" },
+    }) |case| {
+        const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/{s}", .{ base_url, case[0] });
+        defer alloc.free(url);
+        var response = try requestWithRetry(&client, client_io.io(), .POST, url, "[]", &headers, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expectEqualStrings(case[1], response.body.?);
+    }
 
     inline for (.{
         .{ "graph-expand", "invalid graph expand request" },
