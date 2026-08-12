@@ -75,9 +75,8 @@ const RuntimeLibraryUnit = enum {
     // durability, manifests, and index ownership and calls this unit once per
     // bounded extraction operation.
     enrichment_compute,
-    // Complete DB-local query execution over a borrowed opaque DB handle.
-    // Storage retains DB/index lifecycle and all writes; no posting, candidate,
-    // or stored-document callback crosses this boundary.
+    // Test-only standalone provider for the focused CAPI test root. Release
+    // builds co-generate this provider in storage_kernel.
     local_query,
     inference,
     // Short remote/client unit. Its compile-step gate below keeps it from
@@ -8866,6 +8865,9 @@ pub fn build(b: *std.Build) void {
         var inference_runtime_artifact: ?*std.Build.Step.Compile = null;
         var storage_runtime_artifact: ?*std.Build.Step.Compile = null;
         var enrichment_compute_artifact: ?*std.Build.Step.Compile = null;
+        // The standalone local-query artifact remains available only to the
+        // focused CAPI tests. Release outputs co-generate the same provider in
+        // the storage kernel and do not schedule this compiler unit.
         var local_query_artifact: ?*std.Build.Step.Compile = null;
         var storage_owner_tests: ?*std.Build.Step.Compile = null;
         var storage_provisioned_owner_tests: ?*std.Build.Step.Compile = null;
@@ -8875,10 +8877,10 @@ pub fn build(b: *std.Build) void {
             const unit_enabled = unit != .data_pic_probe and unit != .storage_runtime_pic_probe and
                 unit != .application_pic_probe and unit != .control_probe and
                 unit != .cli_pic_probe and unit != .control_api_probe and
+                unit != .local_query and
                 (unit != .api_kernel or !storage_kernel_experiment) and
                 (unit != .storage_kernel or storage_kernel_experiment) and
-                (unit != .enrichment_compute or storage_kernel_experiment) and
-                (unit != .local_query or storage_kernel_experiment);
+                (unit != .enrichment_compute or storage_kernel_experiment);
             const owns_storage_kernel = unit == .storage_kernel or unit == .data_pic_probe or
                 unit == .storage_runtime_pic_probe or unit == .application_pic_probe or
                 (unit == .distributed and !storage_kernel_experiment);
@@ -8990,13 +8992,10 @@ pub fn build(b: *std.Build) void {
                     role_artifact.step.dependOn(&application_runtime_artifact.?.step);
                 },
                 .local_query => {
-                    if (unit_enabled) {
-                        local_query_artifact = role_artifact;
-                        // Do not add a third LLVM-heavy compiler to the initial
-                        // storage+distributed wave. It becomes eligible after
-                        // the storage owner that supplies its borrowed DB handles.
-                        role_artifact.step.dependOn(&storage_runtime_artifact.?.step);
-                    }
+                    // Test-only provider for the CAPI root that deliberately
+                    // owns a DB directly rather than linking the production
+                    // storage-owner archive.
+                    local_query_artifact = role_artifact;
                 },
                 .inference => {
                     inference_runtime_artifact = role_artifact;
@@ -9237,7 +9236,7 @@ pub fn build(b: *std.Build) void {
             // available. Storage and enrichment are PIC because the
             // executable and C ABI libraries share both archives; all three
             // consumers reuse the same analyzed and optimized graphs.
-            if (unit_enabled and (owns_storage_kernel or unit == .enrichment_compute or unit == .local_query)) {
+            if (unit_enabled and (owns_storage_kernel or unit == .enrichment_compute)) {
                 capi_link_mod.linkLibrary(role_artifact);
                 lite_capi_link_mod.linkLibrary(role_artifact);
             }
@@ -9266,7 +9265,6 @@ pub fn build(b: *std.Build) void {
             tests.root_module.linkLibrary(api_runtime_artifact.?);
             tests.root_module.linkLibrary(inference_runtime_artifact.?);
             tests.root_module.linkLibrary(enrichment_compute_artifact.?);
-            tests.root_module.linkLibrary(local_query_artifact.?);
         }
         if (storage_kernel_experiment) {
             // The focused CAPI test root owns its DB directly rather than

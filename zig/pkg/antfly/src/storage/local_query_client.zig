@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Contract-only client for the separately compiled local-query provider.
+//! Contract-only client for the compiled local-query provider.
 
 const std = @import("std");
 const abi = @import("kernel_owner_abi");

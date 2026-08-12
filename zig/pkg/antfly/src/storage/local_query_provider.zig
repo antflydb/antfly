@@ -12,9 +12,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Physical local-query execution island. The storage archive owns and closes
-//! the DB; this unit borrows that opaque handle for one complete query and
-//! returns one encoded response. Index internals never cross the ABI.
+//! Physical local-query provider. The storage archive owns and closes the DB;
+//! this component borrows that opaque handle for one complete query and returns
+//! one encoded response. Index internals never cross the ABI. The provider is
+//! co-generated with the owning storage kernel in release builds so physical
+//! storage and local query share one optimized compilation graph.
 
 const std = @import("std");
 const abi = @import("kernel_owner_abi");

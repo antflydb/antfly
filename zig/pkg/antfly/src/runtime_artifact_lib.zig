@@ -48,7 +48,7 @@ const enrichment_compute_exports = if (unit_options.unit == .enrichment_compute)
     @import("storage/enrichment_compute_provider.zig")
 else
     struct {};
-const local_query_exports = if (unit_options.unit == .local_query)
+const local_query_exports = if (owns_storage_kernel or unit_options.unit == .local_query)
     @import("storage/local_query_provider.zig")
 else
     struct {};
@@ -486,6 +486,8 @@ comptime {
             exportInternal(&storage_kernel_exports.storageWalStatsSnapshot, "antfly_storage_wal_stats_snapshot");
             exportInternal(&storage_kernel_exports.storageWalLastLsn, "antfly_storage_wal_last_lsn");
             exportInternal(&storage_kernel_exports.storageOwnerBufferDestroy, "antfly_storage_owner_buffer_destroy");
+            exportInternal(&local_query_exports.execute, "antfly_local_query_execute");
+            exportInternal(&local_query_exports.bufferDestroy, "antfly_local_query_buffer_destroy");
         },
         .enrichment_compute => {
             exportInternal(&enrichment_compute_exports.extractStream, "antfly_enrichment_extract_stream");

@@ -202,6 +202,7 @@ the same host, target, cache state, and report set.
 | Atomic control-only physical-source cut | Focused distributed control 236 s; full cold archive 509 s -> 458 s; storage 316 s / 4.03 GiB and distributed 233 s / 2.98 GiB; executable 71.79 MB -> 65.27 MB | Keep behind the experiment; production enablement remains pending repeated normal-runner proof |
 | First normal-runner physical-source cut | Storage 11 m / 10 GB, distributed 8 m / 8 GB, inference 7 m / 6 GB; complete archive 16:25.14; executable 65.27 MB; C API 16.68 MB | Reliable and structurally valid, but both critical units miss 380 s; revise using authoritative Linux time reports |
 | Atomic local-query cut, normal runner | 43/43 steps; storage 590.707 s, distributed 482.636 s, local query 127.258 s, inference 528.849 s; complete build 19:23.59; executable 63.312 MB; C API 20.495 MB | Keep the identity-safe boundary opt-in; source ownership and artifacts pass, but reject the current six-unit schedule as the production performance solution |
+| Co-generated storage/local query, local cold ARM64 | Combined unit 313.334 s; duplicate instances 727 -> 523; emitted overlap 3.553 MB -> 1.948 MB; executable 61.400 MB; C API 18.461 MB | Keep as the five-unit runner candidate; same opaque/error ABI with one fewer LLVM unit, pending normal-runner proof |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -3763,19 +3764,78 @@ units on this two-vCPU runner while preserving normal concurrency; merely
 rescheduling the same 590-second storage and 529-second inference work cannot
 satisfy the compiler-time gate.
 
+### Phase 4u: co-generated storage and local query
+
+The next composition experiment keeps the complete local-query ABI but emits
+its provider in the PIC storage kernel instead of a separate static library.
+This is not an inlining or source-level fallback: distributed control and the
+storage wrappers still call the same hidden `antfly_local_query_*` symbols with
+the same opaque borrowed DB handle, request/result wire, and ABI 33
+`FailureIdentity`. Valid nested failures therefore retain status, originating
+boundary, operation, exact bounded Zig error name, truncation bit, and full-name
+hash exactly as in Phase 4t. Only the archive that defines the provider symbols
+changes.
+
+The standalone local-query artifact remains test-only for the focused CAPI
+root, which intentionally owns its DB directly. It is not linked or scheduled
+by release outputs. A cold Apple-Silicon cross-build to ARM64 Linux musl
+`ReleaseFast`, with normal concurrency and fresh local/global caches, produced:
+
+| Unit | Separate provider | Co-generated provider | Change |
+|---|---:|---:|---:|
+| Storage / storage+query | 278.304 s + 61.716 s | 313.334 s | -26.686 s chain |
+| Distributed/API control | 232.290 s | 238.758 s | +6.468 s |
+| Inference | 222.862 s | 237.220 s | +14.358 s |
+| Remote CLI | 38.107 s | 39.342 s | +1.235 s |
+| Enrichment compute | 17.349 s | 17.503 s | +0.154 s |
+
+The co-generated storage/query graph is 591 repository files / 919,247 lines /
+33,475 declarations, with 306.555 seconds (97.8%) in LLVM emission. That is
+larger than storage alone, as intended, but materially smaller than optimizing
+the storage and query graphs separately. The complete five-report graph has
+1,744 repository-file instances, 1,221 unique files, and 523 duplicate
+instances, versus 1,948 / 1,221 / 727 on the six-unit normal-runner report.
+Conservative emitted overlap across storage, distributed, and enrichment fell
+from 3,552,673 B to 1,947,522 B. A remaining 47,234 B duplicate
+`storage.db.query.search_exec` contribution is still attributable across
+storage and distributed composition; the large physical implementation is no
+longer duplicated as its own query compiler unit.
+
+The stripped static executable is 61,399,552 B, down 1,912,552 B. The stripped
+shared C API is 18,460,704 B, down 2,034,664 B and back well inside its
+historical size range. The combined storage object is 31,373,344 B, versus
+34,862,912 B for the prior storage and local-query objects together. The
+artifacts remain ARM64 musl, the executable remains statically linked, and the
+CAPI dynamic-symbol audit exposes none of the hidden runtime, local-query,
+storage-owner, snapshot, restore, or data-apply symbols.
+
+All 39 linked Debug build steps, 92 storage-owner tests, and 11 CAPI tests pass
+with zero leaks. The three import/codegen gates, 19 analyzer/patch tests,
+workflow lint, and experiment-disabled behavior also remain required before a
+keep decision. The owner tests continue to exercise exact provider failure
+identity and consumer attribution for malformed envelopes, demonstrating that
+co-generation has not collapsed the semantic boundary.
+
+Decision: **keep the co-generated provider as the next opt-in runner
+candidate**. It removes an LLVM unit, improves the local critical chain, cuts
+both analyzed and emitted duplication, and reverses the CAPI size growth while
+preserving the designed ABI. It remains opt-in pending normal-runner timing,
+RSS, artifact, and repeated reliability evidence; do not enable it by default
+or raise runner cost based on the local result.
+
 ## Holistic target architecture
 
-The current structural candidate is the opt-in six-unit source-selected topology above:
-storage, distributed/API control, local query, enrichment compute, inference,
-and remote CLI. Unlike the rejected source-only coalescing probes, it gives the
-distributed/API unit only control sources, removes composed local-query
-execution from storage, and keeps compute-heavy inference/enrichment isolated.
-The local cold storage-plus-local-query chain is now 340.020 seconds, below the
+The current structural candidate is the opt-in five-unit source-selected topology above:
+storage plus local query, distributed/API control, enrichment compute,
+inference, and remote CLI. Unlike the rejected source-only coalescing probes, it gives the
+distributed/API unit only control sources, co-generates physical local-query
+execution with its storage owner, and keeps compute-heavy
+inference/enrichment isolated.
+The local cold combined storage/query unit is now 313.334 seconds, below the
 350-second preferred gate. It is not yet the production baseline: the normal
-Linux runner measured the same chain at 717.965 seconds and every large unit
-except local query above 380 seconds under contention. The topology therefore
-passes the ownership and reliability questions but not the production
-performance gate.
+Linux runner measured only its six-unit predecessor, whose storage-query chain
+was 717.965 seconds and whose large units all exceeded 380 seconds under
+contention. The five-unit topology requires its own runner evidence.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:

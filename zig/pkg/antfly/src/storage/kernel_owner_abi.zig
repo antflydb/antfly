@@ -408,7 +408,7 @@ pub const LocalQueryDialect = enum(u32) {
     public = 1,
 };
 
-/// Complete operation families owned by the compiled local-query unit. New
+/// Complete operation families owned by the compiled local-query provider. New
 /// values are append-only. The storage owner remains responsible for handle
 /// lifetime and admission; parsing, physical execution, and response encoding
 /// stay together on the provider side.
