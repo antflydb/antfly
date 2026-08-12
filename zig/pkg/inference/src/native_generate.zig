@@ -5849,6 +5849,14 @@ fn liveWholeModelShouldStopOnEos(gpt_config: gpt_mod.Config, ignore_eos: bool, t
     return !ignore_eos and token_id >= 0 and gpt_config.isEosToken(@intCast(token_id));
 }
 
+fn liveWholeModelPrefillChunkSize(config: generation.GenerationConfig, prompt_tokens: usize) usize {
+    const admitted = if (config.prefill_chunk_size > 0)
+        config.prefill_chunk_size
+    else
+        runtime.tier.memory.generation_default_prefill_chunk_tokens;
+    return @max(@min(admitted, prompt_tokens), 1);
+}
+
 fn runLiveWholeModelExecutorReuseProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -5968,6 +5976,10 @@ fn tryRunLiveWholeModelExecutorGenerate(
     defer allocator.free(prompt_ids);
     for (prompt_token_ids, 0..) |token_id, idx| prompt_ids[idx] = token_id;
     if (prompt_ids.len == 0) return error.EmptyPrompt;
+    // Prewarming and execution must use the same admitted row geometry.
+    // Passing the complete long-context prompt to prepare() would preplan and
+    // reserve full-prompt Metal scratch before chunked execution begins.
+    const prefill_chunk_size = liveWholeModelPrefillChunkSize(config, prompt_ids.len);
 
     var warmed_runtime_at = created_runtime_at;
     var runtime_prewarm_ms: u64 = 0;
@@ -5978,7 +5990,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     {
         const prewarm_started_at = std.Io.Timestamp.now(io, .awake);
         const prewarm_ok = runtime_model.prepare(allocator, .{
-            .kv_tokens_hint = prompt_ids.len,
+            .kv_tokens_hint = prefill_chunk_size,
         }) catch |err| blk: {
             std.log.warn("Gemma4 Metal runtime prewarm failed for {s}: {s}", .{ opts.model_dir, @errorName(err) });
             break :blk false;
@@ -6016,11 +6028,6 @@ fn tryRunLiveWholeModelExecutorGenerate(
     const use_greedy_decode = use_runtime_token_decode and runtime_caps.supports_greedy_decode and isPureGreedyConfig(config);
     const use_sample_decode = use_runtime_token_decode and runtime_caps.supports_sample_decode and !use_greedy_decode;
     const prefer_prefill_greedy_token = prefillGreedyTokenEnabled() and use_greedy_decode;
-    var prefill_chunk_size = if (config.prefill_chunk_size > 0)
-        config.prefill_chunk_size
-    else
-        runtime.tier.memory.generation_default_prefill_chunk_tokens;
-    prefill_chunk_size = @max(@min(prefill_chunk_size, prompt_ids.len), 1);
     const allow_swa_ring = kv_capacity_policy == .split_swa_ring;
     const graph_stats_before_generate = graph_mod.executor_stats.snapshot();
     const prefill_started_at = std.Io.Timestamp.now(io, .awake);
@@ -8700,6 +8707,21 @@ test "live whole-model route uses the shared KV capacity policy" {
         generation.generationKvCapacityPolicyForRoute(.metal_whole_model, gpt_config, .{
             .cache_compaction_ratio = 0.5,
         }, .f16),
+    );
+}
+
+test "live whole-model prewarm stays within admitted prefill geometry" {
+    try std.testing.expectEqual(
+        @as(usize, 128),
+        liveWholeModelPrefillChunkSize(.{ .prefill_chunk_size = 128 }, 65_536),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 64),
+        liveWholeModelPrefillChunkSize(.{ .prefill_chunk_size = 128 }, 64),
+    );
+    try std.testing.expectEqual(
+        runtime.tier.memory.generation_default_prefill_chunk_tokens,
+        liveWholeModelPrefillChunkSize(.{}, 65_536),
     );
 }
 
