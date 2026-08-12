@@ -2076,12 +2076,12 @@ export interface paths {
          *
          *     Downloaded and inline encoded media is limited cumulatively across the request
          *     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-         *     `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+         *     `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
          *     download limit disables nonempty media. Remote URL byte potential is reserved before
          *     fetch; inline sources reserve their actual encoded size without adding it to the
          *     existing request-body reservation. Accepted image headers are then validated and
          *     decoded source pixels are admitted at a conservative 16 bytes per pixel against
-         *     the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+         *     the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero
          *     concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
          *     limits each source edge. Malformed images return 400, while dimension or aggregate
          *     excess returns 413 before model loading. Initial capacity admission occurs before
@@ -2223,11 +2223,11 @@ export interface paths {
          *     weighted capacity unit and at least one unit per two declared images. The effective
          *     ceiling is the minimum of the configured per-image limit times image count, the
          *     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-         *     `max_concurrent_requests`. Admission happens before model resolution or download.
+         *     `admission.inference.max_concurrent_requests`. Admission happens before model resolution or download.
          *
          *     After download, image headers are validated before model loading. Decoded source
          *     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-         *     512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+         *     512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
          *     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
          *     from downloaded-byte admission before inference. `max_image_dimension` limits
          *     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -12250,7 +12250,32 @@ export interface components {
              */
             ttl_ms?: number;
         };
-        InferenceConfig: {
+        /** @description Process-local foreground request admission settings. */
+        InferenceAdmissionConfig: {
+            inference?: components["schemas"]["InferenceRequestAdmissionConfig"];
+        };
+        InferenceRequestAdmissionConfig: {
+            /**
+             * @description Maximum concurrent weighted inference admission units in this
+             *     process. The budget is shared by every executing inference endpoint.
+             *     Request body size, generation workload, and image byte/count
+             *     reservations can consume more than one unit. Read and image-extraction
+             *     admission reserves the effective downloaded-byte ceiling at 16 MiB
+             *     per unit and at least one unit per two images. A positive capacity also
+             *     clamps each such request's downloaded-image ceiling to 16 MiB times
+             *     this value. When exhausted, new HTTP requests are rejected immediately
+             *     with 503 Service Unavailable and Retry-After: 1; they are not retained
+             *     in an in-process queue. Set to 0 to disable both admission accounting
+             *     and the capacity-derived clamp. The default is 32.
+             * @default 32
+             * @example 32
+             */
+            max_concurrent_requests?: number;
+        };
+        InferenceConfig: components["schemas"]["InferenceRuntimeConfig"] & {
+            admission?: components["schemas"]["InferenceAdmissionConfig"];
+        };
+        InferenceRuntimeConfig: {
             /**
              * Format: uri
              * @description URL of the Antfly inference embedding/chunking service
@@ -12279,7 +12304,7 @@ export interface components {
              * @example ~/.antfly/inference/ml
              */
             ml_dir?: string;
-            /** @description Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline. */
+            /** @description Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline. */
             content_security?: components["schemas"]["InferenceContentSecurityConfig"];
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
             s3_credentials?: components["schemas"]["InferenceCredentials"];
@@ -12317,23 +12342,6 @@ export interface components {
              *     configuring this list has no effect.
              */
             backend_priority?: components["schemas"]["InferenceBackendPriorityEntry"][];
-            /**
-             * @description Maximum concurrent weighted inference admission units in the Zig runtime.
-             *     Request body size, generation workload, and image byte/count reservations
-             *     can consume more than one unit. Read and image-extraction admission reserves the
-             *     effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per
-             *     two images. A positive capacity also clamps each such request's downloaded-image
-             *     ceiling to 16 MiB times this value. Set to 0 disables both admission accounting
-             *     and that capacity-derived clamp.
-             *     When a positive limit is exhausted, new requests are rejected immediately
-             *     with 503 Service Unavailable and Retry-After: 1; they are not retained in
-             *     an in-process queue. Set to 0 only as an operational escape hatch for
-             *     trusted testing environments; unlimited admission is not recommended for
-             *     production native generation. Use a positive production limit. The default is 32.
-             * @default 32
-             * @example 32
-             */
-            max_concurrent_requests?: number;
             /**
              * @deprecated
              * @description Legacy Go-runtime queue setting. The current Zig runtime does not retain

@@ -564,8 +564,8 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 
 	// Initialize request queue for backpressure control
 	maxConcurrentRequests := 0
-	if config.MaxConcurrentRequests != nil {
-		maxConcurrentRequests = *config.MaxConcurrentRequests
+	if config.Admission.Inference.MaxConcurrentRequests != nil {
+		maxConcurrentRequests = *config.Admission.Inference.MaxConcurrentRequests
 	}
 	var requestTimeout time.Duration
 	if config.RequestTimeout != "" && config.RequestTimeout != "0" {

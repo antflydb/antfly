@@ -1865,7 +1865,7 @@ pub fn runFromIterator(
         cli.inference_kernel_jit_mode,
     );
     const inference_runtime_config_json = try std.json.Stringify.valueAlloc(alloc, InferenceRuntimeConfigWire{
-        .max_concurrent_requests = configured_inference.max_concurrent_requests,
+        .max_concurrent_requests = resolveInferenceMaxConcurrentRequests(loaded_cfg),
         .kernel_jit = .{
             .mode = effective_kernel_jit_mode,
             .cache_dir = configured_inference.kernel_jit.cache_dir,
@@ -4529,6 +4529,13 @@ fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.C
     return null;
 }
 
+fn resolveInferenceMaxConcurrentRequests(cfg: ?*const antfly.common.config.Config) u32 {
+    return if (cfg) |config|
+        config.admission.inference.max_concurrent_requests
+    else
+        antfly.common.config.default_inference_max_concurrent_requests;
+}
+
 fn resolveInferenceMlDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
     if (cli.inference_ml_dir) |value| return value;
     if (cfg) |loaded| return loaded.inference.ml_dir;
@@ -6865,11 +6872,13 @@ test "inference config falls back to common config" {
         .transcribers = antfly.transcribing.Registry.init(alloc),
         .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
+        .admission = .{
+            .inference = .{ .max_concurrent_requests = 0 },
+        },
         .inference = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:8089"),
             .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),
             .ml_dir = try alloc.dupe(u8, "/tmp/antfly-ml"),
-            .max_concurrent_requests = 0,
             .kernel_jit = .{
                 .mode = .shadow,
                 .cache_dir = try alloc.dupe(u8, "/tmp/antfly-jit"),
@@ -6898,6 +6907,11 @@ test "inference config falls back to common config" {
 
     try std.testing.expectEqualStrings("/tmp/antfly-models", resolveInferenceModelsDir(.{}, &cfg).?);
     try std.testing.expectEqualStrings("/tmp/antfly-ml", resolveInferenceMlDir(.{}, &cfg).?);
+    try std.testing.expectEqual(@as(u32, 0), resolveInferenceMaxConcurrentRequests(&cfg));
+    try std.testing.expectEqual(
+        antfly.common.config.default_inference_max_concurrent_requests,
+        resolveInferenceMaxConcurrentRequests(null),
+    );
     try std.testing.expectEqual(@as(usize, 1), cfg.inference.preload.len);
     try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);

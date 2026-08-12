@@ -35,8 +35,9 @@ import (
 func TestAdmissionMaxConcurrentRequestsZeroRoundTrip(t *testing.T) {
 	zero := 0
 	original := Config{Admission: AdmissionConfig{
-		Query: QueryAdmissionConfig{MaxConcurrentRequests: &zero},
-		Write: WriteAdmissionConfig{MaxConcurrentRequests: &zero},
+		Query:     QueryAdmissionConfig{MaxConcurrentRequests: &zero},
+		Write:     WriteAdmissionConfig{MaxConcurrentRequests: &zero},
+		Inference: InferenceAdmissionConfig{MaxConcurrentRequests: &zero},
 	}}
 
 	encoded, err := json.Marshal(original)
@@ -49,6 +50,8 @@ func TestAdmissionMaxConcurrentRequestsZeroRoundTrip(t *testing.T) {
 	require.Zero(t, *decoded.Admission.Query.MaxConcurrentRequests)
 	require.NotNil(t, decoded.Admission.Write.MaxConcurrentRequests)
 	require.Zero(t, *decoded.Admission.Write.MaxConcurrentRequests)
+	require.NotNil(t, decoded.Admission.Inference.MaxConcurrentRequests)
+	require.Zero(t, *decoded.Admission.Inference.MaxConcurrentRequests)
 }
 
 // JSONStructTag returns a viper.DecoderConfigOption that uses json tags instead of mapstructure tags

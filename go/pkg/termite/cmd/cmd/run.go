@@ -59,6 +59,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	logger.Info("Running as termite")
 
 	// Build termite config from viper/env
+	maxConcurrentRequests := viper.GetInt("admission.inference.max_concurrent_requests")
 	cfg := termite.Config{
 		ApiUrl:          viper.GetString("api_url"),
 		ModelsDir:       modelsDir, // Set from --models-dir flag (defaults to ~/.termite/models)
@@ -67,6 +68,11 @@ func runServer(cmd *cobra.Command, args []string) error {
 		MaxLoadedModels: viper.GetInt("max_loaded_models"),
 		MaxMemoryMb:     viper.GetInt("max_memory_mb"),
 		Preload:         preloadModelRefs(viper.GetStringSlice("preload")),
+		Admission: termite.AdmissionConfig{
+			Inference: termite.RequestAdmissionConfig{
+				MaxConcurrentRequests: &maxConcurrentRequests,
+			},
+		},
 	}
 
 	// Parse model_strategies from config (map[string]string -> map[string]ConfigModelStrategies)

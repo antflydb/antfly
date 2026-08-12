@@ -16,6 +16,7 @@ const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 pub const AdmissionConfig = struct {
     query: ?QueryAdmissionConfig = null,
     write: ?WriteAdmissionConfig = null,
+    inference: ?InferenceAdmissionConfig = null,
 };
 
 /// Per-connection AWS credential identity. Each named connection owns an independent refresh cache, allowing lanes to use different accounts, profiles, or workload identities.
@@ -124,7 +125,7 @@ pub const Config = struct {
     storage: ?StorageConfig = null,
     transaction_sessions: ?TransactionSessionConfig = null,
     metadata: ?MetadataInfo = null,
-    inference: ?antfly_inference_config_openapi.Config = null,
+    inference: ?antfly_inference_config_openapi.RuntimeConfig = null,
     tls: ?TLSInfo = null,
     remote_content: ?antfly_scraping_openapi.RemoteContentConfig = null,
     /// Public connection resources keyed by stable connection ID. These are the external systems Antfly can use for inference, external IO, CDC, backups, indexing, agents, and related workflows.
@@ -388,6 +389,11 @@ pub const HttpExternalIoConfig = struct {
     headers: ?std.json.ArrayHashMap([]const u8) = null,
 };
 
+pub const InferenceAdmissionConfig = struct {
+    /// Maximum concurrent weighted inference admission units in this process. The budget is shared by every executing inference endpoint. Request body size, generation workload, and image byte/count reservations can consume more than one unit. Read and image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per two images. A positive capacity also clamps each such request's downloaded-image ceiling to 16 MiB times this value. When exhausted, new HTTP requests are rejected immediately with 503 Service Unavailable and Retry-After: 1; they are not retained in an in-process queue. Set to 0 to disable both admission accounting and the capacity-derived clamp. The default is 32.
+    max_concurrent_requests: ?i64 = null,
+};
+
 pub const InferenceConnectionConfig = struct {
     /// Inference provider type, such as openai, anthropic, antfly, ollama, or mock.
     provider: []const u8,
@@ -474,7 +480,7 @@ pub const ObjectStorageLocation = struct {
 };
 
 pub const QueryAdmissionConfig = struct {
-    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, and federated searches consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and inference.max_concurrent_requests.
+    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, and federated searches consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
     max_concurrent_requests: ?i64 = null,
 };
 
@@ -613,6 +619,6 @@ pub const WebSearchConnectionVariant = struct {
 };
 
 pub const WriteAdmissionConfig = struct {
-    /// Maximum concurrent foreground data mutations in this process. The default is 16. Table batch writes, cross-table batches, linear merges, and transaction commits consume this budget. Schema, index, backup, restore, repair, and other administrative operations use dedicated control or background-maintenance paths. Set to 0 to disable write admission. Excess HTTP work in either foreground class is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Both budgets are independent of transport safeguards and inference.max_concurrent_requests.
+    /// Maximum concurrent foreground data mutations in this process. The default is 16. Table batch writes, cross-table batches, linear merges, and transaction commits consume this budget. Schema, index, backup, restore, repair, and other administrative operations use dedicated control or background-maintenance paths. Set to 0 to disable write admission. Excess HTTP work in either foreground class is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Both budgets are independent of transport safeguards and admission.inference.max_concurrent_requests.
     max_concurrent_requests: ?i64 = null,
 };

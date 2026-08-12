@@ -37,6 +37,7 @@ const default_standalone_shards_per_table: u32 = 1;
 pub const default_health_port: u16 = 4200;
 pub const default_query_max_concurrent_requests: u32 = 32;
 pub const default_write_max_concurrent_requests: u32 = 16;
+pub const default_inference_max_concurrent_requests: u32 = 32;
 pub const local_inference_connection_id = "local-inference";
 
 pub const DeploymentMode = enum {
@@ -84,6 +85,7 @@ pub const Config = struct {
     pub const AdmissionConfig = struct {
         query: RequestAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
         write: RequestAdmissionConfig = .{ .max_concurrent_requests = default_write_max_concurrent_requests },
+        inference: RequestAdmissionConfig = .{ .max_concurrent_requests = default_inference_max_concurrent_requests },
     };
 
     pub const MetadataConfig = struct {
@@ -242,9 +244,6 @@ pub const Config = struct {
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
         preload: []WarmModelConfig = &.{},
-        /// Zero disables the admission limit. Positive values bound concurrent
-        /// inference work units; excess HTTP requests are rejected with 503.
-        max_concurrent_requests: ?usize = null,
         kernel_jit: KernelJitConfig = .{},
         prompt_cache: PromptCacheConfig = .{},
         keep_alive: ?[]u8 = null,
@@ -599,7 +598,7 @@ pub const Config = struct {
             else => return error.InvalidConfig,
         };
         if (root.get("admission")) |admission_value| {
-            try validateObjectMemberFields(root, "admission", &.{ "query", "write" });
+            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference" });
             const admission_object = switch (admission_value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
@@ -609,6 +608,22 @@ pub const Config = struct {
             }
             if (admission_object.get("write") != null) {
                 try validateObjectMemberFields(admission_object, "write", &.{"max_concurrent_requests"});
+            }
+            if (admission_object.get("inference") != null) {
+                try validateObjectMemberFields(admission_object, "inference", &.{"max_concurrent_requests"});
+            }
+        }
+        if (root.get("inference")) |inference_value| {
+            const inference_object = switch (inference_value) {
+                .object => |object| object,
+                else => return error.InvalidConfig,
+            };
+            // Admission is process-wide configuration. Reject the old flat
+            // spelling and the mechanically possible nested alias explicitly.
+            if (inference_object.get("max_concurrent_requests") != null or
+                inference_object.get("admission") != null)
+            {
+                return error.InvalidConfig;
             }
         }
 
@@ -689,6 +704,13 @@ pub const Config = struct {
                         default_write_max_concurrent_requests
                 else
                     default_write_max_concurrent_requests },
+                .inference = .{ .max_concurrent_requests = if (admission.inference) |inference|
+                    if (inference.max_concurrent_requests) |value|
+                        std.math.cast(u32, value) orelse return error.InvalidConfig
+                    else
+                        default_inference_max_concurrent_requests
+                else
+                    default_inference_max_concurrent_requests },
             } else .{},
             .metadata = try parseMetadataConfig(
                 alloc,
@@ -705,10 +727,6 @@ pub const Config = struct {
                 .content_security = if (inference.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
                 .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
                 .preload = try parseInferencePreloadModels(alloc, raw_root.get("inference")),
-                .max_concurrent_requests = if (inference.max_concurrent_requests) |value|
-                    std.math.cast(usize, value) orelse return error.InvalidConfig
-                else
-                    null,
                 .kernel_jit = kernel_jit,
                 .prompt_cache = prompt_cache,
                 .keep_alive = if (inference.keep_alive) |value| try alloc.dupe(u8, value) else null,
@@ -2206,13 +2224,13 @@ test "common config extracts antfly settings" {
         \\  "max_shards_per_table": 4,
         \\  "admission": {
         \\    "query": { "max_concurrent_requests": 11 },
-        \\    "write": { "max_concurrent_requests": 5 }
+        \\    "write": { "max_concurrent_requests": 5 },
+        \\    "inference": { "max_concurrent_requests": 7 }
         \\  },
         \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
         \\    "ml_dir": "/tmp/ml",
-        \\    "max_concurrent_requests": 7,
         \\    "kernel_jit": {
         \\      "mode": "shadow",
         \\      "cache_dir": "/tmp/antfly-jit",
@@ -2255,7 +2273,7 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
     try std.testing.expectEqual(@as(u32, 11), cfg.admission.query.max_concurrent_requests);
     try std.testing.expectEqual(@as(u32, 5), cfg.admission.write.max_concurrent_requests);
-    try std.testing.expectEqual(@as(?usize, 7), cfg.inference.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 7), cfg.admission.inference.max_concurrent_requests);
     try std.testing.expectEqual(Config.InferenceConfig.KernelJitConfig.Mode.shadow, cfg.inference.kernel_jit.mode);
     try std.testing.expectEqualStrings("/tmp/antfly-jit", cfg.inference.kernel_jit.cache_dir.?);
     try std.testing.expectEqual(@as(usize, 256), cfg.inference.kernel_jit.max_cache_bytes_mb);
@@ -2282,11 +2300,12 @@ test "common config extracts antfly settings" {
 
 test "common config preserves disabled foreground admission" {
     var cfg = try Config.parseFromSlice(std.testing.allocator,
-        \\{"admission":{"query":{"max_concurrent_requests":0},"write":{"max_concurrent_requests":0}}}
+        \\{"admission":{"query":{"max_concurrent_requests":0},"write":{"max_concurrent_requests":0},"inference":{"max_concurrent_requests":0}}}
     );
     defer cfg.deinit();
     try std.testing.expectEqual(@as(u32, 0), cfg.admission.query.max_concurrent_requests);
     try std.testing.expectEqual(@as(u32, 0), cfg.admission.write.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 0), cfg.admission.inference.max_concurrent_requests);
 }
 
 test "common config rejects unknown admission settings" {
@@ -2300,6 +2319,12 @@ test "common config rejects unknown admission settings" {
         error.InvalidConfig,
         Config.parseFromSlice(std.testing.allocator,
             \\{"admission":{"writes":{"max_concurrent_requests":1}}}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidConfig,
+        Config.parseFromSlice(std.testing.allocator,
+            \\{"inference":{"max_concurrent_requests":1}}
         ),
     );
 }
@@ -3060,6 +3085,7 @@ test "common config parses minimal config with admission defaults" {
     try std.testing.expectEqual(@as(?u16, default_health_port), cfg.health_port);
     try std.testing.expectEqual(default_query_max_concurrent_requests, cfg.admission.query.max_concurrent_requests);
     try std.testing.expectEqual(default_write_max_concurrent_requests, cfg.admission.write.max_concurrent_requests);
+    try std.testing.expectEqual(default_inference_max_concurrent_requests, cfg.admission.inference.max_concurrent_requests);
     try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
     try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);

@@ -17,6 +17,7 @@ pub const FilesystemExternalIoConfig = types.FilesystemExternalIoConfig;
 pub const GcsCredentialConfig = types.GcsCredentialConfig;
 pub const GcsExternalIoConfig = types.GcsExternalIoConfig;
 pub const HttpExternalIoConfig = types.HttpExternalIoConfig;
+pub const InferenceAdmissionConfig = types.InferenceAdmissionConfig;
 pub const InferenceConnectionConfig = types.InferenceConnectionConfig;
 pub const InferenceConnectionVariant = types.InferenceConnectionVariant;
 pub const LiteStorageConfig = types.LiteStorageConfig;

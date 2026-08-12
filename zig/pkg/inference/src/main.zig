@@ -55,6 +55,14 @@ const RunConfig = struct {
         ttl_ms: u64 = 300_000,
     };
 
+    const InferenceAdmissionConfig = struct {
+        max_concurrent_requests: ?u32 = null,
+    };
+
+    const AdmissionConfig = struct {
+        inference: ?InferenceAdmissionConfig = null,
+    };
+
     models_dir: ?[]const u8 = null,
     ml_dir: ?[]const u8 = null,
     content_security: ?inference.scraping.ContentSecurityConfig = null,
@@ -62,7 +70,7 @@ const RunConfig = struct {
     preload: []const WarmModelConfig = &.{},
     keep_alive_ms: ?u64 = null,
     max_loaded_models: ?usize = null,
-    max_concurrent_requests: ?usize = null,
+    admission: ?AdmissionConfig = null,
     pool_size: ?usize = null,
     generation_batching: ?inference.server.GenerationBatchingConfig = null,
     kernel_jit: ?inference.graph.kernel_jit.Config = null,
@@ -76,6 +84,29 @@ fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !std.json.Parse
 }
 
 fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parsed(RunConfig) {
+    var raw_tree = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer raw_tree.deinit();
+    const root = switch (raw_tree.value) {
+        .object => |object| object,
+        else => return error.InvalidInferenceConfig,
+    };
+    if (root.get("max_concurrent_requests") != null) return error.InvalidInferenceConfig;
+    if (root.get("admission")) |admission_value| {
+        const admission = switch (admission_value) {
+            .object => |object| object,
+            else => return error.InvalidInferenceConfig,
+        };
+        if (admission.count() != @intFromBool(admission.get("inference") != null))
+            return error.InvalidInferenceConfig;
+        if (admission.get("inference")) |inference_value| {
+            const inference_admission = switch (inference_value) {
+                .object => |object| object,
+                else => return error.InvalidInferenceConfig,
+            };
+            if (inference_admission.count() != @intFromBool(inference_admission.get("max_concurrent_requests") != null))
+                return error.InvalidInferenceConfig;
+        }
+    }
     const parsed = try std.json.parseFromSlice(RunConfig, allocator, raw, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
@@ -426,7 +457,12 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         }
         if (cfg.keep_alive_ms) |value| node_cfg.keep_alive_ms = value;
         if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
-        if (cfg.max_concurrent_requests) |value| node_cfg.max_concurrent_requests = value;
+        if (cfg.admission) |admission| {
+            if (admission.inference) |inference_admission| {
+                if (inference_admission.max_concurrent_requests) |value|
+                    node_cfg.max_concurrent_requests = value;
+            }
+        }
         if (cfg.pool_size) |value| node_cfg.pool_size = value;
         if (cfg.generation_batching) |value| node_cfg.generation_batching = value;
         if (cfg.prompt_cache) |value| node_cfg.prompt_cache = .{
@@ -661,6 +697,7 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\    { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
         \\  ],
         \\  "max_loaded_models": 8,
+        \\  "admission": { "inference": { "max_concurrent_requests": 12 } },
         \\  "pool_size": 4,
         \\  "generation_batching": {
         \\    "mode": "on",
@@ -677,6 +714,7 @@ test "run config parses shared scraping fields and ignores api_url" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("/tmp/models", parsed.value.models_dir.?);
+    try std.testing.expectEqual(@as(?u32, 12), parsed.value.admission.?.inference.?.max_concurrent_requests);
     try std.testing.expectEqualStrings("/tmp/ml", parsed.value.ml_dir.?);
     try std.testing.expectEqual(@as(?bool, true), parsed.value.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", parsed.value.s3_credentials.?.endpoint.?);
@@ -703,6 +741,23 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqual(@as(usize, 64), parsed.value.prompt_cache.?.max_bytes_mb);
     try std.testing.expectEqual(@as(usize, 32), parsed.value.prompt_cache.?.min_tokens);
     try std.testing.expectEqual(@as(u64, 1000), parsed.value.prompt_cache.?.ttl_ms);
+}
+
+test "run config requires inference admission under admission" {
+    const disabled = try parseRunConfig(std.testing.allocator,
+        \\{"admission":{"inference":{"max_concurrent_requests":0}}}
+    );
+    defer disabled.deinit();
+    try std.testing.expectEqual(@as(?u32, 0), disabled.value.admission.?.inference.?.max_concurrent_requests);
+
+    try std.testing.expectError(
+        error.InvalidInferenceConfig,
+        parseRunConfig(std.testing.allocator, "{\"max_concurrent_requests\":1}"),
+    );
+    try std.testing.expectError(
+        error.InvalidInferenceConfig,
+        parseRunConfig(std.testing.allocator, "{\"admission\":{\"infer\":{\"max_concurrent_requests\":1}}}"),
+    );
 }
 
 test "run config rejects unrepresentable prompt cache values" {

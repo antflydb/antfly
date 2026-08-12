@@ -74,7 +74,7 @@ Serving admission and backend execution are separate concerns:
 - `admission.write.max_concurrent_requests` independently bounds foreground
   table mutations, linear merges, and transaction commits. Administrative and
   control-plane routes remain available when either foreground class saturates.
-- `inference.max_concurrent_requests` is an independent weighted budget shared
+- `admission.inference.max_concurrent_requests` is an independent weighted budget shared
   by every embedded inference execution surface, including direct providers and
   the public inference and traditional-ML prediction routes.
 - Listener connection limits remain transport safeguards. They do not express
