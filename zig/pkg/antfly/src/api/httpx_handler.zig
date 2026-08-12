@@ -268,7 +268,7 @@ pub const AntflyApiHandler = struct {
             try server.delete(path, handler);
         }
         if (self.api_server.cfg.experimental) {
-            try server.post(routes.a2a, handler);
+            try server.post(routes.a2a, httpx.Handler.bind(self, a2aRoute));
             const a2a_card_handler = httpx.Handler.bind(self, a2aCardRoute);
             try server.get(routes.agent_card, a2a_card_handler);
             try server.get(routes.agent_card_legacy, a2a_card_handler);
@@ -668,6 +668,25 @@ pub const AntflyApiHandler = struct {
         );
         defer self.api_server.alloc.free(body);
         return jsonResponse(ctx, 200, body);
+    }
+
+    fn a2aRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |response| return response;
+        const body = (try ctx.body()) orelse "";
+        var response = try protocol_adapters.executeA2aRequest(
+            self.api_server,
+            ctx.header("authorization"),
+            body,
+            ApiHttpServer.queryEmbeddingSecurityScope(authenticated_identity),
+            authenticated_identity,
+        );
+        defer response.deinit(self.api_server.alloc);
+        _ = ctx.status(response.status);
+        try ctx.setHeader("content-type", response.content_type);
+        _ = ctx.response.body(response.body);
+        return ctx.response.build();
     }
 
     fn authorizeStorageMaintenance(
@@ -6164,6 +6183,14 @@ test "httpx ARD routes call typed contextual operations directly" {
     defer card.deinit();
     try std.testing.expectEqual(@as(u16, 200), card.status.code);
     try std.testing.expect(std.mem.indexOf(u8, card.body.?, "\"skills\"") != null);
+
+    const a2a_url = try std.fmt.allocPrint(alloc, "{s}/a2a", .{base_url});
+    defer alloc.free(a2a_url);
+    const json_headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    var a2a_response = try requestWithRetry(&client, client_io.io(), .POST, a2a_url, "{}", &json_headers, 20);
+    defer a2a_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), a2a_response.status.code);
+    try std.testing.expectEqualStrings("application/json", a2a_response.header("content-type").?);
 }
 
 test "httpx storage maintenance routes call typed operations directly" {

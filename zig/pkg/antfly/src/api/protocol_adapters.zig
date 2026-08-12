@@ -15,6 +15,7 @@
 const std = @import("std");
 const routes = @import("http_routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const contextual_operations = @import("contextual_operations.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const wasmtime_runtime = extension_domain.wasmtime_runtime;
 const usermgr = @import("../usermgr/mod.zig");
@@ -1335,31 +1336,33 @@ fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn handleA2aRequest(
+pub fn executeA2aRequest(
     server_ptr: anytype,
-    req: http_common.HttpRequest,
+    authorization: ?[]const u8,
+    body: []const u8,
     query_embedding_security_scope: anytype,
     authenticated_identity: anytype,
-) !http_common.HttpResponse {
+) !contextual_operations.OwnedResponse {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
     var dispatcher = try buildA2aDispatcher(
         server_ptr,
         arena_impl.allocator(),
-        req.authorization,
+        authorization,
         query_embedding_security_scope,
         authenticated_identity,
     );
-    if (isJsonRpcMethod(arena_impl.allocator(), req.body, "message/stream")) {
+    if (isJsonRpcMethod(arena_impl.allocator(), body, "message/stream")) {
         var sink = A2aSseSink{};
         defer sink.out.deinit(server_ptr.alloc);
-        try dispatcher.handleJsonRpcStream(server_ptr.alloc, req.body, sink.iface());
+        try dispatcher.handleJsonRpcStream(server_ptr.alloc, body, sink.iface());
         try sink.out.appendSlice(server_ptr.alloc, "event: done\ndata: {}\n\n");
-        return try eventStreamResponse(server_ptr.alloc, 200, sink.out.items);
+        return .{
+            .content_type = "text/event-stream",
+            .body = try sink.out.toOwnedSlice(server_ptr.alloc),
+        };
     }
-    const response_body = try dispatcher.handleJsonRpc(server_ptr.alloc, req.body);
-    defer server_ptr.alloc.free(response_body);
-    return try jsonBodyResponseWithStatus(server_ptr.alloc, 200, response_body);
+    return contextual_operations.json(try dispatcher.handleJsonRpc(server_ptr.alloc, body), false);
 }
 
 pub fn isA2aStreamingRequest(alloc: std.mem.Allocator, req: http_common.HttpRequest) bool {

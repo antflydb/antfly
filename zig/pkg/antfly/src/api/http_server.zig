@@ -3869,14 +3869,6 @@ pub const ApiHttpServer = struct {
         if ((req.method == .GET or req.method == .POST or req.method == .DELETE) and (std.mem.eql(u8, uri_parts.path, routes.Routes.mcp_v1) or std.mem.startsWith(u8, uri_parts.path, routes.Routes.mcp_v1_prefix))) {
             return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
         }
-        if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.a2a)) {
-            return try protocol_adapters.handleA2aRequest(
-                self,
-                req,
-                queryEmbeddingSecurityScope(authenticated_identity),
-                authenticated_identity,
-            );
-        }
         return null;
     }
 
