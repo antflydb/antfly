@@ -56,6 +56,10 @@ that end state:
 - Metadata extension install, update, drop, enable, disable, configure, and
   restore are transport-neutral operations registered as concrete method/path
   pairs; extension lifecycle no longer enters the metadata dispatcher.
+- Metadata node registration, status reporting, drain request/cancel, and
+  shutdown finalization are transport-neutral operations with explicit source
+  capabilities and ownership transfer. Node lifecycle no longer enters the
+  metadata dispatcher.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

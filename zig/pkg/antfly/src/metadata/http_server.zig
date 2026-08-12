@@ -21,6 +21,7 @@ const metadata_admin = @import("admin.zig");
 const admin_read_operations = @import("admin_read_operations.zig");
 const admin_mutation_operations = @import("admin_mutation_operations.zig");
 const extension_operations = @import("extension_operations.zig");
+const node_operations = @import("node_operations.zig");
 const operation = @import("../api/operation.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
@@ -1123,8 +1124,12 @@ pub const MetadataHttpServer = struct {
         );
         const node_shutdown_path = routes.Routes.internal_nodes_prefix ++ ":node_id" ++ routes.Routes.internal_node_shutdown_suffix;
         try server.get(node_shutdown_path, httpx.Handler.bind(self, metadataNodeShutdownStatus));
-        try server.put(node_shutdown_path, handler);
-        try server.delete(node_shutdown_path, handler);
+        try server.put(node_shutdown_path, httpx.Handler.bind(self, metadataRequestNodeShutdown));
+        try server.delete(node_shutdown_path, httpx.Handler.bind(self, metadataCancelNodeShutdown));
+        try server.post(routes.Routes.internal_nodes, httpx.Handler.bind(self, metadataRegisterNode));
+        const node_path = routes.Routes.internal_nodes_prefix ++ ":node_id";
+        try server.delete(node_path, httpx.Handler.bind(self, metadataFinalizeNodeShutdown));
+        try server.post(node_path ++ routes.Routes.internal_node_status_suffix, httpx.Handler.bind(self, metadataReportNodeStatus));
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_reallocate, httpx.Handler.bind(self, metadataTriggerReallocate));
@@ -1138,14 +1143,7 @@ pub const MetadataHttpServer = struct {
         try server.post(extension_path ++ routes.Routes.internal_extension_disable_suffix, httpx.Handler.bind(self, metadataDisableExtension));
         try server.put(extension_path ++ routes.Routes.internal_extension_config_suffix, httpx.Handler.bind(self, metadataConfigureExtension));
 
-        const static_paths = [_][]const u8{
-            routes.Routes.internal_nodes,
-        };
-        inline for (static_paths) |path| try server.any(path, handler);
-
         const dynamic_paths = [_][]const u8{
-            routes.Routes.internal_nodes_prefix ++ ":node_id",
-            routes.Routes.internal_nodes_prefix ++ ":node_id" ++ routes.Routes.internal_node_status_suffix,
             routes.Routes.internal_tables_prefix ++ ":table_name",
             routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_restore_suffix,
             routes.Routes.internal_tables_prefix ++ ":table_name" ++ routes.Routes.internal_table_definition_suffix,
@@ -1544,6 +1542,124 @@ pub const MetadataHttpServer = struct {
         return ctx.status(202).text("accepted");
     }
 
+    fn nodeOperations(self: *MetadataHttpServer) node_operations.Operations {
+        return .{ .source = .{
+            .ptr = self,
+            .vtable = &.{
+                .snapshot = nodeSnapshotOperation,
+                .free_snapshot = freeNodeSnapshotOperation,
+                .upsert_node = upsertNodeOperation,
+                .upsert_store = upsertStoreOperation,
+                .report_store_status = reportStoreStatusOperation,
+                .request_shutdown = requestNodeShutdownOperation,
+                .cancel_shutdown = cancelNodeShutdownOperation,
+                .finalize_shutdown = finalizeNodeShutdownOperation,
+                .trigger_reallocate = triggerReallocateOperation,
+            },
+            .supports_upsert_node = self.source.vtable.upsert_node != null,
+            .supports_upsert_store = self.source.vtable.upsert_store != null,
+            .supports_report_store_status = self.source.vtable.report_store_status != null,
+            .supports_request_shutdown = self.source.vtable.request_node_shutdown != null,
+            .supports_cancel_shutdown = self.source.vtable.cancel_node_shutdown != null,
+            .supports_finalize_shutdown = self.source.vtable.finalize_node_shutdown != null,
+        } };
+    }
+
+    fn nodeSnapshotOperation(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.adminSnapshot();
+    }
+
+    fn freeNodeSnapshotOperation(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        self.source.freeAdminSnapshot(snapshot);
+    }
+
+    fn upsertNodeOperation(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.NodeRecord) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.upsertNode(alloc, record);
+    }
+
+    fn upsertStoreOperation(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.StoreRecord) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.upsertStore(alloc, record);
+    }
+
+    fn reportStoreStatusOperation(ptr: *anyopaque, alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.reportStoreStatus(alloc, report);
+    }
+
+    fn requestNodeShutdownOperation(ptr: *anyopaque, node_id: u64) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.requestNodeShutdown(node_id);
+    }
+
+    fn cancelNodeShutdownOperation(ptr: *anyopaque, node_id: u64) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.cancelNodeShutdown(node_id);
+    }
+
+    fn finalizeNodeShutdownOperation(ptr: *anyopaque, node_id: u64) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.finalizeNodeShutdown(node_id);
+    }
+
+    fn nodeMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.InvalidArgument, error.StoreIdentityMismatch => ctx.status(400).text("invalid node request"),
+            error.NodeNotFound, error.UnknownStore => ctx.status(404).text("node not found"),
+            error.ActiveNodeFinalizeRejected => ctx.status(409).text("active node cannot be finalized"),
+            error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
+            else => metadataReadError(ctx, err),
+        };
+    }
+
+    fn metadataRegisterNode(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse "";
+        const node = parseNodeRecord(ctx.allocator, body) catch return ctx.status(400).text("invalid node registration request");
+        var registration = node_operations.Registration{ .node = node };
+        defer registration.deinit(ctx.allocator);
+        if (parseNodeRegistrationIncludesStore(ctx.allocator, body) catch return ctx.status(400).text("invalid node registration request")) {
+            registration.store = parseStoreRecord(ctx.allocator, body) catch return ctx.status(400).text("invalid node registration request");
+        }
+        self.nodeOperations().register(ctx.allocator, requestContext(ctx), &registration) catch |err| switch (err) {
+            error.StoreIdentityMismatch => return ctx.status(400).text("store identity must match node identity"),
+            else => return nodeMutationError(ctx, err),
+        };
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataReportNodeStatus(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
+        const report = parseNodeStatusReport(ctx.allocator, (try ctx.body()) orelse "", node_id) catch
+            return ctx.status(400).text("invalid node status request");
+        var owned = node_operations.StatusReport{ .value = report };
+        defer owned.deinit(ctx.allocator);
+        self.nodeOperations().reportStatus(ctx.allocator, requestContext(ctx), &owned) catch |err| return nodeMutationError(ctx, err);
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataRequestNodeShutdown(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
+        parseNodeShutdownRequest(ctx.allocator, (try ctx.body()) orelse "") catch
+            return ctx.status(400).text("invalid node shutdown request");
+        self.nodeOperations().requestShutdown(ctx.allocator, requestContext(ctx), node_id) catch |err| return nodeMutationError(ctx, err);
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataCancelNodeShutdown(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
+        self.nodeOperations().cancelShutdown(ctx.allocator, requestContext(ctx), node_id) catch |err| return nodeMutationError(ctx, err);
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataFinalizeNodeShutdown(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
+        self.nodeOperations().finalizeShutdown(requestContext(ctx), node_id) catch |err| return nodeMutationError(ctx, err);
+        return ctx.status(202).text("accepted");
+    }
+
     fn contextualRoute(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const method: http_common.Method = switch (ctx.request.method) {
             .GET => .GET,
@@ -1581,45 +1697,6 @@ pub const MetadataHttpServer = struct {
         switch (req.method) {
             .GET => {},
             .POST => {
-                if (std.mem.eql(u8, req.uri, routes.Routes.internal_nodes)) {
-                    var node = parseNodeRecord(alloc, req.body) catch return try textResponse(alloc, 400, "invalid node registration request");
-                    var node_owned = true;
-                    defer if (node_owned) metadata_table_manager.freeNode(alloc, node);
-                    var store: ?metadata_table_manager.StoreRecord = null;
-                    var store_owned = false;
-                    defer if (store_owned) {
-                        if (store) |record| metadata_table_manager.freeStore(alloc, record);
-                    };
-                    if (parseNodeRegistrationIncludesStore(alloc, req.body) catch return try textResponse(alloc, 400, "invalid node registration request")) {
-                        store = parseStoreRecord(alloc, req.body) catch return try textResponse(alloc, 400, "invalid node registration request");
-                        store_owned = true;
-                        if (store.?.node_id != node.node_id or store.?.store_id != node.node_id) return try textResponse(alloc, 400, "store identity must match node identity");
-                        try self.preserveExistingStoreDrainIntent(&store.?);
-                        if (self.source.vtable.upsert_store == null) return try textResponse(alloc, 405, "unsupported operation");
-                    }
-                    try self.preserveExistingNodeLifecycle(alloc, &node);
-                    if (self.source.vtable.upsert_node == null) return try textResponse(alloc, 405, "unsupported operation");
-                    node_owned = false;
-                    self.source.upsertNode(alloc, node) catch |err| switch (err) {
-                        else => return err,
-                    };
-                    if (store) |record| {
-                        store_owned = false;
-                        self.source.upsertStore(alloc, record) catch |err| switch (err) {
-                            else => return err,
-                        };
-                    }
-                    return try textResponse(alloc, 202, "accepted");
-                }
-                if (routes.Routes.matchInternalNodeStatus(req.uri)) |node_id| {
-                    const report = parseNodeStatusReport(alloc, req.body, node_id) catch return try textResponse(alloc, 400, "invalid node status request");
-                    self.source.reportStoreStatus(alloc, report) catch |err| switch (err) {
-                        error.UnknownStore => return try textResponse(alloc, 404, "node not found"),
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
                 if (routes.Routes.matchInternalTable(req.uri)) |table| {
                     var create_req = parseCreateTableRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid create table request");
                     defer create_req.deinit(alloc);
@@ -1710,15 +1787,6 @@ pub const MetadataHttpServer = struct {
                 }
             },
             .PUT => {
-                if (routes.Routes.matchInternalNodeShutdown(req.uri)) |node_id| {
-                    parseNodeShutdownRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid node shutdown request");
-                    self.requestNodeShutdown(alloc, node_id) catch |err| switch (err) {
-                        error.NodeNotFound => return try textResponse(alloc, 404, "node not found"),
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
                 if (routes.Routes.matchInternalTableDefinition(req.uri)) |table| {
                     var parsed = std.json.parseFromSlice(ReplaceTableDefinitionRequest, alloc, req.body, .{ .allocate = .alloc_always }) catch {
                         return try textResponse(alloc, 400, "invalid table definition replacement");
@@ -1787,21 +1855,6 @@ pub const MetadataHttpServer = struct {
                 }
             },
             .DELETE => {
-                if (routes.Routes.matchInternalNodeShutdown(req.uri)) |node_id| {
-                    self.cancelNodeShutdown(alloc, node_id) catch |err| switch (err) {
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
-                if (routes.Routes.matchInternalNode(req.uri)) |node_id| {
-                    self.finalizeNodeShutdown(alloc, node_id) catch |err| switch (err) {
-                        error.ActiveNodeFinalizeRejected => return try textResponse(alloc, 409, "active node cannot be finalized"),
-                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return err,
-                    };
-                    return try textResponse(alloc, 202, "accepted");
-                }
                 if (routes.Routes.matchInternalTable(req.uri)) |table| {
                     self.source.dropTable(alloc, table.table_name) catch |err| switch (err) {
                         error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
@@ -1848,199 +1901,6 @@ pub const MetadataHttpServer = struct {
             },
         }
         return try textResponse(alloc, 404, "not found");
-    }
-
-    fn preserveExistingStoreDrainIntent(self: *MetadataHttpServer, record: *metadata_table_manager.StoreRecord) !void {
-        if (record.drain_requested) return;
-        var snapshot = try self.source.adminSnapshot();
-        defer self.source.freeAdminSnapshot(&snapshot);
-        for (snapshot.nodes) |node| {
-            if (node.node_id != record.node_id) continue;
-            if (!metadata_table_manager.nodeLifecycleActive(node.lifecycle)) {
-                record.drain_requested = true;
-                return;
-            }
-            break;
-        }
-        for (snapshot.stores) |existing| {
-            if (existing.store_id != record.store_id) continue;
-            record.drain_requested = existing.drain_requested;
-            return;
-        }
-    }
-
-    fn preserveExistingNodeLifecycle(self: *MetadataHttpServer, alloc: std.mem.Allocator, record: *metadata_table_manager.NodeRecord) !void {
-        if (!metadata_table_manager.nodeLifecycleActive(record.lifecycle)) return;
-        var snapshot = try self.source.adminSnapshot();
-        defer self.source.freeAdminSnapshot(&snapshot);
-        for (snapshot.nodes) |existing| {
-            if (existing.node_id != record.node_id) continue;
-            if (metadata_table_manager.nodeLifecycleActive(existing.lifecycle)) return;
-            alloc.free(record.lifecycle);
-            record.lifecycle = try alloc.dupe(u8, existing.lifecycle);
-            return;
-        }
-    }
-
-    fn shutdownRequestWouldChange(snapshot: *const metadata_api.AdminSnapshot, node_id: u64) bool {
-        var node_found = false;
-        for (snapshot.nodes) |node| {
-            if (node.node_id != node_id) continue;
-            node_found = true;
-            if (metadata_table_manager.nodeLifecycleActive(node.lifecycle)) return true;
-            break;
-        }
-        if (!node_found) return true;
-        for (snapshot.stores) |store| {
-            if (store.node_id == node_id and !store.drain_requested) return true;
-        }
-        return false;
-    }
-
-    fn shutdownCancelWouldChange(snapshot: *const metadata_api.AdminSnapshot, node_id: u64) bool {
-        for (snapshot.nodes) |node| {
-            if (node.node_id == node_id and !metadata_table_manager.nodeLifecycleActive(node.lifecycle)) return true;
-        }
-        for (snapshot.stores) |store| {
-            if (store.node_id == node_id and store.drain_requested) return true;
-        }
-        return false;
-    }
-
-    fn requestNodeShutdown(self: *MetadataHttpServer, alloc: std.mem.Allocator, node_id: u64) !void {
-        if (self.source.vtable.request_node_shutdown) |_| {
-            try self.source.requestNodeShutdown(node_id);
-            self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
-                else => return err,
-            };
-            return;
-        }
-
-        if (self.source.vtable.upsert_node == null or self.source.vtable.upsert_store == null) return error.UnsupportedOperation;
-        var snapshot = try self.source.adminSnapshot();
-        defer self.source.freeAdminSnapshot(&snapshot);
-
-        var changed = false;
-        var node_found = false;
-        for (snapshot.nodes) |node| {
-            if (node.node_id != node_id) continue;
-            node_found = true;
-            if (std.mem.eql(u8, node.lifecycle, metadata_table_manager.node_lifecycle_draining)) break;
-
-            var updated_node: metadata_table_manager.NodeRecord = undefined;
-            {
-                var cloned_node = try metadata_table_manager.cloneNode(alloc, node);
-                errdefer metadata_table_manager.freeNode(alloc, cloned_node);
-                const draining_lifecycle = try alloc.dupe(u8, metadata_table_manager.node_lifecycle_draining);
-                alloc.free(cloned_node.lifecycle);
-                cloned_node.lifecycle = draining_lifecycle;
-                updated_node = cloned_node;
-            }
-            try self.source.upsertNode(alloc, updated_node);
-            changed = true;
-            break;
-        }
-        if (!node_found) {
-            var draining_node: metadata_table_manager.NodeRecord = undefined;
-            {
-                const role = try alloc.dupe(u8, "data");
-                errdefer alloc.free(role);
-                const lifecycle = try alloc.dupe(u8, metadata_table_manager.node_lifecycle_draining);
-                draining_node = .{
-                    .node_id = node_id,
-                    .role = role,
-                    .lifecycle = lifecycle,
-                };
-            }
-            try self.source.upsertNode(alloc, draining_node);
-            changed = true;
-        }
-
-        for (snapshot.stores) |store| {
-            if (store.node_id != node_id) continue;
-            if (store.drain_requested) continue;
-
-            var updated = try metadata_table_manager.cloneStore(alloc, store);
-            updated.drain_requested = true;
-            try self.source.upsertStore(alloc, updated);
-            changed = true;
-        }
-
-        if (changed) {
-            self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
-                else => return err,
-            };
-        }
-    }
-
-    fn cancelNodeShutdown(self: *MetadataHttpServer, alloc: std.mem.Allocator, node_id: u64) !void {
-        if (self.source.vtable.cancel_node_shutdown) |_| {
-            try self.source.cancelNodeShutdown(node_id);
-            self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
-                else => return err,
-            };
-            return;
-        }
-
-        if (self.source.vtable.upsert_node == null or self.source.vtable.upsert_store == null) return error.UnsupportedOperation;
-        var snapshot = try self.source.adminSnapshot();
-        defer self.source.freeAdminSnapshot(&snapshot);
-
-        var changed = false;
-        for (snapshot.nodes) |node| {
-            if (node.node_id != node_id) continue;
-            if (metadata_table_manager.nodeLifecycleActive(node.lifecycle)) break;
-
-            var updated_node = try metadata_table_manager.cloneNode(alloc, node);
-            var updated_node_owned = true;
-            errdefer if (updated_node_owned) metadata_table_manager.freeNode(alloc, updated_node);
-            const active_lifecycle = try alloc.dupe(u8, metadata_table_manager.node_lifecycle_active);
-            alloc.free(updated_node.lifecycle);
-            updated_node.lifecycle = active_lifecycle;
-            updated_node_owned = false;
-            try self.source.upsertNode(alloc, updated_node);
-            changed = true;
-            break;
-        }
-
-        for (snapshot.stores) |store| {
-            if (store.node_id != node_id) continue;
-            if (!store.drain_requested) continue;
-
-            var updated = try metadata_table_manager.cloneStore(alloc, store);
-            var updated_owned = true;
-            errdefer if (updated_owned) metadata_table_manager.freeStore(alloc, updated);
-            updated.drain_requested = false;
-            updated_owned = false;
-            try self.source.upsertStore(alloc, updated);
-            changed = true;
-        }
-
-        if (changed) {
-            self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
-                else => return err,
-            };
-        }
-    }
-
-    fn finalizeNodeShutdown(self: *MetadataHttpServer, alloc: std.mem.Allocator, node_id: u64) !void {
-        _ = alloc;
-        if (self.source.vtable.finalize_node_shutdown) |_| {
-            var snapshot = try self.source.adminSnapshot();
-            defer self.source.freeAdminSnapshot(&snapshot);
-            if (finalizeWouldDeleteActiveNodeOrStore(&snapshot, node_id)) return error.ActiveNodeFinalizeRejected;
-            try self.source.finalizeNodeShutdown(node_id);
-            self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
-                else => return err,
-            };
-            return;
-        }
-        return error.UnsupportedOperation;
     }
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -2108,21 +1968,6 @@ fn testInternalTableRestoreRequestBodyAlloc(
         .connection = connection,
         .manifest = manifest,
     }, .{});
-}
-
-fn finalizeWouldDeleteActiveNodeOrStore(snapshot: *const metadata_api.AdminSnapshot, node_id: u64) bool {
-    var draining_node = false;
-    for (snapshot.nodes) |node| {
-        if (node.node_id != node_id) continue;
-        if (metadata_table_manager.nodeLifecycleActive(node.lifecycle)) return true;
-        draining_node = true;
-        break;
-    }
-    if (draining_node) return false;
-    for (snapshot.stores) |store| {
-        if (store.node_id == node_id and !store.drain_requested) return true;
-    }
-    return false;
 }
 
 fn parseSplitRequest(alloc: std.mem.Allocator, body: []const u8) !SplitRequest {
@@ -3108,9 +2953,7 @@ fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
 }
 
 fn freeStoreStatusReport(alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) void {
-    alloc.free(report.health_class);
-    metadata_table_manager.freeGroupStatuses(alloc, report.group_statuses);
-    metadata_table_manager.freeRuntimeGroupStatusReports(alloc, report.runtime_statuses);
+    node_operations.freeStoreStatusReport(alloc, report);
 }
 
 test "metadata http server serves status and filtered admin routes" {
@@ -3584,49 +3427,45 @@ test "metadata http server registers nodes and marks node stores draining for sh
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
 
-    var node_resp = try server.handle(.{ .method = .POST, .uri = routes.Routes.internal_nodes, .body = "{\"node_id\":9,\"role\":\"data\"}" });
-    defer node_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), node_resp.status);
+    var node_resp = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_nodes, &.{}, "{\"node_id\":9,\"role\":\"data\"}", MetadataHttpServer.metadataRegisterNode);
+    defer node_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), node_resp.status.code);
     try std.testing.expectEqual(@as(usize, 1), source.node_count);
     try std.testing.expect(metadata_table_manager.nodeLifecycleActive(source.nodes[0].lifecycle));
 
-    var draining_register_resp = try server.handle(.{ .method = .POST, .uri = routes.Routes.internal_nodes, .body = "{\"node_id\":99,\"role\":\"data\",\"lifecycle\":\"draining\"}" });
-    defer draining_register_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 400), draining_register_resp.status);
+    var draining_register_resp = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_nodes, &.{}, "{\"node_id\":99,\"role\":\"data\",\"lifecycle\":\"draining\"}", MetadataHttpServer.metadataRegisterNode);
+    defer draining_register_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 400), draining_register_resp.status.code);
     try std.testing.expectEqual(@as(usize, 1), source.node_count);
     try std.testing.expect(!source.stores[1].drain_requested);
 
-    var shutdown_resp = try server.handle(.{ .method = .PUT, .uri = "/internal/v1/nodes/9/shutdown", .body = "{\"type\":\"remove\",\"reason\":\"test\"}" });
-    defer shutdown_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), shutdown_resp.status);
+    const node_9_params = [_]httpx.RouteParam{.{ .name = "node_id", .value = "9" }};
+    var shutdown_resp = try server.executeTypedHandlerWithBodyForTest(.PUT, "/internal/v1/nodes/9/shutdown", &node_9_params, "{\"type\":\"remove\",\"reason\":\"test\"}", MetadataHttpServer.metadataRequestNodeShutdown);
+    defer shutdown_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), shutdown_resp.status.code);
     try std.testing.expect(std.mem.eql(u8, source.nodes[0].lifecycle, metadata_table_manager.node_lifecycle_draining));
     try std.testing.expect(source.stores[0].drain_requested);
     try std.testing.expect(source.reallocate_triggered);
 
-    var register_node_resp = try server.handle(.{ .method = .POST, .uri = routes.Routes.internal_nodes, .body = "{\"node_id\":9,\"role\":\"data\"}" });
-    defer register_node_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), register_node_resp.status);
+    var register_node_resp = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_nodes, &.{}, "{\"node_id\":9,\"role\":\"data\"}", MetadataHttpServer.metadataRegisterNode);
+    defer register_node_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), register_node_resp.status.code);
     try std.testing.expect(std.mem.eql(u8, source.nodes[0].lifecycle, metadata_table_manager.node_lifecycle_draining));
 
-    var register_node_store_resp = try server.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.internal_nodes,
-        .body = "{\"store_id\":9,\"node_id\":9,\"role\":\"data\",\"health_class\":\"healthy\",\"live\":true}",
-    });
-    defer register_node_store_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), register_node_store_resp.status);
+    var register_node_store_resp = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_nodes, &.{}, "{\"store_id\":9,\"node_id\":9,\"role\":\"data\",\"health_class\":\"healthy\",\"live\":true}", MetadataHttpServer.metadataRegisterNode);
+    defer register_node_store_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), register_node_store_resp.status.code);
     try std.testing.expect(source.stores[0].drain_requested);
 
-    const node_9_params = [_]httpx.RouteParam{.{ .name = "node_id", .value = "9" }};
     var status_resp = try server.executeTypedHandlerForTest(.GET, "/internal/v1/nodes/9/shutdown", &node_9_params, MetadataHttpServer.metadataNodeShutdownStatus);
     defer status_resp.deinit();
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"phase\":\"complete\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"safe_to_terminate\":true") != null);
 
     source.reallocate_triggered = false;
-    var cancel_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/nodes/9/shutdown" });
-    defer cancel_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), cancel_resp.status);
+    var cancel_resp = try server.executeTypedHandlerForTest(.DELETE, "/internal/v1/nodes/9/shutdown", &node_9_params, MetadataHttpServer.metadataCancelNodeShutdown);
+    defer cancel_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), cancel_resp.status.code);
     try std.testing.expect(metadata_table_manager.nodeLifecycleActive(source.nodes[0].lifecycle));
     try std.testing.expect(!source.stores[0].drain_requested);
     try std.testing.expect(source.reallocate_triggered);
@@ -3636,37 +3475,29 @@ test "metadata http server registers nodes and marks node stores draining for sh
     try std.testing.expect(std.mem.indexOf(u8, cancelled_status_resp.body.?, "\"phase\":\"active\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, cancelled_status_resp.body.?, "\"safe_to_terminate\":false") != null);
 
-    var post_cancel_register_node_store_resp = try server.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.internal_nodes,
-        .body = "{\"store_id\":9,\"node_id\":9,\"role\":\"data\",\"health_class\":\"healthy\",\"live\":true}",
-    });
-    defer post_cancel_register_node_store_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), post_cancel_register_node_store_resp.status);
+    var post_cancel_register_node_store_resp = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_nodes, &.{}, "{\"store_id\":9,\"node_id\":9,\"role\":\"data\",\"health_class\":\"healthy\",\"live\":true}", MetadataHttpServer.metadataRegisterNode);
+    defer post_cancel_register_node_store_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), post_cancel_register_node_store_resp.status.code);
     try std.testing.expect(!source.stores[0].drain_requested);
 
     source.reallocate_triggered = false;
-    var retry_cancel_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/nodes/9/shutdown" });
-    defer retry_cancel_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), retry_cancel_resp.status);
+    var retry_cancel_resp = try server.executeTypedHandlerForTest(.DELETE, "/internal/v1/nodes/9/shutdown", &node_9_params, MetadataHttpServer.metadataCancelNodeShutdown);
+    defer retry_cancel_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), retry_cancel_resp.status.code);
     try std.testing.expect(!source.reallocate_triggered);
 
-    var retry_resp = try server.handle(.{ .method = .PUT, .uri = "/internal/v1/nodes/99/shutdown", .body = "{\"type\":\"remove\"}" });
-    defer retry_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), retry_resp.status);
+    const node_99_params = [_]httpx.RouteParam{.{ .name = "node_id", .value = "99" }};
+    var retry_resp = try server.executeTypedHandlerWithBodyForTest(.PUT, "/internal/v1/nodes/99/shutdown", &node_99_params, "{\"type\":\"remove\"}", MetadataHttpServer.metadataRequestNodeShutdown);
+    defer retry_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), retry_resp.status.code);
     try std.testing.expectEqual(@as(usize, 2), source.node_count);
     try std.testing.expect(std.mem.eql(u8, source.nodes[1].lifecycle, metadata_table_manager.node_lifecycle_draining));
 
-    var register_unknown_store_resp = try server.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.internal_nodes,
-        .body = "{\"store_id\":99,\"node_id\":99,\"role\":\"data\",\"health_class\":\"healthy\",\"live\":true}",
-    });
-    defer register_unknown_store_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), register_unknown_store_resp.status);
+    var register_unknown_store_resp = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_nodes, &.{}, "{\"store_id\":99,\"node_id\":99,\"role\":\"data\",\"health_class\":\"healthy\",\"live\":true}", MetadataHttpServer.metadataRegisterNode);
+    defer register_unknown_store_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), register_unknown_store_resp.status.code);
     try std.testing.expect(source.stores[1].drain_requested);
 
-    const node_99_params = [_]httpx.RouteParam{.{ .name = "node_id", .value = "99" }};
     var unknown_status_resp = try server.executeTypedHandlerForTest(.GET, "/internal/v1/nodes/99/shutdown", &node_99_params, MetadataHttpServer.metadataNodeShutdownStatus);
     defer unknown_status_resp.deinit();
     try std.testing.expect(std.mem.indexOf(u8, unknown_status_resp.body.?, "\"phase\":\"complete\"") != null);
@@ -3784,17 +3615,18 @@ test "metadata http server appends explicit shutdown commands even when snapshot
 
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    const node_params = [_]httpx.RouteParam{.{ .name = "node_id", .value = "9" }};
 
-    var cancel_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/nodes/9/shutdown" });
-    defer cancel_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), cancel_resp.status);
+    var cancel_resp = try server.executeTypedHandlerForTest(.DELETE, "/internal/v1/nodes/9/shutdown", &node_params, MetadataHttpServer.metadataCancelNodeShutdown);
+    defer cancel_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), cancel_resp.status.code);
     try std.testing.expectEqual(@as(usize, 1), source.cancel_count);
     try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
 
     source.nodes[0].lifecycle = metadata_table_manager.node_lifecycle_draining;
-    var request_resp = try server.handle(.{ .method = .PUT, .uri = "/internal/v1/nodes/9/shutdown", .body = "{\"type\":\"remove\"}" });
-    defer request_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), request_resp.status);
+    var request_resp = try server.executeTypedHandlerWithBodyForTest(.PUT, "/internal/v1/nodes/9/shutdown", &node_params, "{\"type\":\"remove\"}", MetadataHttpServer.metadataRequestNodeShutdown);
+    defer request_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), request_resp.status.code);
     try std.testing.expectEqual(@as(usize, 1), source.request_count);
     try std.testing.expectEqual(@as(usize, 2), source.reallocate_count);
 }
@@ -3856,17 +3688,18 @@ test "metadata http server finalizes node shutdown through explicit command" {
 
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    const node_params = [_]httpx.RouteParam{.{ .name = "node_id", .value = "9" }};
 
-    var active_finalize_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/nodes/9" });
-    defer active_finalize_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 409), active_finalize_resp.status);
+    var active_finalize_resp = try server.executeTypedHandlerForTest(.DELETE, "/internal/v1/nodes/9", &node_params, MetadataHttpServer.metadataFinalizeNodeShutdown);
+    defer active_finalize_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 409), active_finalize_resp.status.code);
     try std.testing.expectEqual(@as(usize, 0), source.finalize_count);
     try std.testing.expectEqual(@as(usize, 0), source.reallocate_count);
 
     source.nodes[0].lifecycle = metadata_table_manager.node_lifecycle_draining;
-    var finalize_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/nodes/9" });
-    defer finalize_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), finalize_resp.status);
+    var finalize_resp = try server.executeTypedHandlerForTest(.DELETE, "/internal/v1/nodes/9", &node_params, MetadataHttpServer.metadataFinalizeNodeShutdown);
+    defer finalize_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), finalize_resp.status.code);
     try std.testing.expectEqual(@as(usize, 1), source.finalize_count);
     try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
 }
@@ -3921,16 +3754,17 @@ test "metadata http server rejects finalizing active store-only node" {
 
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    const node_params = [_]httpx.RouteParam{.{ .name = "node_id", .value = "9" }};
 
-    var active_finalize_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/nodes/9" });
-    defer active_finalize_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 409), active_finalize_resp.status);
+    var active_finalize_resp = try server.executeTypedHandlerForTest(.DELETE, "/internal/v1/nodes/9", &node_params, MetadataHttpServer.metadataFinalizeNodeShutdown);
+    defer active_finalize_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 409), active_finalize_resp.status.code);
     try std.testing.expectEqual(@as(usize, 0), source.finalize_count);
 
     source.stores[0].drain_requested = true;
-    var draining_finalize_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/nodes/9" });
-    defer draining_finalize_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), draining_finalize_resp.status);
+    var draining_finalize_resp = try server.executeTypedHandlerForTest(.DELETE, "/internal/v1/nodes/9", &node_params, MetadataHttpServer.metadataFinalizeNodeShutdown);
+    defer draining_finalize_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), draining_finalize_resp.status.code);
     try std.testing.expectEqual(@as(usize, 1), source.finalize_count);
 }
 
@@ -4028,25 +3862,22 @@ test "metadata http server stale registration from another admin instance cannot
     defer source.deinit(std.testing.allocator);
     var server_a = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
     var server_b = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    const node_params = [_]httpx.RouteParam{.{ .name = "node_id", .value = "9" }};
 
-    var shutdown_resp = try server_a.handle(.{ .method = .PUT, .uri = "/internal/v1/nodes/9/shutdown", .body = "{\"type\":\"remove\"}" });
-    defer shutdown_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), shutdown_resp.status);
+    var shutdown_resp = try server_a.executeTypedHandlerWithBodyForTest(.PUT, "/internal/v1/nodes/9/shutdown", &node_params, "{\"type\":\"remove\"}", MetadataHttpServer.metadataRequestNodeShutdown);
+    defer shutdown_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), shutdown_resp.status.code);
     try std.testing.expect(source.stores[0].drain_requested);
 
     source.stage_next_store = true;
-    var stale_register_resp = try server_a.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.internal_nodes,
-        .body = "{\"store_id\":9,\"node_id\":9,\"role\":\"data\",\"health_class\":\"healthy\",\"live\":true}",
-    });
-    defer stale_register_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), stale_register_resp.status);
+    var stale_register_resp = try server_a.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_nodes, &.{}, "{\"store_id\":9,\"node_id\":9,\"role\":\"data\",\"health_class\":\"healthy\",\"live\":true}", MetadataHttpServer.metadataRegisterNode);
+    defer stale_register_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), stale_register_resp.status.code);
     try std.testing.expect(source.pending_store.?.drain_requested);
 
-    var cancel_resp = try server_b.handle(.{ .method = .DELETE, .uri = "/internal/v1/nodes/9/shutdown" });
-    defer cancel_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), cancel_resp.status);
+    var cancel_resp = try server_b.executeTypedHandlerForTest(.DELETE, "/internal/v1/nodes/9/shutdown", &node_params, MetadataHttpServer.metadataCancelNodeShutdown);
+    defer cancel_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 202), cancel_resp.status.code);
     try std.testing.expect(metadata_table_manager.nodeLifecycleActive(source.nodes[0].lifecycle));
     try std.testing.expect(!source.stores[0].drain_requested);
 
@@ -4325,67 +4156,39 @@ test "metadata http server accepts internal reallocate and split merge routes" {
     defer reallocate.deinit();
     try std.testing.expectEqual(@as(u16, 202), reallocate.status.code);
 
-    var zero_node = try server.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.internal_nodes,
-        .body = "{\"node_id\":0}",
-        .content_type = "application/json",
-    });
-    defer zero_node.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 400), zero_node.status);
+    var zero_node = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_nodes, &.{}, "{\"node_id\":0}", MetadataHttpServer.metadataRegisterNode);
+    defer zero_node.deinit();
+    try std.testing.expectEqual(@as(u16, 400), zero_node.status.code);
 
-    var zero_store = try server.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.internal_nodes,
-        .body = "{\"store_id\":0,\"node_id\":0}",
-        .content_type = "application/json",
-    });
-    defer zero_store.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 400), zero_store.status);
+    var zero_store = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_nodes, &.{}, "{\"store_id\":0,\"node_id\":0}", MetadataHttpServer.metadataRegisterNode);
+    defer zero_store.deinit();
+    try std.testing.expectEqual(@as(u16, 400), zero_store.status.code);
 
-    var mismatched_store = try server.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.internal_nodes,
-        .body = "{\"store_id\":7,\"node_id\":1}",
-        .content_type = "application/json",
-    });
-    defer mismatched_store.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 400), mismatched_store.status);
+    var mismatched_store = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_nodes, &.{}, "{\"store_id\":7,\"node_id\":1}", MetadataHttpServer.metadataRegisterNode);
+    defer mismatched_store.deinit();
+    try std.testing.expectEqual(@as(u16, 400), mismatched_store.status.code);
 
-    var zero_node_status = try server.handle(.{
-        .method = .POST,
-        .uri = "/internal/v1/nodes/0/status",
-        .body = "{\"health_class\":\"healthy\"}",
-        .content_type = "application/json",
-    });
-    defer zero_node_status.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 404), zero_node_status.status);
+    const zero_node_params = [_]httpx.RouteParam{.{ .name = "node_id", .value = "0" }};
+    var zero_node_status = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/nodes/0/status", &zero_node_params, "{\"health_class\":\"healthy\"}", MetadataHttpServer.metadataReportNodeStatus);
+    defer zero_node_status.deinit();
+    try std.testing.expectEqual(@as(u16, 404), zero_node_status.status.code);
 
-    var zero_node_shutdown = try server.handle(.{ .method = .PUT, .uri = "/internal/v1/nodes/0/shutdown", .body = "{\"type\":\"remove\"}" });
-    defer zero_node_shutdown.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 404), zero_node_shutdown.status);
+    var zero_node_shutdown = try server.executeTypedHandlerWithBodyForTest(.PUT, "/internal/v1/nodes/0/shutdown", &zero_node_params, "{\"type\":\"remove\"}", MetadataHttpServer.metadataRequestNodeShutdown);
+    defer zero_node_shutdown.deinit();
+    try std.testing.expectEqual(@as(u16, 404), zero_node_shutdown.status.code);
 
-    var zero_node_finalize = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/nodes/0" });
-    defer zero_node_finalize.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 404), zero_node_finalize.status);
+    var zero_node_finalize = try server.executeTypedHandlerForTest(.DELETE, "/internal/v1/nodes/0", &zero_node_params, MetadataHttpServer.metadataFinalizeNodeShutdown);
+    defer zero_node_finalize.deinit();
+    try std.testing.expectEqual(@as(u16, 404), zero_node_finalize.status.code);
 
-    var store = try server.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.internal_nodes,
-        .body = "{\"store_id\":7,\"node_id\":7}",
-        .content_type = "application/json",
-    });
-    defer store.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), store.status);
+    var store = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_nodes, &.{}, "{\"store_id\":7,\"node_id\":7}", MetadataHttpServer.metadataRegisterNode);
+    defer store.deinit();
+    try std.testing.expectEqual(@as(u16, 202), store.status.code);
 
-    var store_status = try server.handle(.{
-        .method = .POST,
-        .uri = "/internal/v1/nodes/7/status",
-        .body = "{\"store_id\":7,\"health_class\":\"healthy\"}",
-        .content_type = "application/json",
-    });
-    defer store_status.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), store_status.status);
+    const node_7_params = [_]httpx.RouteParam{.{ .name = "node_id", .value = "7" }};
+    var store_status = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/nodes/7/status", &node_7_params, "{\"store_id\":7,\"health_class\":\"healthy\"}", MetadataHttpServer.metadataReportNodeStatus);
+    defer store_status.deinit();
+    try std.testing.expectEqual(@as(u16, 202), store_status.status.code);
 
     const restore_body = try testInternalTableRestoreRequestBodyAlloc(
         std.testing.allocator,
