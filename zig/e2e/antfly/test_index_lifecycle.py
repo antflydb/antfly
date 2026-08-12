@@ -571,6 +571,74 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
     assert hits[0]["_id"] == "doc:a"
 
 
+def test_stateful_back_to_back_external_embedding_indexes_admit_immediate_batch(stateful_api):
+    table_name = f"stateful_external_embeddings_online_admission_{time.time_ns()}"
+    index_names = ("vectors_one", "vectors_two")
+    vector = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert created["name"] == table_name
+
+    for index_name in index_names:
+        # Do not wait for runtime readiness between creates. The regression
+        # requires each short write-capability admission to complete while the
+        # prior index can still have background lifecycle work queued.
+        assert (
+            stateful_api.post(
+                f"/tables/{table_name}/indexes/{index_name}",
+                {
+                    "name": index_name,
+                    "type": "embeddings",
+                    "external": True,
+                    "dimension": len(vector),
+                    "distance_metric": "cosine",
+                },
+            )
+            == {}
+        )
+
+    batch = stateful_api.batch_write(
+        table_name,
+        inserts={
+            "doc:a": {
+                "content": "one document, two vectors",
+                "_embeddings": {index_name: vector for index_name in index_names},
+            }
+        },
+        sync_level="full_index",
+    )
+    assert batch["status"] == "committed"
+    assert batch["inserted"] == 1
+
+    for index_name in index_names:
+        ready = wait_until(
+            lambda index_name=index_name: _ready_index(
+                stateful_api,
+                table_name,
+                index_name,
+                expected_docs=1,
+            ),
+            timeout_s=30.0,
+            interval_s=0.25,
+        )
+        assert ready is not None, json.dumps(
+            stateful_api.get_index(table_name, index_name),
+            indent=2,
+            sort_keys=True,
+        )
+        assert int(ready.get("total_indexed", ready.get("doc_count", 0))) == 1
+
+        result = stateful_api.query_table(
+            table_name,
+            {
+                "embeddings": {index_name: vector},
+                "indexes": [index_name],
+                "limit": 5,
+            },
+        )
+        assert _response_hit_ids(result) == ["doc:a"]
+
+
 def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
     stateful_api,
     openai_embedder,

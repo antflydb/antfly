@@ -56,6 +56,7 @@ Use product-area names for test files. Do not use migration labels like `*_parit
   - full-text rebuild from `full_text_index_v0` to `full_text_index_v1`
 - `test_index_lifecycle.py`
   - shared backend-agnostic table index lifecycle coverage
+  - back-to-back external vector index admission installs every write path before background catch-up
   - stateful and serverless both run here when the behavior is part of the shared `/tables/...` contract
   - rejection of non-Go public full-text chunk-source config
   - chunker-driven full-text routing from template chunks, normalized to index-visible semantics

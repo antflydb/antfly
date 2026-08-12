@@ -909,16 +909,11 @@ fn ensureIndexDefinition(
         .config_json = desired.config_json,
         .coverage_generation = desired.coverage_generation,
     };
-    if (desired.kind == .full_text) {
-        const repair_id = db.admitManagedFullTextIndex(admitted) catch |err| switch (err) {
-            error.IndexArtifactCleanupPending => {
-                summary.pending += 1;
-                return;
-            },
-            else => return err,
-        };
-        if (repair_id != null) summary.pending += 1;
-    } else {
+    if (!db_mod.DB.indexKindSupportsManagedGenerationRepair(desired.kind)) {
+        // Algebraic admission is O(1): the base index starts observing writes
+        // immediately and its adaptive materializations own their own bounded
+        // lifecycle. It must not enter generation repair, which deliberately
+        // has no algebraic shadow rebuilder.
         db.addIndex(admitted) catch |err| switch (err) {
             error.IndexArtifactCleanupPending => {
                 summary.pending += 1;
@@ -926,6 +921,15 @@ fn ensureIndexDefinition(
             },
             else => return err,
         };
+    } else {
+        const repair_id = db.admitManagedIndex(admitted) catch |err| switch (err) {
+            error.IndexArtifactCleanupPending => {
+                summary.pending += 1;
+                return;
+            },
+            else => return err,
+        };
+        if (repair_id != null) summary.pending += 1;
     }
     summary.added += 1;
 }
@@ -1870,6 +1874,38 @@ test "table provisioner reconciles stored algebraic metadata without public type
     try std.testing.expectEqual(@as(usize, 0), summary.added);
     try std.testing.expectEqual(@as(usize, 0), summary.removed);
     try std.testing.expect(db.core.index_manager.algebraicIndex("alg") != null);
+}
+
+test "table provisioner admits algebraic index on a non-empty table without repair debt" {
+    const path = "/tmp/antfly-metadata-table-provisioner-algebraic-non-empty";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2002);
+    defer std.testing.allocator.free(db_path);
+    try fs_paths.createDirPathPortable(io_impl.io(), db_path);
+
+    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"product\":\"hammer\"}" }},
+        .sync_level = .write,
+    });
+
+    const indexes_json =
+        \\{"alg":{"version":1,"table":"docs","schema_version":1,"group_fields":[{"name":"product","path":"product","type":"string"}],"materializations":[]}}
+    ;
+    const summary = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
+    try std.testing.expectEqual(@as(usize, 1), summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 0), summary.indexes_pending);
+    try std.testing.expect(db.core.index_manager.algebraicIndex("alg") != null);
+    try std.testing.expect(!db.core.index_manager.repairUnavailable("alg"));
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(std.testing.allocator));
 }
 
 test "table provisioner extracts public algebraic metadata as internal config" {

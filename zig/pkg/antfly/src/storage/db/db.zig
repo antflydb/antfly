@@ -10287,8 +10287,7 @@ pub const DB = struct {
         }
         if (types.indexConfigHash(cfg.*) != marker.config_hash)
             return error.InvalidManagedIndexAdmission;
-        if (marker.disposition == .managed_rebuild and
-            (cfg.kind != .full_text or marker.source_doc_count == 0))
+        if (marker.disposition == .managed_rebuild and marker.source_doc_count == 0)
             return error.InvalidManagedIndexAdmission;
         const summary = try self.managedAdmissionVisibilitySummary();
         const current_identity_generation = @max(
@@ -15154,8 +15153,20 @@ pub const DB = struct {
 
     const IndexAdmissionMode = enum {
         ordinary,
-        managed_full_text,
+        managed,
     };
+
+    pub fn indexKindSupportsManagedGenerationRepair(kind: types.IndexKind) bool {
+        return switch (kind) {
+            .dense_vector, .sparse_vector, .graph, .full_text => true,
+            // Algebraic indexes are installed in O(1) and maintain their
+            // adaptive materializations through their own lifecycle. The
+            // shadow generation repair engine intentionally has no algebraic
+            // rebuilder, so admitting one into that engine would strand it in
+            // a terminal fail-closed state.
+            .algebraic => false,
+        };
+    }
 
     const managed_index_admission_magic: u64 = 0x324d444154584449; // "IDXTADM2"
     const managed_index_admission_encoded_len = 48;
@@ -15237,10 +15248,11 @@ pub const DB = struct {
     ) !InstalledIndex {
         lockApply(self);
         defer self.core.unlockApply();
+        if (admission_mode == .managed and !indexKindSupportsManagedGenerationRepair(cfg.kind))
+            return error.UnsupportedOperation;
         try self.removeOrphanedIndexRepairIntentForFreshAdmission(self.alloc, cfg.name);
-        if (admission_mode == .managed_full_text and cfg.kind != .full_text) return error.InvalidArgument;
         const summary = try self.managedAdmissionVisibilitySummary();
-        const disposition: IndexAdmissionDisposition = if (admission_mode == .managed_full_text and summary.live_ordinals != 0)
+        const disposition: IndexAdmissionDisposition = if (admission_mode == .managed and summary.live_ordinals != 0)
             .managed_rebuild
         else
             .activation_fence;
@@ -15271,7 +15283,7 @@ pub const DB = struct {
         // generation at the current replay head without scanning tombstones.
         var applied = switch (admission_mode) {
             .ordinary => try self.core.addIndex(cfg, admission_write),
-            .managed_full_text => try self.core.addManagedIndex(cfg, admission_write),
+            .managed => try self.core.addManagedIndex(cfg, admission_write),
         };
         catalog_committed = true;
         // Publish outbox work only after the catalog/marker transaction is
@@ -15283,7 +15295,7 @@ pub const DB = struct {
             error.TestPostCommitIndexActivation
         else
             null;
-        if (admission_mode == .managed_full_text and disposition == .activation_fence) {
+        if (admission_mode == .managed and disposition == .activation_fence) {
             applied = self.core.nextDerivedSequence();
         }
         if (post_commit_error == null) {
@@ -15391,7 +15403,7 @@ pub const DB = struct {
         } else null;
 
         var worker_applied = installed.applied;
-        if (installed.needs_enrichment_replay) {
+        if (installed.needs_enrichment_replay and !installed.managed_admission_pending) {
             // A newly admitted index owns a fresh coverage generation. Establish
             // its worker baseline only after current artifact reconstruction.
             const rebuilt = switch (cfg.kind) {
@@ -15470,11 +15482,20 @@ pub const DB = struct {
     }
 
     /// Managed table reconciliation uses a crash-consistent catalog/outbox
-    /// admission. Corpus reconstruction remains asynchronous and bounded by
-    /// the owner-side generation repair scheduler.
+    /// admission for index kinds supported by shadow generation repair.
+    /// Corpus reconstruction remains asynchronous and bounded by the
+    /// owner-side generation repair scheduler, while the installed worker
+    /// records writes after the admission fence. O(1) index kinds without a
+    /// generation rebuilder must use ordinary admission instead.
+    pub fn admitManagedIndex(self: *DB, cfg: types.IndexConfig) !?u128 {
+        return try self.addIndexWithAdmission(cfg, .managed);
+    }
+
+    /// Compatibility wrapper for callers that specifically admit full-text
+    /// indexes. New managed-table code should use admitManagedIndex.
     pub fn admitManagedFullTextIndex(self: *DB, cfg: types.IndexConfig) !?u128 {
         if (cfg.kind != .full_text) return error.InvalidArgument;
-        return try self.addIndexWithAdmission(cfg, .managed_full_text);
+        return try self.admitManagedIndex(cfg);
     }
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
@@ -67904,6 +67925,90 @@ test "db dense repair durably yields and resumes a reopenable building candidate
     try std.testing.expect(found_replayed_insert);
 }
 
+test "db managed vector admission captures writes while durable repair is pending" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"before admission\"}" }},
+        .sync_level = .write,
+    });
+
+    _ = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+    try std.testing.expectError(error.IndexRebuilding, db.search(alloc, .{
+        .index_name = cfg.name,
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } },
+    }));
+
+    // A post-admission write is allowed to commit while the corpus rebuild is
+    // pending. With workers disabled, its target watermark is durable proof
+    // that catch-up owns the write instead of silently dropping the vector.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:new",
+            .value = "{\"body\":\"after admission\",\"_embeddings\":{\"semantic_idx\":[1,0,0]}}",
+        }},
+        .sync_level = .write,
+    });
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    const target = for (stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, cfg.name)) break item;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), target.doc_count);
+    try std.testing.expect(target.replay_target_sequence > target.replay_applied_sequence);
+}
+
+test "db managed admission rejects algebraic repair without poisoning ordinary admission" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "analytics_idx",
+        .kind = .algebraic,
+        .config_json =
+        \\{"version":1,"table":"docs","group_fields":[{"name":"category","path":"category","type":"string"}],"materializations":[]}
+        ,
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"category\":\"tools\"}" }},
+        .sync_level = .write,
+    });
+
+    try std.testing.expectError(error.UnsupportedOperation, db.admitManagedIndex(cfg));
+    try std.testing.expect(db.core.index_manager.algebraicIndex(cfg.name) == null);
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+
+    // Algebraic base-index admission is already O(1), so the ordinary path is
+    // the supported online lifecycle even when the table is non-empty.
+    try db.addIndex(cfg);
+    try std.testing.expect(db.core.index_manager.algebraicIndex(cfg.name) != null);
+    try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+}
+
 test "db managed full text admission survives restart without in-place backfill" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -68416,7 +68521,7 @@ test "db managed admission materialization serializes with index deletion" {
         .name = index_name,
         .kind = .full_text,
         .config_json = "{}",
-    }, .managed_full_text);
+    }, .managed);
 
     const Race = struct {
         db: *DB,
