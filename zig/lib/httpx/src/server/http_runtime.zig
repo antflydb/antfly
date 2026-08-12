@@ -131,7 +131,7 @@ pub const HttpRuntime = struct {
 };
 
 test "HTTP runtime listener leases share one cancellation observer lifecycle" {
-    if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .freestanding) return;
+    if (@import("builtin").os.tag == .freestanding) return;
     var runtime = HttpRuntime.init(std.testing.allocator, .{ .max_active_h1_requests = 2 });
     defer runtime.deinit();
 

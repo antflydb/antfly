@@ -61,6 +61,19 @@ const SharedBodyBudget = @import("../protocol/body_budget.zig").SharedBodyBudget
 const HttpRuntime = @import("http_runtime.zig").HttpRuntime;
 const CancellationObserver = @import("cancellation_observer.zig").Observer;
 
+fn deadlineAfter(io: Io, timeout_ms: u64) i64 {
+    if (timeout_ms == 0) return 0;
+    const bounded_ms: i64 = @intCast(@min(timeout_ms, @as(u64, std.math.maxInt(i64))));
+    return milliTimestamp(io) +| bounded_ms;
+}
+
+fn applyReadDeadline(sock: *Socket, io: Io, deadline_ms: i64) !void {
+    if (deadline_ms == 0) return sock.setRecvTimeout(0);
+    const remaining_ms = deadline_ms - milliTimestamp(io);
+    if (remaining_ms <= 0) return error.Timeout;
+    try sock.setRecvTimeout(@intCast(remaining_ms));
+}
+
 pub const CookieOptions = common.CookieOptions;
 pub const SameSite = common.SameSite;
 
@@ -92,7 +105,14 @@ pub const ServerConfig = struct {
     max_body_size: usize = 10 * 1024 * 1024,
     max_headers: usize = 100,
     max_file_size: usize = types.default_max_body_size,
-    request_timeout_ms: u64 = 30_000,
+    /// Absolute wall-clock limit for receiving one request's header block.
+    /// Zero disables this phase deadline.
+    header_read_timeout_ms: u64 = 30_000,
+    /// Absolute wall-clock limit for receiving one request body after headers.
+    /// Zero disables this phase deadline.
+    body_read_timeout_ms: u64 = 120_000,
+    /// Per-write socket timeout for response delivery. Zero disables it.
+    response_write_timeout_ms: u64 = 30_000,
     keep_alive_timeout_ms: u64 = 60_000,
     max_connections: u32 = 1000,
     /// Optional transport runtime shared by multiple listeners. When absent,
@@ -142,8 +162,10 @@ pub const ServerConfig = struct {
 
 fn routeErrorStatus(err: anyerror) u16 {
     return switch (err) {
+        error.Timeout => 408,
         error.BodyTooLarge, error.StreamTooLong, error.ValueTooLong => 413,
         error.BodyCapacityExceeded => 429,
+        error.EndOfStream,
         error.SyntaxError,
         error.UnexpectedToken,
         error.MissingField,
@@ -257,6 +279,11 @@ pub const Context = struct {
     /// or HTTP/2 connection representations across a code-generation ABI.
     stream_delegate: ?StreamDelegate = null,
 
+    /// Optional transport-neutral lazy request body. Linked runtime adapters
+    /// use this to retain transport ownership while application admission runs
+    /// before a streaming upload is buffered.
+    body_delegate: ?BodyDelegate = null,
+
     /// Streaming body reader for HTTP/2 requests where the body arrives
     /// incrementally (dispatch-on-HEADERS mode). Null for HTTP/1.1 or
     /// for H2 requests that completed before the handler was dispatched.
@@ -284,6 +311,12 @@ pub const Context = struct {
         start: *const fn (?*anyopaque, u16) anyerror!void,
         write: *const fn (?*anyopaque, []const u8) anyerror!void,
         close: *const fn (?*anyopaque) anyerror!void,
+    };
+
+    pub const BodyDelegate = struct {
+        ptr: ?*anyopaque,
+        read_all: *const fn (?*anyopaque) anyerror!?[]const u8,
+        streaming: bool,
     };
 
     /// Creates a new context for a request.
@@ -518,13 +551,13 @@ pub const Context = struct {
         h2_stream: *Stream,
         io: Io,
         data_event: *Io.Event,
-        /// Read timeout for body data. Defaults to the server's request_timeout_ms.
-        /// Prevents handler fibers from blocking indefinitely when a peer stops
-        /// sending DATA frames without closing the stream.
-        read_timeout: Io.Timeout = .none,
+        /// One absolute body deadline shared by every read. A duration timeout
+        /// here would renew after each DATA frame and permit an endless
+        /// trickle upload to retain application admission.
+        deadline_ms: i64 = 0,
 
         /// Reads available body data into `buf`. Returns 0 on EOF.
-        /// Returns error.Timeout if no data arrives within read_timeout.
+        /// Returns error.Timeout once the shared body deadline expires.
         pub fn read(self: *H2StreamReader, buf: []u8) !usize {
             while (true) {
                 const avail = self.h2_stream.data_buf.items.len - self.h2_stream.read_offset;
@@ -548,7 +581,15 @@ pub const Context = struct {
                 if (self.h2_stream.stream_error) |err| return err;
                 if (self.h2_stream.completed) return 0;
 
-                self.data_event.waitTimeout(self.io, self.read_timeout) catch |err| switch (err) {
+                const timeout: Io.Timeout = if (self.deadline_ms > 0) blk: {
+                    const remaining_ms = self.deadline_ms - milliTimestamp(self.io);
+                    if (remaining_ms <= 0) return error.Timeout;
+                    break :blk .{ .duration = .{
+                        .raw = Io.Duration.fromMilliseconds(@intCast(remaining_ms)),
+                        .clock = .awake,
+                    } };
+                } else .none;
+                self.data_event.waitTimeout(self.io, timeout) catch |err| switch (err) {
                     error.Timeout => return error.Timeout,
                     error.Canceled => return error.Canceled,
                 };
@@ -574,6 +615,13 @@ pub const Context = struct {
     /// reads the entire body on first call.
     pub fn body(self: *Self) !?[]const u8 {
         if (self.request.body != null) return self.request.body;
+        if (self.body_delegate) |delegate| {
+            const data = try delegate.read_all(delegate.ptr);
+            self.request.body = data;
+            self.request.body_owned = false;
+            self.body_delegate = null;
+            return data;
+        }
         if (self.h2_body_reader) |reader| {
             const data = reader.readAll(self.allocator) catch |err| switch (err) {
                 error.EndOfStream => {
@@ -589,6 +637,14 @@ pub const Context = struct {
             return self.request.body;
         }
         return null;
+    }
+
+    /// True when reading the body can still block on peer-controlled input.
+    /// Application admission uses this instead of inspecting a concrete H2
+    /// reader so linked and direct transports have identical semantics.
+    pub fn hasStreamingRequestBody(self: *const Self) bool {
+        if (self.h2_body_reader != null) return true;
+        return if (self.body_delegate) |delegate| delegate.streaming else false;
     }
 
     pub fn isCancellationRequested(self: *const Self) bool {
@@ -1108,8 +1164,6 @@ pub const Server = struct {
     pub fn initWithConfig(allocator: Allocator, io: Io, config: ServerConfig) Self {
         var cfg = config;
         if (cfg.max_connections == 0) cfg.max_connections = 1000;
-        if (cfg.request_timeout_ms == 0) cfg.request_timeout_ms = 30_000;
-        if (cfg.keep_alive_timeout_ms == 0) cfg.keep_alive_timeout_ms = 60_000;
         if (cfg.h2_max_concurrent_streams == 0) cfg.h2_max_concurrent_streams = 100;
         cfg.request_body_buffer_budget_bytes = @max(cfg.request_body_buffer_budget_bytes, cfg.max_body_size);
         cfg.accept_error_backoff_initial_ms = @max(cfg.accept_error_backoff_initial_ms, 1);
@@ -1485,14 +1539,18 @@ pub const Server = struct {
         var sock = connection.socket;
 
         // Set initial timeout once; only update when transitioning to keep-alive.
-        if (self.config.request_timeout_ms > 0) {
-            try sock.setRecvTimeout(self.config.request_timeout_ms);
-            try sock.setSendTimeout(self.config.request_timeout_ms);
+        if (self.config.header_read_timeout_ms > 0) {
+            try sock.setRecvTimeout(self.config.header_read_timeout_ms);
+        }
+        if (self.config.response_write_timeout_ms > 0) {
+            try sock.setSendTimeout(self.config.response_write_timeout_ms);
         }
 
         // Peek at the first bytes to detect HTTP/2 "prior knowledge" (RFC 7540 §3.4).
         // The h2 preface is "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (24 bytes).
         var peek_buf: [8192]u8 = undefined;
+        const first_header_deadline_ms = deadlineAfter(self.io, self.config.header_read_timeout_ms);
+        try applyReadDeadline(&sock, self.io, first_header_deadline_ms);
         const first_n = try sock.recv(&peek_buf);
         if (first_n == 0) return;
 
@@ -1519,10 +1577,17 @@ pub const Server = struct {
             var h1_body_reserved = false;
             defer if (h1_body_reserved) self.h1_body_budget.release(1);
 
-            // Wall-clock deadline prevents slow-loris attacks where an attacker
-            // trickles bytes just fast enough to avoid per-recv timeouts.
-            const active_timeout = if (first_request) self.config.request_timeout_ms else self.config.keep_alive_timeout_ms;
-            const deadline_ms: i64 = if (active_timeout > 0) milliTimestamp(self.io) + @as(i64, @intCast(active_timeout)) else 0;
+            // Keep-alive idle, header ingress, and body ingress are separate
+            // absolute phases. Bytes cannot renew any of these deadlines.
+            var waiting_for_request_bytes = !first_request and leftover == 0;
+            var body_deadline_started = false;
+            var deadline_ms = if (first_request)
+                first_header_deadline_ms
+            else
+                deadlineAfter(
+                    self.io,
+                    if (waiting_for_request_bytes) self.config.keep_alive_timeout_ms else self.config.header_read_timeout_ms,
+                );
 
             // Feed any leftover bytes from the previous request (pipelining)
             // before reading from the socket.
@@ -1558,11 +1623,15 @@ pub const Server = struct {
                     try self.sendError(&sock, 429);
                     return;
                 }
+                if (!body_deadline_started and parser.hasCompleteHeaders() and !parser.isComplete()) {
+                    body_deadline_started = true;
+                    deadline_ms = deadlineAfter(self.io, self.config.body_read_timeout_ms);
+                }
             }
 
             while (!parser.isComplete()) {
                 if (deadline_ms > 0 and milliTimestamp(self.io) >= deadline_ms) {
-                    try self.sendError(&sock, 408);
+                    if (!waiting_for_request_bytes) try self.sendError(&sock, 408);
                     return;
                 }
                 // On the very first iteration, feed the bytes we already read
@@ -1571,7 +1640,27 @@ pub const Server = struct {
                     @memcpy(buffer[0..first_n], peek_buf[0..first_n]);
                     first_recv_done = false;
                     break :blk first_n;
-                } else try sock.recv(&buffer);
+                } else blk: {
+                    applyReadDeadline(&sock, self.io, deadline_ms) catch |err| switch (err) {
+                        error.Timeout => {
+                            if (!waiting_for_request_bytes) try self.sendError(&sock, 408);
+                            return;
+                        },
+                        else => return err,
+                    };
+                    const received = sock.recv(&buffer) catch |err| switch (err) {
+                        error.Timeout => {
+                            if (!waiting_for_request_bytes) try self.sendError(&sock, 408);
+                            return;
+                        },
+                        else => return err,
+                    };
+                    if (waiting_for_request_bytes and received > 0) {
+                        waiting_for_request_bytes = false;
+                        deadline_ms = deadlineAfter(self.io, self.config.header_read_timeout_ms);
+                    }
+                    break :blk received;
+                };
                 if (n == 0) return;
                 const consumed = parser.feed(buffer[0..n]) catch |err| switch (err) {
                     error.BodyTooLarge => {
@@ -1604,6 +1693,10 @@ pub const Server = struct {
                 if (!self.reserveH1BodyAfterHeaders(&parser, &h1_body_reserved)) {
                     try self.sendError(&sock, 429);
                     return;
+                }
+                if (!body_deadline_started and parser.hasCompleteHeaders() and !parser.isComplete()) {
+                    body_deadline_started = true;
+                    deadline_ms = deadlineAfter(self.io, self.config.body_read_timeout_ms);
                 }
             }
 
@@ -1757,14 +1850,7 @@ pub const Server = struct {
                     request_count >= self.config.max_requests_per_connection)
                     return;
 
-                if (first_request) {
-                    first_request = false;
-                    if (self.config.keep_alive_timeout_ms != self.config.request_timeout_ms and
-                        self.config.keep_alive_timeout_ms > 0)
-                    {
-                        try sock.setRecvTimeout(self.config.keep_alive_timeout_ms);
-                    }
-                }
+                if (first_request) first_request = false;
                 self.io.sleep(Io.Duration.zero, .awake) catch {};
                 continue;
             }
@@ -1824,12 +1910,6 @@ pub const Server = struct {
 
             if (first_request) {
                 first_request = false;
-                // Transition to keep-alive timeout (only one setsockopt call).
-                if (self.config.keep_alive_timeout_ms != self.config.request_timeout_ms and
-                    self.config.keep_alive_timeout_ms > 0)
-                {
-                    try sock.setRecvTimeout(self.config.keep_alive_timeout_ms);
-                }
             }
             self.io.sleep(Io.Duration.zero, .awake) catch {};
         }
@@ -2292,13 +2372,7 @@ pub const Server = struct {
                 .h2_stream = stream,
                 .io = self.io,
                 .data_event = data_event,
-                .read_timeout = if (self.config.request_timeout_ms > 0)
-                    .{ .duration = .{
-                        .raw = Io.Duration.fromMilliseconds(@intCast(self.config.request_timeout_ms)),
-                        .clock = .awake,
-                    } }
-                else
-                    .none,
+                .deadline_ms = deadlineAfter(self.io, self.config.body_read_timeout_ms),
             };
         }
 
@@ -2951,6 +3025,21 @@ test "ServerConfig defaults" {
     try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), config.request_body_buffer_budget_bytes);
     try std.testing.expectEqual(@as(usize, 100), config.max_headers);
     try std.testing.expectEqual(@as(usize, 100 * 1024 * 1024), config.max_file_size);
+    try std.testing.expectEqual(@as(u64, 30_000), config.header_read_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 120_000), config.body_read_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 30_000), config.response_write_timeout_ms);
+
+    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .header_read_timeout_ms = 0,
+        .body_read_timeout_ms = 0,
+        .response_write_timeout_ms = 0,
+        .keep_alive_timeout_ms = 0,
+    });
+    defer server.deinit();
+    try std.testing.expectEqual(@as(u64, 0), server.config.header_read_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 0), server.config.body_read_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 0), server.config.response_write_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 0), server.config.keep_alive_timeout_ms);
 }
 
 test "routeErrorStatus maps oversized route errors to payload too large" {
@@ -2960,6 +3049,7 @@ test "routeErrorStatus maps oversized route errors to payload too large" {
     try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.StreamTooLong));
     try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.BodyTooLarge));
     try std.testing.expectEqual(@as(u16, 429), routeErrorStatus(error.BodyCapacityExceeded));
+    try std.testing.expectEqual(@as(u16, 408), routeErrorStatus(error.Timeout));
     try std.testing.expectEqual(@as(u16, 500), routeErrorStatus(error.UnexpectedRouteFailure));
     try std.testing.expectEqualStrings(
         "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid request\"}",
@@ -3162,6 +3252,80 @@ test "H2StreamReader.readAll buffers entire body" {
     const body_data = try reader.readAll(allocator);
     defer allocator.free(body_data);
     try std.testing.expectEqualStrings("part1part2", body_data);
+}
+
+test "H2StreamReader body deadline cannot be renewed by trickle data" {
+    const allocator = std.testing.allocator;
+    var stream = Stream.init(1);
+    defer stream.deinit(allocator);
+    try stream.data_buf.append(allocator, 'x');
+
+    var event = Io.Event.unset;
+    var reader = Context.H2StreamReader{
+        .h2_stream = &stream,
+        .io = std.testing.io,
+        .data_event = &event,
+        .deadline_ms = milliTimestamp(std.testing.io) - 1,
+    };
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try reader.read(&byte));
+    try std.testing.expectEqual(@as(u8, 'x'), byte[0]);
+    try std.testing.expectError(error.Timeout, reader.read(&byte));
+}
+
+test "H1 body deadline starts after headers and rejects a stalled upload" {
+    const State = struct {
+        var handled = std.atomic.Value(bool).init(false);
+
+        fn handler(ctx: *Context) anyerror!Response {
+            handled.store(true, .release);
+            return ctx.text("unexpected");
+        }
+    };
+    State.handled.store(false, .release);
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .header_read_timeout_ms = 1_000,
+        .body_read_timeout_ms = 25,
+        .response_write_timeout_ms = 1_000,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    try server.post("/upload", State.handler);
+    try server.bind();
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("deadline listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll(
+        "POST /upload HTTP/1.1\r\n" ++
+            "Host: test\r\n" ++
+            "Content-Length: 3\r\n" ++
+            "Connection: close\r\n\r\n" ++
+            "x",
+    );
+
+    var response: [512]u8 = undefined;
+    const n = try client.recv(&response);
+    try std.testing.expect(mem.indexOf(u8, response[0..n], " 408 ") != null);
+    try std.testing.expect(!State.handled.load(.acquire));
 }
 
 test "H2StreamReader reports terminal stream errors instead of truncated EOF" {

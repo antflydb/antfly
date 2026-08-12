@@ -631,7 +631,7 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
     var http_context = httpx.Context.init(alloc, state.io_impl.io(), &http_request);
     defer http_context.deinit();
     http_context.params = params;
-    runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.stream);
+    runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
     var response = try route.handler.invoke(&http_context);
     errdefer response.deinit();
 

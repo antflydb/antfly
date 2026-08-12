@@ -373,7 +373,7 @@ pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi
     var http_context = httpx.Context.init(alloc, io_impl.io(), &http_request);
     defer http_context.deinit();
     http_context.params = params;
-    runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.stream);
+    runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
     var response = state.handler.dispatchLinkedRoute(&http_context, route.handler) catch |err| return fail(err);
     errdefer response.deinit();
 
@@ -631,7 +631,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     const mutation_request = abi.HttpRequestView{
         .method = .post,
         .path = abi.Bytes.init("/db/v1/tables/docs"),
-        .body = abi.Bytes.init("{}"),
+        .body = abi.OptionalBytes.init("{}"),
     };
     var mutation_response_handle: ?*anyopaque = null;
     var mutation_response: abi.HttpResponseView = undefined;
@@ -655,7 +655,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     const retry_request = abi.HttpRequestView{
         .method = .get,
         .path = abi.Bytes.init("/db/v1/tables/docs"),
-        .body = abi.Bytes.init(""),
+        .body = abi.OptionalBytes.init(""),
     };
     var retry_response_handle: ?*anyopaque = null;
     var retry_response: abi.HttpResponseView = undefined;

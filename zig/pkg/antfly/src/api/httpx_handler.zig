@@ -3281,7 +3281,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = body: {
-            const needs_h2_body_slot = ctx.h2_body_reader != null;
+            const needs_h2_body_slot = ctx.hasStreamingRequestBody();
             if (needs_h2_body_slot and !self.query_body_admission.tryAcquire())
                 return queryBodyOverloadedResponse(ctx);
             defer if (needs_h2_body_slot) self.query_body_admission.release();
@@ -3817,7 +3817,7 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         const body_data = body: {
-            const needs_h2_body_slot = ctx.h2_body_reader != null;
+            const needs_h2_body_slot = ctx.hasStreamingRequestBody();
             if (needs_h2_body_slot and !self.query_body_admission.tryAcquire())
                 return queryBodyOverloadedResponse(ctx);
             defer if (needs_h2_body_slot) self.query_body_admission.release();
@@ -5198,7 +5198,9 @@ const HttpxE2eServer = struct {
         self.server = httpx.Server.initWithConfig(allocator, self.io_impl.io(), .{
             .host = "127.0.0.1",
             .port = 0,
-            .request_timeout_ms = 30_000,
+            .header_read_timeout_ms = 30_000,
+            .body_read_timeout_ms = 30_000,
+            .response_write_timeout_ms = 30_000,
             .max_connections = max_connections,
         });
         errdefer self.server.deinit();
@@ -6361,8 +6363,16 @@ test "httpx query admission rejects saturated queries without blocking control r
     defer h2_query_request.deinit();
     var h2_query_ctx = httpx.Context.init(alloc, std.testing.io, &h2_query_request);
     defer h2_query_ctx.deinit();
-    var unused_body_reader: httpx.Context.H2StreamReader = undefined;
-    h2_query_ctx.h2_body_reader = &unused_body_reader;
+    const UnusedStreamingBody = struct {
+        fn readAll(_: ?*anyopaque) !?[]const u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+    h2_query_ctx.body_delegate = .{
+        .ptr = null,
+        .read_all = UnusedStreamingBody.readAll,
+        .streaming = true,
+    };
     var h2_rejected = try handler.queryTable(&h2_query_ctx, "docs");
     defer h2_rejected.deinit();
     try std.testing.expectEqual(@as(u16, 429), h2_rejected.status.code);

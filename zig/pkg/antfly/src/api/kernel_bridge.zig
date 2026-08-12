@@ -356,7 +356,6 @@ const RuntimeRoute = struct {
 
 fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     const route: *const RuntimeRoute = @ptrCast(@alignCast(context.route_data orelse return error.ApiKernelUnavailable));
-    if (route.request_body == .buffered) _ = try context.body();
     const source_headers = context.request.headers.iterator();
     const headers = try context.allocator.alloc(abi.HeaderView, source_headers.len);
     defer context.allocator.free(headers);
@@ -385,16 +384,18 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .headers_len = headers.len,
         .params_ptr = if (params.len == 0) null else params.ptr,
         .params_len = params.len,
-        .body = abi.Bytes.init(context.request.body orelse ""),
+        .body = abi.OptionalBytes.init(context.request.body),
         .authorization = abi.OptionalBytes.init(context.request.headers.get("Authorization")),
         .content_type = abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
     };
     var transport = runtime_http_bridge.Outbound{ .context = context };
+    const body_source = if (route.request_body == .buffered) transport.bodySource() else abi.RequestBodySource{};
     try callError(route.functions.handler_handle_http(&.{
         .abi_version = abi.abi_version,
         .route_handle = route.kernel_route_handle,
         .request = &request_view,
         .cancellation = transport.cancellation(),
+        .body_source = body_source,
         .stream = if (route.streaming_response) transport.stream() else .{},
         .out_response_handle = &response_handle,
         .out_response = &response_view,
@@ -507,4 +508,66 @@ test "linked transport projects the universal request cancellation callback" {
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
     try std.testing.expectEqualStrings("ok", response.body.?);
     try std.testing.expect(FakeKernel.saw_cancellation);
+}
+
+test "linked transport admits a streaming body before the kernel pulls it" {
+    const BodyState = struct {
+        calls: usize = 0,
+
+        fn readAll(raw: ?*anyopaque) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return error.TestUnexpectedResult));
+            self.calls += 1;
+            return "deferred body";
+        }
+    };
+    const FakeKernel = struct {
+        var observed_state: ?*BodyState = null;
+        var body_calls_before_dispatch: usize = 0;
+        var saw_streaming_source = false;
+        var saw_body = false;
+
+        fn handle(context: *const abi.HttpHandleContext) callconv(.c) abi.Status {
+            body_calls_before_dispatch = observed_state.?.calls;
+            saw_streaming_source = context.body_source.streaming != 0;
+            var body: abi.OptionalBytes = .{};
+            const callback = context.body_source.read_all orelse return abi.statusFromError(error.InvalidArgument);
+            if (callback(context.body_source.context, &body) != .ok) return abi.statusFromError(error.BodyReadFailed);
+            saw_body = if (body.slice()) |bytes| std.mem.eql(u8, bytes, "deferred body") else false;
+            context.out_response_handle.* = @ptrFromInt(1);
+            context.out_response.* = .{ .status = 200, .body = abi.Bytes.init("ok") };
+            return .ok;
+        }
+
+        fn destroy(_: *anyopaque) callconv(.c) void {}
+    };
+
+    var functions: abi.FunctionTable = undefined;
+    functions.handler_handle_http = FakeKernel.handle;
+    functions.handler_destroy_http_response = FakeKernel.destroy;
+    var route = RuntimeRoute{
+        .functions = &functions,
+        .kernel_route_handle = @ptrFromInt(1),
+        .request_body = .buffered,
+        .streaming_response = false,
+    };
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/db/v1/query");
+    defer request.deinit();
+    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    var body_state = BodyState{};
+    FakeKernel.observed_state = &body_state;
+    defer FakeKernel.observed_state = null;
+    context.body_delegate = .{
+        .ptr = &body_state,
+        .read_all = BodyState.readAll,
+        .streaming = true,
+    };
+    context.route_data = &route;
+
+    var response = try runtimeApiHttpHandler(&context);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 0), FakeKernel.body_calls_before_dispatch);
+    try std.testing.expect(FakeKernel.saw_streaming_source);
+    try std.testing.expect(FakeKernel.saw_body);
+    try std.testing.expectEqual(@as(usize, 1), body_state.calls);
 }

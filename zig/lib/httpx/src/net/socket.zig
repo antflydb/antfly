@@ -17,6 +17,17 @@ const common = @import("../util/common.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
+const WindowsSocket = if (is_windows) struct {
+    extern "ws2_32" fn setsockopt(
+        socket: net.Socket.Handle,
+        level: c_int,
+        option_name: c_int,
+        option_value: [*]const u8,
+        option_len: c_int,
+    ) callconv(.winapi) c_int;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+} else struct {};
+
 /// Network address type (std.Io.net.IpAddress).
 pub const Address = net.IpAddress;
 
@@ -325,7 +336,7 @@ pub const Socket = struct {
     /// Enables or disables TCP_NODELAY (Nagle's algorithm).
     pub fn setNoDelay(self: *Self, enable: bool) !void {
         const value: u32 = if (enable) 1 else 0;
-        try posix.setsockopt(self.handle, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&value));
+        try setSocketOption(self.handle, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&value));
     }
 
     /// Sets the receive timeout in milliseconds.
@@ -353,8 +364,14 @@ pub const Socket = struct {
 
     fn setSocketOption(fd: net.Socket.Handle, level: i32, optname: u32, opt: []const u8) !void {
         if (is_windows) {
-            try posix.setsockopt(fd, level, optname, opt);
-            return;
+            if (WindowsSocket.setsockopt(fd, level, @intCast(optname), opt.ptr, @intCast(opt.len)) == 0) return;
+            return switch (WindowsSocket.WSAGetLastError()) {
+                10013 => error.PermissionDenied, // WSAEACCES
+                10022, 10038 => error.InvalidSocketOption, // WSAEINVAL / WSAENOTSOCK
+                10042 => error.InvalidProtocolOption, // WSAENOPROTOOPT
+                10055 => error.SystemResources, // WSAENOBUFS
+                else => error.InvalidSocketOption,
+            };
         }
         switch (posix.errno(posix.system.setsockopt(fd, level, optname, opt.ptr, @intCast(opt.len)))) {
             .SUCCESS => {},
@@ -373,7 +390,7 @@ pub const Socket = struct {
     /// Enables or disables keep-alive probes.
     pub fn setKeepAlive(self: *Self, enable: bool) !void {
         const value: u32 = if (enable) 1 else 0;
-        try posix.setsockopt(self.handle, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&value));
+        try setSocketOption(self.handle, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&value));
     }
 
     /// Returns a reader interface for the socket.

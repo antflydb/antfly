@@ -94,7 +94,9 @@ pub fn main(init: std.process.Init) !void {
         .host = "127.0.0.1",
         .port = port,
         .keep_alive = false,
-        .request_timeout_ms = 10_000,
+        .header_read_timeout_ms = 10_000,
+        .body_read_timeout_ms = 10_000,
+        .response_write_timeout_ms = 10_000,
     });
     defer server.deinit();
 

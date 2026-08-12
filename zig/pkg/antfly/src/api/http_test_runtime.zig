@@ -131,7 +131,9 @@ pub const Runtime = struct {
         server.* = httpx.Server.initWithConfig(alloc, io_impl.io(), .{
             .host = "127.0.0.1",
             .port = 0,
-            .request_timeout_ms = 30_000,
+            .header_read_timeout_ms = 30_000,
+            .body_read_timeout_ms = 30_000,
+            .response_write_timeout_ms = 30_000,
             .max_connections = 64,
         });
         errdefer server.deinit();

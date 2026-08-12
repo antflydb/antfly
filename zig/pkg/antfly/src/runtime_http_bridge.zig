@@ -20,6 +20,14 @@ pub const Outbound = struct {
         };
     }
 
+    pub fn bodySource(self: *Outbound) abi.RequestBodySource {
+        return .{
+            .context = self,
+            .read_all = readAllBody,
+            .streaming = @intFromBool(self.context.hasStreamingRequestBody()),
+        };
+    }
+
     pub fn stream(self: *Outbound) abi.StreamSink {
         return .{
             .context = self,
@@ -32,6 +40,21 @@ pub const Outbound = struct {
     fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
         const context: *const httpx.Context = @ptrCast(@alignCast(raw orelse return 0));
         return @intFromBool(context.isCancellationRequested());
+    }
+
+    fn readAllBody(raw: ?*anyopaque, out: *abi.OptionalBytes) callconv(.c) abi.CallbackStatus {
+        const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
+        if (self.context.isCancellationRequested()) return .canceled;
+        const body = self.context.body() catch |err| return switch (err) {
+            error.Canceled => .canceled,
+            error.Timeout => .timeout,
+            error.BodyTooLarge => .body_too_large,
+            error.BodyCapacityExceeded => .body_capacity_exceeded,
+            error.EndOfStream => .end_of_stream,
+            else => .failed,
+        };
+        out.* = abi.OptionalBytes.init(body);
+        return .ok;
     }
 
     fn start(raw: ?*anyopaque, status: u16) callconv(.c) abi.CallbackStatus {
@@ -61,6 +84,7 @@ pub const Outbound = struct {
 pub fn installInbound(
     context: *httpx.Context,
     cancellation: *const abi.CancellationView,
+    body_source: *const abi.RequestBodySource,
     stream: *const abi.StreamSink,
 ) void {
     context.cancellation = null;
@@ -68,6 +92,13 @@ pub fn installInbound(
         context.cancellation_probe = .{
             .ptr = cancellation,
             .is_cancelled = inboundIsCancelled,
+        };
+    }
+    if (body_source.read_all != null) {
+        context.body_delegate = .{
+            .ptr = @constCast(body_source),
+            .read_all = inboundReadAllBody,
+            .streaming = body_source.streaming != 0,
         };
     }
     if (stream.start != null and stream.write != null and stream.close != null) {
@@ -78,6 +109,21 @@ pub fn installInbound(
             .close = inboundClose,
         };
     }
+}
+
+fn inboundReadAllBody(raw: ?*anyopaque) !?[]const u8 {
+    const body_source: *const abi.RequestBodySource = @ptrCast(@alignCast(raw orelse return error.BodySourceUnavailable));
+    var bytes: abi.OptionalBytes = .{};
+    switch (body_source.read_all.?(body_source.context, &bytes)) {
+        .ok => {},
+        .failed => return error.BodyReadFailed,
+        .canceled => return error.Canceled,
+        .timeout => return error.Timeout,
+        .body_too_large => return error.BodyTooLarge,
+        .body_capacity_exceeded => return error.BodyCapacityExceeded,
+        .end_of_stream => return error.EndOfStream,
+    }
+    return bytes.slice();
 }
 
 fn inboundIsCancelled(raw: ?*const anyopaque) bool {
@@ -105,6 +151,10 @@ fn callbackResult(status: abi.CallbackStatus) !void {
         .ok => {},
         .failed => error.StreamWriteFailed,
         .canceled => error.Canceled,
+        .timeout => error.Timeout,
+        .body_too_large => error.BodyTooLarge,
+        .body_capacity_exceeded => error.BodyCapacityExceeded,
+        .end_of_stream => error.EndOfStream,
     };
 }
 
@@ -117,10 +167,47 @@ test "missing linked callbacks leave a normal buffered context" {
     var context = httpx.Context.init(std.testing.allocator, io_impl.io(), &request);
     defer context.deinit();
     const cancellation: abi.CancellationView = .{};
+    const body_source: abi.RequestBodySource = .{};
     const stream: abi.StreamSink = .{};
-    installInbound(&context, &cancellation, &stream);
+    installInbound(&context, &cancellation, &body_source, &stream);
     try std.testing.expect(context.cancellation_probe == null);
     try std.testing.expect(context.stream_delegate == null);
+}
+
+test "linked request bodies remain lazy and transport neutral" {
+    const std = @import("std");
+    const State = struct {
+        calls: usize = 0,
+
+        fn readAll(raw: ?*anyopaque, out: *abi.OptionalBytes) callconv(.c) abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return .failed));
+            self.calls += 1;
+            out.* = abi.OptionalBytes.init("linked body");
+            return .ok;
+        }
+    };
+
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/query");
+    defer request.deinit();
+    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    var state = State{};
+    const cancellation: abi.CancellationView = .{};
+    const body_source: abi.RequestBodySource = .{
+        .context = &state,
+        .read_all = State.readAll,
+        .streaming = 1,
+    };
+    const stream: abi.StreamSink = .{};
+    installInbound(&context, &cancellation, &body_source, &stream);
+
+    try std.testing.expect(context.hasStreamingRequestBody());
+    try std.testing.expectEqual(@as(usize, 0), state.calls);
+    try std.testing.expectEqualStrings("linked body", (try context.body()).?);
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    try std.testing.expect(!context.hasStreamingRequestBody());
+    try std.testing.expectEqualStrings("linked body", (try context.body()).?);
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
 }
 
 test "linked callbacks preserve streaming and cancellation semantics" {
@@ -176,7 +263,8 @@ test "linked callbacks preserve streaming and cancellation semantics" {
         .write = State.write,
         .close = State.close,
     };
-    installInbound(&context, &cancellation, &stream);
+    const body_source: abi.RequestBodySource = .{};
+    installInbound(&context, &cancellation, &body_source, &stream);
 
     try std.testing.expect(!context.isCancellationRequested());
     state.canceled = true;

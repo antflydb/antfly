@@ -35,6 +35,13 @@ that end state:
   stream reset signal, while HTTP/1 registrations share the role's
   `HttpRuntime`. The linked API and inference ABIs carry the same semantic
   cancellation callback without route-specific OpenAPI policy.
+- Linked request bodies use a transport-owned lazy body source. The API kernel
+  can identify a still-streaming upload, acquire application body admission,
+  and only then ask the listener to buffer it; direct and independently linked
+  handlers therefore enforce the same limit and publish the same metrics.
+- Header and body ingress have separate absolute phase deadlines. HTTP/2 body
+  readers retain one deadline across every DATA wait, so trickle traffic cannot
+  renew a timeout or hold an upload permit indefinitely.
 - Query and write admission are application-operation gates owned by
   `ApiHttpServer`, not handler-local or listener-local limits. Generated HTTP,
   MCP, A2A, extension-host, and other in-process entry points therefore share
@@ -608,8 +615,11 @@ and retains those workers until executor deinitialization. Consequently, one
 long-lived watcher submitted per connection or request would turn peak socket
 concurrency into retained thread stacks. The current H1 implementation instead
 uses one explicitly owned OS thread with a small configurable stack and
-multiplexes all registered sockets with `poll`/`kqueue`. It only peeks; the HTTP
-parser remains the sole consumer of socket bytes. An HTTP/1 peer may
+multiplexes all registered sockets with `poll`, `kqueue`, or `WSAPoll` on
+Windows. It only peeks; the HTTP parser remains the sole consumer of socket
+bytes. Unsupported freestanding targets fail listener startup when observation
+is required; no supported platform can silently turn `.required` into a no-op.
+An HTTP/1 peer may
 half-close its request side with FIN while legitimately awaiting the response,
 so orderly EOF is never treated as request cancellation. Only a hard socket
 failure/reset cancels an active H1 request; explicit protocol cancellation and
@@ -1034,16 +1044,18 @@ preserving the compiler-memory benefit of independent code generation.
 The linked API and inference manifests carry buffered-body and streaming-
 response policy. Cancellation is deliberately absent from route manifests and
 OpenAPI extensions because it is a universal request-lifetime property, not an
-operation opt-in. Before crossing the archive boundary, the listener buffers a
-deferred HTTP/2 body only when the matched route requires it. Each dispatch
-also receives request-scoped cancellation and streaming callback views. The
-archive reconstructs an `httpx.Context` with transport-neutral delegates, so
-an inference SSE handler can start, write, and close the original listener's
-HTTP/1 chunked stream or HTTP/2 DATA stream without sharing socket or
-connection layouts across the ABI. The same callback cancellation source is
-used by operation contexts, storage/search internals, inference generation,
-and outbound requests. There is no ABI fast flag or dependence on Zig atomic
-layout; the callback is the only cancellation contract.
+operation opt-in. Each dispatch receives request-scoped cancellation, lazy
+body-source, and streaming callback views. A deferred HTTP/2 body remains owned
+by the listener until the archive requests it; the archive's reconstructed
+`httpx.Context` exposes that source as streaming so application admission runs
+before buffering. Callback outcomes preserve cancellation, timeout, size,
+capacity, and end-of-stream errors across the ABI. The same transport-neutral
+delegate model lets an inference SSE handler start, write, and close the
+original listener's HTTP/1 chunked stream or HTTP/2 DATA stream without sharing
+socket or connection layouts across the ABI. The cancellation callback is used
+by operation contexts, storage/search internals, inference generation, and
+outbound requests. There is no ABI fast flag or dependence on Zig atomic
+layout.
 
 Application ingress policy happens inside linked dispatch, where the API
 kernel owns request accounting, continuous-HA mutation classification, and
@@ -1132,6 +1144,9 @@ HTTP and kernel migration tests should also cover:
 - Direct kernel tests without an HTTP server
 - Multiple simultaneous server instances with independent handler context
 - API-kernel route-manifest ABI compatibility
+- Linked lazy-body admission before transport buffering
+- Absolute H1 and H2 phase deadlines under byte-trickle traffic
+- Required HTTP/1 disconnect cancellation on every supported OS
 
 The CI matrix should include sanitizer and stress coverage, supported operating
 systems and architectures, and the real ARM64 `ReleaseFast` linked build. The
@@ -1174,8 +1189,8 @@ The branch completed the migration in this order:
     where they remain owned, stopped, and joined.
 13. Hardened the API-kernel and linked-inference boundaries with versioned
     function tables, owned route manifests, route body/stream metadata,
-    request-scoped cancellation and streaming sinks, prefix validation, and
-    duplicate route rejection.
+    request-scoped cancellation, lazy body sources, streaming sinks, prefix
+    validation, and duplicate route rejection.
 14. Added lifecycle, routing, cancellation, shutdown, ABI, restart, and
     resource-leak tests plus linked native and ARM64 Linux build coverage.
 15. Migrated public API simulation fixtures from compatibility executors to

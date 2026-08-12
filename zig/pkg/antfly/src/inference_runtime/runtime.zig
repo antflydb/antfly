@@ -424,7 +424,9 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var server = httpx.Server.initWithConfig(alloc, io, .{
         .host = host,
         .port = port,
-        .request_timeout_ms = 300_000,
+        .header_read_timeout_ms = 300_000,
+        .body_read_timeout_ms = 300_000,
+        .response_write_timeout_ms = 300_000,
         .keep_alive_timeout_ms = 300_000,
     });
     defer server.deinit();
@@ -495,7 +497,9 @@ pub fn spawnServerProcess(
     server.* = httpx.Server.initWithConfig(alloc, io, .{
         .host = host_dup,
         .port = parsed.port,
-        .request_timeout_ms = 300_000,
+        .header_read_timeout_ms = 300_000,
+        .body_read_timeout_ms = 300_000,
+        .response_write_timeout_ms = 300_000,
         .keep_alive_timeout_ms = 300_000,
     });
     errdefer server.deinit();

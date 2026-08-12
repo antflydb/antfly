@@ -19,7 +19,7 @@
 const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 
-pub const abi_version: u32 = 7;
+pub const abi_version: u32 = 8;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -165,6 +165,7 @@ pub const HttpHandleContext = extern struct {
     route_handle: *anyopaque,
     request: *const http_abi.HttpRequestView,
     cancellation: http_abi.CancellationView = .{},
+    body_source: http_abi.RequestBodySource = .{},
     stream: http_abi.StreamSink = .{},
     out_response_handle: *?*anyopaque,
     out_response: *http_abi.HttpResponseView,

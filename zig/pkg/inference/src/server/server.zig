@@ -10271,7 +10271,9 @@ pub const Node = struct {
             .port = port,
             // Generation can legitimately take longer than the generic 30s HTTP
             // default during cold model startup or first-token GPU execution.
-            .request_timeout_ms = 300_000,
+            .header_read_timeout_ms = 300_000,
+            .body_read_timeout_ms = 300_000,
+            .response_write_timeout_ms = 300_000,
             .keep_alive_timeout_ms = 300_000,
         });
         defer server.deinit();

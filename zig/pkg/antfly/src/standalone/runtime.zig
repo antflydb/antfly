@@ -2512,7 +2512,6 @@ fn registerLinkedInferenceManifest(
 
 fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     const route: *const LinkedInferenceRoute = @ptrCast(@alignCast(context.route_data orelse return error.InferenceRuntimeUnavailable));
-    if (route.request_body == .buffered) _ = try context.body();
     const source_headers = context.request.headers.iterator();
     const headers = try context.allocator.alloc(runtime_http_abi.HeaderView, source_headers.len);
     defer context.allocator.free(headers);
@@ -2545,11 +2544,12 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .headers_len = headers.len,
         .params_ptr = if (params.len == 0) null else params.ptr,
         .params_len = params.len,
-        .body = runtime_http_abi.Bytes.init(context.request.body orelse ""),
+        .body = runtime_http_abi.OptionalBytes.init(context.request.body),
         .authorization = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Authorization")),
         .content_type = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
     };
     var transport = @import("../runtime_http_bridge.zig").Outbound{ .context = context };
+    const body_source = if (route.request_body == .buffered) transport.bodySource() else runtime_http_abi.RequestBodySource{};
     var response_handle: ?*anyopaque = null;
     var response_view: runtime_http_abi.HttpResponseView = undefined;
     const status = route.functions.handle_http(&.{
@@ -2557,6 +2557,7 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .route_handle = route.kernel_route_handle,
         .request = &request_view,
         .cancellation = transport.cancellation(),
+        .body_source = body_source,
         .stream = if (route.streaming_response) transport.stream() else .{},
         .out_response_handle = &response_handle,
         .out_response = &response_view,
@@ -2610,7 +2611,9 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         // This is a transport safeguard for every H1 request body. Keep it
         // independent from admission.query.max_concurrent_requests.
         .max_h1_inflight_bodies = public_http_max_h1_inflight_bodies,
-        .request_timeout_ms = 300_000,
+        .header_read_timeout_ms = 300_000,
+        .body_read_timeout_ms = 300_000,
+        .response_write_timeout_ms = 300_000,
         // Keep a large process-wide FD reserve for storage, Raft, outbound
         // clients, and diagnostics. This prevents the historical 1,000-socket
         // cliff under the common 1,024 descriptor soft limit.

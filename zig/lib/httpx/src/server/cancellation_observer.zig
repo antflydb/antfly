@@ -12,8 +12,34 @@ const std = @import("std");
 
 const observation_interval_ms: u64 = 25;
 
+const WindowsPoll = if (builtin.os.tag == .windows) struct {
+    const PollFd = extern struct {
+        fd: std.posix.fd_t,
+        events: i16,
+        revents: i16,
+    };
+
+    const poll_read: i16 = 0x0300; // POLLRDNORM | POLLRDBAND
+    const poll_err: i16 = 0x0001;
+    const poll_hup: i16 = 0x0002;
+    const poll_nval: i16 = 0x0004;
+    const wsa_would_block = 10035;
+    const wsa_network_reset = 10052;
+    const wsa_connection_aborted = 10053;
+    const wsa_connection_reset = 10054;
+
+    extern "ws2_32" fn WSAPoll(fds: [*]PollFd, count: u32, timeout_ms: c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+    extern "ws2_32" fn recv(socket: std.posix.fd_t, buffer: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+    extern "kernel32" fn Sleep(timeout_ms: u32) callconv(.winapi) void;
+} else struct {};
+
 fn sleepMs(ms: u64) void {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+    if (comptime builtin.os.tag == .freestanding) return;
+    if (comptime builtin.os.tag == .windows) {
+        WindowsPoll.Sleep(@intCast(@min(ms, @as(u64, std.math.maxInt(u32)))));
+        return;
+    }
     var req = std.posix.timespec{
         .sec = @intCast(ms / std.time.ms_per_s),
         .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
@@ -71,7 +97,7 @@ pub const Observer = struct {
     }
 
     pub fn start(self: *Observer) !void {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+        if (comptime builtin.os.tag == .freestanding) return error.ObserverUnavailable;
         if (self.thread != null) return error.AlreadyStarted;
         try self.entries.ensureTotalCapacity(self.alloc, self.capacity);
         if (comptime builtin.os.tag == .macos) {
@@ -89,7 +115,7 @@ pub const Observer = struct {
     }
 
     pub fn stop(self: *Observer) void {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+        if (comptime builtin.os.tag == .freestanding) return;
         self.stopping.store(true, .release);
         if (self.thread) |thread| thread.join();
         self.thread = null;
@@ -111,7 +137,7 @@ pub const Observer = struct {
         fd: std.posix.fd_t,
         cancellation: *std.atomic.Value(bool),
     ) !Registration {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return .{};
+        if (comptime builtin.os.tag == .freestanding) return error.ObserverUnavailable;
         if (self.thread == null or self.stopping.load(.acquire) or !self.healthy.load(.acquire)) return error.ObserverUnavailable;
         self.lock();
         defer self.mutex.unlock();
@@ -157,7 +183,7 @@ pub const Observer = struct {
     }
 
     fn unregister(self: *Observer, id: u64) void {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+        if (comptime builtin.os.tag == .freestanding) return;
         self.lock();
         defer self.mutex.unlock();
         for (self.entries.items, 0..) |entry, index| {
@@ -168,9 +194,59 @@ pub const Observer = struct {
     }
 
     fn run(self: *Observer) void {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+        if (comptime builtin.os.tag == .freestanding) return;
+        if (comptime builtin.os.tag == .windows) return self.runWindowsPoll();
         if (comptime builtin.os.tag == .macos) return self.runKqueue();
         self.runPoll();
+    }
+
+    fn runWindowsPoll(self: *Observer) void {
+        if (comptime builtin.os.tag != .windows) unreachable;
+        var fds: std.ArrayListUnmanaged(WindowsPoll.PollFd) = .empty;
+        defer fds.deinit(self.alloc);
+        var ids: std.ArrayListUnmanaged(u64) = .empty;
+        defer ids.deinit(self.alloc);
+        fds.ensureTotalCapacity(self.alloc, self.capacity) catch return self.stopAfterFailure();
+        ids.ensureTotalCapacity(self.alloc, self.capacity) catch return self.stopAfterFailure();
+
+        while (!self.stopping.load(.acquire)) {
+            self.lock();
+            fds.clearRetainingCapacity();
+            ids.clearRetainingCapacity();
+            for (self.entries.items) |entry| {
+                if (!entry.watched) continue;
+                fds.appendAssumeCapacity(.{ .fd = entry.fd, .events = WindowsPoll.poll_read, .revents = 0 });
+                ids.appendAssumeCapacity(entry.id);
+            }
+            self.mutex.unlock();
+            if (fds.items.len == 0) {
+                sleepMs(observation_interval_ms);
+                continue;
+            }
+            const ready = WindowsPoll.WSAPoll(
+                fds.items.ptr,
+                @intCast(fds.items.len),
+                @intCast(observation_interval_ms),
+            );
+            if (ready < 0) return self.stopAfterFailure();
+            if (ready == 0) continue;
+            self.lock();
+            for (fds.items, ids.items) |poll_fd, id| {
+                if (poll_fd.revents == 0) continue;
+                const index = self.indexOfLocked(id) orelse continue;
+                if (poll_fd.revents & WindowsPoll.poll_nval != 0) {
+                    self.cancelLocked(index, false);
+                    continue;
+                }
+                if (poll_fd.revents & WindowsPoll.poll_err != 0) {
+                    self.cancelLocked(index, true);
+                    continue;
+                }
+                if (poll_fd.revents & (WindowsPoll.poll_read | WindowsPoll.poll_hup) != 0)
+                    self.probeWindowsLocked(index);
+            }
+            self.mutex.unlock();
+        }
     }
 
     fn runPoll(self: *Observer) void {
@@ -279,6 +355,26 @@ pub const Observer = struct {
         switch (std.posix.errno(n)) {
             .AGAIN, .INTR => {},
             .CONNRESET => self.cancelLocked(index, true),
+            else => self.cancelLocked(index, false),
+        }
+    }
+
+    fn probeWindowsLocked(self: *Observer, index: usize) void {
+        if (comptime builtin.os.tag != .windows) unreachable;
+        const entry = &self.entries.items[index];
+        var byte: [1]u8 = undefined;
+        const n = WindowsPoll.recv(entry.fd, &byte, byte.len, 0x2); // MSG_PEEK
+        if (n == 0) return self.stopWatchingLocked(index);
+        if (n > 0) {
+            self.stopWatchingLocked(index);
+            return;
+        }
+        switch (WindowsPoll.WSAGetLastError()) {
+            WindowsPoll.wsa_would_block => {},
+            WindowsPoll.wsa_network_reset,
+            WindowsPoll.wsa_connection_aborted,
+            WindowsPoll.wsa_connection_reset,
+            => self.cancelLocked(index, true),
             else => self.cancelLocked(index, false),
         }
     }
