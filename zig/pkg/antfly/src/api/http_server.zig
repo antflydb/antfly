@@ -88,7 +88,6 @@ const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 const repair_jobs = @import("repair_jobs.zig");
 const admin_routes = @import("../admin/routes.zig");
 const internal_api_routes = @import("../internal/routes.zig");
-const http_internal_routes = @import("http_internal_routes.zig");
 const internal_query_operations = @import("internal_query_operations.zig");
 const internal_group_operations = @import("internal_group_operations.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -3810,7 +3809,6 @@ pub const ApiHttpServer = struct {
         if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchSecretRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchTransactionRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
-        if (try http_internal_routes.handle(self.internalRoutesContext(uri_parts), req)) |resp| return resp;
         const public_table_resp = self.dispatchPublicTableRoutes(req, uri_parts, authenticated_identity) catch |err| {
             if (err == error.InvalidPathParameter)
                 return try textResponse(self.alloc, 400, "invalid path parameter");
@@ -5618,16 +5616,6 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn internalRoutesContext(self: *ApiHttpServer, uri_parts: UriParts) http_internal_routes.Context {
-        return .{
-            .path = uri_parts.path,
-            .retrieval_executor = .{
-                .ptr = self,
-                .execute = executeInternalRetrievalRoute,
-            },
-        };
-    }
-
     pub fn executeA2aRetrieval(
         self: *ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -5866,11 +5854,10 @@ pub const ApiHttpServer = struct {
         defer alloc.free(retrieval_resp.body);
     }
 
-    fn executeInternalRetrievalRoute(ptr: *anyopaque, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
-        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        if (req.method != .POST or !std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return null;
-
-        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+    /// Execute the internal retrieval worker protocol without manufacturing
+    /// an HTTP request. The caller owns `response.body` with `self.alloc`.
+    pub fn executeInternalRetrieval(self: *ApiHttpServer, body: []const u8) !retrieval_agent.EncodedResponse {
+        const source = self.table_reads orelse return error.TableNotFound;
 
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
@@ -5993,31 +5980,7 @@ pub const ApiHttpServer = struct {
             .server = self,
             .source = source,
         };
-        const retrieval_resp = retrieval_agent.execute(self.alloc, query_runner.iface(), generation_runner.iface(), req.body) catch |err| switch (err) {
-            error.TreeRootSetTooLarge => return try textResponse(self.alloc, 422, "tree root set exceeds the bounded retrieval limit"),
-            error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => return try textResponse(self.alloc, 400, "invalid retrieval agent request"),
-            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-            error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
-            error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
-            error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
-            error.EmbedRateLimited => return try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
-            error.EmbedTransientFailure => return try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
-            error.EmbedUpstreamFailure => return try textResponse(self.alloc, 502, "query embedding provider failed"),
-            error.Timeout => return try textResponse(self.alloc, 504, "query embedding timed out"),
-            else => {
-                if (try queryEmbeddingOperationalResponse(self.alloc, err)) |operational_response| return operational_response;
-                std.log.err("public retrieval failed err={}", .{err});
-                return err;
-            },
-        };
-        defer self.alloc.free(retrieval_resp.body);
-        if (std.mem.eql(u8, retrieval_resp.content_type, "text/event-stream")) {
-            return try eventStreamResponse(self.alloc, 200, retrieval_resp.body);
-        }
-        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_impl.deinit();
-        const response = try parseJsonResponseBody(metadata_openapi.RetrievalAgentResult, arena_impl.allocator(), retrieval_resp.body);
-        return try jsonResponse(self.alloc, response);
+        return retrieval_agent.execute(self.alloc, query_runner.iface(), generation_runner.iface(), body);
     }
 
     fn dispatchPublicTableRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {

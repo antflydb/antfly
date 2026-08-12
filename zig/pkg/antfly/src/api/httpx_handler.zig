@@ -352,12 +352,7 @@ pub const AntflyApiHandler = struct {
         try server.post(document_artifact_prefix ++ routes.child_range_batch_suffix, httpx.Handler.bind(self, internalDocumentArtifactChildRangeBatch));
         try server.post(document_artifact_prefix ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalDocumentArtifactReprocess));
         try server.post(table_prefix ++ routes.artifacts_marker ++ ":artifact_name" ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalTableArtifactReprocess));
-        const internal_posts = [_][]const u8{
-            table_prefix ++ routes.artifacts_marker ++ "*",
-            table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ "*",
-        };
-        inline for (internal_posts) |path| try server.post(path, handler);
-        try server.post(routes.agents_retrieval, handler);
+        try server.post(routes.agents_retrieval, httpx.Handler.bind(self, internalRetrieval));
     }
 
     fn registerProbes(self: *AntflyApiHandler, server: anytype) !void {
@@ -1557,6 +1552,34 @@ pub const AntflyApiHandler = struct {
             internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
         return internalQueryResponse(ctx, &result);
+    }
+
+    fn internalRetrieval(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse "";
+        const response = self.api_server.executeInternalRetrieval(body) catch |err| switch (err) {
+            error.TreeRootSetTooLarge => return textResponse(ctx, 422, "tree root set exceeds the bounded retrieval limit"),
+            error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => return textResponse(ctx, 400, "invalid retrieval agent request"),
+            error.TableNotFound => return textResponse(ctx, 404, "not found"),
+            error.DocIdentityNamespaceMismatch => return textResponse(ctx, 503, "doc identity unavailable"),
+            else => {
+                if (try respondQueryEmbeddingOperationalError(ctx, err)) |operational_response| return operational_response;
+                std.log.err("internal retrieval failed err={}", .{err});
+                return err;
+            },
+        };
+        defer self.api_server.alloc.free(response.body);
+        if (std.mem.eql(u8, response.content_type, "text/event-stream")) {
+            _ = ctx.status(200);
+            try ctx.setHeader("content-type", "text/event-stream");
+            _ = ctx.response.body(response.body);
+            return ctx.response.build();
+        }
+        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena_impl.deinit();
+        const value = try std.json.parseFromSliceLeaky(metadata_openapi.RetrievalAgentResult, arena_impl.allocator(), response.body, .{
+            .allocate = .alloc_always,
+        });
+        return ctx.json(value);
     }
 
     fn internalGroupScan(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -5954,6 +5977,13 @@ test "httpx internal control routes call typed operations directly" {
         try std.testing.expectEqual(@as(u16, 400), response.status.code);
         try std.testing.expectEqualStrings(case[1], response.body.?);
     }
+
+    const retrieval_url = try std.fmt.allocPrint(alloc, "{s}/agents/retrieval", .{base_url});
+    defer alloc.free(retrieval_url);
+    var invalid_retrieval = try requestWithRetry(&client, client_io.io(), .POST, retrieval_url, "[]", &headers, 20);
+    defer invalid_retrieval.deinit();
+    try std.testing.expectEqual(@as(u16, 400), invalid_retrieval.status.code);
+    try std.testing.expectEqualStrings("invalid retrieval agent request", invalid_retrieval.body.?);
 
     inline for (.{
         .{ "graph-expand", "invalid graph expand request" },

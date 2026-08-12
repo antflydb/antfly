@@ -97,10 +97,11 @@ that end state:
   concrete `httpx` routes over typed shard operations. Route-group invariants,
   local-leader projection, and operational error classification now live below
   the transport; their former method/path dispatcher branches are gone.
-- The temporary internal compatibility registrar now enumerates only the
-  remaining artifact-management and retrieval-agent routes. This preserves
-  reachability during extraction without a global fallback or any legacy
-  public alias; router registration still rejects duplicate route shapes.
+- Every internal group/table worker route is now registered as a concrete
+  `httpx` handler. Dead artifact wildcard registrations have been removed, so
+  an unknown artifact operation is rejected by the router instead of entering
+  the public dispatcher; router registration still rejects duplicate route
+  shapes.
 - The ordinary internal group batch route now decodes directly into an owned
   batch request and invokes a typed operation for schema validation, local
   group write, cancellation, and outcome classification. The explicitly
@@ -155,6 +156,11 @@ that end state:
   request. The old internal read dispatcher and its dispatcher-only tests have
   been deleted; semantic planning retains a direct service test and the real
   router test covers all three wire adapters.
+- The retrieval-agent worker is a concrete `httpx` route over a typed executor
+  that accepts a body and returns an owned encoded result. HTTP status,
+  retry-after, JSON, and event-stream adaptation remain at ingress. The last
+  `http_internal_routes` request/response dispatcher and its executor function
+  table have been deleted.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those
