@@ -290,10 +290,11 @@ pub const AntflyApiHandler = struct {
             routes.extensions_v1_installed,
             routes.extensions_v1_installed_prefix ++ "*",
         };
+        const extension_handler = httpx.Handler.bind(self, extensionRoute);
         inline for (extension_paths) |path| {
-            try server.get(path, handler);
-            try server.post(path, handler);
-            try server.put(path, handler);
+            try server.get(path, extension_handler);
+            try server.post(path, extension_handler);
+            try server.put(path, extension_handler);
         }
         const extension_agent_handler = httpx.Handler.bind(self, extensionAgentRoute);
         try server.get(routes.agents_v1_extensions_prefix ++ "*", extension_agent_handler);
@@ -596,6 +597,39 @@ pub const AntflyApiHandler = struct {
         var response = try self.api_server.handle(request.value);
         const response_alloc = response.owner_allocator orelse self.api_server.alloc;
         return respondWithAllocator(ctx, &response, response_alloc);
+    }
+
+    fn extensionRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |response| return response;
+
+        const method: contextual_operations.Method = switch (ctx.request.method) {
+            .GET => .get,
+            .POST => .post,
+            .PUT => .put,
+            else => return jsonResponse(ctx, 405, "{\"error\":\"method not allowed\"}"),
+        };
+        const path = ctx.request.uri.path;
+        const body = (try ctx.body()) orelse "";
+        var response = self.api_server.executeExtensionRoute(method, path, body) catch |err| {
+            if (metadata_authority.isRetryableError(err) and
+                ApiHttpServer.extensionRouteMutatesMetadata(method, path))
+            {
+                _ = ctx.status(503);
+                try ctx.setHeader("content-type", "application/json");
+                try ctx.setHeader("Retry-After", "1");
+                try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
+                _ = ctx.response.body("{\"error\":\"metadata leader unavailable\"}");
+                return ctx.response.build();
+            }
+            return err;
+        } orelse return jsonResponse(ctx, 404, "{\"error\":\"not found\"}");
+        defer response.deinit(self.api_server.alloc);
+        _ = ctx.status(response.status);
+        try ctx.setHeader("content-type", response.content_type);
+        _ = ctx.response.body(response.body);
+        return ctx.response.build();
     }
 
     fn ardRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -5957,6 +5991,14 @@ test "httpx shared registrar keeps root probes and rejects removed data aliases"
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 200), response.status.code);
     }
+
+    const extensions_url = try std.fmt.allocPrint(alloc, "{s}/extensions/v1", .{base_url});
+    defer alloc.free(extensions_url);
+    var extensions = try getWithRetry(&client, client_io.io(), extensions_url, null, 20);
+    defer extensions.deinit();
+    try std.testing.expectEqual(@as(u16, 200), extensions.status.code);
+    try std.testing.expectEqualStrings("application/json", extensions.header("content-type").?);
+    try std.testing.expect(std.mem.indexOf(u8, extensions.body.?, "\"packages\":\"/extensions/v1/packages\"") != null);
 
     const encoded_job = try api_server.repair_job_store.startJob(alloc, "documents", .{});
     defer alloc.free(encoded_job);

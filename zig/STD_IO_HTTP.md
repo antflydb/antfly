@@ -172,6 +172,11 @@ that end state:
   parsing and visibility checks receive typed method/path/query values; JSON
   and event-stream adaptation is performed by `httpx`. Their legacy dispatcher
   branch and response-conversion helper have been removed.
+- Extension catalog and lifecycle management routes now have their own direct
+  `httpx` registrar over typed method/path/body inputs and the shared owned
+  contextual result. Metadata-leader retry policy and headers remain at the
+  transport edge; the application operation no longer receives a synthetic
+  request, returns a legacy response, or enters `ApiHttpServer.handle()`.
 - Canonical and legacy-location A2A agent-card reads now use a direct `httpx`
   handler over an owned JSON builder. Card generation no longer constructs a
   request or response compatibility object, and both locations share the same

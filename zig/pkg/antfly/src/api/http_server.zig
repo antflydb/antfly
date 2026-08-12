@@ -3794,16 +3794,6 @@ pub const ApiHttpServer = struct {
                 .body = body,
             };
         }
-        const extension_resp = self.dispatchExtensionRoutes(req, uri_parts) catch |err| {
-            if (metadata_authority.isRetryableError(err)) {
-                if (publicExtensionRouteMutatesMetadata(req.method, uri_parts.path)) {
-                    return try metadataNotLeaderResponse(self.alloc);
-                }
-                return err;
-            }
-            return err;
-        };
-        if (extension_resp) |resp| return resp;
         if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchSecretRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchTransactionRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
@@ -4112,137 +4102,142 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
-    fn dispatchExtensionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
-        if (!isExtensionPath(uri_parts.path)) return null;
+    pub fn executeExtensionRoute(
+        self: *ApiHttpServer,
+        method: contextual_operations.Method,
+        path: []const u8,
+        body: []const u8,
+    ) !?contextual_operations.OwnedResponse {
+        if (!isExtensionPath(path)) return null;
 
-        if (req.method != .GET) {
-            if (req.method == .POST) {
-                if (routes.Routes.matchInstalledExtensionUpdate(uri_parts.path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.UpdateExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try jsonErrorResponse(self.alloc, 400, "invalid extension update request");
+        if (method != .get) {
+            if (method == .post) {
+                if (routes.Routes.matchInstalledExtensionUpdate(path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.UpdateExtensionRequest, self.alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try contextualJsonErrorResponse(self.alloc, 400, "invalid extension update request");
                     };
                     defer parsed.deinit();
                     var installed = self.source.updateExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                        return try extensionLifecycleContextualResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
                     self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
                         else => return err,
                     };
-                    return try jsonResponse(self.alloc, installed);
+                    return try contextualJsonResponse(self.alloc, 200, installed);
                 }
-                if (routes.Routes.matchInstalledExtensionDrop(uri_parts.path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.DropExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try jsonErrorResponse(self.alloc, 400, "invalid extension drop request");
+                if (routes.Routes.matchInstalledExtensionDrop(path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.DropExtensionRequest, self.alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try contextualJsonErrorResponse(self.alloc, 400, "invalid extension drop request");
                     };
                     defer parsed.deinit();
                     self.source.dropExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                        return try extensionLifecycleContextualResponse(self.alloc, err);
                     };
-                    return try jsonResponse(self.alloc, .{ .dropped = installed_route.name, .dry_run = parsed.value.dry_run });
+                    return try contextualJsonResponse(self.alloc, 200, .{ .dropped = installed_route.name, .dry_run = parsed.value.dry_run });
                 }
-                if (routes.Routes.matchInstalledExtensionEnable(uri_parts.path)) |installed_route| {
+                if (routes.Routes.matchInstalledExtensionEnable(path)) |installed_route| {
                     var installed = self.source.enableExtension(self.alloc, installed_route.name) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                        return try extensionLifecycleContextualResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
                     self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
                         else => return err,
                     };
-                    return try jsonResponse(self.alloc, installed);
+                    return try contextualJsonResponse(self.alloc, 200, installed);
                 }
-                if (routes.Routes.matchInstalledExtensionDisable(uri_parts.path)) |installed_route| {
+                if (routes.Routes.matchInstalledExtensionDisable(path)) |installed_route| {
                     var installed = self.source.disableExtension(self.alloc, installed_route.name) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                        return try extensionLifecycleContextualResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
                     self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
                         else => return err,
                     };
-                    return try jsonResponse(self.alloc, installed);
+                    return try contextualJsonResponse(self.alloc, 200, installed);
                 }
-                if (routes.Routes.matchInstalledExtension(uri_parts.path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.InstallExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try jsonErrorResponse(self.alloc, 400, "invalid extension install request");
+                if (routes.Routes.matchInstalledExtension(path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.InstallExtensionRequest, self.alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try contextualJsonErrorResponse(self.alloc, 400, "invalid extension install request");
                     };
                     defer parsed.deinit();
                     var installed = self.source.installExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                        return try extensionLifecycleContextualResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
                     if (!parsed.value.dry_run) {
                         self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                            error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                            error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
                             else => return err,
                         };
                     }
-                    return try jsonResponse(self.alloc, installed);
+                    return try contextualJsonResponse(self.alloc, 200, installed);
                 }
             }
-            if (req.method == .PUT) {
-                if (routes.Routes.matchInstalledExtensionConfig(uri_parts.path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.ConfigureExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try jsonErrorResponse(self.alloc, 400, "invalid extension config request");
+            if (method == .put) {
+                if (routes.Routes.matchInstalledExtensionConfig(path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.ConfigureExtensionRequest, self.alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try contextualJsonErrorResponse(self.alloc, 400, "invalid extension config request");
                     };
                     defer parsed.deinit();
                     var installed = self.source.configureExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                        return try extensionLifecycleContextualResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
                     self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
                         else => return err,
                     };
-                    return try jsonResponse(self.alloc, installed);
+                    return try contextualJsonResponse(self.alloc, 200, installed);
                 }
             }
-            return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            return try contextualJsonErrorResponse(self.alloc, 405, "method not allowed");
         }
 
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1)) {
-            return try jsonResponse(self.alloc, .{
+        if (std.mem.eql(u8, path, routes.Routes.extensions_v1)) {
+            return try contextualJsonResponse(self.alloc, 200, .{
                 .packages = routes.Routes.extensions_v1_packages,
                 .installed = routes.Routes.extensions_v1_installed,
             });
         }
 
-        var snapshot = (try self.source.adminSnapshot()) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+        var snapshot = (try self.source.adminSnapshot()) orelse return try contextualJsonErrorResponse(self.alloc, 404, "not found");
         defer self.source.freeAdminSnapshot(&snapshot);
 
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1_packages)) {
-            return try jsonResponse(self.alloc, snapshot.extension_packages);
+        if (std.mem.eql(u8, path, routes.Routes.extensions_v1_packages)) {
+            return try contextualJsonResponse(self.alloc, 200, snapshot.extension_packages);
         }
-        if (routes.Routes.matchExtensionPackageVersion(uri_parts.path)) |package_version| {
+        if (routes.Routes.matchExtensionPackageVersion(path)) |package_version| {
             const package = findExtensionPackageVersion(&snapshot, package_version.name, package_version.version) orelse {
-                return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
             };
-            return try jsonResponse(self.alloc, package.*);
+            return try contextualJsonResponse(self.alloc, 200, package.*);
         }
-        if (routes.Routes.matchExtensionPackage(uri_parts.path)) |package_route| {
+        if (routes.Routes.matchExtensionPackage(path)) |package_route| {
             const package = findLatestExtensionPackage(&snapshot, package_route.name) orelse {
-                return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
             };
-            return try jsonResponse(self.alloc, package.*);
+            return try contextualJsonResponse(self.alloc, 200, package.*);
         }
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1_installed)) {
-            return try jsonResponse(self.alloc, snapshot.installed_extensions);
+        if (std.mem.eql(u8, path, routes.Routes.extensions_v1_installed)) {
+            return try contextualJsonResponse(self.alloc, 200, snapshot.installed_extensions);
         }
-        if (routes.Routes.matchInstalledExtensionObjects(uri_parts.path)) |installed_route| {
+        if (routes.Routes.matchInstalledExtensionObjects(path)) |installed_route| {
             const members = try extensionMembersForName(self.alloc, snapshot.extension_members, installed_route.name);
             defer if (members.len > 0) self.alloc.free(members);
             if (members.len == 0 and findInstalledExtension(&snapshot, installed_route.name) == null) {
-                return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
             }
-            return try jsonResponse(self.alloc, members);
+            return try contextualJsonResponse(self.alloc, 200, members);
         }
-        if (routes.Routes.matchInstalledExtension(uri_parts.path)) |installed_route| {
+        if (routes.Routes.matchInstalledExtension(path)) |installed_route| {
             const installed = findInstalledExtension(&snapshot, installed_route.name) orelse {
-                return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
             };
-            return try jsonResponse(self.alloc, installed.*);
+            return try contextualJsonResponse(self.alloc, 200, installed.*);
         }
         return null;
     }
@@ -8646,15 +8641,15 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn publicExtensionRouteMutatesMetadata(method: http_common.Method, path: []const u8) bool {
+    pub fn extensionRouteMutatesMetadata(method: contextual_operations.Method, path: []const u8) bool {
         return switch (method) {
-            .POST => routes.Routes.matchInstalledExtension(path) != null or
+            .post => routes.Routes.matchInstalledExtension(path) != null or
                 routes.Routes.matchInstalledExtensionUpdate(path) != null or
                 routes.Routes.matchInstalledExtensionDrop(path) != null or
                 routes.Routes.matchInstalledExtensionEnable(path) != null or
                 routes.Routes.matchInstalledExtensionDisable(path) != null,
-            .PUT => routes.Routes.matchInstalledExtensionConfig(path) != null,
-            .GET, .DELETE => false,
+            .put => routes.Routes.matchInstalledExtensionConfig(path) != null,
+            .get, .delete => false,
         };
     }
 
@@ -13906,13 +13901,25 @@ fn jsonBodyOrEmptyObject(body: []const u8) []const u8 {
     return if (body.len == 0) "{}" else body;
 }
 
-fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
+fn contextualJsonResponse(alloc: std.mem.Allocator, status: u16, value: anytype) !contextual_operations.OwnedResponse {
+    return .{
+        .status = status,
+        .content_type = "application/json",
+        .body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}),
+    };
+}
+
+fn contextualJsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8) !contextual_operations.OwnedResponse {
+    return try contextualJsonResponse(alloc, status, .{ .@"error" = message });
+}
+
+fn extensionLifecycleContextualResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
     return switch (err) {
-        error.UnsupportedOperation => try jsonErrorResponse(alloc, 405, "method not allowed"),
-        error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => try jsonErrorResponse(alloc, 404, "not found"),
-        error.ExtensionAlreadyInstalled => try jsonErrorResponse(alloc, 409, "extension already installed"),
-        error.DependentExtensionExists => try jsonErrorResponse(alloc, 409, "dependent extension exists"),
-        error.RequiredExtensionNotInstalled => try jsonErrorResponse(alloc, 409, "required extension not installed"),
+        error.UnsupportedOperation => try contextualJsonErrorResponse(alloc, 405, "method not allowed"),
+        error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => try contextualJsonErrorResponse(alloc, 404, "not found"),
+        error.ExtensionAlreadyInstalled => try contextualJsonErrorResponse(alloc, 409, "extension already installed"),
+        error.DependentExtensionExists => try contextualJsonErrorResponse(alloc, 409, "dependent extension exists"),
+        error.RequiredExtensionNotInstalled => try contextualJsonErrorResponse(alloc, 409, "required extension not installed"),
         error.UnsupportedManifestApiVersion,
         error.UnsupportedPackageKind,
         error.UnsupportedExtensionScope,
@@ -13933,7 +13940,7 @@ fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !htt
         error.EmptyName,
         error.InvalidIdentifier,
         error.MemberTableOutsideScope,
-        => try jsonErrorResponse(alloc, 400, "invalid extension lifecycle request"),
+        => try contextualJsonErrorResponse(alloc, 400, "invalid extension lifecycle request"),
         else => err,
     };
 }
@@ -18631,7 +18638,7 @@ test "api http server dispatches extension lifecycle mutations" {
 }
 
 test "extension lifecycle maps unrequested capability grants to client errors" {
-    var resp = try extensionLifecycleErrorResponse(std.testing.allocator, error.UnrequestedCapabilityGrant);
+    var resp = try extensionLifecycleContextualResponse(std.testing.allocator, error.UnrequestedCapabilityGrant);
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid extension lifecycle request") != null);
