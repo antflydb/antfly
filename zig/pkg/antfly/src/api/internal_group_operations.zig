@@ -15,6 +15,7 @@ const operation = @import("operation.zig");
 const raft_mod = @import("../raft/mod.zig");
 const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_write_source.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub const Error = operation.ApiError || error{
     TopologyChanged,
@@ -25,6 +26,17 @@ pub const Error = operation.ApiError || error{
     RaftBatchWriteOutcomeUnknown,
     DecisionConflict,
     TransactionConflict,
+    RepairCanceled,
+    InvalidRepairCancelToken,
+};
+
+pub const RepairCancellationLookup = struct {
+    ptr: *anyopaque,
+    is_requested_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, u64, u64, ?[]const u8) anyerror!bool,
+
+    fn isRequested(self: @This(), alloc: std.mem.Allocator, table_name: []const u8, job_id: u64, attempt_id: u64, base_uri: ?[]const u8) !bool {
+        return self.is_requested_fn(self.ptr, alloc, table_name, job_id, attempt_id, base_uri);
+    }
 };
 
 pub const BatchValidator = struct {
@@ -60,6 +72,7 @@ pub const Operations = struct {
     batch_validator: ?BatchValidator = null,
     reject_unrouted_batch: bool = false,
     txn_validator: ?TxnValidator = null,
+    repair_cancellation_lookup: ?RepairCancellationLookup = null,
 
     pub fn corruptEmbeddingArtifact(
         self: Operations,
@@ -393,6 +406,43 @@ pub const Operations = struct {
         }) orelse error.NotFound;
     }
 
+    /// The returned result owns its nested allocations and must be deinitialized
+    /// with the same allocator by the caller.
+    pub fn repairArtifactIssues(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        input: db_mod.types.ArtifactRepairRunRequest,
+    ) Error!db_mod.types.ArtifactRepairResult {
+        try request.ensureActive();
+        const writes = self.writes orelse return error.NotFound;
+        var probe: RepairCancelProbe = undefined;
+        var options: db_mod.types.ArtifactRepairRunOptions = .{};
+        if (input.repair_job_id != null or input.repair_attempt_id != null) {
+            const job_id = input.repair_job_id orelse return error.InvalidRepairCancelToken;
+            const attempt_id = input.repair_attempt_id orelse return error.InvalidRepairCancelToken;
+            probe = .{
+                .alloc = alloc,
+                .lookup = self.repair_cancellation_lookup orelse return error.Unavailable,
+                .table_name = table_name,
+                .job_id = job_id,
+                .attempt_id = attempt_id,
+                .base_uri = input.repair_cancel_base_uri,
+            };
+            options.cancel_check = .{ .ptr = &probe, .is_requested = RepairCancelProbe.check };
+        }
+        return (writes.repairArtifactIssuesGroupLocalControlled(alloc, group_id, table_name, input, options) catch |err| switch (err) {
+            error.Canceled => return error.RepairCanceled,
+            error.InvalidArgument => return error.InvalidArgument,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
     fn transitionActionMatchesGroup(action: @import("../metadata/domain.zig").TransitionAction, group_id: u64) bool {
         return switch (action) {
             .none => group_id == 0,
@@ -448,6 +498,28 @@ pub const Operations = struct {
             error.UnsupportedOperation => error.Unsupported,
             else => error.Internal,
         };
+    }
+};
+
+const RepairCancelProbe = struct {
+    alloc: std.mem.Allocator,
+    lookup: RepairCancellationLookup,
+    table_name: []const u8,
+    job_id: u64,
+    attempt_id: u64,
+    base_uri: ?[]const u8,
+    cached_requested: bool = false,
+    last_check_ns: u64 = 0,
+
+    fn check(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.cached_requested) return true;
+        const now_ns = platform_time.monotonicNs();
+        if (self.last_check_ns != 0 and now_ns -| self.last_check_ns < 100 * std.time.ns_per_ms) return false;
+        self.last_check_ns = now_ns;
+        const requested = self.lookup.isRequested(self.alloc, self.table_name, self.job_id, self.attempt_id, self.base_uri) catch return false;
+        self.cached_requested = requested;
+        return requested;
     }
 };
 
