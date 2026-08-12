@@ -4055,9 +4055,22 @@ shapes before copying. During the mixed migration, the adapters deliberately
 preserve the raw table's existing opaque Node pointer; changing it to the
 lifecycle-state handle would silently break every not-yet-migrated callback.
 
+ABI 36 extends the cut to both generation entry points. Role/content generation
+uses paired borrowed string descriptors with one provider-owned byte result.
+Rich chat messages cross as one bounded JSON document because their nested
+tagged content parts and tool calls are already a versioned wire-like domain;
+no generated token or message part incurs an ABI call. The provider parses the
+complete document inside the inference unit and returns generated content
+through the same owned byte-result contract. `InvalidGenerationRequest` now has
+an append-only registered status, while unsupported providers, model failures,
+resource failures, and unexpected defects retain the existing identity rules.
+The focused suite is 50/50 with zero leaks, including rich-message JSON
+round-trip and generation-origin tests; the full linked build and the 92-case
+exhaustive status/owner suite also pass at ABI 36.
+
 Decision: **keep this as the identity and ownership template for the remaining
 coarse inference operations**. It is a prerequisite slice, not yet a compiler
-graph win: multipart embedding, generation, media, and extraction still come
+graph win: multipart embedding, media, and extraction still come
 from the transitional raw Zig provider table. Because that table still exists,
 a cold `ReleaseFast` compiler comparison would not measure the intended root
 removal. Migrate the remaining callbacks using the same status/envelope and

@@ -15,7 +15,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 35;
+pub const abi_version: u32 = 36;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -198,6 +198,7 @@ pub const Status = enum(u32) {
     model_not_found = 174,
     model_not_specified = 175,
     model_artifacts_changing = 176,
+    invalid_generation_request = 177,
     internal = 255,
 };
 

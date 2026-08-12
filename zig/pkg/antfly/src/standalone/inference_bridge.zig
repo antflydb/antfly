@@ -31,6 +31,8 @@ pub const Operation = enum(u32) {
     embed_sparse_texts = 5,
     rerank_texts = 6,
     list_models_json = 7,
+    generate_text = 8,
+    generate_messages = 9,
 };
 
 pub const String = extern struct {
@@ -183,6 +185,24 @@ pub const BytesResult = extern struct {
     byte_count: usize = 0,
 };
 
+pub const GenerateTextRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    handle: ?*anyopaque = null,
+    model: String,
+    roles: ?[*]const String = null,
+    contents: ?[*]const String = null,
+    message_count: usize = 0,
+};
+
+pub const JsonOperationRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    handle: ?*anyopaque = null,
+    model: String,
+    payload_json: String,
+};
+
 pub const RoutesContext = extern struct {
     handle: *anyopaque,
     server: *anyopaque,
@@ -224,5 +244,15 @@ pub extern fn antfly_standalone_inference_list_models(
 pub extern fn antfly_standalone_inference_bytes_result_destroy(
     result: *BytesResult,
 ) callconv(.c) void;
+pub extern fn antfly_standalone_inference_generate_text(
+    request: *const GenerateTextRequest,
+    out_result: *BytesResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub extern fn antfly_standalone_inference_generate_messages(
+    request: *const JsonOperationRequest,
+    out_result: *BytesResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
 pub extern fn antfly_standalone_inference_register_routes(context: *const RoutesContext) callconv(.c) Status;
 pub extern fn antfly_standalone_inference_destroy(handle: *anyopaque) callconv(.c) void;

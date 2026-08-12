@@ -182,6 +182,7 @@ const mappings = [_]Mapping{
     .{ .status = .model_not_found, .err = error.ModelNotFound },
     .{ .status = .model_not_specified, .err = error.ModelNotSpecified },
     .{ .status = .model_artifacts_changing, .err = error.ModelArtifactsChanging },
+    .{ .status = .invalid_generation_request, .err = error.InvalidGenerationRequest },
     .{ .status = .active_node_finalize_rejected, .err = error.ActiveNodeFinalizeRejected },
     .{ .status = .applied_snapshot_index_mismatch, .err = error.AppliedSnapshotIndexMismatch },
     .{ .status = .invalid_committed_entries_encoding, .err = error.InvalidCommittedEntriesEncoding },

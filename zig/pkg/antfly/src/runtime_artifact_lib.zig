@@ -512,6 +512,8 @@ comptime {
             exportInternal(&standaloneInferenceFloatResultDestroy, "antfly_standalone_inference_float_result_destroy");
             exportInternal(&standaloneInferenceListModels, "antfly_standalone_inference_list_models");
             exportInternal(&standaloneInferenceBytesResultDestroy, "antfly_standalone_inference_bytes_result_destroy");
+            exportInternal(&standaloneInferenceGenerateText, "antfly_standalone_inference_generate_text");
+            exportInternal(&standaloneInferenceGenerateMessages, "antfly_standalone_inference_generate_messages");
             exportInternal(&standaloneInferenceRegisterRoutes, "antfly_standalone_inference_register_routes");
             exportInternal(&standaloneInferenceDestroy, "antfly_standalone_inference_destroy");
         },
@@ -613,6 +615,32 @@ fn standaloneInferenceBytesResultDestroy(
     result: *standalone_inference_bridge.BytesResult,
 ) callconv(.c) void {
     standalone_inference_host.linkedInferenceBytesResultDestroy(result);
+}
+
+fn standaloneInferenceGenerateText(
+    request: *const standalone_inference_bridge.GenerateTextRequest,
+    out_result: *standalone_inference_bridge.BytesResult,
+    out_failure: *standalone_inference_bridge.FailureIdentity,
+) callconv(.c) standalone_inference_bridge.Status {
+    out_result.* = .{};
+    out_failure.* = .{};
+    standalone_inference_host.linkedInferenceGenerateText(request, out_result) catch |err| {
+        return reportStandaloneInferenceFailure(out_failure, .generate_text, err);
+    };
+    return .ok;
+}
+
+fn standaloneInferenceGenerateMessages(
+    request: *const standalone_inference_bridge.JsonOperationRequest,
+    out_result: *standalone_inference_bridge.BytesResult,
+    out_failure: *standalone_inference_bridge.FailureIdentity,
+) callconv(.c) standalone_inference_bridge.Status {
+    out_result.* = .{};
+    out_failure.* = .{};
+    standalone_inference_host.linkedInferenceGenerateMessages(request, out_result) catch |err| {
+        return reportStandaloneInferenceFailure(out_failure, .generate_messages, err);
+    };
+    return .ok;
 }
 
 fn standaloneInferenceRegisterRoutes(context: *const standalone_inference_bridge.RoutesContext) callconv(.c) standalone_inference_bridge.Status {

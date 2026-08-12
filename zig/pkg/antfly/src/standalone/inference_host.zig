@@ -443,6 +443,64 @@ pub fn linkedInferenceListModels(
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const bytes = try node.listModelsJsonAlloc(alloc, io_impl.io());
+    try publishBytesResult(bytes, out_result);
+}
+
+pub fn linkedInferenceGenerateText(
+    request: *const inference_bridge.GenerateTextRequest,
+    out_result: *inference_bridge.BytesResult,
+) !void {
+    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
+    if (request._reserved0 != 0 or request.handle == null or
+        request.message_count > 1_000_000 or
+        (request.message_count == 0 and (request.roles != null or request.contents != null)) or
+        (request.message_count != 0 and (request.roles == null or request.contents == null)))
+    {
+        return error.InvalidArgument;
+    }
+    const alloc = std.heap.c_allocator;
+    const role_wire = if (request.message_count == 0) &.{} else request.roles.?[0..request.message_count];
+    const content_wire = if (request.message_count == 0) &.{} else request.contents.?[0..request.message_count];
+    const roles = try alloc.alloc([]const u8, request.message_count);
+    defer alloc.free(roles);
+    const contents = try alloc.alloc([]const u8, request.message_count);
+    defer alloc.free(contents);
+    for (role_wire, 0..) |role, i| roles[i] = role.slice();
+    for (content_wire, 0..) |content, i| contents[i] = content.slice();
+    const node: *inference.server.Node = @ptrCast(@alignCast(request.handle.?));
+    const bytes = try node.generateTextDirect(alloc, request.model.slice(), roles, contents);
+    try publishBytesResult(bytes, out_result);
+}
+
+pub fn linkedInferenceGenerateMessages(
+    request: *const inference_bridge.JsonOperationRequest,
+    out_result: *inference_bridge.BytesResult,
+) !void {
+    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
+    if (request._reserved0 != 0 or request.handle == null or
+        request.payload_json.len > 256 * 1024 * 1024)
+    {
+        return error.InvalidArgument;
+    }
+    const alloc = std.heap.c_allocator;
+    const parsed = try std.json.parseFromSlice(
+        []antfly.inference.ChatMessage,
+        alloc,
+        request.payload_json.slice(),
+        .{},
+    );
+    defer parsed.deinit();
+    const bytes = try localAntflyGenerateMessages(
+        request.handle.?,
+        alloc,
+        request.model.slice(),
+        parsed.value,
+    );
+    try publishBytesResult(bytes, out_result);
+}
+
+fn publishBytesResult(bytes: []u8, out_result: *inference_bridge.BytesResult) !void {
+    const alloc = std.heap.c_allocator;
     errdefer alloc.free(bytes);
     const owner = try alloc.create(BytesOwner);
     owner.* = .{ .bytes = bytes };

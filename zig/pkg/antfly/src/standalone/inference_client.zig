@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const inference_types = @import("../inference/types.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const bridge = @import("inference_bridge.zig");
 const failure_identity = @import("runtime_failure_identity");
@@ -73,6 +74,8 @@ pub fn installProviderAdapters(provider: *managed_embedder.AntflyProvider) void 
     provider.embed_sparse_texts = embedSparseTexts;
     provider.rerank_texts = rerankTexts;
     provider.list_models_json = listModelsJson;
+    provider.generate_text = generateText;
+    provider.generate_messages = generateMessages;
 }
 
 fn embedDenseTexts(
@@ -234,6 +237,71 @@ fn listModelsJson(handle: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
     var failure: bridge.FailureIdentity = .{};
     const status = linked_list_models_api.execute(&.{ .handle = handle }, &result, &failure);
     try acceptFailure(status, &failure, .list_models_json);
+    try validateBytesResult(result);
+    return try alloc.dupe(u8, if (result.byte_count == 0) &.{} else result.bytes.?[0..result.byte_count]);
+}
+
+fn generateText(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    roles: []const []const u8,
+    contents: []const []const u8,
+) anyerror![]u8 {
+    if (roles.len != contents.len) return error.InvalidGenerationRequest;
+    const role_wire = try alloc.alloc(bridge.String, roles.len);
+    defer alloc.free(role_wire);
+    const content_wire = try alloc.alloc(bridge.String, contents.len);
+    defer alloc.free(content_wire);
+    for (roles, 0..) |role, i| role_wire[i] = .init(role);
+    for (contents, 0..) |content, i| content_wire[i] = .init(content);
+    const request = bridge.GenerateTextRequest{
+        .handle = handle,
+        .model = .init(model),
+        .roles = if (role_wire.len == 0) null else role_wire.ptr,
+        .contents = if (content_wire.len == 0) null else content_wire.ptr,
+        .message_count = role_wire.len,
+    };
+    return callBytesOperation(
+        alloc,
+        .generate_text,
+        bridge.antfly_standalone_inference_generate_text,
+        &request,
+    );
+}
+
+fn generateMessages(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    messages: []const inference_types.ChatMessage,
+) anyerror![]u8 {
+    const payload = try std.json.Stringify.valueAlloc(alloc, messages, .{});
+    defer alloc.free(payload);
+    const request = bridge.JsonOperationRequest{
+        .handle = handle,
+        .model = .init(model),
+        .payload_json = .init(payload),
+    };
+    return callBytesOperation(
+        alloc,
+        .generate_messages,
+        bridge.antfly_standalone_inference_generate_messages,
+        &request,
+    );
+}
+
+fn callBytesOperation(
+    alloc: std.mem.Allocator,
+    operation: bridge.Operation,
+    comptime execute: anytype,
+    request: anytype,
+) ![]u8 {
+    var result: bridge.BytesResult = .{};
+    defer bridge.antfly_standalone_inference_bytes_result_destroy(&result);
+    var failure: bridge.FailureIdentity = .{};
+    const status = execute(request, &result, &failure);
+    try acceptFailure(status, &failure, operation);
     try validateBytesResult(result);
     return try alloc.dupe(u8, if (result.byte_count == 0) &.{} else result.bytes.?[0..result.byte_count]);
 }
@@ -470,6 +538,8 @@ test "simple inference operations retain their distinct failure origins" {
         bridge.Operation.embed_sparse_texts,
         bridge.Operation.rerank_texts,
         bridge.Operation.list_models_json,
+        bridge.Operation.generate_text,
+        bridge.Operation.generate_messages,
     }) |operation| {
         const failure = failure_identity.failureFromError(
             error.ModelNotFound,
@@ -482,4 +552,33 @@ test "simple inference operations retain their distinct failure origins" {
             acceptFailure(.model_not_found, &failure, operation),
         );
     }
+}
+
+test "generation ABI preserves domain errors and rich message JSON" {
+    const failure = failure_identity.failureFromError(
+        error.InvalidGenerationRequest,
+        .inference_runtime,
+        bridge.abi_version,
+        @intFromEnum(bridge.Operation.generate_text),
+    );
+    try std.testing.expectError(
+        error.InvalidGenerationRequest,
+        acceptFailure(.invalid_generation_request, &failure, .generate_text),
+    );
+
+    const messages = [_]inference_types.ChatMessage{.{
+        .role = .user,
+        .content = .{ .text = "hello" },
+    }};
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, &messages, .{});
+    defer std.testing.allocator.free(encoded);
+    const parsed = try std.json.parseFromSlice(
+        []inference_types.ChatMessage,
+        std.testing.allocator,
+        encoded,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.len);
+    try std.testing.expectEqualStrings("hello", parsed.value[0].content.?.text);
 }

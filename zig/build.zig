@@ -6262,6 +6262,7 @@ pub fn build(b: *std.Build) void {
             "dense adapter copies provider-owned vectors and destroys provider result",
             "dense adapter preserves registered failure identity and rejects wrong origin",
             "simple inference operations retain their distinct failure origins",
+            "generation ABI preserves domain errors and rich message JSON",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
