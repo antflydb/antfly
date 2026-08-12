@@ -210,6 +210,7 @@ pub const Connection = pool.Connection;
 pub const PoolStats = pool.PoolStats;
 
 pub const Server = server_mod.Server;
+pub const ListenerTask = server_mod.Server.ListenerTask;
 pub const ServerConfig = server_mod.ServerConfig;
 pub const Context = server_mod.Context;
 pub const Handler = server_mod.Handler;

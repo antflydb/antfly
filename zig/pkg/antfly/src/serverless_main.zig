@@ -21,38 +21,6 @@ const serverless_default_max_connection_threads: u32 = 64;
 const serverless_default_query_cache_max_bytes: u64 = 4 * 1024 * 1024 * 1024;
 const serverless_default_query_cache_payload_max_bytes: u64 = 64 * 1024 * 1024;
 
-var termination_requested: std.atomic.Value(bool) = .init(false);
-
-fn terminationSignalHandler(_: std.posix.SIG) callconv(.c) void {
-    termination_requested.store(true, .release);
-}
-
-const TerminationSignalScope = struct {
-    old_int: std.posix.Sigaction,
-    old_term: std.posix.Sigaction,
-
-    fn install() TerminationSignalScope {
-        termination_requested.store(false, .release);
-        const action = std.posix.Sigaction{
-            .handler = .{ .handler = terminationSignalHandler },
-            .mask = std.posix.sigemptyset(),
-            .flags = 0,
-        };
-        var old_int: std.posix.Sigaction = undefined;
-        var old_term: std.posix.Sigaction = undefined;
-        std.posix.sigaction(.INT, &action, &old_int);
-        std.posix.sigaction(.TERM, &action, &old_term);
-        return .{ .old_int = old_int, .old_term = old_term };
-    }
-
-    fn deinit(self: *TerminationSignalScope) void {
-        std.posix.sigaction(.INT, &self.old_int, null);
-        std.posix.sigaction(.TERM, &self.old_term, null);
-        termination_requested.store(false, .release);
-        self.* = undefined;
-    }
-};
-
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
     secret_store_path: ?[]const u8 = null,
@@ -106,13 +74,15 @@ pub fn runFromIterator(
     forced_combined_mode: ?bool,
 ) !void {
     const alloc = init.gpa;
-    var termination_signals = TerminationSignalScope.install();
+    var termination_signals = antfly.common.runtime_lifecycle.ProcessSignalScope.install();
     defer termination_signals.deinit();
     const cli = try parseCli(args);
     if (cli.help) {
         printUsage(argv0);
         return;
     }
+    var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
+    defer supervisor.markStopped();
 
     var secret_store: ?antfly.common.secrets.FileStore = if (cli.secret_store_path orelse init.environ_map.get("ANTFLY_SECRET_STORE_PATH")) |path|
         try antfly.common.secrets.FileStore.init(alloc, path)
@@ -124,6 +94,10 @@ pub fn runFromIterator(
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
+    antfly.common.config.Config.validateServerTlsConfig(if (loaded_config) |*cfg| cfg.tls else null) catch |err| {
+        std.log.err("serverless startup rejected configured tls: built-in server TLS is unsupported; terminate TLS at a trusted reverse proxy", .{});
+        return err;
+    };
     var configured_uris = try ConfiguredStorageUris.init(
         alloc,
         if (loaded_config) |*cfg| cfg else null,
@@ -167,19 +141,19 @@ pub fn runFromIterator(
     const listener_enabled = forced_listener orelse listenerEnabledForRole(bootstrap.role);
     const listener = if (listener_enabled) try serverless_serverConfigFromEnv(init.environ_map, cli) else null;
 
-    var srv = serverless.ServerlessServer.init(alloc, .{
+    var srv = serverless.ServerlessServer.init(alloc, init.io, .{
         .bootstrap = bootstrap,
         .listener = listener,
     }) catch |err| {
         reportStartupError(err);
         return err;
     };
-    defer srv.deinit();
+    defer srv.deinitWithDeadline(supervisor.deadline());
     srv.start() catch |err| {
         reportStartupError(err);
         return err;
     };
-    defer srv.stop();
+    defer srv.stopWithDeadline(supervisor.deadline());
 
     if (listener_enabled) {
         const base_uri = try srv.baseUri(alloc);
@@ -190,20 +164,24 @@ pub fn runFromIterator(
     }
     printRuntimeStatusSummary(srv.runtimeStatus());
 
-    var health_source = ServerlessHealthSource{ .srv = &srv };
+    var health_source = ServerlessHealthSource{ .srv = &srv, .supervisor = &supervisor };
     const health_port = cli.health_port orelse try parseEnvOptionalInt(init.environ_map, u16, "ANTFLY_SERVERLESS_HEALTH_PORT");
     const health_bind_host = cli.bind_host orelse init.environ_map.get("ANTFLY_SERVERLESS_BIND_HOST") orelse "127.0.0.1";
     const health_server = try antfly.common.health_server.HealthServer.startIfConfiguredOnHost(
         alloc,
+        init.io,
         "serverless",
         health_bind_host,
         health_port,
         health_source.readiness(),
         health_source.metricsWriter(),
     );
-    defer if (health_server) |hs| hs.deinit();
+    defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
 
-    while (!termination_requested.load(.acquire)) {
+    try supervisor.publishReady();
+    while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
+        if (srv.listenerFailure()) |err| return supervisor.fail("serverless", "public-http", err);
+        if (health_server) |hs| if (hs.runtimeFailure()) |err| return supervisor.fail("health", "http", err);
         // A short interruptible wait bounds graceful termination latency even
         // on platforms whose clock sleep is automatically restarted.
         sleepMs(init.io, 250);
@@ -212,6 +190,7 @@ pub fn runFromIterator(
 
 const ServerlessHealthSource = struct {
     srv: *serverless.ServerlessServer,
+    supervisor: *const antfly.common.runtime_lifecycle.RuntimeSupervisor,
 
     fn readiness(self: *ServerlessHealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
@@ -229,11 +208,13 @@ const ServerlessHealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *ServerlessHealthSource = @ptrCast(@alignCast(ptr));
-        return self.srv.runtimeStatus().validated;
+        return self.supervisor.currentState() == .ready and self.srv.runtimeStatus().validated;
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
         const self: *ServerlessHealthSource = @ptrCast(@alignCast(ptr));
+        try antfly.common.prometheus.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(self.supervisor.currentState()));
+        try antfly.common.prometheus.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(self.supervisor.token().isCancelled()));
         const run_stats = self.srv.stack.runtime.metricsSnapshot();
         const query_metrics = self.srv.stack.query.metricsSnapshot();
         try writeServerlessPrometheus(writer, run_stats, query_metrics);
@@ -564,7 +545,7 @@ fn invalidEnvironmentValue(name: []const u8, value: []const u8, expected: []cons
 fn serverless_serverConfigFromEnv(
     env_map: *std.process.Environ.Map,
     cli: CliConfig,
-) !antfly.raft.transport.StdHttpListenerConfig {
+) !serverless.ListenerConfig {
     return .{
         .bind_host = cli.bind_host orelse env_map.get("ANTFLY_SERVERLESS_BIND_HOST") orelse "127.0.0.1",
         .bind_port = cli.bind_port orelse try parseEnvIntOrDefault(env_map, u16, "ANTFLY_SERVERLESS_BIND_PORT", 8080),
@@ -574,8 +555,7 @@ fn serverless_serverConfigFromEnv(
             "ANTFLY_SERVERLESS_MAX_REQUEST_BYTES",
             serverless_default_max_request_bytes,
         ),
-        .serve_in_connection_threads = true,
-        .max_connection_threads = cli.max_connection_threads orelse try parseEnvIntOrDefault(
+        .max_connections = cli.max_connection_threads orelse try parseEnvIntOrDefault(
             env_map,
             u32,
             "ANTFLY_SERVERLESS_MAX_CONNECTION_THREADS",
@@ -801,8 +781,7 @@ test "serverless main listener config defaults request limit to public API limit
 
     const cfg = try serverless_serverConfigFromEnv(&env_map, .{});
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
-    try std.testing.expect(cfg.serve_in_connection_threads);
-    try std.testing.expectEqual(serverless_default_max_connection_threads, cfg.max_connection_threads);
+    try std.testing.expectEqual(serverless_default_max_connection_threads, cfg.max_connections);
 }
 
 test "serverless main listener config allows env and cli listener limit overrides" {
@@ -813,14 +792,14 @@ test "serverless main listener config allows env and cli listener limit override
 
     const env_cfg = try serverless_serverConfigFromEnv(&env_map, .{});
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), env_cfg.max_request_bytes);
-    try std.testing.expectEqual(@as(u32, 7), env_cfg.max_connection_threads);
+    try std.testing.expectEqual(@as(u32, 7), env_cfg.max_connections);
 
     const cli_cfg = try serverless_serverConfigFromEnv(&env_map, .{
         .max_request_bytes = 8 * 1024 * 1024,
         .max_connection_threads = 11,
     });
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), cli_cfg.max_request_bytes);
-    try std.testing.expectEqual(@as(u32, 11), cli_cfg.max_connection_threads);
+    try std.testing.expectEqual(@as(u32, 11), cli_cfg.max_connections);
 }
 
 test "serverless main rejects malformed explicit environment values" {

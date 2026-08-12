@@ -3164,7 +3164,7 @@ pub fn build(b: *std.Build) void {
     const lib_reranking_runtime_test_step = b.step("lib-reranking-runtime-test", "Run reranking backend adapter tests");
     lib_reranking_runtime_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
 
-    const lib_common_default_filters = [_][]const u8{ "provider registry", "std http listener", "std http executor", "threaded connector", "health server" };
+    const lib_common_default_filters = [_][]const u8{ "provider registry", "std http listener", "std http executor", "threaded connector", "health server", "runtime lifecycle" };
     const lib_common_runtime_filters = selectTestFilters(b, &lib_common_default_filters);
     const lib_common_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -3356,6 +3356,10 @@ pub fn build(b: *std.Build) void {
         "backend runtime durable lane runs inline jobs",
         "backend runtime durable lane leaves inline failed jobs owned by caller",
         "backend runtime threaded durable lane rejects jobs after owner close",
+        "backend runtime API lane leases expose and release the interface",
+        "backend runtime rejects API lane leases after shutdown begins",
+        "backend runtime control lane leases are isolated from API leases",
+        "backend runtime rejects control lane leases after shutdown begins",
         "provisioned table write cache retires stale db when index metadata changes",
         "managed startup catch-up advances counterless incomplete dense repair",
         "provisioned leader admission rejects uncommitted writes under dense repair pressure",
@@ -5777,7 +5781,8 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_logic_default_filters = [_][]const u8{
         "metadata reconciler",
         "transition state",
-        "metadata server module compiles",
+        "metadata server ",
+        "metadata admin mux ",
         "metadata merge request validation rejects incompatible doc identity namespaces",
         "metadata split request validation rejects stale doc identity namespace",
         "transition actions",
@@ -7169,9 +7174,13 @@ pub fn build(b: *std.Build) void {
     const unit_metadata_shard_max_rss = [_]usize{
         5 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
+        // The core shard now compiles the contextual public router and its
+        // compatibility manifest; Debug codegen peaks above 5 GiB on macOS.
+        6 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
-        5 * 1024 * 1024 * 1024,
-        5 * 1024 * 1024 * 1024,
+        // The server shard compiles the public API kernel and listener stack;
+        // Debug codegen currently peaks around 6.4 GB on aarch64 macOS.
+        7 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
         7 * 1024 * 1024 * 1024,
@@ -9040,12 +9049,14 @@ pub fn build(b: *std.Build) void {
                 // Claims conservatively cover clean production ReleaseFast
                 // peaks measured for both aarch64-linux-musl and explicit
                 // aarch64-macos (including Metal and Accelerate). They are
-                // scheduling reservations, not hard process limits. A 20 GiB
+                // scheduling reservations, not hard process limits. A 24 GiB
                 // budget can overlap all four units while a smaller cgroup
                 // automatically schedules only the subset that fits.
                 .api_kernel => 4 * 1024 * 1024 * 1024,
                 .distributed => 8 * 1024 * 1024 * 1024,
-                .inference => 5 * 1024 * 1024 * 1024,
+                // Debug codegen currently peaks around 6.7 GB on aarch64
+                // macOS; reserve headroom for mode- and target-dependent IR.
+                .inference => 7 * 1024 * 1024 * 1024,
                 .cli => 2 * 1024 * 1024 * 1024,
             },
         });

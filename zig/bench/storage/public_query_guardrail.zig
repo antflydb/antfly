@@ -1320,6 +1320,7 @@ fn runLocalBench(
     };
     const health_server = try common.health_server.HealthServer.init(
         alloc,
+        io,
         .{ .bind_port = 0 },
         metrics_source.readiness(),
         metrics_source.metricsWriter(),

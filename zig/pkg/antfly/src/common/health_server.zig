@@ -16,7 +16,7 @@
 //! main API. Exposes Kubernetes liveness/readiness probes and Prometheus
 //! metrics in the standard text exposition format.
 //!
-//! The server is built on top of `StdHttpListener` and takes two optional
+//! The server is built on top of `httpx.Server` and takes two optional
 //! pluggable interfaces via vtables:
 //!   * `ReadinessChecker` — called by `/readyz` to decide 200 vs 503.
 //!   * `MetricsWriter`    — called by `/metrics` to write Prometheus text.
@@ -25,21 +25,14 @@
 //! server-specific metrics sources (raft metrics, serverless metrics, etc).
 
 const std = @import("std");
+const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
 const Io = std.Io;
-const http_common = @import("http/http_common.zig");
-const std_http_listener = @import("http/std_http_listener.zig");
 const platform_time = @import("antfly_platform").time;
 const prometheus = @import("prometheus.zig");
-const thread_config = @import("../runtime_thread_config.zig");
-
-const StdHttpListener = std_http_listener.StdHttpListener;
-const StdHttpListenerConfig = std_http_listener.StdHttpListenerConfig;
-const HttpRequest = http_common.HttpRequest;
-const HttpResponse = http_common.HttpResponse;
-const RequestExecutor = http_common.RequestExecutor;
+const runtime_lifecycle = @import("runtime_lifecycle.zig");
 const metrics_cache_ttl_ms: u64 = 5 * std.time.ms_per_s;
-const health_thread_stack_size = thread_config.minimum_partitioned_stack_size;
+const graceful_shutdown_timeout_ms: u64 = 5_000;
 
 pub const ReadinessChecker = struct {
     ptr: *anyopaque,
@@ -74,19 +67,21 @@ pub const Config = struct {
 
 pub const HealthServer = struct {
     alloc: std.mem.Allocator,
+    io: Io,
     ready: ?ReadinessChecker,
     metrics: ?MetricsWriter,
-    listener: StdHttpListener,
+    server: httpx.Server,
+    listener_task: httpx.ListenerTask,
     metrics_cache_mutex: std.atomic.Mutex = .unlocked,
     metrics_cache_body: ?[]u8 = null,
     metrics_cache_built_at_ms: u64 = 0,
     metrics_cache_refreshing: bool = false,
-    metrics_refresh_io: ?Io.Threaded = null,
     metrics_refresh_future: ?Io.Future(void) = null,
     metrics_refresh_stop: std.atomic.Value(bool) = .init(false),
 
     pub fn init(
         alloc: std.mem.Allocator,
+        io: Io,
         cfg: Config,
         ready: ?ReadinessChecker,
         metrics: ?MetricsWriter,
@@ -96,19 +91,22 @@ pub const HealthServer = struct {
 
         self.* = .{
             .alloc = alloc,
+            .io = io,
             .ready = ready,
             .metrics = metrics,
-            .listener = undefined,
+            .server = httpx.Server.initWithConfig(alloc, io, .{
+                .host = cfg.bind_host,
+                .port = cfg.bind_port,
+                .reuse_address = true,
+                .max_connections = 16,
+            }),
+            .listener_task = undefined,
         };
-
-        self.listener = StdHttpListener.init(alloc, .{
-            .bind_host = cfg.bind_host,
-            .bind_port = cfg.bind_port,
-            .reuse_address = true,
-            .serve_in_connection_threads = true,
-            .connection_thread_stack_size = health_thread_stack_size,
-            .max_connection_threads = 16,
-        }, self.executor());
+        errdefer self.server.deinit();
+        self.listener_task = httpx.ListenerTask.init(&self.server);
+        try self.server.get("/healthz", httpx.Handler.bind(self, healthz));
+        try self.server.get("/readyz", httpx.Handler.bind(self, readyz));
+        try self.server.get("/metrics", httpx.Handler.bind(self, metricsHandler));
         if (metrics != null) {
             self.refreshMetricsCacheSync() catch {};
         }
@@ -116,30 +114,49 @@ pub const HealthServer = struct {
     }
 
     pub fn deinit(self: *HealthServer) void {
-        self.stop();
+        self.deinitWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMilliseconds(graceful_shutdown_timeout_ms));
+    }
+
+    pub fn deinitWithDeadline(self: *HealthServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
+        self.stopWithDeadline(deadline);
         lockAtomic(&self.metrics_cache_mutex);
         const cached_body = self.metrics_cache_body;
         self.metrics_cache_body = null;
         self.metrics_cache_refreshing = false;
         self.metrics_cache_mutex.unlock();
         if (cached_body) |body| std.heap.page_allocator.free(body);
-        self.listener.deinit();
+        self.server.deinit();
         self.alloc.destroy(self);
     }
 
     pub fn start(self: *HealthServer) !void {
-        try self.listener.start();
-        errdefer self.listener.stop();
+        try self.listener_task.start();
+        errdefer {
+            self.listener_task.requestStop();
+            self.listener_task.join() catch {};
+        }
         try self.startMetricsRefreshThread();
     }
 
     pub fn stop(self: *HealthServer) void {
-        self.stopMetricsRefreshThread();
-        self.listener.stop();
+        self.stopWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMilliseconds(graceful_shutdown_timeout_ms));
     }
 
-    pub fn baseUri(self: *const HealthServer, alloc: std.mem.Allocator) ![]u8 {
-        return try self.listener.baseUri(alloc);
+    pub fn stopWithDeadline(self: *HealthServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
+        self.stopMetricsRefreshThread();
+        self.listener_task.shutdown(deadline.remainingMilliseconds());
+        self.listener_task.join() catch |err| {
+            std.log.err("health listener failed during shutdown err={s}", .{@errorName(err)});
+        };
+    }
+
+    pub fn baseUri(self: *HealthServer, alloc: std.mem.Allocator) ![]u8 {
+        const address = self.server.boundAddress() orelse return error.ListenerNotStarted;
+        return try std.fmt.allocPrint(alloc, "http://{f}", .{address});
+    }
+
+    pub fn runtimeFailure(self: *const HealthServer) ?anyerror {
+        return self.listener_task.runtimeFailure();
     }
 
     /// Conditional init + start. Returns null when `port` is unset and
@@ -149,16 +166,18 @@ pub const HealthServer = struct {
     /// runtime. Prints the bound URI prefixed with `label` on success.
     pub fn startIfConfigured(
         alloc: std.mem.Allocator,
+        io: Io,
         label: []const u8,
         port: ?u16,
         ready: ?ReadinessChecker,
         metrics: ?MetricsWriter,
     ) !?*HealthServer {
-        return try startIfConfiguredOnHost(alloc, label, null, port, ready, metrics);
+        return try startIfConfiguredOnHost(alloc, io, label, null, port, ready, metrics);
     }
 
     pub fn startIfConfiguredOnHost(
         alloc: std.mem.Allocator,
+        io: Io,
         label: []const u8,
         bind_host: ?[]const u8,
         port: ?u16,
@@ -166,7 +185,7 @@ pub const HealthServer = struct {
         metrics: ?MetricsWriter,
     ) !?*HealthServer {
         const p = port orelse return null;
-        const hs = try HealthServer.init(alloc, .{
+        const hs = try HealthServer.init(alloc, io, .{
             .bind_host = bind_host orelse "0.0.0.0",
             .bind_port = p,
         }, ready, metrics);
@@ -178,41 +197,25 @@ pub const HealthServer = struct {
         return hs;
     }
 
-    pub fn executor(self: *HealthServer) RequestExecutor {
-        return .{
-            .ptr = self,
-            .vtable = &.{ .execute = execute },
-        };
+    fn healthz(_: *HealthServer, ctx: *httpx.Context) anyerror!httpx.Response {
+        return try ctx.json(.{ .status = "ok" });
     }
 
-    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: HttpRequest) anyerror!HttpResponse {
-        const self: *HealthServer = @ptrCast(@alignCast(ptr));
-        const path = pathOnly(req.uri);
-
-        if (req.method == .GET and std.mem.eql(u8, path, "/healthz")) {
-            return try jsonResponse(alloc, 200, "{\"status\":\"ok\"}");
-        }
-
-        if (req.method == .GET and std.mem.eql(u8, path, "/readyz")) {
-            const is_ready = if (self.ready) |r| r.check() else true;
-            if (is_ready) {
-                return try jsonResponse(alloc, 200, "{\"status\":\"ready\"}");
-            }
-            return try jsonResponse(alloc, 503, "{\"status\":\"not_ready\"}");
-        }
-
-        if (req.method == .GET and std.mem.eql(u8, path, "/metrics")) {
-            return try self.metricsResponseCached(alloc);
-        }
-
-        return try textResponse(alloc, 404, "not found");
+    fn readyz(self: *HealthServer, ctx: *httpx.Context) anyerror!httpx.Response {
+        const is_ready = if (self.ready) |ready| ready.check() else true;
+        if (is_ready) return try ctx.json(.{ .status = "ready" });
+        return try ctx.status(503).json(.{ .status = "not_ready" });
     }
 
-    fn metricsResponseCached(self: *HealthServer, alloc: std.mem.Allocator) !HttpResponse {
+    fn metricsHandler(self: *HealthServer, ctx: *httpx.Context) anyerror!httpx.Response {
+        return try self.metricsResponseCached(ctx);
+    }
+
+    fn metricsResponseCached(self: *HealthServer, ctx: *httpx.Context) !httpx.Response {
         lockAtomic(&self.metrics_cache_mutex);
         const cached = self.metrics_cache_body;
         const body_copy = if (cached) |body|
-            alloc.dupe(u8, body) catch |err| {
+            ctx.allocator.dupe(u8, body) catch |err| {
                 self.metrics_cache_mutex.unlock();
                 return err;
             }
@@ -221,43 +224,26 @@ pub const HealthServer = struct {
         self.metrics_cache_mutex.unlock();
 
         if (body_copy) |body| {
-            errdefer alloc.free(body);
-            const content_type = try alloc.dupe(u8, "text/plain; version=0.0.4; charset=utf-8");
-            return .{
-                .status = 200,
-                .content_type = content_type,
-                .body = body,
-            };
+            defer ctx.allocator.free(body);
+            var response = try ctx.text(body);
+            try response.headers.set("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+            return response;
         }
 
-        return try textResponse(alloc, 503, "metrics unavailable");
+        return try ctx.status(503).text("metrics unavailable");
     }
 
     fn startMetricsRefreshThread(self: *HealthServer) !void {
         if (self.metrics == null or self.metrics_refresh_future != null) return;
         self.metrics_refresh_stop.store(false, .release);
-        if (self.metrics_refresh_io == null) {
-            self.metrics_refresh_io = Io.Threaded.init(self.alloc, .{
-                .stack_size = health_thread_stack_size,
-                // This executor owns exactly one long-lived refresh future.
-                .concurrent_limit = .limited(1),
-            });
-        }
-        const io = self.metrics_refresh_io.?.io();
-        self.metrics_refresh_future = try io.concurrent(metricsRefreshTask, .{self});
+        self.metrics_refresh_future = try self.io.concurrent(metricsRefreshTask, .{self});
     }
 
     fn stopMetricsRefreshThread(self: *HealthServer) void {
         self.metrics_refresh_stop.store(true, .release);
         if (self.metrics_refresh_future) |*future| {
-            if (self.metrics_refresh_io) |*io_impl| {
-                _ = future.await(io_impl.io());
-            }
+            _ = future.await(self.io);
             self.metrics_refresh_future = null;
-        }
-        if (self.metrics_refresh_io) |*io_impl| {
-            io_impl.deinit();
-            self.metrics_refresh_io = null;
         }
     }
 
@@ -270,9 +256,8 @@ pub const HealthServer = struct {
     }
 
     fn metricsRefreshTask(self: *HealthServer) void {
-        const io = if (self.metrics_refresh_io) |*io_impl| io_impl.io() else return;
         while (!self.metrics_refresh_stop.load(.acquire)) {
-            sleepRefreshInterval(io, &self.metrics_refresh_stop);
+            sleepRefreshInterval(self.io, &self.metrics_refresh_stop);
             if (self.metrics_refresh_stop.load(.acquire)) return;
             self.refreshMetricsCacheThread();
         }
@@ -291,6 +276,18 @@ pub const HealthServer = struct {
         self.metrics_cache_mutex.unlock();
         if (old) |prev| std.heap.page_allocator.free(prev);
     }
+
+    fn executeForTest(self: *HealthServer, method: httpx.Method, uri: []const u8) !httpx.Response {
+        var request = try httpx.Request.init(self.alloc, method, uri);
+        defer request.deinit();
+        var ctx = httpx.Context.init(self.alloc, self.io, &request);
+        defer ctx.deinit();
+        var params: [16]httpx.RouteParam = undefined;
+        const matched = self.server.router.find(method, uri, &params) orelse
+            return try ctx.status(404).text("not found");
+        ctx.params = matched.params;
+        return try matched.handler.invoke(&ctx);
+    }
 };
 
 fn sleepRefreshInterval(io: Io, stop: *std.atomic.Value(bool)) void {
@@ -307,27 +304,6 @@ pub const appendPromMetricLabeled = prometheus.appendPromMetricLabeled;
 pub const appendPromMetricHeader = prometheus.appendPromMetricHeader;
 pub const appendPromSample = prometheus.appendPromSample;
 pub const appendPromSampleLabeled = prometheus.appendPromSampleLabeled;
-
-fn pathOnly(uri: []const u8) []const u8 {
-    const query_index = std.mem.indexOfScalar(u8, uri, '?') orelse return uri;
-    return uri[0..query_index];
-}
-
-fn jsonResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try alloc.dupe(u8, body),
-    };
-}
-
-fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "text/plain; charset=utf-8"),
-        .body = try alloc.dupe(u8, body),
-    };
-}
 
 fn buildMetricsBody(alloc: std.mem.Allocator, metrics: ?MetricsWriter) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
@@ -385,115 +361,116 @@ const FakeMetrics = struct {
 
 test "health server healthz returns ok" {
     const alloc = testing.allocator;
-    const hs = try HealthServer.init(alloc, .{ .bind_port = 0 }, null, null);
+    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, null, null);
     defer hs.deinit();
 
-    var resp = try hs.executor().execute(alloc, .{ .method = .GET, .uri = "/healthz" });
-    defer resp.deinit(alloc);
+    var resp = try hs.executeForTest(.GET, "/healthz");
+    defer resp.deinit();
 
-    try testing.expectEqual(@as(u16, 200), resp.status);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "ok") != null);
+    try testing.expectEqual(@as(u16, 200), resp.status.code);
+    try testing.expect(std.mem.indexOf(u8, resp.body.?, "ok") != null);
 }
 
 test "health server readyz reports 200 when ready" {
     const alloc = testing.allocator;
     var fake = FakeReady{ .ready = true };
-    const hs = try HealthServer.init(alloc, .{ .bind_port = 0 }, fake.iface(), null);
+    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, fake.iface(), null);
     defer hs.deinit();
 
-    var resp = try hs.executor().execute(alloc, .{ .method = .GET, .uri = "/readyz" });
-    defer resp.deinit(alloc);
+    var resp = try hs.executeForTest(.GET, "/readyz");
+    defer resp.deinit();
 
-    try testing.expectEqual(@as(u16, 200), resp.status);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "ready") != null);
+    try testing.expectEqual(@as(u16, 200), resp.status.code);
+    try testing.expect(std.mem.indexOf(u8, resp.body.?, "ready") != null);
 }
 
 test "health server readyz reports 503 when not ready" {
     const alloc = testing.allocator;
     var fake = FakeReady{ .ready = false };
-    const hs = try HealthServer.init(alloc, .{ .bind_port = 0 }, fake.iface(), null);
+    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, fake.iface(), null);
     defer hs.deinit();
 
-    var resp = try hs.executor().execute(alloc, .{ .method = .GET, .uri = "/readyz" });
-    defer resp.deinit(alloc);
+    var resp = try hs.executeForTest(.GET, "/readyz");
+    defer resp.deinit();
 
-    try testing.expectEqual(@as(u16, 503), resp.status);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "not_ready") != null);
+    try testing.expectEqual(@as(u16, 503), resp.status.code);
+    try testing.expect(std.mem.indexOf(u8, resp.body.?, "not_ready") != null);
 }
 
 test "health server metrics returns prometheus text" {
     const alloc = testing.allocator;
     var fake = FakeMetrics{};
-    const hs = try HealthServer.init(alloc, .{ .bind_port = 0 }, null, fake.iface());
+    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, null, fake.iface());
     defer hs.deinit();
 
-    var resp = try hs.executor().execute(alloc, .{ .method = .GET, .uri = "/metrics" });
-    defer resp.deinit(alloc);
+    var resp = try hs.executeForTest(.GET, "/metrics");
+    defer resp.deinit();
 
-    try testing.expectEqual(@as(u16, 200), resp.status);
-    try testing.expect(resp.content_type != null);
-    try testing.expect(std.mem.indexOf(u8, resp.content_type.?, "text/plain") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "# HELP antfly_test_metric_total") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "antfly_test_metric_total 42") != null);
+    try testing.expectEqual(@as(u16, 200), resp.status.code);
+    try testing.expect(std.mem.indexOf(u8, resp.headers.get("Content-Type").?, "text/plain") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body.?, "# HELP antfly_test_metric_total") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body.?, "antfly_test_metric_total 42") != null);
     try testing.expectEqual(@as(usize, 1), fake.call_count);
 }
 
 test "health server metrics serves cached payload within ttl" {
     const alloc = testing.allocator;
     var fake = FakeMetrics{};
-    const hs = try HealthServer.init(alloc, .{ .bind_port = 0 }, null, fake.iface());
+    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, null, fake.iface());
     defer hs.deinit();
 
-    var resp_a = try hs.executor().execute(alloc, .{ .method = .GET, .uri = "/metrics" });
-    defer resp_a.deinit(alloc);
-    var resp_b = try hs.executor().execute(alloc, .{ .method = .GET, .uri = "/metrics" });
-    defer resp_b.deinit(alloc);
+    var resp_a = try hs.executeForTest(.GET, "/metrics");
+    defer resp_a.deinit();
+    var resp_b = try hs.executeForTest(.GET, "/metrics");
+    defer resp_b.deinit();
 
-    try testing.expectEqualStrings(resp_a.body, resp_b.body);
+    try testing.expectEqualStrings(resp_a.body.?, resp_b.body.?);
     try testing.expectEqual(@as(usize, 1), fake.call_count);
 }
 
 test "health server metrics request path does not refresh stale cache" {
     const alloc = testing.allocator;
     var fake = FakeMetrics{};
-    const hs = try HealthServer.init(alloc, .{ .bind_port = 0 }, null, fake.iface());
+    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, null, fake.iface());
     defer hs.deinit();
 
     lockAtomic(&hs.metrics_cache_mutex);
     hs.metrics_cache_built_at_ms = 0;
     hs.metrics_cache_mutex.unlock();
 
-    var resp = try hs.executor().execute(alloc, .{ .method = .GET, .uri = "/metrics" });
-    defer resp.deinit(alloc);
+    var resp = try hs.executeForTest(.GET, "/metrics");
+    defer resp.deinit();
 
-    try testing.expectEqual(@as(u16, 200), resp.status);
+    try testing.expectEqual(@as(u16, 200), resp.status.code);
     try testing.expectEqual(@as(usize, 1), fake.call_count);
 }
 
 test "health server startIfConfiguredOnHost uses provided bind host" {
     const alloc = testing.allocator;
-    const hs = (try HealthServer.startIfConfiguredOnHost(alloc, "test", "127.0.0.1", 0, null, null)).?;
+    const hs = (try HealthServer.startIfConfiguredOnHost(alloc, std.testing.io, "test", "127.0.0.1", 0, null, null)).?;
     defer hs.deinit();
 
-    try testing.expectEqualStrings("127.0.0.1", hs.listener.cfg.bind_host);
+    const uri = try hs.baseUri(alloc);
+    defer alloc.free(uri);
+    try testing.expect(std.mem.startsWith(u8, uri, "http://127.0.0.1:"));
 }
 
 test "health server startIfConfiguredOnHost propagates configured bind failures" {
     try testing.expectError(
         error.ParseFailed,
-        HealthServer.startIfConfiguredOnHost(testing.allocator, "test", "not-an-ip", 4200, null, null),
+        HealthServer.startIfConfiguredOnHost(testing.allocator, std.testing.io, "test", "not-an-ip", 4200, null, null),
     );
 }
 
 test "health server unknown path returns 404" {
     const alloc = testing.allocator;
-    const hs = try HealthServer.init(alloc, .{ .bind_port = 0 }, null, null);
+    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, null, null);
     defer hs.deinit();
 
-    var resp = try hs.executor().execute(alloc, .{ .method = .GET, .uri = "/nope" });
-    defer resp.deinit(alloc);
+    var resp = try hs.executeForTest(.GET, "/nope");
+    defer resp.deinit();
 
-    try testing.expectEqual(@as(u16, 404), resp.status);
+    try testing.expectEqual(@as(u16, 404), resp.status.code);
 }
 
 test "health server appendPromMetric formats correctly" {

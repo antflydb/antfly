@@ -961,9 +961,6 @@ fn singleBackendPreference(backend: backends_mod.BackendType) []const backends_m
 }
 
 /// Global node pointer for operational handlers.
-var active_node: ?*Node = null;
-var active_models_dir: ?[]const u8 = null;
-
 fn embedTimingEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_EMBED_TIMING", false);
 }
@@ -10167,12 +10164,10 @@ pub const Node = struct {
         const router = api.ServerRouter(Node).init(self);
         var prefixed = PrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
         if (comptime std.mem.eql(u8, prefix, public_api_prefix)) {
-            try server.get(prefix ++ "/models", mlModelsHandler);
+            try server.get(prefix ++ "/models", httpx.Handler.bind(self, mlModelsHandler));
         }
         try router.register(&prefixed);
-        try server.get(prefix ++ "/metrics", metricsHandler);
-        active_node = self;
-        active_models_dir = self.config.models_dir;
+        try server.get(prefix ++ "/metrics", httpx.Handler.bind(self, metricsHandler));
     }
 
     /// Register AI routes without the Traditional ML predictor endpoints.
@@ -10190,7 +10185,7 @@ pub const Node = struct {
         // the standalone public server. Without an explicit tombstone, httpx
         // reports 405 because nearby generated routes match the path shape,
         // while the dedicated inference server reports 404.
-        try server.post(prefix ++ "/recognize", retiredRecognizeHandler);
+        try server.post(prefix ++ "/recognize", httpx.Handler.from(retiredRecognizeHandler));
     }
 
     fn retiredRecognizeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -10200,9 +10195,20 @@ pub const Node = struct {
         });
     }
 
-    fn registerRootOperationalRoutes(server: anytype) !void {
+    fn registerRootOperationalRoutes(self: *Node, server: anytype) !void {
         try server.get("/healthz", healthzHandler);
-        try server.get("/readyz", readyzHandler);
+        try server.get("/readyz", httpx.Handler.bind(self, readyzHandler));
+    }
+
+    /// Registers every inference route on a caller-owned httpx server.
+    pub fn registerHttpRoutes(self: *Node, server: anytype) !void {
+        try self.registerRoutesOn(public_api_prefix, server);
+        try self.registerAiRoutesOn(ai_api_prefix, server);
+        try self.registerRootOperationalRoutes(server);
+    }
+
+    pub fn validateHttpBind(self: *const Node, host: []const u8) !void {
+        try validateStandaloneBind(host, self.config.allow_insecure_public_bind);
     }
 
     pub fn serve(self: *Node, allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !void {
@@ -10224,42 +10230,33 @@ pub const Node = struct {
         });
         defer server.deinit();
 
-        try self.registerRoutesOn(public_api_prefix, &server);
-        try self.registerAiRoutesOn(ai_api_prefix, &server);
-        try registerRootOperationalRoutes(&server);
-        defer {
-            active_node = null;
-            active_models_dir = null;
-        }
+        try self.registerHttpRoutes(&server);
 
         try server.listen();
     }
 
-    fn mlModelsHandler(ctx: *httpx.Context) anyerror!httpx.Response {
-        const node = active_node orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-        return node.listPredictors(ctx);
+    fn mlModelsHandler(self: *Node, ctx: *httpx.Context) anyerror!httpx.Response {
+        return self.listPredictors(ctx);
     }
 
-    fn metricsHandler(ctx: *httpx.Context) anyerror!httpx.Response {
-        const node = active_node orelse return ctx.status(503).text("service unavailable");
-
+    fn metricsHandler(self: *Node, ctx: *httpx.Context) anyerror!httpx.Response {
         var writer: std.Io.Writer.Allocating = .init(ctx.allocator);
         defer writer.deinit();
 
         // Pin model lifetimes while load_lock is held, then read lazy-session
         // counters only after releasing it. Optional-session loading takes the
         // inverse embedding-session -> load-lock path under admission pressure.
-        var loaded_snapshot = try node.model_manager.acquireLoadedModelSnapshot(ctx.allocator);
+        var loaded_snapshot = try self.model_manager.acquireLoadedModelSnapshot(ctx.allocator);
         defer loaded_snapshot.deinit();
 
         // Core metrics via prometheus lib
-        try @constCast(&node.metrics).render(&writer.writer);
+        try @constCast(&self.metrics).render(&writer.writer);
 
         // Scheduler metrics (computed on-the-fly from loaded models)
         {
-            node.model_manager.lockLoadedModels();
-            defer node.model_manager.unlockLoadedModels();
-            const aggregate = runtime.scheduler.native_generate.aggregateStats(node.model_manager.loaded);
+            self.model_manager.lockLoadedModels();
+            defer self.model_manager.unlockLoadedModels();
+            const aggregate = runtime.scheduler.native_generate.aggregateStats(self.model_manager.loaded);
             try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_waiting_requests", "gauge", "Waiting native scheduler requests across loaded models", aggregate.snapshot.waiting_requests);
             try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_prefill_requests", "gauge", "Prefill-phase native scheduler requests across loaded models", aggregate.snapshot.prefill_requests);
             try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_requests", "gauge", "Decode-phase native scheduler requests across loaded models", aggregate.snapshot.decode_requests);
@@ -10277,9 +10274,9 @@ pub const Node = struct {
             try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_5_8_total", "counter", "Unified scheduler steps containing five through eight items", aggregate.stats.step_batch_size_5_8_total);
             try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_9_16_total", "counter", "Unified scheduler steps containing nine through sixteen items", aggregate.stats.step_batch_size_9_16_total);
             try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
-            try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
+            try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(self.model_manager.loaded));
             try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());
-            try appendPromptCacheMetrics(&writer.writer, node.model_manager.loaded);
+            try appendPromptCacheMetrics(&writer.writer, self.model_manager.loaded);
         }
         try appendMetalExactJitMetrics(&writer.writer, aggregateMetalExactJitStats(loaded_snapshot.handles));
 
@@ -10291,12 +10288,8 @@ pub const Node = struct {
         return ctx.json(.{ .status = "ok" });
     }
 
-    fn readyzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
-        const models_dir = active_models_dir orelse return ctx.status(503).json(.{
-            .status = "not_ready",
-            .models = ModelCounts{},
-        });
-        const counts = collectDiscoveredModelCounts(models_dir, ctx.allocator, ctx.io);
+    fn readyzHandler(self: *Node, ctx: *httpx.Context) anyerror!httpx.Response {
+        const counts = collectDiscoveredModelCounts(self.config.models_dir, ctx.allocator, ctx.io);
         const status_text = if (counts.total() > 0) "ready" else "not_ready";
         const status_code: u16 = if (counts.total() > 0) 200 else 503;
         return ctx.status(status_code).json(.{
@@ -11574,19 +11567,19 @@ const RecordingServer = struct {
         });
     }
 
-    pub fn get(self: *@This(), comptime path: []const u8, _: httpx.Handler) !void {
+    pub fn get(self: *@This(), comptime path: []const u8, _: anytype) !void {
         try self.append(.get, path);
     }
 
-    pub fn post(self: *@This(), comptime path: []const u8, _: httpx.Handler) !void {
+    pub fn post(self: *@This(), comptime path: []const u8, _: anytype) !void {
         try self.append(.post, path);
     }
 
-    pub fn put(self: *@This(), comptime path: []const u8, _: httpx.Handler) !void {
+    pub fn put(self: *@This(), comptime path: []const u8, _: anytype) !void {
         try self.append(.put, path);
     }
 
-    pub fn delete(self: *@This(), comptime path: []const u8, _: httpx.Handler) !void {
+    pub fn delete(self: *@This(), comptime path: []const u8, _: anytype) !void {
         try self.append(.delete, path);
     }
 
@@ -13440,10 +13433,6 @@ test "managed download markers return the model publication retry contract" {
 test "registerRoutesOn prefixes embed aliases and metrics route" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
-    defer {
-        active_node = null;
-        active_models_dir = null;
-    }
 
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
@@ -13595,10 +13584,12 @@ test "registerAiRoutesOn excludes Traditional ML predictor routes" {
 }
 
 test "root operational routes stay outside inference API prefix" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
 
-    try Node.registerRootOperationalRoutes(&server);
+    try node.registerRootOperationalRoutes(&server);
 
     try std.testing.expect(server.hasRoute(.get, "/healthz"));
     try std.testing.expect(server.hasRoute(.get, "/readyz"));
@@ -13625,10 +13616,6 @@ test "internal error response hides implementation error names" {
 test "registerRoutesOn supports alternate prefixes through the shared router" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
-    defer {
-        active_node = null;
-        active_models_dir = null;
-    }
 
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();

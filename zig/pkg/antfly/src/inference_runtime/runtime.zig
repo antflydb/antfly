@@ -16,7 +16,9 @@ const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const common_config = @import("../common/config.zig");
+const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
 const inference = @import("inference_server");
+const httpx = @import("httpx");
 
 pub const ServerBudgetOverrides = inference.server.BudgetOverrides;
 
@@ -58,17 +60,30 @@ pub fn defaultMlDirForDataDirAlloc(allocator: std.mem.Allocator, data_dir: []con
 
 pub const SpawnedServer = struct {
     base_uri: []u8,
-    thread: std.Thread,
+    listener_task: httpx.ListenerTask,
     node: *inference.server.Node,
+    server: *httpx.Server,
     host: []u8,
 
+    pub fn shutdown(self: *SpawnedServer, timeout_ms: u64) void {
+        self.listener_task.shutdown(timeout_ms);
+    }
+
+    pub fn join(self: *SpawnedServer) !void {
+        return try self.listener_task.join();
+    }
+
     pub fn deinit(self: *SpawnedServer, alloc: std.mem.Allocator, _: std.Io) void {
-        // The serve loop runs until the process exits; detach so we don't
-        // block shutdown waiting for it.
-        self.thread.detach();
+        self.shutdown(30_000);
+        self.join() catch |err| {
+            std.log.err("embedded inference listener failed during shutdown err={s}", .{@errorName(err)});
+        };
+        self.server.deinit();
+        alloc.destroy(self.server);
+        self.node.deinit();
+        alloc.destroy(self.node);
         alloc.free(self.base_uri);
-        // The embedded server thread owns the running node for the rest of the
-        // process lifetime. Freeing it here would race the detached serve loop.
+        alloc.free(self.host);
         self.* = undefined;
     }
 };
@@ -370,13 +385,54 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
     node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
-    std.debug.print("listening on {s}:{d}\n", .{ host, port });
-    try node.serve(alloc, io, host, port);
+
+    node.validateHttpBind(host) catch |err| {
+        std.log.err(
+            "refusing non-loopback inference bind {s}:{d}: standalone inference has no built-in auth or TLS; pass --allow-insecure-public-bind only behind trusted network controls",
+            .{ host, port },
+        );
+        return err;
+    };
+    var server = httpx.Server.initWithConfig(alloc, io, .{
+        .host = host,
+        .port = port,
+        .request_timeout_ms = 300_000,
+        .keep_alive_timeout_ms = 300_000,
+    });
+    defer server.deinit();
+    try node.registerHttpRoutes(&server);
+
+    var termination_signals = runtime_lifecycle.ProcessSignalScope.install();
+    defer termination_signals.deinit();
+    var supervisor = runtime_lifecycle.RuntimeSupervisor.init(30_000);
+    defer supervisor.markStopped();
+
+    var listener_task = httpx.ListenerTask.init(&server);
+    try listener_task.start();
+    defer {
+        listener_task.shutdown(supervisor.deadline().remainingMilliseconds());
+        listener_task.join() catch |err| {
+            std.log.err("inference listener failed during shutdown err={s}", .{@errorName(err)});
+        };
+    }
+
+    if (server.boundAddress()) |address|
+        std.debug.print("listening on http://{f}\n", .{address})
+    else
+        return error.MissingInferenceListener;
+    try supervisor.publishReady();
+    while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
+        if (listener_task.runtimeFailure()) |err|
+            return supervisor.fail("inference", "public-http", err);
+        io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch |err| switch (err) {
+            error.Canceled => supervisor.requestShutdown(),
+        };
+    }
 }
 
 pub fn spawnServerProcess(
     alloc: std.mem.Allocator,
-    _: std.Io,
+    io: std.Io,
     _: []const u8,
     base_uri: []const u8,
     config: EmbeddedServerConfig,
@@ -402,26 +458,35 @@ pub fn spawnServerProcess(
     const host_dup = try alloc.dupe(u8, parsed.host);
     errdefer alloc.free(host_dup);
 
-    const thread = try std.Thread.spawn(.{}, serveThread, .{ node, alloc, host_dup, parsed.port });
+    try node.validateHttpBind(host_dup);
+    node.attachIo(io);
+    try node.warmConfiguredGenerators(alloc);
+
+    const server = try alloc.create(httpx.Server);
+    errdefer alloc.destroy(server);
+    server.* = httpx.Server.initWithConfig(alloc, io, .{
+        .host = host_dup,
+        .port = parsed.port,
+        .request_timeout_ms = 300_000,
+        .keep_alive_timeout_ms = 300_000,
+    });
+    errdefer server.deinit();
+    try node.registerHttpRoutes(server);
+    const base_uri_owned = try alloc.dupe(u8, base_uri);
+    errdefer alloc.free(base_uri_owned);
+    var listener_task = httpx.ListenerTask.init(server);
+    try listener_task.start();
+    errdefer {
+        listener_task.requestStop();
+        listener_task.join() catch {};
+    }
 
     return .{
-        .base_uri = try alloc.dupe(u8, base_uri),
-        .thread = thread,
+        .base_uri = base_uri_owned,
+        .listener_task = listener_task,
         .node = node,
+        .server = server,
         .host = host_dup,
-    };
-}
-
-fn serveThread(node: *inference.server.Node, alloc: std.mem.Allocator, host: []const u8, port: u16) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    node.attachIo(io_impl.io());
-    node.warmConfiguredGenerators(alloc) catch |err| {
-        std.debug.print("inference warmup error: {}\n", .{err});
-        return;
-    };
-    node.serve(alloc, io_impl.io(), host, port) catch |err| {
-        std.debug.print("inference server error: {}\n", .{err});
     };
 }
 

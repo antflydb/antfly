@@ -612,6 +612,25 @@ test "generated extractors: route table covers public API" {
     try std.testing.expect(found_remove_row_filter);
 }
 
+test "generated route policy inventory is unique and describes wire modes" {
+    const server = generated.server;
+    var found_buffered_query = false;
+    var found_streaming_retrieval = false;
+    for (server.routes, 0..) |route, index| {
+        for (server.routes[index + 1 ..]) |other| {
+            try std.testing.expect(!(std.mem.eql(u8, route.method, other.method) and
+                std.mem.eql(u8, route.path, other.path)));
+            try std.testing.expect(!std.mem.eql(u8, route.operation_id, other.operation_id));
+        }
+        if (std.mem.eql(u8, route.operation_id, "globalQuery"))
+            found_buffered_query = route.request_body == .buffered and !route.streaming_response;
+        if (std.mem.eql(u8, route.operation_id, "retrievalAgent"))
+            found_streaming_retrieval = route.request_body == .buffered and route.streaming_response;
+    }
+    try std.testing.expect(found_buffered_query);
+    try std.testing.expect(found_streaming_retrieval);
+}
+
 test "bleve and metadata openapi modules are generated and wired" {
     try std.testing.expect(@hasDecl(query_generated, "Query"));
     try std.testing.expect(@hasDecl(query_generated, "BooleanQuery"));

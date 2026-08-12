@@ -94,7 +94,6 @@ pub const StdHttpListenerConfig = struct {
     body_read_timeout_ms: u32 = default_body_read_timeout_ms,
     thread_stack_size: usize = default_request_stack_size,
     serve_in_connection_threads: bool = false,
-    connection_thread_stack_size: usize = default_request_stack_size,
     max_connection_threads: u32 = 0,
     /// Bounds admitted executor work separately from accepted sockets. Zero
     /// keeps the historical unlimited behavior.
@@ -134,6 +133,7 @@ pub const StdHttpListener = struct {
     io_owner: IoOwner,
     server: ?std.Io.net.Server = null,
     thread: ?std.Thread = null,
+    connection_group: std.Io.Group = .init,
     stopping: std.atomic.Value(bool) = .init(false),
     active_connection_threads: std.atomic.Value(u32) = .init(0),
     peak_connection_threads: std.atomic.Value(u32) = .init(0),
@@ -269,10 +269,11 @@ pub const StdHttpListener = struct {
             self.thread = null;
         }
         self.shutdownActiveStreams(io);
-        while (self.active_connection_threads.load(.acquire) != 0) {
-            self.shutdownActiveStreams(io);
-            sleepMs(1);
-        }
+        // The accept task is joined above, so no new group members can be
+        // admitted. Cancellation joins every connection task before stream,
+        // observer, server, or shared-I/O state is released.
+        self.connection_group.cancel(io);
+        std.debug.assert(self.active_connection_threads.load(.acquire) == 0);
         if (self.peer_observer) |*observer| observer.deinit();
         self.peer_observer = null;
         if (self.server) |*server| {
@@ -368,8 +369,8 @@ pub const StdHttpListener = struct {
                 return;
             }
             if (self.cfg.serve_in_connection_threads) {
-                const connection_thread = std.Thread.spawn(
-                    .{ .stack_size = self.cfg.connection_thread_stack_size },
+                self.connection_group.concurrent(
+                    io,
                     serveStreamThread,
                     .{ self, stream },
                 ) catch |err| {
@@ -377,16 +378,16 @@ pub const StdHttpListener = struct {
                     // service, not drop an already accepted request. The
                     // listener thread remains joinable by stop(), and retains
                     // this connection's admission slot while serving it.
-                    std.log.warn("std http listener connection thread handoff failed err={s}", .{@errorName(err)});
+                    if (err != error.ConcurrencyUnavailable)
+                        std.log.warn("std http listener connection task handoff failed err={s}", .{@errorName(err)});
                     self.serveStream(stream);
                     self.releaseConnectionThreadSlot();
                     slot_held = false;
                     continue;
                 };
-                connection_thread.detach();
-                // The detached thread owns the slot now. stop() shuts down
-                // registered streams and drains this counter before the
-                // listener or shared I/O runtime can be destroyed.
+                // The structured group owns the task and its admission slot.
+                // stop() cancels and joins the group before destroying any
+                // listener or shared-I/O state.
                 slot_held = false;
                 continue;
             }
@@ -454,7 +455,7 @@ pub const StdHttpListener = struct {
         return @max(self.acceptErrorBackoffInitialMs(), self.cfg.accept_error_backoff_max_ms);
     }
 
-    fn serveStreamThread(self: *StdHttpListener, stream: std.Io.net.Stream) void {
+    fn serveStreamThread(self: *StdHttpListener, stream: std.Io.net.Stream) std.Io.Cancelable!void {
         defer self.releaseConnectionThreadSlot();
         self.serveStream(stream);
     }

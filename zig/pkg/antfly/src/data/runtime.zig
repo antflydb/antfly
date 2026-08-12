@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
 const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
@@ -686,6 +687,147 @@ fn publicApiListenerConfig(bind_host: []const u8, bind_port: u16) antfly.raft.tr
     };
 }
 
+fn publicApiHttpxConfig(cfg: antfly.raft.transport.StdHttpListenerConfig) httpx.ServerConfig {
+    return .{
+        .host = cfg.bind_host,
+        .port = cfg.bind_port,
+        .max_body_size = cfg.max_request_bytes,
+        .request_body_buffer_budget_bytes = cfg.max_request_bytes * public_api_max_active_requests,
+        .max_h1_inflight_bodies = public_api_max_active_requests,
+        .max_connections = public_api_max_connection_threads,
+        .accept_error_backoff_initial_ms = cfg.accept_error_backoff_initial_ms,
+        .accept_error_backoff_max_ms = cfg.accept_error_backoff_max_ms,
+        .reuse_address = cfg.reuse_address,
+    };
+}
+
+/// Structured owner for the data role's public HTTP transport. Generated
+/// `httpx` routes take precedence; the global handler is a deliberately
+/// isolated migration boundary for internal routes not yet represented by a
+/// contextual registrar. Delete it once those route families are extracted.
+const DataPublicHttpRuntime = struct {
+    alloc: std.mem.Allocator,
+    api_server: *antfly.public_api.kernel_bridge.ApiHttpServer,
+    handler: antfly.public_api.kernel_bridge.HttpxHandler,
+    server: httpx.Server,
+    listener_task: httpx.ListenerTask,
+    api_lane_lease: backend_runtime_mod.BackendRuntime.ApiLaneLease,
+
+    const RuntimeStats = struct {
+        max_connection_threads: u32,
+        active_connection_threads: usize,
+        peak_connection_threads: usize,
+        max_active_requests: usize,
+        active_requests: usize,
+        peak_active_requests: usize,
+        rejected_requests_total: u64,
+        accept_errors_total: u64,
+        cancellation_watcher_start_failures_total: u64,
+        deadline_observer_failures_total: u64,
+        deadline_expirations_total: u64,
+        peer_disconnects_total: u64,
+        active_peer_observers: usize,
+        active_deadline_observers: usize,
+    };
+
+    fn start(
+        alloc: std.mem.Allocator,
+        backend_runtime: *backend_runtime_mod.BackendRuntime,
+        cfg: antfly.raft.transport.StdHttpListenerConfig,
+        api_server: *antfly.public_api.kernel_bridge.ApiHttpServer,
+    ) !*DataPublicHttpRuntime {
+        var api_lane_lease = try backend_runtime.acquireApiLane();
+        errdefer api_lane_lease.release();
+        const runtime = try alloc.create(DataPublicHttpRuntime);
+        errdefer alloc.destroy(runtime);
+        runtime.* = .{
+            .alloc = alloc,
+            .api_server = api_server,
+            .handler = try antfly.public_api.kernel_bridge.createHandler(api_server),
+            .server = httpx.Server.initWithConfig(alloc, api_lane_lease.io(), publicApiHttpxConfig(cfg)),
+            .listener_task = undefined,
+            .api_lane_lease = api_lane_lease,
+        };
+        errdefer antfly.public_api.kernel_bridge.deinitHandler(&runtime.handler);
+        errdefer runtime.server.deinit();
+
+        // Direct-codegen handlers own a peer-observer thread whose argument is
+        // `self`; initialize only after the handler has reached its final
+        // address inside the heap-owned runtime.
+        try runtime.handler.initRuntime(alloc);
+        runtime.listener_task = httpx.ListenerTask.init(&runtime.server);
+        try runtime.handler.registerRoutes(&runtime.server);
+        try antfly.public_api.httpx_handler.registerLegacyCompatibilityRoutes(
+            &runtime.server,
+            httpx.Handler.bind(runtime, legacyFallback),
+            .data_public,
+        );
+        try runtime.listener_task.start();
+        return runtime;
+    }
+
+    fn legacyFallback(self: *DataPublicHttpRuntime, ctx: *httpx.Context) anyerror!httpx.Response {
+        const Handler = antfly.public_api.httpx_handler.AntflyApiHandler;
+        return Handler.executeLegacyCompatibility(ctx, self.api_server.executor());
+    }
+
+    fn deinit(self: *DataPublicHttpRuntime) void {
+        self.deinitWithDeadline(antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    fn deinitWithDeadline(
+        self: *DataPublicHttpRuntime,
+        deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
+    ) void {
+        const alloc = self.alloc;
+        self.listener_task.shutdown(deadline.remainingMilliseconds());
+        self.listener_task.join() catch |err| {
+            std.log.err("data public listener failed during shutdown err={s}", .{@errorName(err)});
+        };
+        self.server.deinit();
+        antfly.public_api.kernel_bridge.deinitHandler(&self.handler);
+        self.api_lane_lease.release();
+        alloc.destroy(self);
+    }
+
+    fn baseUri(self: *DataPublicHttpRuntime, alloc: std.mem.Allocator) ![]u8 {
+        const address = self.server.boundAddress() orelse return error.NotListening;
+        return try std.fmt.allocPrint(alloc, "http://{f}", .{address});
+    }
+
+    fn runtimeStats(self: *const DataPublicHttpRuntime) RuntimeStats {
+        const transport = self.server.runtimeStats();
+        const application = antfly.public_api.kernel_bridge.handlerStats(&self.handler);
+        return .{
+            // Preserve the established metric schema during the transport
+            // migration; these now describe bounded connections, not OS
+            // handoff threads.
+            .max_connection_threads = transport.max_connections,
+            .active_connection_threads = transport.active_connections,
+            .peak_connection_threads = transport.peak_active_connections,
+            .max_active_requests = application.query_capacity,
+            .active_requests = application.query_in_flight,
+            .peak_active_requests = application.query_peak_in_flight,
+            .rejected_requests_total = application.query_rejected_total,
+            .accept_errors_total = transport.accept_errors_total,
+            .cancellation_watcher_start_failures_total = application.cancellation_watcher_start_failures_total,
+            .deadline_observer_failures_total = 0,
+            .deadline_expirations_total = transport.connection_timeouts_total,
+            .peer_disconnects_total = application.peer_disconnect_cancellations_total,
+            .active_peer_observers = application.active_peer_observers,
+            .active_deadline_observers = 0,
+        };
+    }
+
+    fn runtimeFailure(self: *const DataPublicHttpRuntime) ?anyerror {
+        return self.listener_task.runtimeFailure();
+    }
+
+    fn healthy(self: *const DataPublicHttpRuntime) bool {
+        return antfly.public_api.kernel_bridge.handlerStats(&self.handler).peer_observer_failures_total == 0;
+    }
+};
+
 test "data public API listener uses public API request body limit" {
     const cfg = publicApiListenerConfig("127.0.0.1", 8080);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
@@ -1022,6 +1164,7 @@ fn batchRequiresDocumentDbApply(req: antfly.db.types.BatchRequest) bool {
 pub const HealthSource = struct {
     data_server: *DataServer,
     raft_progress: ?*const antfly.raft.ManagedProgressDriver = null,
+    supervisor: ?*const antfly.common.runtime_lifecycle.RuntimeSupervisor = null,
     lsm_maintenance_metrics_mutex: std.atomic.Mutex = .unlocked,
     lsm_maintenance_metrics_stats: lsm_backend_mod.Backend.MaintenanceStats = .{},
     lsm_maintenance_metrics_built_at_ns: u64 = 0,
@@ -1052,8 +1195,10 @@ pub const HealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
-        return self.data_server.http_server != null and
+        return (self.supervisor == null or self.supervisor.?.currentState() == .ready) and
+            self.data_server.http_server != null and
             self.data_server.listener != null and
+            self.data_server.publicListenerHealthy() and
             (self.raft_progress == null or self.raft_progress.?.isHealthy());
     }
 
@@ -1074,7 +1219,7 @@ pub const HealthSource = struct {
             http_server.requestStats()
         else
             antfly.public_api.ApiHttpServer.RequestStats{};
-        const listener_stats = if (self.data_server.listener) |*listener|
+        const listener_stats = if (self.data_server.listener) |listener|
             listener.runtimeStats()
         else
             null;
@@ -1085,6 +1230,21 @@ pub const HealthSource = struct {
             "Whether the data server process is running (1 = yes)",
             1,
         );
+        if (self.supervisor) |supervisor| {
+            try health_metrics.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(supervisor.currentState()));
+            try health_metrics.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(supervisor.token().isCancelled()));
+        }
+        if (self.data_server.backend_runtime) |backend_runtime| {
+            const lanes = backend_runtime.laneStats();
+            try health_metrics.appendPromMetric(writer, "antfly_executor_api_active_leases", "gauge", "Active API executor lifetime leases", lanes.api_active_leases);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_api_peak_leases", "gauge", "Peak API executor lifetime leases", lanes.api_peak_leases);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_api_acquisitions_total", "counter", "Successful API executor lease acquisitions", lanes.api_acquisitions_total);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_api_rejections_total", "counter", "API executor lease acquisitions rejected during shutdown", lanes.api_rejections_total);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_control_active_leases", "gauge", "Active control executor lifetime leases", lanes.control_active_leases);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_control_peak_leases", "gauge", "Peak control executor lifetime leases", lanes.control_peak_leases);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_control_acquisitions_total", "counter", "Successful control executor lease acquisitions", lanes.control_acquisitions_total);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_control_rejections_total", "counter", "Control executor lease acquisitions rejected during shutdown", lanes.control_rejections_total);
+        }
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_completions_total", "counter", "Raft snapshot compactions published", raft_metrics.runtime_snapshot_compaction_completions);
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_failures_total", "counter", "Raft snapshot compaction build or publication failures", raft_metrics.runtime_snapshot_compaction_failures);
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_candidates", "gauge", "Raft groups currently queued for snapshot compaction", raft_metrics.runtime_snapshot_compaction_candidates);
@@ -4044,7 +4204,7 @@ pub const DataServer = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
     listener_cfg: antfly.raft.transport.std_http_listener.StdHttpListenerConfig,
-    listener: ?antfly.raft.transport.std_http_listener.StdHttpListener = null,
+    listener: ?*DataPublicHttpRuntime = null,
     query_io_impl: ?std.Io.Threaded = null,
     lsm_maintenance_thread: ?std.Thread = null,
     lsm_maintenance_stop: std.atomic.Value(bool) = .init(false),
@@ -5583,33 +5743,14 @@ pub const DataServer = struct {
             self.data_raft_base_uri = try raft.baseUri(self.alloc);
         }
         if (self.listener == null) {
-            // ApiHttpServer owns responses with its request allocator. Keep the
-            // listener on that exact allocator identity; using smp_allocator
-            // here while the API uses c_allocator causes cross-allocator frees.
-            const request_alloc = self.http_server.?.alloc;
-            self.listener = if (self.backend_runtime) |runtime|
-                if (runtime.apiIoImpl()) |io_impl|
-                    antfly.raft.transport.std_http_listener.StdHttpListener.initShared(
-                        request_alloc,
-                        self.listener_cfg,
-                        self.http_server.?.executor(),
-                        io_impl,
-                    )
-                else
-                    antfly.raft.transport.std_http_listener.StdHttpListener.init(
-                        request_alloc,
-                        self.listener_cfg,
-                        self.http_server.?.executor(),
-                    )
-            else
-                antfly.raft.transport.std_http_listener.StdHttpListener.init(
-                    request_alloc,
-                    self.listener_cfg,
-                    self.http_server.?.executor(),
-                );
+            const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+            self.listener = try DataPublicHttpRuntime.start(
+                self.alloc,
+                runtime,
+                self.listener_cfg,
+                &self.http_server.?,
+            );
         }
-        self.listener.?.setStreamingExecutor(self.http_server.?.streamingExecutor());
-        try self.listener.?.start();
         if (self.store_registration != null) {
             self.store_status_dirty.store(true, .release);
         }
@@ -5841,6 +5982,15 @@ pub const DataServer = struct {
     /// state is still alive, and only then release the remaining DataServer
     /// resources. Repeated calls are harmless.
     pub fn quiesceBackgroundWork(self: *DataServer) void {
+        self.quiesceBackgroundWorkWithDeadline(
+            antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000),
+        );
+    }
+
+    pub fn quiesceBackgroundWorkWithDeadline(
+        self: *DataServer,
+        deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
+    ) void {
         if (self.background_work_quiesced) return;
         self.background_work_quiesced = true;
         self.unregisterMetadataLocalProviders();
@@ -5855,7 +6005,7 @@ pub const DataServer = struct {
         self.stopProvisionedIndexRepair();
         self.stopReplicatedTransitionActions();
         self.clearProvisionedStartupCatchUpTarget();
-        if (self.listener) |*listener| listener.deinit();
+        if (self.listener) |listener| listener.deinitWithDeadline(deadline);
         self.listener = null;
         if (self.http_server) |*http_server| http_server.deinit();
         self.http_server = null;
@@ -5867,7 +6017,22 @@ pub const DataServer = struct {
     }
 
     pub fn deinit(self: *DataServer) void {
-        self.quiesceBackgroundWork();
+        self.deinitWithDeadline(antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    pub fn publicListenerFailure(self: *const DataServer) ?anyerror {
+        return if (self.listener) |listener| listener.runtimeFailure() else null;
+    }
+
+    pub fn publicListenerHealthy(self: *const DataServer) bool {
+        return if (self.listener) |listener| listener.healthy() else false;
+    }
+
+    pub fn deinitWithDeadline(
+        self: *DataServer,
+        deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
+    ) void {
+        self.quiesceBackgroundWorkWithDeadline(deadline);
         if (self.ha_admin_server) |*server| server.deinit();
         if (self.ha_promoted_primary) |*primary| primary.close();
         if (self.ha_standby_replication_http_executor) |*executor| executor.deinit();
@@ -15791,6 +15956,8 @@ pub fn runFromIterator(
     argv0: []const u8,
     args: *std.process.Args.Iterator,
 ) !void {
+    var termination_signals = antfly.common.runtime_lifecycle.ProcessSignalScope.install();
+    defer termination_signals.deinit();
     const alloc = init.gpa;
     var cli = try parseCli(alloc, args);
     defer cli.deinit(alloc);
@@ -15798,6 +15965,8 @@ pub fn runFromIterator(
         printUsage(argv0);
         return;
     }
+    var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
+    defer supervisor.markStopped();
     const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
         cli.raft_tick_ms,
         cli.control_tick_ms,
@@ -15821,6 +15990,10 @@ pub fn runFromIterator(
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
+    antfly.common.config.Config.validateServerTlsConfig(if (loaded_config) |*cfg| cfg.tls else null) catch |err| {
+        std.log.err("data startup rejected configured tls: built-in server TLS is unsupported; terminate TLS at a trusted reverse proxy", .{});
+        return err;
+    };
 
     var remote_content_runtime: antfly.common.remote_content_runtime.Runtime = undefined;
     var remote_content_runtime_initialized = false;
@@ -15936,7 +16109,7 @@ pub fn runFromIterator(
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
     }, metadata_api_urls.urls);
-    defer data_server.deinit();
+    defer data_server.deinitWithDeadline(supervisor.deadline());
     try data_server.start();
 
     const base_uri = try data_server.baseUri(alloc);
@@ -15957,37 +16130,48 @@ pub fn runFromIterator(
     var data_health = HealthSource{
         .data_server = &data_server,
         .raft_progress = if (data_server.data_raft != null) &raft_progress else null,
+        .supervisor = &supervisor,
     };
     const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
     const health_port = if (health_enabled)
         cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
     else
         null;
+    var control_lane_lease = try data_server.backend_runtime.?.acquireControlLane();
+    defer control_lane_lease.release();
     const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
         alloc,
+        control_lane_lease.io(),
         "data",
         health_port,
         data_health.readiness(),
         data_health.metricsWriter(),
     );
-    defer if (health_server) |hs| hs.deinit();
+    defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
 
-    while (true) {
-        if (data_server.data_raft != null) try raft_progress.check();
+    try supervisor.publishReady();
+    while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
+        if (data_server.publicListenerFailure()) |err| return supervisor.fail("data", "public-http", err);
+        if (health_server) |hs| if (hs.runtimeFailure()) |err| return supervisor.fail("health", "http", err);
+        if (data_server.data_raft != null) raft_progress.check() catch |err| {
+            return supervisor.fail("data", "raft-progress", err);
+        };
         data_server.runControlRoundOnly() catch |err| {
             // Report the fatal round error before deferred listener shutdown.
             // A shutdown failure must not hide the storage/Raft error that
             // caused this process to leave its serving loop.
             std.log.err("data server round failed err={s}", .{@errorName(err)});
-            return err;
+            return supervisor.fail("data", "control-round", err);
         };
         if (data_server.data_raft != null) {
-            try raft_progress.waitForFailureOrTimeout(runtime_cadence.control_tick_ns);
+            raft_progress.waitForFailureOrTimeout(runtime_cadence.control_tick_ns) catch |err| {
+                return supervisor.fail("data", "raft-progress", err);
+            };
         } else {
-            try init.io.sleep(
+            init.io.sleep(
                 std.Io.Duration.fromNanoseconds(runtime_cadence.control_tick_ns),
                 .awake,
-            );
+            ) catch |err| return supervisor.fail("data", "control-wait", err);
         }
     }
 }

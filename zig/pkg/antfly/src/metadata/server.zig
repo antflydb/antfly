@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
 const metadata_mod = @import("domain.zig");
 const metadata_authority = @import("authority.zig");
@@ -22,6 +23,7 @@ const metadata_storage = @import("storage/mod.zig");
 const metadata_http_server = @import("http_server.zig");
 const public_api_http_server = @import("../api/http_server.zig");
 const public_api_kernel = @import("../api/kernel_bridge.zig");
+const public_api_httpx_handler = @import("../api/httpx_handler.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("../api/table_reads.zig");
 const api_table_router = @import("../api/table_router.zig");
@@ -35,6 +37,7 @@ const raft_hosted_shard_ops = @import("../raft/hosted_shard_ops.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const raft_shard_ops = @import("../raft/shard_ops.zig");
 const raft_transport = @import("../raft/transport/mod.zig");
+const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
 
 pub const MetadataServerConfig = struct {
     http: raft_managed_host.ManagedHttpHostConfig,
@@ -60,7 +63,7 @@ pub const MetadataServer = struct {
     owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
     owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
-    owned_admin_listener: ?*raft_transport.StdHttpListener = null,
+    owned_admin_listener: ?*MetadataAdminHttpRuntime = null,
     restore_supervisor_owner_id: u64 = 0,
     restore_supervisor_stop: std.atomic.Value(bool) = .init(false),
 
@@ -126,10 +129,9 @@ pub const MetadataServer = struct {
         };
         var owned_admin_mux: ?*MetadataAdminMux = null;
         errdefer if (owned_admin_mux) |mux| alloc.destroy(mux);
-        var owned_admin_listener: ?*raft_transport.StdHttpListener = null;
+        var owned_admin_listener: ?*MetadataAdminHttpRuntime = null;
         errdefer if (owned_admin_listener) |listener| {
             listener.deinit();
-            alloc.destroy(listener);
         };
 
         if (cfg.admin_listener) |listener_cfg| {
@@ -203,12 +205,13 @@ pub const MetadataServer = struct {
             };
             owned_admin_mux = mux;
 
-            const listener = try alloc.create(raft_transport.StdHttpListener);
-            listener.* = if (svc.apiIoImpl()) |io_impl|
-                raft_transport.StdHttpListener.initShared(public_http_server.alloc, listener_cfg, mux.executor(), io_impl)
-            else
-                raft_transport.StdHttpListener.init(public_http_server.alloc, listener_cfg, mux.executor());
-            owned_admin_listener = listener;
+            owned_admin_listener = try MetadataAdminHttpRuntime.init(
+                alloc,
+                try svc.ensureBackendRuntime(),
+                listener_cfg,
+                mux,
+                public_http_server,
+            );
         }
 
         return .{
@@ -236,12 +239,15 @@ pub const MetadataServer = struct {
     }
 
     pub fn deinit(self: *MetadataServer) void {
+        self.deinitWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    pub fn deinitWithDeadline(self: *MetadataServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
         self.stopRestoreSupervisor();
         if (self.transition_ops_registration) |*registration| registration.deinit();
         self.transition_ops_registration = null;
         if (self.owned_admin_listener) |listener| {
-            listener.deinit();
-            self.alloc.destroy(listener);
+            listener.deinitWithDeadline(deadline);
         }
         if (self.owned_admin_mux) |mux| {
             self.alloc.destroy(mux);
@@ -299,9 +305,22 @@ pub const MetadataServer = struct {
     }
 
     pub fn stop(self: *MetadataServer) void {
-        if (self.owned_admin_listener) |listener| listener.stop();
+        self.stopWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    pub fn stopWithDeadline(self: *MetadataServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
+        if (self.owned_admin_listener) |listener| listener.stopWithDeadline(deadline);
         self.stopRestoreSupervisor();
         self.svc.stop();
+    }
+
+    pub fn adminListenerFailure(self: *const MetadataServer) ?anyerror {
+        return if (self.owned_admin_listener) |listener| listener.listener_task.runtimeFailure() else null;
+    }
+
+    pub fn adminListenerHealthy(self: *const MetadataServer) bool {
+        const listener = self.owned_admin_listener orelse return false;
+        return public_api_kernel.handlerStats(&listener.handler).peer_observer_failures_total == 0;
     }
 
     fn restoreSupervisorRun(ptr: *anyopaque) !void {
@@ -433,6 +452,123 @@ pub const MetadataServer = struct {
         try self.control_loop.stateRef().syncProjected(self.svc);
         try self.control_loop.stateRef().seedDesiredFromProjected();
         _ = try self.svc.reconcilePreparedIfLeaseHeld(&self.control_loop);
+    }
+};
+
+const MetadataAdminHttpRuntime = struct {
+    alloc: std.mem.Allocator,
+    cfg: raft_transport.StdHttpListenerConfig,
+    mux: *MetadataAdminMux,
+    handler: public_api_kernel.HttpxHandler,
+    server: httpx.Server,
+    listener_task: httpx.ListenerTask,
+    api_lane_lease: @import("../storage/background_runtime.zig").BackendRuntime.ApiLaneLease,
+
+    fn init(
+        alloc: std.mem.Allocator,
+        backend_runtime: *@import("../storage/background_runtime.zig").BackendRuntime,
+        cfg: raft_transport.StdHttpListenerConfig,
+        mux: *MetadataAdminMux,
+        public_api: *public_api_kernel.ApiHttpServer,
+    ) !*MetadataAdminHttpRuntime {
+        var api_lane_lease = try backend_runtime.acquireApiLane();
+        errdefer api_lane_lease.release();
+        const runtime = try alloc.create(MetadataAdminHttpRuntime);
+        errdefer alloc.destroy(runtime);
+        const max_connections: u32 = if (cfg.max_connection_threads == 0) 256 else cfg.max_connection_threads;
+        const max_active_requests: u32 = if (cfg.max_active_requests == 0) @min(max_connections, 32) else cfg.max_active_requests;
+        runtime.* = .{
+            .alloc = alloc,
+            .cfg = cfg,
+            .mux = mux,
+            .handler = try public_api_kernel.createHandler(public_api),
+            .server = httpx.Server.initWithConfig(alloc, api_lane_lease.io(), .{
+                .host = cfg.bind_host,
+                .port = cfg.bind_port,
+                .max_body_size = cfg.max_request_bytes,
+                .request_body_buffer_budget_bytes = cfg.max_request_bytes * @as(usize, max_active_requests),
+                .max_h1_inflight_bodies = max_active_requests,
+                .max_connections = max_connections,
+                .accept_error_backoff_initial_ms = cfg.accept_error_backoff_initial_ms,
+                .accept_error_backoff_max_ms = cfg.accept_error_backoff_max_ms,
+                .reuse_address = cfg.reuse_address,
+            }),
+            .listener_task = undefined,
+            .api_lane_lease = api_lane_lease,
+        };
+        errdefer public_api_kernel.deinitHandler(&runtime.handler);
+        errdefer runtime.server.deinit();
+        // The direct handler's observer receives `self`; start it only after
+        // the handler is resident at its final heap address.
+        try runtime.handler.initRuntime(alloc);
+        runtime.listener_task = httpx.ListenerTask.init(&runtime.server);
+        try runtime.server.use(httpx.Middleware.bind("metadata-authority", runtime, authorityMiddleware));
+        try runtime.handler.registerRoutes(&runtime.server);
+        try public_api_httpx_handler.registerLegacyCompatibilityRoutes(
+            &runtime.server,
+            httpx.Handler.bind(runtime, legacyAdminFallback),
+            .metadata_admin,
+        );
+        return runtime;
+    }
+
+    fn start(self: *MetadataAdminHttpRuntime) !void {
+        try self.listener_task.start();
+    }
+
+    fn stop(self: *MetadataAdminHttpRuntime) void {
+        self.stopWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    fn stopWithDeadline(self: *MetadataAdminHttpRuntime, deadline: runtime_lifecycle.ShutdownDeadline) void {
+        self.listener_task.shutdown(deadline.remainingMilliseconds());
+        self.listener_task.join() catch |err| {
+            std.log.err("metadata admin listener failed during shutdown err={s}", .{@errorName(err)});
+        };
+    }
+
+    fn deinit(self: *MetadataAdminHttpRuntime) void {
+        self.deinitWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    fn deinitWithDeadline(self: *MetadataAdminHttpRuntime, deadline: runtime_lifecycle.ShutdownDeadline) void {
+        const alloc = self.alloc;
+        self.stopWithDeadline(deadline);
+        self.server.deinit();
+        public_api_kernel.deinitHandler(&self.handler);
+        self.api_lane_lease.release();
+        alloc.destroy(self);
+    }
+
+    fn baseUri(self: *MetadataAdminHttpRuntime, alloc: std.mem.Allocator) ![]u8 {
+        const address = self.server.boundAddress() orelse return error.MissingAdminListener;
+        return try std.fmt.allocPrint(alloc, "http://{f}", .{address});
+    }
+
+    fn authorityMiddleware(
+        self: *MetadataAdminHttpRuntime,
+        ctx: *httpx.Context,
+        next: *httpx.Next,
+    ) anyerror!httpx.Response {
+        if (!MetadataAdminMux.isRestoreApiRequest(ctx.request.uri.raw)) return next.call(ctx);
+        const local_leader = self.mux.ensureRestoreLeadershipIfLocalLeader() catch |err| {
+            if (!metadata_authority.isRetryableError(err)) return err;
+            return self.metadataNotLeader(ctx);
+        };
+        const is_collection_get = ctx.request.method == .GET and
+            MetadataAdminMux.isRestoreJobCollectionRequest(ctx.request.uri.raw);
+        if (!local_leader and (ctx.request.method != .GET or is_collection_get))
+            return self.metadataNotLeader(ctx);
+        return next.call(ctx);
+    }
+
+    fn metadataNotLeader(_: *MetadataAdminHttpRuntime, ctx: *httpx.Context) !httpx.Response {
+        var response = try public_api_http_server.metadataNotLeaderResponse(ctx.allocator);
+        return public_api_httpx_handler.AntflyApiHandler.respondWithAllocator(ctx, &response, ctx.allocator);
+    }
+
+    fn legacyAdminFallback(self: *MetadataAdminHttpRuntime, ctx: *httpx.Context) anyerror!httpx.Response {
+        return public_api_httpx_handler.AntflyApiHandler.executeLegacyCompatibility(ctx, self.mux.executor());
     }
 };
 

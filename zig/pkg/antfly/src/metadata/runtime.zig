@@ -161,6 +161,7 @@ const ResolvedPaths = struct {
 pub const HealthSource = struct {
     server: *Server,
     raft_progress: ?*const antfly.raft.ManagedProgressDriver = null,
+    supervisor: ?*const antfly.common.runtime_lifecycle.RuntimeSupervisor = null,
 
     pub fn readiness(self: *HealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
@@ -178,7 +179,9 @@ pub const HealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
-        return self.server.metadataHttpService().probeReady() and
+        return (self.supervisor == null or self.supervisor.?.currentState() == .ready) and
+            self.server.metadataHttpService().probeReady() and
+            self.server.server.adminListenerHealthy() and
             (self.raft_progress == null or self.raft_progress.?.isHealthy());
     }
 
@@ -189,8 +192,26 @@ pub const HealthSource = struct {
         const svc_metrics = svc.metrics();
         const memory = svc.memoryDiagnostics();
         const raft_storage = self.server.metadataRaftStorageDiagnostics();
+        const backend_runtime = self.server.server.svc.ensureBackendRuntime() catch null;
 
         const append = antfly.common.health_server.appendPromMetric;
+
+        if (self.supervisor) |supervisor| {
+            try append(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(supervisor.currentState()));
+            try append(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(supervisor.token().isCancelled()));
+        }
+
+        if (backend_runtime) |runtime| {
+            const lanes = runtime.laneStats();
+            try append(writer, "antfly_executor_api_active_leases", "gauge", "Active API executor lifetime leases", lanes.api_active_leases);
+            try append(writer, "antfly_executor_api_peak_leases", "gauge", "Peak API executor lifetime leases", lanes.api_peak_leases);
+            try append(writer, "antfly_executor_api_acquisitions_total", "counter", "Successful API executor lease acquisitions", lanes.api_acquisitions_total);
+            try append(writer, "antfly_executor_api_rejections_total", "counter", "API executor lease acquisitions rejected during shutdown", lanes.api_rejections_total);
+            try append(writer, "antfly_executor_control_active_leases", "gauge", "Active control executor lifetime leases", lanes.control_active_leases);
+            try append(writer, "antfly_executor_control_peak_leases", "gauge", "Peak control executor lifetime leases", lanes.control_peak_leases);
+            try append(writer, "antfly_executor_control_acquisitions_total", "counter", "Successful control executor lease acquisitions", lanes.control_acquisitions_total);
+            try append(writer, "antfly_executor_control_rejections_total", "counter", "Control executor lease acquisitions rejected during shutdown", lanes.control_rejections_total);
+        }
 
         try append(writer, "antfly_raft_hosted_groups", "gauge", "Number of raft groups hosted on this node", @intCast(host_metrics.hosted_groups));
         try append(writer, "antfly_raft_reconcile_rounds_total", "counter", "Total number of reconcile rounds", @intCast(host_metrics.reconcile_rounds));
@@ -477,7 +498,14 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        self.server.deinit();
+        self.deinitWithDeadline(antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    pub fn deinitWithDeadline(
+        self: *Server,
+        deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
+    ) void {
+        self.server.deinitWithDeadline(deadline);
         self.alloc.free(self.admin_bind_host);
         self.alloc.free(self.bind_host);
         self.alloc.free(self.snapshot_root_dir);
@@ -492,6 +520,10 @@ pub const Server = struct {
 
     pub fn start(self: *Server) !void {
         try self.server.start();
+    }
+
+    pub fn adminListenerFailure(self: *const Server) ?anyerror {
+        return self.server.adminListenerFailure();
     }
 
     pub fn bootstrapCluster(
@@ -760,6 +792,8 @@ pub fn runFromIterator(
     argv0: []const u8,
     args: *std.process.Args.Iterator,
 ) !void {
+    var termination_signals = antfly.common.runtime_lifecycle.ProcessSignalScope.install();
+    defer termination_signals.deinit();
     const alloc = init.gpa;
     var cli = try parseCli(alloc, args);
     defer cli.deinit(alloc);
@@ -767,6 +801,8 @@ pub fn runFromIterator(
         printUsage(argv0);
         return;
     }
+    var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
+    defer supervisor.markStopped();
     const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
         cli.raft_tick_ms,
         cli.control_tick_ms,
@@ -790,6 +826,10 @@ pub fn runFromIterator(
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
+    antfly.common.config.Config.validateServerTlsConfig(if (loaded_config) |*cfg| cfg.tls else null) catch |err| {
+        std.log.err("metadata startup rejected configured tls: built-in server TLS is unsupported; terminate TLS at a trusted reverse proxy", .{});
+        return err;
+    };
 
     var remote_content_runtime: antfly.common.remote_content_runtime.Runtime = undefined;
     var remote_content_runtime_initialized = false;
@@ -901,7 +941,7 @@ pub fn runFromIterator(
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
     });
-    defer server.deinit();
+    defer server.deinitWithDeadline(supervisor.deadline());
     try server.start();
     try server.bootstrapCluster(metadata_group_id, local_node_id, cluster_peers);
     const synced_extension_packages = try server.server.svc.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir);
@@ -928,50 +968,60 @@ pub fn runFromIterator(
     var metadata_health = HealthSource{
         .server = &server,
         .raft_progress = &raft_progress,
+        .supervisor = &supervisor,
     };
     const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
     const health_port = if (health_enabled)
         cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
     else
         null;
+    const metadata_backend_runtime = try server.server.svc.ensureBackendRuntime();
+    var control_lane_lease = try metadata_backend_runtime.acquireControlLane();
+    defer control_lane_lease.release();
     const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
         alloc,
+        control_lane_lease.io(),
         "metadata",
         health_port,
         metadata_health.readiness(),
         metadata_health.metricsWriter(),
     );
-    defer if (health_server) |hs| hs.deinit();
+    defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
 
     const preferred_bootstrap_campaigner = metadataClusterPreferredCampaigner(cluster_peers, local_node_id);
     const bootstrap_campaign_retry_interval_ns = metadataBootstrapCampaignRetryIntervalNs(cli.raft_tick_ms);
     var last_bootstrap_campaign_retry_ns = platform_time.monotonicNs();
-    while (true) {
-        try raft_progress.check();
+    try supervisor.publishReady();
+    while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
+        if (server.adminListenerFailure()) |err| return supervisor.fail("metadata", "admin-http", err);
+        if (health_server) |hs| if (hs.runtimeFailure()) |err| return supervisor.fail("health", "http", err);
+        raft_progress.check() catch |err| return supervisor.fail("metadata", "raft-progress", err);
         if (preferred_bootstrap_campaigner) {
             const now_ns = platform_time.monotonicNs();
             if (last_bootstrap_campaign_retry_ns == 0 or
                 now_ns -| last_bootstrap_campaign_retry_ns >= bootstrap_campaign_retry_interval_ns)
             {
-                if (try server.campaignMetadataGroupIfBootstrapLeaderless(metadata_group_id, local_node_id)) {
+                if (server.campaignMetadataGroupIfBootstrapLeaderless(metadata_group_id, local_node_id) catch |err| return supervisor.fail("metadata", "bootstrap-campaign", err)) {
                     std.log.warn("metadata bootstrap campaign retry node_id={}", .{local_node_id});
                     last_bootstrap_campaign_retry_ns = now_ns;
                 }
             }
         }
         const run_round_start_ns = platform_time.monotonicNs();
-        try server.runControlRoundOnly();
+        server.runControlRoundOnly() catch |err| return supervisor.fail("metadata", "control-round", err);
         const run_round_elapsed_ns = platform_time.monotonicNs() -| run_round_start_ns;
         if (run_round_elapsed_ns > antfly.metadata_service.metadata_run_round_slow_threshold_ns) {
             std.log.warn("metadata runRound slow elapsed_ms={d}", .{@divTrunc(run_round_elapsed_ns, std.time.ns_per_ms)});
         }
         const cdc_round_start_ns = platform_time.monotonicNs();
-        try server.runCdcRound();
+        server.runCdcRound() catch |err| return supervisor.fail("metadata", "cdc-round", err);
         const cdc_round_elapsed_ns = platform_time.monotonicNs() -| cdc_round_start_ns;
         if (cdc_round_elapsed_ns > std.time.ns_per_s) {
             std.log.warn("metadata runCdcRound slow elapsed_ms={d}", .{@divTrunc(cdc_round_elapsed_ns, std.time.ns_per_ms)});
         }
-        try raft_progress.waitForFailureOrTimeout(runtime_cadence.control_tick_ns);
+        raft_progress.waitForFailureOrTimeout(runtime_cadence.control_tick_ns) catch |err| {
+            return supervisor.fail("metadata", "raft-progress", err);
+        };
     }
 }
 

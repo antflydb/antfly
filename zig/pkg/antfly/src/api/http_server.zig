@@ -1964,6 +1964,42 @@ pub const ApiHttpServer = struct {
         return storageRuntimeStatus(maintenance.status());
     }
 
+    /// Transport-neutral status operation shared by direct callers and every
+    /// HTTP adapter. Ownership of nested allocations follows `alloc`.
+    pub fn loadClusterStatus(self: *ApiHttpServer, alloc: std.mem.Allocator) !cluster.ClusterStatus {
+        const metadata_status = try self.source.status();
+        var status = try cluster.fromMetadataStatus(alloc, metadata_status);
+        errdefer status.deinit(alloc);
+        status.auth_enabled = self.cfg.auth_enabled;
+        status.deployment_mode = self.cfg.deployment_mode;
+        status.storage = self.currentStorageRuntimeStatus();
+        if (self.cfg.secret_store) |secret_store| {
+            _ = secret_store.refreshIfChanged() catch |err| {
+                std.log.warn("secret store status refresh skipped err={}", .{err});
+            };
+            try cluster.applySecretStoreHealth(alloc, &status, secret_store.healthSnapshot());
+        }
+        if (self.cfg.remote_content) |remote_content| {
+            if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(alloc, &status, health);
+        }
+        return status;
+    }
+
+    /// Transport-neutral topology operation. It composes the shared status
+    /// operation with the best available metadata snapshot and returns one
+    /// typed result instead of serialized HTTP bytes.
+    pub fn loadClusterTopology(self: *ApiHttpServer, alloc: std.mem.Allocator) !cluster.ClusterTopology {
+        var status = try self.loadClusterStatus(alloc);
+        defer status.deinit(alloc);
+        var snapshot_opt = try self.source.cachedAdminSnapshot();
+        if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
+        if (snapshot_opt) |*snapshot| {
+            defer self.source.freeAdminSnapshot(snapshot);
+            return try cluster.topologyFromStatusAndSnapshot(alloc, status, snapshot);
+        }
+        return try cluster.topologyFromStatus(alloc, status);
+    }
+
     pub fn initWithConfig(
         alloc: std.mem.Allocator,
         cfg: ApiHttpServerConfig,
@@ -3742,54 +3778,12 @@ pub const ApiHttpServer = struct {
             };
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.status)) {
-            const metadata_status = try self.source.status();
-            var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
+            var public_status = try self.loadClusterStatus(self.alloc);
             defer public_status.deinit(self.alloc);
-            public_status.auth_enabled = self.cfg.auth_enabled;
-            public_status.deployment_mode = self.cfg.deployment_mode;
-            if (self.cfg.storage_maintenance) |maintenance| {
-                public_status.storage = storageRuntimeStatus(maintenance.status());
-            }
-            if (self.cfg.secret_store) |secret_store| {
-                _ = secret_store.refreshIfChanged() catch |err| {
-                    std.log.warn("secret store status refresh skipped err={}", .{err});
-                };
-                try cluster.applySecretStoreHealth(self.alloc, &public_status, secret_store.healthSnapshot());
-            }
-            if (self.cfg.remote_content) |remote_content| {
-                if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(self.alloc, &public_status, health);
-            }
             return try jsonResponse(self.alloc, public_status);
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.cluster)) {
-            const metadata_status = try self.source.status();
-            var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
-            defer public_status.deinit(self.alloc);
-            public_status.auth_enabled = self.cfg.auth_enabled;
-            public_status.deployment_mode = self.cfg.deployment_mode;
-            if (self.cfg.storage_maintenance) |maintenance| {
-                public_status.storage = storageRuntimeStatus(maintenance.status());
-            }
-            if (self.cfg.secret_store) |secret_store| {
-                _ = secret_store.refreshIfChanged() catch |err| {
-                    std.log.warn("secret store status refresh skipped err={}", .{err});
-                };
-                try cluster.applySecretStoreHealth(self.alloc, &public_status, secret_store.healthSnapshot());
-            }
-            if (self.cfg.remote_content) |remote_content| {
-                if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(self.alloc, &public_status, health);
-            }
-            var snapshot_opt = try self.source.cachedAdminSnapshot();
-            if (snapshot_opt == null) {
-                snapshot_opt = try self.source.adminSnapshot();
-            }
-            if (snapshot_opt) |*snapshot| {
-                defer self.source.freeAdminSnapshot(snapshot);
-                var topology_status = try cluster.topologyFromStatusAndSnapshot(self.alloc, public_status, snapshot);
-                defer topology_status.deinit(self.alloc);
-                return try jsonResponse(self.alloc, topology_status);
-            }
-            var topology_status = try cluster.topologyFromStatus(self.alloc, public_status);
+            var topology_status = try self.loadClusterTopology(self.alloc);
             defer topology_status.deinit(self.alloc);
             return try jsonResponse(self.alloc, topology_status);
         }

@@ -101,6 +101,13 @@ pub const Config = struct {
         }
     };
 
+    /// The Zig HTTP server currently relies on trusted reverse-proxy TLS
+    /// termination. Every role must reject a configured server TLS block
+    /// instead of silently serving plaintext.
+    pub fn validateServerTlsConfig(tls: ?TlsConfig) !void {
+        if (tls != null) return error.ServerTlsUnsupported;
+    }
+
     pub const StorageConfig = struct {
         engine: common_openapi.StorageEngine = .local,
         lite_path: ?[]u8 = null,
@@ -3015,6 +3022,11 @@ test "common config can disable health server" {
 
     try std.testing.expect(!cfg.health_enabled);
     try std.testing.expectEqual(@as(?u16, default_health_port), cfg.health_port);
+}
+
+test "common config rejects unsupported built-in server TLS" {
+    try Config.validateServerTlsConfig(null);
+    try std.testing.expectError(error.ServerTlsUnsupported, Config.validateServerTlsConfig(.{}));
 }
 
 test "common config accepts partial metadata and storage objects" {

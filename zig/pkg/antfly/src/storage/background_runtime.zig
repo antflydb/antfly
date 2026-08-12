@@ -212,6 +212,17 @@ pub const BackendRuntime = struct {
     raft_inbound_io_impl: ?*IoImpl = null,
     raft_outbound_io_impl: ?*IoImpl = null,
     api_io_impl: ?*IoImpl = null,
+    control_io_impl: ?*IoImpl = null,
+    api_lane_shutting_down: std.atomic.Value(bool) = .init(false),
+    api_lane_leases: std.atomic.Value(usize) = .init(0),
+    api_lane_peak_leases: std.atomic.Value(usize) = .init(0),
+    api_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
+    api_lane_rejections_total: std.atomic.Value(u64) = .init(0),
+    control_lane_shutting_down: std.atomic.Value(bool) = .init(false),
+    control_lane_leases: std.atomic.Value(usize) = .init(0),
+    control_lane_peak_leases: std.atomic.Value(usize) = .init(0),
+    control_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
+    control_lane_rejections_total: std.atomic.Value(u64) = .init(0),
     threaded_jobs: ?*ThreadedDurableJobLane = null,
     durable_jobs: DurableJobLane,
     db_open_configurator: ?DbOpenConfigurator = null,
@@ -254,6 +265,8 @@ pub const BackendRuntime = struct {
                 errdefer deinitIoLane(alloc, raft_outbound_io_impl);
                 const api_io_impl = try initIoLane(alloc);
                 errdefer deinitIoLane(alloc, api_io_impl);
+                const control_io_impl = try initIoLane(alloc);
+                errdefer deinitIoLane(alloc, control_io_impl);
 
                 const threaded_jobs = try alloc.create(ThreadedDurableJobLane);
                 errdefer alloc.destroy(threaded_jobs);
@@ -265,6 +278,7 @@ pub const BackendRuntime = struct {
                 runtime.raft_inbound_io_impl = raft_inbound_io_impl;
                 runtime.raft_outbound_io_impl = raft_outbound_io_impl;
                 runtime.api_io_impl = api_io_impl;
+                runtime.control_io_impl = control_io_impl;
                 runtime.threaded_jobs = threaded_jobs;
                 runtime.durable_jobs = threaded_jobs.lane();
             }
@@ -274,6 +288,10 @@ pub const BackendRuntime = struct {
     }
 
     pub fn deinit(self: *BackendRuntime) void {
+        self.api_lane_shutting_down.store(true, .release);
+        self.control_lane_shutting_down.store(true, .release);
+        std.debug.assert(self.api_lane_leases.load(.acquire) == 0);
+        std.debug.assert(self.control_lane_leases.load(.acquire) == 0);
         if (self.threaded_jobs) |jobs| {
             jobs.deinit();
             self.alloc.destroy(jobs);
@@ -282,6 +300,10 @@ pub const BackendRuntime = struct {
         if (self.api_io_impl) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
             self.api_io_impl = null;
+        }
+        if (self.control_io_impl) |io_impl| {
+            deinitIoLane(self.alloc, io_impl);
+            self.control_io_impl = null;
         }
         if (self.raft_outbound_io_impl) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
@@ -338,6 +360,135 @@ pub const BackendRuntime = struct {
     pub fn apiIoImpl(self: *BackendRuntime) ?*IoImpl {
         if (comptime builtin.os.tag == .freestanding) return null;
         return self.api_io_impl orelse self.io_impl;
+    }
+
+    /// Returns the API executor interface without exposing its implementation.
+    /// Components own and await the tasks they submit; BackendRuntime only owns
+    /// the executor lane and must outlive every borrower.
+    pub fn apiIo(self: *BackendRuntime) ?Io {
+        const io_impl = self.apiIoImpl() orelse return null;
+        return io_impl.io();
+    }
+
+    pub const ApiLaneLease = struct {
+        runtime: *BackendRuntime,
+        borrowed_io: Io,
+        released: bool = false,
+
+        pub fn io(self: *const ApiLaneLease) Io {
+            std.debug.assert(!self.released);
+            return self.borrowed_io;
+        }
+
+        pub fn release(self: *ApiLaneLease) void {
+            if (self.released) return;
+            self.released = true;
+            const previous = self.runtime.api_lane_leases.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+        }
+    };
+
+    /// Acquires an explicit lifetime lease for the API executor lane. The
+    /// caller must stop and await every submitted task before releasing it.
+    pub fn acquireApiLane(self: *BackendRuntime) !ApiLaneLease {
+        if (self.api_lane_shutting_down.load(.acquire)) {
+            _ = self.api_lane_rejections_total.fetchAdd(1, .monotonic);
+            return error.BackendRuntimeShuttingDown;
+        }
+        const borrowed_io = self.apiIo() orelse return error.BackendRuntimeUnavailable;
+        const leases = self.api_lane_leases.fetchAdd(1, .acq_rel) + 1;
+        if (self.api_lane_shutting_down.load(.acquire)) {
+            _ = self.api_lane_leases.fetchSub(1, .acq_rel);
+            _ = self.api_lane_rejections_total.fetchAdd(1, .monotonic);
+            return error.BackendRuntimeShuttingDown;
+        }
+        updateAtomicMax(&self.api_lane_peak_leases, leases);
+        _ = self.api_lane_acquisitions_total.fetchAdd(1, .monotonic);
+        return .{ .runtime = self, .borrowed_io = borrowed_io };
+    }
+
+    pub fn outstandingApiLeases(self: *const BackendRuntime) usize {
+        return self.api_lane_leases.load(.acquire);
+    }
+
+    /// Reserved control-plane executor for health, metrics, and shutdown
+    /// coordination. It is intentionally isolated from public API work so
+    /// overload cannot consume the runtime's last observable control path.
+    pub fn controlIo(self: *BackendRuntime) ?Io {
+        if (comptime builtin.os.tag == .freestanding) return null;
+        const io_impl = self.control_io_impl orelse self.io_impl orelse return null;
+        return io_impl.io();
+    }
+
+    pub const ControlLaneLease = struct {
+        runtime: *BackendRuntime,
+        borrowed_io: Io,
+        released: bool = false,
+
+        pub fn io(self: *const ControlLaneLease) Io {
+            std.debug.assert(!self.released);
+            return self.borrowed_io;
+        }
+
+        pub fn release(self: *ControlLaneLease) void {
+            if (self.released) return;
+            self.released = true;
+            const previous = self.runtime.control_lane_leases.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+        }
+    };
+
+    pub fn acquireControlLane(self: *BackendRuntime) !ControlLaneLease {
+        if (self.control_lane_shutting_down.load(.acquire)) {
+            _ = self.control_lane_rejections_total.fetchAdd(1, .monotonic);
+            return error.BackendRuntimeShuttingDown;
+        }
+        const borrowed_io = self.controlIo() orelse return error.BackendRuntimeUnavailable;
+        const leases = self.control_lane_leases.fetchAdd(1, .acq_rel) + 1;
+        if (self.control_lane_shutting_down.load(.acquire)) {
+            _ = self.control_lane_leases.fetchSub(1, .acq_rel);
+            _ = self.control_lane_rejections_total.fetchAdd(1, .monotonic);
+            return error.BackendRuntimeShuttingDown;
+        }
+        updateAtomicMax(&self.control_lane_peak_leases, leases);
+        _ = self.control_lane_acquisitions_total.fetchAdd(1, .monotonic);
+        return .{ .runtime = self, .borrowed_io = borrowed_io };
+    }
+
+    pub fn outstandingControlLeases(self: *const BackendRuntime) usize {
+        return self.control_lane_leases.load(.acquire);
+    }
+
+    pub const LaneStats = struct {
+        api_active_leases: usize,
+        api_peak_leases: usize,
+        api_acquisitions_total: u64,
+        api_rejections_total: u64,
+        control_active_leases: usize,
+        control_peak_leases: usize,
+        control_acquisitions_total: u64,
+        control_rejections_total: u64,
+    };
+
+    pub fn laneStats(self: *const BackendRuntime) LaneStats {
+        return .{
+            .api_active_leases = self.api_lane_leases.load(.acquire),
+            .api_peak_leases = self.api_lane_peak_leases.load(.acquire),
+            .api_acquisitions_total = self.api_lane_acquisitions_total.load(.acquire),
+            .api_rejections_total = self.api_lane_rejections_total.load(.acquire),
+            .control_active_leases = self.control_lane_leases.load(.acquire),
+            .control_peak_leases = self.control_lane_peak_leases.load(.acquire),
+            .control_acquisitions_total = self.control_lane_acquisitions_total.load(.acquire),
+            .control_rejections_total = self.control_lane_rejections_total.load(.acquire),
+        };
+    }
+
+    fn updateAtomicMax(counter: *std.atomic.Value(usize), value: usize) void {
+        var observed = counter.load(.acquire);
+        while (observed < value) {
+            if (counter.cmpxchgWeak(observed, value, .acq_rel, .acquire) == null) return;
+            observed = counter.load(.acquire);
+        }
     }
 
     pub fn allocOwnerId(self: *BackendRuntime) !u64 {
@@ -790,6 +941,77 @@ test "backend runtime allocates stable nonzero owner ids" {
 
     try std.testing.expect(first != 0);
     try std.testing.expectEqual(first + 1, second);
+}
+
+test "backend runtime API lane leases expose and release the interface" {
+    if (builtin.os.tag == .freestanding) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), handle.ptr().outstandingApiLeases());
+    var first = try handle.ptr().acquireApiLane();
+    var second = try handle.ptr().acquireApiLane();
+    try std.testing.expectEqual(@as(usize, 2), handle.ptr().outstandingApiLeases());
+    const active_stats = handle.ptr().laneStats();
+    try std.testing.expectEqual(@as(usize, 2), active_stats.api_active_leases);
+    try std.testing.expectEqual(@as(usize, 2), active_stats.api_peak_leases);
+    try std.testing.expectEqual(@as(u64, 2), active_stats.api_acquisitions_total);
+    _ = first.io();
+    _ = second.io();
+
+    first.release();
+    try std.testing.expectEqual(@as(usize, 1), handle.ptr().outstandingApiLeases());
+    // Release is idempotent so cleanup paths may call it defensively.
+    first.release();
+    try std.testing.expectEqual(@as(usize, 1), handle.ptr().outstandingApiLeases());
+    second.release();
+    try std.testing.expectEqual(@as(usize, 0), handle.ptr().outstandingApiLeases());
+}
+
+test "backend runtime rejects API lane leases after shutdown begins" {
+    if (builtin.os.tag == .freestanding) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+    handle.ptr().api_lane_shutting_down.store(true, .release);
+
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, handle.ptr().acquireApiLane());
+    try std.testing.expectEqual(@as(usize, 0), handle.ptr().outstandingApiLeases());
+    try std.testing.expectEqual(@as(u64, 1), handle.ptr().laneStats().api_rejections_total);
+}
+
+test "backend runtime control lane leases are isolated from API leases" {
+    if (builtin.os.tag == .freestanding) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+
+    var api = try handle.ptr().acquireApiLane();
+    defer api.release();
+    var control = try handle.ptr().acquireControlLane();
+    defer control.release();
+
+    try std.testing.expectEqual(@as(usize, 1), handle.ptr().outstandingApiLeases());
+    try std.testing.expectEqual(@as(usize, 1), handle.ptr().outstandingControlLeases());
+    const stats = handle.ptr().laneStats();
+    try std.testing.expectEqual(@as(usize, 1), stats.control_peak_leases);
+    try std.testing.expectEqual(@as(u64, 1), stats.control_acquisitions_total);
+    _ = api.io();
+    _ = control.io();
+    try std.testing.expect(handle.ptr().api_io_impl.? != handle.ptr().control_io_impl.?);
+}
+
+test "backend runtime rejects control lane leases after shutdown begins" {
+    if (builtin.os.tag == .freestanding) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+    handle.ptr().control_lane_shutting_down.store(true, .release);
+
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, handle.ptr().acquireControlLane());
+    try std.testing.expectEqual(@as(usize, 0), handle.ptr().outstandingControlLeases());
+    try std.testing.expectEqual(@as(u64, 1), handle.ptr().laneStats().control_rejections_total);
 }
 
 test "backend runtime retires closed owner registry state" {

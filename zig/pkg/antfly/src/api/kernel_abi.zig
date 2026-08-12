@@ -27,12 +27,13 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 3;
+pub const abi_version: u32 = 6;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
 pub const CreateContext = extern struct {
     abi_version: u32,
+    struct_size: u32 = @sizeOf(@This()),
     flags: u32 = 0,
     owner_alloc: *const memory_abi.Allocator,
     cfg: *const anyopaque,
@@ -51,7 +52,7 @@ pub const CreateContext = extern struct {
 
 pub const CallContext = extern struct {
     abi_version: u32,
-    _reserved: u32 = 0,
+    struct_size: u32 = @sizeOf(@This()),
     handle: *anyopaque,
     input: ?*const anyopaque = null,
     input_contract: native_abi.TypeContract = .of(void),
@@ -61,7 +62,7 @@ pub const CallContext = extern struct {
 
 pub const HandlerCreateContext = extern struct {
     abi_version: u32,
-    _reserved: u32 = 0,
+    struct_size: u32 = @sizeOf(@This()),
     api_server_handle: *anyopaque,
     out_handle: *?*anyopaque,
 };
@@ -80,7 +81,7 @@ pub const AuthorizationDecision = enum(c_int) {
 
 pub const AuthorizeInferenceContext = extern struct {
     abi_version: u32,
-    _reserved: u32 = 0,
+    struct_size: u32 = @sizeOf(@This()),
     handle: *anyopaque,
     authorization: OptionalBytes = .{},
     trusted_principal: OptionalBytes = .{},
@@ -98,21 +99,25 @@ pub const HttpResponseView = http_abi.HttpResponseView;
 
 pub const HttpHandleContext = extern struct {
     abi_version: u32,
-    _reserved: u32 = 0,
+    struct_size: u32 = @sizeOf(@This()),
     route_handle: *anyopaque,
     request: *const HttpRequestView,
     out_response_handle: *?*anyopaque,
     out_response: *HttpResponseView,
 };
 
-pub const RouteContext = extern struct {
-    abi_version: u32,
-    _reserved: u32 = 0,
-    server: *anyopaque,
+pub const RouteManifestEntry = extern struct {
     route_handle: *anyopaque,
     method: HttpMethod,
-    path_ptr: [*]const u8,
-    path_len: usize,
+    path: Bytes,
+};
+
+pub const RouteManifestContext = extern struct {
+    abi_version: u32,
+    struct_size: u32 = @sizeOf(@This()),
+    handler_handle: *anyopaque,
+    out_entries: *?[*]const RouteManifestEntry,
+    out_len: *usize,
 };
 
 pub const HandlerStats = extern struct {
@@ -130,12 +135,84 @@ pub const HandlerStats = extern struct {
     active_peer_observers: usize,
 };
 
+/// Features exposed by the independently code-generated API-kernel archive.
+/// Consumers must test a capability before using its corresponding optional
+/// portion of the function table.
+pub const Capability = struct {
+    pub const core: u64 = 1 << 0;
+    pub const legacy_http_dispatch: u64 = 1 << 1;
+    pub const route_manifest: u64 = 1 << 3;
+};
+
+/// The sole discovery point for the API-kernel ABI. Keeping the table itself
+/// append-only lets a caller validate the fixed prefix it understands while a
+/// newer archive appends optional operations.
+pub const FunctionTable = extern struct {
+    abi_version: u32,
+    struct_size: u32,
+    capabilities: u64,
+
+    create: *const fn (*const CreateContext) callconv(.c) Status,
+    destroy: *const fn (*anyopaque) callconv(.c) void,
+    request_stats: *const fn (*const CallContext) callconv(.c) Status,
+    set_provider: *const fn (*const CallContext) callconv(.c) Status,
+    set_ha_executor: *const fn (*const CallContext) callconv(.c) Status,
+    executor: *const fn (*const CallContext) callconv(.c) Status,
+    streaming_executor: *const fn (*const CallContext) callconv(.c) Status,
+    attach_runtime_restore_store: *const fn (*const CallContext) callconv(.c) Status,
+    attach_replicated_restore_store: *const fn (u32, *anyopaque, *const anyopaque) callconv(.c) Status,
+    resume_restore_jobs: *const fn (*const CallContext) callconv(.c) Status,
+    poll_restore_jobs: *const fn (*const CallContext) callconv(.c) Status,
+    prepare_restore_leadership: *const fn (*const CallContext) callconv(.c) Status,
+    schedule_session_maintenance: *const fn (*const CallContext) callconv(.c) Status,
+    storage_maintenance_active: *const fn (*const CallContext) callconv(.c) Status,
+    authorize_inference: *const fn (*const AuthorizeInferenceContext) callconv(.c) Status,
+    handle: *const fn (*const CallContext) callconv(.c) Status,
+    handle_internal: *const fn (*const CallContext) callconv(.c) Status,
+    handler_create: *const fn (*const HandlerCreateContext) callconv(.c) Status,
+    handler_init: *const fn (*const CallContext) callconv(.c) Status,
+    handler_stats: *const fn (*const CallContext) callconv(.c) Status,
+    handler_route_manifest: *const fn (*const RouteManifestContext) callconv(.c) Status,
+    handler_handle_http: *const fn (*const HttpHandleContext) callconv(.c) Status,
+    handler_destroy_http_response: *const fn (*anyopaque) callconv(.c) void,
+    handler_destroy: *const fn (*anyopaque) callconv(.c) void,
+};
+
+pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
+    return version == abi_version and struct_size == @sizeOf(T);
+}
+
+pub fn validFunctionTable(table: *const FunctionTable, required_capabilities: u64) bool {
+    return table.abi_version == abi_version and
+        table.struct_size >= @sizeOf(FunctionTable) and
+        table.capabilities & required_capabilities == required_capabilities;
+}
+
 test "API kernel control contexts retain C layout" {
     const std = @import("std");
     try std.testing.expectEqual(.@"extern", @typeInfo(CreateContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(CallContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(HandlerCreateContext).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(RouteManifestContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(AuthorizeInferenceContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(native_abi.TypeContract).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(memory_abi.Allocator).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(FunctionTable).@"struct".layout);
+    try std.testing.expectEqual(@as(u32, @sizeOf(CreateContext)), (CreateContext{ .abi_version = abi_version, .owner_alloc = undefined, .cfg = undefined, .cfg_contract = .of(void), .source = undefined, .source_contract = .of(void), .table_reads = undefined, .table_reads_contract = .of(void), .table_writes = undefined, .table_writes_contract = .of(void), .out_handle = undefined, .out_request_alloc = undefined }).struct_size);
+}
+
+test "API kernel ABI rejects mismatched context and function-table prefixes" {
+    const std = @import("std");
+    try std.testing.expect(validContext(CallContext, abi_version, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, abi_version - 1, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, abi_version, @sizeOf(CallContext) - 1));
+
+    var table: FunctionTable = undefined;
+    table.abi_version = abi_version;
+    table.struct_size = @sizeOf(FunctionTable);
+    table.capabilities = Capability.core;
+    try std.testing.expect(validFunctionTable(&table, Capability.core));
+    try std.testing.expect(!validFunctionTable(&table, Capability.route_manifest));
+    table.struct_size -= 1;
+    try std.testing.expect(!validFunctionTable(&table, Capability.core));
 }

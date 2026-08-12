@@ -62,6 +62,76 @@ const builtin = @import("builtin");
 const db_mod = @import("../storage/db/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
+const routes = @import("http_routes.zig").Routes;
+const admin_routes = @import("../admin/routes.zig");
+const internal_routes = @import("../internal/routes.zig");
+
+/// Temporary, explicit ownership boundaries for route families that still
+/// cross the legacy request/response adapter. Keeping these paths in one
+/// manifest prevents native listeners from using an unbounded global fallback
+/// and makes each remaining migration target mechanically discoverable.
+pub const LegacyCompatibilitySurface = enum {
+    data_public,
+    metadata_admin,
+};
+
+pub const data_public_legacy_paths = [_][]const u8{
+    routes.healthz,
+    routes.readyz,
+    routes.status,
+    routes.cluster,
+    routes.connections,
+    routes.secrets,
+    routes.secrets_prefix ++ "*",
+    routes.eval,
+    routes.agents_query_builder,
+    routes.agents_retrieval,
+    routes.agents_v1_extensions_prefix ++ "*",
+    routes.mcp_v1,
+    routes.mcp_v1_prefix ++ "*",
+    routes.a2a,
+    routes.ai_catalog,
+    routes.agent_card,
+    routes.agent_card_legacy,
+    routes.ard_v1,
+    routes.ard_v1 ++ "/*",
+    routes.extensions_v1,
+    routes.extensions_v1 ++ "/*",
+    routes.backup,
+    routes.backups,
+    routes.restore,
+    routes.restore ++ "/*",
+    routes.tables,
+    routes.tables_prefix ++ "*",
+    routes.transactions,
+    routes.transactions_prefix ++ "*",
+    admin_routes.base,
+    admin_routes.base ++ "/*",
+    internal_routes.base,
+    internal_routes.base ++ "/*",
+};
+
+pub const metadata_admin_legacy_paths = [_][]const u8{
+    "/metadata/v1",
+    "/metadata/v1/*",
+    internal_routes.base,
+    internal_routes.base ++ "/*",
+};
+
+/// Registers every standard HTTP method so a request within an owned legacy
+/// namespace reaches the compatibility adapter and receives its established
+/// 404/405 behavior. Requests outside this manifest use httpx's native 404.
+pub fn registerLegacyCompatibilityRoutes(
+    server: anytype,
+    handler: anytype,
+    surface: LegacyCompatibilitySurface,
+) !void {
+    const paths: []const []const u8 = switch (surface) {
+        .data_public => &data_public_legacy_paths,
+        .metadata_admin => &metadata_admin_legacy_paths,
+    };
+    for (paths) |path| try server.any(path, handler);
+}
 
 const ParsedGlobalQueryTable = struct {
     parsed: std.json.Parsed(metadata_openapi.QueryRequest),
@@ -180,6 +250,24 @@ pub const AntflyApiHandler = struct {
             self.peer_observer = null;
             return err;
         };
+    }
+
+    /// Register the complete generated public surface for one handler
+    /// instance. Runtime roles call this common registrar instead of carrying
+    /// their own duplicate route arrays or active-handler globals.
+    pub fn registerRoutes(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        var prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = server };
+        try self.registerRouteSets(&prefixed, server);
+    }
+
+    /// One generated route manifest shared by native servers and the linked
+    /// kernel registrar boundary. `public_server` already represents the
+    /// `/db/v1` namespace; `root_server` owns root-level APIs such as auth.
+    pub fn registerRouteSets(self: *AntflyApiHandler, public_server: anytype, root_server: anytype) !void {
+        const metadata_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(self);
+        try metadata_router.register(public_server);
+        const usermgr_router = usermgr_openapi.server.ServerRouter(AntflyApiHandler).init(self);
+        try usermgr_router.register(root_server);
     }
 
     pub fn deinitRuntime(self: *AntflyApiHandler) void {
@@ -397,6 +485,50 @@ pub const AntflyApiHandler = struct {
         };
     }
 
+    /// One deletion-scoped adapter for route families that have not yet been
+    /// extracted into typed kernel operations. Keeping conversion here avoids
+    /// independent fallback handlers drifting on headers, body ownership, and
+    /// response allocator selection while those routes migrate.
+    pub fn executeLegacyCompatibility(
+        ctx: *httpx.Context,
+        executor: http_common.RequestExecutor,
+    ) !httpx.Response {
+        var request = httpRequestFromContext(ctx, null) catch |err| switch (err) {
+            error.UnsupportedMethod => {
+                _ = ctx.status(405);
+                return ctx.text("method not allowed");
+            },
+            else => return err,
+        };
+        defer request.deinit();
+        var response = try executor.execute(ctx.allocator, request.value);
+        const response_alloc = response.owner_allocator orelse ctx.allocator;
+        return respondWithAllocator(ctx, &response, response_alloc);
+    }
+
+    /// Compatibility adapter for the legacy internal dispatcher, whose null
+    /// result distinguishes an unowned route from an application response.
+    /// This remains centralized with the public adapter so standalone cannot
+    /// grow an independent request conversion or allocator policy.
+    pub fn executeLegacyInternalCompatibility(
+        ctx: *httpx.Context,
+        api_server: anytype,
+    ) !httpx.Response {
+        var request = httpRequestFromContext(ctx, null) catch |err| switch (err) {
+            error.UnsupportedMethod => {
+                _ = ctx.status(405);
+                return ctx.text("method not allowed");
+            },
+            else => return err,
+        };
+        defer request.deinit();
+        var response = (try api_server.handleInternalRoute(request.value)) orelse {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        };
+        return respondWithAllocator(ctx, &response, api_server.alloc);
+    }
+
     // ---------------------------------------------------------------
     // Authentication helper
     // ---------------------------------------------------------------
@@ -547,21 +679,8 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const metadata_status = try self.api_server.source.status();
-        var public_status = try cluster.fromMetadataStatus(alloc, metadata_status);
+        var public_status = try self.api_server.loadClusterStatus(alloc);
         defer public_status.deinit(alloc);
-        public_status.auth_enabled = self.api_server.cfg.auth_enabled;
-        public_status.deployment_mode = self.api_server.cfg.deployment_mode;
-        public_status.storage = self.api_server.currentStorageRuntimeStatus();
-        if (self.api_server.cfg.secret_store) |secret_store| {
-            _ = secret_store.refreshIfChanged() catch |err| {
-                std.log.warn("secret store status refresh skipped err={}", .{err});
-            };
-            try cluster.applySecretStoreHealth(alloc, &public_status, secret_store.healthSnapshot());
-        }
-        if (self.api_server.cfg.remote_content) |remote_content| {
-            if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(alloc, &public_status, health);
-        }
         return ctx.json(public_status);
     }
 
@@ -570,32 +689,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const metadata_status = try self.api_server.source.status();
-        var public_status = try cluster.fromMetadataStatus(alloc, metadata_status);
-        defer public_status.deinit(alloc);
-        public_status.auth_enabled = self.api_server.cfg.auth_enabled;
-        public_status.deployment_mode = self.api_server.cfg.deployment_mode;
-        public_status.storage = self.api_server.currentStorageRuntimeStatus();
-        if (self.api_server.cfg.secret_store) |secret_store| {
-            _ = secret_store.refreshIfChanged() catch |err| {
-                std.log.warn("secret store status refresh skipped err={}", .{err});
-            };
-            try cluster.applySecretStoreHealth(alloc, &public_status, secret_store.healthSnapshot());
-        }
-        if (self.api_server.cfg.remote_content) |remote_content| {
-            if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(alloc, &public_status, health);
-        }
-        var snapshot_opt = try self.api_server.source.cachedAdminSnapshot();
-        if (snapshot_opt == null) {
-            snapshot_opt = try self.api_server.source.adminSnapshot();
-        }
-        if (snapshot_opt) |*snapshot| {
-            defer self.api_server.source.freeAdminSnapshot(snapshot);
-            var topology = try cluster.topologyFromStatusAndSnapshot(alloc, public_status, snapshot);
-            defer topology.deinit(alloc);
-            return ctx.json(topology);
-        }
-        var topology = try cluster.topologyFromStatus(alloc, public_status);
+        var topology = try self.api_server.loadClusterTopology(alloc);
         defer topology.deinit(alloc);
         return ctx.json(topology);
     }
@@ -3706,6 +3800,51 @@ pub const AntflyApiHandler = struct {
     }
 };
 
+test "legacy compatibility routes are explicit and exclude generated namespaces" {
+    const RecordingServer = struct {
+        paths: [64][]const u8 = undefined,
+        len: usize = 0,
+
+        fn any(self: *@This(), path: []const u8, _: anytype) !void {
+            self.paths[self.len] = path;
+            self.len += 1;
+        }
+
+        fn hasPath(self: *const @This(), expected: []const u8) bool {
+            for (self.paths[0..self.len]) |path| {
+                if (std.mem.eql(u8, path, expected)) return true;
+            }
+            return false;
+        }
+    };
+
+    var data = RecordingServer{};
+    try registerLegacyCompatibilityRoutes(&data, {}, .data_public);
+    for (data.paths[0..data.len], 0..) |path, index| {
+        for (data.paths[index + 1 .. data.len]) |other|
+            try std.testing.expect(!std.mem.eql(u8, path, other));
+    }
+    try std.testing.expect(data.hasPath(routes.healthz));
+    try std.testing.expect(data.hasPath(routes.tables_prefix ++ "*"));
+    try std.testing.expect(data.hasPath(admin_routes.base ++ "/*"));
+    try std.testing.expect(data.hasPath(internal_routes.base ++ "/*"));
+    try std.testing.expect(!data.hasPath("/db/v1"));
+    try std.testing.expect(!data.hasPath("/db/v1/*"));
+    try std.testing.expect(!data.hasPath("/auth/v1"));
+    try std.testing.expect(!data.hasPath("/*"));
+
+    var metadata = RecordingServer{};
+    try registerLegacyCompatibilityRoutes(&metadata, {}, .metadata_admin);
+    for (metadata.paths[0..metadata.len], 0..) |path, index| {
+        for (metadata.paths[index + 1 .. metadata.len]) |other|
+            try std.testing.expect(!std.mem.eql(u8, path, other));
+    }
+    try std.testing.expect(metadata.hasPath("/metadata/v1/*"));
+    try std.testing.expect(metadata.hasPath(internal_routes.base ++ "/*"));
+    try std.testing.expect(!metadata.hasPath("/db/v1/*"));
+    try std.testing.expect(!metadata.hasPath("/*"));
+}
+
 fn sleepNs(duration_ns: u64) void {
     var req = std.posix.timespec{
         .sec = @intCast(duration_ns / std.time.ns_per_s),
@@ -3814,12 +3953,7 @@ const HttpxE2eServer = struct {
         });
         errdefer self.server.deinit();
 
-        const metadata_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(&self.handler);
-        var prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = &self.server };
-        try metadata_router.register(&prefixed);
-
-        const usermgr_router = usermgr_openapi.server.ServerRouter(AntflyApiHandler).init(&self.handler);
-        try usermgr_router.register(&self.server);
+        try self.handler.registerRoutes(&self.server);
 
         try self.server.bind();
         self.thread = try std.Thread.spawn(.{}, listenHttpxE2eServer, .{&self.server});

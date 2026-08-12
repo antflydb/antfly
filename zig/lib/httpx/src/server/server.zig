@@ -786,16 +786,71 @@ pub const Context = struct {
     }
 };
 
-/// Handler function type.
-pub const Handler = *const fn (*Context) anyerror!Response;
+/// A route handler with optional instance context.
+///
+/// Bound handlers make route ownership explicit and allow multiple server
+/// instances to use the same generated router type without process-global
+/// state. Plain functions remain supported for stateless handlers.
+pub const Handler = union(enum) {
+    function: *const fn (*Context) anyerror!Response,
+    bound: Bound,
+
+    pub const Bound = struct {
+        ptr: *anyopaque,
+        call: *const fn (ptr: *anyopaque, ctx: *Context) anyerror!Response,
+    };
+
+    /// Converts either an existing Handler or a plain handler function into
+    /// the canonical stored representation.
+    pub fn from(handler: anytype) Handler {
+        if (@TypeOf(handler) == Handler) return handler;
+        return .{ .function = handler };
+    }
+
+    /// Binds a handler method to an explicitly owned instance.
+    pub fn bind(instance: anytype, comptime method: anytype) Handler {
+        const Instance = @TypeOf(instance);
+        comptime {
+            switch (@typeInfo(Instance)) {
+                .pointer => |pointer| {
+                    if (pointer.size != .one) @compileError("httpx.Handler.bind requires a single-item pointer");
+                    if (pointer.is_const) @compileError("httpx.Handler.bind currently requires a mutable instance pointer");
+                },
+                else => @compileError("httpx.Handler.bind requires an instance pointer"),
+            }
+        }
+
+        const Adapter = struct {
+            fn call(raw: *anyopaque, ctx: *Context) anyerror!Response {
+                const typed: Instance = @ptrCast(@alignCast(raw));
+                return @call(.auto, method, .{ typed, ctx });
+            }
+        };
+
+        return .{ .bound = .{
+            .ptr = @ptrCast(instance),
+            .call = Adapter.call,
+        } };
+    }
+
+    pub fn invoke(self: Handler, ctx: *Context) anyerror!Response {
+        return switch (self) {
+            .function => |function| function(ctx),
+            .bound => |bound| bound.call(bound.ptr, ctx),
+        };
+    }
+};
 
 /// HTTP Server.
 pub const Server = struct {
     pub const RuntimeStats = struct {
         max_connections: u32,
         active_connections: usize,
+        peak_active_connections: usize,
         active_requests: usize,
+        peak_active_requests: usize,
         accept_errors_total: u64,
+        connection_timeouts_total: u64,
         body_buffer_capacity_bytes: usize,
         body_buffer_in_use_bytes: usize,
         body_buffer_peak_bytes: usize,
@@ -823,8 +878,11 @@ pub const Server = struct {
     /// is zero and the kernel selects an ephemeral port.
     wake_port: std.atomic.Value(u16) = .init(0),
     active_connections: std.atomic.Value(usize) = .init(0),
+    peak_active_connections: std.atomic.Value(usize) = .init(0),
     active_requests: std.atomic.Value(usize) = .init(0),
+    peak_active_requests: std.atomic.Value(usize) = .init(0),
     accept_errors_total: std.atomic.Value(u64) = .init(0),
+    connection_timeouts_total: std.atomic.Value(u64) = .init(0),
     connection_controls_mutex: std.atomic.Mutex = .unlocked,
     connection_controls: std.ArrayListUnmanaged(*ConnectionControl) = .empty,
     connections: Io.Group = Io.Group.init,
@@ -834,6 +892,90 @@ pub const Server = struct {
     body_budget: SharedBodyBudget,
 
     const Self = @This();
+
+    /// Structured owner for a long-lived `Server.listen` task.
+    ///
+    /// The caller owns both the Server and the executor behind its Io value.
+    /// A ListenerTask owns only the submitted future: it binds before
+    /// returning from `start`, publishes shutdown to the listener, and makes
+    /// joining explicit before the server or executor can be destroyed.
+    pub const ListenerTask = struct {
+        server: *Self,
+        io: Io,
+        future: ?Io.Future(anyerror!void) = null,
+        state: State = .initialized,
+        runtime_state: std.atomic.Value(RuntimeState) = .init(.initialized),
+        failure: anyerror = error.Unexpected,
+
+        pub const State = enum {
+            initialized,
+            running,
+            joined,
+        };
+
+        pub const RuntimeState = enum(u8) {
+            initialized,
+            running,
+            stopped,
+            failed,
+        };
+
+        pub fn init(server: *Self) ListenerTask {
+            return .{ .server = server, .io = server.io };
+        }
+
+        pub fn start(self: *ListenerTask) !void {
+            if (self.state != .initialized) return error.ListenerTaskAlreadyStarted;
+            try self.server.bind();
+            self.state = .running;
+            self.runtime_state.store(.running, .release);
+            self.future = self.io.concurrent(run, .{self}) catch |err| {
+                self.state = .initialized;
+                self.runtime_state.store(.initialized, .release);
+                return err;
+            };
+        }
+
+        pub fn requestStop(self: *ListenerTask) void {
+            if (self.state == .running) self.server.requestStop();
+        }
+
+        pub fn shutdown(self: *ListenerTask, timeout_ms: u64) void {
+            if (self.state == .running) self.server.shutdown(timeout_ms);
+        }
+
+        pub fn join(self: *ListenerTask) !void {
+            if (self.future) |*future| {
+                defer {
+                    self.future = null;
+                    self.state = .joined;
+                }
+                return try future.await(self.io);
+            }
+            if (self.state == .initialized) self.state = .joined;
+            if (self.runtime_state.load(.acquire) == .initialized)
+                self.runtime_state.store(.stopped, .release);
+        }
+
+        pub fn isRunning(self: *const ListenerTask) bool {
+            return self.state == .running;
+        }
+
+        /// Publish an unexpected terminal listener error without consuming the
+        /// Future. The owner still must call `join` before deinitialization.
+        pub fn runtimeFailure(self: *const ListenerTask) ?anyerror {
+            return if (self.runtime_state.load(.acquire) == .failed) self.failure else null;
+        }
+
+        fn run(self: *ListenerTask) anyerror!void {
+            self.server.listen() catch |err| {
+                self.failure = err;
+                self.runtime_state.store(.failed, .release);
+                return err;
+            };
+            self.runtime_state.store(.stopped, .release);
+        }
+    };
 
     const ConnectionControl = struct {
         socket: *Socket,
@@ -897,8 +1039,11 @@ pub const Server = struct {
         return .{
             .max_connections = self.config.max_connections,
             .active_connections = self.active_connections.load(.acquire),
+            .peak_active_connections = self.peak_active_connections.load(.acquire),
             .active_requests = self.active_requests.load(.acquire),
+            .peak_active_requests = self.peak_active_requests.load(.acquire),
             .accept_errors_total = self.accept_errors_total.load(.acquire),
+            .connection_timeouts_total = self.connection_timeouts_total.load(.acquire),
             .body_buffer_capacity_bytes = body.capacity,
             .body_buffer_in_use_bytes = body.in_use,
             .body_buffer_peak_bytes = body.peak_in_use,
@@ -926,66 +1071,67 @@ pub const Server = struct {
     }
 
     /// Registers a global fallback handler for unmatched routes.
-    pub fn global(self: *Self, handler: Handler) void {
-        self.global_handler = handler;
+    pub fn global(self: *Self, handler: anytype) void {
+        self.global_handler = Handler.from(handler);
     }
 
     /// Registers a route handler.
-    pub fn route(self: *Self, method: types.Method, path: []const u8, handler: Handler) !void {
+    pub fn route(self: *Self, method: types.Method, path: []const u8, handler: anytype) !void {
         try self.router.add(method, path, handler);
     }
 
     /// Registers a route with borrowed opaque data copied into Context.
-    pub fn routeWithData(self: *Self, method: types.Method, path: []const u8, handler: Handler, data: *anyopaque) !void {
+    pub fn routeWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
         try self.router.addWithData(method, path, handler, data);
     }
 
     /// Registers a GET route.
-    pub fn get(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn get(self: *Self, path: []const u8, handler: anytype) !void {
         try self.route(.GET, path, handler);
     }
 
     /// Registers a POST route.
-    pub fn post(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn post(self: *Self, path: []const u8, handler: anytype) !void {
         try self.route(.POST, path, handler);
     }
 
     /// Registers a PUT route.
-    pub fn put(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn put(self: *Self, path: []const u8, handler: anytype) !void {
         try self.route(.PUT, path, handler);
     }
 
     /// Registers a DELETE route.
-    pub fn delete(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn delete(self: *Self, path: []const u8, handler: anytype) !void {
         try self.route(.DELETE, path, handler);
     }
 
     /// Registers a PATCH route.
-    pub fn patch(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn patch(self: *Self, path: []const u8, handler: anytype) !void {
         try self.route(.PATCH, path, handler);
     }
 
     /// Registers a HEAD route.
-    pub fn head(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn head(self: *Self, path: []const u8, handler: anytype) !void {
         try self.route(.HEAD, path, handler);
     }
 
     /// Registers an OPTIONS route.
-    pub fn options(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn options(self: *Self, path: []const u8, handler: anytype) !void {
         try self.route(.OPTIONS, path, handler);
     }
 
     /// Registers a handler for all standard HTTP methods on a path.
-    pub fn any(self: *Self, path: []const u8, handler: Handler) !void {
-        try self.route(.GET, path, handler);
-        try self.route(.POST, path, handler);
-        try self.route(.PUT, path, handler);
-        try self.route(.DELETE, path, handler);
-        try self.route(.PATCH, path, handler);
-        try self.route(.HEAD, path, handler);
-        try self.route(.OPTIONS, path, handler);
-        try self.route(.TRACE, path, handler);
-        try self.route(.CONNECT, path, handler);
+    pub fn any(self: *Self, path: []const u8, handler: anytype) !void {
+        const normalized = Handler.from(handler);
+        try self.route(.GET, path, normalized);
+        try self.route(.POST, path, normalized);
+        try self.route(.PUT, path, normalized);
+        try self.route(.DELETE, path, normalized);
+        try self.route(.PATCH, path, normalized);
+        try self.route(.HEAD, path, normalized);
+        try self.route(.OPTIONS, path, normalized);
+        try self.route(.TRACE, path, normalized);
+        try self.route(.CONNECT, path, normalized);
     }
 
     /// Binds the server socket without starting the accept loop.
@@ -1094,9 +1240,11 @@ pub const Server = struct {
                 self.conn_semaphore.post(self.io);
                 continue;
             };
-            _ = self.active_connections.fetchAdd(1, .acq_rel);
+            const active = self.active_connections.fetchAdd(1, .acq_rel) + 1;
+            updateAtomicMax(&self.peak_active_connections, active);
             self.connections.concurrent(self.io, handleConnectionFiber, .{ self, connection }) catch {
                 self.handleConnection(connection) catch |err| {
+                    self.recordConnectionError(err);
                     logConnectionError(err);
                 };
             };
@@ -1183,8 +1331,13 @@ pub const Server = struct {
     /// Signature returns `Io.Cancelable!void` as required by Group.concurrent.
     fn handleConnectionFiber(self: *Self, connection: *ConnectionContext) Io.Cancelable!void {
         self.handleConnection(connection) catch |err| {
+            self.recordConnectionError(err);
             logConnectionError(err);
         };
+    }
+
+    fn recordConnectionError(self: *Self, err: anyerror) void {
+        if (err == error.Timeout) _ = self.connection_timeouts_total.fetchAdd(1, .monotonic);
     }
 
     fn logConnectionError(err: anyerror) void {
@@ -2025,7 +2178,8 @@ pub const Server = struct {
     }
 
     fn startRequest(self: *Self) void {
-        _ = self.active_requests.fetchAdd(1, .acq_rel);
+        const active = self.active_requests.fetchAdd(1, .acq_rel) + 1;
+        updateAtomicMax(&self.peak_active_requests, active);
     }
 
     fn finishRequest(self: *Self) void {
@@ -2035,6 +2189,14 @@ pub const Server = struct {
     fn shouldContinueH2(self: *Self) bool {
         const mode = self.shutdown_mode.load(.acquire);
         return mode != 2 and (self.running or (mode == 1 and self.active_requests.load(.acquire) != 0));
+    }
+
+    fn updateAtomicMax(counter: *std.atomic.Value(usize), value: usize) void {
+        var observed = counter.load(.acquire);
+        while (observed < value) {
+            if (counter.cmpxchgWeak(observed, value, .acq_rel, .acquire) == null) return;
+            observed = counter.load(.acquire);
+        }
     }
 
     fn registerConnection(self: *Self, control: *ConnectionControl) !void {
@@ -2372,9 +2534,9 @@ pub const Server = struct {
             if (state.index < state.server.middleware.items.len) {
                 const mw = state.server.middleware.items[state.index];
                 state.index += 1;
-                return mw.handler(ctx, &state.next);
+                return mw.invoke(ctx, &state.next);
             }
-            return state.route_handler(ctx);
+            return state.route_handler.invoke(ctx);
         }
     };
 
@@ -2500,6 +2662,45 @@ test "Server initialization" {
     defer server.deinit();
 
     try std.testing.expectEqual(@as(u16, 8080), server.config.port);
+}
+
+test "bound handlers keep independent instance context" {
+    const StatefulHandler = struct {
+        status_code: u16,
+        calls: usize = 0,
+
+        fn handle(self: *@This(), ctx: *Context) anyerror!Response {
+            self.calls += 1;
+            return Response.init(ctx.allocator, self.status_code);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var first_state = StatefulHandler{ .status_code = 201 };
+    var second_state = StatefulHandler{ .status_code = 202 };
+    var first_router = Router.init(allocator);
+    defer first_router.deinit();
+    var second_router = Router.init(allocator);
+    defer second_router.deinit();
+
+    try first_router.add(.GET, "/state", Handler.bind(&first_state, StatefulHandler.handle));
+    try second_router.add(.GET, "/state", Handler.bind(&second_state, StatefulHandler.handle));
+
+    var request = try Request.init(allocator, .GET, "/state");
+    defer request.deinit();
+    var ctx = Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var params: [16]RouteParam = undefined;
+
+    var first_response = try first_router.find(.GET, "/state", &params).?.handler.invoke(&ctx);
+    defer first_response.deinit();
+    var second_response = try second_router.find(.GET, "/state", &params).?.handler.invoke(&ctx);
+    defer second_response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 201), first_response.status.code);
+    try std.testing.expectEqual(@as(u16, 202), second_response.status.code);
+    try std.testing.expectEqual(@as(usize, 1), first_state.calls);
+    try std.testing.expectEqual(@as(usize, 1), second_state.calls);
 }
 
 test "Context response helpers" {
@@ -3265,13 +3466,19 @@ test "accept backoff is normalized and bounded" {
     try std.testing.expectEqual(server.config.accept_error_backoff_max_ms, delay);
 
     server.active_connections.store(3, .release);
+    server.peak_active_connections.store(5, .release);
     server.active_requests.store(2, .release);
+    server.peak_active_requests.store(4, .release);
     server.accept_errors_total.store(7, .release);
+    server.connection_timeouts_total.store(11, .release);
     const stats = server.runtimeStats();
     try std.testing.expectEqual(@as(u32, 1000), stats.max_connections);
     try std.testing.expectEqual(@as(usize, 3), stats.active_connections);
+    try std.testing.expectEqual(@as(usize, 5), stats.peak_active_connections);
     try std.testing.expectEqual(@as(usize, 2), stats.active_requests);
+    try std.testing.expectEqual(@as(usize, 4), stats.peak_active_requests);
     try std.testing.expectEqual(@as(u64, 7), stats.accept_errors_total);
+    try std.testing.expectEqual(@as(u64, 11), stats.connection_timeouts_total);
 }
 
 test "cross-thread stop wakes an ephemeral listener" {
@@ -3292,6 +3499,27 @@ test "cross-thread stop wakes an ephemeral listener" {
     server.stop();
     listener_thread.join();
     try std.testing.expect(!server.running);
+}
+
+test "listener task binds synchronously and joins before executor teardown" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+
+    var task = Server.ListenerTask.init(&server);
+    try task.start();
+    try std.testing.expect(task.isRunning());
+    try std.testing.expect(server.boundAddress() != null);
+    try std.testing.expectError(error.ListenerTaskAlreadyStarted, task.start());
+
+    task.shutdown(1000);
+    try task.join();
+    try std.testing.expectEqual(Server.ListenerTask.State.joined, task.state);
+    try std.testing.expect(!server.running);
+    // Joining is idempotent for cleanup paths.
+    try task.join();
 }
 
 test "cross-thread graceful shutdown is listener-owned" {

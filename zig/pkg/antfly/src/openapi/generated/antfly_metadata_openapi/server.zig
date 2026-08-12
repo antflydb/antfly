@@ -532,77 +532,81 @@ pub fn parseStageTransactionWriteBody(allocator: std.mem.Allocator, body: []cons
 }
 
 /// Route metadata for all operations.
+pub const RequestBodyMode = enum { none, buffered };
+
 pub const Route = struct {
     method: []const u8,
     path: []const u8,
     operation_id: []const u8,
+    request_body: RequestBodyMode,
+    streaming_response: bool,
 };
 
 pub const routes = [_]Route{
-    .{ .method = "POST", .path = "/agents/query-builder", .operation_id = "queryBuilderAgent" },
-    .{ .method = "POST", .path = "/agents/retrieval", .operation_id = "retrievalAgent" },
-    .{ .method = "POST", .path = "/backup", .operation_id = "backup" },
-    .{ .method = "GET", .path = "/backups", .operation_id = "listBackups" },
-    .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite" },
-    .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster" },
-    .{ .method = "GET", .path = "/connections", .operation_id = "listConnections" },
-    .{ .method = "POST", .path = "/connections/{connection_id}/inference/{operation}", .operation_id = "invokeInferenceConnection" },
-    .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
-    .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
-    .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
-    .{ .method = "GET", .path = "/restore/jobs", .operation_id = "listRestoreJobs" },
-    .{ .method = "GET", .path = "/restore/jobs/{job_id}", .operation_id = "getRestoreJob" },
-    .{ .method = "DELETE", .path = "/restore/jobs/{job_id}", .operation_id = "cancelRestoreJob" },
-    .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets" },
-    .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret" },
-    .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret" },
-    .{ .method = "GET", .path = "/status", .operation_id = "getStatus" },
-    .{ .method = "GET", .path = "/tables", .operation_id = "listTables" },
-    .{ .method = "GET", .path = "/tables/{tableName}", .operation_id = "getTable" },
-    .{ .method = "POST", .path = "/tables/{tableName}", .operation_id = "createTable" },
-    .{ .method = "DELETE", .path = "/tables/{tableName}", .operation_id = "dropTable" },
-    .{ .method = "GET", .path = "/tables/{tableName}/artifacts", .operation_id = "listArtifactEnrichments" },
-    .{ .method = "PUT", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "putArtifactEnrichment" },
-    .{ .method = "DELETE", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "deleteArtifactEnrichment" },
-    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
-    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs", .operation_id = "startDocumentArtifactReprocessJob" },
-    .{ .method = "GET", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}", .operation_id = "getDocumentArtifactReprocessJob" },
-    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance", .operation_id = "advanceDocumentArtifactReprocessJob" },
-    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel", .operation_id = "cancelDocumentArtifactReprocessJob" },
-    .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable" },
-    .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite" },
-    .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys" },
-    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
-    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
-    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest" },
-    .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact" },
-    .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes" },
-    .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex" },
-    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex" },
-    .{ .method = "DELETE", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "dropIndex" },
-    .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge" },
-    .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable" },
-    .{ .method = "POST", .path = "/tables/{tableName}/repair/issues", .operation_id = "listTableRepairIssues" },
-    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs", .operation_id = "startTableRepairJob" },
-    .{ .method = "GET", .path = "/tables/{tableName}/repair/jobs/{jobId}", .operation_id = "getTableRepairJob" },
-    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/advance", .operation_id = "advanceTableRepairJob" },
-    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/cancel", .operation_id = "cancelTableRepairJob" },
-    .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair" },
-    .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable" },
-    .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema" },
-    .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions" },
-    .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction" },
-    .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions" },
-    .{ .method = "POST", .path = "/transactions/commit", .operation_id = "commitTransaction" },
-    .{ .method = "GET", .path = "/transactions/{transaction_id}", .operation_id = "getTransactionSession" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/abort", .operation_id = "abortTransactionSession" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/commit", .operation_id = "commitTransactionSession" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/delete", .operation_id = "stageTransactionDelete" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/read", .operation_id = "stageTransactionRead" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints", .operation_id = "createTransactionSavepoint" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback", .operation_id = "rollbackTransactionSavepoint" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/stage", .operation_id = "stageTransactionSession" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/write", .operation_id = "stageTransactionWrite" },
+    .{ .method = "POST", .path = "/agents/query-builder", .operation_id = "queryBuilderAgent", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/agents/retrieval", .operation_id = "retrievalAgent", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "POST", .path = "/backup", .operation_id = "backup", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/backups", .operation_id = "listBackups", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/connections", .operation_id = "listConnections", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/connections/{connection_id}/inference/{operation}", .operation_id = "invokeInferenceConnection", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/eval", .operation_id = "evaluate", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/query", .operation_id = "globalQuery", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/restore", .operation_id = "restore", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/restore/jobs", .operation_id = "listRestoreJobs", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/restore/jobs/{job_id}", .operation_id = "getRestoreJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/restore/jobs/{job_id}", .operation_id = "cancelRestoreJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/status", .operation_id = "getStatus", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables", .operation_id = "listTables", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}", .operation_id = "getTable", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}", .operation_id = "createTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/tables/{tableName}", .operation_id = "dropTable", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/artifacts", .operation_id = "listArtifactEnrichments", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "putArtifactEnrichment", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "deleteArtifactEnrichment", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs", .operation_id = "startDocumentArtifactReprocessJob", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}", .operation_id = "getDocumentArtifactReprocessJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance", .operation_id = "advanceDocumentArtifactReprocessJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel", .operation_id = "cancelDocumentArtifactReprocessJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "dropIndex", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/issues", .operation_id = "listTableRepairIssues", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs", .operation_id = "startTableRepairJob", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/repair/jobs/{jobId}", .operation_id = "getTableRepairJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/advance", .operation_id = "advanceTableRepairJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/cancel", .operation_id = "cancelTableRepairJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/transactions/commit", .operation_id = "commitTransaction", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/transactions/{transaction_id}", .operation_id = "getTransactionSession", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/abort", .operation_id = "abortTransactionSession", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/commit", .operation_id = "commitTransactionSession", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/delete", .operation_id = "stageTransactionDelete", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/read", .operation_id = "stageTransactionRead", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints", .operation_id = "createTransactionSavepoint", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback", .operation_id = "rollbackTransactionSavepoint", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/stage", .operation_id = "stageTransactionSession", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/write", .operation_id = "stageTransactionWrite", .request_body = .buffered, .streaming_response = false },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -683,108 +687,101 @@ pub fn ServerRouter(comptime Impl: type) type {
     }
 
     return struct {
-        var active_impl: ?*Impl = null;
-
         impl: *Impl,
 
         pub fn init(impl: *Impl) @This() {
             return .{ .impl = impl };
         }
 
-        /// Register all routes on the server and activate the impl.
+        /// Register all routes on the server with explicit instance context.
         pub fn register(self: *const @This(), server: anytype) !void {
-            active_impl = self.impl;
-            try server.post("/agents/query-builder", queryBuilderAgent);
-            try server.post("/agents/retrieval", retrievalAgent);
-            try server.post("/backup", backup);
-            try server.get("/backups", listBackups);
-            try server.post("/batch", multiBatchWrite);
-            try server.get("/cluster", getCluster);
-            try server.get("/connections", listConnections);
-            try server.post("/connections/:connection_id/inference/:operation", invokeInferenceConnection);
-            try server.post("/eval", evaluate);
-            try server.post("/query", globalQuery);
-            try server.post("/restore", restore);
-            try server.get("/restore/jobs", listRestoreJobs);
-            try server.get("/restore/jobs/:job_id", getRestoreJob);
-            try server.delete("/restore/jobs/:job_id", cancelRestoreJob);
-            try server.get("/secrets", listSecrets);
-            try server.put("/secrets/:key", putSecret);
-            try server.delete("/secrets/:key", deleteSecret);
-            try server.get("/status", getStatus);
-            try server.get("/tables", listTables);
-            try server.get("/tables/:tableName", getTable);
-            try server.post("/tables/:tableName", createTable);
-            try server.delete("/tables/:tableName", dropTable);
-            try server.get("/tables/:tableName/artifacts", listArtifactEnrichments);
-            try server.put("/tables/:tableName/artifacts/:artifactName/enrichment", putArtifactEnrichment);
-            try server.delete("/tables/:tableName/artifacts/:artifactName/enrichment", deleteArtifactEnrichment);
-            try server.post("/tables/:tableName/artifacts/:artifactName/reprocess", reprocessDocumentArtifactRange);
-            try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs", startDocumentArtifactReprocessJob);
-            try server.get("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId", getDocumentArtifactReprocessJob);
-            try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId/advance", advanceDocumentArtifactReprocessJob);
-            try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId/cancel", cancelDocumentArtifactReprocessJob);
-            try server.post("/tables/:tableName/backup", backupTable);
-            try server.post("/tables/:tableName/batch", batchWrite);
-            try server.post("/tables/:tableName/documents", scanKeys);
-            try server.get("/tables/:tableName/documents/:key", lookupKey);
-            try server.get("/tables/:tableName/documents/:key/artifacts", listDocumentArtifactManifests);
-            try server.get("/tables/:tableName/documents/:key/artifacts/:artifactName", getDocumentArtifactManifest);
-            try server.post("/tables/:tableName/documents/:key/artifacts/:artifactName/reprocess", reprocessDocumentArtifact);
-            try server.get("/tables/:tableName/indexes", listIndexes);
-            try server.get("/tables/:tableName/indexes/:indexName", getIndex);
-            try server.post("/tables/:tableName/indexes/:indexName", createIndex);
-            try server.delete("/tables/:tableName/indexes/:indexName", dropIndex);
-            try server.post("/tables/:tableName/merge", linearMerge);
-            try server.post("/tables/:tableName/query", queryTable);
-            try server.post("/tables/:tableName/repair/issues", listTableRepairIssues);
-            try server.post("/tables/:tableName/repair/jobs", startTableRepairJob);
-            try server.get("/tables/:tableName/repair/jobs/:jobId", getTableRepairJob);
-            try server.post("/tables/:tableName/repair/jobs/:jobId/advance", advanceTableRepairJob);
-            try server.post("/tables/:tableName/repair/jobs/:jobId/cancel", cancelTableRepairJob);
-            try server.post("/tables/:tableName/repair/run", runTableRepair);
-            try server.post("/tables/:tableName/restore", restoreTable);
-            try server.put("/tables/:tableName/schema", updateSchema);
-            try server.get("/transactions", listTransactionSessions);
-            try server.post("/transactions/begin", beginTransaction);
-            try server.post("/transactions/cleanup", cleanupTransactionSessions);
-            try server.post("/transactions/commit", commitTransaction);
-            try server.get("/transactions/:transaction_id", getTransactionSession);
-            try server.post("/transactions/:transaction_id/abort", abortTransactionSession);
-            try server.post("/transactions/:transaction_id/commit", commitTransactionSession);
-            try server.post("/transactions/:transaction_id/delete", stageTransactionDelete);
-            try server.post("/transactions/:transaction_id/read", stageTransactionRead);
-            try server.post("/transactions/:transaction_id/savepoints", createTransactionSavepoint);
-            try server.post("/transactions/:transaction_id/savepoints/:savepoint_id/rollback", rollbackTransactionSavepoint);
-            try server.post("/transactions/:transaction_id/stage", stageTransactionSession);
-            try server.post("/transactions/:transaction_id/write", stageTransactionWrite);
+            try server.post("/agents/query-builder", httpx.Handler.bind(self.impl, queryBuilderAgent));
+            try server.post("/agents/retrieval", httpx.Handler.bind(self.impl, retrievalAgent));
+            try server.post("/backup", httpx.Handler.bind(self.impl, backup));
+            try server.get("/backups", httpx.Handler.bind(self.impl, listBackups));
+            try server.post("/batch", httpx.Handler.bind(self.impl, multiBatchWrite));
+            try server.get("/cluster", httpx.Handler.bind(self.impl, getCluster));
+            try server.get("/connections", httpx.Handler.bind(self.impl, listConnections));
+            try server.post("/connections/:connection_id/inference/:operation", httpx.Handler.bind(self.impl, invokeInferenceConnection));
+            try server.post("/eval", httpx.Handler.bind(self.impl, evaluate));
+            try server.post("/query", httpx.Handler.bind(self.impl, globalQuery));
+            try server.post("/restore", httpx.Handler.bind(self.impl, restore));
+            try server.get("/restore/jobs", httpx.Handler.bind(self.impl, listRestoreJobs));
+            try server.get("/restore/jobs/:job_id", httpx.Handler.bind(self.impl, getRestoreJob));
+            try server.delete("/restore/jobs/:job_id", httpx.Handler.bind(self.impl, cancelRestoreJob));
+            try server.get("/secrets", httpx.Handler.bind(self.impl, listSecrets));
+            try server.put("/secrets/:key", httpx.Handler.bind(self.impl, putSecret));
+            try server.delete("/secrets/:key", httpx.Handler.bind(self.impl, deleteSecret));
+            try server.get("/status", httpx.Handler.bind(self.impl, getStatus));
+            try server.get("/tables", httpx.Handler.bind(self.impl, listTables));
+            try server.get("/tables/:tableName", httpx.Handler.bind(self.impl, getTable));
+            try server.post("/tables/:tableName", httpx.Handler.bind(self.impl, createTable));
+            try server.delete("/tables/:tableName", httpx.Handler.bind(self.impl, dropTable));
+            try server.get("/tables/:tableName/artifacts", httpx.Handler.bind(self.impl, listArtifactEnrichments));
+            try server.put("/tables/:tableName/artifacts/:artifactName/enrichment", httpx.Handler.bind(self.impl, putArtifactEnrichment));
+            try server.delete("/tables/:tableName/artifacts/:artifactName/enrichment", httpx.Handler.bind(self.impl, deleteArtifactEnrichment));
+            try server.post("/tables/:tableName/artifacts/:artifactName/reprocess", httpx.Handler.bind(self.impl, reprocessDocumentArtifactRange));
+            try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs", httpx.Handler.bind(self.impl, startDocumentArtifactReprocessJob));
+            try server.get("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId", httpx.Handler.bind(self.impl, getDocumentArtifactReprocessJob));
+            try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId/advance", httpx.Handler.bind(self.impl, advanceDocumentArtifactReprocessJob));
+            try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId/cancel", httpx.Handler.bind(self.impl, cancelDocumentArtifactReprocessJob));
+            try server.post("/tables/:tableName/backup", httpx.Handler.bind(self.impl, backupTable));
+            try server.post("/tables/:tableName/batch", httpx.Handler.bind(self.impl, batchWrite));
+            try server.post("/tables/:tableName/documents", httpx.Handler.bind(self.impl, scanKeys));
+            try server.get("/tables/:tableName/documents/:key", httpx.Handler.bind(self.impl, lookupKey));
+            try server.get("/tables/:tableName/documents/:key/artifacts", httpx.Handler.bind(self.impl, listDocumentArtifactManifests));
+            try server.get("/tables/:tableName/documents/:key/artifacts/:artifactName", httpx.Handler.bind(self.impl, getDocumentArtifactManifest));
+            try server.post("/tables/:tableName/documents/:key/artifacts/:artifactName/reprocess", httpx.Handler.bind(self.impl, reprocessDocumentArtifact));
+            try server.get("/tables/:tableName/indexes", httpx.Handler.bind(self.impl, listIndexes));
+            try server.get("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, getIndex));
+            try server.post("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createIndex));
+            try server.delete("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, dropIndex));
+            try server.post("/tables/:tableName/merge", httpx.Handler.bind(self.impl, linearMerge));
+            try server.post("/tables/:tableName/query", httpx.Handler.bind(self.impl, queryTable));
+            try server.post("/tables/:tableName/repair/issues", httpx.Handler.bind(self.impl, listTableRepairIssues));
+            try server.post("/tables/:tableName/repair/jobs", httpx.Handler.bind(self.impl, startTableRepairJob));
+            try server.get("/tables/:tableName/repair/jobs/:jobId", httpx.Handler.bind(self.impl, getTableRepairJob));
+            try server.post("/tables/:tableName/repair/jobs/:jobId/advance", httpx.Handler.bind(self.impl, advanceTableRepairJob));
+            try server.post("/tables/:tableName/repair/jobs/:jobId/cancel", httpx.Handler.bind(self.impl, cancelTableRepairJob));
+            try server.post("/tables/:tableName/repair/run", httpx.Handler.bind(self.impl, runTableRepair));
+            try server.post("/tables/:tableName/restore", httpx.Handler.bind(self.impl, restoreTable));
+            try server.put("/tables/:tableName/schema", httpx.Handler.bind(self.impl, updateSchema));
+            try server.get("/transactions", httpx.Handler.bind(self.impl, listTransactionSessions));
+            try server.post("/transactions/begin", httpx.Handler.bind(self.impl, beginTransaction));
+            try server.post("/transactions/cleanup", httpx.Handler.bind(self.impl, cleanupTransactionSessions));
+            try server.post("/transactions/commit", httpx.Handler.bind(self.impl, commitTransaction));
+            try server.get("/transactions/:transaction_id", httpx.Handler.bind(self.impl, getTransactionSession));
+            try server.post("/transactions/:transaction_id/abort", httpx.Handler.bind(self.impl, abortTransactionSession));
+            try server.post("/transactions/:transaction_id/commit", httpx.Handler.bind(self.impl, commitTransactionSession));
+            try server.post("/transactions/:transaction_id/delete", httpx.Handler.bind(self.impl, stageTransactionDelete));
+            try server.post("/transactions/:transaction_id/read", httpx.Handler.bind(self.impl, stageTransactionRead));
+            try server.post("/transactions/:transaction_id/savepoints", httpx.Handler.bind(self.impl, createTransactionSavepoint));
+            try server.post("/transactions/:transaction_id/savepoints/:savepoint_id/rollback", httpx.Handler.bind(self.impl, rollbackTransactionSavepoint));
+            try server.post("/transactions/:transaction_id/stage", httpx.Handler.bind(self.impl, stageTransactionSession));
+            try server.post("/transactions/:transaction_id/write", httpx.Handler.bind(self.impl, stageTransactionWrite));
         }
 
         /// Build a search query from natural language
         /// POST /agents/query-builder
-        fn queryBuilderAgent(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn queryBuilderAgent(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.queryBuilderAgent(ctx);
         }
 
         /// Retrieval Agent - Agentic document retrieval with tool calling
         /// POST /agents/retrieval
-        fn retrievalAgent(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn retrievalAgent(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.retrievalAgent(ctx);
         }
 
         /// Backup all tables or selected tables
         /// POST /backup
-        fn backup(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn backup(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.backup(ctx);
         }
 
         /// List available backups
         /// GET /backups
-        fn listBackups(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listBackups(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const query_params = ListBackupsParams{
                 .location = (try ctx.queryDecoded("location")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: location" }),
                 .connection = (try ctx.queryDecoded("connection")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: connection" }),
@@ -796,22 +793,19 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Cross-table batch operations
         /// POST /batch
-        fn multiBatchWrite(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn multiBatchWrite(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.multiBatchWrite(ctx);
         }
 
         /// Get cluster topology
         /// GET /cluster
-        fn getCluster(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getCluster(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.getCluster(ctx);
         }
 
         /// List configured external connections
         /// GET /connections
-        fn listConnections(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listConnections(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const query_params = ListConnectionsParams{
                 .types = try ctx.queryDecoded("types"),
                 .include = try ctx.queryDecoded("include"),
@@ -822,8 +816,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Invoke an Antfly-compatible inference connection
         /// POST /connections/{connection_id}/inference/{operation}
-        fn invokeInferenceConnection(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn invokeInferenceConnection(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const connection_id = ctx.param("connection_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: connection_id" });
             const operation = ctx.param("operation") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: operation" });
             return impl.invokeInferenceConnection(ctx, connection_id, operation);
@@ -831,29 +824,25 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Standalone evaluation endpoint
         /// POST /eval
-        fn evaluate(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn evaluate(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.evaluate(ctx);
         }
 
         /// Perform a global query
         /// POST /query
-        fn globalQuery(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn globalQuery(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.globalQuery(ctx);
         }
 
         /// Restore multiple tables from a backup
         /// POST /restore
-        fn restore(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn restore(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.restore(ctx);
         }
 
         /// List durable restore jobs
         /// GET /restore/jobs
-        fn listRestoreJobs(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listRestoreJobs(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const query_params = ListRestoreJobsParams{
                 .limit = try ctx.queryDecoded("limit"),
                 .cursor = try ctx.queryDecoded("cursor"),
@@ -865,54 +854,47 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Get durable restore job status
         /// GET /restore/jobs/{job_id}
-        fn getRestoreJob(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getRestoreJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const job_id = ctx.param("job_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: job_id" });
             return impl.getRestoreJob(ctx, job_id);
         }
 
         /// Request cooperative restore cancellation
         /// DELETE /restore/jobs/{job_id}
-        fn cancelRestoreJob(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn cancelRestoreJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const job_id = ctx.param("job_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: job_id" });
             return impl.cancelRestoreJob(ctx, job_id);
         }
 
         /// List secrets status
         /// GET /secrets
-        fn listSecrets(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listSecrets(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.listSecrets(ctx);
         }
 
         /// Store a secret
         /// PUT /secrets/{key}
-        fn putSecret(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn putSecret(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             return impl.putSecret(ctx, key);
         }
 
         /// Delete a secret
         /// DELETE /secrets/{key}
-        fn deleteSecret(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn deleteSecret(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             return impl.deleteSecret(ctx, key);
         }
 
         /// Get cluster status
         /// GET /status
-        fn getStatus(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.getStatus(ctx);
         }
 
         /// List all tables
         /// GET /tables
-        fn listTables(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listTables(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const query_params = ListTablesParams{
                 .prefix = try ctx.queryDecoded("prefix"),
                 .pattern = try ctx.queryDecoded("pattern"),
@@ -922,40 +904,35 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Get table details
         /// GET /tables/{tableName}
-        fn getTable(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getTable(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.getTable(ctx, table_name);
         }
 
         /// Create a new table
         /// POST /tables/{tableName}
-        fn createTable(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn createTable(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.createTable(ctx, table_name);
         }
 
         /// Drop a table
         /// DELETE /tables/{tableName}
-        fn dropTable(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn dropTable(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.dropTable(ctx, table_name);
         }
 
         /// List table artifact enrichments
         /// GET /tables/{tableName}/artifacts
-        fn listArtifactEnrichments(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listArtifactEnrichments(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.listArtifactEnrichments(ctx, table_name);
         }
 
         /// Register or replace an artifact enrichment
         /// PUT /tables/{tableName}/artifacts/{artifactName}/enrichment
-        fn putArtifactEnrichment(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn putArtifactEnrichment(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
             return impl.putArtifactEnrichment(ctx, table_name, artifact_name);
@@ -963,8 +940,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Delete an artifact enrichment
         /// DELETE /tables/{tableName}/artifacts/{artifactName}/enrichment
-        fn deleteArtifactEnrichment(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn deleteArtifactEnrichment(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
             return impl.deleteArtifactEnrichment(ctx, table_name, artifact_name);
@@ -972,8 +948,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Reprocess a derived asset across a table range
         /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess
-        fn reprocessDocumentArtifactRange(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn reprocessDocumentArtifactRange(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
             return impl.reprocessDocumentArtifactRange(ctx, table_name, artifact_name);
@@ -981,8 +956,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Create a derived document artifact reprocess job
         /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs
-        fn startDocumentArtifactReprocessJob(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn startDocumentArtifactReprocessJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
             return impl.startDocumentArtifactReprocessJob(ctx, table_name, artifact_name);
@@ -990,8 +964,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Get derived document artifact reprocess job status
         /// GET /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}
-        fn getDocumentArtifactReprocessJob(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getDocumentArtifactReprocessJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
             const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
@@ -1000,8 +973,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Advance a derived document artifact reprocess job
         /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance
-        fn advanceDocumentArtifactReprocessJob(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn advanceDocumentArtifactReprocessJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
             const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
@@ -1010,8 +982,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Cancel a derived document artifact reprocess job
         /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel
-        fn cancelDocumentArtifactReprocessJob(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn cancelDocumentArtifactReprocessJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
             const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
@@ -1020,32 +991,28 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Backup a table
         /// POST /tables/{tableName}/backup
-        fn backupTable(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn backupTable(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.backupTable(ctx, table_name);
         }
 
         /// Perform batch inserts and deletes on a table
         /// POST /tables/{tableName}/batch
-        fn batchWrite(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn batchWrite(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.batchWrite(ctx, table_name);
         }
 
         /// Scan documents in a table within a key range
         /// POST /tables/{tableName}/documents
-        fn scanKeys(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn scanKeys(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.scanKeys(ctx, table_name);
         }
 
         /// Retrieve a document by key
         /// GET /tables/{tableName}/documents/{key}
-        fn lookupKey(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn lookupKey(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             const query_params = LookupKeyParams{
@@ -1057,8 +1024,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// List derived document artifact manifests
         /// GET /tables/{tableName}/documents/{key}/artifacts
-        fn listDocumentArtifactManifests(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listDocumentArtifactManifests(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             const query_params = ListDocumentArtifactManifestsParams{
@@ -1069,8 +1035,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Inspect a derived document artifact manifest
         /// GET /tables/{tableName}/documents/{key}/artifacts/{artifactName}
-        fn getDocumentArtifactManifest(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getDocumentArtifactManifest(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
@@ -1082,8 +1047,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Reprocess a derived asset
         /// POST /tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess
-        fn reprocessDocumentArtifact(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn reprocessDocumentArtifact(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
@@ -1092,16 +1056,14 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// List all indexes for a table
         /// GET /tables/{tableName}/indexes
-        fn listIndexes(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listIndexes(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.listIndexes(ctx, table_name);
         }
 
         /// Get index details
         /// GET /tables/{tableName}/indexes/{indexName}
-        fn getIndex(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getIndex(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
             return impl.getIndex(ctx, table_name, index_name);
@@ -1109,8 +1071,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Add an index to a table
         /// POST /tables/{tableName}/indexes/{indexName}
-        fn createIndex(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn createIndex(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
             return impl.createIndex(ctx, table_name, index_name);
@@ -1118,8 +1079,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Drop an index from a table
         /// DELETE /tables/{tableName}/indexes/{indexName}
-        fn dropIndex(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn dropIndex(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
             return impl.dropIndex(ctx, table_name, index_name);
@@ -1127,40 +1087,35 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
         /// POST /tables/{tableName}/merge
-        fn linearMerge(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn linearMerge(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.linearMerge(ctx, table_name);
         }
 
         /// Query a specific table
         /// POST /tables/{tableName}/query
-        fn queryTable(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn queryTable(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.queryTable(ctx, table_name);
         }
 
         /// List table repair issues
         /// POST /tables/{tableName}/repair/issues
-        fn listTableRepairIssues(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listTableRepairIssues(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.listTableRepairIssues(ctx, table_name);
         }
 
         /// Start a durable table repair job
         /// POST /tables/{tableName}/repair/jobs
-        fn startTableRepairJob(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn startTableRepairJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.startTableRepairJob(ctx, table_name);
         }
 
         /// Get a table repair job
         /// GET /tables/{tableName}/repair/jobs/{jobId}
-        fn getTableRepairJob(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getTableRepairJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
             return impl.getTableRepairJob(ctx, table_name, job_id);
@@ -1168,8 +1123,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Advance a table repair job
         /// POST /tables/{tableName}/repair/jobs/{jobId}/advance
-        fn advanceTableRepairJob(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn advanceTableRepairJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
             return impl.advanceTableRepairJob(ctx, table_name, job_id);
@@ -1177,8 +1131,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Cancel a table repair job
         /// POST /tables/{tableName}/repair/jobs/{jobId}/cancel
-        fn cancelTableRepairJob(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn cancelTableRepairJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
             return impl.cancelTableRepairJob(ctx, table_name, job_id);
@@ -1186,46 +1139,40 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Run a bounded table repair pass
         /// POST /tables/{tableName}/repair/run
-        fn runTableRepair(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn runTableRepair(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.runTableRepair(ctx, table_name);
         }
 
         /// Restore a table from backup
         /// POST /tables/{tableName}/restore
-        fn restoreTable(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn restoreTable(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.restoreTable(ctx, table_name);
         }
 
         /// Update a table's schema
         /// PUT /tables/{tableName}/schema
-        fn updateSchema(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn updateSchema(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.updateSchema(ctx, table_name);
         }
 
         /// List transaction sessions
         /// GET /transactions
-        fn listTransactionSessions(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listTransactionSessions(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.listTransactionSessions(ctx);
         }
 
         /// Begin a transaction session
         /// POST /transactions/begin
-        fn beginTransaction(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn beginTransaction(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.beginTransaction(ctx);
         }
 
         /// Clean up expired transaction sessions
         /// POST /transactions/cleanup
-        fn cleanupTransactionSessions(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn cleanupTransactionSessions(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const query_params = CleanupTransactionSessionsParams{
                 .cutoff_ns = try ctx.queryDecoded("cutoff_ns"),
             };
@@ -1234,63 +1181,55 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Commit an OCC transaction
         /// POST /transactions/commit
-        fn commitTransaction(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn commitTransaction(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.commitTransaction(ctx);
         }
 
         /// Get transaction session details
         /// GET /transactions/{transaction_id}
-        fn getTransactionSession(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getTransactionSession(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
             return impl.getTransactionSession(ctx, transaction_id);
         }
 
         /// Abort a transaction session
         /// POST /transactions/{transaction_id}/abort
-        fn abortTransactionSession(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn abortTransactionSession(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
             return impl.abortTransactionSession(ctx, transaction_id);
         }
 
         /// Commit a transaction session
         /// POST /transactions/{transaction_id}/commit
-        fn commitTransactionSession(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn commitTransactionSession(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
             return impl.commitTransactionSession(ctx, transaction_id);
         }
 
         /// Stage a transaction delete
         /// POST /transactions/{transaction_id}/delete
-        fn stageTransactionDelete(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn stageTransactionDelete(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
             return impl.stageTransactionDelete(ctx, transaction_id);
         }
 
         /// Stage a transaction read version
         /// POST /transactions/{transaction_id}/read
-        fn stageTransactionRead(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn stageTransactionRead(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
             return impl.stageTransactionRead(ctx, transaction_id);
         }
 
         /// Create a transaction savepoint
         /// POST /transactions/{transaction_id}/savepoints
-        fn createTransactionSavepoint(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn createTransactionSavepoint(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
             return impl.createTransactionSavepoint(ctx, transaction_id);
         }
 
         /// Roll back a transaction session to a savepoint
         /// POST /transactions/{transaction_id}/savepoints/{savepoint_id}/rollback
-        fn rollbackTransactionSavepoint(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn rollbackTransactionSavepoint(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
             const savepoint_id = ctx.param("savepoint_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: savepoint_id" });
             return impl.rollbackTransactionSavepoint(ctx, transaction_id, savepoint_id);
@@ -1298,16 +1237,14 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Stage a transaction commit request
         /// POST /transactions/{transaction_id}/stage
-        fn stageTransactionSession(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn stageTransactionSession(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
             return impl.stageTransactionSession(ctx, transaction_id);
         }
 
         /// Stage a transaction write
         /// POST /transactions/{transaction_id}/write
-        fn stageTransactionWrite(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn stageTransactionWrite(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
             return impl.stageTransactionWrite(ctx, transaction_id);
         }

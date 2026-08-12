@@ -194,37 +194,41 @@ pub const RemoveRowFilterPathParams = struct {
 };
 
 /// Route metadata for all operations.
+pub const RequestBodyMode = enum { none, buffered };
+
 pub const Route = struct {
     method: []const u8,
     path: []const u8,
     operation_id: []const u8,
+    request_body: RequestBodyMode,
+    streaming_response: bool,
 };
 
 pub const routes = [_]Route{
-    .{ .method = "GET", .path = "/auth/v1/me", .operation_id = "getCurrentUser" },
-    .{ .method = "GET", .path = "/auth/v1/subjects", .operation_id = "listAuthSubjects" },
-    .{ .method = "GET", .path = "/auth/v1/subjects/{subject}/row-filters", .operation_id = "listSubjectRowFilters" },
-    .{ .method = "GET", .path = "/auth/v1/subjects/{subject}/row-filters/{table}", .operation_id = "getSubjectRowFilter" },
-    .{ .method = "PUT", .path = "/auth/v1/subjects/{subject}/row-filters/{table}", .operation_id = "setSubjectRowFilter" },
-    .{ .method = "DELETE", .path = "/auth/v1/subjects/{subject}/row-filters/{table}", .operation_id = "removeSubjectRowFilter" },
-    .{ .method = "GET", .path = "/auth/v1/users", .operation_id = "listUsers" },
-    .{ .method = "GET", .path = "/auth/v1/users/{userName}", .operation_id = "getUserByName" },
-    .{ .method = "POST", .path = "/auth/v1/users/{userName}", .operation_id = "createUser" },
-    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}", .operation_id = "deleteUser" },
-    .{ .method = "GET", .path = "/auth/v1/users/{userName}/api-keys", .operation_id = "listApiKeys" },
-    .{ .method = "POST", .path = "/auth/v1/users/{userName}/api-keys", .operation_id = "createApiKey" },
-    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/api-keys/{keyId}", .operation_id = "deleteApiKey" },
-    .{ .method = "PUT", .path = "/auth/v1/users/{userName}/password", .operation_id = "updateUserPassword" },
-    .{ .method = "GET", .path = "/auth/v1/users/{userName}/permissions", .operation_id = "getUserPermissions" },
-    .{ .method = "POST", .path = "/auth/v1/users/{userName}/permissions", .operation_id = "addPermissionToUser" },
-    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/permissions", .operation_id = "removePermissionFromUser" },
-    .{ .method = "GET", .path = "/auth/v1/users/{userName}/roles", .operation_id = "listUserRoles" },
-    .{ .method = "POST", .path = "/auth/v1/users/{userName}/roles", .operation_id = "addRoleToUser" },
-    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/roles", .operation_id = "removeRoleFromUser" },
-    .{ .method = "GET", .path = "/auth/v1/users/{userName}/row-filters", .operation_id = "listRowFilters" },
-    .{ .method = "GET", .path = "/auth/v1/users/{userName}/row-filters/{table}", .operation_id = "getRowFilter" },
-    .{ .method = "PUT", .path = "/auth/v1/users/{userName}/row-filters/{table}", .operation_id = "setRowFilter" },
-    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/row-filters/{table}", .operation_id = "removeRowFilter" },
+    .{ .method = "GET", .path = "/auth/v1/me", .operation_id = "getCurrentUser", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/auth/v1/subjects", .operation_id = "listAuthSubjects", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/auth/v1/subjects/{subject}/row-filters", .operation_id = "listSubjectRowFilters", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/auth/v1/subjects/{subject}/row-filters/{table}", .operation_id = "getSubjectRowFilter", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/auth/v1/subjects/{subject}/row-filters/{table}", .operation_id = "setSubjectRowFilter", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/auth/v1/subjects/{subject}/row-filters/{table}", .operation_id = "removeSubjectRowFilter", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/auth/v1/users", .operation_id = "listUsers", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/auth/v1/users/{userName}", .operation_id = "getUserByName", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/auth/v1/users/{userName}", .operation_id = "createUser", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}", .operation_id = "deleteUser", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/auth/v1/users/{userName}/api-keys", .operation_id = "listApiKeys", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/auth/v1/users/{userName}/api-keys", .operation_id = "createApiKey", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/api-keys/{keyId}", .operation_id = "deleteApiKey", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/auth/v1/users/{userName}/password", .operation_id = "updateUserPassword", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/auth/v1/users/{userName}/permissions", .operation_id = "getUserPermissions", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/auth/v1/users/{userName}/permissions", .operation_id = "addPermissionToUser", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/permissions", .operation_id = "removePermissionFromUser", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/auth/v1/users/{userName}/roles", .operation_id = "listUserRoles", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/auth/v1/users/{userName}/roles", .operation_id = "addRoleToUser", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/roles", .operation_id = "removeRoleFromUser", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/auth/v1/users/{userName}/row-filters", .operation_id = "listRowFilters", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/auth/v1/users/{userName}/row-filters/{table}", .operation_id = "getRowFilter", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/auth/v1/users/{userName}/row-filters/{table}", .operation_id = "setRowFilter", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/auth/v1/users/{userName}/row-filters/{table}", .operation_id = "removeRowFilter", .request_body = .none, .streaming_response = false },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -265,69 +269,62 @@ pub fn ServerRouter(comptime Impl: type) type {
     }
 
     return struct {
-        var active_impl: ?*Impl = null;
-
         impl: *Impl,
 
         pub fn init(impl: *Impl) @This() {
             return .{ .impl = impl };
         }
 
-        /// Register all routes on the server and activate the impl.
+        /// Register all routes on the server with explicit instance context.
         pub fn register(self: *const @This(), server: anytype) !void {
-            active_impl = self.impl;
-            try server.get("/auth/v1/me", getCurrentUser);
-            try server.get("/auth/v1/subjects", listAuthSubjects);
-            try server.get("/auth/v1/subjects/:subject/row-filters", listSubjectRowFilters);
-            try server.get("/auth/v1/subjects/:subject/row-filters/:table", getSubjectRowFilter);
-            try server.put("/auth/v1/subjects/:subject/row-filters/:table", setSubjectRowFilter);
-            try server.delete("/auth/v1/subjects/:subject/row-filters/:table", removeSubjectRowFilter);
-            try server.get("/auth/v1/users", listUsers);
-            try server.get("/auth/v1/users/:userName", getUserByName);
-            try server.post("/auth/v1/users/:userName", createUser);
-            try server.delete("/auth/v1/users/:userName", deleteUser);
-            try server.get("/auth/v1/users/:userName/api-keys", listApiKeys);
-            try server.post("/auth/v1/users/:userName/api-keys", createApiKey);
-            try server.delete("/auth/v1/users/:userName/api-keys/:keyId", deleteApiKey);
-            try server.put("/auth/v1/users/:userName/password", updateUserPassword);
-            try server.get("/auth/v1/users/:userName/permissions", getUserPermissions);
-            try server.post("/auth/v1/users/:userName/permissions", addPermissionToUser);
-            try server.delete("/auth/v1/users/:userName/permissions", removePermissionFromUser);
-            try server.get("/auth/v1/users/:userName/roles", listUserRoles);
-            try server.post("/auth/v1/users/:userName/roles", addRoleToUser);
-            try server.delete("/auth/v1/users/:userName/roles", removeRoleFromUser);
-            try server.get("/auth/v1/users/:userName/row-filters", listRowFilters);
-            try server.get("/auth/v1/users/:userName/row-filters/:table", getRowFilter);
-            try server.put("/auth/v1/users/:userName/row-filters/:table", setRowFilter);
-            try server.delete("/auth/v1/users/:userName/row-filters/:table", removeRowFilter);
+            try server.get("/auth/v1/me", httpx.Handler.bind(self.impl, getCurrentUser));
+            try server.get("/auth/v1/subjects", httpx.Handler.bind(self.impl, listAuthSubjects));
+            try server.get("/auth/v1/subjects/:subject/row-filters", httpx.Handler.bind(self.impl, listSubjectRowFilters));
+            try server.get("/auth/v1/subjects/:subject/row-filters/:table", httpx.Handler.bind(self.impl, getSubjectRowFilter));
+            try server.put("/auth/v1/subjects/:subject/row-filters/:table", httpx.Handler.bind(self.impl, setSubjectRowFilter));
+            try server.delete("/auth/v1/subjects/:subject/row-filters/:table", httpx.Handler.bind(self.impl, removeSubjectRowFilter));
+            try server.get("/auth/v1/users", httpx.Handler.bind(self.impl, listUsers));
+            try server.get("/auth/v1/users/:userName", httpx.Handler.bind(self.impl, getUserByName));
+            try server.post("/auth/v1/users/:userName", httpx.Handler.bind(self.impl, createUser));
+            try server.delete("/auth/v1/users/:userName", httpx.Handler.bind(self.impl, deleteUser));
+            try server.get("/auth/v1/users/:userName/api-keys", httpx.Handler.bind(self.impl, listApiKeys));
+            try server.post("/auth/v1/users/:userName/api-keys", httpx.Handler.bind(self.impl, createApiKey));
+            try server.delete("/auth/v1/users/:userName/api-keys/:keyId", httpx.Handler.bind(self.impl, deleteApiKey));
+            try server.put("/auth/v1/users/:userName/password", httpx.Handler.bind(self.impl, updateUserPassword));
+            try server.get("/auth/v1/users/:userName/permissions", httpx.Handler.bind(self.impl, getUserPermissions));
+            try server.post("/auth/v1/users/:userName/permissions", httpx.Handler.bind(self.impl, addPermissionToUser));
+            try server.delete("/auth/v1/users/:userName/permissions", httpx.Handler.bind(self.impl, removePermissionFromUser));
+            try server.get("/auth/v1/users/:userName/roles", httpx.Handler.bind(self.impl, listUserRoles));
+            try server.post("/auth/v1/users/:userName/roles", httpx.Handler.bind(self.impl, addRoleToUser));
+            try server.delete("/auth/v1/users/:userName/roles", httpx.Handler.bind(self.impl, removeRoleFromUser));
+            try server.get("/auth/v1/users/:userName/row-filters", httpx.Handler.bind(self.impl, listRowFilters));
+            try server.get("/auth/v1/users/:userName/row-filters/:table", httpx.Handler.bind(self.impl, getRowFilter));
+            try server.put("/auth/v1/users/:userName/row-filters/:table", httpx.Handler.bind(self.impl, setRowFilter));
+            try server.delete("/auth/v1/users/:userName/row-filters/:table", httpx.Handler.bind(self.impl, removeRowFilter));
         }
 
         /// Get current authenticated user
         /// GET /auth/v1/me
-        fn getCurrentUser(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getCurrentUser(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.getCurrentUser(ctx);
         }
 
         /// List auth subjects
         /// GET /auth/v1/subjects
-        fn listAuthSubjects(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listAuthSubjects(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.listAuthSubjects(ctx);
         }
 
         /// List row filters for an auth subject
         /// GET /auth/v1/subjects/{subject}/row-filters
-        fn listSubjectRowFilters(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listSubjectRowFilters(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const subject = ctx.param("subject") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: subject" });
             return impl.listSubjectRowFilters(ctx, subject);
         }
 
         /// Get row filter for an auth subject on a table
         /// GET /auth/v1/subjects/{subject}/row-filters/{table}
-        fn getSubjectRowFilter(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getSubjectRowFilter(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const subject = ctx.param("subject") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: subject" });
             const table = ctx.param("table") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table" });
             return impl.getSubjectRowFilter(ctx, subject, table);
@@ -335,8 +332,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Set row filter for an auth subject on a table
         /// PUT /auth/v1/subjects/{subject}/row-filters/{table}
-        fn setSubjectRowFilter(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn setSubjectRowFilter(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const subject = ctx.param("subject") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: subject" });
             const table = ctx.param("table") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table" });
             return impl.setSubjectRowFilter(ctx, subject, table);
@@ -344,8 +340,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Remove row filter for an auth subject on a table
         /// DELETE /auth/v1/subjects/{subject}/row-filters/{table}
-        fn removeSubjectRowFilter(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn removeSubjectRowFilter(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const subject = ctx.param("subject") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: subject" });
             const table = ctx.param("table") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table" });
             return impl.removeSubjectRowFilter(ctx, subject, table);
@@ -353,55 +348,48 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// List all users
         /// GET /auth/v1/users
-        fn listUsers(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listUsers(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.listUsers(ctx);
         }
 
         /// Get user details
         /// GET /auth/v1/users/{userName}
-        fn getUserByName(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getUserByName(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             return impl.getUserByName(ctx, user_name);
         }
 
         /// Create a new user
         /// POST /auth/v1/users/{userName}
-        fn createUser(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn createUser(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             return impl.createUser(ctx, user_name);
         }
 
         /// Delete a user
         /// DELETE /auth/v1/users/{userName}
-        fn deleteUser(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn deleteUser(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             return impl.deleteUser(ctx, user_name);
         }
 
         /// List API keys for a user
         /// GET /auth/v1/users/{userName}/api-keys
-        fn listApiKeys(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listApiKeys(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             return impl.listApiKeys(ctx, user_name);
         }
 
         /// Create a new API key
         /// POST /auth/v1/users/{userName}/api-keys
-        fn createApiKey(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn createApiKey(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             return impl.createApiKey(ctx, user_name);
         }
 
         /// Delete an API key
         /// DELETE /auth/v1/users/{userName}/api-keys/{keyId}
-        fn deleteApiKey(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn deleteApiKey(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             const key_id = ctx.param("keyId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: keyId" });
             return impl.deleteApiKey(ctx, user_name, key_id);
@@ -409,32 +397,28 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Update user password
         /// PUT /auth/v1/users/{userName}/password
-        fn updateUserPassword(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn updateUserPassword(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             return impl.updateUserPassword(ctx, user_name);
         }
 
         /// Get user permissions
         /// GET /auth/v1/users/{userName}/permissions
-        fn getUserPermissions(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getUserPermissions(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             return impl.getUserPermissions(ctx, user_name);
         }
 
         /// Add permission to user
         /// POST /auth/v1/users/{userName}/permissions
-        fn addPermissionToUser(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn addPermissionToUser(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             return impl.addPermissionToUser(ctx, user_name);
         }
 
         /// Remove permission from user
         /// DELETE /auth/v1/users/{userName}/permissions
-        fn removePermissionFromUser(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn removePermissionFromUser(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             const query_params = RemovePermissionFromUserParams{
                 .resource = (try ctx.queryDecoded("resource")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: resource" }),
@@ -445,24 +429,21 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// List user roles
         /// GET /auth/v1/users/{userName}/roles
-        fn listUserRoles(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listUserRoles(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             return impl.listUserRoles(ctx, user_name);
         }
 
         /// Add role to user
         /// POST /auth/v1/users/{userName}/roles
-        fn addRoleToUser(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn addRoleToUser(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             return impl.addRoleToUser(ctx, user_name);
         }
 
         /// Remove role from user
         /// DELETE /auth/v1/users/{userName}/roles
-        fn removeRoleFromUser(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn removeRoleFromUser(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             const query_params = RemoveRoleFromUserParams{
                 .role = (try ctx.queryDecoded("role")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: role" }),
@@ -472,16 +453,14 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// List row filters for a user
         /// GET /auth/v1/users/{userName}/row-filters
-        fn listRowFilters(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listRowFilters(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             return impl.listRowFilters(ctx, user_name);
         }
 
         /// Get row filter for a user on a table
         /// GET /auth/v1/users/{userName}/row-filters/{table}
-        fn getRowFilter(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn getRowFilter(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             const table = ctx.param("table") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table" });
             return impl.getRowFilter(ctx, user_name, table);
@@ -489,8 +468,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Set row filter for a user on a table
         /// PUT /auth/v1/users/{userName}/row-filters/{table}
-        fn setRowFilter(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn setRowFilter(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             const table = ctx.param("table") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table" });
             return impl.setRowFilter(ctx, user_name, table);
@@ -498,8 +476,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Remove row filter for a user on a table
         /// DELETE /auth/v1/users/{userName}/row-filters/{table}
-        fn removeRowFilter(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn removeRowFilter(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             const table = ctx.param("table") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table" });
             return impl.removeRowFilter(ctx, user_name, table);

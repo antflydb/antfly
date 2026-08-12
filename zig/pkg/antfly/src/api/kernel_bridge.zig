@@ -39,36 +39,18 @@ const BoundaryAllocator = struct {
     abi_allocator: abi.memory_abi.Allocator,
 };
 
-extern fn antfly_api_kernel_create(context: *const CreateContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_destroy(handle: *anyopaque) callconv(.c) void;
-extern fn antfly_api_kernel_request_stats(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_set_provider(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_set_ha_executor(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_executor(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_streaming_executor(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_attach_runtime_restore_store(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_attach_replicated_restore_store(
-    abi_version: u32,
-    handle: *anyopaque,
-    persistence: *const restore_jobs.ReplicatedPersistence,
-) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_resume_restore_jobs(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_poll_restore_jobs(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_prepare_restore_leadership(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_schedule_session_maintenance(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_storage_maintenance_active(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_authorize_inference(context: *const abi.AuthorizeInferenceContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_handle(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_handle_internal(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_handler_create(context: *const HandlerCreateContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_handler_init(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_handler_stats(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_handler_register_routes(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_handler_destroy(handle: *anyopaque) callconv(.c) void;
+extern fn antfly_api_kernel_get_function_table() callconv(.c) *const abi.FunctionTable;
 
 fn callError(status: abi.Status) !void {
     if (status.isOk()) return;
     return abi.errorFromStatus(status);
+}
+
+fn validateFunctionTable() !*const abi.FunctionTable {
+    const table = antfly_api_kernel_get_function_table();
+    if (!abi.validFunctionTable(table, abi.Capability.core))
+        return error.UnsupportedVersion;
+    return table;
 }
 
 pub const ApiHttpServer = if (direct_codegen) server_mod.ApiHttpServer else OpaqueApiHttpServer;
@@ -76,6 +58,7 @@ pub const HttpxHandler = if (direct_codegen) handler_mod.AntflyApiHandler else O
 
 const OpaqueApiHttpServer = struct {
     opaque_handle: *anyopaque,
+    functions: *const abi.FunctionTable,
     boundary_allocator: *BoundaryAllocator,
     alloc: std.mem.Allocator,
     cfg: server_mod.ApiHttpServerConfig,
@@ -106,68 +89,68 @@ const OpaqueApiHttpServer = struct {
     pub fn deinit(self: *OpaqueApiHttpServer) void {
         const boundary_allocator = self.boundary_allocator;
         const allocator = boundary_allocator.allocator;
-        antfly_api_kernel_destroy(self.opaque_handle);
+        self.functions.destroy(self.opaque_handle);
         allocator.destroy(boundary_allocator);
         self.* = undefined;
     }
 
     pub fn requestStats(self: *OpaqueApiHttpServer) RequestStats {
         var out: RequestStats = undefined;
-        callInfallible(void, RequestStats, antfly_api_kernel_request_stats, self.opaque_handle, null, &out);
+        callInfallible(void, RequestStats, self.functions.request_stats, self.opaque_handle, null, &out);
         return out;
     }
 
     pub fn setAntflyProvider(self: *OpaqueApiHttpServer, provider: ?managed_embedder.AntflyProvider) void {
         var input = provider;
-        callInfallible(?managed_embedder.AntflyProvider, void, antfly_api_kernel_set_provider, self.opaque_handle, &input, null);
+        callInfallible(?managed_embedder.AntflyProvider, void, self.functions.set_provider, self.opaque_handle, &input, null);
     }
 
     pub fn setHAInternalExecutor(self: *OpaqueApiHttpServer, executor_value: ?http_common.RequestExecutor) void {
         var input = executor_value;
-        callInfallible(?http_common.RequestExecutor, void, antfly_api_kernel_set_ha_executor, self.opaque_handle, &input, null);
+        callInfallible(?http_common.RequestExecutor, void, self.functions.set_ha_executor, self.opaque_handle, &input, null);
     }
 
     pub fn executor(self: *OpaqueApiHttpServer) http_common.RequestExecutor {
         var out: http_common.RequestExecutor = undefined;
-        callInfallible(void, http_common.RequestExecutor, antfly_api_kernel_executor, self.opaque_handle, null, &out);
+        callInfallible(void, http_common.RequestExecutor, self.functions.executor, self.opaque_handle, null, &out);
         return out;
     }
 
     pub fn streamingExecutor(self: *OpaqueApiHttpServer) http_common.StreamingRequestExecutor {
         var out: http_common.StreamingRequestExecutor = undefined;
-        callInfallible(void, http_common.StreamingRequestExecutor, antfly_api_kernel_streaming_executor, self.opaque_handle, null, &out);
+        callInfallible(void, http_common.StreamingRequestExecutor, self.functions.streaming_executor, self.opaque_handle, null, &out);
         return out;
     }
 
     pub fn attachRestoreJobRuntimeStore(self: *OpaqueApiHttpServer, store: *backend_erased.Store) !void {
-        try callFallible(backend_erased.Store, void, antfly_api_kernel_attach_runtime_restore_store, self.opaque_handle, store, null);
+        try callFallible(backend_erased.Store, void, self.functions.attach_runtime_restore_store, self.opaque_handle, store, null);
     }
 
     pub fn attachReplicatedRestoreJobStore(self: *OpaqueApiHttpServer, persistence: restore_jobs.ReplicatedPersistence) !void {
         var input = persistence;
-        try callError(antfly_api_kernel_attach_replicated_restore_store(abi.abi_version, self.opaque_handle, &input));
+        try callError(self.functions.attach_replicated_restore_store(abi.abi_version, self.opaque_handle, &input));
     }
 
     pub fn resumeRestoreJobsOnce(self: *OpaqueApiHttpServer) !void {
-        try callFallible(void, void, antfly_api_kernel_resume_restore_jobs, self.opaque_handle, null, null);
+        try callFallible(void, void, self.functions.resume_restore_jobs, self.opaque_handle, null, null);
     }
 
     pub fn pollRestoreJobsOnce(self: *OpaqueApiHttpServer) !void {
-        try callFallible(void, void, antfly_api_kernel_poll_restore_jobs, self.opaque_handle, null, null);
+        try callFallible(void, void, self.functions.poll_restore_jobs, self.opaque_handle, null, null);
     }
 
     pub fn prepareRestoreLeadership(self: *OpaqueApiHttpServer, term: u64) !void {
         var input = term;
-        try callFallible(u64, void, antfly_api_kernel_prepare_restore_leadership, self.opaque_handle, &input, null);
+        try callFallible(u64, void, self.functions.prepare_restore_leadership, self.opaque_handle, &input, null);
     }
 
     pub fn scheduleSessionMaintenance(self: *OpaqueApiHttpServer) !void {
-        try callFallible(void, void, antfly_api_kernel_schedule_session_maintenance, self.opaque_handle, null, null);
+        try callFallible(void, void, self.functions.schedule_session_maintenance, self.opaque_handle, null, null);
     }
 
     pub fn storageMaintenanceExclusiveActive(self: *const OpaqueApiHttpServer) bool {
         var out = false;
-        callInfallible(void, bool, antfly_api_kernel_storage_maintenance_active, self.opaque_handle, null, &out);
+        callInfallible(void, bool, self.functions.storage_maintenance_active, self.opaque_handle, null, &out);
         return out;
     }
 
@@ -177,7 +160,7 @@ const OpaqueApiHttpServer = struct {
         permission: abi.InferencePermission,
     ) !abi.AuthorizationDecision {
         var decision: abi.AuthorizationDecision = undefined;
-        try callError(antfly_api_kernel_authorize_inference(&.{
+        try callError(self.functions.authorize_inference(&.{
             .abi_version = abi.abi_version,
             .handle = self.opaque_handle,
             .authorization = abi.OptionalBytes.init(request.authorization),
@@ -191,14 +174,14 @@ const OpaqueApiHttpServer = struct {
     pub fn handle(self: *OpaqueApiHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
         var input = req;
         var out: http_common.HttpResponse = undefined;
-        try callFallible(http_common.HttpRequest, http_common.HttpResponse, antfly_api_kernel_handle, self.opaque_handle, &input, &out);
+        try callFallible(http_common.HttpRequest, http_common.HttpResponse, self.functions.handle, self.opaque_handle, &input, &out);
         return out;
     }
 
     pub fn handleInternalRoute(self: *OpaqueApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
         var input = req;
         var out: ?http_common.HttpResponse = null;
-        try callFallible(http_common.HttpRequest, ?http_common.HttpResponse, antfly_api_kernel_handle_internal, self.opaque_handle, &input, &out);
+        try callFallible(http_common.HttpRequest, ?http_common.HttpResponse, self.functions.handle_internal, self.opaque_handle, &input, &out);
         return out;
     }
 };
@@ -211,6 +194,7 @@ fn createOpaqueServer(
     write_source: ?table_writes.TableWriteSource,
     fallible: bool,
 ) !OpaqueApiHttpServer {
+    const functions = try validateFunctionTable();
     var cfg_copy = cfg;
     var source_copy = source;
     var reads_copy = read_source;
@@ -221,7 +205,7 @@ fn createOpaqueServer(
     errdefer owner_alloc.destroy(boundary_allocator);
     boundary_allocator.allocator = owner_alloc;
     boundary_allocator.abi_allocator = .fromStd(&boundary_allocator.allocator);
-    const status = antfly_api_kernel_create(&.{
+    const status = functions.create(&.{
         .abi_version = abi.abi_version,
         .owner_alloc = &boundary_allocator.abi_allocator,
         .cfg = &cfg_copy,
@@ -239,11 +223,12 @@ fn createOpaqueServer(
     try callError(status);
     const owned_handle = handle orelse return error.ApiKernelOperationFailed;
     const owned_request_alloc = request_alloc_abi orelse {
-        antfly_api_kernel_destroy(owned_handle);
+        functions.destroy(owned_handle);
         return error.ApiKernelOperationFailed;
     };
     return .{
         .opaque_handle = owned_handle,
+        .functions = functions,
         .boundary_allocator = boundary_allocator,
         .alloc = owned_request_alloc.asStd(),
         .cfg = cfg,
@@ -253,7 +238,7 @@ fn createOpaqueServer(
 fn callFallible(
     comptime Input: type,
     comptime Output: type,
-    comptime function: fn (*const CallContext) callconv(.c) abi.Status,
+    function: *const fn (*const CallContext) callconv(.c) abi.Status,
     handle: *anyopaque,
     input: ?*const Input,
     output: ?*Output,
@@ -271,7 +256,7 @@ fn callFallible(
 fn callInfallible(
     comptime Input: type,
     comptime Output: type,
-    comptime function: fn (*const CallContext) callconv(.c) abi.Status,
+    function: *const fn (*const CallContext) callconv(.c) abi.Status,
     handle: *anyopaque,
     input: ?*const Input,
     output: ?*Output,
@@ -283,38 +268,137 @@ pub const HandlerStats = abi.HandlerStats;
 
 const OpaqueHttpxHandler = struct {
     handle: *anyopaque,
+    functions: *const abi.FunctionTable,
+    alloc: ?std.mem.Allocator = null,
+    runtime_routes: std.ArrayListUnmanaged(*RuntimeRoute) = .empty,
 
     pub fn initRuntime(self: *OpaqueHttpxHandler, alloc: std.mem.Allocator) !void {
-        _ = alloc;
-        try callFallible(void, void, antfly_api_kernel_handler_init, self.handle, null, null);
+        try callFallible(void, void, self.functions.handler_init, self.handle, null, null);
+        self.alloc = alloc;
     }
 
     pub fn stats(self: *const OpaqueHttpxHandler) HandlerStats {
         var out: HandlerStats = undefined;
-        callInfallible(void, HandlerStats, antfly_api_kernel_handler_stats, self.handle, null, &out);
+        callInfallible(void, HandlerStats, self.functions.handler_stats, self.handle, null, &out);
         return out;
     }
 
     pub fn registerRoutes(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
-        try callFallible(httpx.Server, void, antfly_api_kernel_handler_register_routes, self.handle, server, null);
+        if (!abi.validFunctionTable(self.functions, abi.Capability.route_manifest)) return error.UnsupportedVersion;
+        if (self.runtime_routes.items.len != 0) return error.RoutesAlreadyRegistered;
+        const alloc = self.alloc orelse return error.ApiKernelNotInitialized;
+        var entries_ptr: ?[*]const abi.RouteManifestEntry = null;
+        var entries_len: usize = 0;
+        try callError(self.functions.handler_route_manifest(&.{
+            .abi_version = abi.abi_version,
+            .handler_handle = self.handle,
+            .out_entries = &entries_ptr,
+            .out_len = &entries_len,
+        }));
+        const entries = if (entries_ptr) |ptr| ptr[0..entries_len] else &.{};
+        for (entries) |entry| {
+            const route = try alloc.create(RuntimeRoute);
+            errdefer alloc.destroy(route);
+            route.* = .{ .functions = self.functions, .kernel_route_handle = entry.route_handle };
+            try self.runtime_routes.append(alloc, route);
+            errdefer _ = self.runtime_routes.pop();
+            try server.routeWithData(switch (entry.method) {
+                .get => .GET,
+                .post => .POST,
+                .put => .PUT,
+                .delete => .DELETE,
+            }, entry.path.slice(), runtimeApiHttpHandler, route);
+        }
     }
 
     pub fn deinit(self: *OpaqueHttpxHandler) void {
-        antfly_api_kernel_handler_destroy(self.handle);
+        if (self.alloc) |alloc| {
+            for (self.runtime_routes.items) |route| alloc.destroy(route);
+            self.runtime_routes.deinit(alloc);
+        }
+        self.functions.handler_destroy(self.handle);
         self.* = undefined;
     }
 };
 
+const RuntimeRoute = struct {
+    functions: *const abi.FunctionTable,
+    kernel_route_handle: *anyopaque,
+};
+
+fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
+    const route: *const RuntimeRoute = @ptrCast(@alignCast(context.route_data orelse return error.ApiKernelUnavailable));
+    const source_headers = context.request.headers.iterator();
+    const headers = try context.allocator.alloc(abi.HeaderView, source_headers.len);
+    defer context.allocator.free(headers);
+    for (source_headers, 0..) |header, i| {
+        headers[i] = .{ .name = abi.Bytes.init(header.name), .value = abi.Bytes.init(header.value) };
+    }
+    const params = try context.allocator.alloc(abi.RouteParamView, context.params.len);
+    defer context.allocator.free(params);
+    for (context.params, 0..) |param, i| {
+        params[i] = .{ .name = abi.Bytes.init(param.name), .value = abi.Bytes.init(param.value) };
+    }
+
+    var response_handle: ?*anyopaque = null;
+    var response_view: abi.HttpResponseView = undefined;
+    const request_view: abi.HttpRequestView = .{
+        .method = switch (context.request.method) {
+            .GET => .get,
+            .POST => .post,
+            .PUT => .put,
+            .DELETE => .delete,
+            else => return error.MethodNotAllowed,
+        },
+        .path = abi.Bytes.init(context.request.uri.path),
+        .query = abi.OptionalBytes.init(context.request.uri.query),
+        .headers_ptr = if (headers.len == 0) null else headers.ptr,
+        .headers_len = headers.len,
+        .params_ptr = if (params.len == 0) null else params.ptr,
+        .params_len = params.len,
+        .body = abi.Bytes.init(context.request.body orelse ""),
+        .authorization = abi.OptionalBytes.init(context.request.headers.get("Authorization")),
+        .content_type = abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
+    };
+    try callError(route.functions.handler_handle_http(&.{
+        .abi_version = abi.abi_version,
+        .route_handle = route.kernel_route_handle,
+        .request = &request_view,
+        .out_response_handle = &response_handle,
+        .out_response = &response_view,
+    }));
+    const owned_response_handle = response_handle orelse return error.RuntimeBoundaryFailure;
+    defer route.functions.handler_destroy_http_response(owned_response_handle);
+
+    var response = httpx.Response.init(context.allocator, response_view.status);
+    errdefer response.deinit();
+    if (response_view.content_type.slice()) |content_type|
+        try response.headers.set("Content-Type", content_type);
+    const response_headers = if (response_view.headers_ptr) |ptr| ptr[0..response_view.headers_len] else &.{};
+    for (response_headers) |header| {
+        if (response_view.content_type.slice() != null and
+            std.ascii.eqlIgnoreCase(header.name.slice(), "Content-Type")) continue;
+        try response.headers.append(header.name.slice(), header.value.slice());
+    }
+    const body = try context.allocator.dupe(u8, response_view.body.slice());
+    response.body = body;
+    response.body_owned = true;
+    return response;
+}
+
 pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
     if (comptime direct_codegen) return .{ .api_server = server };
     var handle: ?*anyopaque = null;
-    const status = antfly_api_kernel_handler_create(&.{
+    const status = server.functions.handler_create(&.{
         .abi_version = abi.abi_version,
         .api_server_handle = server.opaque_handle,
         .out_handle = &handle,
     });
     try callError(status);
-    return .{ .handle = handle orelse return error.ApiKernelOperationFailed };
+    return .{
+        .handle = handle orelse return error.ApiKernelOperationFailed,
+        .functions = server.functions,
+    };
 }
 
 pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {

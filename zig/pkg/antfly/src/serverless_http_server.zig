@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const httpx = @import("httpx");
 const http_common = @import("raft/transport/http_common.zig");
 const serverless_http_routes = @import("serverless/api/http_routes.zig");
 const serverless_http_types = @import("serverless/api/http_types.zig");
@@ -80,6 +81,32 @@ pub const ServerlessHttpServer = struct {
             .content_type = try self.alloc.dupe(u8, resp.content_type),
             .body = try self.alloc.dupe(u8, resp.body),
         };
+    }
+
+    /// Native httpx adapter. Request decoding and response encoding remain at
+    /// the transport edge; the serverless handler receives its canonical
+    /// transport-neutral request exactly once.
+    pub fn handleHttpx(self: *ServerlessHttpServer, ctx: *httpx.Context) !httpx.Response {
+        _ = self.cfg;
+        const method: serverless_http_routes.HttpMethod = switch (ctx.request.method) {
+            .GET => .get,
+            .POST => .post,
+            .PUT => .put,
+            .DELETE => .delete,
+            else => return try ctx.status(405).text("method not allowed"),
+        };
+        const body = (try ctx.body()) orelse "";
+        var response = try self.handler.handle(.{
+            .method = method,
+            .path = ctx.request.uri.raw,
+            .body = body,
+        });
+        defer response.deinit(self.alloc);
+
+        _ = ctx.status(response.status);
+        try ctx.setHeader("Content-Type", response.content_type);
+        _ = ctx.response.body(response.body);
+        return try ctx.response.build();
     }
 
     fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {

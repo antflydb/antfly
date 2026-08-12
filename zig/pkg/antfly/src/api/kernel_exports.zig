@@ -22,11 +22,8 @@ const restore_jobs = @import("restore_jobs.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const http_common = @import("../raft/transport/http_common.zig");
-const metadata_openapi = @import("antfly_metadata_openapi");
-const usermgr_openapi = @import("antfly_usermgr_openapi");
 const httpx = @import("httpx");
-
-extern fn antfly_distributed_httpx_register(context: *const abi.RouteContext) callconv(.c) abi.Status;
+const platform_sync = @import("antfly_platform").sync;
 
 pub const CreateContext = abi.CreateContext;
 pub const CallContext = abi.CallContext;
@@ -43,6 +40,9 @@ const HandlerState = struct {
     handler: handler_mod.AntflyApiHandler,
     io_impl: ?std.Io.Threaded = null,
     routes: std.ArrayListUnmanaged(*RouteState) = .empty,
+    route_manifest: std.ArrayListUnmanaged(abi.RouteManifestEntry) = .empty,
+    route_manifest_mutex: std.atomic.Mutex = .unlocked,
+    route_manifest_ready: bool = false,
 };
 
 const RouteState = struct {
@@ -63,6 +63,11 @@ fn fail(err: anyerror) abi.Status {
 fn validateVersion(version: u32) ?abi.Status {
     if (version == abi.abi_version) return null;
     return fail(error.UnsupportedVersion);
+}
+
+fn validateContext(comptime T: type, version: u32, struct_size: u32) ?abi.Status {
+    if (!abi.validContext(T, version, struct_size)) return fail(error.UnsupportedVersion);
+    return null;
 }
 
 fn validateNativeValue(
@@ -89,8 +94,7 @@ fn validateNativeOutput(
 }
 
 fn validateCall(comptime Input: type, comptime Output: type, context: *const CallContext) ?abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
-    if (context._reserved != 0) return fail(error.UnsupportedVersion);
+    if (validateContext(CallContext, context.abi_version, context.struct_size)) |failure| return failure;
     if (validateNativeValue(Input, context.input, context.input_contract)) |failure| return failure;
     if (validateNativeOutput(Output, context.output, context.output_contract)) |failure| return failure;
     return null;
@@ -109,7 +113,7 @@ fn output(comptime T: type, context: *const CallContext) *T {
 }
 
 pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateContext(CreateContext, context.abi_version, context.struct_size)) |failure| return failure;
     if (context.flags & ~CreateContext.fallible_init != 0)
         return fail(error.UnsupportedVersion);
     if (!context.owner_alloc.valid())
@@ -194,9 +198,10 @@ pub fn attachRuntimeRestoreStore(context: *const CallContext) callconv(.c) abi.S
 pub fn attachReplicatedRestoreStore(
     abi_version: u32,
     server_handle: *anyopaque,
-    persistence: *const restore_jobs.ReplicatedPersistence,
+    persistence_opaque: *const anyopaque,
 ) callconv(.c) abi.Status {
     if (validateVersion(abi_version)) |failure| return failure;
+    const persistence: *const restore_jobs.ReplicatedPersistence = @ptrCast(@alignCast(persistence_opaque));
     if (persistence.version != restore_jobs.ReplicatedPersistence.abi_version)
         return fail(error.UnsupportedVersion);
     const state: *ServerState = @ptrCast(@alignCast(server_handle));
@@ -236,8 +241,7 @@ pub fn storageMaintenanceActive(context: *const CallContext) callconv(.c) abi.St
 }
 
 pub fn authorizeInference(context: *const abi.AuthorizeInferenceContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
-    if (context._reserved != 0) return fail(error.UnsupportedVersion);
+    if (validateContext(abi.AuthorizeInferenceContext, context.abi_version, context.struct_size)) |failure| return failure;
     const state: *ServerState = @ptrCast(@alignCast(context.handle));
     context.out_decision.* = state.server.authorizeInferenceRequest(.{
         .authorization = context.authorization.slice(),
@@ -261,8 +265,7 @@ pub fn handleInternal(context: *const CallContext) callconv(.c) abi.Status {
 }
 
 pub fn handlerCreate(context: *const HandlerCreateContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
-    if (context._reserved != 0) return fail(error.UnsupportedVersion);
+    if (validateContext(HandlerCreateContext, context.abi_version, context.struct_size)) |failure| return failure;
     const api_state: *ServerState = @ptrCast(@alignCast(context.api_server_handle));
     const state = api_state.owner_alloc.create(HandlerState) catch |err| return fail(err);
     state.* = .{
@@ -309,29 +312,32 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
     return .ok;
 }
 
-pub fn handlerRegisterRoutes(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(httpx.Server, void, context)) |failure| return failure;
-    const server: *httpx.Server = @constCast(input(httpx.Server, context));
-    const state = handlerState(context);
-    const handler = &state.handler;
-    const public_router = metadata_openapi.server.ServerRouter(handler_mod.AntflyApiHandler).init(handler);
-    var public_prefixed = BoundaryServer("/db/v1"){
-        .inner = server,
-        .owner = state,
-    };
-    public_router.register(&public_prefixed) catch |err| return fail(err);
-    const usermgr_router = usermgr_openapi.server.ServerRouter(handler_mod.AntflyApiHandler).init(handler);
-    var usermgr_boundary = BoundaryServer(""){
-        .inner = server,
-        .owner = state,
-    };
-    usermgr_router.register(&usermgr_boundary) catch |err| return fail(err);
+pub fn handlerRouteManifest(context: *const abi.RouteManifestContext) callconv(.c) abi.Status {
+    if (validateContext(abi.RouteManifestContext, context.abi_version, context.struct_size)) |failure| return failure;
+    const state: *HandlerState = @ptrCast(@alignCast(context.handler_handle));
+    platform_sync.lockYielding(&state.route_manifest_mutex);
+    defer state.route_manifest_mutex.unlock();
+    if (!state.route_manifest_ready) {
+        const routes_start = state.routes.items.len;
+        const manifest_start = state.route_manifest.items.len;
+        const handler = &state.handler;
+        var public_manifest = ManifestServer("/db/v1"){ .owner = state };
+        var root_manifest = ManifestServer(""){ .owner = state };
+        handler.registerRouteSets(&public_manifest, &root_manifest) catch |err| {
+            for (state.routes.items[routes_start..]) |route| state.alloc.destroy(route);
+            state.routes.shrinkRetainingCapacity(routes_start);
+            state.route_manifest.shrinkRetainingCapacity(manifest_start);
+            return fail(err);
+        };
+        state.route_manifest_ready = true;
+    }
+    context.out_entries.* = if (state.route_manifest.items.len == 0) null else state.route_manifest.items.ptr;
+    context.out_len.* = state.route_manifest.items.len;
     return .ok;
 }
 
 pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
-    if (context._reserved != 0) return fail(error.UnsupportedVersion);
+    if (validateContext(abi.HttpHandleContext, context.abi_version, context.struct_size)) |failure| return failure;
     const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
     const state = route.owner;
     const request = context.request;
@@ -367,7 +373,7 @@ pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi
     var http_context = httpx.Context.init(alloc, io_impl.io(), &http_request);
     defer http_context.deinit();
     http_context.params = params;
-    var response = route.handler(&http_context) catch |err| return fail(err);
+    var response = route.handler.invoke(&http_context) catch |err| return fail(err);
     errdefer response.deinit();
 
     const response_state = alloc.create(HttpResponseState) catch |err| return fail(err);
@@ -410,47 +416,78 @@ pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
     const alloc = state.alloc;
     for (state.routes.items) |route| alloc.destroy(route);
     state.routes.deinit(alloc);
+    state.route_manifest.deinit(alloc);
     state.handler.deinitRuntime();
     if (state.io_impl) |*io_impl| io_impl.deinit();
     alloc.destroy(state);
 }
 
-fn BoundaryServer(comptime prefix: []const u8) type {
+const function_table: abi.FunctionTable = .{
+    .abi_version = abi.abi_version,
+    .struct_size = @sizeOf(abi.FunctionTable),
+    .capabilities = abi.Capability.core |
+        abi.Capability.legacy_http_dispatch |
+        abi.Capability.route_manifest,
+    .create = &create,
+    .destroy = &destroy,
+    .request_stats = &requestStats,
+    .set_provider = &setProvider,
+    .set_ha_executor = &setHAExecutor,
+    .executor = &executor,
+    .streaming_executor = &streamingExecutor,
+    .attach_runtime_restore_store = &attachRuntimeRestoreStore,
+    .attach_replicated_restore_store = &attachReplicatedRestoreStore,
+    .resume_restore_jobs = &resumeRestoreJobs,
+    .poll_restore_jobs = &pollRestoreJobs,
+    .prepare_restore_leadership = &prepareRestoreLeadership,
+    .schedule_session_maintenance = &scheduleSessionMaintenance,
+    .storage_maintenance_active = &storageMaintenanceActive,
+    .authorize_inference = &authorizeInference,
+    .handle = &handle,
+    .handle_internal = &handleInternal,
+    .handler_create = &handlerCreate,
+    .handler_init = &handlerInit,
+    .handler_stats = &handlerStats,
+    .handler_route_manifest = &handlerRouteManifest,
+    .handler_handle_http = &handlerHandleHttp,
+    .handler_destroy_http_response = &handlerDestroyHttpResponse,
+    .handler_destroy = &handlerDestroy,
+};
+
+pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {
+    return &function_table;
+}
+
+fn ManifestServer(comptime prefix: []const u8) type {
     return struct {
-        inner: *httpx.Server,
         owner: *HandlerState,
 
-        fn register(self: *const @This(), method: abi.HttpMethod, comptime path: []const u8, comptime handler: httpx.Handler) !void {
-            const route = self.owner.alloc.create(RouteState) catch |err| return err;
+        fn register(self: *const @This(), method: abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
+            const route = try self.owner.alloc.create(RouteState);
             errdefer self.owner.alloc.destroy(route);
             route.* = .{ .owner = self.owner, .handler = handler };
-            self.owner.routes.append(self.owner.alloc, route) catch |err| return err;
+            try self.owner.routes.append(self.owner.alloc, route);
             errdefer _ = self.owner.routes.pop();
-            const full_path = prefix ++ path;
-            const status = antfly_distributed_httpx_register(&.{
-                .abi_version = abi.abi_version,
-                .server = self.inner,
+            try self.owner.route_manifest.append(self.owner.alloc, .{
                 .route_handle = route,
                 .method = method,
-                .path_ptr = full_path.ptr,
-                .path_len = full_path.len,
+                .path = abi.Bytes.init(prefix ++ path),
             });
-            if (!status.isOk()) return abi.errorFromStatus(status);
         }
 
-        pub fn get(self: *const @This(), comptime path: []const u8, comptime handler: httpx.Handler) !void {
+        pub fn get(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             try self.register(.get, path, handler);
         }
 
-        pub fn post(self: *const @This(), comptime path: []const u8, comptime handler: httpx.Handler) !void {
+        pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             try self.register(.post, path, handler);
         }
 
-        pub fn put(self: *const @This(), comptime path: []const u8, comptime handler: httpx.Handler) !void {
+        pub fn put(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             try self.register(.put, path, handler);
         }
 
-        pub fn delete(self: *const @This(), comptime path: []const u8, comptime handler: httpx.Handler) !void {
+        pub fn delete(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             try self.register(.delete, path, handler);
         }
     };
