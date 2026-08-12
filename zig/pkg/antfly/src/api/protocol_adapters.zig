@@ -1517,13 +1517,7 @@ fn buildA2aDispatcher(
                 }
             }
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
-            var resp = try ctx.server.handle(.{
-                .method = .POST,
-                .uri = routes.Routes.agents_query_builder,
-                .authorization = ctx.authorization,
-                .content_type = "application/json",
-                .body = body_json,
-            });
+            var resp = try ctx.server.executeQueryBuilderAgent(body_json, ctx.authenticated_identity);
             defer resp.deinit(ctx.server.alloc);
             if (resp.status < 200 or resp.status >= 300) {
                 try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "failed", resp.body);

@@ -4689,6 +4689,97 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
+    pub fn executeQueryBuilderAgent(
+        self: *ApiHttpServer,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        var parsed = metadata_openapi.server.parseQueryBuilderAgentBody(self.alloc, body) catch
+            return try contextual_operations.textAlloc(self.alloc, 400, "invalid query builder request");
+        defer parsed.deinit();
+        if (parsed.value.intent.len == 0)
+            return try contextual_operations.textAlloc(self.alloc, 400, "invalid query builder request");
+
+        var table_context: ?query_builder_agent.QueryBuilderTableContext = null;
+        defer if (table_context) |context| freeQueryBuilderTableContext(self.alloc, context);
+        var runtime_validator_context: ?QueryBuilderRuntimeQueryRequestValidatorContext = null;
+        if (parsed.value.table) |table_name| {
+            if (authenticated_identity) |identity| {
+                if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                    return try contextual_operations.textAlloc(self.alloc, 403, "forbidden");
+            }
+            table_context = self.loadQueryBuilderTableContext(table_name) catch |err| switch (err) {
+                error.TableNotFound => return try contextual_operations.textAlloc(self.alloc, 404, "not found"),
+                else => return err,
+            };
+            if (self.table_reads) |reads| {
+                runtime_validator_context = .{
+                    .server = self,
+                    .source = reads,
+                    .table_name = table_name,
+                    .query_embedding_security_scope = queryEmbeddingSecurityScope(authenticated_identity),
+                };
+                table_context.?.runtime_query_request_validator = runtime_validator_context.?.iface();
+            }
+        }
+
+        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_impl.deinit();
+        const QueryBuilderGenerationRunner = struct {
+            antfly_provider: ?managed_embedder.AntflyProvider,
+            secret_store: ?*common_secrets.FileStore,
+            inference_api_key: ?[]const u8,
+            io: std.Io,
+
+            fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
+                return .{ .ptr = runner, .vtable = &.{ .execute_chain = executeChain } };
+            }
+
+            fn executeChain(
+                ptr: *anyopaque,
+                alloc: std.mem.Allocator,
+                chain: []const generating_runtime.ChainLink,
+                messages: []const generating_runtime.ChatMessage,
+            ) !generating_runtime.GenerateResult {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                var client = httpx.Client.initWithConfig(alloc, runner.io, .{ .keep_alive = false });
+                defer client.deinit();
+                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{
+                    .antfly_provider = runner.antfly_provider,
+                    .secret_store = runner.secret_store,
+                    .inference_api_key = runner.inference_api_key,
+                }, messages);
+            }
+        };
+        var generation_runner = QueryBuilderGenerationRunner{
+            .antfly_provider = self.antfly_provider,
+            .secret_store = self.cfg.secret_store,
+            .inference_api_key = self.cfg.inference_api_key,
+            .io = self.inferenceIo(),
+        };
+        var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
+        const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(
+            arena_impl.allocator(),
+            parsed.value,
+            &collected_context,
+            generation_runner.iface(),
+        ) catch |err| return switch (err) {
+            error.InvalidQueryBuilderRequest => try contextual_operations.textAlloc(self.alloc, 400, "invalid query builder request"),
+            error.DocIdentityNamespaceMismatch => try contextual_operations.textAlloc(self.alloc, 503, "doc identity unavailable"),
+            error.QueryEmbeddingInputTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "query embedding input too large"),
+            error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(self.alloc, 429, "query embedding overloaded"),
+            error.EmbedRateLimited => try contextualRetryableTextResponse(self.alloc, 429, "query embedding rate limited"),
+            error.EmbedTransientFailure => try contextualRetryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
+            error.EmbedUpstreamFailure => try contextual_operations.textAlloc(self.alloc, 502, "query embedding provider failed"),
+            error.Timeout => try contextual_operations.textAlloc(self.alloc, 504, "query embedding timed out"),
+            else => return err,
+        };
+        return contextual_operations.json(
+            try std.fmt.allocPrint(self.alloc, "{f}", .{std.json.fmt(response, .{})}),
+            false,
+        );
+    }
+
     fn dispatchTransactionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
         if (req.method == .GET) {
             if (std.mem.eql(u8, uri_parts.path, routes.Routes.transactions)) {
@@ -4724,88 +4815,6 @@ pub const ApiHttpServer = struct {
             const response = retrieval_agent.buildEvalResponse(arena_impl.allocator(), parsed.value) catch |err| switch (err) {
                 error.InvalidEvalRequest => return try jsonErrorResponse(self.alloc, 400, "invalid eval request"),
                 else => return err,
-            };
-            return try jsonResponse(self.alloc, response);
-        }
-        if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.agents_query_builder)) {
-            var parsed = metadata_openapi.server.parseQueryBuilderAgentBody(self.alloc, req.body) catch {
-                return try jsonErrorResponse(self.alloc, 400, "invalid query builder request");
-            };
-            defer parsed.deinit();
-            if (parsed.value.intent.len == 0) return try jsonErrorResponse(self.alloc, 400, "invalid query builder request");
-
-            var table_context: ?query_builder_agent.QueryBuilderTableContext = null;
-            defer if (table_context) |context| freeQueryBuilderTableContext(self.alloc, context);
-            var runtime_validator_context: ?QueryBuilderRuntimeQueryRequestValidatorContext = null;
-            if (parsed.value.table) |table_name| {
-                if (self.cfg.auth_enabled) {
-                    const identity = authenticated_identity orelse return try unauthorizedResponse(self.alloc);
-                    if (!permissionsAllow(identity.permissions, .table, table_name, .read)) {
-                        return try jsonErrorResponse(self.alloc, 403, "forbidden");
-                    }
-                }
-                table_context = self.loadQueryBuilderTableContext(table_name) catch |err| switch (err) {
-                    error.TableNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                if (self.table_reads) |reads| {
-                    runtime_validator_context = .{
-                        .server = self,
-                        .source = reads,
-                        .table_name = table_name,
-                        .query_embedding_security_scope = queryEmbeddingSecurityScope(authenticated_identity),
-                    };
-                    table_context.?.runtime_query_request_validator = runtime_validator_context.?.iface();
-                }
-            }
-
-            var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena_impl.deinit();
-            const QueryBuilderGenerationRunner = struct {
-                antfly_provider: ?managed_embedder.AntflyProvider,
-                secret_store: ?*common_secrets.FileStore,
-                inference_api_key: ?[]const u8,
-                io: std.Io,
-
-                fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
-                    return .{
-                        .ptr = runner,
-                        .vtable = &.{ .execute_chain = executeChain },
-                    };
-                }
-
-                fn executeChain(
-                    ptr: *anyopaque,
-                    alloc: std.mem.Allocator,
-                    chain: []const generating_runtime.ChainLink,
-                    messages: []const generating_runtime.ChatMessage,
-                ) !generating_runtime.GenerateResult {
-                    const runner: *@This() = @ptrCast(@alignCast(ptr));
-                    var client = httpx.Client.initWithConfig(alloc, runner.io, .{ .keep_alive = false });
-                    defer client.deinit();
-                    return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
-                }
-            };
-            var generation_runner = QueryBuilderGenerationRunner{
-                .antfly_provider = self.antfly_provider,
-                .secret_store = self.cfg.secret_store,
-                .inference_api_key = self.cfg.inference_api_key,
-                .io = self.inferenceIo(),
-            };
-            var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
-            const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
-                error.InvalidQueryBuilderRequest => return try jsonErrorResponse(self.alloc, 400, "invalid query builder request"),
-                error.DocIdentityNamespaceMismatch => return try jsonErrorResponse(self.alloc, 503, "doc identity unavailable"),
-                error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
-                error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
-                error.EmbedRateLimited => return try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
-                error.EmbedTransientFailure => return try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
-                error.EmbedUpstreamFailure => return try textResponse(self.alloc, 502, "query embedding provider failed"),
-                error.Timeout => return try textResponse(self.alloc, 504, "query embedding timed out"),
-                else => {
-                    if (try queryEmbeddingOperationalResponse(self.alloc, err)) |operational_response| return operational_response;
-                    return err;
-                },
             };
             return try jsonResponse(self.alloc, response);
         }
@@ -13959,6 +13968,25 @@ fn contextualJsonResponse(alloc: std.mem.Allocator, status: u16, value: anytype)
 
 fn contextualJsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8) !contextual_operations.OwnedResponse {
     return try contextualJsonResponse(alloc, status, .{ .@"error" = message });
+}
+
+fn contextualRetryableTextResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !contextual_operations.OwnedResponse {
+    const headers = try alloc.alloc(contextual_operations.Header, 1);
+    errdefer alloc.free(headers);
+    headers[0] = .{
+        .name = try alloc.dupe(u8, "Retry-After"),
+        .value = alloc.dupe(u8, "1") catch |err| {
+            alloc.free(headers[0].name);
+            return err;
+        },
+    };
+    errdefer headers[0].deinit(alloc);
+    return .{
+        .status = status,
+        .content_type = "text/plain",
+        .body = try alloc.dupe(u8, body),
+        .headers = headers,
+    };
 }
 
 fn extensionLifecycleContextualResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {

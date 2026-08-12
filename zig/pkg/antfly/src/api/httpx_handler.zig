@@ -3341,96 +3341,17 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const alloc = ctx.allocator;
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
             return ctx.text("invalid query builder request");
         };
-        var parsed = metadata_openapi.server.parseQueryBuilderAgentBody(alloc, body_data) catch {
-            _ = ctx.status(400);
-            return ctx.text("invalid query builder request");
-        };
-        defer parsed.deinit();
-        if (parsed.value.intent.len == 0) {
-            _ = ctx.status(400);
-            return ctx.text("invalid query builder request");
-        }
-
-        var table_context: ?query_builder_agent.QueryBuilderTableContext = null;
-        defer if (table_context) |context| http_server_mod.freeQueryBuilderTableContext(alloc, context);
-        var runtime_validator_context: ?http_server_mod.QueryBuilderRuntimeQueryRequestValidatorContext = null;
-        if (parsed.value.table) |table_name| {
-            if (authenticated_identity) |identity| {
-                if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read)) {
-                    _ = ctx.status(403);
-                    return ctx.text("forbidden");
-                }
-            }
-            table_context = self.api_server.loadQueryBuilderTableContext(table_name) catch |err| switch (err) {
-                error.TableNotFound => {
-                    _ = ctx.status(404);
-                    return ctx.text("not found");
-                },
-                else => return err,
-            };
-            if (self.api_server.table_reads) |reads| {
-                runtime_validator_context = .{
-                    .server = self.api_server,
-                    .source = reads,
-                    .table_name = table_name,
-                    .query_embedding_security_scope = ApiHttpServer.queryEmbeddingSecurityScope(authenticated_identity),
-                };
-                table_context.?.runtime_query_request_validator = runtime_validator_context.?.iface();
-            }
-        }
-
-        var arena_impl = std.heap.ArenaAllocator.init(alloc);
-        defer arena_impl.deinit();
-        const QueryBuilderGenerationRunner = struct {
-            antfly_provider: ?managed_embedder.AntflyProvider,
-            secret_store: ?*common_secrets.FileStore,
-            io: std.Io,
-
-            fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
-                return .{
-                    .ptr = runner,
-                    .vtable = &.{ .execute_chain = executeChain },
-                };
-            }
-
-            fn executeChain(
-                ptr: *anyopaque,
-                a: std.mem.Allocator,
-                chain: []const generating_runtime.ChainLink,
-                messages: []const generating_runtime.ChatMessage,
-            ) !generating_runtime.GenerateResult {
-                const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var client = httpx.Client.initWithConfig(a, runner.io, .{ .keep_alive = false });
-                defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
-            }
-        };
-        var generation_runner = QueryBuilderGenerationRunner{
-            .antfly_provider = self.api_server.antfly_provider,
-            .secret_store = self.api_server.cfg.secret_store,
-            .io = self.api_server.inferenceIo(),
-        };
-        var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
-        const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
-            error.InvalidQueryBuilderRequest => {
-                _ = ctx.status(400);
-                return ctx.text("invalid query builder request");
-            },
-            error.DocIdentityNamespaceMismatch => {
-                _ = ctx.status(503);
-                return ctx.text("doc identity unavailable");
-            },
-            else => {
-                if (try respondQueryEmbeddingOperationalError(ctx, err)) |operational_response| return operational_response;
-                return err;
-            },
-        };
-        return ctx.json(response);
+        var response = try self.api_server.executeQueryBuilderAgent(body_data, authenticated_identity);
+        defer response.deinit(self.api_server.alloc);
+        _ = ctx.status(response.status);
+        try ctx.setHeader("content-type", response.content_type);
+        for (response.headers) |header| try ctx.setHeader(header.name, header.value);
+        _ = ctx.response.body(response.body);
+        return ctx.response.build();
     }
 
     pub fn retrievalAgent(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
