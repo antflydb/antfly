@@ -323,6 +323,37 @@ pub fn metalSplitSwaRingEligible(
         backends.metal_kv_storage.KeyFormat.fromKvDType(kv_dtype) != null;
 }
 
+pub const GenerationKvRoute = enum {
+    standard,
+    metal_whole_model,
+};
+
+fn generationKvCapacityPolicy(
+    route: GenerationKvRoute,
+    split_swa_ring_eligible: bool,
+) runtime.tier.memory.GenerationKvCapacityPolicy {
+    return if (route == .metal_whole_model and split_swa_ring_eligible)
+        .split_swa_ring
+    else
+        .full_history;
+}
+
+/// Resolves the KV geometry that both request admission and execution must use.
+/// Keeping this decision route-scoped prevents a caller from budgeting a
+/// different cache layout than the whole-model runtime will allocate.
+pub fn generationKvCapacityPolicyForRoute(
+    route: GenerationKvRoute,
+    model_config: gpt_mod.Config,
+    generation_config: GenerationConfig,
+    kv_dtype: runtime.kv.pool.KvDType,
+) runtime.tier.memory.GenerationKvCapacityPolicy {
+    if (route == .standard) return .full_history;
+    return generationKvCapacityPolicy(
+        route,
+        metalSplitSwaRingEligible(model_config, generation_config, kv_dtype),
+    );
+}
+
 pub fn kvPoolConfig(
     backend: runtime.kv.pool.BackendKind,
     dtype: runtime.kv.pool.KvDType,
@@ -3360,12 +3391,26 @@ pub const NativeGenerationPipeline = struct {
         );
 
         const runtime_prepare_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        const whole_model_kv_policy = generationKvCapacityPolicyForRoute(
+            if (self.compiled_partition_backend == .metal and
+                self.compiled_attachment_target == .whole_model and
+                self.graph_cache != null and
+                decode_state.isPaged() and
+                self.cb.kind() == .metal and
+                self.kv_dtype != null)
+                .metal_whole_model
+            else
+                .standard,
+            self.gpt_config,
+            config,
+            self.kv_dtype orelse .f16,
+        );
         const runtime_prepare_token_hint = if (self.compiled_partition_backend != null and
             self.compiled_attachment_target == .whole_model and
             self.graph_cache != null and
             decode_state.isPaged() and
             self.cb.kind() == .metal and
-            metalSplitSwaRingRequestEligible(self.gpt_config, config))
+            whole_model_kv_policy == .split_swa_ring)
             wholeModelPrefillChunkSize(
                 config.prefill_chunk_size,
                 if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
@@ -4571,9 +4616,18 @@ pub const NativeGenerationPipeline = struct {
 
         if (self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null) {
             if (prefilled_tokens != 0) return error.UnsupportedShape;
-            const bounded_swa_prefill = self.cb.kind() == .metal and
-                decode_state.isPaged() and
-                metalSplitSwaRingRequestEligible(self.gpt_config, config);
+            const whole_model_kv_policy = generationKvCapacityPolicyForRoute(
+                if (self.compiled_partition_backend == .metal and
+                    self.cb.kind() == .metal and decode_state.isPaged() and
+                    self.kv_dtype != null)
+                    .metal_whole_model
+                else
+                    .standard,
+                self.gpt_config,
+                config,
+                self.kv_dtype orelse .f16,
+            );
+            const bounded_swa_prefill = whole_model_kv_policy == .split_swa_ring;
             const prefill_chunk_size = if (bounded_swa_prefill)
                 wholeModelPrefillChunkSize(
                     config.prefill_chunk_size,
@@ -12465,6 +12519,41 @@ test "whole-model prefill stays bounded and speculative width is validated" {
         validateSpeculativeK(true, runtime.tier.memory.generation_max_speculative_k + 1),
     );
     try validateSpeculativeK(false, runtime.tier.memory.generation_max_speculative_k + 1);
+}
+
+test "generation KV capacity policy is route and device-format aware" {
+    const config = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+        .ple_hidden_size = 256,
+    };
+
+    try std.testing.expectEqual(
+        runtime.tier.memory.GenerationKvCapacityPolicy.split_swa_ring,
+        generationKvCapacityPolicy(.metal_whole_model, true),
+    );
+    try std.testing.expectEqual(
+        runtime.tier.memory.GenerationKvCapacityPolicy.full_history,
+        generationKvCapacityPolicy(.standard, true),
+    );
+
+    try std.testing.expectEqual(
+        runtime.tier.memory.GenerationKvCapacityPolicy.full_history,
+        generationKvCapacityPolicyForRoute(.standard, config, .{}, .f16),
+    );
+    try std.testing.expectEqual(
+        runtime.tier.memory.GenerationKvCapacityPolicy.full_history,
+        generationKvCapacityPolicyForRoute(.metal_whole_model, config, .{}, .int4),
+    );
+    try std.testing.expectEqual(
+        runtime.tier.memory.GenerationKvCapacityPolicy.full_history,
+        generationKvCapacityPolicyForRoute(.metal_whole_model, config, .{
+            .prompt_cache_enabled = true,
+        }, .f16),
+    );
 }
 
 test "native generation suppress token mask removes configured logits" {

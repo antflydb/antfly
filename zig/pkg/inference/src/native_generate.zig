@@ -703,38 +703,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         };
     }
 
-    debugGenerateSetup("live whole-model executor probe begin", .{});
-    const live_whole_model_executed = tryRunLiveWholeModelExecutorGenerate(
-        allocator,
-        io,
-        &opts,
-        model,
-        gpt_config,
-        tokenizer,
-        config,
-        prompt_encoded.ids[0..countPromptTokens(prompt_encoded.attention_mask)],
-        prompt_tokens,
-        started_at,
-        loaded_model_at,
-        encoded_prompt_at,
-    ) catch |err| {
-        print("error: live whole-model generate failed for {s} with backend {s}: {s}\n", .{
-            opts.model_dir,
-            @tagName(opts.backend),
-            @errorName(err),
-        });
-        return err;
-    };
-    if (live_whole_model_executed) {
-        debugGenerateSetup("live whole-model executor handled request", .{});
-        return;
-    }
-    debugGenerateSetup("live whole-model executor skipped", .{});
-
-    if (!graph_mode) {
-        graph_mod.executor_stats.printBypass("inference.generate", "native_generation_direct_decoder_runtime");
-    }
-
     const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .native => .native,
         .metal => .metal,
@@ -765,9 +733,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
     }
     const acquired_scheduler_at = std.Io.Timestamp.now(io, .awake);
-
-    var kv_manager = runtime.kv.manager.KvManager.init(allocator);
-    defer kv_manager.deinit();
 
     const draft_backend_kind: ?runtime.kv.pool.BackendKind = if (draft_model) |loaded|
         generationKvBackendKind(loaded.session.backend()) orelse return error.SpeculativeDecodingRequiresNativeBackend
@@ -814,15 +779,27 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         budget_limits.backend_limit_bytes / (1024 * 1024),
         budget_limits.combined_limit_bytes / (1024 * 1024),
     });
-    const kv_capacity_policy: runtime.tier.memory.GenerationKvCapacityPolicy = if (graph_mode and
+    const compiled_whole_model_route = graph_mode and
         explicit_partition_backend == .metal and
         compiled_attachment_target == .whole_model and
         backend_kind == .metal and
-        graph_mod.metal_executor.supportsSession(model.session) and
-        generation.metalSplitSwaRingEligible(gpt_config, config, kv_dtype))
-        .split_swa_ring
-    else
-        .full_history;
+        graph_mod.metal_executor.supportsSession(model.session);
+    const live_whole_model_route = liveWholeModelExecutorRequested(&opts) and
+        backend_kind == .metal and
+        !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and
+        config.draft_model == null and
+        !config.speculation_requested and
+        opts.image_count == 0 and
+        opts.audio_count == 0;
+    const kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
+        if (compiled_whole_model_route or live_whole_model_route)
+            .metal_whole_model
+        else
+            .standard,
+        gpt_config,
+        config,
+        kv_dtype,
+    );
     const draft_kv_dtype = if (draft_model) |loaded| blk: {
         const requested_draft_kv_dtype = if (opts.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
@@ -887,6 +864,73 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
         return err;
     };
+
+    // The live executor is an alternate implementation of this admitted
+    // route, not an admission bypass. Reuse the effective KV dtype, capacity
+    // policy, scheduler lease, and selected prefill geometry above.
+    debugGenerateSetup("live whole-model executor probe begin", .{});
+    const live_whole_model_executed = tryRunLiveWholeModelExecutorGenerate(
+        allocator,
+        io,
+        &opts,
+        model,
+        gpt_config,
+        tokenizer,
+        config,
+        kv_dtype,
+        kv_capacity_policy,
+        prompt_encoded.ids[0..countPromptTokens(prompt_encoded.attention_mask)],
+        prompt_tokens,
+        started_at,
+        loaded_model_at,
+        encoded_prompt_at,
+    ) catch |err| {
+        print("error: live whole-model generate failed for {s} with backend {s}: {s}\n", .{
+            opts.model_dir,
+            @tagName(opts.backend),
+            @errorName(err),
+        });
+        return err;
+    };
+    if (live_whole_model_executed) {
+        debugGenerateSetup("live whole-model executor handled request", .{});
+        return;
+    }
+    debugGenerateSetup("live whole-model executor skipped", .{});
+
+    // A requested live route can decline when the installed executor lacks an
+    // operation. Re-admit the actual fallback route before it allocates a cache;
+    // a split-ring estimate must never leak into a full-history execution.
+    const fallback_kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
+        if (compiled_whole_model_route) .metal_whole_model else .standard,
+        gpt_config,
+        config,
+        kv_dtype,
+    );
+    if (fallback_kv_capacity_policy != kv_capacity_policy) {
+        budget_components[0].kv_capacity_policy = fallback_kv_capacity_policy;
+        run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
+        config.prefill_chunk_size = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
+            &run_budget,
+            budget_components[0..budget_component_count],
+            prompt_tokens,
+            budget_max_tokens,
+            admission_prefill_ceiling,
+        ) catch |err| {
+            if (err == error.MemoryBudgetExceeded) {
+                printBudgetExceeded(model.session, &run_budget);
+            }
+            return err;
+        };
+    }
+
+    if (!graph_mode) {
+        graph_mod.executor_stats.printBypass("inference.generate", "native_generation_direct_decoder_runtime");
+    }
+
+    var kv_manager = runtime.kv.manager.KvManager.init(allocator);
+    defer kv_manager.deinit();
+
     debugGenerateSetup("compute backend begin", .{});
     var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
         debugGenerateSetup("compute backend failed err={s}", .{@errorName(err)});
@@ -5801,16 +5845,6 @@ fn liveWholeModelExecutorRequested(opts: *const Options) bool {
     };
 }
 
-fn liveWholeModelSupportsSplitSwaRing(gpt_config: gpt_mod.Config) bool {
-    return gpt_config.supportsSplitSwaGlobalKvRing();
-}
-
-fn liveWholeModelAllowsSplitSwaRing(gpt_config: gpt_mod.Config, config: generation.GenerationConfig) bool {
-    return liveWholeModelSupportsSplitSwaRing(gpt_config) and
-        !config.prompt_cache_enabled and
-        config.cache_compaction_ratio == null;
-}
-
 fn liveWholeModelShouldStopOnEos(gpt_config: gpt_mod.Config, ignore_eos: bool, token_id: i32) bool {
     return !ignore_eos and token_id >= 0 and gpt_config.isEosToken(@intCast(token_id));
 }
@@ -5839,7 +5873,12 @@ fn runLiveWholeModelExecutorReuseProbe(
     var processed: usize = 0;
     var output_accum: ?graph_mod.model_runtime.ModelOutput = null;
     errdefer if (output_accum) |*owned| owned.deinit(allocator);
-    const allow_swa_ring = liveWholeModelSupportsSplitSwaRing(gpt_config);
+    const allow_swa_ring = generation.generationKvCapacityPolicyForRoute(
+        .metal_whole_model,
+        gpt_config,
+        .{},
+        kv_dtype,
+    ) == .split_swa_ring;
     while (processed < prompt_ids.len) {
         const chunk_end = @min(prompt_ids.len, processed + @max(prefill_chunk_size, 1));
         if (output_accum) |*owned| owned.deinit(allocator);
@@ -5892,6 +5931,8 @@ fn tryRunLiveWholeModelExecutorGenerate(
     gpt_config: @import("models/gpt.zig").Config,
     tokenizer: tokenizer_mod.Tokenizer,
     config: generation.GenerationConfig,
+    kv_dtype: runtime.kv.pool.KvDType,
+    kv_capacity_policy: runtime.tier.memory.GenerationKvCapacityPolicy,
     prompt_token_ids: []const i32,
     prompt_tokens: usize,
     started_at: std.Io.Timestamp,
@@ -5905,15 +5946,6 @@ fn tryRunLiveWholeModelExecutorGenerate(
 
     gpt_arch.resetDebugTimingStats();
 
-    const kv_backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
-        .metal => .metal,
-        .native => .native,
-        else => .native,
-    };
-    const kv_dtype = if (opts.cache_dtype) |name|
-        runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDType
-    else
-        session_factory.recommendedKvDTypeForSession(model.session, kv_backend_kind);
     var executor = (model.wholeModelExecutor(allocator, kv_dtype) catch |err| {
         debugGenerateSetup("live whole-model executor unavailable err={s}", .{@errorName(err)});
         if (liveWholeModelDeclineError(err)) return false;
@@ -5989,7 +6021,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     else
         runtime.tier.memory.generation_default_prefill_chunk_tokens;
     prefill_chunk_size = @max(@min(prefill_chunk_size, prompt_ids.len), 1);
-    const allow_swa_ring = liveWholeModelAllowsSplitSwaRing(gpt_config, config);
+    const allow_swa_ring = kv_capacity_policy == .split_swa_ring;
     const graph_stats_before_generate = graph_mod.executor_stats.snapshot();
     const prefill_started_at = std.Io.Timestamp.now(io, .awake);
     var output = blk: {
@@ -8644,7 +8676,7 @@ test "explicit compiled whole model does not route through live executor" {
     try std.testing.expect(!liveWholeModelExecutorRequested(&opts));
 }
 
-test "live whole-model split KV policy preserves cache and compaction guards" {
+test "live whole-model route uses the shared KV capacity policy" {
     const gpt_config = gpt_mod.Config{
         .family = .gemma,
         .num_hidden_layers = 6,
@@ -8653,13 +8685,22 @@ test "live whole-model split KV policy preserves cache and compaction guards" {
         .sliding_window_pattern = 6,
         .ple_hidden_size = 256,
     };
-    try std.testing.expect(liveWholeModelAllowsSplitSwaRing(gpt_config, .{}));
-    try std.testing.expect(!liveWholeModelAllowsSplitSwaRing(gpt_config, .{
-        .prompt_cache_enabled = true,
-    }));
-    try std.testing.expect(!liveWholeModelAllowsSplitSwaRing(gpt_config, .{
-        .cache_compaction_ratio = 0.5,
-    }));
+    try std.testing.expectEqual(
+        runtime.tier.memory.GenerationKvCapacityPolicy.full_history,
+        generation.generationKvCapacityPolicyForRoute(.standard, gpt_config, .{}, .f16),
+    );
+    try std.testing.expectEqual(
+        runtime.tier.memory.GenerationKvCapacityPolicy.full_history,
+        generation.generationKvCapacityPolicyForRoute(.metal_whole_model, gpt_config, .{
+            .prompt_cache_enabled = true,
+        }, .f16),
+    );
+    try std.testing.expectEqual(
+        runtime.tier.memory.GenerationKvCapacityPolicy.full_history,
+        generation.generationKvCapacityPolicyForRoute(.metal_whole_model, gpt_config, .{
+            .cache_compaction_ratio = 0.5,
+        }, .f16),
+    );
 }
 
 test "live whole-model generation excludes all EOS tokens unless ignored" {

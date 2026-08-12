@@ -3224,6 +3224,19 @@ pub const Node = struct {
             .pjrt, .onnx, .wasm => return error.UnsupportedGeneratorProvider,
         };
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
+        const use_metal_whole_model = build_options.enable_metal and
+            model.session.backend() == .metal and
+            graph_mod.metal_executor.supportsSession(model.session) and
+            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
+        var generation_config = generation.GenerationConfig{
+            .max_tokens = max_tokens,
+        };
+        const kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
+            if (use_metal_whole_model) .metal_whole_model else .standard,
+            gpt_config,
+            generation_config,
+            kv_dtype,
+        );
         const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
             .native => .cpu,
             .metal, .cuda => .gpu,
@@ -3235,7 +3248,12 @@ pub const Node = struct {
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const prompt_tokens = try countPromptTokens(allocator, model, gpt_config, messages, max_tokens);
         const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
-            .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config },
+            .{
+                .backend = backend_kind,
+                .kv_dtype = kv_dtype,
+                .config = gpt_config,
+                .kv_capacity_policy = kv_capacity_policy,
+            },
         };
         const direct_prefill_ceiling = @min(
             prompt_tokens,
@@ -3261,13 +3279,15 @@ pub const Node = struct {
             }
             return err;
         };
-        const resource_estimate = try runtime.tier.memory.estimateGptGeneration(
+        generation_config.prefill_chunk_size = admitted_prefill_chunk;
+        const resource_estimate = try runtime.tier.memory.estimateGptGenerationForKvPolicy(
             backend_kind,
             kv_dtype,
             gpt_config,
             prompt_tokens,
             @intCast(@max(max_tokens, 1)),
             admitted_prefill_chunk,
+            kv_capacity_policy,
         );
         var admission_lease = try self.model_manager.acquireRunResources(
             budget_backend_class,
@@ -3298,11 +3318,6 @@ pub const Node = struct {
         var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
         decode_state.kv_storage = &kv_storage;
         defer decode_state.deinit();
-
-        const use_metal_whole_model = build_options.enable_metal and
-            model.session.backend() == .metal and
-            graph_mod.metal_executor.supportsSession(model.session) and
-            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
 
         var pipeline = generation.NativeGenerationPipeline{
             .allocator = allocator,
@@ -3336,7 +3351,7 @@ pub const Node = struct {
                 (if (session_factory.cudaOpProfileLoggingEnabled()) session_factory.getCudaRuntimeStats(model.session) else null)
             else
                 null;
-        var result = pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = admitted_prefill_chunk }) catch |err| {
+        var result = pipeline.generate(messages, generation_config) catch |err| {
             if (comptime build_options.enable_cuda) session_factory.drainCudaProfile(model.session);
             std.log.err("direct generator generation failed model={s} backend={s}: {s}", .{
                 model_name,
@@ -5824,16 +5839,20 @@ pub const Node = struct {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid cache_dtype value" })
         else
             session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
-        const target_kv_capacity_policy: runtime.tier.memory.GenerationKvCapacityPolicy = if (build_options.enable_metal and
-            model.session.backend() == .metal and
-            effective_compiled_partition_backend == .metal and
-            effective_compiled_attachment_target == .whole_model and
-            graph_mod.metal_executor.supportsSession(model.session) and
-            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and
-            generation.metalSplitSwaRingEligible(gpt_config, config, kv_dtype))
-            .split_swa_ring
-        else
-            .full_history;
+        const target_kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
+            if (build_options.enable_metal and
+                model.session.backend() == .metal and
+                effective_compiled_partition_backend == .metal and
+                effective_compiled_attachment_target == .whole_model and
+                graph_mod.metal_executor.supportsSession(model.session) and
+                !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config))
+                .metal_whole_model
+            else
+                .standard,
+            gpt_config,
+            config,
+            kv_dtype,
+        );
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
         const prompt_tokens = self.estimateNativePromptTokens(
             ctx.allocator,
