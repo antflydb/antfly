@@ -164,11 +164,6 @@ const RemoteRepairJobCancelProbe = struct {
     }
 };
 
-const CorruptEmbeddingArtifactRequest = struct {
-    doc_key: []const u8,
-    index_name: []const u8,
-};
-
 const DocumentArtifactChildKeyPrefixes = struct {
     unit: []u8,
     chunk: []u8,
@@ -246,21 +241,6 @@ fn validateDocumentArtifactChildRangeBatchScope(
 
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
     if (req.method != .POST) return null;
-
-    if (routes.Routes.matchInternalTableCorruptEmbeddingArtifact(path)) |route| {
-        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        var parsed = std.json.parseFromSlice(CorruptEmbeddingArtifactRequest, ctx.alloc, req.body, .{
-            .allocate = .alloc_always,
-        }) catch {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid corrupt embedding artifact request");
-        };
-        defer parsed.deinit();
-        _ = (writes.corruptEmbeddingArtifact(ctx.alloc, route.table_name, parsed.value.doc_key, parsed.value.index_name) catch |err| switch (err) {
-            error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
-            else => return err,
-        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-        return try http_route_helpers.jsonResponse(ctx.alloc, struct {}{});
-    }
 
     if (routes.Routes.matchGroupShardObserveSplit(path)) |route| {
         const ops = ctx.shard_ops orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");

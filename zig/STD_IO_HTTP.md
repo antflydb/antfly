@@ -90,6 +90,9 @@ that end state:
   request execution beneath their retained wire helpers. The concrete `httpx`
   routes decode into those owned requests and call typed operations directly;
   the separate internal join HTTP dispatcher has been deleted.
+- Internal corrupt-embedding-artifact control now calls the table-write source
+  through the typed internal-group operation surface. Its body/path decoding
+  and empty JSON response are handled only by the concrete `httpx` adapter.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

@@ -11,6 +11,7 @@ const metadata_mod = @import("../metadata/domain.zig");
 const operation = @import("operation.zig");
 const raft_mod = @import("../raft/mod.zig");
 const table_reads = @import("table_reads.zig");
+const table_writes = @import("table_write_source.zig");
 
 pub const Error = operation.ApiError || error{
     TopologyChanged,
@@ -29,6 +30,23 @@ pub const LookupInput = struct {
 pub const Operations = struct {
     reads: ?table_reads.TableReadSource,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter,
+    writes: ?table_writes.TableWriteSource = null,
+
+    pub fn corruptEmbeddingArtifact(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        table_name: []const u8,
+        doc_key: []const u8,
+        index_name: []const u8,
+    ) Error!void {
+        try request.ensureActive();
+        const writes = self.writes orelse return error.NotFound;
+        _ = (writes.corruptEmbeddingArtifact(alloc, table_name, doc_key, index_name) catch |err| switch (err) {
+            error.NotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse return error.NotFound;
+    }
 
     pub fn lookup(
         self: Operations,
@@ -134,4 +152,8 @@ test "internal group reads are callable without an HTTP request" {
     const median = (try operations.medianKey(alloc, .{}, 7)).?;
     defer alloc.free(median);
     try std.testing.expectEqualStrings("doc:m", median);
+    try std.testing.expectError(
+        error.NotFound,
+        operations.corruptEmbeddingArtifact(alloc, .{}, "documents", "doc:a", "embedding"),
+    );
 }

@@ -317,8 +317,8 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.join_rows_suffix, httpx.Handler.bind(self, internalJoinRows));
         try server.post(table_prefix ++ routes.join_unmatched_suffix, httpx.Handler.bind(self, internalJoinUnmatched));
         try server.post(table_prefix ++ routes.join_partition_suffix, httpx.Handler.bind(self, internalJoinPartition));
+        try server.post(internal_table_prefix ++ routes.corrupt_embedding_artifact_suffix, httpx.Handler.bind(self, internalCorruptEmbeddingArtifact));
         const internal_posts = [_][]const u8{
-            internal_table_prefix ++ routes.corrupt_embedding_artifact_suffix,
             group_prefix ++ routes.shard_ops_observe_split_suffix,
             group_prefix ++ routes.shard_ops_observe_merge_suffix,
             group_prefix ++ routes.shard_ops_execute_suffix,
@@ -773,6 +773,7 @@ pub const AntflyApiHandler = struct {
         return .{
             .reads = self.api_server.table_reads,
             .shard_db_adapter = self.api_server.cfg.shard_db_adapter,
+            .writes = self.api_server.table_writes,
         };
     }
 
@@ -979,6 +980,26 @@ pub const AntflyApiHandler = struct {
         const encoded = try self.api_server.join_job_store.encodeJoinPartitionResponse(ctx.allocator, result);
         defer ctx.allocator.free(encoded);
         return jsonResponse(ctx, 200, encoded);
+    }
+
+    fn internalCorruptEmbeddingArtifact(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const encoded_table_name = ctx.param("table_name") orelse return textResponse(ctx, 400, "invalid path parameter");
+        const table_name = (try decodePathParamOrBadRequest(ctx, encoded_table_name)) orelse
+            return textResponse(ctx, 400, "invalid path parameter");
+        defer ctx.allocator.free(table_name);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid corrupt embedding artifact request");
+        const WireRequest = struct { doc_key: []const u8, index_name: []const u8 };
+        var input = std.json.parseFromSlice(WireRequest, ctx.allocator, body, .{ .allocate = .alloc_always }) catch
+            return textResponse(ctx, 400, "invalid corrupt embedding artifact request");
+        defer input.deinit();
+        self.internalGroupOperations().corruptEmbeddingArtifact(
+            ctx.allocator,
+            operationContext(ctx, null),
+            table_name,
+            input.value.doc_key,
+            input.value.index_name,
+        ) catch |err| return internalGroupErrorResponse(ctx, err);
+        return ctx.json(struct {}{});
     }
 
     // ---------------------------------------------------------------
@@ -5016,7 +5037,7 @@ test "httpx shared registrar keeps root probes and rejects removed data aliases"
     }
 }
 
-test "httpx internal group GET routes call typed operations directly" {
+test "httpx internal control routes call typed operations directly" {
     const alloc = std.testing.allocator;
     const Fake = struct {
         fn reads() table_reads.TableReadSource {
@@ -5116,6 +5137,13 @@ test "httpx internal group GET routes call typed operations directly" {
         try std.testing.expectEqual(@as(u16, 400), response.status.code);
         try std.testing.expectEqualStrings(case[1], response.body.?);
     }
+
+    const corrupt_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/tables/docs/corrupt-embedding-artifact", .{base_url});
+    defer alloc.free(corrupt_url);
+    var invalid_corrupt = try requestWithRetry(&client, client_io.io(), .POST, corrupt_url, "{}", &headers, 20);
+    defer invalid_corrupt.deinit();
+    try std.testing.expectEqual(@as(u16, 400), invalid_corrupt.status.code);
+    try std.testing.expectEqualStrings("invalid corrupt embedding artifact request", invalid_corrupt.body.?);
 }
 
 test "httpx storage maintenance routes call typed operations directly" {
