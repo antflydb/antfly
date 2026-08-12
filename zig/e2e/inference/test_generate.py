@@ -169,7 +169,8 @@ def test_generate_response_format_json_object(api):
     resp = api.generate(
         [{"role": "user", "content": "Return a tiny JSON object"}],
         model=model,
-        max_tokens=128,
+        max_tokens=64,
+        chat_template_kwargs={"enable_thinking": False},
         response_format={"type": "json_object"},
     )
 
@@ -387,7 +388,8 @@ def test_multimodal_generation(api):
     r = api.post("/generate", json={
         "model": model,
         "messages": messages,
-        "max_tokens": 20,
+        "max_tokens": 8,
+        "chat_template_kwargs": {"enable_thinking": False},
     })
     r.raise_for_status()
     resp = r.json()
@@ -420,7 +422,8 @@ def test_multimodal_audio_generation(api):
     response = api.post("/generate", json={
         "model": model,
         "messages": messages,
-        "max_tokens": 20,
+        "max_tokens": 8,
+        "chat_template_kwargs": {"enable_thinking": False},
     })
     assert response.status_code == 200, (
         "shipped Gemma decoder/projector failed audio inference: "

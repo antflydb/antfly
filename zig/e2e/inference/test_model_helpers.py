@@ -308,7 +308,7 @@ def test_generator_environment_override_preserves_curated_variant(monkeypatch):
 
 
 def test_draft_generator_environment_override_is_bootstrapped(monkeypatch):
-    for env_name in models.GENERATOR_ENV_VARS:
+    for env_name in (*models.GENERATOR_ENV_VARS, *models.READER_ENV_VARS):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv("ANTFLY_INFERENCE_DRAFT_MODEL", "unsloth/Qwen3-1.7B-GGUF")
 

@@ -1268,20 +1268,20 @@ fn macosLiveAdmissionGrace(total_bytes: usize) usize {
 ///
 /// Linux MemAvailable is an allocation-availability estimate. The stable shared
 /// admission limit already retains full node headroom against Antfly residency,
-/// so this second, live-pressure gate preserves at least half of both the node
-/// headroom and the currently available memory. This keeps a shared runner
-/// usable without permitting Antfly to consume the last reclaimable bytes when
-/// the host is already under severe pressure. macOS supplies a system pressure
-/// percentage, with raw Mach page queues as a conservative fallback, and uses a
-/// smaller bounded grace window because its availability sample omits some
-/// reclaimable memory.
+/// so this second, live-pressure gate preserves half of current availability,
+/// with a 512 MiB emergency floor and the stable node headroom as a ceiling.
+/// This keeps a shared runner usable without reducing request capacity to zero
+/// merely because an already-admitted model lowered MemAvailable below half of
+/// the stable headroom. macOS supplies a system pressure percentage, with raw
+/// Mach page queues as a conservative fallback, and uses a smaller bounded
+/// grace window because its availability sample omits some reclaimable memory.
 fn liveHostAdmissionReserve(info: SystemMemoryInfo) usize {
     const available = info.available_bytes orelse return 0;
     const node_headroom = liveHostMemoryHeadroom(info.total_bytes);
     return switch (info.availability_basis) {
         .mem_available => @min(
-            available,
-            @min(node_headroom, @max(node_headroom / 2, available / 2)),
+            node_headroom,
+            @min(available, @max(mib(512), available / 2)),
         ),
         .macos_memory_pressure, .macos_reclaimable_pages => blk: {
             const normal_capacity = available -| node_headroom;
@@ -2624,15 +2624,26 @@ test "Linux live admission admits the CI model under shared-host pressure" {
         checkLiveHostMemoryWithInfo(info, 8_958_998_529),
     );
 
-    const severe_pressure = SystemMemoryInfo{
+    const later_request = SystemMemoryInfo{
         .total_bytes = info.total_bytes,
-        .available_bytes = gib(7),
+        // Reproduce the same runner after the model is resident. The prior
+        // policy reserved this entire sample and rejected even 3.4 MiB of
+        // request scratch despite 5.4 GiB remaining available.
+        .available_bytes = 5_775_224_832,
         .availability_basis = .mem_available,
     };
-    try std.testing.expectEqual(gib(7), liveHostAdmissionReserve(severe_pressure));
+    try std.testing.expectEqual(@as(usize, 2_887_612_416), liveHostAdmissionReserve(later_request));
+    try checkLiveHostMemoryWithInfo(later_request, 3_358_720);
+
+    const emergency_pressure = SystemMemoryInfo{
+        .total_bytes = info.total_bytes,
+        .available_bytes = mib(512),
+        .availability_basis = .mem_available,
+    };
+    try std.testing.expectEqual(mib(512), liveHostAdmissionReserve(emergency_pressure));
     try std.testing.expectError(
         error.ResourceTemporarilyUnavailable,
-        checkLiveHostMemoryWithInfo(severe_pressure, 1),
+        checkLiveHostMemoryWithInfo(emergency_pressure, 1),
     );
 }
 
