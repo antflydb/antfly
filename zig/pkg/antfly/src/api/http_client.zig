@@ -248,8 +248,26 @@ pub const ApiHttpClient = struct {
         };
     }
 
+    /// Public generated operations live below `/db/v1`. Internal forwarding
+    /// and the contextual retrieval operation deliberately remain rooted on
+    /// the listener, so callers continue to pass a node base URI rather than
+    /// having to know which routing namespace an operation belongs to.
+    fn joinRoute(self: *ApiHttpClient, base_uri: []const u8, path: []const u8) ![]u8 {
+        if (std.mem.startsWith(u8, path, "/internal/v1/") or
+            std.mem.eql(u8, path, routes.Routes.agents_retrieval))
+        {
+            return raft_routes.Routes.join(self.alloc, base_uri, path);
+        }
+        if (std.mem.eql(u8, path, "/db/v1") or std.mem.startsWith(u8, path, "/db/v1/")) {
+            return raft_routes.Routes.join(self.alloc, base_uri, path);
+        }
+        const canonical_path = try std.fmt.allocPrint(self.alloc, "/db/v1{s}", .{path});
+        defer self.alloc.free(canonical_path);
+        return raft_routes.Routes.join(self.alloc, base_uri, canonical_path);
+    }
+
     pub fn fetchClusterStatus(self: *ApiHttpClient, base_uri: []const u8) !std.json.Parsed(cluster.ClusterStatus) {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.status);
+        const uri = try self.joinRoute(base_uri, routes.Routes.status);
         defer self.alloc.free(uri);
         var resp = try self.executor.execute(self.alloc, .{
             .method = .GET,
@@ -283,7 +301,7 @@ pub const ApiHttpClient = struct {
                 key,
             });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -328,7 +346,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{ .method = .GET, .uri = uri });
@@ -357,7 +375,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.documents_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -387,7 +405,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.backup_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -413,7 +431,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.restore_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -432,7 +450,7 @@ pub const ApiHttpClient = struct {
         base_uri: []const u8,
         body: []const u8,
     ) !TablesResponse {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.backup);
+        const uri = try self.joinRoute(base_uri, routes.Routes.backup);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -459,7 +477,7 @@ pub const ApiHttpClient = struct {
         const path = routes.Routes.backup;
 
         for (base_uris, 0..) |base_uri, endpoint_index| {
-            const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+            const uri = try self.joinRoute(base_uri, path);
             defer self.alloc.free(uri);
 
             var resp = try self.executor.execute(self.alloc, .{
@@ -486,7 +504,7 @@ pub const ApiHttpClient = struct {
         base_uri: []const u8,
         body: []const u8,
     ) !TablesResponse {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.restore);
+        const uri = try self.joinRoute(base_uri, routes.Routes.restore);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -507,7 +525,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}?location={s}", .{ routes.Routes.backups, location });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -534,7 +552,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -565,7 +583,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.query_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -587,7 +605,7 @@ pub const ApiHttpClient = struct {
         base_uri: []const u8,
         body: []const u8,
     ) !RetrievalAgentResponse {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.agents_retrieval);
+        const uri = try self.joinRoute(base_uri, routes.Routes.agents_retrieval);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -630,7 +648,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -681,7 +699,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         const preflight_body = if (max_work == 0)
@@ -812,7 +830,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -858,7 +876,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -904,7 +922,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -951,7 +969,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1000,7 +1018,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1048,7 +1066,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1083,7 +1101,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1128,7 +1146,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1178,7 +1196,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1228,7 +1246,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1278,7 +1296,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1313,7 +1331,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.batch_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1338,7 +1356,7 @@ pub const ApiHttpClient = struct {
         base_uri: []const u8,
         body: []const u8,
     ) !TransactionResponse {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.transactions_commit);
+        const uri = try self.joinRoute(base_uri, routes.Routes.transactions_commit);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1363,7 +1381,7 @@ pub const ApiHttpClient = struct {
         base_uri: []const u8,
         body: []const u8,
     ) !TransactionBeginResponse {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.transactions_begin);
+        const uri = try self.joinRoute(base_uri, routes.Routes.transactions_begin);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1380,7 +1398,7 @@ pub const ApiHttpClient = struct {
     }
 
     pub fn fetchTransactionSessions(self: *ApiHttpClient, base_uri: []const u8) !TransactionResponse {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.transactions);
+        const uri = try self.joinRoute(base_uri, routes.Routes.transactions);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1401,7 +1419,7 @@ pub const ApiHttpClient = struct {
         else
             try self.alloc.dupe(u8, routes.Routes.transactions_cleanup);
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1428,7 +1446,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.transactions_commit_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1455,7 +1473,7 @@ pub const ApiHttpClient = struct {
             txn_id_hex,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1482,7 +1500,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.transactions_stage_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1537,7 +1555,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.transactions_savepoints_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1566,7 +1584,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.transactions_rollback_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1592,7 +1610,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.transactions_abort_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1620,7 +1638,7 @@ pub const ApiHttpClient = struct {
             suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1676,7 +1694,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var remaining_buf: [10]u8 = undefined;
@@ -1776,7 +1794,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1812,7 +1830,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1853,7 +1871,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1891,7 +1909,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1924,7 +1942,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1957,7 +1975,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1995,7 +2013,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.repair_cancel_state_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2039,7 +2057,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2082,7 +2100,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2115,7 +2133,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2149,7 +2167,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2203,7 +2221,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2299,7 +2317,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2328,7 +2346,7 @@ pub const ApiHttpClient = struct {
     ) ![]u8 {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2361,7 +2379,7 @@ pub const ApiHttpClient = struct {
     ) ![]u8 {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2388,7 +2406,7 @@ pub const ApiHttpClient = struct {
         else
             try self.alloc.dupe(u8, routes.Routes.tables);
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2407,7 +2425,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ routes.Routes.tables_prefix, table_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2427,7 +2445,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ routes.Routes.tables_prefix, table_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2448,7 +2466,7 @@ pub const ApiHttpClient = struct {
     ) !EmptyResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ routes.Routes.tables_prefix, table_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2468,7 +2486,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}/schema", .{ routes.Routes.tables_prefix, table_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2489,7 +2507,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}/indexes", .{ routes.Routes.tables_prefix, table_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2509,7 +2527,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}/indexes/{s}", .{ routes.Routes.tables_prefix, table_name, index_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2530,7 +2548,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}/indexes/{s}", .{ routes.Routes.tables_prefix, table_name, index_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2555,7 +2573,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}/indexes/{s}", .{ routes.Routes.tables_prefix, table_name, index_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{

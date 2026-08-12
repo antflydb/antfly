@@ -235,6 +235,13 @@ that end state:
   results directly; the listener-side `respondWithAllocator` and the last
   legacy-to-contextual response converter have been deleted. The residual
   synthetic dispatcher has the only typed-to-legacy query adapter.
+- The in-repository API client now resolves generated public operations below
+  the canonical `/db/v1` namespace while keeping internal group RPCs and the
+  contextual retrieval worker rooted. Stateful public multi-node fixtures use
+  an owned real-`httpx` test runtime, including deterministic listener restart
+  and stopped-node teardown; they no longer exercise `ApiHttpServer.executor()`.
+  Durable terminal transaction sessions remain visible until TTL cleanup so
+  commit retries can replay the stable result.
 - The former shared non-generated compatibility manifest and listener
   catch-alls are gone. Metadata has no manual dispatcher, and data and
   standalone register generated and contextual families explicitly. Unknown
