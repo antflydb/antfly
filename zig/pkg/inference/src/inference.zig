@@ -117,6 +117,7 @@ test {
     _ = architectures;
     _ = architectures.clipclap_format;
     _ = architectures.projector_format;
+    _ = @import("architectures/gemma4_runtime.zig");
     _ = @import("server/model_manager.zig");
     _ = finetune;
     _ = finetune_cli;
@@ -148,6 +149,7 @@ test {
     _ = native_smoke;
     _ = native_compute.native;
     if (build_options.enable_metal) {
+        _ = backends.metal_kv_storage;
         _ = metal_runtime;
         _ = native_compute.metal;
     }

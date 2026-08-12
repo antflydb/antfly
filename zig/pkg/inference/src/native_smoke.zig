@@ -230,14 +230,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return err;
     };
     defer cb.deinit();
-    const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-        null
-    else if (gpt_config.sliding_window > 0)
-        gpt_config.sliding_window
-    else if (gpt_config.max_position_embeddings > 0)
-        gpt_config.max_position_embeddings
-    else
-        null;
+    const sliding_window_size = gpt_config.kvPoolSlidingWindowSize(false);
 
     const pool_id = try kv_manager.addPool(.{
         .backend = backend_kind,

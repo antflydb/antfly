@@ -3124,6 +3124,19 @@ const CudaKvDeviceStorage = struct {
         }
     }
 
+    fn truncateSequence(
+        ctx: *anyopaque,
+        sequence_id: kv_storage_runtime.SequenceId,
+        retained_token_count: usize,
+    ) void {
+        const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        var it = self.layers.iterator();
+        while (it.next()) |entry| {
+            if (@as(u32, @intCast(entry.key_ptr.* >> 32)) != sequence_id) continue;
+            entry.value_ptr.token_count = @min(entry.value_ptr.token_count, retained_token_count);
+        }
+    }
+
     fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
         self.deinit();
@@ -3134,6 +3147,7 @@ const CudaKvDeviceStorage = struct {
         .writeLayerKvSuffix = writeLayerKvSuffix,
         .gatherLayerKvDevice = gatherLayerKvDevice,
         .pagedLayerKvDevice = pagedLayerKvDevice,
+        .truncateSequence = truncateSequence,
         .releaseSequence = releaseSequence,
         .deinit = hookDeinit,
     };

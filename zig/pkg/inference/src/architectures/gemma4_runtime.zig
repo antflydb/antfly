@@ -40,11 +40,15 @@ pub fn supportsRuntimeConfig(config: gpt_mod.Config) bool {
     return config.family == .gemma and !config.usesMoe();
 }
 
+pub fn wholeFramePrefillExplicitlyDisabled() bool {
+    return getenvBool("TERMITE_METAL_DISABLE_GATED_FAMILY_RUNTIME_PREFILL_BLOCK");
+}
+
 pub fn supportsWholeFramePrefill(config: gpt_mod.Config, configured_layer_count: usize) bool {
     if (!supportsRuntimeConfig(config)) return false;
     if (config.num_hidden_layers == 0 or config.num_hidden_layers > max_runtime_layers) return false;
     if (preparedLayers(@min(configured_layer_count, config.num_hidden_layers)) != config.num_hidden_layers) return false;
-    if (getenvBool("TERMITE_METAL_DISABLE_GATED_FAMILY_RUNTIME_PREFILL_BLOCK")) return false;
+    if (wholeFramePrefillExplicitlyDisabled()) return false;
     return true;
 }
 
