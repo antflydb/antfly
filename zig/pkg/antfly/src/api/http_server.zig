@@ -27226,7 +27226,7 @@ test "api http server keeps session maintenance off internal request paths" {
     try std.testing.expectEqual(@as(u64, 0), owner.last_session_lease_renew_ns.load(.acquire));
 }
 
-test "api http server contextual operation handles internal group lookups" {
+test "legacy api dispatcher no longer handles internal group lookups" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
@@ -27313,6 +27313,7 @@ test "api http server contextual operation handles internal group lookups" {
     };
 
     var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), null);
+    defer server.deinit();
 
     const req: http_common.HttpRequest = .{
         .method = .GET,
@@ -27322,9 +27323,8 @@ test "api http server contextual operation handles internal group lookups" {
     var response = try server.handle(req);
     defer response.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u16, 200), response.status);
-    try std.testing.expectEqualStrings("application/json", response.content_type.?);
-    try std.testing.expectEqual(@as(usize, 1), response.headers.len);
+    try std.testing.expectEqual(@as(u16, 404), response.status);
+    try std.testing.expectEqualStrings("not found", response.body);
 }
 
 test "api http server preserves public query availability errors" {

@@ -527,42 +527,9 @@ fn childRangeResponsesAlloc(alloc: std.mem.Allocator, child_ranges: []const db_m
 }
 
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, query: []const u8) !?http_common.HttpResponse {
+    _ = query;
     const alloc = ctx.alloc;
     const source = ctx.reads;
-    if (req.method == .GET) {
-        if (routes.Routes.matchGroupLookup(path)) |lookup| {
-            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, lookup.key);
-            defer alloc.free(decoded_key);
-            var lookup_opts = try http_route_helpers.parseLookupOptions(alloc, query);
-            defer lookup_opts.deinit(alloc);
-
-            var result = (reads.lookupGroupLocal(
-                alloc,
-                lookup.group_id,
-                lookup.table_name,
-                decoded_key,
-                lookup_opts.opts,
-                .read_index,
-            ) catch |err| switch (err) {
-                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
-                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
-                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
-                error.StorageReadTemporarilyUnavailable => return try http_route_helpers.textResponse(alloc, 503, "storage read temporarily unavailable"),
-                else => return err,
-            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            defer result.deinit(alloc);
-            var version_buf: [20]u8 = undefined;
-            const version = try std.fmt.bufPrint(&version_buf, "{d}", .{result.version});
-            return try http_route_helpers.jsonWithHeadersResponse(alloc, 200, result.json, &.{
-                .{
-                    .name = "X-Antfly-Version",
-                    .value = version,
-                },
-            });
-        }
-    }
-
     if (req.method == .GET) {
         if (routes.Routes.matchGroupDocumentArtifacts(path)) |artifact_route| {
             const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");

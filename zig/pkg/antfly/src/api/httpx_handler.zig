@@ -28,6 +28,7 @@ const http_server_mod = @import("http_server.zig");
 const operation_contract = @import("operation.zig");
 const probe_operations = @import("probe_operations.zig");
 const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
+const internal_group_operations = @import("internal_group_operations.zig");
 const internal_repair_operations = @import("internal_repair_operations.zig");
 const ApiHttpServer = http_server_mod.ApiHttpServer;
 const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
@@ -307,8 +308,8 @@ pub const AntflyApiHandler = struct {
         const group_prefix = routes.internal_groups_prefix ++ ":group_id";
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
-        try server.get(group_prefix ++ routes.group_db_median_key_suffix, handler);
-        try server.get(table_prefix ++ routes.documents_marker ++ ":key", handler);
+        try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
+        try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
         try server.get(internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix, httpx.Handler.bind(self, internalRepairCancelState));
         const internal_posts = [_][]const u8{
             internal_table_prefix ++ routes.corrupt_embedding_artifact_suffix,
@@ -765,6 +766,71 @@ pub const AntflyApiHandler = struct {
             else => textResponse(ctx, 500, "internal server error"),
         };
         return ctx.json(result);
+    }
+
+    fn internalGroupOperations(self: *AntflyApiHandler) internal_group_operations.Operations {
+        return .{
+            .reads = self.api_server.table_reads,
+            .shard_db_adapter = self.api_server.cfg.shard_db_adapter,
+        };
+    }
+
+    fn internalGroupErrorResponse(ctx: *httpx.Context, err: internal_group_operations.Error) !httpx.Response {
+        return switch (err) {
+            error.NotFound => textResponse(ctx, 404, "not found"),
+            error.Unsupported => textResponse(ctx, 405, "method not allowed"),
+            error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
+            error.IdentityReadGenerationChanged => textResponse(ctx, 409, "identity read generation changed"),
+            error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
+            error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
+            error.Canceled => textResponse(ctx, 408, "request canceled"),
+            error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            else => textResponse(ctx, 500, "internal server error"),
+        };
+    }
+
+    fn internalGroupMedianKey(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const group_id_raw = ctx.param("group_id") orelse return textResponse(ctx, 400, "invalid group id");
+        const group_id = std.fmt.parseUnsigned(u64, group_id_raw, 10) catch
+            return textResponse(ctx, 400, "invalid group id");
+        const median_key = self.internalGroupOperations().medianKey(
+            ctx.allocator,
+            operationContext(ctx, null),
+            group_id,
+        ) catch |err| return internalGroupErrorResponse(ctx, err);
+        defer if (median_key) |value| ctx.allocator.free(value);
+        return ctx.json(.{ .median_key = median_key });
+    }
+
+    fn internalGroupLookup(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const group_id_raw = ctx.param("group_id") orelse return textResponse(ctx, 400, "invalid group id");
+        const group_id = std.fmt.parseUnsigned(u64, group_id_raw, 10) catch
+            return textResponse(ctx, 400, "invalid group id");
+        const table_name = ctx.param("table_name") orelse return textResponse(ctx, 400, "invalid table name");
+        const encoded_key = ctx.param("key") orelse return textResponse(ctx, 400, "invalid path parameter");
+        const key = (try decodePathParamOrBadRequest(ctx, encoded_key)) orelse
+            return textResponse(ctx, 400, "invalid path parameter");
+        defer ctx.allocator.free(key);
+        var lookup_options = http_route_helpers.parseLookupOptions(
+            ctx.allocator,
+            ctx.request.uri.query orelse "",
+        ) catch return textResponse(ctx, 400, "invalid lookup options");
+        defer lookup_options.deinit(ctx.allocator);
+        var result = self.internalGroupOperations().lookup(
+            ctx.allocator,
+            operationContext(ctx, null),
+            .{
+                .group_id = group_id,
+                .table_name = table_name,
+                .key = key,
+                .options = lookup_options.opts,
+            },
+        ) catch |err| return internalGroupErrorResponse(ctx, err);
+        defer result.deinit(ctx.allocator);
+        var version_buf: [20]u8 = undefined;
+        const version = try std.fmt.bufPrint(&version_buf, "{d}", .{result.version});
+        try ctx.setHeader("X-Antfly-Version", version);
+        return jsonResponse(ctx, 200, result.json);
     }
 
     // ---------------------------------------------------------------
@@ -4800,6 +4866,86 @@ test "httpx shared registrar keeps root probes and rejects removed data aliases"
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 404), response.status.code);
     }
+}
+
+test "httpx internal group GET routes call typed operations directly" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        fn reads() table_reads.TableReadSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .lookup = publicLookup,
+                .scan = scan,
+                .query = query,
+                .lookup_group_local = groupLookup,
+            } };
+        }
+
+        fn shardDb() @import("../metadata/domain.zig").ShardDbAdapter {
+            return .{ .ptr = undefined, .vtable = &.{
+                .fetch_median_key = medianKey,
+                .schema_index_ready = schemaIndexReady,
+            } };
+        }
+
+        fn publicLookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn groupLookup(_: *anyopaque, inner_alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:a", key);
+            try std.testing.expectEqual(@as(usize, 1), opts.fields.len);
+            try std.testing.expectEqualStrings("title", opts.fields[0]);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            return .{ .json = try inner_alloc.dupe(u8, "{\"title\":\"alpha\"}"), .version = 42 };
+        }
+
+        fn medianKey(_: *anyopaque, inner_alloc: std.mem.Allocator, group_id: u64) !?[]u8 {
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            return try inner_alloc.dupe(u8, "doc:m");
+        }
+
+        fn schemaIndexReady(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u64, _: u32, _: u32) !bool {
+            return true;
+        }
+    };
+
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{ .shard_db_adapter = Fake.shardDb() }, source.iface(), Fake.reads(), null);
+    defer api_server.deinit();
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+
+    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/documents/doc:a?fields=title", .{base_url});
+    defer alloc.free(lookup_url);
+    var lookup = try getWithRetry(&client, client_io.io(), lookup_url, null, 20);
+    defer lookup.deinit();
+    try std.testing.expectEqual(@as(u16, 200), lookup.status.code);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", lookup.body.?);
+    try std.testing.expectEqualStrings("42", lookup.header("X-Antfly-Version").?);
+
+    const median_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/db/median-key", .{base_url});
+    defer alloc.free(median_url);
+    var median = try getWithRetry(&client, client_io.io(), median_url, null, 20);
+    defer median.deinit();
+    try std.testing.expectEqual(@as(u16, 200), median.status.code);
+    try std.testing.expectEqualStrings("{\"median_key\":\"doc:m\"}", median.body.?);
 }
 
 test "httpx storage maintenance routes call typed operations directly" {

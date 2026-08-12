@@ -78,6 +78,10 @@ that end state:
   handler owns path decoding and status mapping, while the operation owns job
   lookup and cancellation semantics; it no longer enters the synthetic
   internal `HttpRequest` dispatcher.
+- Internal group median-key and document lookup reads now follow the same
+  split. Query-string/path parsing and version-header adaptation remain at the
+  `httpx` edge, while group-local consistency, storage lookup, and error
+  classification live in typed operations callable without HTTP.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

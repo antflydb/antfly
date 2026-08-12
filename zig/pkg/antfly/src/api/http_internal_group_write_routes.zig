@@ -245,19 +245,6 @@ fn validateDocumentArtifactChildRangeBatchScope(
 }
 
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
-    if (req.method == .GET) {
-        if (routes.Routes.matchGroupDbMedianKey(path)) |route| {
-            const adapter = ctx.shard_db_adapter orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-            const median_key = adapter.fetchMedianKey(ctx.alloc, route.group_id) catch |err| switch (err) {
-                error.UnknownGroup => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
-                error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
-                else => return err,
-            };
-            defer if (median_key) |value| ctx.alloc.free(value);
-            return try http_route_helpers.jsonResponse(ctx.alloc, .{ .median_key = median_key });
-        }
-    }
-
     if (req.method != .POST) return null;
 
     if (routes.Routes.matchInternalTableCorruptEmbeddingArtifact(path)) |route| {
