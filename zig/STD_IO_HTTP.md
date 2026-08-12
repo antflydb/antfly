@@ -82,6 +82,10 @@ that end state:
   split. Query-string/path parsing and version-header adaptation remain at the
   `httpx` edge, while group-local consistency, storage lookup, and error
   classification live in typed operations callable without HTTP.
+- Internal distributed-join job-state lookup now accepts a typed job ID and
+  returns an owned typed state. JSON request decoding and response encoding are
+  confined to its concrete `httpx` handler; the old join route dispatcher no
+  longer recognizes this path.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

@@ -29,6 +29,7 @@ const operation_contract = @import("operation.zig");
 const probe_operations = @import("probe_operations.zig");
 const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 const internal_group_operations = @import("internal_group_operations.zig");
+const internal_join_operations = @import("internal_join_operations.zig");
 const internal_repair_operations = @import("internal_repair_operations.zig");
 const ApiHttpServer = http_server_mod.ApiHttpServer;
 const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
@@ -311,6 +312,7 @@ pub const AntflyApiHandler = struct {
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
         try server.get(internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix, httpx.Handler.bind(self, internalRepairCancelState));
+        try server.post(table_prefix ++ routes.join_job_state_suffix, httpx.Handler.bind(self, internalJoinJobState));
         const internal_posts = [_][]const u8{
             internal_table_prefix ++ routes.corrupt_embedding_artifact_suffix,
             group_prefix ++ routes.shard_ops_observe_split_suffix,
@@ -320,7 +322,6 @@ pub const AntflyApiHandler = struct {
             table_prefix ++ routes.graph_expand_suffix,
             table_prefix ++ routes.graph_hydrate_suffix,
             table_prefix ++ routes.text_stats_suffix,
-            table_prefix ++ routes.join_job_state_suffix,
             table_prefix ++ routes.join_finalize_suffix,
             table_prefix ++ routes.join_rows_suffix,
             table_prefix ++ routes.join_unmatched_suffix,
@@ -831,6 +832,29 @@ pub const AntflyApiHandler = struct {
         const version = try std.fmt.bufPrint(&version_buf, "{d}", .{result.version});
         try ctx.setHeader("X-Antfly-Version", version);
         return jsonResponse(ctx, 200, result.json);
+    }
+
+    fn internalJoinJobState(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid join job state request");
+        var input = std.json.parseFromSlice(
+            @import("distributed_join.zig").EncodedJoinJobStateRequest,
+            ctx.allocator,
+            body,
+            .{ .ignore_unknown_fields = true },
+        ) catch return textResponse(ctx, 400, "invalid join job state request");
+        defer input.deinit();
+        var result = (internal_join_operations.Operations{ .job_store = &self.api_server.join_job_store }).jobState(
+            ctx.allocator,
+            operationContext(ctx, null),
+            input.value.job_id,
+        ) catch |err| return switch (err) {
+            error.NotFound => textResponse(ctx, 404, "not found"),
+            error.Canceled => textResponse(ctx, 408, "request canceled"),
+            error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            else => textResponse(ctx, 500, "internal server error"),
+        };
+        defer result.deinit();
+        return ctx.json(result.parsed.value);
     }
 
     // ---------------------------------------------------------------
@@ -4946,6 +4970,14 @@ test "httpx internal group GET routes call typed operations directly" {
     defer median.deinit();
     try std.testing.expectEqual(@as(u16, 200), median.status.code);
     try std.testing.expectEqualStrings("{\"median_key\":\"doc:m\"}", median.body.?);
+
+    const join_state_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/join-job-state", .{base_url});
+    defer alloc.free(join_state_url);
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    var invalid_join_state = try requestWithRetry(&client, client_io.io(), .POST, join_state_url, "{}", &headers, 20);
+    defer invalid_join_state.deinit();
+    try std.testing.expectEqual(@as(u16, 400), invalid_join_state.status.code);
+    try std.testing.expectEqualStrings("invalid join job state request", invalid_join_state.body.?);
 }
 
 test "httpx storage maintenance routes call typed operations directly" {

@@ -34,19 +34,6 @@ pub const Context = struct {
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
     if (req.method != .POST) return null;
 
-    if (routes.Routes.matchGroupJoinJobState(path)) |join_job_state_route| {
-        _ = join_job_state_route;
-        const body = distributed_join.executeGroupJoinJobStateRequest(ctx.join_job_store, ctx.alloc, req.body) catch |err| switch (err) {
-            else => return try joinRouteErrorResponse(ctx.alloc, err, "invalid join job state request"),
-        };
-        defer ctx.alloc.free(body);
-        var arena_impl = std.heap.ArenaAllocator.init(ctx.alloc);
-        defer arena_impl.deinit();
-        const response = try std.json.parseFromSliceLeaky(distributed_join.EncodedJoinJobState, arena_impl.allocator(), body, .{
-            .allocate = .alloc_always,
-        });
-        return try http_route_helpers.jsonResponse(ctx.alloc, response);
-    }
     if (routes.Routes.matchGroupJoinFinalize(path)) |join_finalize_route| {
         const reads = ctx.reads orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         const body = distributed_join.executeGroupJoinFinalizeRequest(ctx.join_ctx, ctx.join_job_store, ctx.alloc, reads, join_finalize_route.group_id, join_finalize_route.table_name, req.body) catch |err| switch (err) {
@@ -135,12 +122,12 @@ test "internal group join routes require reads for join rows" {
     try std.testing.expectEqualStrings("not found", resp.body);
 }
 
-test "internal group join routes validate join job state requests" {
+test "legacy internal join dispatcher no longer handles join job state" {
     const alloc = std.testing.allocator;
     var join_job_store = distributed_join.JoinJobStore.init(alloc, .{});
     defer join_job_store.deinit();
 
-    var resp = (try handle(.{
+    const resp = try handle(.{
         .alloc = alloc,
         .reads = null,
         .join_ctx = TestJoinContext.context(),
@@ -149,11 +136,8 @@ test "internal group join routes validate join job state requests" {
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/join-job-state",
         .body = "{}",
-    }, "/internal/v1/groups/7/tables/docs/join-job-state")).?;
-    defer resp.deinit(alloc);
-
-    try std.testing.expectEqual(@as(u16, 400), resp.status);
-    try std.testing.expectEqualStrings("invalid join job state request", resp.body);
+    }, "/internal/v1/groups/7/tables/docs/join-job-state");
+    try std.testing.expect(resp == null);
 }
 
 test "internal group join routes map doc identity mismatch to conflict" {
