@@ -248,6 +248,11 @@ that end state:
   Restore submission validates the complete request and backup location before
   reporting worker availability, keeping deterministic client errors ahead of
   transient runtime admission failures.
+- API-client wire round trips now run against the real generated and contextual
+  router as well, including public tables, transaction sessions, and internal
+  group control. The transaction assertions cover read-set preflight conflicts,
+  stable commit replay, and terminal-record TTL cleanup instead of depending on
+  the synthetic dispatcher's obsolete response lifecycle.
 - The former shared non-generated compatibility manifest and listener
   catch-alls are gone. Metadata has no manual dispatcher, and data and
   standalone register generated and contextual families explicitly. Unknown

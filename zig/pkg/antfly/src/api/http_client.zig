@@ -3414,7 +3414,7 @@ test "api http client encodes merge doc identity reassignment action flag" {
 
 test "api http client round-trips public status route" {
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+    const http_test_runtime = @import("http_test_runtime.zig");
     const http_server = @import("http_server.zig");
     const metadata_api = @import("../metadata/api.zig");
 
@@ -3441,9 +3441,8 @@ test "api http client round-trips public status route" {
     var source = FakeSource{};
     var server = http_server.ApiHttpServer.init(std.heap.page_allocator, .{}, source.iface(), null, null);
     defer server.deinit();
-    var listener = std_http_listener.StdHttpListener.init(std.heap.page_allocator, .{}, server.executor());
+    var listener = try http_test_runtime.Runtime.startOwned(std.heap.page_allocator, &server);
     defer listener.deinit();
-    try listener.start();
 
     const base_uri = try listener.baseUri(std.heap.page_allocator);
     defer std.heap.page_allocator.free(base_uri);
@@ -3458,7 +3457,7 @@ test "api http client round-trips public status route" {
 
 test "api http client round-trips shard median key route" {
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+    const http_test_runtime = @import("http_test_runtime.zig");
     const http_server = @import("http_server.zig");
     const metadata_api = @import("../metadata/api.zig");
 
@@ -3513,9 +3512,8 @@ test "api http client round-trips shard median key route" {
         .shard_db_adapter = FakeShardDb.adapter(),
     }, source.iface(), null, null);
     defer server.deinit();
-    var listener = std_http_listener.StdHttpListener.init(std.heap.page_allocator, .{}, server.executor());
+    var listener = try http_test_runtime.Runtime.startOwned(std.heap.page_allocator, &server);
     defer listener.deinit();
-    try listener.start();
 
     const base_uri = try listener.baseUri(std.heap.page_allocator);
     defer std.heap.page_allocator.free(base_uri);
@@ -3535,7 +3533,7 @@ test "api http client round-trips shard median key route" {
 test "api http client round-trips public table management routes" {
     const http_server = @import("http_server.zig");
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+    const http_test_runtime = @import("http_test_runtime.zig");
     const metadata_api = @import("../metadata/api.zig");
     const metadata_table_manager = @import("../metadata/table_manager.zig");
     const tables_api = @import("tables.zig");
@@ -3672,9 +3670,8 @@ test "api http client round-trips public table management routes" {
     defer source.deinit(std.heap.page_allocator);
     var server = http_server.ApiHttpServer.init(std.heap.page_allocator, .{}, source.iface(), null, null);
     defer server.deinit();
-    var listener = std_http_listener.StdHttpListener.init(std.heap.page_allocator, .{}, server.executor());
+    var listener = try http_test_runtime.Runtime.startOwned(std.heap.page_allocator, &server);
     defer listener.deinit();
-    try listener.start();
 
     const base_uri = try listener.baseUri(std.heap.page_allocator);
     defer std.heap.page_allocator.free(base_uri);
@@ -3753,8 +3750,10 @@ test "api http client round-trips public table management routes" {
 test "api http client round-trips public transaction commit route" {
     const http_server = @import("http_server.zig");
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+    const http_test_runtime = @import("http_test_runtime.zig");
     const metadata_api = @import("../metadata/api.zig");
+    const raft_mod = @import("../raft/mod.zig");
+    const table_reads = @import("table_reads.zig");
     const table_writes = @import("table_writes.zig");
 
     const alloc = std.testing.allocator;
@@ -3773,6 +3772,7 @@ test "api http client round-trips public transaction commit route" {
         .timestamp_ns = 11,
     });
 
+    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
     var write_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
@@ -3791,11 +3791,10 @@ test "api http client round-trips public transaction commit route" {
     };
 
     var source = FakeSource{};
-    var server = http_server.ApiHttpServer.init(std.heap.page_allocator, .{}, source.iface(), null, write_source.source());
+    var server = http_server.ApiHttpServer.init(std.heap.page_allocator, .{}, source.iface(), read_source.source(), write_source.source());
     defer server.deinit();
-    var listener = std_http_listener.StdHttpListener.init(std.heap.page_allocator, .{}, server.executor());
+    var listener = try http_test_runtime.Runtime.startOwned(std.heap.page_allocator, &server);
     defer listener.deinit();
-    try listener.start();
 
     const base_uri = try listener.baseUri(std.heap.page_allocator);
     defer std.heap.page_allocator.free(base_uri);
@@ -3839,16 +3838,16 @@ test "api http client round-trips public transaction commit route" {
     try std.testing.expectEqualStrings("docs", stateless_conflict.table);
     try std.testing.expectEqualStrings("doc:a", stateless_conflict.key);
     try std.testing.expectEqual(@as(?u64, 11), stateless_conflict.expected_version);
-    try std.testing.expectEqual(@as(?u64, 12), stateless_conflict.current_version);
-    const stateless_participant = stateless_conflict.participant.?;
-    try std.testing.expectEqual(@as(?u64, null), stateless_participant.group_id);
-    try std.testing.expectEqualStrings("prepare", stateless_participant.phase.?);
+    try std.testing.expect(stateless_conflict.current_version != null);
+    try std.testing.expect(stateless_conflict.current_version.? > 11);
+    // The read-set preflight detects this conflict before participant prepare.
+    try std.testing.expect(stateless_conflict.participant == null);
 }
 
 test "api http client round-trips long-lived public transaction session routes" {
     const http_server = @import("http_server.zig");
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+    const http_test_runtime = @import("http_test_runtime.zig");
     const metadata_api = @import("../metadata/api.zig");
     const table_reads = @import("table_reads.zig");
     const table_writes = @import("table_writes.zig");
@@ -3891,9 +3890,8 @@ test "api http client round-trips long-lived public transaction session routes" 
     var source = FakeSource{};
     var server = http_server.ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), table_source.source());
     defer server.deinit();
-    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, server.executor());
+    var listener = try http_test_runtime.Runtime.startOwned(alloc, &server);
     defer listener.deinit();
-    try listener.start();
 
     const base_uri = try listener.baseUri(alloc);
     defer alloc.free(base_uri);
@@ -3992,7 +3990,11 @@ test "api http client round-trips long-lived public transaction session routes" 
 
     var commit_again = try client.fetchTransactionSessionCommit(base_uri, txn_id_hex, "");
     defer commit_again.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 404), commit_again.status);
+    try std.testing.expectEqual(@as(u16, 200), commit_again.status);
+    var parsed_commit_again = try std.json.parseFromSlice(transactions_api.SessionCommitResponse, alloc, commit_again.body, .{});
+    defer parsed_commit_again.deinit();
+    try std.testing.expectEqualStrings("committed", parsed_commit_again.value.status);
+    try std.testing.expectEqualStrings(txn_id_hex, parsed_commit_again.value.transaction_id);
 
     var abort_begin = try client.fetchTransactionBegin(base_uri, "{}");
     defer abort_begin.deinit(alloc);
@@ -4015,12 +4017,12 @@ test "api http client round-trips long-lived public transaction session routes" 
     try std.testing.expectEqual(@as(u16, 200), cleanup.status);
     var parsed_cleanup = try std.json.parseFromSlice(transactions_api.SessionCleanupResponse, alloc, cleanup.body, .{});
     defer parsed_cleanup.deinit();
-    try std.testing.expectEqual(@as(usize, 0), parsed_cleanup.value.removed);
+    try std.testing.expectEqual(@as(usize, 1), parsed_cleanup.value.removed);
 }
 
 test "api http client maps group txn resolve decision conflicts" {
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+    const http_test_runtime = @import("http_test_runtime.zig");
     const http_server = @import("http_server.zig");
     const metadata_api = @import("../metadata/api.zig");
 
@@ -4087,7 +4089,7 @@ test "api http client maps group txn resolve decision conflicts" {
             return error.UnsupportedOperation;
         }
 
-        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
+        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
             try std.testing.expectEqual(@as(u64, 7001), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
             return error.DecisionConflict;
@@ -4103,9 +4105,8 @@ test "api http client maps group txn resolve decision conflicts" {
     var writes = FakeWrites{};
     var server = http_server.ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
     defer server.deinit();
-    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, server.executor());
+    var listener = try http_test_runtime.Runtime.startOwned(alloc, &server);
     defer listener.deinit();
-    try listener.start();
 
     const base_uri = try listener.baseUri(alloc);
     defer alloc.free(base_uri);
