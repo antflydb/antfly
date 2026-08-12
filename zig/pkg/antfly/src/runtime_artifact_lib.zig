@@ -504,6 +504,8 @@ comptime {
             exportInternal(&standaloneInferenceCreate, "antfly_standalone_inference_create");
             exportInternal(&standaloneInferenceConfigure, "antfly_standalone_inference_configure");
             exportInternal(&standaloneInferenceProvider, "antfly_standalone_inference_provider");
+            exportInternal(&standaloneInferenceEmbedDense, "antfly_standalone_inference_embed_dense");
+            exportInternal(&standaloneInferenceDenseResultDestroy, "antfly_standalone_inference_dense_result_destroy");
             exportInternal(&standaloneInferenceRegisterRoutes, "antfly_standalone_inference_register_routes");
             exportInternal(&standaloneInferenceDestroy, "antfly_standalone_inference_destroy");
         },
@@ -529,6 +531,25 @@ fn standaloneInferenceConfigure(context: *const standalone_inference_bridge.Conf
 
 fn standaloneInferenceProvider(context: *const standalone_inference_bridge.ProviderContext) callconv(.c) void {
     standalone_inference_host.linkedInferenceProvider(context);
+}
+
+fn standaloneInferenceEmbedDense(
+    request: *const standalone_inference_bridge.DenseEmbeddingRequest,
+    out_result: *standalone_inference_bridge.DenseEmbeddingResult,
+    out_failure: *standalone_inference_bridge.FailureIdentity,
+) callconv(.c) standalone_inference_bridge.Status {
+    out_result.* = .{};
+    out_failure.* = .{};
+    standalone_inference_host.linkedInferenceEmbedDense(request, out_result) catch |err| {
+        return reportStandaloneInferenceFailure(out_failure, .embed_dense_texts, err);
+    };
+    return .ok;
+}
+
+fn standaloneInferenceDenseResultDestroy(
+    result: *standalone_inference_bridge.DenseEmbeddingResult,
+) callconv(.c) void {
+    standalone_inference_host.linkedInferenceDenseResultDestroy(result);
 }
 
 fn standaloneInferenceRegisterRoutes(context: *const standalone_inference_bridge.RoutesContext) callconv(.c) standalone_inference_bridge.Status {

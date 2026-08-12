@@ -27,6 +27,7 @@ pub const Operation = enum(u32) {
     create = 1,
     configure = 2,
     register_routes = 3,
+    embed_dense_texts = 4,
 };
 
 pub const String = extern struct {
@@ -95,6 +96,44 @@ pub const ProviderContext = extern struct {
     out_provider: *anyopaque,
 };
 
+pub const CancellationProbeFn = *const fn (?*const anyopaque) callconv(.c) u8;
+
+/// One coarse dense-embedding batch. All strings are borrowed for the
+/// synchronous call. Cancellation is queried through a consumer-local C ABI
+/// callback rather than passing a Zig atomic or `std.Io` across the boundary.
+pub const DenseEmbeddingRequest = extern struct {
+    version: u32 = abi_version,
+    has_deadline: u8 = 0,
+    _reserved0: [3]u8 = @splat(0),
+    handle: ?*anyopaque = null,
+    model: String,
+    texts: ?[*]const String = null,
+    text_count: usize = 0,
+    deadline_ns: u64 = 0,
+    cancellation_ctx: ?*const anyopaque = null,
+    cancellation_probe: ?CancellationProbeFn = null,
+};
+
+pub const DenseVector = extern struct {
+    values: ?[*]const f32 = null,
+    value_count: usize = 0,
+
+    pub fn slice(self: DenseVector) []const f32 {
+        const ptr = self.values orelse return &.{};
+        return ptr[0..self.value_count];
+    }
+};
+
+/// Provider-owned descriptors and vectors. The consumer copies the result
+/// into its own allocator and always calls the matching destroy function.
+pub const DenseEmbeddingResult = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    owner: ?*anyopaque = null,
+    vectors: ?[*]const DenseVector = null,
+    vector_count: usize = 0,
+};
+
 pub const RoutesContext = extern struct {
     handle: *anyopaque,
     server: *anyopaque,
@@ -104,5 +143,13 @@ pub const RoutesContext = extern struct {
 pub extern fn antfly_standalone_inference_create(context: *const CreateContext) callconv(.c) Status;
 pub extern fn antfly_standalone_inference_configure(context: *const ConfigureContext) callconv(.c) Status;
 pub extern fn antfly_standalone_inference_provider(context: *const ProviderContext) callconv(.c) void;
+pub extern fn antfly_standalone_inference_embed_dense(
+    request: *const DenseEmbeddingRequest,
+    out_result: *DenseEmbeddingResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub extern fn antfly_standalone_inference_dense_result_destroy(
+    result: *DenseEmbeddingResult,
+) callconv(.c) void;
 pub extern fn antfly_standalone_inference_register_routes(context: *const RoutesContext) callconv(.c) Status;
 pub extern fn antfly_standalone_inference_destroy(handle: *anyopaque) callconv(.c) void;

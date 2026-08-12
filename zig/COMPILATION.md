@@ -3993,6 +3993,68 @@ green. It does not complete the main goal by itself and does not supersede the
 required `AntflyProvider` replacement described in Phase 4v. Normal-runner
 evidence is still required before attributing the same reduction to Linux.
 
+### Phase 4x: identity-preserving dense-inference ABI slice
+
+The first `AntflyProvider` replacement slice moves a complete dense-embedding
+batch onto a dependency-neutral C-compatible ABI. The control unit retains the
+source-level `AntflyProvider` expected by data and enrichment code, but replaces
+its dense callbacks with consumer-local shims. The shim sends borrowed string
+descriptors, an optional scalar deadline, and an opaque cancellation callback
+and context to the inference archive. It does not send a Zig allocator,
+`std.Io`, atomic type, slice-of-slices, error union, or provider function table
+on this call. The inference provider owns all result vectors and descriptors;
+the consumer validates and copies them into its requested allocator and invokes
+the matching provider destroy function on every path.
+
+ABI 35 adds the append-only `embed_dense_texts` operation and stable statuses
+for `UnsupportedEmbeddingProvider`, `ModelNotFound`, `ModelNotSpecified`, and
+`ModelArtifactsChanging`. Existing `Timeout`, `Cancelled`, `OutOfMemory`,
+protocol, and resource statuses remain unchanged. Every non-successful call
+returns the canonical `FailureIdentity`; the consumer validates the status,
+ABI version, `inference_runtime` origin, operation, bounded exact Zig error
+name, and full-name hash before converting a registered status back to the
+identical Zig error. Unexpected provider defects remain `.internal` for control
+flow but retain their exact diagnostic name and hash. An inconsistent status,
+origin, operation, or success envelope is a protocol error rather than being
+relabelled as the reported domain failure.
+
+Request validation also preserves identity: only an actual version mismatch is
+`InvalidAbiVersion`; malformed pointers, counts, flags, reserved bytes, or a
+noncanonical cancellation pair are `InvalidArgument`. Results reject ambiguous
+zero-length pointers, missing ownership, excessive counts, and nonzero reserved
+fields as `InvalidBoundaryQueryResponse`. Empty successful batches still carry
+an explicit provider owner, so destruction remains unambiguous and idempotent
+at the consumer call site.
+
+Behavioral validation passed with zero leaks:
+
+- 47/47 focused standalone tests, including provider-owned result copying and
+  destruction, request/result validation, exact registered-error round trips,
+  and wrong-origin rejection;
+- the complete linked five-unit native Debug build;
+- 92/92 opaque storage-owner and status-registry tests;
+- 11/11 CAPI tests; and
+- all three graph gates plus 17/17 graph-analyzer tests.
+
+The unavoidable copy introduced by provider ownership is not a meaningful
+inference-path regression in a local `ReleaseFast` microbenchmark: copying a
+32-by-768 f32 batch (98,304 B) took 3.04 microseconds, and copying a
+256-by-1536 batch (1,572,864 B) took 58.14 microseconds. These are deliberately
+large representative result shapes and remain negligible beside model
+execution. If a future measured workload disproves that assumption, the next
+design should use a typed caller-buffer protocol, not a cross-unit Zig
+allocator.
+
+Decision: **keep this as the identity and ownership template for the remaining
+coarse inference operations**. It is a prerequisite slice, not yet a compiler
+graph win: sparse embedding, multipart embedding, reranking, generation,
+media, extraction, and model listing still come from the transitional raw Zig
+provider table. Because that table still exists, a cold `ReleaseFast` compiler
+comparison would not measure the intended root removal. Migrate the remaining
+callbacks using the same status/envelope and provider-owned-result rules, then
+delete `ProviderContext`, `linkedInferenceProvider`, and the raw provider export
+before taking the authoritative cold graph, time, RSS, and artifact measurement.
+
 ## Holistic target architecture
 
 The current structural candidate is the opt-in five-unit source-selected topology above:

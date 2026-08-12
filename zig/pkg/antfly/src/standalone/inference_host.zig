@@ -25,6 +25,20 @@ pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
     node: inference.server.Node,
     warm_models: ResolvedWarmModels,
+    io: ?std.Io = null,
+};
+
+const DenseEmbeddingOwner = struct {
+    vectors: [][]f32,
+    descriptors: []inference_bridge.DenseVector,
+
+    fn deinit(self: *DenseEmbeddingOwner) void {
+        const alloc = std.heap.c_allocator;
+        for (self.vectors) |vector| alloc.free(vector);
+        alloc.free(self.vectors);
+        alloc.free(self.descriptors);
+        alloc.destroy(self);
+    }
 };
 
 const ResolvedWarmModels = struct {
@@ -189,11 +203,116 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
     if (context.io) |io_ptr| {
         const io: *const std.Io = @ptrCast(@alignCast(io_ptr));
         state.node.attachIo(io.*);
+        state.io = io.*;
     }
     state.node.warmConfiguredModels(state.alloc) catch |err| {
         std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
         return err;
     };
+}
+
+/// Execute one complete dense-embedding batch using only the dependency-neutral
+/// bridge contract. Provider allocations stay provider-owned until the caller
+/// invokes `linkedInferenceDenseResultDestroy`.
+pub fn linkedInferenceEmbedDense(
+    request: *const inference_bridge.DenseEmbeddingRequest,
+    out_result: *inference_bridge.DenseEmbeddingResult,
+) !void {
+    try validateDenseEmbeddingRequest(request);
+    const handle = request.handle.?;
+    const input_strings = if (request.text_count == 0)
+        &.{}
+    else
+        request.texts.?[0..request.text_count];
+    if (isDenseRequestCancelled(request)) return error.Cancelled;
+
+    const alloc = std.heap.c_allocator;
+    const texts = try alloc.alloc([]const u8, input_strings.len);
+    defer alloc.free(texts);
+    for (input_strings, 0..) |input, i| texts[i] = input.slice();
+
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    const io = state.io orelse std.Io.Threaded.global_single_threaded.io();
+    const deadline_ns: ?u64 = if (request.has_deadline != 0) request.deadline_ns else null;
+    const vectors = try state.node.embedDenseTextsDirectWithContext(
+        alloc,
+        io,
+        deadline_ns,
+        request.model.slice(),
+        texts,
+    );
+    errdefer {
+        for (vectors) |vector| alloc.free(vector);
+        alloc.free(vectors);
+    }
+    if (isDenseRequestCancelled(request)) return error.Cancelled;
+
+    const descriptors = try alloc.alloc(inference_bridge.DenseVector, vectors.len);
+    errdefer alloc.free(descriptors);
+    for (vectors, 0..) |vector, i| {
+        descriptors[i] = .{
+            .values = if (vector.len == 0) null else vector.ptr,
+            .value_count = vector.len,
+        };
+    }
+    const owner = try alloc.create(DenseEmbeddingOwner);
+    owner.* = .{ .vectors = vectors, .descriptors = descriptors };
+    out_result.* = .{
+        .owner = owner,
+        .vectors = if (descriptors.len == 0) null else descriptors.ptr,
+        .vector_count = descriptors.len,
+    };
+}
+
+fn validateDenseEmbeddingRequest(request: *const inference_bridge.DenseEmbeddingRequest) !void {
+    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
+    if (request.handle == null or
+        request.has_deadline > 1 or
+        !std.mem.eql(u8, &request._reserved0, &@as([3]u8, @splat(0))) or
+        request.text_count > 1_000_000 or
+        (request.text_count == 0 and request.texts != null) or
+        (request.text_count != 0 and request.texts == null) or
+        (request.cancellation_ctx == null) != (request.cancellation_probe == null))
+    {
+        return error.InvalidArgument;
+    }
+}
+
+fn isDenseRequestCancelled(request: *const inference_bridge.DenseEmbeddingRequest) bool {
+    const probe = request.cancellation_probe orelse return false;
+    return probe(request.cancellation_ctx) != 0;
+}
+
+test "dense inference request validation preserves protocol error identity" {
+    var handle: u8 = 0;
+    const valid = inference_bridge.DenseEmbeddingRequest{
+        .handle = &handle,
+        .model = .init("model"),
+    };
+    try validateDenseEmbeddingRequest(&valid);
+
+    var wrong_version = valid;
+    wrong_version.version += 1;
+    try std.testing.expectError(
+        error.InvalidAbiVersion,
+        validateDenseEmbeddingRequest(&wrong_version),
+    );
+
+    var malformed = valid;
+    malformed.has_deadline = 2;
+    try std.testing.expectError(error.InvalidArgument, validateDenseEmbeddingRequest(&malformed));
+
+    malformed = valid;
+    malformed.cancellation_ctx = &handle;
+    try std.testing.expectError(error.InvalidArgument, validateDenseEmbeddingRequest(&malformed));
+}
+
+pub fn linkedInferenceDenseResultDestroy(result: *inference_bridge.DenseEmbeddingResult) void {
+    if (result.owner) |opaque_owner| {
+        const owner: *DenseEmbeddingOwner = @ptrCast(@alignCast(opaque_owner));
+        owner.deinit();
+    }
+    result.* = .{};
 }
 
 pub fn linkedInferenceProvider(context: *const inference_bridge.ProviderContext) void {

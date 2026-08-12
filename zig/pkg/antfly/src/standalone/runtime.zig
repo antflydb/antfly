@@ -23,6 +23,7 @@ const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const inference_bridge = @import("inference_bridge.zig");
+const inference_client = @import("inference_client.zig");
 const boundary_error_identity = @import("runtime_failure_identity");
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const storage_source_options = @import("storage_source_options");
@@ -1785,6 +1786,7 @@ pub fn runFromIterator(
             .handle = antfly_node,
             .out_provider = &provider,
         });
+        inference_client.installDenseAdapter(&provider, antfly_node);
         data_server.setAntflyProvider(provider);
     }
 
