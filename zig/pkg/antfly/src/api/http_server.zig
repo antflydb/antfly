@@ -12583,7 +12583,6 @@ pub const ApiHttpServer = struct {
         const parsed = backups_api.parseRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer parsed.deinit();
         backups_api.validateBackupId(parsed.value.backup_id) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup id");
-        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
         const connection = parsed.value.connection;
         var location = backups_api.openBackupLocationWithOptions(self.alloc, parsed.value.location, .{
             .secret_store = self.cfg.secret_store,
@@ -12593,6 +12592,7 @@ pub const ApiHttpServer = struct {
             .io = self.sharedApiIo(),
         }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         location.deinit(self.alloc);
+        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
         const idempotency_namespace = try restoreIdempotencyNamespaceAlloc(self.alloc, principal, .table, table_name);
         defer self.alloc.free(idempotency_namespace);
         const encoded = self.restore_job_store.start(self.alloc, .{
@@ -12645,7 +12645,6 @@ pub const ApiHttpServer = struct {
         defer backups_api.freeClusterRestoreRequest(self.alloc, &req);
         const connection = req.connection orelse return try contextualJsonErrorResponse(self.alloc, 400, "restore requires a named external_io connection");
         const restore_mode = backups_api.validateClusterRestoreMode(req.restore_mode) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore mode");
-        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
         var location = backups_api.openBackupLocationWithOptions(self.alloc, req.location, .{
             .secret_store = self.cfg.secret_store,
             .node_config = self.cfg.node_config,
@@ -12654,6 +12653,7 @@ pub const ApiHttpServer = struct {
             .io = self.sharedApiIo(),
         }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         location.deinit(self.alloc);
+        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
         const idempotency_namespace = try restoreIdempotencyNamespaceAlloc(self.alloc, principal, .cluster, null);
         defer self.alloc.free(idempotency_namespace);
         const encoded = self.restore_job_store.start(self.alloc, .{

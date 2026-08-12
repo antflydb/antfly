@@ -242,6 +242,12 @@ that end state:
   and stopped-node teardown; they no longer exercise `ApiHttpServer.executor()`.
   Durable terminal transaction sessions remain visible until TTL cleanup so
   commit retries can replay the stable result.
+- Stateful single-node public API fixtures now use that same owned `httpx`
+  runtime. Their raw wire requests use canonical generated paths, while
+  executor-backed listeners remain only for fake outbound provider peers.
+  Restore submission validates the complete request and backup location before
+  reporting worker availability, keeping deterministic client errors ahead of
+  transient runtime admission failures.
 - The former shared non-generated compatibility manifest and listener
   catch-alls are gone. Metadata has no manual dispatcher, and data and
   standalone register generated and contextual families explicitly. Unknown
