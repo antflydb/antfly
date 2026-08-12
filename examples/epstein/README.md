@@ -25,7 +25,7 @@ The documents are processed page-by-page, chunked for semantic search, and made 
 ```bash
 # From the antfly root directory
 cd zig
-zig build install
+zig build antfly
 ./zig-out/bin/antfly standalone
 ```
 

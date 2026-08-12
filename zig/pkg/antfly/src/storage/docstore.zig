@@ -377,6 +377,7 @@ pub const DocStore = struct {
     kind: Kind,
     runtime_store: backend_erased.Store,
     owns_runtime_store: bool,
+    owned_lsm_backend: ?lsm_backend.BackendHandle,
     env: LmdbEnvironment,
     dbi: LmdbDbi,
     lmdb_user_db_kind: LmdbUserDbKind,
@@ -710,7 +711,29 @@ pub const DocStore = struct {
     };
 
     pub fn open(alloc: Allocator, path: [*:0]const u8, opts: DocStoreOptions) !DocStore {
-        if (!supports_lmdb) return error.UnsupportedPlatform;
+        if (!supports_lmdb) {
+            var backend = try lsm_backend.BackendHandle.open(alloc, std.mem.span(path), .{
+                .backend = .{
+                    .read_only = opts.read_only,
+                    .create_if_missing = !opts.read_only,
+                },
+                .wal_enabled = !opts.read_only,
+            });
+            errdefer backend.close();
+            const runtime_store = try backend.backend.runtimeStore(alloc, .{});
+            return .{
+                .alloc = alloc,
+                .kind = .runtime,
+                .runtime_store = runtime_store,
+                .owns_runtime_store = true,
+                .owned_lsm_backend = backend,
+                .env = undefined,
+                .dbi = undefined,
+                .lmdb_user_db_kind = undefined,
+                .replay_index_state = .init(replay_index_unknown),
+                .next_replay_sequence_cached = .init(0),
+            };
+        }
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         if (!opts.read_only) {
@@ -747,6 +770,7 @@ pub const DocStore = struct {
             .kind = .lmdb,
             .runtime_store = undefined,
             .owns_runtime_store = false,
+            .owned_lsm_backend = null,
             .env = env,
             .dbi = resolved.dbi,
             .lmdb_user_db_kind = resolved.kind,
@@ -762,6 +786,7 @@ pub const DocStore = struct {
             .kind = .runtime,
             .runtime_store = runtime_store.store,
             .owns_runtime_store = runtime_store.owned,
+            .owned_lsm_backend = null,
             .env = undefined,
             .dbi = undefined,
             .lmdb_user_db_kind = undefined,
@@ -773,7 +798,10 @@ pub const DocStore = struct {
     pub fn close(self: *DocStore) void {
         switch (self.kind) {
             .lmdb => if (supports_lmdb) self.env.close(),
-            .runtime => if (self.owns_runtime_store) self.runtime_store.deinit(),
+            .runtime => {
+                if (self.owns_runtime_store) self.runtime_store.deinit();
+                if (self.owned_lsm_backend) |*backend| backend.close();
+            },
         }
         self.* = undefined;
     }

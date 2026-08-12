@@ -19,7 +19,6 @@ FROM --platform=$BUILDPLATFORM alpine:3.21 AS builder
 
 ARG TARGETARCH
 ARG ZIG_OPTIMIZE=ReleaseFast
-ARG ZIG_BUILD_JOBS=1
 
 RUN apk add --no-cache build-base clang lld curl xz git perl python3 linux-headers
 
@@ -35,7 +34,11 @@ RUN case "${TARGETARCH}" in \
         *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac && \
     cd zig && \
-    zig build -j"${ZIG_BUILD_JOBS}" -Dtarget="${zig_target}" -Doptimize="${ZIG_OPTIMIZE}" -Dedition=full install --prefix /out
+    python3 tools/run_bounded_zig_build.py --zig zig -- build \
+      -Dtarget="${zig_target}" \
+      -Doptimize="${ZIG_OPTIMIZE}" \
+      antfly \
+      --prefix /out
 
 FROM --platform=$BUILDPLATFORM alpine:3.21 AS wasmtime
 

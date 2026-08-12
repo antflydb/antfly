@@ -12,7 +12,7 @@ Build the Antfly C ABI first:
 
 ```bash
 cd ../../zig
-zig build lite-capi
+zig build capi
 cd ../examples/antfly-lite-retrieval-go
 ```
 

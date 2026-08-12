@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const runtime_callback_abi = @import("../../runtime_callback_abi.zig");
 
 pub const metadata_not_leader_header = "X-Antfly-Metadata-Not-Leader";
 pub const metadata_not_leader_value = "true";
@@ -154,49 +155,55 @@ pub const StreamingResponse = struct {
 pub const StreamWriter = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         start: *const fn (*anyopaque, std.mem.Allocator, StreamingResponse) anyerror!void,
         write_all: *const fn (*anyopaque, []const u8) anyerror!void,
         flush: *const fn (*anyopaque) anyerror!void,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn start(self: StreamWriter, alloc: std.mem.Allocator, response: StreamingResponse) !void {
-        try self.vtable.start(self.ptr, alloc, response);
+        try BoundaryAbi.call("start", self.boundary_dispatch, self.vtable.start, .{ self.ptr, alloc, response });
     }
 
     pub fn writeAll(self: StreamWriter, bytes: []const u8) !void {
-        try self.vtable.write_all(self.ptr, bytes);
+        try BoundaryAbi.call("write_all", self.boundary_dispatch, self.vtable.write_all, .{ self.ptr, bytes });
     }
 
     pub fn flush(self: StreamWriter) !void {
-        try self.vtable.flush(self.ptr);
+        try BoundaryAbi.call("flush", self.boundary_dispatch, self.vtable.flush, .{self.ptr});
     }
 };
 
 pub const StreamingRequestExecutor = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         execute: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: HttpRequest, writer: StreamWriter) anyerror!bool,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn execute(self: StreamingRequestExecutor, alloc: std.mem.Allocator, req: HttpRequest, writer: StreamWriter) !bool {
-        return try self.vtable.execute(self.ptr, alloc, req, writer);
+        return try BoundaryAbi.call("execute", self.boundary_dispatch, self.vtable.execute, .{ self.ptr, alloc, req, writer });
     }
 };
 
 pub const RequestExecutor = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         execute: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: HttpRequest) anyerror!HttpResponse,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn execute(self: RequestExecutor, alloc: std.mem.Allocator, req: HttpRequest) !HttpResponse {
-        return try self.vtable.execute(self.ptr, alloc, req);
+        return try BoundaryAbi.call("execute", self.boundary_dispatch, self.vtable.execute, .{ self.ptr, alloc, req });
     }
 };
 

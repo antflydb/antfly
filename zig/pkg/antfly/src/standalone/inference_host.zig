@@ -25,6 +25,13 @@ pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
     node: inference.server.Node,
     warm_models: ResolvedWarmModels,
+    runtime_config: std.json.Parsed(InferenceRuntimeConfig),
+};
+
+const InferenceRuntimeConfig = struct {
+    max_concurrent_requests: ?usize = null,
+    kernel_jit: inference.graph.kernel_jit.Config = .{},
+    prompt_cache: inference.server.PromptCacheConfig = .{},
 };
 
 const DenseEmbeddingOwner = struct {
@@ -184,6 +191,16 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
     const data_dir = context.data_dir_ptr[0..context.data_dir_len];
     const alloc = init.gpa;
 
+    var runtime_config = try std.json.parseFromSlice(
+        InferenceRuntimeConfig,
+        alloc,
+        context.runtime_config_json.slice(),
+        .{ .ignore_unknown_fields = false },
+    );
+    errdefer runtime_config.deinit();
+    try runtime_config.value.kernel_jit.validate();
+    try runtime_config.value.prompt_cache.validate();
+
     const state = try alloc.create(LinkedInferenceState);
     errdefer alloc.destroy(state);
     var warm_models = try convertWarmModels(alloc, context, loaded_config);
@@ -204,7 +221,11 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
             .scratch_limit_bytes = context.scratch_limit_bytes,
         },
         .preload = warm_models.items,
+        .kernel_jit = runtime_config.value.kernel_jit,
+        .prompt_cache = runtime_config.value.prompt_cache,
     };
+    if (runtime_config.value.max_concurrent_requests) |limit|
+        node_config.max_concurrent_requests = limit;
     if (loaded_config) |cfg| {
         if (cfg.effectiveAntflyContentSecurity()) |security| node_config.content_security = security.*;
         if (cfg.inference.s3_credentials) |creds| node_config.s3_credentials = creds;
@@ -219,6 +240,7 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
         .alloc = alloc,
         .node = try inference.server.Node.init(alloc, node_config),
         .warm_models = warm_models,
+        .runtime_config = runtime_config,
     };
     return state;
 }
@@ -653,8 +675,10 @@ pub fn linkedInferenceRegisterRoutes(context: *const inference_bridge.RoutesCont
 pub fn linkedInferenceDestroy(handle: *anyopaque) void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
     const alloc = state.alloc;
+    state.node.detachPromptCacheResourceUsageObserver();
     state.node.deinit();
     state.warm_models.deinit(alloc);
+    state.runtime_config.deinit();
     alloc.destroy(state);
 }
 
@@ -788,6 +812,48 @@ fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64
     manager.observeUsage(.inference_prompt_cache, current, next);
 }
 
+test "standalone prompt cache detaches resource observer before owner teardown" {
+    const Observer = struct {
+        alive: bool = true,
+        callbacks_after_teardown: usize = 0,
+
+        fn update(context: *anyopaque, current: *u64, next: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (!self.alive) self.callbacks_after_teardown += 1;
+            current.* = next;
+        }
+    };
+
+    var observer = Observer{};
+    var cache = inference.runtime.kv.prompt_cache.PromptPrefixCache.init(std.testing.allocator);
+    cache.configure(.{
+        .enabled = true,
+        .mode = .simple,
+        .min_tokens = 2,
+        .max_bytes = 1 << 20,
+        .resource_usage_observer = .{
+            .context = &observer,
+            .update = Observer.update,
+        },
+    });
+    const pool_id = (try cache.ensurePool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    })).?;
+    const sequence_id = try cache.manager.attachSequence(pool_id);
+    try cache.manager.appendTokens(sequence_id, 2);
+    try cache.storeFromSequence("shutdown", &.{ 1, 2 }, sequence_id);
+
+    cache.detachResourceUsageObserver();
+    observer.alive = false;
+    cache.deinit();
+    try std.testing.expectEqual(@as(usize, 0), observer.callbacks_after_teardown);
+}
+
 fn tokenizerCacheResourceBudget(
     manager: *antfly.resource_manager.ResourceManager,
 ) inference.hf_tokenizer.HfTokenizer.BpeCacheResourceBudget {
@@ -871,56 +937,25 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
     deadline_ns: ?u64,
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    var values = std.json.Array.init(alloc);
-    defer values.deinit();
-    var encoded_buffers = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (encoded_buffers.items) |buf| alloc.free(buf);
-        encoded_buffers.deinit(alloc);
-    }
+    const direct_parts = try localAntflyDirectDenseParts(alloc, parts);
+    defer alloc.free(direct_parts);
+    return try node.embedDensePartsDirectWithContext(alloc, io, deadline_ns, model, direct_parts);
+}
 
-    for (parts) |part| {
-        switch (part) {
-            .text => |text| {
-                var obj = std.json.ObjectMap.empty;
-                errdefer obj.deinit(alloc);
-                try obj.put(alloc, "type", .{ .string = "text" });
-                try obj.put(alloc, "text", .{ .string = text });
-                try values.append(.{ .object = obj });
-            },
-            .media_url => |url| {
-                var image_url = std.json.ObjectMap.empty;
-                errdefer image_url.deinit(alloc);
-                try image_url.put(alloc, "url", .{ .string = url });
-
-                var obj = std.json.ObjectMap.empty;
-                errdefer obj.deinit(alloc);
-                try obj.put(alloc, "type", .{ .string = "image_url" });
-                try obj.put(alloc, "image_url", .{ .object = image_url });
-                try values.append(.{ .object = obj });
-            },
-            .binary => |binary_part| {
-                const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
-                const encoded = try alloc.alloc(u8, encoded_len);
-                errdefer alloc.free(encoded);
-                _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
-                try encoded_buffers.append(alloc, encoded);
-
-                var obj = std.json.ObjectMap.empty;
-                errdefer {
-                    obj.deinit(alloc);
-                    _ = encoded_buffers.pop();
-                    alloc.free(encoded);
-                }
-                try obj.put(alloc, "type", .{ .string = "media" });
-                try obj.put(alloc, "data", .{ .string = encoded });
-                try obj.put(alloc, "mime_type", .{ .string = binary_part.mime_type });
-                try values.append(.{ .object = obj });
-            },
-        }
-    }
-
-    return try node.embedDenseJsonInputDirectWithContext(alloc, io, deadline_ns, model, .{ .array = values });
+pub fn localAntflyDirectDenseParts(
+    alloc: std.mem.Allocator,
+    parts: []const antfly.template.ContentPart,
+) ![]inference.server.Node.DirectDenseEmbedPart {
+    const out = try alloc.alloc(inference.server.Node.DirectDenseEmbedPart, parts.len);
+    for (parts, out) |part, *direct| direct.* = switch (part) {
+        .text => |text| .{ .text = text },
+        .media_url => |url| .{ .image_url = url },
+        .binary => |media| .{ .media = .{
+            .mime_type = media.mime_type,
+            .data = media.data,
+        } },
+    };
+    return out;
 }
 
 fn localAntflyEmbedDensePartsWithContext(
@@ -986,9 +1021,14 @@ fn localAntflyGenerateMessages(
     messages: []const antfly.inference.ChatMessage,
 ) anyerror![]u8 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    var converted = try convertLocalGenerateMessages(alloc, messages);
+    if (messages.len == 0) return error.InvalidGenerationRequest;
+    const preflight = try preflightLocalGenerateMessages(messages);
+    var admission = try node.beginDirectGenerateAdmission(preflight, 256);
+    defer admission.deinit();
+
+    var converted = try convertLocalGenerateMessages(alloc, messages, preflight.decoded_media_bytes);
     defer converted.deinit(alloc);
-    return try node.generateMessagesDirect(alloc, model, converted.messages);
+    return try node.generateMessagesDirectAdmitted(alloc, model, converted.messages, &admission);
 }
 
 fn localAntflyReadImages(
@@ -1042,18 +1082,113 @@ const LocalGenerateMessages = struct {
     }
 };
 
+const LocalGenerateMediaDescriptor = struct {
+    payload: []const u8,
+    mime_type: []const u8,
+    encoded_bytes: usize,
+    decoded_bytes: usize,
+};
+
+pub const LocalGenerateDecodeBudget = struct {
+    remaining_bytes: usize,
+
+    fn reserve(self: *@This(), bytes: usize) !void {
+        if (bytes > self.remaining_bytes) return error.RemoteContentTooLarge;
+        self.remaining_bytes -= bytes;
+    }
+};
+
+fn inspectLocalGenerateDataUri(
+    raw: []const u8,
+    declared_mime_type: ?[]const u8,
+) !LocalGenerateMediaDescriptor {
+    var mime_type = declared_mime_type orelse "application/octet-stream";
+    var payload = raw;
+    if (std.mem.startsWith(u8, raw, "data:")) {
+        const comma = std.mem.indexOfScalar(u8, raw, ',') orelse return error.UnsupportedGeneratorProvider;
+        const meta = raw["data:".len..comma];
+        if (!std.mem.endsWith(u8, meta, ";base64")) return error.UnsupportedGeneratorProvider;
+        const embedded_mime = meta[0 .. meta.len - ";base64".len];
+        if (embedded_mime.len > 0) {
+            if (declared_mime_type) |declared| {
+                if (!std.mem.eql(u8, declared, embedded_mime)) return error.UnsupportedGeneratorProvider;
+            }
+            mime_type = embedded_mime;
+        }
+        payload = raw[comma + 1 ..];
+    }
+
+    return .{
+        .payload = payload,
+        .mime_type = mime_type,
+        .encoded_bytes = raw.len,
+        .decoded_bytes = try std.base64.standard.Decoder.calcSizeForSlice(payload),
+    };
+}
+
+fn addLocalGenerateBytes(total: *usize, amount: usize) !void {
+    total.* = std.math.add(usize, total.*, amount) catch return error.RemoteContentTooLarge;
+}
+
+fn addLocalGenerateMediaPreflight(
+    preflight: *inference.server.Node.DirectGeneratePreflight,
+    descriptor: LocalGenerateMediaDescriptor,
+    image_only: bool,
+) !void {
+    const is_image = std.mem.startsWith(u8, descriptor.mime_type, "image/");
+    const is_audio = std.mem.startsWith(u8, descriptor.mime_type, "audio/");
+    if (!is_image and (image_only or !is_audio)) return error.UnsupportedGeneratorProvider;
+
+    try addLocalGenerateBytes(&preflight.encoded_media_bytes, descriptor.encoded_bytes);
+    try addLocalGenerateBytes(&preflight.decoded_media_bytes, descriptor.decoded_bytes);
+    try addLocalGenerateBytes(&preflight.media_count, 1);
+    if (is_image) {
+        try addLocalGenerateBytes(&preflight.image_count, 1);
+    } else {
+        preflight.has_audio = true;
+    }
+}
+
+pub fn preflightLocalGenerateMessages(
+    messages: []const antfly.inference.ChatMessage,
+) !inference.server.Node.DirectGeneratePreflight {
+    var preflight: inference.server.Node.DirectGeneratePreflight = .{};
+    for (messages) |message| {
+        const content = message.content orelse continue;
+        switch (content) {
+            .text => |text_value| try addLocalGenerateBytes(&preflight.text_bytes, text_value.len),
+            .parts => |parts| for (parts) |part| switch (part) {
+                .text => |text_value| try addLocalGenerateBytes(&preflight.text_bytes, text_value.len),
+                .image_url => |image_url| try addLocalGenerateMediaPreflight(
+                    &preflight,
+                    try inspectLocalGenerateDataUri(image_url.url, null),
+                    true,
+                ),
+                .media => |media| try addLocalGenerateMediaPreflight(
+                    &preflight,
+                    try inspectLocalGenerateDataUri(media.url orelse media.data, media.mime_type),
+                    false,
+                ),
+            },
+        }
+    }
+    return preflight;
+}
+
 pub fn convertLocalGenerateMessages(
     alloc: std.mem.Allocator,
     messages: []const antfly.inference.ChatMessage,
+    decoded_media_bytes: usize,
 ) !LocalGenerateMessages {
     var out = LocalGenerateMessages{
         .messages = try alloc.alloc(inference.pipelines.GenerationMessage, messages.len),
     };
     errdefer out.deinit(alloc);
 
-    for (messages, 0..) |message, i| {
-        out.messages[i] = try convertLocalGenerateMessage(alloc, &out, message);
-    }
+    var decode_budget = LocalGenerateDecodeBudget{ .remaining_bytes = decoded_media_bytes };
+    for (messages, 0..) |message, i|
+        out.messages[i] = try convertLocalGenerateMessage(alloc, &out, message, &decode_budget);
+    if (decode_budget.remaining_bytes != 0) return error.InvalidGenerationAdmission;
     return out;
 }
 
@@ -1061,6 +1196,7 @@ fn convertLocalGenerateMessage(
     alloc: std.mem.Allocator,
     owner: *LocalGenerateMessages,
     message: antfly.inference.ChatMessage,
+    decode_budget: *LocalGenerateDecodeBudget,
 ) !inference.pipelines.GenerationMessage {
     const role = message.role.toSlice();
     const content = message.content orelse {
@@ -1081,7 +1217,7 @@ fn convertLocalGenerateMessage(
             text_owned = false;
             break :blk .{ .role = role, .content = text };
         },
-        .parts => |parts| try convertLocalGenerateParts(alloc, owner, role, parts),
+        .parts => |parts| try convertLocalGenerateParts(alloc, owner, role, parts, decode_budget),
     };
 }
 
@@ -1090,6 +1226,7 @@ fn convertLocalGenerateParts(
     owner: *LocalGenerateMessages,
     role: []const u8,
     parts: []const antfly.inference.ContentPart,
+    decode_budget: *LocalGenerateDecodeBudget,
 ) !inference.pipelines.GenerationMessage {
     var text_buf = std.ArrayListUnmanaged(u8).empty;
     errdefer text_buf.deinit(alloc);
@@ -1109,7 +1246,7 @@ fn convertLocalGenerateParts(
                 try out_parts.append(alloc, .{ .text = text });
             },
             .image_url => |image_url| {
-                const decoded = try decodeLocalGenerateDataUri(alloc, image_url.url, null);
+                const decoded = try decodeLocalGenerateDataUri(alloc, image_url.url, null, decode_budget);
                 var decoded_owned = true;
                 errdefer if (decoded_owned) alloc.free(decoded.data);
                 if (!std.mem.startsWith(u8, decoded.mime_type, "image/")) {
@@ -1122,7 +1259,7 @@ fn convertLocalGenerateParts(
             },
             .media => |media| {
                 const raw = media.url orelse media.data;
-                const decoded = try decodeLocalGenerateDataUri(alloc, raw, media.mime_type);
+                const decoded = try decodeLocalGenerateDataUri(alloc, raw, media.mime_type, decode_budget);
                 var decoded_owned = true;
                 errdefer if (decoded_owned) alloc.free(decoded.data);
                 if (std.mem.startsWith(u8, decoded.mime_type, "image/")) {
@@ -1186,32 +1323,18 @@ const DecodedLocalMedia = struct {
     mime_type: []const u8,
 };
 
-fn decodeLocalGenerateDataUri(
+pub fn decodeLocalGenerateDataUri(
     alloc: std.mem.Allocator,
     raw: []const u8,
     declared_mime_type: ?[]const u8,
+    decode_budget: *LocalGenerateDecodeBudget,
 ) !DecodedLocalMedia {
-    var mime_type = declared_mime_type orelse "application/octet-stream";
-    var payload = raw;
-    if (std.mem.startsWith(u8, raw, "data:")) {
-        const comma = std.mem.indexOfScalar(u8, raw, ',') orelse return error.UnsupportedGeneratorProvider;
-        const meta = raw["data:".len..comma];
-        if (!std.mem.endsWith(u8, meta, ";base64")) return error.UnsupportedGeneratorProvider;
-        const embedded_mime = meta[0 .. meta.len - ";base64".len];
-        if (embedded_mime.len > 0) {
-            if (declared_mime_type) |declared| {
-                if (!std.mem.eql(u8, declared, embedded_mime)) return error.UnsupportedGeneratorProvider;
-            }
-            mime_type = embedded_mime;
-        }
-        payload = raw[comma + 1 ..];
-    }
-
-    const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(payload);
-    const decoded = try alloc.alloc(u8, decoded_len);
+    const descriptor = try inspectLocalGenerateDataUri(raw, declared_mime_type);
+    try decode_budget.reserve(descriptor.decoded_bytes);
+    const decoded = try alloc.alloc(u8, descriptor.decoded_bytes);
     errdefer alloc.free(decoded);
-    try std.base64.standard.Decoder.decode(decoded, payload);
-    return .{ .data = decoded, .mime_type = mime_type };
+    try std.base64.standard.Decoder.decode(decoded, descriptor.payload);
+    return .{ .data = decoded, .mime_type = descriptor.mime_type };
 }
 
 // ---------------------------------------------------------------

@@ -248,25 +248,69 @@ pub const CudaContext = struct {
         self.noteKernelLaunch();
     }
 
-    pub fn beginProfileEventPair(self: *CudaContext) driver_mod.Error!ProfileEventPair {
+    /// Return the driver's authoritative stream-capture state when the
+    /// installed CUDA driver exposes it. The local flag remains the fallback
+    /// for older drivers and for unit-test contexts. Treat an invalidated
+    /// capture as active: descriptor creation, event timing, and other
+    /// capture-unsafe first-use work must still be rejected on that stream.
+    pub fn streamCaptureActive(self: *CudaContext) driver_mod.Error!bool {
+        const query = self.driver.fns.cuStreamIsCapturing orelse
+            return self.debug_graph_capture_active;
+        try self.makeCurrent();
+        var status: driver_mod.CUstreamCaptureStatus = driver_mod.CU_STREAM_CAPTURE_STATUS_NONE;
+        try self.driver.check(query(self.stream, &status));
+        return status != driver_mod.CU_STREAM_CAPTURE_STATUS_NONE;
+    }
+
+    /// Create a timing event pair without recording either event. Used by the
+    /// pooled, non-blocking profiler so the two `cuEventCreate` calls happen once
+    /// per pool slot rather than once per profiled op.
+    pub fn createProfileEventPair(self: *CudaContext) driver_mod.Error!ProfileEventPair {
         try self.makeCurrent();
         var pair = ProfileEventPair{};
         errdefer self.destroyProfileEventPair(pair);
         try self.driver.check(self.driver.fns.cuEventCreate(&pair.start, driver_mod.CU_EVENT_DEFAULT));
         try self.driver.check(self.driver.fns.cuEventCreate(&pair.end, driver_mod.CU_EVENT_DEFAULT));
+        return pair;
+    }
+
+    /// Record the start event on the compute stream. Returns immediately (async).
+    pub fn recordProfileStart(self: *CudaContext, pair: ProfileEventPair) driver_mod.Error!void {
+        try self.makeCurrent();
         try self.driver.check(self.driver.fns.cuEventRecord(pair.start, self.stream));
+    }
+
+    /// Record the end event on the compute stream. Returns immediately (async):
+    /// unlike `endProfileEventPairUs` this performs NO host synchronization, so a
+    /// caller timing many ops can defer a single sync until it drains the batch.
+    pub fn recordProfileEnd(self: *CudaContext, pair: ProfileEventPair) driver_mod.Error!void {
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuEventRecord(pair.end, self.stream));
+    }
+
+    /// Read the elapsed time between an already-recorded, already-completed event
+    /// pair. The caller MUST have synchronized (e.g. one `cuStreamSynchronize`
+    /// covering the whole batch) so both events have fired; this neither
+    /// synchronizes nor destroys the events (the pool reuses them).
+    pub fn readProfileEventPairUs(self: *CudaContext, pair: ProfileEventPair) driver_mod.Error!u64 {
+        var elapsed_ms: f32 = 0;
+        try self.driver.check(self.driver.fns.cuEventElapsedTime(&elapsed_ms, pair.start, pair.end));
+        if (elapsed_ms <= 0) return 0;
+        return @intFromFloat(@as(f64, elapsed_ms) * 1000.0);
+    }
+
+    pub fn beginProfileEventPair(self: *CudaContext) driver_mod.Error!ProfileEventPair {
+        const pair = try self.createProfileEventPair();
+        errdefer self.destroyProfileEventPair(pair);
+        try self.recordProfileStart(pair);
         return pair;
     }
 
     pub fn endProfileEventPairUs(self: *CudaContext, pair: ProfileEventPair) driver_mod.Error!u64 {
         defer self.destroyProfileEventPair(pair);
-        try self.makeCurrent();
-        try self.driver.check(self.driver.fns.cuEventRecord(pair.end, self.stream));
+        try self.recordProfileEnd(pair);
         try self.driver.check(self.driver.fns.cuEventSynchronize(pair.end));
-        var elapsed_ms: f32 = 0;
-        try self.driver.check(self.driver.fns.cuEventElapsedTime(&elapsed_ms, pair.start, pair.end));
-        if (elapsed_ms <= 0) return 0;
-        return @intFromFloat(@as(f64, elapsed_ms) * 1000.0);
+        return self.readProfileEventPairUs(pair);
     }
 
     pub fn destroyGraphExec(self: *CudaContext, exec: CUgraphExec) void {
@@ -281,7 +325,7 @@ pub const CudaContext = struct {
         _ = self.driver.fns.cuGraphDestroy(graph);
     }
 
-    fn destroyProfileEventPair(self: *CudaContext, pair: ProfileEventPair) void {
+    pub fn destroyProfileEventPair(self: *CudaContext, pair: ProfileEventPair) void {
         if (pair.start != null) {
             _ = self.driver.fns.cuEventDestroy(pair.start);
         }

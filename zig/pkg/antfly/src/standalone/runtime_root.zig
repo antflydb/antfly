@@ -30,6 +30,7 @@ pub const metadata = @import("../metadata/mod.zig");
 pub const metadata_api = @import("../metadata/api.zig");
 pub const metadata_service = @import("../metadata/service.zig");
 pub const public_api = @import("../api/runtime.zig");
+pub const casbin = @import("antfly_casbin");
 pub const raft = @import("../raft/mod.zig");
 pub const readers = @import("antfly_readers");
 pub const resource_manager = @import("../storage/resource_manager.zig");

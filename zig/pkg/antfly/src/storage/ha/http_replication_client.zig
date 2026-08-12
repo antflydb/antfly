@@ -80,24 +80,36 @@ pub const AppliedBatch = struct {
     progress: standby_mod.Progress,
 };
 
+pub const AuthOptions = struct {
+    bearer_token: ?[]const u8 = null,
+};
+
 pub const Client = struct {
     alloc: Allocator,
     executor: http_common.RequestExecutor,
+    auth: AuthOptions = .{},
 
     pub fn init(alloc: Allocator, executor: http_common.RequestExecutor) Client {
+        return initWithOptions(alloc, executor, .{});
+    }
+
+    pub fn initWithOptions(alloc: Allocator, executor: http_common.RequestExecutor, auth: AuthOptions) Client {
         return .{
             .alloc = alloc,
             .executor = executor,
+            .auth = auth,
         };
     }
 
     pub fn identifySystem(self: *Client, base_uri: []const u8) !internal_api.HAIdentifySystemResponse {
         const uri = try join(self.alloc, base_uri, internal_api.routes.ha_replication_identify);
-        errdefer self.alloc.free(uri);
+        var free_uri_on_error = true;
+        errdefer if (free_uri_on_error) self.alloc.free(uri);
         var resp = try self.execute(.{
             .method = .GET,
             .uri = uri,
         });
+        free_uri_on_error = false;
         defer self.alloc.free(resp.request_uri);
         defer resp.response.deinit(self.alloc);
         try mapStatus(resp.response.status, resp.response.body);
@@ -133,13 +145,15 @@ pub const Client = struct {
         defer self.alloc.free(body);
 
         const uri = try join(self.alloc, base_uri, internal_api.routes.ha_replication_slots);
-        errdefer self.alloc.free(uri);
+        var free_uri_on_error = true;
+        errdefer if (free_uri_on_error) self.alloc.free(uri);
         var resp = try self.execute(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
             .body = body,
         });
+        free_uri_on_error = false;
         defer self.alloc.free(resp.request_uri);
         defer resp.response.deinit(self.alloc);
         try mapStatus(resp.response.status, resp.response.body);
@@ -363,13 +377,15 @@ pub const Client = struct {
         defer self.alloc.free(body);
 
         const uri = try join(self.alloc, base_uri, internal_api.routes.ha_replication_start);
-        errdefer self.alloc.free(uri);
+        var free_uri_on_error = true;
+        errdefer if (free_uri_on_error) self.alloc.free(uri);
         var resp = try self.execute(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
             .body = body,
         });
+        free_uri_on_error = false;
         errdefer {
             self.alloc.free(resp.request_uri);
             resp.response.deinit(self.alloc);
@@ -441,12 +457,21 @@ pub const Client = struct {
         try verifyStandbyStatusUpdateResponse(parsed.value, slot_name, identity, progress);
     }
 
-    fn execute(self: *Client, req: http_common.HttpRequest) !OwnedResponse {
+    fn execute(self: *Client, raw_request: http_common.HttpRequest) !OwnedResponse {
+        var request = raw_request;
+        var authorization: ?[]u8 = null;
+        defer if (authorization) |value| self.alloc.free(value);
+        if (self.auth.bearer_token) |token| {
+            try validateBearerToken(token);
+            authorization = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{token});
+            request.authorization = authorization.?;
+        }
+
         var attempt: usize = 0;
         while (true) {
             return .{
-                .request_uri = req.uri,
-                .response = self.executor.execute(self.alloc, req) catch |err| switch (err) {
+                .request_uri = request.uri,
+                .response = self.executor.execute(self.alloc, request) catch |err| switch (err) {
                     error.HttpConnectionClosing,
                     error.ConnectionResetByPeer,
                     error.ConnectionRefused,
@@ -574,8 +599,8 @@ fn validateFrameMetadata(frame: internal_api.openapi.types.HAReplicationFrame, r
 
 fn validateRecordIdentity(record: replication_record.RecordView, expected: standby_mod.Identity) !void {
     if (record.cluster_id != expected.cluster_id) return error.WrongCluster;
-    if (record.shard_id != expected.shard_id) return error.WrongShard;
-    if (record.table_id != expected.table_id) return error.WrongTable;
+    if (expected.shard_id != 0 and record.shard_id != expected.shard_id) return error.WrongShard;
+    if (expected.table_id != 0 and record.table_id != expected.table_id) return error.WrongTable;
     if (record.kind == .timeline_switch) {
         if (record.timeline_id <= expected.timeline_id) return error.InvalidTimelineSwitch;
         if (record.epoch <= expected.epoch) return error.InvalidTimelineSwitch;
@@ -655,6 +680,13 @@ fn positiveUint64FromJson(value: i64) !u64 {
 
 fn validateSlotName(slot_name: []const u8) !void {
     if (!validation.isIdentifier(slot_name)) return error.InvalidSlotName;
+}
+
+fn validateBearerToken(token: []const u8) !void {
+    if (token.len == 0) return error.InvalidInternalReplicationBearerToken;
+    for (token) |byte| {
+        if (byte <= 0x20 or byte == 0x7f) return error.InvalidInternalReplicationBearerToken;
+    }
 }
 
 fn validateBaseURI(base_uri: []const u8) !void {
@@ -780,6 +812,23 @@ const NoCallExecutor = struct {
         _ = alloc;
         _ = req;
         return error.TestExecutorShouldNotRun;
+    }
+};
+
+const NotFoundExecutor = struct {
+    fn executor(self: *NotFoundExecutor) http_common.RequestExecutor {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .execute = execute },
+        };
+    }
+
+    fn execute(_: *anyopaque, alloc: Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+        return .{
+            .status = 404,
+            .content_type = try alloc.dupe(u8, "text/plain"),
+            .body = try alloc.dupe(u8, "not found"),
+        };
     }
 };
 
@@ -1129,6 +1178,25 @@ test "storage.ha http replication client rejects invalid local inputs before exe
     );
 }
 
+test "storage.ha http replication client releases transferred request URIs once on status errors" {
+    const alloc = std.testing.allocator;
+    var executor = NotFoundExecutor{};
+    var client = Client.init(alloc, executor.executor());
+
+    try std.testing.expectError(
+        error.InternalReplicationEndpointNotFound,
+        client.identifySystem("http://primary.internal.test"),
+    );
+    try std.testing.expectError(
+        error.InternalReplicationEndpointNotFound,
+        client.createReplicationSlot("http://primary.internal.test", "standby-a", 0),
+    );
+    try std.testing.expectError(
+        error.InternalReplicationEndpointNotFound,
+        client.startReplication("http://primary.internal.test", "standby-a", 1, .{}),
+    );
+}
+
 test "storage.ha http replication client pulls applies and acknowledges standby progress" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "replicate");
@@ -1184,6 +1252,48 @@ test "storage.ha http replication client pulls applies and acknowledges standby 
         .standby_names = &names,
     });
     try std.testing.expectEqual(primary_mod.DurabilityStatus.satisfied, decision.status);
+}
+
+test "storage.ha http replication client replicates mixed tables for whole instance identity" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "replicate-whole-instance");
+    defer paths.deinit(alloc);
+    const identity = standby_mod.Identity{
+        .cluster_id = 100,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+
+    var server = http_internal.Server.init(alloc, &primary);
+    var client = Client.init(alloc, server.executor());
+    try client.createReplicationSlotForStandby("http://primary.internal.test", "standby-a", 0, &standby);
+    _ = try primary.append(.{ .shard_id = 10, .table_id = 20, .payload = "one" });
+    _ = try primary.append(.{ .shard_id = 11, .table_id = 21, .payload = "two" });
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const result = try client.replicateAvailable(
+        "http://primary.internal.test",
+        "standby-a",
+        &standby,
+        &capture,
+        ApplyCapture.apply,
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 2), result.received_count);
+    try std.testing.expectEqual(@as(usize, 2), result.applied_count);
+    standby.close();
+
+    var reopened = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer reopened.close();
+    try std.testing.expectEqual(identity, reopened.identitySnapshot());
+    try std.testing.expectEqual(@as(u64, 2), reopened.currentProgress().safe_read_lsn);
 }
 
 test "storage.ha http replication client verifies upstream identity before streaming" {

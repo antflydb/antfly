@@ -334,8 +334,8 @@ pub const Standby = struct {
 
     fn receiveTimelineSwitch(self: *Standby, record: replication_record.Record) !u64 {
         if (record.cluster_id != self.identity_state.cluster_id) return error.WrongCluster;
-        if (record.shard_id != self.identity_state.shard_id) return error.WrongShard;
-        if (record.table_id != self.identity_state.table_id) return error.WrongTable;
+        if (!scopeDimensionMatches(self.identity_state.shard_id, record.shard_id)) return error.WrongShard;
+        if (!scopeDimensionMatches(self.identity_state.table_id, record.table_id)) return error.WrongTable;
         if (record.timeline_id <= self.identity_state.timeline_id) return error.InvalidTimelineSwitch;
         if (record.epoch <= self.identity_state.epoch) return error.InvalidTimelineSwitch;
         if (record.lsn != self.progress_state.received_lsn + 1) return error.UnexpectedRecordLsn;
@@ -346,8 +346,8 @@ pub const Standby = struct {
         const lsn = try self.receive_log.append(self.alloc, record);
         const next_identity = Identity{
             .cluster_id = record.cluster_id,
-            .shard_id = record.shard_id,
-            .table_id = record.table_id,
+            .shard_id = self.identity_state.shard_id,
+            .table_id = self.identity_state.table_id,
             .timeline_id = record.timeline_id,
             .epoch = record.epoch,
         };
@@ -572,11 +572,11 @@ pub const Standby = struct {
                 expected_lsn = entry.record.lsn;
             }
             if (entry.record.cluster_id != self.identity_state.cluster_id) return error.WrongCluster;
-            if (entry.record.shard_id != self.identity_state.shard_id) return error.WrongShard;
-            if (entry.record.table_id != self.identity_state.table_id) return error.WrongTable;
+            if (!scopeDimensionMatches(self.identity_state.shard_id, entry.record.shard_id)) return error.WrongShard;
+            if (!scopeDimensionMatches(self.identity_state.table_id, entry.record.table_id)) return error.WrongTable;
 
             if (current_identity) |current| {
-                if (recordMatchesIdentity(entry.record, current)) {
+                if (recordMatchesTimeline(entry.record, current)) {
                     expected_lsn.? += 1;
                     continue;
                 }
@@ -587,8 +587,8 @@ pub const Standby = struct {
 
             current_identity = .{
                 .cluster_id = entry.record.cluster_id,
-                .shard_id = entry.record.shard_id,
-                .table_id = entry.record.table_id,
+                .shard_id = self.identity_state.shard_id,
+                .table_id = self.identity_state.table_id,
                 .timeline_id = entry.record.timeline_id,
                 .epoch = entry.record.epoch,
             };
@@ -630,8 +630,8 @@ pub const Standby = struct {
         defer entry.deinit(self.alloc);
         if (entry.record.kind != .timeline_switch) return null;
         if (entry.record.cluster_id != self.identity_state.cluster_id) return error.WrongCluster;
-        if (entry.record.shard_id != self.identity_state.shard_id) return error.WrongShard;
-        if (entry.record.table_id != self.identity_state.table_id) return error.WrongTable;
+        if (!scopeDimensionMatches(self.identity_state.shard_id, entry.record.shard_id)) return error.WrongShard;
+        if (!scopeDimensionMatches(self.identity_state.table_id, entry.record.table_id)) return error.WrongTable;
         if (entry.record.timeline_id < self.identity_state.timeline_id) return error.WrongTimeline;
         if (entry.record.timeline_id == self.identity_state.timeline_id and entry.record.epoch != self.identity_state.epoch) return error.WrongEpoch;
         if (entry.record.timeline_id > self.identity_state.timeline_id and entry.record.epoch <= self.identity_state.epoch) return error.InvalidTimelineSwitch;
@@ -640,8 +640,8 @@ pub const Standby = struct {
         return .{
             .identity = .{
                 .cluster_id = entry.record.cluster_id,
-                .shard_id = entry.record.shard_id,
-                .table_id = entry.record.table_id,
+                .shard_id = self.identity_state.shard_id,
+                .table_id = self.identity_state.table_id,
                 .timeline_id = entry.record.timeline_id,
                 .epoch = entry.record.epoch,
             },
@@ -655,8 +655,8 @@ pub const Standby = struct {
 
     fn validateRecord(self: *const Standby, record: replication_record.RecordView) !void {
         if (record.cluster_id != self.identity_state.cluster_id) return error.WrongCluster;
-        if (record.shard_id != self.identity_state.shard_id) return error.WrongShard;
-        if (record.table_id != self.identity_state.table_id) return error.WrongTable;
+        if (!scopeDimensionMatches(self.identity_state.shard_id, record.shard_id)) return error.WrongShard;
+        if (!scopeDimensionMatches(self.identity_state.table_id, record.table_id)) return error.WrongTable;
         if (record.timeline_id != self.identity_state.timeline_id) return error.WrongTimeline;
         if (record.epoch != self.identity_state.epoch) return error.WrongEpoch;
     }
@@ -724,10 +724,12 @@ pub const Standby = struct {
     }
 };
 
-fn recordMatchesIdentity(record: replication_record.RecordView, identity: Identity) bool {
+fn scopeDimensionMatches(expected: u64, actual: u64) bool {
+    return expected == 0 or actual == expected;
+}
+
+fn recordMatchesTimeline(record: replication_record.RecordView, identity: Identity) bool {
     return record.cluster_id == identity.cluster_id and
-        record.shard_id == identity.shard_id and
-        record.table_id == identity.table_id and
         record.timeline_id == identity.timeline_id and
         record.epoch == identity.epoch;
 }
@@ -986,6 +988,38 @@ test "storage.ha standby allows whole instance shard table identity" {
     var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
     defer standby.close();
     try std.testing.expectEqual(@as(u64, 1), standby.nextReceiveLsn());
+}
+
+test "storage.ha standby whole instance identity accepts mixed table records across reopen" {
+    const alloc = std.testing.allocator;
+    const identity = Identity{ .cluster_id = 10, .shard_id = 0, .table_id = 0, .timeline_id = 1, .epoch = 1 };
+    const paths = try testPaths(alloc, "whole-instance-mixed-records");
+    defer paths.deinit(alloc);
+
+    {
+        var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+        defer standby.close();
+
+        var first = baseRecord(identity, 1, "one");
+        first.shard_id = 20;
+        first.table_id = 30;
+        var second = baseRecord(identity, 2, "two");
+        second.shard_id = 21;
+        second.table_id = 31;
+        _ = try standby.receive(first);
+        _ = try standby.receive(second);
+
+        var capture = ApplyCapture{ .alloc = alloc };
+        defer capture.deinit();
+        try std.testing.expectEqual(@as(usize, 2), try standby.applyAvailable(&capture, ApplyCapture.apply));
+    }
+
+    {
+        var reopened = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+        defer reopened.close();
+        try std.testing.expectEqual(identity, reopened.identitySnapshot());
+        try std.testing.expectEqual(@as(u64, 2), reopened.currentProgress().safe_read_lsn);
+    }
 }
 
 test "storage.ha standby snapshots do not wait behind the operation lease" {

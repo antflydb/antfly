@@ -49,6 +49,22 @@ pub fn monotonicNs() u64 {
     }
 }
 
+/// Suspend-inclusive authority clock for fail-closed lease deadlines. Linux
+/// CLOCK_BOOTTIME advances while a VM/node is suspended; MONOTONIC does not.
+/// Other supported platforms fall back to their monotonic clock.
+pub fn authorityNs() u64 {
+    if (comptime builtin.os.tag == .linux) {
+        var ts: std.posix.timespec = undefined;
+        switch (std.posix.errno(std.posix.system.clock_gettime(.BOOTTIME, &ts))) {
+            .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+            // A suspend-blind fallback could reopen a stale writer after node
+            // resume. Saturating time expires every outstanding authority.
+            else => return std.math.maxInt(u64),
+        }
+    }
+    return monotonicNs();
+}
+
 pub fn realtimeNs() u64 {
     if (comptime builtin.os.tag == .freestanding) {
         freestanding_counter +%= 1;

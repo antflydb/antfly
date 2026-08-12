@@ -44,6 +44,8 @@ pub const PromotionOwner = runtime_callbacks.PromotionOwner;
 pub const HAAsyncEffectMirror = ha_contract.AsyncEffectMirror;
 pub const HAAsyncBatchMirror = ha_contract.AsyncBatchMirror;
 pub const HAAsyncMetadataMirror = ha_contract.AsyncMetadataMirror;
+pub const HAMutationBarrier = @import("../ha/mutation_barrier.zig").MutationBarrier;
+pub const HASyncWaitFn = ha_contract.SyncWaitFn;
 pub const HAWriteGate = ha_contract.WriteGate;
 pub const HAProgressPollFn = *const fn (
     ctx: *anyopaque,

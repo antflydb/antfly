@@ -41,6 +41,7 @@ func TestEmbeddedOpenAPITransformOperationsMatchGeneratedModel(t *testing.T) {
 		TransformOpTypeINC,
 		TransformOpTypePUSH,
 		TransformOpTypeADDTOSET,
+		TransformOpTypeMIN,
 		TransformOpTypeMAX,
 	}
 	if len(embedded) != len(generated) {

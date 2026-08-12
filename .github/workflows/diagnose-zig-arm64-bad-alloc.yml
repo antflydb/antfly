@@ -83,7 +83,7 @@ jobs:
           fi
           "$node_bin" --version
           /usr/bin/time -v -o "$RUNNER_TEMP/linked-runtime.time" \
-            zig build install lite-capi \
+            zig build install capi \
             --build-runner "$RUNNER_TEMP/zig-build-runner-maxrss.zig" \
             -Dtarget=aarch64-linux-musl \
             -Doptimize=ReleaseFast \
@@ -245,17 +245,17 @@ jobs:
           file "$binary"
           file "$library"
           readelf -h "$binary" | tee "$RUNNER_TEMP/linked-runtime.elf-header"
-          readelf -h "$library" | tee "$RUNNER_TEMP/lite-capi.elf-header"
-          readelf -Ws "$library" | tee "$RUNNER_TEMP/lite-capi.symbols"
+          readelf -h "$library" | tee "$RUNNER_TEMP/capi.elf-header"
+          readelf -Ws "$library" | tee "$RUNNER_TEMP/capi.symbols"
           grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/linked-runtime.elf-header"
-          grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/lite-capi.elf-header"
-          grep -Eq 'GLOBAL.*antfly_db_open$' "$RUNNER_TEMP/lite-capi.symbols"
-          if grep -Eq 'GLOBAL.*antfly_(runtime_|api_kernel_|enrichment_|standalone_inference_|storage_kernel_link_anchor|storage_context_|storage_owner_|storage_snapshot_|storage_restore_|data_apply_store_)' "$RUNNER_TEMP/lite-capi.symbols"; then
+          grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/capi.elf-header"
+          grep -Eq 'GLOBAL.*antfly_db_open$' "$RUNNER_TEMP/capi.symbols"
+          if grep -Eq 'GLOBAL.*antfly_(runtime_|api_kernel_|enrichment_|standalone_inference_|storage_kernel_link_anchor|storage_context_|storage_owner_|storage_snapshot_|storage_restore_|data_apply_store_)' "$RUNNER_TEMP/capi.symbols"; then
             echo "private executable ABI leaked from libantfly.so" >&2
             exit 1
           fi
           stat -c 'binary_size_bytes=%s' "$binary" | tee "$RUNNER_TEMP/linked-runtime.size"
-          stat -c 'lite_capi_size_bytes=%s' "$library" | tee "$RUNNER_TEMP/lite-capi.size"
+          stat -c 'capi_size_bytes=%s' "$library" | tee "$RUNNER_TEMP/capi.size"
           library_size=$(stat -c '%s' "$library")
           if [ "$library_size" -ge 20971520 ]; then
             echo "libantfly.so exceeded the 20MiB retained-code budget: $library_size bytes" >&2
@@ -279,7 +279,7 @@ jobs:
             ${{ runner.temp }}/linked-runtime-reports
             ${{ runner.temp }}/linked-runtime.elf-header
             ${{ runner.temp }}/linked-runtime.size
-            ${{ runner.temp }}/lite-capi.elf-header
-            ${{ runner.temp }}/lite-capi.symbols
-            ${{ runner.temp }}/lite-capi.size
+            ${{ runner.temp }}/capi.elf-header
+            ${{ runner.temp }}/capi.symbols
+            ${{ runner.temp }}/capi.size
           if-no-files-found: error

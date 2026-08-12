@@ -28,6 +28,7 @@ const readers_mod = @import("readers/reader.zig");
 const reading_pipeline = @import("pipelines/reading.zig");
 const runtime = @import("runtime/root.zig");
 const compat = @import("io/compat.zig");
+const metal_generated_quant_stats = @import("metal_generated_quant_stats.zig");
 
 const print = std.debug.print;
 
@@ -67,6 +68,7 @@ const ReadBenchmarkResult = struct {
     image_bytes: usize,
     last_text: []const u8,
     telemetry: reading_pipeline.ReadTelemetry,
+    metal_generated_quant: metal_generated_quant_stats.Stats = .{},
 };
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -188,6 +190,7 @@ fn runWarmBenchmark(
         result.deinit();
     }
 
+    const before_metal_generated = reader.snapshotMetalGeneratedQuantStats(allocator);
     const measure_iters = opts.measure_iters orelse return error.InvalidMeasureIters;
     const samples = try allocator.alloc(u64, measure_iters);
     defer allocator.free(samples);
@@ -212,6 +215,7 @@ fn runWarmBenchmark(
             return error.BenchmarkTelemetryDrift;
         }
     }
+    const after_metal_generated = reader.snapshotMetalGeneratedQuantStats(allocator);
 
     return .{
         .load_ns = load_ns,
@@ -219,6 +223,7 @@ fn runWarmBenchmark(
         .image_bytes = image_data.len,
         .last_text = last_text,
         .telemetry = telemetry,
+        .metal_generated_quant = metal_generated_quant_stats.Stats.diff(before_metal_generated, after_metal_generated),
     };
 }
 
@@ -456,6 +461,51 @@ fn writeBenchmarkJson(allocator: std.mem.Allocator, io: std.Io, model_name: []co
     } else {
         try buf.appendSlice(allocator, "null");
     }
+    try buf.appendSlice(allocator, ",\"metal_generated_quant\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.generatedTotal());
+    const metal_generated_top = result.metal_generated_quant.topFamily();
+    try buf.appendSlice(allocator, ",\"metal_generated_quant_family_count\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.nonzeroFamilyCount());
+    try buf.appendSlice(allocator, ",\"metal_generated_quant_top_family\":");
+    try jsonEncodeString(&buf, allocator, metal_generated_top.name);
+    try buf.appendSlice(allocator, ",\"metal_generated_quant_top_count\":");
+    try appendIntJson(&buf, allocator, metal_generated_top.count);
+    try buf.appendSlice(allocator, ",\"metal_generated_q2_k\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q2_k);
+    try buf.appendSlice(allocator, ",\"metal_generated_q2_k_bias\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q2_k_bias);
+    try buf.appendSlice(allocator, ",\"metal_generated_q2_k_bias_gelu\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q2_k_bias_gelu);
+    try buf.appendSlice(allocator, ",\"metal_generated_q3_k\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q3_k);
+    try buf.appendSlice(allocator, ",\"metal_generated_q3_k_bias\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q3_k_bias);
+    try buf.appendSlice(allocator, ",\"metal_generated_q3_k_bias_gelu\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q3_k_bias_gelu);
+    try buf.appendSlice(allocator, ",\"metal_generated_q4_0\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q4_0);
+    try buf.appendSlice(allocator, ",\"metal_generated_q4_1\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q4_1);
+    try buf.appendSlice(allocator, ",\"metal_generated_q5_0\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q5_0);
+    try buf.appendSlice(allocator, ",\"metal_generated_q5_1\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q5_1);
+    try buf.appendSlice(allocator, ",\"metal_generated_q4_k\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q4_k);
+    try buf.appendSlice(allocator, ",\"metal_generated_q4_k_bias\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q4_k_bias);
+    try buf.appendSlice(allocator, ",\"metal_generated_q4_k_bias_gelu\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q4_k_bias_gelu);
+    try buf.appendSlice(allocator, ",\"metal_generated_q5_k\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q5_k);
+    try buf.appendSlice(allocator, ",\"metal_generated_q6_k\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q6_k);
+    try buf.appendSlice(allocator, ",\"metal_generated_q8_0\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q8_0);
+    try buf.appendSlice(allocator, ",\"metal_generated_q8_1\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q8_1);
+    try buf.appendSlice(allocator, ",\"metal_generated_q8_k\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.q8_k);
     try buf.appendSlice(allocator, ",\"last_text\":");
     try jsonEncodeString(&buf, allocator, result.last_text);
     try buf.appendSlice(allocator, "}\n");

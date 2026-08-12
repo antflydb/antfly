@@ -19,6 +19,8 @@
 const failure_abi = @import("runtime_failure_abi");
 
 pub const abi_version = failure_abi.abi_version;
+pub const ai_api_prefix = "/ai/v1";
+pub const public_api_prefix = "/ml/v1";
 pub const Status = failure_abi.Status;
 pub const FailureIdentity = failure_abi.FailureIdentity;
 
@@ -87,6 +89,7 @@ pub const CreateContext = extern struct {
     combined_limit_bytes: usize,
     kv_limit_bytes: usize,
     scratch_limit_bytes: usize,
+    runtime_config_json: String,
     preload_ptr: ?[*]const WarmModel,
     preload_len: usize,
     out_handle: *?*anyopaque,

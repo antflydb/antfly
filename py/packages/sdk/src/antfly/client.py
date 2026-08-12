@@ -2,10 +2,12 @@
 
 import base64
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, cast
 from urllib.parse import quote
 
-from httpx import Timeout
+from httpx import Response, Timeout
 
 from antfly.client_generated import Client
 from antfly.client_generated.api.data_operations import (
@@ -16,13 +18,153 @@ from antfly.client_generated.models import (
     BatchRequest,
     BatchRequestInserts,
     Error,
+    InferenceGenerateChunk,
+    InferenceGenerateRequest,
+    InferenceGenerateResponse,
     QueryResponses,
 )
 from antfly.client_generated.types import UNSET
 
-from .exceptions import AntflyException
+from .exceptions import AntflyException, InferenceAPIError, InferenceCapacityError
 
 DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20
+DEFAULT_MAX_JSON_RESPONSE_BYTES = 64 << 20
+DEFAULT_MAX_ERROR_RESPONSE_BYTES = 1 << 20
+MAX_INFERENCE_ERROR_BYTES = 1 << 20
+MAX_GENERATION_RESPONSE_BYTES = 16 << 20
+MAX_GENERATION_SSE_EVENT_BYTES = 16 << 20
+MAX_GENERATION_SSE_LINE_BYTES = 16 << 20
+
+
+def _read_limited_response(response: Response, max_bytes: int) -> tuple[bytes, bool]:
+    body = bytearray()
+    for chunk in response.iter_bytes():
+        remaining = max_bytes - len(body)
+        if len(chunk) > remaining:
+            body.extend(chunk[:remaining])
+            return bytes(body), True
+        body.extend(chunk)
+    return bytes(body), False
+
+
+def _raise_inference_error(response: Response) -> None:
+    body, truncated = _read_limited_response(response, MAX_INFERENCE_ERROR_BYTES)
+    code: str | None = None
+    retryable: bool | None = None
+    capacity: tuple[str, str, int] | None = None
+    message = body.decode("utf-8", errors="replace").strip()
+    if not truncated:
+        try:
+            payload = json.loads(body)
+            if isinstance(payload, dict):
+                code = payload.get("error") if isinstance(payload.get("error"), str) else None
+                detail = payload.get("message")
+                if isinstance(detail, str) and detail:
+                    message = f"{detail} ({code})" if code and detail != code else detail
+                elif code:
+                    message = code
+                if isinstance(payload.get("retryable"), bool):
+                    retryable = payload["retryable"]
+                reason = payload.get("reason")
+                retry_after_ms = payload.get("retry_after_ms")
+                if (
+                    response.status_code == 503
+                    and code is not None
+                    and retryable is True
+                    and reason in {"inference_capacity", "request_queue"}
+                    and type(retry_after_ms) is int
+                    and retry_after_ms > 0
+                ):
+                    capacity = (code, reason, retry_after_ms)
+        except (TypeError, ValueError):
+            pass
+    else:
+        message = f"{response.reason_phrase or f'HTTP {response.status_code}'} (response body exceeded {MAX_INFERENCE_ERROR_BYTES} bytes)"
+    if not message:
+        message = response.reason_phrase or f"HTTP {response.status_code}"
+    if capacity is not None:
+        capacity_code, reason, retry_after_ms = capacity
+        raise InferenceCapacityError(capacity_code, message, reason, retry_after_ms)
+    raise InferenceAPIError(response.status_code, code, message, retryable)
+
+
+def _iter_bounded_response_lines(response: Response, max_line_bytes: int) -> Iterator[bytes]:
+    line = bytearray()
+    for chunk in response.iter_bytes():
+        offset = 0
+        while offset < len(chunk):
+            newline = chunk.find(b"\n", offset)
+            end = len(chunk) if newline < 0 else newline
+            piece = chunk[offset:end]
+            if len(line) + len(piece) > max_line_bytes:
+                raise AntflyException(f"generation SSE line exceeded {max_line_bytes} bytes")
+            line.extend(piece)
+            if newline < 0:
+                break
+            if line.endswith(b"\r"):
+                del line[-1]
+            yield bytes(line)
+            line.clear()
+            offset = newline + 1
+
+    if line:
+        if line.endswith(b"\r"):
+            del line[-1]
+        yield bytes(line)
+
+
+def _decode_sse_value(value: bytes) -> str:
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AntflyException("generation SSE stream contained invalid UTF-8") from exc
+
+
+def _iter_sse_frames(response: Response) -> Iterator[tuple[str, str]]:
+    event = ""
+    data: list[str] = []
+    data_bytes = 0
+
+    for line in _iter_bounded_response_lines(response, MAX_GENERATION_SSE_LINE_BYTES):
+        if line == b"":
+            if data:
+                yield event, "\n".join(data)
+            event = ""
+            data = []
+            data_bytes = 0
+            continue
+        if line.startswith(b":"):
+            continue
+
+        field, separator, value = line.partition(b":")
+        if separator and value.startswith(b" "):
+            value = value[1:]
+        if field == b"event":
+            event = _decode_sse_value(value)
+        elif field == b"data":
+            data_bytes += (1 if data else 0) + len(value)
+            if data_bytes > MAX_GENERATION_SSE_EVENT_BYTES:
+                raise AntflyException(f"generation SSE event exceeded {MAX_GENERATION_SSE_EVENT_BYTES} bytes")
+            data.append(_decode_sse_value(value))
+
+    if data:
+        yield event, "\n".join(data)
+
+
+def _iter_generation_chunks(response: Response) -> Iterator[InferenceGenerateChunk]:
+    for event, data in _iter_sse_frames(response):
+        if event == "error":
+            raise AntflyException(f"generation stream failed: {data}")
+        if data.strip() == "[DONE]":
+            return
+        try:
+            payload = json.loads(data)
+            if not isinstance(payload, dict):
+                raise ValueError("event data must be a JSON object")
+            yield InferenceGenerateChunk.from_dict(payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AntflyException(f"generation stream returned invalid JSON: {exc}") from exc
+    raise AntflyException("generation stream ended before [DONE]")
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -38,7 +180,7 @@ def normalize_base_url(base_url: str) -> str:
 
 
 class AntflyClient:
-    """High-level client for interacting with Antfly database."""
+    """High-level client for Antfly database and inference APIs."""
 
     def __init__(
         self,
@@ -49,6 +191,8 @@ class AntflyClient:
         token: str | None = None,
         timeout: float = 30.0,
         max_write_request_bytes: int = DEFAULT_WRITE_MAX_REQUEST_BYTES,
+        max_json_response_bytes: int = DEFAULT_MAX_JSON_RESPONSE_BYTES,
+        max_error_response_bytes: int = DEFAULT_MAX_ERROR_RESPONSE_BYTES,
     ):
         """
         Initialize Antfly client.
@@ -66,9 +210,15 @@ class AntflyClient:
             token: Token string for token authentication (optional)
             timeout: Request timeout in seconds
             max_write_request_bytes: Maximum encoded JSON bytes for write requests
+            max_json_response_bytes: Maximum bytes read for a successful JSON response
+            max_error_response_bytes: Maximum bytes read from an error response
         """
+        if max_json_response_bytes <= 0 or max_error_response_bytes <= 0:
+            raise ValueError("response byte limits must be positive")
         self.base_url = normalize_base_url(base_url)
         self.max_write_request_bytes = max_write_request_bytes
+        self.max_json_response_bytes = max_json_response_bytes
+        self.max_error_response_bytes = max_error_response_bytes
 
         httpx_args: dict[str, Any] = {}
 
@@ -114,17 +264,35 @@ class AntflyClient:
         Raises:
             AntflyException: If the request fails
         """
-        response = self._client.get_httpx_client().request(method, path, **kwargs)
-        if response.status_code >= 400:
+        with self._client.get_httpx_client().stream(method, path, **kwargs) as response:
+            if response.status_code >= 400:
+                body, truncated = _read_limited_response(response, self.max_error_response_bytes)
+                if truncated:
+                    msg = (
+                        f"{response.reason_phrase or f'HTTP {response.status_code}'} "
+                        f"(response body exceeded {self.max_error_response_bytes} bytes)"
+                    )
+                else:
+                    text = body.decode("utf-8", errors="replace")
+                    try:
+                        error_body = json.loads(body)
+                        error = error_body.get("error") if isinstance(error_body, dict) else None
+                        msg = error if isinstance(error, str) else text
+                    except (TypeError, ValueError):
+                        msg = text
+                    if not msg:
+                        msg = response.reason_phrase or f"HTTP {response.status_code}"
+                raise AntflyException(f"Request failed ({response.status_code}): {msg}")
+            if response.status_code == 204:
+                return None
+
+            body, truncated = _read_limited_response(response, self.max_json_response_bytes)
+            if truncated:
+                raise AntflyException(f"response exceeded {self.max_json_response_bytes} bytes")
             try:
-                error_body = response.json()
-                msg = error_body.get("error", response.text)
-            except Exception:
-                msg = response.text
-            raise AntflyException(f"Request failed ({response.status_code}): {msg}")
-        if response.status_code == 204:
-            return None
-        return response.json()
+                return json.loads(body)
+            except (TypeError, ValueError) as exc:
+                raise AntflyException("response returned invalid JSON") from exc
 
     def _encode_write_request(self, operation: str, body: dict[str, Any]) -> bytes:
         encoded = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -136,6 +304,47 @@ class AntflyClient:
                 f"{self.max_write_request_bytes}"
             )
         return encoded
+
+    def generate(self, request: InferenceGenerateRequest) -> InferenceGenerateResponse:
+        """Generate one non-streaming chat completion."""
+        body = request.to_dict()
+        body["stream"] = False
+        with self._client.get_httpx_client().stream(
+            "POST",
+            "/ai/v1/generate",
+            json=body,
+            headers={"Accept": "application/json"},
+        ) as response:
+            if response.status_code < 200 or response.status_code >= 300:
+                _raise_inference_error(response)
+            raw, truncated = _read_limited_response(response, MAX_GENERATION_RESPONSE_BYTES)
+            if truncated:
+                raise AntflyException(f"generation response exceeded {MAX_GENERATION_RESPONSE_BYTES} bytes")
+            try:
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    raise ValueError("response must be a JSON object")
+                return InferenceGenerateResponse.from_dict(payload)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise AntflyException(f"generation returned invalid JSON: {exc}") from exc
+
+    @contextmanager
+    def generate_stream(self, request: InferenceGenerateRequest) -> Iterator[Iterator[InferenceGenerateChunk]]:
+        """Open a context-managed SSE generation stream."""
+        body = request.to_dict()
+        body["stream"] = True
+        with self._client.get_httpx_client().stream(
+            "POST",
+            "/ai/v1/generate",
+            json=body,
+            headers={"Accept": "text/event-stream"},
+        ) as response:
+            if response.status_code < 200 or response.status_code >= 300:
+                _raise_inference_error(response)
+            content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+            if content_type != "text/event-stream":
+                raise AntflyException(f"generation stream returned content type {content_type!r}")
+            yield _iter_generation_chunks(response)
 
     # Table operations
 

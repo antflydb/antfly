@@ -4,15 +4,19 @@ package controllers
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,12 +33,15 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -49,34 +56,50 @@ import (
 // AntflyClusterReconciler reconciles an AntflyCluster object
 type AntflyClusterReconciler struct {
 	client.Client
-	Scheme               *runtime.Scheme
-	AutoScaler           *AutoScaler
-	KubeClient           kubernetes.Interface
-	NodeStatsFetcher     func(context.Context, string) (*kubeletStatsSummary, error)
-	HTTPClient           *http.Client
-	Recorder             events.EventRecorder
-	ManageInferencePools bool
-	// EnableHotStandbyHA is always set by the operator binary. A nil value keeps
-	// existing embedded controller and unit-test constructors backward compatible.
-	EnableHotStandbyHA    *bool
+	// BoundaryReader bypasses the controller cache for fencing decisions whose
+	// correctness depends on a current Lease/workload/Pod snapshot.
+	BoundaryReader        client.Reader
+	Scheme                *runtime.Scheme
+	AutoScaler            *AutoScaler
+	KubeClient            kubernetes.Interface
+	NodeStatsFetcher      func(context.Context, string) (*kubeletStatsSummary, error)
+	HTTPClient            *http.Client
+	Recorder              events.EventRecorder
+	ManageInferencePools  bool
 	DefaultInferenceImage string
+	Now                   func() time.Time
+	// MonotonicNow is a test hook for process-local HA watchdog barriers. In
+	// production it is nil and time.Now retains its monotonic clock reading.
+	MonotonicNow func() time.Time
 
 	// validationAttempts tracks consecutive validation failure counts per cluster
 	// (namespace/name -> int). Reset on successful validation. Used for
 	// exponential backoff on repeated validation failures.
 	validationAttempts sync.Map
+	// haIsolationGraceStarts is intentionally process-local and unpersisted. A
+	// controller or leader restart must observe the exact Lease transfer again
+	// and wait a fresh full runtime maximum fence latency.
+	haIsolationGraceStarts sync.Map
+	// haProcessGraceStarts prevents a replacement process from inheriting a
+	// still-live process incarnation's Lease before that incarnation's maximum
+	// local authority window has elapsed without a renewal.
+	haProcessGraceStarts sync.Map
 }
 
 var defaultOperatorHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
+const maxHASeededSlotActivationReceiptBytes = 64 * 1024
 
 const (
 	antflyRuntimeUID int64 = 10001
 	antflyRuntimeGID int64 = 10001
 
-	antflySecretStoreVolumeName  = "secret-store"
-	antflySecretStoreDefaultKey  = "secrets.json"
-	antflySecretStoreDefaultPath = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
-	antflySecretStoreEnvVar      = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
+	antflySecretStoreVolumeName           = "secret-store"
+	antflySecretStoreDefaultKey           = "secrets.json"
+	antflySecretStoreDefaultPath          = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
+	antflySecretStoreEnvVar               = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
+	antflyExtensionPackageStoreEnvVar     = "ANTFLY_EXTENSION_PACKAGE_STORE"
+	antflyStandaloneExtensionPackageStore = "/antflydb/extensions"
 
 	haPrimaryRouteTargetAnnotation          = "antfly.io/ha-primary-route-target"
 	haPrimaryRouteFenceAuthorityAnnotation  = "antfly.io/ha-primary-route-fence-authority"
@@ -85,17 +108,41 @@ const (
 	haAdminTokenDefaultEnvVar               = "ANTFLY_HA_ADMIN_TOKEN" // #nosec G101 -- environment variable name, not a credential
 	defaultHAPrimaryLogPath                 = "/antflydb/ha/primary.wal"
 	defaultHAPrimarySlotsPath               = "/antflydb/ha/slots"
+	defaultHASeedCaptureRoot                = "/antflydb/ha/seed-captures"
 	defaultHAFencePath                      = "/antflydb/ha/fence.wal"
 	defaultHAStandbyLogPath                 = "/antflydb/ha/standby.wal"
 	defaultHAStandbyProgressPath            = "/antflydb/ha/standby-progress.wal"
-	haAdminRetryRequeueAfter                = 5 * time.Second
+	defaultHADirectAdminRetryLimit          = int32(8)
+	defaultHADirectAdminRetryBase           = 5 * time.Second
+	defaultHADirectAdminRetryMaximum        = 2 * time.Minute
+	defaultHADirectAdminReservation         = 30 * time.Second
+	defaultHADirectPrerequisiteTimeout      = 10 * time.Minute
+	haStartupGateReceiptHashAnnotation      = "antfly.io/ha-startup-receipt-hash"
+	haSeedRoleAnnotation                    = "antfly.io/ha-seed-role"
+	haTopologyIDAnnotation                  = "antfly.io/ha-topology-id"
+	haTopologyGenerationAnnotation          = "antfly.io/ha-topology-generation"
+	haNodeIDAnnotation                      = "antfly.io/ha-node-id"
+	haSlotNameAnnotation                    = "antfly.io/ha-slot-name"
+	haSeedGenerationAnnotation              = "antfly.io/ha-seed-generation"
+	haSeedManifestIDAnnotation              = "antfly.io/ha-seed-manifest-id"
+	haSeedManifestSHA256Annotation          = "antfly.io/ha-seed-manifest-sha256"
+	haSeedSourcePVCNameAnnotation           = "antfly.io/ha-seed-source-pvc-name"
+	haSeedSourcePVCUIDAnnotation            = "antfly.io/ha-seed-source-pvc-uid"
+	haSeedTargetPVCNameAnnotation           = "antfly.io/ha-seed-target-pvc-name"
+	haSeedTargetPVCUIDAnnotation            = "antfly.io/ha-seed-target-pvc-uid"
+	haSeedCheckpointLSNAnnotation           = "antfly.io/ha-seed-checkpoint-lsn"
+	haSeedGenerationVolumeName              = "ha-seed-generation"
+	haSeedLiveDataPath                      = "/antflydb/data"
+	haSeedActivationRelativeRoot            = ".antfly-ha/active"
 
-	haAdminJobPhaseWaitingDependency = "WaitingDependency"
-	haAdminJobPhasePending           = "Pending"
-	haAdminJobPhaseRunning           = "Running"
-	haAdminJobPhaseSucceeded         = "Succeeded"
-	haAdminJobPhaseFailed            = "Failed"
-	haAdminJobPhaseMissingAdminURL   = "MissingAdminURL"
+	haAdminJobPhaseWaitingDependency   = "WaitingDependency"
+	haAdminJobPhaseWaitingPrerequisite = "WaitingPrerequisite"
+	haAdminJobPhaseWaitingJobFallback  = "WaitingJobFallback"
+	haAdminJobPhasePending             = "Pending"
+	haAdminJobPhaseRunning             = "Running"
+	haAdminJobPhaseSucceeded           = "Succeeded"
+	haAdminJobPhaseFailed              = "Failed"
+	haAdminJobPhaseMissingAdminURL     = "MissingAdminURL"
 
 	defaultManagedInferenceAPIPort = 8080
 )
@@ -107,11 +154,13 @@ const (
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
 //+kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update
 //+kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 //+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
@@ -177,6 +226,215 @@ func secretStoreArg(store *antflyv1.SecretStoreSpec) string {
 	return fmt.Sprintf(" \\\n  --secret-store-path %s", shellQuoteArg(secretStorePath(store)))
 }
 
+func haRuntimeStartupGate(cluster *antflyv1.AntflyCluster) *antflyv1.HAStartupGateSpec {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil {
+		return nil
+	}
+	return cluster.Spec.HighAvailability.Runtime.StartupGate
+}
+
+func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Context, cluster *antflyv1.AntflyCluster, storageSize string) (*corev1.PersistentVolumeClaim, error) {
+	gate := haRuntimeStartupGate(cluster)
+	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed || gate.RequiredReceipt == nil {
+		return nil, nil
+	}
+	name := strings.TrimSpace(gate.RequiredReceipt.TargetPVCName)
+	if name == "" {
+		return nil, fmt.Errorf("HA startup gate target PVC name is empty")
+	}
+	key := types.NamespacedName{Name: name, Namespace: cluster.Namespace}
+	existing := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, key, existing); err != nil {
+		if !errors.IsNotFound(err) {
+			return nil, err
+		}
+		var storageClassName *string
+		if cluster.Spec.Storage.StorageClass != "" {
+			storageClassName = &cluster.Spec.Storage.StorageClass
+		}
+		created := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace, Labels: persistentVolumeClaimLabels(cluster, standaloneComponent(cluster))},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				StorageClassName: storageClassName,
+				Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse(storageSize),
+				}},
+			},
+		}
+		if err := r.Create(ctx, created); err != nil {
+			return nil, err
+		}
+		return created, nil
+	}
+	if existing.DeletionTimestamp != nil {
+		return nil, fmt.Errorf("HA startup target PVC %s is terminating", name)
+	}
+	if owner := metav1.GetControllerOf(existing); owner != nil {
+		return nil, fmt.Errorf("HA startup target PVC %s must be independently retained, but is controlled by %s %s", name, owner.Kind, owner.Name)
+	}
+	if expectedUID := strings.TrimSpace(gate.RequiredReceipt.TargetPVCUID); expectedUID != "" && string(existing.UID) != expectedUID {
+		return nil, fmt.Errorf("HA startup target PVC %s UID %s does not match required activation receipt UID %s", name, existing.UID, expectedUID)
+	}
+	changed := false
+	desiredLabels := persistentVolumeClaimLabels(cluster, standaloneComponent(cluster))
+	if existing.Labels == nil {
+		existing.Labels = map[string]string{}
+	}
+	for key, value := range desiredLabels {
+		if existing.Labels[key] != value {
+			existing.Labels[key] = value
+			changed = true
+		}
+	}
+	if changed {
+		if err := r.Update(ctx, existing); err != nil {
+			return nil, err
+		}
+	}
+	return existing, nil
+}
+
+// Existing ungated StatefulSets own immutable volumeClaimTemplates. Migrate
+// safely by first suspending and retaining all claims, waiting for every pod to
+// stop, and only then recreating the controller around the deterministic claim.
+func (r *AntflyClusterReconciler) reconcileLegacyStandaloneStatefulSetStartupGate(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
+	existing := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}
+	if err := r.Get(ctx, key, existing); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	if len(existing.Spec.VolumeClaimTemplates) == 0 {
+		return false, nil
+	}
+	retain := &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+		WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+		WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+	}
+	if existing.Spec.Replicas == nil || *existing.Spec.Replicas != 0 || existing.Spec.PersistentVolumeClaimRetentionPolicy == nil ||
+		existing.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted != retain.WhenDeleted ||
+		existing.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled != retain.WhenScaled {
+		zero := int32(0)
+		existing.Spec.Replicas = &zero
+		existing.Spec.PersistentVolumeClaimRetentionPolicy = retain
+		return true, r.Update(ctx, existing)
+	}
+	if existing.Status.Replicas != 0 || existing.Status.CurrentReplicas != 0 || existing.Status.ReadyReplicas != 0 {
+		return true, nil
+	}
+	return true, r.Delete(ctx, existing)
+}
+
+// Suspend is a pure availability hold. Preserve the existing storage and pod
+// template verbatim so a former primary cannot encounter an immutable
+// StatefulSet/PVC handoff while it is being fenced and repaired.
+func (r *AntflyClusterReconciler) reconcileSuspendedStandaloneStatefulSet(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
+	existing := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}
+	if err := r.Get(ctx, key, existing); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if existing.Spec.Replicas == nil || *existing.Spec.Replicas != 0 {
+		zero := int32(0)
+		existing.Spec.Replicas = &zero
+		return true, r.Update(ctx, existing)
+	}
+	return true, nil
+}
+
+func haStartupGateRuntimeEligible(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentVolumeClaim) (bool, string) {
+	gate := haRuntimeStartupGate(cluster)
+	if gate == nil {
+		return true, "NotConfigured"
+	}
+	if gate.Policy == antflyv1.HAStartupGatePolicySuspend {
+		return false, "PolicySuspended"
+	}
+	if !gate.RuntimeEligible {
+		return false, "DeclarativelySuspended"
+	}
+	if gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed || gate.ReceiptMatchPolicy != antflyv1.HAReceiptMatchPolicyExact || gate.RequiredReceipt == nil {
+		return false, "UnsupportedPolicy"
+	}
+	if pvc == nil || strings.TrimSpace(string(pvc.UID)) == "" {
+		return false, "TargetPVCNotObserved"
+	}
+	if cluster.Status.HAStatus == nil || cluster.Status.HAStatus.StartupGate == nil ||
+		!cluster.Status.HAStatus.StartupGate.RuntimeEligible || cluster.Status.HAStatus.StartupGate.ActivationReceipt == nil {
+		return false, "ActivationReceiptNotObserved"
+	}
+	required := *gate.RequiredReceipt
+	receipt := cluster.Status.HAStatus.StartupGate.ActivationReceipt
+	if receipt.TopologyID != required.TopologyID || receipt.NodeID != required.NodeID ||
+		receipt.SlotName != required.SlotName || receipt.Generation != required.Generation ||
+		receipt.TargetPVCName != required.TargetPVCName || receipt.TargetPVCUID != string(pvc.UID) ||
+		receipt.GenerationPath != path.Join("live-generations", required.Generation) ||
+		receipt.RawGenerationPath != path.Join("generations", required.Generation) ||
+		receipt.TargetLocalNodeID == 0 || receipt.TargetReplicaID == 0 ||
+		!isLowerHexDigest(receipt.CaptureReceiptSHA256) ||
+		!isLowerHexDigest(receipt.MaterializedReceiptSHA256) ||
+		!isLowerHexDigest(receipt.MaterializedAggregateSHA256) {
+		return false, "ActivationReceiptIdentityMismatch"
+	}
+	if required.TopologyGeneration != 0 && receipt.TopologyGeneration != required.TopologyGeneration {
+		return false, "ActivationReceiptTopologyGenerationMismatch"
+	}
+	if required.TargetPVCUID != "" && receipt.TargetPVCUID != required.TargetPVCUID {
+		return false, "ActivationReceiptPVCUIDMismatch"
+	}
+	if (required.ManifestSHA256 != "" && receipt.ManifestSHA256 != required.ManifestSHA256) ||
+		(required.AggregateSHA256 != "" && receipt.AggregateSHA256 != required.AggregateSHA256) ||
+		(required.SeedReceiptSHA256 != "" && receipt.SeedReceiptSHA256 != required.SeedReceiptSHA256) ||
+		(required.CaptureReceiptSHA256 != "" && receipt.CaptureReceiptSHA256 != required.CaptureReceiptSHA256) ||
+		(required.MaterializedReceiptSHA256 != "" && receipt.MaterializedReceiptSHA256 != required.MaterializedReceiptSHA256) ||
+		(required.MaterializedAggregateSHA256 != "" && receipt.MaterializedAggregateSHA256 != required.MaterializedAggregateSHA256) ||
+		(required.TargetLocalNodeID != 0 && receipt.TargetLocalNodeID != required.TargetLocalNodeID) ||
+		(required.TargetReplicaID != 0 && receipt.TargetReplicaID != required.TargetReplicaID) {
+		return false, "ActivationReceiptDigestMismatch"
+	}
+	return true, "ExactActivationReceiptMatched"
+}
+
+func haStartupGateReceiptHash(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentVolumeClaim) string {
+	eligible, _ := haStartupGateRuntimeEligible(cluster, pvc)
+	if !eligible || cluster.Status.HAStatus == nil || cluster.Status.HAStatus.StartupGate == nil {
+		return ""
+	}
+	raw, err := json.Marshal(cluster.Status.HAStatus.StartupGate.ActivationReceipt)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func haStandaloneRuntimeSeedIdentityAnnotations(cluster *antflyv1.AntflyCluster) map[string]string {
+	if cluster == nil || cluster.Status.HAStatus == nil || cluster.Status.HAStatus.StartupGate == nil ||
+		cluster.Status.HAStatus.StartupGate.ActivationReceipt == nil {
+		return nil
+	}
+	receipt := cluster.Status.HAStatus.StartupGate.ActivationReceipt
+	annotations := map[string]string{haSeedRoleAnnotation: "standby-runtime"}
+	setHASeedIdentityAnnotation(annotations, haTopologyIDAnnotation, receipt.TopologyID)
+	if receipt.TopologyGeneration > 0 {
+		annotations[haTopologyGenerationAnnotation] = strconv.FormatInt(receipt.TopologyGeneration, 10)
+	}
+	setHASeedIdentityAnnotation(annotations, haNodeIDAnnotation, receipt.NodeID)
+	setHASeedIdentityAnnotation(annotations, haSlotNameAnnotation, receipt.SlotName)
+	setHASeedIdentityAnnotation(annotations, haSeedGenerationAnnotation, receipt.Generation)
+	setHASeedIdentityAnnotation(annotations, haSeedManifestIDAnnotation, receipt.ManifestID)
+	setHASeedIdentityAnnotation(annotations, haSeedManifestSHA256Annotation, receipt.ManifestSHA256)
+	setHASeedIdentityAnnotation(annotations, haSeedTargetPVCNameAnnotation, receipt.TargetPVCName)
+	setHASeedIdentityAnnotation(annotations, haSeedTargetPVCUIDAnnotation, receipt.TargetPVCUID)
+	if receipt.CheckpointLSN > 0 {
+		annotations[haSeedCheckpointLSNAnnotation] = strconv.FormatUint(receipt.CheckpointLSN, 10)
+	}
+	return annotations
+}
+
 func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 	if ha == nil || ha.Mode == antflyv1.HAModeDisabled || ha.Runtime == nil || ha.Identity == nil {
 		return ""
@@ -184,6 +442,10 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 	runtime := ha.Runtime
 	identity := ha.Identity
 	var args strings.Builder
+	seedCaptureRoot := defaultHASeedCaptureRoot
+	if value := strings.TrimSpace(runtime.SeedCaptureRoot); value != "" {
+		seedCaptureRoot = value
+	}
 	fencePath := defaultHAFencePath
 	if value := strings.TrimSpace(runtime.FencePath); value != "" {
 		fencePath = value
@@ -265,9 +527,15 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 			appendHAArg("--ha-standby-upstream-url", standby.UpstreamURL)
 			appendHAArg("--ha-standby-slot", standby.SlotName)
 		}
+		// The standby opens the same runtime that may later be promoted in
+		// place. Pass the future primary durability policy at startup so a
+		// promotion cannot silently inherit Async defaults during the topology
+		// repair gap.
+		appendStandaloneHASyncPolicyArgs(&args, ha.SyncPolicy)
 	default:
 		return ""
 	}
+	appendHAArg("--ha-seed-capture-root", seedCaptureRoot)
 	appendHAUint("--ha-cluster-id", identity.ClusterID)
 	if identity.ShardID != 0 {
 		appendHAUint("--ha-shard-id", identity.ShardID)
@@ -277,6 +545,44 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 	}
 	appendHAUint("--ha-timeline-id", identity.TimelineID)
 	appendHAUint("--ha-epoch", identity.Epoch)
+	return args.String()
+}
+
+func standaloneHAStartupArgs(cluster *antflyv1.AntflyCluster) string {
+	gate := haRuntimeStartupGate(cluster)
+	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed ||
+		cluster.Status.HAStatus == nil || cluster.Status.HAStatus.StartupGate == nil ||
+		!cluster.Status.HAStatus.StartupGate.RuntimeEligible || cluster.Status.HAStatus.StartupGate.ActivationReceipt == nil {
+		return ""
+	}
+	receipt := cluster.Status.HAStatus.StartupGate.ActivationReceipt
+	var args strings.Builder
+	appendArg := func(name, value string) {
+		args.WriteString(" \\\n  ")
+		args.WriteString(name)
+		args.WriteByte(' ')
+		args.WriteString(shellQuoteArg(strings.TrimSpace(value)))
+	}
+	appendArg("--ha-startup-target-root", path.Join("/antflydb", haSeedActivationRelativeRoot))
+	appendArg("--ha-startup-topology-id", receipt.TopologyID)
+	appendArg("--ha-startup-topology-generation", strconv.FormatInt(receipt.TopologyGeneration, 10))
+	appendArg("--ha-startup-generation", receipt.Generation)
+	appendArg("--ha-startup-target-pvc-name", receipt.TargetPVCName)
+	appendArg("--ha-startup-target-pvc-uid", receipt.TargetPVCUID)
+	if receipt.ManifestSHA256 != "" {
+		appendArg("--ha-startup-manifest-sha256", receipt.ManifestSHA256)
+	}
+	if receipt.AggregateSHA256 != "" {
+		appendArg("--ha-startup-aggregate-sha256", receipt.AggregateSHA256)
+	}
+	if receipt.SeedReceiptSHA256 != "" {
+		appendArg("--ha-startup-seed-receipt-sha256", receipt.SeedReceiptSHA256)
+	}
+	appendArg("--ha-startup-capture-receipt-sha256", receipt.CaptureReceiptSHA256)
+	appendArg("--ha-startup-materialized-receipt-sha256", receipt.MaterializedReceiptSHA256)
+	appendArg("--ha-startup-materialized-aggregate-sha256", receipt.MaterializedAggregateSHA256)
+	appendArg("--ha-startup-target-local-node-id", strconv.FormatUint(receipt.TargetLocalNodeID, 10))
+	appendArg("--ha-startup-target-replica-id", strconv.FormatUint(receipt.TargetReplicaID, 10))
 	return args.String()
 }
 
@@ -463,7 +769,7 @@ func haPublicAPISelector(cluster *antflyv1.AntflyCluster, standaloneMode bool, t
 	if target == "" || target == "primary" {
 		component := "metadata"
 		if standaloneMode {
-			component = "standalone"
+			component = standaloneComponent(cluster)
 		}
 		return serviceSelectorLabels(cluster.Name, component), true
 	}
@@ -573,7 +879,7 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 	// Include canonical owned workloads in the deletion set. Do not mutate them
 	// yet: every matching PVC must pass ownership validation first so an error or
 	// controller restart cannot erase the only source of a historical prefix.
-	for _, suffix := range []string{"-metadata", "-data", "-standalone"} {
+	for _, suffix := range []string{"-metadata", "-data", "-standalone", "-swarm"} {
 		sts := &appsv1.StatefulSet{}
 		stsName := cluster.Name + suffix
 		err := r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, sts)
@@ -595,6 +901,13 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 		"metadata-storage-" + cluster.Name + "-metadata-",
 		"data-storage-" + cluster.Name + "-data-",
 		"standalone-storage-" + cluster.Name + "-standalone-",
+		"swarm-storage-" + cluster.Name + "-swarm-",
+	}
+	startupTargetPVCName := ""
+	startupTargetPVCUID := ""
+	if gate := haRuntimeStartupGate(cluster); gate != nil && gate.RequiredReceipt != nil {
+		startupTargetPVCName = strings.TrimSpace(gate.RequiredReceipt.TargetPVCName)
+		startupTargetPVCUID = strings.TrimSpace(gate.RequiredReceipt.TargetPVCUID)
 	}
 	var pvcList corev1.PersistentVolumeClaimList
 	if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace)); err != nil {
@@ -603,11 +916,14 @@ func (r *AntflyClusterReconciler) cleanupStorageResources(ctx context.Context, c
 	cleanupPVCs := make([]*corev1.PersistentVolumeClaim, 0)
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
-		if !hasAnyPrefix(pvc.Name, discoveredClaimPrefixes) && !hasAnyPrefix(pvc.Name, canonicalClaimPrefixes) {
+		if pvc.Name != startupTargetPVCName && !hasAnyPrefix(pvc.Name, discoveredClaimPrefixes) && !hasAnyPrefix(pvc.Name, canonicalClaimPrefixes) {
 			continue
 		}
 		if err := validatePVCOwnership(cluster, pvc); err != nil {
 			return nil, err
+		}
+		if pvc.Name == startupTargetPVCName && startupTargetPVCUID != "" && string(pvc.UID) != startupTargetPVCUID {
+			return nil, fmt.Errorf("refusing HA startup target PVC cleanup for %s/%s: expected UID %q, got %q", pvc.Namespace, pvc.Name, startupTargetPVCUID, pvc.UID)
 		}
 		cleanupPVCs = append(cleanupPVCs, pvc)
 	}
@@ -845,6 +1161,26 @@ func isStandaloneMode(cluster *antflyv1.AntflyCluster) bool {
 	return effectiveTopologyMode(cluster) == topologyModeStandalone
 }
 
+func standaloneUsesLegacySwarmIdentity(cluster *antflyv1.AntflyCluster) bool {
+	return cluster.Spec.Standalone != nil &&
+		cluster.Spec.Standalone.ResourceIdentity == antflyv1.StandaloneResourceIdentityLegacySwarm
+}
+
+func standaloneComponent(cluster *antflyv1.AntflyCluster) string {
+	if standaloneUsesLegacySwarmIdentity(cluster) {
+		return "swarm"
+	}
+	return "standalone"
+}
+
+func standaloneStatefulSetName(cluster *antflyv1.AntflyCluster) string {
+	return cluster.Name + "-" + standaloneComponent(cluster)
+}
+
+func standaloneStorageVolumeName(cluster *antflyv1.AntflyCluster) string {
+	return standaloneComponent(cluster) + "-storage"
+}
+
 func standaloneStorageIdentity(cluster *antflyv1.AntflyCluster) (engine, liteFileName string) {
 	engine = cluster.Spec.Storage.Engine
 	if engine == "" {
@@ -864,7 +1200,11 @@ func validateAndSetStandaloneStorageIdentity(statefulSet *appsv1.StatefulSet, cl
 	if statefulSet.ResourceVersion != "" {
 		persistedEngine, ok := statefulSet.Annotations[annotationStorageEngine]
 		if !ok {
-			return fmt.Errorf("existing StatefulSet %s is missing storage identity annotation %q; refusing to guess its on-disk format", statefulSet.Name, annotationStorageEngine)
+			if standaloneUsesLegacySwarmIdentity(cluster) && engine == "local" && statefulSet.Name == cluster.Name+"-swarm" && metav1.IsControlledBy(statefulSet, cluster) {
+				persistedEngine = "local"
+			} else {
+				return fmt.Errorf("existing StatefulSet %s is missing storage identity annotation %q; refusing to guess its on-disk format", statefulSet.Name, annotationStorageEngine)
+			}
 		}
 		if persistedEngine != engine {
 			return fmt.Errorf("storage engine migration requires backup and restore: existing StatefulSet %s uses %q, requested %q", statefulSet.Name, persistedEngine, engine)
@@ -936,7 +1276,7 @@ func (r *AntflyClusterReconciler) ensureTopologyResourcesMatchMode(ctx context.C
 
 	expected := map[string]struct{}{}
 	if mode == topologyModeStandalone {
-		expected[cluster.Name+"-standalone"] = struct{}{}
+		expected[standaloneStatefulSetName(cluster)] = struct{}{}
 	} else {
 		expected[cluster.Name+"-metadata"] = struct{}{}
 		expected[cluster.Name+"-data"] = struct{}{}
@@ -1015,6 +1355,9 @@ func (r *AntflyClusterReconciler) applyDefaults(cluster *antflyv1.AntflyCluster)
 	}
 
 	if standaloneMode && cluster.Spec.Standalone != nil {
+		if cluster.Spec.Standalone.ResourceIdentity == "" {
+			cluster.Spec.Standalone.ResourceIdentity = antflyv1.StandaloneResourceIdentityV1
+		}
 		if cluster.Spec.Standalone.Replicas == 0 {
 			cluster.Spec.Standalone.Replicas = 1
 		}
@@ -1128,24 +1471,8 @@ func (r *AntflyClusterReconciler) applyDefaults(cluster *antflyv1.AntflyCluster)
 // validateClusterConfiguration validates the cluster configuration (T025)
 // This is a fallback validation for cases where webhook validation is disabled
 func (r *AntflyClusterReconciler) validateClusterConfiguration(cluster *antflyv1.AntflyCluster) error {
-	if !r.hotStandbyHAEnabled() && hotStandbyHARequested(cluster) {
-		return hotStandbyHAFeatureGateError()
-	}
 	// Call the webhook validation methods as fallback
 	return cluster.ValidateCreate()
-}
-
-func (r *AntflyClusterReconciler) hotStandbyHAEnabled() bool {
-	return r.EnableHotStandbyHA == nil || *r.EnableHotStandbyHA
-}
-
-func hotStandbyHARequested(cluster *antflyv1.AntflyCluster) bool {
-	return cluster != nil && cluster.Spec.HighAvailability != nil &&
-		cluster.Spec.HighAvailability.Mode == antflyv1.HAModeHotStandby
-}
-
-func hotStandbyHAFeatureGateError() error {
-	return fmt.Errorf("hot-standby HA is disabled by the operator feature gate; restart the operator with --enable-hot-standby-ha=true to reconcile spec.highAvailability.mode=HotStandby")
 }
 
 // calculateBackoff calculates exponential backoff duration for validation failures (T027)
@@ -1466,16 +1793,6 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
-	if !r.hotStandbyHAEnabled() && hotStandbyHARequested(&antflyCluster) {
-		validationErr := hotStandbyHAFeatureGateError()
-		log.Error(validationErr, "Cluster configuration validation failed")
-		if statusErr := r.updateStatusWithValidationError(ctx, &antflyCluster, validationErr); statusErr != nil {
-			log.Error(statusErr, "Failed to update status with validation error")
-		}
-		attempt := r.incrementValidationAttempts(req.String())
-		return ctrl.Result{RequeueAfter: calculateBackoff(attempt - 1)}, nil
-	}
-
 	// Ensure finalizer is present when WhenDeleted=Delete.
 	// The finalizer is only removed inside the deletion handler (above) after
 	// cleanup completes. Removing it here on policy change would race with
@@ -1492,14 +1809,13 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Apply defaults to a working copy, not the original
 	// this avoids an error from our caller `reconcileHandler` because of a version missmatch.
 	workingCluster := antflyCluster.DeepCopy()
+	workingCluster.NormalizeLegacySwarm()
+	r.applyDefaults(workingCluster) // Use workingCluster for all processing, keep original cluster for status updates
 	topologyMode := effectiveTopologyMode(workingCluster)
 	standaloneMode := topologyMode == topologyModeStandalone
-	if err := r.ensureTopologyResourcesMatchMode(ctx, &antflyCluster, topologyMode); err != nil {
+	if err := r.ensureTopologyResourcesMatchMode(ctx, workingCluster, topologyMode); err != nil {
 		return ctrl.Result{}, err
 	}
-
-	// Apply default values for ports
-	r.applyDefaults(workingCluster) // Use workingCluster for all processing, keep original cluster for status updates
 
 	// Per-reconcile cache for ConfigMap lookups used by buildPodAnnotations.
 	efCache := newEnvFromCache(r.Client)
@@ -1516,6 +1832,13 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				break
 			}
 		}
+	}
+	// A pre-authentication HA object may have been valid under an older
+	// operator. Revalidate it on every upgrade reconcile before touching its
+	// StatefulSet so a new fail-closed runtime image cannot roll out without a
+	// bearer-token source and silently stop replication/admin control.
+	if !needsValidation && haRuntimeNeedsAdminTokenMigration(&antflyCluster) {
+		needsValidation = true
 	}
 
 	clusterKey := req.String()
@@ -1558,7 +1881,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.reconcileServices(ctx, workingCluster); err != nil {
 			return ctrl.Result{}, err
 		}
-		workingCluster.Spec.Storage.StandaloneStorage = r.reconcileStorageAutoGrow(ctx, workingCluster, "standalone", "standalone-storage", workingCluster.Name+"-standalone", chooseStandaloneStorageSize(workingCluster), maxStandaloneAutoGrowSize(workingCluster))
+		component := standaloneComponent(workingCluster)
+		storageVolume := standaloneStorageVolumeName(workingCluster)
+		statefulSetName := standaloneStatefulSetName(workingCluster)
+		workingCluster.Spec.Storage.StandaloneStorage = r.reconcileStorageAutoGrow(ctx, workingCluster, component, storageVolume, statefulSetName, chooseStandaloneStorageSize(workingCluster), maxStandaloneAutoGrowSize(workingCluster))
 		if err := r.reconcileStandaloneStatefulSet(ctx, efCache, workingCluster); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1569,10 +1895,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 
 		r.setPVCExpansionCondition(workingCluster, []pvcExpansionResult{
-			r.reconcilePVCExpansion(ctx, workingCluster, "standalone", "standalone-storage", workingCluster.Name+"-standalone", chooseStandaloneStorageSize(workingCluster)),
+			r.reconcilePVCExpansion(ctx, workingCluster, component, storageVolume, statefulSetName, chooseStandaloneStorageSize(workingCluster)),
 		})
 
-		if err := r.reconcilePodDisruptionBudget(ctx, workingCluster, workingCluster.Name+"-standalone-pdb", "standalone"); err != nil {
+		if err := r.reconcilePodDisruptionBudget(ctx, workingCluster, statefulSetName+"-pdb", component); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -1583,6 +1909,9 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		r.checkPVCTopologyHealth(ctx, workingCluster)
 
 		if err := r.updateStatus(ctx, workingCluster); err != nil {
+			if stderrors.Is(err, errHAStatusCheckpointed) {
+				return ctrl.Result{Requeue: true}, nil
+			}
 			return ctrl.Result{}, err
 		}
 
@@ -1844,6 +2173,9 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Update status
 	if err := r.updateStatus(ctx, workingCluster); err != nil {
+		if stderrors.Is(err, errHAStatusCheckpointed) {
+			return ctrl.Result{Requeue: true}, nil
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -1854,13 +2186,25 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return ctrl.Result{}, nil
 }
 
+func haRuntimeNeedsAdminTokenMigration(cluster *antflyv1.AntflyCluster) bool {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil {
+		return false
+	}
+	ha := cluster.Spec.HighAvailability
+	return ha.Mode != "" && ha.Mode != antflyv1.HAModeDisabled && strings.TrimSpace(ha.Runtime.AdminTokenEnvVar) == ""
+}
+
 func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
+	return periodicRequeueAfterAt(cluster, time.Now())
+}
+
+func periodicRequeueAfterAt(cluster *antflyv1.AntflyCluster, now time.Time) time.Duration {
 	var requeueAfter time.Duration
 	if haKubernetesLeaseRenewalEnabled(cluster) {
-		requeueAfter = minPositiveDuration(requeueAfter, haFencingLeaseRenewalRequeueAfter())
+		requeueAfter = minPositiveDuration(requeueAfter, haFencingLeaseRenewalRequeueAfter(cluster))
 	}
-	if haRetryingDirectAdminAction(cluster) {
-		requeueAfter = minPositiveDuration(requeueAfter, haAdminRetryRequeueAfter)
+	if retryAfter := haDirectAdminRetryRequeueAfter(cluster, now); retryAfter > 0 {
+		requeueAfter = minPositiveDuration(requeueAfter, retryAfter)
 	}
 	if cluster.Spec.DataNodes.AutoScaling != nil && cluster.Spec.DataNodes.AutoScaling.Enabled {
 		requeueAfter = minPositiveDuration(requeueAfter, 30*time.Second)
@@ -1871,18 +2215,39 @@ func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
 	return requeueAfter
 }
 
-func haRetryingDirectAdminAction(cluster *antflyv1.AntflyCluster) bool {
+func haDirectAdminRetryRequeueAfter(cluster *antflyv1.AntflyCluster, now time.Time) time.Duration {
 	if cluster == nil || cluster.Status.HAStatus == nil {
-		return false
+		return 0
 	}
+	var retryAfter time.Duration
 	for _, action := range cluster.Status.HAStatus.PlannedActions {
-		if action.AdminJobName == haAdminDirectAPIName &&
-			action.AdminJobPhase == haAdminJobPhasePending &&
-			strings.TrimSpace(action.AdminError) != "" {
-			return true
+		if action.AdminJobName != haAdminDirectAPIName {
+			continue
 		}
+		var due *metav1.Time
+		switch {
+		case action.InFlightAttempt > 0:
+			due = action.ReservationExpiresAt
+		case action.AdminJobPhase == haAdminJobPhaseWaitingPrerequisite:
+			due = action.NextRetryAt
+			if action.PrerequisiteDeadlineAt != nil && (due == nil || action.PrerequisiteDeadlineAt.Before(due)) {
+				due = action.PrerequisiteDeadlineAt
+			}
+		case action.AdminJobPhase == haAdminJobPhasePending && action.Retryable && strings.TrimSpace(action.AdminError) != "":
+			due = action.NextRetryAt
+		default:
+			continue
+		}
+		candidate := defaultHADirectAdminRetryBase
+		if due != nil {
+			candidate = due.Sub(now)
+			if candidate <= 0 {
+				candidate = time.Millisecond
+			}
+		}
+		retryAfter = minPositiveDuration(retryAfter, candidate)
 	}
-	return false
+	return retryAfter
 }
 
 func minPositiveDuration(current time.Duration, candidate time.Duration) time.Duration {
@@ -1893,6 +2258,103 @@ func minPositiveDuration(current time.Duration, candidate time.Duration) time.Du
 		return candidate
 	}
 	return current
+}
+
+func (r *AntflyClusterReconciler) haNow() time.Time {
+	if r != nil && r.Now != nil {
+		return r.Now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func haDirectAdminRetryLimit(admin *antflyv1.HAAdminSpec) int32 {
+	if admin != nil && admin.DirectRetryLimit != nil && *admin.DirectRetryLimit > 0 {
+		return *admin.DirectRetryLimit
+	}
+	return defaultHADirectAdminRetryLimit
+}
+
+func haDirectAdminRetryBase(admin *antflyv1.HAAdminSpec) time.Duration {
+	if admin != nil && admin.DirectRetryBaseSeconds != nil && *admin.DirectRetryBaseSeconds > 0 {
+		return time.Duration(*admin.DirectRetryBaseSeconds) * time.Second
+	}
+	return defaultHADirectAdminRetryBase
+}
+
+func haDirectAdminRetryMaximum(admin *antflyv1.HAAdminSpec) time.Duration {
+	if admin != nil && admin.DirectRetryMaxSeconds != nil && *admin.DirectRetryMaxSeconds > 0 {
+		return time.Duration(*admin.DirectRetryMaxSeconds) * time.Second
+	}
+	return defaultHADirectAdminRetryMaximum
+}
+
+func haDirectAdminReservation(admin *antflyv1.HAAdminSpec) time.Duration {
+	if admin != nil && admin.DirectReservationSeconds != nil && *admin.DirectReservationSeconds > 0 {
+		return time.Duration(*admin.DirectReservationSeconds) * time.Second
+	}
+	return defaultHADirectAdminReservation
+}
+
+func haDirectPrerequisiteTimeout(admin *antflyv1.HAAdminSpec) time.Duration {
+	if admin != nil && admin.DirectPrerequisiteTimeoutSeconds != nil && *admin.DirectPrerequisiteTimeoutSeconds > 0 {
+		return time.Duration(*admin.DirectPrerequisiteTimeoutSeconds) * time.Second
+	}
+	return defaultHADirectPrerequisiteTimeout
+}
+
+func haDirectAdminRetryDelay(admin *antflyv1.HAAdminSpec, attempt int32) time.Duration {
+	delay := haDirectAdminRetryBase(admin)
+	maximum := haDirectAdminRetryMaximum(admin)
+	if maximum < delay {
+		maximum = delay
+	}
+	for i := int32(1); i < attempt && delay < maximum; i++ {
+		if delay > maximum/2 {
+			return maximum
+		}
+		delay *= 2
+	}
+	if delay > maximum {
+		return maximum
+	}
+	return delay
+}
+
+func haDirectAdminErrorClass(err error) string {
+	if stderrors.Is(err, errHAPromotionBoundaryNotApplied) {
+		return "PromotionBoundaryNotApplied"
+	}
+	if statusCode, ok := adminsdk.HAStatusCode(err); ok {
+		return fmt.Sprintf("HTTP%d", statusCode)
+	}
+	if adminsdk.HAIsRetryable(err) {
+		return "RetryableAdminError"
+	}
+	return "PermanentAdminError"
+}
+
+func haActionTime(t time.Time) *metav1.Time {
+	value := metav1.NewTime(t.UTC())
+	return &value
+}
+
+func resetHAActionAttemptStatus(action *antflyv1.HAPlannedActionStatus) {
+	if action == nil {
+		return
+	}
+	action.AttemptCount = 0
+	action.RetryBudgetUsed = 0
+	action.ExecutionStateVersion = 0
+	action.Retryable = false
+	action.ErrorClass = ""
+	action.FirstAttemptAt = nil
+	action.LastAttemptAt = nil
+	action.NextRetryAt = nil
+	action.InFlightAttempt = 0
+	action.AttemptID = ""
+	action.ReservationExpiresAt = nil
+	action.PrerequisiteDeadlineAt = nil
+	action.CompletedAt = nil
 }
 
 func (r *AntflyClusterReconciler) reconcileInferencePool(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
@@ -2301,7 +2763,7 @@ func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.Ant
 	}
 
 	orchestrationURLs := map[string]string{
-		strconv.FormatInt(int64(standalone.NodeID), 16): fmt.Sprintf("http://%s-standalone.%s.svc.cluster.local:%d", cluster.Name, cluster.Namespace, standalone.MetadataAPI.Port),
+		strconv.FormatInt(int64(standalone.NodeID), 16): fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", standaloneStatefulSetName(cluster), cluster.Namespace, standalone.MetadataAPI.Port),
 	}
 
 	completeConfig := map[string]any{
@@ -2482,7 +2944,7 @@ func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.Antfl
 	component := "metadata"
 	if standaloneMode && cluster.Spec.Standalone != nil {
 		targetPort = cluster.Spec.Standalone.MetadataAPI.Port
-		component = "standalone"
+		component = standaloneComponent(cluster)
 	}
 
 	servicePort := corev1.ServicePort{
@@ -2591,13 +3053,13 @@ func (r *AntflyClusterReconciler) createStandaloneService(cluster *antflyv1.Antf
 
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cluster.Name + "-standalone",
+			Name:      standaloneStatefulSetName(cluster),
 			Namespace: cluster.Namespace,
 		},
 		Spec: corev1.ServiceSpec{
 			ClusterIP:                "None",
 			PublishNotReadyAddresses: true,
-			Selector:                 serviceSelectorLabels(cluster.Name, "standalone"),
+			Selector:                 serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)),
 			Ports: []corev1.ServicePort{
 				{
 					Name:       "metadata-api",
@@ -2634,54 +3096,100 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	if standalone == nil {
 		return fmt.Errorf("spec.standalone is required when spec.mode=Standalone")
 	}
+	runtimeServiceAccountName, err := r.reconcileHARuntimeLeaseRBAC(ctx, cluster)
+	if err != nil {
+		return err
+	}
 	replicas := standalone.Replicas
 	if replicas == 0 {
 		replicas = 1
 	}
+	if haFormerPrimaryIsolationActive(cluster) {
+		// A completed Kubernetes physical fence remains an availability hold
+		// until Colony rewrites this runtime as a standby with an exact startup
+		// gate. Never let ordinary StatefulSet reconciliation resurrect the old
+		// writer after ownership has moved to another Lease holder.
+		replicas = 0
+	}
 	storageSize := chooseStandaloneStorageSize(cluster)
+	startupGate := haRuntimeStartupGate(cluster)
+	activatedSeedGate := startupGate != nil && startupGate.Policy == antflyv1.HAStartupGatePolicyRequireActivatedSeed && startupGate.RequiredReceipt != nil
+	var startupPVC *corev1.PersistentVolumeClaim
+	if startupGate != nil {
+		if activatedSeedGate {
+			if migrated, err := r.reconcileLegacyStandaloneStatefulSetStartupGate(ctx, cluster); err != nil {
+				return err
+			} else if migrated {
+				return nil
+			}
+			var err error
+			startupPVC, err = r.reconcileHAStartupTargetPVC(ctx, cluster, storageSize)
+			if err != nil {
+				return err
+			}
+		}
+		eligible, _ := haStartupGateRuntimeEligible(cluster, startupPVC)
+		if !eligible {
+			replicas = 0
+		}
+		if startupGate.Policy == antflyv1.HAStartupGatePolicySuspend {
+			if held, err := r.reconcileSuspendedStandaloneStatefulSet(ctx, cluster); err != nil {
+				return err
+			} else if held {
+				return nil
+			}
+		}
+	}
 
 	var storageClassName *string
 	if cluster.Spec.Storage.StorageClass != "" {
 		storageClassName = &cluster.Spec.Storage.StorageClass
 	}
+	component := standaloneComponent(cluster)
+	statefulSetName := standaloneStatefulSetName(cluster)
+	storageVolumeName := standaloneStorageVolumeName(cluster)
 
 	envFromSources := append([]corev1.EnvFromSource{}, standalone.EnvFrom...)
 
-	statefulSet := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cluster.Name + "-standalone",
-			Namespace: cluster.Namespace,
-		},
-		Spec: appsv1.StatefulSetSpec{
-			ServiceName:         cluster.Name + "-standalone",
-			Replicas:            &replicas,
-			PodManagementPolicy: appsv1.ParallelPodManagement,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: serviceSelectorLabels(cluster.Name, "standalone"),
+	volumeClaimTemplates := []corev1.PersistentVolumeClaim{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   storageVolumeName,
+				Labels: persistentVolumeClaimLabels(cluster, component),
 			},
-			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:   "standalone-storage",
-						Labels: persistentVolumeClaimLabels(cluster, "standalone"),
-					},
-					Spec: corev1.PersistentVolumeClaimSpec{
-						AccessModes: []corev1.PersistentVolumeAccessMode{
-							corev1.ReadWriteOnce,
-						},
-						StorageClassName: storageClassName,
-						Resources: corev1.VolumeResourceRequirements{
-							Requests: corev1.ResourceList{
-								corev1.ResourceStorage: resource.MustParse(storageSize),
-							},
-						},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{
+					corev1.ReadWriteOnce,
+				},
+				StorageClassName: storageClassName,
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse(storageSize),
 					},
 				},
 			},
 		},
 	}
+	if activatedSeedGate {
+		volumeClaimTemplates = nil
+	}
+	statefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      statefulSetName,
+			Namespace: cluster.Namespace,
+		},
+		Spec: appsv1.StatefulSetSpec{
+			ServiceName:         statefulSetName,
+			Replicas:            &replicas,
+			PodManagementPolicy: appsv1.ParallelPodManagement,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: serviceSelectorLabels(cluster.Name, component),
+			},
+			VolumeClaimTemplates: volumeClaimTemplates,
+		},
+	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, statefulSet, func() error {
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, statefulSet, func() error {
 		if err := validateAndSetStandaloneStorageIdentity(statefulSet, cluster); err != nil {
 			return err
 		}
@@ -2691,16 +3199,50 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 
 		statefulSet.Spec.Replicas = &replicas
 		statefulSet.Spec.PersistentVolumeClaimRetentionPolicy = buildPVCRetentionPolicy(cluster.Spec.Storage.PVCRetentionPolicy)
+		podAnnotations := r.buildPodAnnotations(ctx, cache, cluster, envFromSources)
+		if activatedSeedGate {
+			podAnnotations = maps.Clone(podAnnotations)
+			if podAnnotations == nil {
+				podAnnotations = map[string]string{}
+			}
+			if hash := haStartupGateReceiptHash(cluster, startupPVC); hash != "" {
+				podAnnotations[haStartupGateReceiptHashAnnotation] = hash
+				maps.Copy(podAnnotations, haStandaloneRuntimeSeedIdentityAnnotations(cluster))
+			}
+		}
+		volumeMounts := []corev1.VolumeMount{
+			{Name: storageVolumeName, MountPath: "/antflydb"},
+			{Name: "config", MountPath: "/config"},
+		}
+		volumes := []corev1.Volume{
+			{
+				Name: "config",
+				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: cluster.Name + "-config"},
+				}},
+			},
+		}
+		if activatedSeedGate {
+			required := *startupGate.RequiredReceipt
+			volumes = append(volumes,
+				corev1.Volume{Name: storageVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
+				corev1.Volume{Name: haSeedGenerationVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
+			)
+			volumeMounts = append(volumeMounts, corev1.VolumeMount{
+				Name: haSeedGenerationVolumeName, MountPath: haSeedLiveDataPath,
+				SubPath: path.Join(haSeedActivationRelativeRoot, "live-generations", required.Generation),
+			})
+		}
 		statefulSet.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
-				Labels:      podLabels(cluster, "standalone"),
-				Annotations: r.buildPodAnnotations(ctx, cache, cluster, envFromSources),
+				Labels:      podLabels(cluster, component),
+				Annotations: podAnnotations,
 			},
 			Spec: corev1.PodSpec{
-				ServiceAccountName: cluster.Spec.ServiceAccountName,
+				ServiceAccountName: runtimeServiceAccountName,
 				SecurityContext:    antflyPodSecurityContext(),
 				InitContainers: []corev1.Container{
-					r.buildStorageInitContainer("standalone-storage"),
+					r.buildStorageInitContainer(storageVolumeName),
 				},
 				Containers: []corev1.Container{
 					{
@@ -2708,7 +3250,13 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         envFromSources,
-						Env:             append(secretStoreEnv(cluster.Spec.SecretStore), haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability)...),
+						Env: append(
+							append(append(append(secretStoreEnv(cluster.Spec.SecretStore), haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability)...), haPodUIDEnv()...), haRuntimeLeaseEnv(cluster)...),
+							corev1.EnvVar{
+								Name:  antflyExtensionPackageStoreEnvVar,
+								Value: antflyStandaloneExtensionPackageStore,
+							},
+						),
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",
@@ -2736,29 +3284,21 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 								Protocol:      corev1.ProtocolTCP,
 							},
 						},
-						VolumeMounts: append([]corev1.VolumeMount{
-							{
-								Name:      "standalone-storage",
-								MountPath: "/antflydb",
-							},
-							{
-								Name:      "config",
-								MountPath: "/config",
-							},
-						}, secretStoreVolumeMounts(cluster.Spec.SecretStore)...),
-						Command: []string{"/bin/sh", "-c"},
+						VolumeMounts: append(volumeMounts, secretStoreVolumeMounts(cluster.Spec.SecretStore)...),
+						Command:      []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`
 exec /antfly standalone --id %d --config /config/config.json \
   --host 0.0.0.0 \
   --port %d \
-  --health-port %d%s%s
+  --health-port %d%s%s%s
 							`,
 								standalone.NodeID,
 								standalone.MetadataAPI.Port,
 								standalone.Health.Port,
 								secretStoreArg(cluster.Spec.SecretStore),
 								standaloneHAArgs(cluster.Spec.HighAvailability),
+								standaloneHAStartupArgs(cluster),
 							),
 						},
 						Resources:    r.buildResourceRequirements(standalone.Resources),
@@ -2771,6 +3311,7 @@ exec /antfly standalone --id %d --config /config/config.json \
 								},
 							},
 							PeriodSeconds:    15,
+							TimeoutSeconds:   10,
 							FailureThreshold: 3,
 						},
 						ReadinessProbe: &corev1.Probe{
@@ -2781,22 +3322,12 @@ exec /antfly standalone --id %d --config /config/config.json \
 								},
 							},
 							PeriodSeconds:    5,
+							TimeoutSeconds:   10,
 							FailureThreshold: 5,
 						},
 					},
 				},
-				Volumes: append([]corev1.Volume{
-					{
-						Name: "config",
-						VolumeSource: corev1.VolumeSource{
-							ConfigMap: &corev1.ConfigMapVolumeSource{
-								LocalObjectReference: corev1.LocalObjectReference{
-									Name: cluster.Name + "-config",
-								},
-							},
-						},
-					},
-				}, secretStoreVolumes(cluster.Spec.SecretStore)...),
+				Volumes: append(volumes, secretStoreVolumes(cluster.Spec.SecretStore)...),
 			},
 		}
 
@@ -2810,7 +3341,7 @@ exec /antfly standalone --id %d --config /config/config.json \
 		r.applyEKSPodSpec(&statefulSet.Spec.Template, cluster, false)
 
 		isGKEAutopilot := cluster.Spec.GKE != nil && cluster.Spec.GKE.Autopilot
-		applyDefaultZoneTopologySpread(statefulSet, &statefulSet.Spec.Template, "standalone", cluster.Name,
+		applyDefaultZoneTopologySpread(statefulSet, &statefulSet.Spec.Template, component, cluster.Name,
 			standalone.TopologySpreadConstraints, isGKEAutopilot)
 
 		return nil
@@ -3007,6 +3538,7 @@ exec /antfly metadata --id $ID --config /config/config.json \
 								},
 							},
 							PeriodSeconds:    15,
+							TimeoutSeconds:   10,
 							FailureThreshold: 3,
 						},
 						ReadinessProbe: &corev1.Probe{
@@ -3017,6 +3549,7 @@ exec /antfly metadata --id $ID --config /config/config.json \
 								},
 							},
 							PeriodSeconds:    5,
+							TimeoutSeconds:   10,
 							FailureThreshold: 5,
 						},
 					},
@@ -3181,7 +3714,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 								MountPath: "/config",
 							},
 						}, secretStoreVolumeMounts(cluster.Spec.SecretStore)...),
-						Env: append([]corev1.EnvVar{
+						Env: append(append([]corev1.EnvVar{
 							{
 								Name: "POD_IP",
 								ValueFrom: &corev1.EnvVarSource{
@@ -3190,7 +3723,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 									},
 								},
 							},
-						}, secretStoreEnv(cluster.Spec.SecretStore)...),
+						}, secretStoreEnv(cluster.Spec.SecretStore)...), haPodUIDEnv()...),
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`
@@ -3219,6 +3752,7 @@ exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
 								},
 							},
 							PeriodSeconds:    15,
+							TimeoutSeconds:   10,
 							FailureThreshold: 3,
 						},
 						ReadinessProbe: &corev1.Probe{
@@ -3229,6 +3763,7 @@ exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
 								},
 							},
 							PeriodSeconds:    5,
+							TimeoutSeconds:   10,
 							FailureThreshold: 5,
 						},
 					},
@@ -3300,7 +3835,7 @@ func (r *AntflyClusterReconciler) buildResourceRequirements(resourceSpec antflyv
 func buildHTTPStartupProbe(port int32, cfg *antflyv1.ProbeConfig) *corev1.Probe {
 	failureThreshold := int32(30)
 	periodSeconds := int32(10)
-	timeoutSeconds := int32(1)
+	timeoutSeconds := int32(10)
 	if cfg != nil {
 		if cfg.FailureThreshold != nil {
 			failureThreshold = *cfg.FailureThreshold
@@ -3436,6 +3971,11 @@ while [ $timeout -gt 0 ]; do
             chown %d:%d /antflydb
             chmod ug+rwX /antflydb
         fi
+        extension_store=%s
+        echo "Preparing durable extension package store at $extension_store"
+        mkdir -p "$extension_store"
+        chown -R %d:%d "$extension_store"
+        chmod -R ug+rwX "$extension_store"
         exit 0
     fi
     echo "Waiting for PVC mount... ($timeout seconds remaining)"
@@ -3451,6 +3991,9 @@ exit 1
 			antflyRuntimeGID,
 			antflyRuntimeUID,
 			antflyRuntimeGID,
+			antflyRuntimeUID,
+			antflyRuntimeGID,
+			antflyStandaloneExtensionPackageStore,
 			antflyRuntimeUID,
 			antflyRuntimeGID,
 		)},
@@ -3571,7 +4114,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		}
 
 		standaloneSts := &appsv1.StatefulSet{}
-		if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-standalone", Namespace: cluster.Namespace}, standaloneSts); err != nil && !errors.IsNotFound(err) {
+		if err := r.Get(ctx, types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}, standaloneSts); err != nil && !errors.IsNotFound(err) {
 			return err
 		}
 
@@ -3604,7 +4147,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		}
 
 		var podList corev1.PodList
-		if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, "standalone"))); err != nil {
+		if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)))); err != nil {
 			return err
 		}
 		for _, pod := range podList.Items {
@@ -3661,10 +4204,10 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		if standbyErr := r.observeHAStandbyAdminStatuses(ctx, cluster); standbyErr != nil && haAdminStatusErr == nil {
 			haAdminStatusErr = standbyErr
 		}
-		if err := r.reconcileHAFencingLease(ctx, cluster); err != nil {
+		if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
 			return err
 		}
-		if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
+		if err := r.reconcileHAFencingLease(ctx, cluster); err != nil {
 			return err
 		}
 		r.observeHAFormerPrimaryFenceStatus(ctx, cluster)
@@ -3678,9 +4221,22 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 				fmt.Sprintf("Unable to observe HA admin status: %v", haAdminStatusErr),
 			)
 		}
-		if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
+		// Revalidate a previously succeeded physical-isolation receipt against
+		// current uncached Kubernetes objects before any dependent admin action
+		// can observe it as satisfied in this reconciliation.
+		if err := r.reconcileHAFormerPrimaryIsolation(ctx, cluster); err != nil {
 			return err
 		}
+		if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
+			if stderrors.Is(err, errHAPlanNeedsPersistence) {
+				if persistErr := r.persistHAActionPlanBarrier(ctx, cluster); persistErr != nil {
+					return persistErr
+				}
+				return errHAStatusCheckpointed
+			}
+			return err
+		}
+		r.updateHAStartupGateStatus(ctx, cluster)
 		r.updateHALastPromotionFromAdminJobs(ctx, cluster)
 		r.updateHAFormerPrimaryFromAdminJobs(ctx, cluster)
 		if err := r.reconcileHAPrimaryRoute(ctx, cluster); err != nil {
@@ -3757,10 +4313,10 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	if standbyErr := r.observeHAStandbyAdminStatuses(ctx, cluster); standbyErr != nil && haAdminStatusErr == nil {
 		haAdminStatusErr = standbyErr
 	}
-	if err := r.reconcileHAFencingLease(ctx, cluster); err != nil {
+	if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
 		return err
 	}
-	if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
+	if err := r.reconcileHAFencingLease(ctx, cluster); err != nil {
 		return err
 	}
 	r.observeHAFormerPrimaryFenceStatus(ctx, cluster)
@@ -3774,9 +4330,20 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			fmt.Sprintf("Unable to observe HA admin status: %v", haAdminStatusErr),
 		)
 	}
-	if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
+	// Revalidate physical isolation before releasing any dependent action.
+	if err := r.reconcileHAFormerPrimaryIsolation(ctx, cluster); err != nil {
 		return err
 	}
+	if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
+		if stderrors.Is(err, errHAPlanNeedsPersistence) {
+			if persistErr := r.persistHAActionPlanBarrier(ctx, cluster); persistErr != nil {
+				return persistErr
+			}
+			return errHAStatusCheckpointed
+		}
+		return err
+	}
+	r.updateHAStartupGateStatus(ctx, cluster)
 	r.updateHALastPromotionFromAdminJobs(ctx, cluster)
 	r.updateHAFormerPrimaryFromAdminJobs(ctx, cluster)
 	if err := r.reconcileHAPrimaryRoute(ctx, cluster); err != nil {
@@ -3790,6 +4357,30 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	return r.Status().Update(ctx, cluster)
 }
 
+func (r *AntflyClusterReconciler) persistHAActionPlanBarrier(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if r == nil || r.Client == nil || cluster == nil {
+		return fmt.Errorf("persist HA action plan barrier: cluster client is unavailable")
+	}
+	latest := &antflyv1.AntflyCluster{}
+	key := types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}
+	if err := r.Get(ctx, key, latest); err != nil {
+		return fmt.Errorf("persist HA action plan barrier: get latest cluster: %w", err)
+	}
+	if cluster.ResourceVersion != "" && latest.ResourceVersion != cluster.ResourceVersion {
+		return errors.NewConflict(
+			schema.GroupResource{Group: antflyv1.GroupVersion.Group, Resource: "antflyclusters"},
+			cluster.Name,
+			fmt.Errorf("resource changed before HA plan barrier"),
+		)
+	}
+	latest.Status = cluster.DeepCopy().Status
+	if err := r.Status().Update(ctx, latest); err != nil {
+		return fmt.Errorf("persist HA action plan barrier status: %w", err)
+	}
+	cluster.ResourceVersion = latest.ResourceVersion
+	return nil
+}
+
 func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
 	ha := cluster.Spec.HighAvailability
 	if ha == nil || ha.Admin == nil || !ha.Admin.ExecutePlannedActions ||
@@ -3797,76 +4388,119 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		cluster.Status.HAStatus == nil {
 		return nil
 	}
+	// Dependency evidence can freeze payload fields (notably the former-primary
+	// tail LSN) after an earlier action checkpoints. Apply those transformations
+	// before the persistence preflight so a changed payload creates a plan-only
+	// barrier instead of being overwritten by the older persisted action during
+	// reservation.
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		haBindPlannedActionToFrozenPrimaryBoundary(cluster.Status.HAStatus, &cluster.Status.HAStatus.PlannedActions[i])
+	}
+	sourceAuthorityChanged, err := r.bindHASeedSourcePVCAuthority(ctx, cluster)
+	if err != nil {
+		return err
+	}
+	if sourceAuthorityChanged {
+		return errHAPlanNeedsPersistence
+	}
+	if err := r.requirePersistedHADirectActionPlan(ctx, cluster); err != nil {
+		return err
+	}
 
 	for i := range cluster.Status.HAStatus.PlannedActions {
 		action := &cluster.Status.HAStatus.PlannedActions[i]
 		if strings.TrimSpace(action.AdminURL) == "" {
-			if haPlannedActionRequiresAdminTarget(*action) {
+			if haPlannedActionRequiresAdminURL(*action) {
 				action.AdminJobPhase = haAdminJobPhaseMissingAdminURL
+				continue
 			}
-			continue
+			// Controller-only actions are reconciled elsewhere. Portable artifact
+			// actions are the only Job-backed operations that deliberately have no
+			// HA admin URL.
+			if !haPlannedActionKindIsPortableArtifact(haActionKind(action.Kind)) {
+				continue
+			}
 		}
 		if action.AdminJobPhase == haAdminJobPhaseFailed &&
 			action.AdminJobName == haAdminDirectAPIName &&
 			haAdminActionMissingTokenCanFallbackFromStatus(cluster, ha.Admin, *action) {
-			action.AdminJobName = ""
-			action.AdminJobPhase = ""
-			action.AdminError = ""
-			action.AdminStatusCode = 0
+			if err := r.resetPersistedHADirectFailureForJobFallback(ctx, cluster, action); err != nil {
+				return err
+			}
+			return errHAStatusCheckpointed
 		}
-		if reset, err := r.resetMissingFailedHAAdminJob(ctx, cluster, action); err != nil {
-			return err
-		} else if reset {
-			action.AdminJobName = ""
-			action.AdminJobPhase = ""
-			action.AdminError = ""
-			action.AdminStatusCode = 0
+		if action.AdminJobPhase == haAdminJobPhaseWaitingJobFallback {
+			if err := r.reconcileHAAdminJob(ctx, cluster, ha.Admin, action); err != nil {
+				return err
+			}
+			return nil
 		}
-		if action.AdminJobPhase == haAdminJobPhaseSucceeded || action.AdminJobPhase == haAdminJobPhaseFailed {
+		if haActionKind(action.Kind) == haActionActivateSeedArtifact && action.AdminJobPhase == haAdminJobPhaseSucceeded {
+			current, err := r.haActivationReceiptMatchesCurrentTarget(ctx, cluster, *action)
+			if err != nil {
+				return err
+			}
+			if !current {
+				action.AdminJobName = ""
+				action.AdminJobPhase = ""
+				action.AdminError = ""
+				action.AdminStatusCode = 0
+				action.SeedArtifactReceipt = nil
+				resetHAActionAttemptStatus(action)
+			}
+		}
+		if action.AdminJobPhase == haAdminJobPhaseSucceeded ||
+			(action.AdminJobPhase == haAdminJobPhaseFailed && action.AdminJobName != haAdminDirectAPIName) {
+			if err := r.ensureHAAdminJobTTLAfterCheckpoint(ctx, cluster, ha.Admin, action); err != nil {
+				return err
+			}
 			if action.AdminJobPhase == haAdminJobPhaseSucceeded && action.AdminResult == nil {
 				r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
 			}
 			continue
 		}
-		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
+		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i, cluster) {
 			if action.AdminJobName == "" && action.AdminJobPhase == "" {
 				action.AdminJobPhase = haAdminJobPhaseWaitingDependency
 			}
 			continue
 		}
-		if handled, err := r.executeHAPlannedActionTyped(ctx, cluster, action); handled {
-			if err != nil && haAdminActionCanRunAsFallbackJob(cluster, ha.Admin, *action, err) {
-				action.AdminError = ""
-				action.AdminStatusCode = 0
-				if err := r.reconcileHAAdminJob(ctx, cluster, ha.Admin, action); err != nil {
-					return err
+		now := r.haNow()
+		if action.Executor != string(haActionExecutorCLIJob) && haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) {
+			reserved, checkpointed, err := r.reserveHADirectAdminAttempt(ctx, cluster, ha.Admin, action, now)
+			if err != nil {
+				return fmt.Errorf("reserve HA direct action %s: %w", action.Kind, err)
+			}
+			if !reserved {
+				if checkpointed {
+					return errHAStatusCheckpointed
 				}
 				continue
 			}
-			action.AdminJobName = haAdminDirectAPIName
-			if err != nil {
-				if adminsdk.HAIsRetryable(err) {
-					action.AdminJobPhase = haAdminJobPhasePending
-				} else {
-					action.AdminJobPhase = haAdminJobPhaseFailed
-				}
-				action.AdminError = err.Error()
-				if statusCode, ok := adminsdk.HAStatusCode(err); ok {
-					action.AdminStatusCode = statusCode
-				} else {
-					action.AdminStatusCode = 0
-				}
-			} else {
-				action.AdminJobPhase = haAdminJobPhaseSucceeded
-				action.AdminError = ""
-				action.AdminStatusCode = 0
+			attemptID := action.AttemptID
+			handled, executionErr := r.executeHAPlannedActionTyped(ctx, cluster, action)
+			if !handled {
+				executionErr = fmt.Errorf("HA action %s has no typed /admin/v1 request implementation", action.Kind)
 			}
-			continue
+			if executionErr != nil && haAdminActionCanRunAsFallbackJob(cluster, ha.Admin, *action, executionErr) {
+				if err := r.releaseHADirectReservationForJobFallback(ctx, cluster, action, attemptID); err != nil {
+					return err
+				}
+				return errHAStatusCheckpointed
+			}
+			if err := r.checkpointHADirectAdminResult(ctx, cluster, ha.Admin, action, attemptID, now, executionErr); err != nil {
+				return fmt.Errorf("checkpoint HA direct action %s attempt %s: %w", action.Kind, attemptID, err)
+			}
+			return errHAStatusCheckpointed
 		}
 		if action.Executor == string(haActionExecutorAdminAPI) {
 			action.AdminJobName = haAdminDirectAPIName
 			action.AdminJobPhase = haAdminJobPhaseFailed
 			action.AdminError = fmt.Sprintf("HA action %s is marked AdminAPI but no typed /admin/v1 request could be executed", action.Kind)
+			action.Retryable = false
+			action.ErrorClass = "UnsupportedAdminAction"
+			action.CompletedAt = haActionTime(now)
+			haObserveActionFailure(action, haMetricExecutorDirect, true)
 			continue
 		}
 		if action.Executor != string(haActionExecutorCLIJob) {
@@ -3888,47 +4522,1106 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 	return nil
 }
 
+func (r *AntflyClusterReconciler) bindHASeedSourcePVCAuthority(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
+	if r == nil || r.Client == nil || cluster == nil || cluster.Status.HAStatus == nil {
+		return false, nil
+	}
+	resolvedUIDs := make(map[string]string)
+	changed := false
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		action := &cluster.Status.HAStatus.PlannedActions[i]
+		if !haPlannedActionKindUsesSeedSourceAuthority(haActionKind(action.Kind)) ||
+			strings.TrimSpace(action.TopologyID) == "" {
+			continue
+		}
+		artifact := haSeedArtifactForAction(cluster, *action)
+		if artifact == nil || artifact.SourcePVC == nil || artifact.TargetPVC == nil {
+			return false, fmt.Errorf("HA %s requires distinct configured source and target PVCs", action.Kind)
+		}
+		sourceName := strings.TrimSpace(artifact.SourcePVC.ClaimName)
+		if sourceName == "" || sourceName == strings.TrimSpace(artifact.TargetPVC.ClaimName) {
+			return false, fmt.Errorf("HA %s requires one distinct configured source PVC", action.Kind)
+		}
+		if action.TopologyGeneration <= 0 || strings.TrimSpace(action.TopologyNodeID) == "" ||
+			strings.TrimSpace(action.TargetPVCName) == "" || strings.TrimSpace(action.TargetPVCUID) == "" ||
+			action.TopologyID != strings.TrimSpace(artifact.TopologyID) ||
+			action.TopologyGeneration != artifact.TopologyGeneration ||
+			action.TopologyNodeID != strings.TrimSpace(artifact.NodeID) ||
+			action.TargetPVCName != strings.TrimSpace(artifact.TargetPVC.ClaimName) ||
+			action.TargetPVCUID != strings.TrimSpace(artifact.TargetPVCUID) {
+			return false, fmt.Errorf("HA %s source PVC authority belongs to a stale topology or target incarnation", action.Kind)
+		}
+		if existing := strings.TrimSpace(action.SourcePVCName); existing != "" && existing != sourceName {
+			return false, fmt.Errorf("HA %s source PVC identity is stale: planned name %s, live name %s", action.Kind, existing, sourceName)
+		}
+		uid, ok := resolvedUIDs[sourceName]
+		if !ok {
+			pvc := &corev1.PersistentVolumeClaim{}
+			key := types.NamespacedName{Name: sourceName, Namespace: cluster.Namespace}
+			if err := r.Get(ctx, key, pvc); err != nil {
+				return false, fmt.Errorf("read source PVC %s for HA seed authority: %w", sourceName, err)
+			}
+			uid = strings.TrimSpace(string(pvc.UID))
+			if uid == "" {
+				return false, fmt.Errorf("HA source PVC %s has no durable UID", sourceName)
+			}
+			resolvedUIDs[sourceName] = uid
+		}
+		if existing := strings.TrimSpace(action.SourcePVCUID); existing != "" && existing != uid {
+			return false, fmt.Errorf("HA %s source PVC identity is stale: planned UID %s, live UID %s", action.Kind, existing, uid)
+		}
+		if action.SourcePVCName != sourceName || action.SourcePVCUID != uid {
+			action.SourcePVCName = sourceName
+			action.SourcePVCUID = uid
+			changed = true
+		}
+	}
+	return changed, nil
+}
+
+func (r *AntflyClusterReconciler) requirePersistedHADirectActionPlan(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if r == nil || r.Client == nil || cluster == nil || cluster.Status.HAStatus == nil {
+		return nil
+	}
+	latest := &antflyv1.AntflyCluster{}
+	key := types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}
+	if err := r.Get(ctx, key, latest); err != nil {
+		return fmt.Errorf("read persisted HA action plan: %w", err)
+	}
+	if latest.Generation != cluster.Generation {
+		return fmt.Errorf("%w: planned generation %d, latest generation %d", errHAPlanNeedsPersistence, cluster.Generation, latest.Generation)
+	}
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		desired := &cluster.Status.HAStatus.PlannedActions[i]
+		if desired.Executor == string(haActionExecutorCLIJob) || !haPlannedActionSupportsDirectAdminAPI(haActionKind(desired.Kind)) {
+			continue
+		}
+		if strings.TrimSpace(desired.OperationID) == "" {
+			desired.OperationID = haPlannedActionOperationID(*desired)
+		}
+		if latest.Status.HAStatus == nil {
+			return fmt.Errorf("%w: operation %s is not in status", errHAPlanNeedsPersistence, desired.OperationID)
+		}
+		match := -1
+		for j := range latest.Status.HAStatus.PlannedActions {
+			candidate := &latest.Status.HAStatus.PlannedActions[j]
+			if !haSamePlannedActionIdentity(*desired, *candidate) {
+				continue
+			}
+			if match >= 0 {
+				return fmt.Errorf("persisted HA operation identity %s is ambiguous", desired.OperationID)
+			}
+			match = j
+		}
+		if match < 0 {
+			return fmt.Errorf("%w: operation %s is absent or was concurrently replaced", errHAPlanNeedsPersistence, desired.OperationID)
+		}
+		persisted := &latest.Status.HAStatus.PlannedActions[match]
+		if !haSamePlannedActionOperation(*desired, *persisted) {
+			if haPlannedActionExecutionStarted(*persisted) {
+				*desired = *persisted.DeepCopy()
+				continue
+			}
+			return fmt.Errorf("%w: operation %s payload changed before execution", errHAPlanNeedsPersistence, desired.OperationID)
+		}
+		// Narrow status checkpoints may have landed after this reconcile read the
+		// object. Always execute from the latest exact persisted action state.
+		*desired = *persisted.DeepCopy()
+		if strings.TrimSpace(desired.OperationID) == "" {
+			desired.OperationID = haPlannedActionOperationID(*desired)
+		}
+	}
+	return nil
+}
+
+func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) {
+	gate := haRuntimeStartupGate(cluster)
+	if gate == nil {
+		if cluster != nil && cluster.Status.HAStatus != nil {
+			cluster.Status.HAStatus.StartupGate = nil
+		}
+		return
+	}
+	if cluster.Status.HAStatus == nil {
+		cluster.Status.HAStatus = &antflyv1.HAStatus{}
+	}
+	if gate.Policy == antflyv1.HAStartupGatePolicySuspend {
+		cluster.Status.HAStatus.StartupGate = &antflyv1.HAStartupGateStatus{
+			RuntimeEligible: false,
+			Reason:          "PolicySuspended",
+		}
+		return
+	}
+	status := &antflyv1.HAStartupGateStatus{Reason: "ActivationReceiptNotObserved"}
+	cluster.Status.HAStatus.StartupGate = status
+	if gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed || gate.RequiredReceipt == nil {
+		status.Reason = "UnsupportedPolicy"
+		return
+	}
+	required := *gate.RequiredReceipt
+
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, types.NamespacedName{Name: required.TargetPVCName, Namespace: cluster.Namespace}, pvc); err != nil {
+		status.Reason = "TargetPVCNotObserved"
+		return
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil {
+		status.Reason = "ReplicationIdentityMissing"
+		return
+	}
+	actionSets := [][]antflyv1.HAPlannedActionStatus{cluster.Status.HAStatus.PlannedActions}
+	peers := &antflyv1.AntflyClusterList{}
+	if err := r.List(ctx, peers, client.InNamespace(cluster.Namespace)); err != nil {
+		status.Reason = "ActivationReceiptSourceLookupFailed"
+		return
+	}
+	for i := range peers.Items {
+		peer := &peers.Items[i]
+		if peer.Name == cluster.Name || peer.Status.HAStatus == nil {
+			continue
+		}
+		actionSets = append(actionSets, peer.Status.HAStatus.PlannedActions)
+	}
+	for _, actions := range actionSets {
+		for i := range actions {
+			action := actions[i]
+			if haActionKind(action.Kind) != haActionActivateSeedArtifact ||
+				strings.TrimSpace(action.SlotName) != strings.TrimSpace(required.SlotName) ||
+				strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) ||
+				!haAdminActionSucceededWithEvidence(action) {
+				continue
+			}
+			matchesCurrentTarget, err := r.haActivationReceiptMatchesCurrentTarget(ctx, cluster, action)
+			if err != nil {
+				status.Reason = "ActivationReceiptSourceLookupFailed"
+				return
+			}
+			if !matchesCurrentTarget {
+				continue
+			}
+			receipt := action.SeedArtifactReceipt
+			if receipt.ClusterID != identity.ClusterID || receipt.ShardID != identity.ShardID ||
+				receipt.TableID != identity.TableID || receipt.TimelineID != identity.TimelineID || receipt.Epoch != identity.Epoch {
+				continue
+			}
+			status.ActivationReceipt = &antflyv1.HASeedActivationReceiptStatus{
+				TopologyID:                  receipt.TopologyID,
+				TopologyGeneration:          receipt.TopologyGeneration,
+				NodeID:                      receipt.NodeID,
+				SlotName:                    receipt.SlotName,
+				Generation:                  receipt.Generation,
+				TargetPVCName:               receipt.TargetPVCName,
+				TargetPVCUID:                receipt.TargetPVCUID,
+				ClusterID:                   receipt.ClusterID,
+				ShardID:                     receipt.ShardID,
+				TableID:                     receipt.TableID,
+				TimelineID:                  receipt.TimelineID,
+				Epoch:                       receipt.Epoch,
+				BackupLSN:                   receipt.BackupLSN,
+				CheckpointLSN:               receipt.CheckpointLSN,
+				ManifestID:                  receipt.ManifestID,
+				ManifestSHA256:              receipt.ManifestSHA256,
+				AggregateSHA256:             receipt.AggregateSHA256,
+				SeedReceiptSHA256:           receipt.SeedReceiptSHA256,
+				CaptureReceiptSHA256:        receipt.CaptureReceiptSHA256,
+				MaterializedReceiptSHA256:   receipt.MaterializedReceiptSHA256,
+				MaterializedAggregateSHA256: receipt.MaterializedAggregateSHA256,
+				TargetLocalNodeID:           receipt.TargetLocalNodeID,
+				TargetReplicaID:             receipt.TargetReplicaID,
+				GenerationPath:              receipt.GenerationPath,
+				RawGenerationPath:           receipt.RawGenerationPath,
+			}
+			for j := range actions {
+				gc := actions[j]
+				if haActionKind(gc.Kind) != haActionGCTargetSeedGenerations ||
+					strings.TrimSpace(gc.SlotName) != strings.TrimSpace(required.SlotName) ||
+					strings.TrimSpace(gc.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) {
+					continue
+				}
+				if !haAdminActionSucceededWithEvidence(gc) {
+					status.Reason = "TargetGenerationGCNotObserved"
+					return
+				}
+				break
+			}
+			// Seed the status as eligible only for the exact matcher invocation;
+			// declarative suspension and every configured evidence mismatch still win.
+			status.RuntimeEligible = true
+			eligible, reason := haStartupGateRuntimeEligible(cluster, pvc)
+			status.RuntimeEligible = eligible
+			status.Reason = reason
+			return
+		}
+	}
+	if !gate.RuntimeEligible {
+		status.Reason = "DeclarativelySuspended"
+	}
+}
+
+func haBindPlannedActionToFrozenPrimaryBoundary(status *antflyv1.HAStatus, action *antflyv1.HAPlannedActionStatus) {
+	if status == nil || action == nil {
+		return
+	}
+	switch haActionKind(action.Kind) {
+	case haActionAcquireFence, haActionAssessPromotion, haActionPromoteStandby, haActionUpdatePrimaryRoute, haActionDemoteFormerPrimary:
+	default:
+		return
+	}
+	promotedNodeID := strings.TrimSpace(action.FenceHolder)
+	if promotedNodeID == "" && haActionKind(action.Kind) != haActionDemoteFormerPrimary {
+		promotedNodeID = strings.TrimSpace(action.StandbyName)
+	}
+	frozen := haSucceededFormerPrimaryFenceResult(status, promotedNodeID, action.FenceGeneration)
+	if frozen == nil {
+		return
+	}
+	action.TargetLSN = frozen.FenceRequiredLSN
+	if haActionKind(action.Kind) == haActionDemoteFormerPrimary {
+		action.ObservedLSN = frozen.FenceRequiredLSN
+	}
+}
+
 const haAdminDirectAPIName = "direct-admin-api"
 
 var errHAAdminTokenEnvMissing = stderrors.New("configured HA admin token env var is empty or unset")
+var errHAPromotionBoundaryNotApplied = stderrors.New("standby has not applied the frozen former-primary boundary")
+var errHAStatusCheckpointed = stderrors.New("HA status checkpointed; requeue before further side effects")
+var errHAPlanNeedsPersistence = stderrors.New("HA action plan must be persisted before execution")
+var errHADirectOperationNotPersisted = stderrors.New("HA direct operation is absent from latest persisted plan")
 
-func (r *AntflyClusterReconciler) resetMissingFailedHAAdminJob(ctx context.Context, cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) (bool, error) {
-	if action == nil ||
-		action.AdminJobPhase != haAdminJobPhaseFailed ||
-		action.AdminJobName == "" ||
-		action.AdminJobName == haAdminDirectAPIName ||
-		action.AdminJobName != haAdminJobName(cluster, *action) {
-		return false, nil
+type haDirectActionMutation func(*antflyv1.HAStatus, *antflyv1.HAPlannedActionStatus) (bool, error)
+
+// mutatePersistedHADirectAction applies a narrow status mutation against the
+// latest resource version. It is the durability boundary around external typed
+// admin requests: neither an outer status conflict nor a later route error can
+// erase a reserved attempt or its result.
+func (r *AntflyClusterReconciler) mutatePersistedHADirectAction(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	action *antflyv1.HAPlannedActionStatus,
+	mutate haDirectActionMutation,
+) (bool, error) {
+	if r == nil || r.Client == nil || cluster == nil || action == nil || strings.TrimSpace(cluster.Name) == "" {
+		return false, fmt.Errorf("durable HA direct action checkpoint requires a persisted AntflyCluster")
 	}
-	existing := &batchv1.Job{}
-	err := r.Get(ctx, types.NamespacedName{Name: action.AdminJobName, Namespace: cluster.Namespace}, existing)
-	if errors.IsNotFound(err) {
+	desired := action.DeepCopy()
+	if strings.TrimSpace(desired.OperationID) == "" {
+		desired.OperationID = haPlannedActionOperationID(*desired)
+	}
+	key := types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}
+	var persisted antflyv1.HAPlannedActionStatus
+	var resourceVersion string
+	checkpointed := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &antflyv1.AntflyCluster{}
+		if err := r.Get(ctx, key, latest); err != nil {
+			return fmt.Errorf("get latest AntflyCluster: %w", err)
+		}
+		statusBase := latest.DeepCopy()
+		if latest.Generation != cluster.Generation {
+			return fmt.Errorf("HA direct action %s was planned for generation %d, latest generation is %d", desired.OperationID, cluster.Generation, latest.Generation)
+		}
+		if latest.Status.HAStatus == nil {
+			latest.Status.HAStatus = &antflyv1.HAStatus{}
+		}
+		match := -1
+		for i := range latest.Status.HAStatus.PlannedActions {
+			candidate := &latest.Status.HAStatus.PlannedActions[i]
+			if !haSamePlannedActionIdentity(*desired, *candidate) {
+				continue
+			}
+			if match >= 0 {
+				return fmt.Errorf("HA operation identity %s is ambiguous in persisted status", desired.OperationID)
+			}
+			match = i
+		}
+		if match < 0 {
+			return fmt.Errorf("%w: %s", errHADirectOperationNotPersisted, desired.OperationID)
+		}
+		persistedAction := &latest.Status.HAStatus.PlannedActions[match]
+		if strings.TrimSpace(persistedAction.OperationID) == "" {
+			persistedAction.OperationID = desired.OperationID
+		}
+		if !haSamePlannedActionOperation(*desired, *persistedAction) {
+			return fmt.Errorf("%w: operation %s request payload changed before checkpoint", errHADirectOperationNotPersisted, desired.OperationID)
+		}
+		changed, err := mutate(latest.Status.HAStatus, persistedAction)
+		if err != nil {
+			return err
+		}
+		if changed {
+			patch := client.MergeFromWithOptions(statusBase, client.MergeFromWithOptimisticLock{})
+			if err := r.Status().Patch(ctx, latest, patch); err != nil {
+				return fmt.Errorf("update AntflyCluster status checkpoint: %w", err)
+			}
+			checkpointed = true
+		}
+		persisted = *persistedAction.DeepCopy()
+		resourceVersion = latest.ResourceVersion
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	cluster.ResourceVersion = resourceVersion
+	*action = persisted
+	return checkpointed, nil
+}
+
+func migrateLegacyHADirectActionStatus(action *antflyv1.HAPlannedActionStatus, admin *antflyv1.HAAdminSpec, now time.Time) bool {
+	if action == nil || action.AdminJobName != haAdminDirectAPIName || action.ExecutionStateVersion != 0 {
+		return false
+	}
+	switch action.AdminJobPhase {
+	case haAdminJobPhasePending, haAdminJobPhaseRunning, haAdminJobPhaseFailed:
+	default:
+		return false
+	}
+	action.AttemptCount = 1
+	action.ExecutionStateVersion = 1
+	if action.FirstAttemptAt == nil {
+		action.FirstAttemptAt = haActionTime(now)
+	}
+	if action.LastAttemptAt == nil {
+		action.LastAttemptAt = haActionTime(now)
+	}
+	if action.AdminJobPhase == haAdminJobPhasePending && strings.TrimSpace(action.AdminError) == "" ||
+		action.AdminJobPhase == haAdminJobPhaseRunning {
+		action.AdminJobPhase = haAdminJobPhaseRunning
+		action.InFlightAttempt = 1
+		action.AttemptID = fmt.Sprintf("%s/attempt-%d", action.OperationID, action.AttemptCount)
+		action.ReservationExpiresAt = haActionTime(now.Add(haDirectAdminReservation(admin)))
+		action.Retryable = false
+		action.ErrorClass = "LegacyInFlight"
+		return true
+	}
+	if action.AdminJobPhase == haAdminJobPhasePending || action.AdminJobPhase == haAdminJobPhaseFailed {
+		action.RetryBudgetUsed = 1
+		action.AdminJobPhase = haAdminJobPhasePending
+		action.Retryable = true
+		action.ErrorClass = "LegacyBoundedRetry"
+		action.NextRetryAt = haActionTime(now)
+		action.CompletedAt = nil
+		return true
+	}
+	return true
+}
+
+func (r *AntflyClusterReconciler) reserveHADirectAdminAttempt(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	admin *antflyv1.HAAdminSpec,
+	action *antflyv1.HAPlannedActionStatus,
+	now time.Time,
+) (bool, bool, error) {
+	reservationNonce := ""
+	ensureReservationNonce := func() error {
+		if reservationNonce != "" {
+			return nil
+		}
+		nonceBytes := make([]byte, 16)
+		if _, err := rand.Read(nonceBytes); err != nil {
+			return fmt.Errorf("generate HA direct reservation nonce: %w", err)
+		}
+		reservationNonce = hex.EncodeToString(nonceBytes)
+		return nil
+	}
+	reserved := false
+	expiredReservation := false
+	checkpointed, err := r.mutatePersistedHADirectAction(ctx, cluster, action, func(_ *antflyv1.HAStatus, current *antflyv1.HAPlannedActionStatus) (bool, error) {
+		// RetryOnConflict may invoke this closure more than once. These outcomes
+		// must describe only the final successful/current resource version, never
+		// a mutation that lost a conflict to another reservation owner.
+		reserved = false
+		expiredReservation = false
+		migrated := migrateLegacyHADirectActionStatus(current, admin, now)
+		if migrated {
+			return true, nil
+		}
+		changed := false
+		if current.AdminJobPhase == haAdminJobPhaseSucceeded || current.AdminJobPhase == haAdminJobPhaseFailed {
+			return changed, nil
+		}
+		if current.InFlightAttempt > 0 {
+			if current.ReservationExpiresAt != nil && current.ReservationExpiresAt.After(now) {
+				return changed, nil
+			}
+			// The operator may have crashed after sending the request. Consume that
+			// uncertain attempt, then replay only after expiry with the exact frozen
+			// payload; runtime receipts make the replay idempotent.
+			current.InFlightAttempt = 0
+			current.AttemptID = ""
+			current.ReservationExpiresAt = nil
+			current.RetryBudgetUsed++
+			current.AdminError = "in-flight HA admin reservation expired without a durable result; replay is charged to the retry budget"
+			current.ErrorClass = "ReservationExpired"
+			expiredReservation = true
+			changed = true
+		}
+		if current.AdminJobPhase == haAdminJobPhaseWaitingPrerequisite &&
+			current.PrerequisiteDeadlineAt != nil && !current.PrerequisiteDeadlineAt.After(now) {
+			current.AdminJobPhase = haAdminJobPhaseFailed
+			current.ErrorClass = "PromotionPrerequisiteTimeout"
+			current.Retryable = false
+			current.CompletedAt = haActionTime(now)
+			current.NextRetryAt = nil
+			return true, nil
+		}
+		if current.NextRetryAt != nil && current.NextRetryAt.After(now) {
+			return changed, nil
+		}
+		if current.RetryBudgetUsed >= haDirectAdminRetryLimit(admin) {
+			current.AdminJobPhase = haAdminJobPhaseFailed
+			current.ErrorClass = "RetryBudgetExhausted"
+			current.Retryable = false
+			current.CompletedAt = haActionTime(now)
+			current.NextRetryAt = nil
+			return true, nil
+		}
+		if err := ensureReservationNonce(); err != nil {
+			return false, err
+		}
+		current.AttemptCount++
+		current.ExecutionStateVersion = 1
+		current.InFlightAttempt = current.AttemptCount
+		current.AttemptID = fmt.Sprintf("%s/attempt-%d/%s", current.OperationID, current.AttemptCount, reservationNonce)
+		current.ReservationExpiresAt = haActionTime(now.Add(haDirectAdminReservation(admin)))
+		if current.FirstAttemptAt == nil {
+			current.FirstAttemptAt = haActionTime(now)
+		}
+		current.LastAttemptAt = haActionTime(now)
+		current.AdminJobName = haAdminDirectAPIName
+		current.AdminJobPhase = haAdminJobPhaseRunning
+		current.AdminError = ""
+		current.AdminStatusCode = 0
+		current.Retryable = false
+		current.ErrorClass = ""
+		current.NextRetryAt = nil
+		current.CompletedAt = nil
+		reserved = true
 		return true, nil
+	})
+	if err != nil {
+		return false, false, err
 	}
-	return false, err
+	if reserved {
+		haObserveActionAttempts(action, haMetricExecutorDirect, 1)
+	}
+	if expiredReservation {
+		metricAction := action.DeepCopy()
+		terminal := metricAction.AdminJobPhase == haAdminJobPhaseFailed
+		if !terminal {
+			metricAction.ErrorClass = "ReservationExpired"
+		}
+		haObserveActionFailure(metricAction, haMetricExecutorDirect, terminal)
+	}
+	return reserved, checkpointed, nil
+}
+
+func (r *AntflyClusterReconciler) checkpointHADirectAdminResult(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	admin *antflyv1.HAAdminSpec,
+	action *antflyv1.HAPlannedActionStatus,
+	attemptID string,
+	now time.Time,
+	executionErr error,
+) error {
+	result := action.DeepCopy()
+	var promotion *antflyv1.HAPromotionStatus
+	if executionErr == nil && action.Kind == string(haActionPromoteStandby) && cluster.Status.HAStatus != nil {
+		if receipt := haPromotionReceipt(cluster.Status.HAStatus); receipt != nil {
+			promotion = receipt.DeepCopy()
+		}
+	}
+	_, err := r.mutatePersistedHADirectAction(ctx, cluster, action, func(status *antflyv1.HAStatus, current *antflyv1.HAPlannedActionStatus) (bool, error) {
+		if current.InFlightAttempt == 0 || current.AttemptID != attemptID {
+			return false, fmt.Errorf("HA direct action result attempt %q does not match persisted reservation %q", attemptID, current.AttemptID)
+		}
+		current.AdminResult = nil
+		if result.AdminResult != nil {
+			current.AdminResult = result.AdminResult.DeepCopy()
+		}
+		current.SeedArtifactReceipt = nil
+		if result.SeedArtifactReceipt != nil {
+			current.SeedArtifactReceipt = result.SeedArtifactReceipt.DeepCopy()
+		}
+		current.InFlightAttempt = 0
+		current.AttemptID = ""
+		current.ReservationExpiresAt = nil
+		current.AdminJobName = haAdminDirectAPIName
+		current.NextRetryAt = nil
+		current.CompletedAt = nil
+		if stderrors.Is(executionErr, errHAPromotionBoundaryNotApplied) {
+			// A valid typed assessment reported replication progress, not a request
+			// failure. It therefore does not consume the request-failure budget.
+			current.AdminJobPhase = haAdminJobPhaseWaitingPrerequisite
+			current.AdminError = executionErr.Error()
+			current.AdminStatusCode = 0
+			current.Retryable = false
+			current.ErrorClass = "PromotionBoundaryNotApplied"
+			current.NextRetryAt = haActionTime(now.Add(haDirectAdminRetryBase(admin)))
+			if current.PrerequisiteDeadlineAt == nil {
+				current.PrerequisiteDeadlineAt = haActionTime(now.Add(haDirectPrerequisiteTimeout(admin)))
+			}
+			if !current.PrerequisiteDeadlineAt.After(now) {
+				current.AdminJobPhase = haAdminJobPhaseFailed
+				current.ErrorClass = "PromotionPrerequisiteTimeout"
+				current.NextRetryAt = nil
+				current.CompletedAt = haActionTime(now)
+			}
+			return true, nil
+		}
+		current.PrerequisiteDeadlineAt = nil
+		if executionErr == nil {
+			if promotion != nil {
+				status.LastPromotion = promotion.DeepCopy()
+			}
+			current.AdminJobPhase = haAdminJobPhaseSucceeded
+			current.AdminError = ""
+			current.AdminStatusCode = 0
+			current.Retryable = false
+			current.ErrorClass = ""
+			current.CompletedAt = haActionTime(now)
+			return true, nil
+		}
+		retryable := adminsdk.HAIsRetryable(executionErr)
+		current.AdminError = executionErr.Error()
+		current.ErrorClass = haDirectAdminErrorClass(executionErr)
+		if statusCode, ok := adminsdk.HAStatusCode(executionErr); ok {
+			current.AdminStatusCode = statusCode
+		} else {
+			current.AdminStatusCode = 0
+		}
+		if retryable {
+			current.RetryBudgetUsed++
+		}
+		if retryable && current.RetryBudgetUsed < haDirectAdminRetryLimit(admin) {
+			current.AdminJobPhase = haAdminJobPhasePending
+			current.Retryable = true
+			current.NextRetryAt = haActionTime(now.Add(haDirectAdminRetryDelay(admin, current.RetryBudgetUsed)))
+			return true, nil
+		}
+		current.AdminJobPhase = haAdminJobPhaseFailed
+		current.Retryable = false
+		if retryable {
+			current.ErrorClass = "RetryBudgetExhausted"
+		}
+		current.CompletedAt = haActionTime(now)
+		return true, nil
+	})
+	if err != nil {
+		return err
+	}
+	if executionErr == nil {
+		haObserveActionSuccess(action, haMetricExecutorDirect)
+	} else if stderrors.Is(executionErr, errHAPromotionBoundaryNotApplied) {
+		haObserveActionWait(action, "promotion_boundary")
+	} else {
+		haObserveActionFailure(action, haMetricExecutorDirect, action.AdminJobPhase == haAdminJobPhaseFailed)
+	}
+	return nil
+}
+
+func (r *AntflyClusterReconciler) releaseHADirectReservationForJobFallback(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	action *antflyv1.HAPlannedActionStatus,
+	attemptID string,
+) error {
+	_, err := r.mutatePersistedHADirectAction(ctx, cluster, action, func(_ *antflyv1.HAStatus, current *antflyv1.HAPlannedActionStatus) (bool, error) {
+		if current.InFlightAttempt == 0 || current.AttemptID != attemptID {
+			return false, fmt.Errorf("HA direct fallback attempt %q does not match persisted reservation %q", attemptID, current.AttemptID)
+		}
+		if current.AttemptCount > 0 {
+			current.AttemptCount--
+		}
+		current.InFlightAttempt = 0
+		current.AttemptID = ""
+		current.ReservationExpiresAt = nil
+		current.AdminJobName = ""
+		current.AdminJobPhase = haAdminJobPhaseWaitingJobFallback
+		current.AdminError = ""
+		current.AdminStatusCode = 0
+		current.Retryable = false
+		current.ErrorClass = "JobFallbackReady"
+		current.NextRetryAt = nil
+		current.CompletedAt = nil
+		if current.AttemptCount == 0 {
+			current.FirstAttemptAt = nil
+			current.LastAttemptAt = nil
+		}
+		return true, nil
+	})
+	return err
+}
+
+func (r *AntflyClusterReconciler) resetPersistedHADirectFailureForJobFallback(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	action *antflyv1.HAPlannedActionStatus,
+) error {
+	_, err := r.mutatePersistedHADirectAction(ctx, cluster, action, func(_ *antflyv1.HAStatus, current *antflyv1.HAPlannedActionStatus) (bool, error) {
+		current.AdminJobName = ""
+		current.AdminJobPhase = haAdminJobPhaseWaitingJobFallback
+		current.AdminError = ""
+		current.AdminStatusCode = 0
+		resetHAActionAttemptStatus(current)
+		current.AdminJobPhase = haAdminJobPhaseWaitingJobFallback
+		current.ErrorClass = "JobFallbackReady"
+		return true, nil
+	})
+	return err
 }
 
 func (r *AntflyClusterReconciler) reconcileHAAdminJob(ctx context.Context, cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action *antflyv1.HAPlannedActionStatus) error {
-	job := buildHAAdminJob(cluster, admin, *action)
+	previousPhase := action.AdminJobPhase
+	previousAttemptCount := action.AttemptCount
+	jobAction, ready, err := r.haActivationJobAction(ctx, cluster, *action)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		action.AdminJobName = ""
+		action.AdminJobPhase = haAdminJobPhasePending
+		return nil
+	}
+	jobAction, ready, err = r.haPortableArtifactJobAction(ctx, cluster, jobAction)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		action.AdminJobName = ""
+		action.AdminJobPhase = haAdminJobPhasePending
+		return nil
+	}
+	// Portable source jobs discover the exact source PVC incarnation immediately
+	// before their first side effect. Freeze that identity into status before the
+	// deterministic Job hash is rendered so retries cannot silently retarget a
+	// replacement claim.
+	action.SourcePVCName = jobAction.SourcePVCName
+	action.SourcePVCUID = jobAction.SourcePVCUID
+	if haActionKind(jobAction.Kind) == haActionGCTargetSeedGenerations {
+		if err := r.ensureHASeededSlotActivationReceiptConfigMap(ctx, cluster, jobAction); err != nil {
+			return err
+		}
+	}
+	job := buildHAAdminJob(cluster, admin, jobAction)
 	action.AdminJobName = job.Name
 	if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
 		return err
 	}
 
 	existing := &batchv1.Job{}
-	err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, existing)
+	err = r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, existing)
 	if errors.IsNotFound(err) {
+		if err := r.bindHAAdminJobToPVCConsumer(ctx, job); err != nil {
+			return err
+		}
+		action.Retryable = true
+		action.ErrorClass = ""
+		action.CompletedAt = nil
 		action.AdminJobPhase = haAdminJobPhasePending
-		return r.Create(ctx, job)
+		if err := r.Create(ctx, job); err != nil {
+			return err
+		}
+		return nil
 	}
 	if err != nil {
 		return err
 	}
+	if haPlannedActionKindIsPortableArtifact(haActionKind(jobAction.Kind)) &&
+		(!haSeedIdentityAnnotationsEqual(existing.Annotations, job.Annotations) ||
+			!haSeedIdentityAnnotationsEqual(existing.Spec.Template.Annotations, job.Spec.Template.Annotations)) {
+		return fmt.Errorf("HA admin Job %s immutable seed identity annotations do not match the exact planned action", existing.Name)
+	}
 	action.AdminJobPhase = haAdminJobPhase(existing)
+	observedAttempts, firstAttemptAt, lastAttemptAt, err := r.observeHAAdminJobPodAttempts(ctx, existing)
+	if err != nil {
+		return err
+	}
+	// Terminal Job counters are retained as a conservative fallback if a pod was
+	// manually deleted before observation. RestartPolicyNever makes each retained
+	// pod correspond to exactly one process attempt.
+	terminalCounterAttempts := existing.Status.Failed + existing.Status.Succeeded
+	if terminalCounterAttempts > observedAttempts {
+		observedAttempts = terminalCounterAttempts
+	}
+	if observedAttempts == 0 && (action.AdminJobPhase == haAdminJobPhaseSucceeded || action.AdminJobPhase == haAdminJobPhaseFailed) {
+		observedAttempts = 1
+	}
+	if observedAttempts > action.AttemptCount {
+		action.AttemptCount = observedAttempts
+	}
+	if firstAttemptAt != nil {
+		if action.FirstAttemptAt == nil || firstAttemptAt.Before(action.FirstAttemptAt) {
+			action.FirstAttemptAt = firstAttemptAt.DeepCopy()
+		}
+	}
+	if lastAttemptAt != nil {
+		action.LastAttemptAt = lastAttemptAt.DeepCopy()
+	} else if existing.Status.StartTime != nil {
+		if action.FirstAttemptAt == nil {
+			action.FirstAttemptAt = existing.Status.StartTime.DeepCopy()
+		}
+		action.LastAttemptAt = existing.Status.StartTime.DeepCopy()
+	}
+	switch action.AdminJobPhase {
+	case haAdminJobPhaseSucceeded:
+		action.Retryable = false
+		action.ErrorClass = ""
+		if existing.Status.CompletionTime != nil {
+			action.CompletedAt = existing.Status.CompletionTime.DeepCopy()
+		} else if action.CompletedAt == nil {
+			action.CompletedAt = haActionTime(r.haNow())
+		}
+	case haAdminJobPhaseFailed:
+		action.Retryable = false
+		action.ErrorClass = haAdminJobFailureClass(existing)
+		if existing.Status.CompletionTime != nil {
+			action.CompletedAt = existing.Status.CompletionTime.DeepCopy()
+		} else if action.CompletedAt == nil {
+			action.CompletedAt = haActionTime(r.haNow())
+		}
+	default:
+		action.Retryable = true
+		action.CompletedAt = nil
+	}
 	if action.AdminJobPhase == haAdminJobPhaseSucceeded && action.AdminResult == nil {
 		r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
 	}
+	if additionalAttempts := action.AttemptCount - previousAttemptCount; additionalAttempts > 0 {
+		haObserveActionAttempts(action, haMetricExecutorJob, additionalAttempts)
+	}
+	if previousPhase != action.AdminJobPhase {
+		switch action.AdminJobPhase {
+		case haAdminJobPhaseSucceeded:
+			haObserveActionSuccess(action, haMetricExecutorJob)
+		case haAdminJobPhaseFailed:
+			haObserveActionFailure(action, haMetricExecutorJob, true)
+		}
+	}
 	return nil
+}
+
+func (r *AntflyClusterReconciler) haPortableArtifactJobAction(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (antflyv1.HAPlannedActionStatus, bool, error) {
+	kind := haActionKind(action.Kind)
+	if !haPlannedActionKindIsPortableArtifact(kind) {
+		return action, true, nil
+	}
+	artifact := haSeedArtifactForAction(cluster, action)
+	if artifact == nil {
+		return action, false, fmt.Errorf("HA %s requires a matching seedArtifact spec", action.Kind)
+	}
+	var configured *antflyv1.HASeedArtifactPVCSpec
+	if kind == haActionPublishSeedArtifact || kind == haActionGCSourceSeedGenerations {
+		configured = artifact.SourcePVC
+	} else if kind != haActionPruneSeedArtifacts {
+		configured = artifact.TargetPVC
+	}
+	if kind != haActionPruneSeedArtifacts && (configured == nil || strings.TrimSpace(configured.ClaimName) == "") {
+		return action, false, fmt.Errorf("HA %s requires one explicitly configured PVC", action.Kind)
+	}
+	if strings.TrimSpace(action.TopologyID) == "" || action.TopologyGeneration <= 0 ||
+		strings.TrimSpace(action.TopologyNodeID) == "" || strings.TrimSpace(action.TargetPVCName) == "" ||
+		strings.TrimSpace(action.TargetPVCUID) == "" {
+		return action, false, fmt.Errorf("HA %s requires an exact persisted topology generation and target identity", action.Kind)
+	}
+	if action.TopologyID != strings.TrimSpace(artifact.TopologyID) ||
+		action.TopologyGeneration != artifact.TopologyGeneration ||
+		action.TopologyNodeID != strings.TrimSpace(artifact.NodeID) ||
+		action.TargetPVCUID != strings.TrimSpace(artifact.TargetPVCUID) || artifact.TargetPVC == nil ||
+		action.TargetPVCName != strings.TrimSpace(artifact.TargetPVC.ClaimName) {
+		return action, false, fmt.Errorf("HA %s persisted topology binding no longer matches seedArtifact spec", action.Kind)
+	}
+	gate := haRuntimeStartupGate(cluster)
+	if gate != nil {
+		if gate.RequiredReceipt == nil {
+			return action, false, fmt.Errorf("HA %s startup gate omits its exact receipt contract", action.Kind)
+		}
+		required := gate.RequiredReceipt
+		if action.TopologyID != strings.TrimSpace(required.TopologyID) ||
+			action.TopologyGeneration != required.TopologyGeneration ||
+			action.TopologyNodeID != strings.TrimSpace(required.NodeID) ||
+			action.TargetPVCName != strings.TrimSpace(required.TargetPVCName) ||
+			action.TargetPVCUID != strings.TrimSpace(required.TargetPVCUID) ||
+			action.SlotName != strings.TrimSpace(required.SlotName) ||
+			action.SeedArtifactGeneration != strings.TrimSpace(required.Generation) {
+			return action, false, fmt.Errorf("HA %s topology binding is stale relative to the desired startup gate", action.Kind)
+		}
+	}
+	targetPVC := &corev1.PersistentVolumeClaim{}
+	targetKey := types.NamespacedName{Name: action.TargetPVCName, Namespace: cluster.Namespace}
+	if err := r.Get(ctx, targetKey, targetPVC); err != nil {
+		if errors.IsNotFound(err) {
+			return action, false, nil
+		}
+		return action, false, fmt.Errorf("read target PVC %s for HA %s: %w", targetKey.Name, action.Kind, err)
+	}
+	if string(targetPVC.UID) != action.TargetPVCUID {
+		return action, false, fmt.Errorf("HA %s target PVC UID is stale", action.Kind)
+	}
+	if kind == haActionPruneSeedArtifacts {
+		return action, true, nil
+	}
+	pvc := &corev1.PersistentVolumeClaim{}
+	key := types.NamespacedName{Name: strings.TrimSpace(configured.ClaimName), Namespace: cluster.Namespace}
+	if err := r.Get(ctx, key, pvc); err != nil {
+		if errors.IsNotFound(err) {
+			return action, false, nil
+		}
+		return action, false, fmt.Errorf("read PVC %s for HA %s: %w", key.Name, action.Kind, err)
+	}
+	pvcUID := strings.TrimSpace(string(pvc.UID))
+	if pvcUID == "" {
+		return action, false, nil
+	}
+	if kind != haActionPublishSeedArtifact && kind != haActionGCSourceSeedGenerations {
+		if key.Name != action.TargetPVCName || action.TargetPVCUID != pvcUID {
+			return action, false, fmt.Errorf("HA %s target PVC identity is stale", action.Kind)
+		}
+		action.TargetPVCUID = pvcUID
+	} else {
+		if (strings.TrimSpace(action.SourcePVCName) != "" && strings.TrimSpace(action.SourcePVCName) != key.Name) ||
+			(strings.TrimSpace(action.SourcePVCUID) != "" && strings.TrimSpace(action.SourcePVCUID) != pvcUID) {
+			return action, false, fmt.Errorf("HA %s source PVC identity is stale", action.Kind)
+		}
+		action.SourcePVCName = key.Name
+		action.SourcePVCUID = pvcUID
+	}
+	return action, true, nil
+}
+
+func (r *AntflyClusterReconciler) ensureHASeededSlotActivationReceiptConfigMap(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) error {
+	raw, err := haSeededSlotActivationReceiptForGC(cluster, action)
+	if err != nil {
+		return err
+	}
+	immutable := true
+	desired := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: haSeededSlotActivationConfigMapName(cluster, action), Namespace: cluster.Namespace,
+			Labels: haAdminJobLabels(cluster, action),
+			Annotations: map[string]string{
+				"antfly.io/ha-operation-id":        action.OperationID,
+				"antfly.io/ha-topology-generation": strconv.FormatInt(action.TopologyGeneration, 10),
+				"antfly.io/ha-target-pvc-uid":      action.TargetPVCUID,
+			},
+		},
+		Immutable: &immutable,
+		Data:      map[string]string{"seeded-slot-activation.json": raw},
+	}
+	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
+		return err
+	}
+	existing := &corev1.ConfigMap{}
+	key := types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}
+	if err := r.Get(ctx, key, existing); err != nil {
+		if errors.IsNotFound(err) {
+			if err := r.Create(ctx, desired); err != nil {
+				return fmt.Errorf("create immutable seeded-slot activation receipt %s: %w", desired.Name, err)
+			}
+			return nil
+		}
+		return err
+	}
+	if existing.Immutable == nil || !*existing.Immutable ||
+		!metav1.IsControlledBy(existing, cluster) ||
+		existing.Data["seeded-slot-activation.json"] != raw ||
+		existing.Annotations["antfly.io/ha-operation-id"] != action.OperationID ||
+		existing.Annotations["antfly.io/ha-target-pvc-uid"] != action.TargetPVCUID {
+		return fmt.Errorf("immutable seeded-slot activation receipt ConfigMap %s does not match the exact planned operation", existing.Name)
+	}
+	return nil
+}
+
+func haSeededSlotActivationReceiptForGC(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (string, error) {
+	if cluster == nil || cluster.Status.HAStatus == nil {
+		return "", fmt.Errorf("HA target GC requires persisted seeded-slot activation evidence")
+	}
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		activation := cluster.Status.HAStatus.PlannedActions[i]
+		if haActionKind(activation.Kind) != haActionActivateSeededSlot ||
+			activation.StandbyName != action.StandbyName || activation.SlotName != action.SlotName ||
+			activation.SeedArtifactGeneration != action.SeedArtifactGeneration ||
+			!haAdminActionSucceededWithEvidence(activation) || activation.AdminResult == nil {
+			continue
+		}
+		result := activation.AdminResult
+		request := adminsdk.SeededSlotActivateRequest{
+			SlotName: result.SlotName, Generation: result.SeedArtifactGeneration,
+			ManifestId: result.ManifestID, TimelineId: result.SeedTimelineID,
+			CheckpointLsn: result.CheckpointLSN, SeedReceiptSha256: result.SeedReceiptSHA256,
+			CaptureReceiptSha256: result.CaptureReceiptSHA256,
+			ManifestSha256:       result.ManifestSHA256, AggregateSha256: result.AggregateSHA256,
+		}
+		raw, err := haExactSeededSlotActivationReceipt([]byte(result.RawReceiptJSON), request)
+		if err != nil {
+			return "", fmt.Errorf("validate exact seeded-slot activation receipt for target GC: %w", err)
+		}
+		return raw, nil
+	}
+	return "", fmt.Errorf("HA target GC requires one matching successful seeded-slot activation receipt")
+}
+
+func haSeededSlotActivationConfigMapName(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) string {
+	hash := haAdminActionHash(action)[:10]
+	base := strings.Trim(strings.ToLower(cluster.Name)+"-ha-slot-receipt", "-")
+	maxBaseLen := 63 - len(hash) - 1
+	if len(base) > maxBaseLen {
+		base = strings.TrimRight(base[:maxBaseLen], "-")
+	}
+	return fmt.Sprintf("%s-%s", base, hash)
+}
+
+func (r *AntflyClusterReconciler) observeHAAdminJobPodAttempts(ctx context.Context, job *batchv1.Job) (int32, *metav1.Time, *metav1.Time, error) {
+	if r == nil || job == nil {
+		return 0, nil, nil, nil
+	}
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(job.Namespace)); err != nil {
+		return 0, nil, nil, fmt.Errorf("list attempt pods for HA admin Job %s: %w", job.Name, err)
+	}
+	var count int32
+	var first *metav1.Time
+	var last *metav1.Time
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !haPodControlledByJob(pod, job) {
+			continue
+		}
+		var observedAt *metav1.Time
+		started := false
+		for j := range pod.Status.ContainerStatuses {
+			container := &pod.Status.ContainerStatuses[j]
+			switch {
+			case container.State.Running != nil:
+				started = true
+				candidate := metav1.NewTime(container.State.Running.StartedAt.Time)
+				observedAt = &candidate
+			case container.State.Terminated != nil:
+				started = true
+				candidate := metav1.NewTime(container.State.Terminated.StartedAt.Time)
+				observedAt = &candidate
+			case container.LastTerminationState.Terminated != nil:
+				started = true
+				candidate := metav1.NewTime(container.LastTerminationState.Terminated.StartedAt.Time)
+				observedAt = &candidate
+			}
+		}
+		if !started {
+			continue
+		}
+		count++
+		if observedAt == nil || observedAt.IsZero() {
+			observedAt = pod.Status.StartTime
+		}
+		if observedAt == nil || observedAt.IsZero() {
+			continue
+		}
+		if first == nil || observedAt.Before(first) {
+			first = observedAt.DeepCopy()
+		}
+		if last == nil || last.Before(observedAt) {
+			last = observedAt.DeepCopy()
+		}
+	}
+	return count, first, last, nil
+}
+
+// haActivationJobAction binds the activation receipt to the PVC instance that
+// the operator actually observed. The bound copy is hashed into the Job name,
+// while the declarative planned action remains stable across status replans.
+func (r *AntflyClusterReconciler) haActivationJobAction(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (antflyv1.HAPlannedActionStatus, bool, error) {
+	if haActionKind(action.Kind) != haActionActivateSeedArtifact {
+		return action, true, nil
+	}
+	if strings.TrimSpace(action.TopologyID) == "" || action.TopologyGeneration <= 0 ||
+		strings.TrimSpace(action.TopologyNodeID) == "" || strings.TrimSpace(action.TargetPVCName) == "" ||
+		strings.TrimSpace(action.TargetPVCUID) == "" || action.TargetLocalNodeID == 0 || action.TargetReplicaID == 0 {
+		return action, false, fmt.Errorf("HA target activation requires an exact persisted topology and PVC identity")
+	}
+	if cluster.Spec.Standalone == nil || cluster.Spec.Standalone.NodeID <= 0 || cluster.Spec.Standalone.Replicas != 1 ||
+		action.TargetLocalNodeID != uint64(cluster.Spec.Standalone.NodeID) || action.TargetReplicaID != 1 {
+		return action, false, fmt.Errorf("HA target activation runtime materialization identity does not match standalone topology")
+	}
+	if gate := haRuntimeStartupGate(cluster); gate != nil {
+		if gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed ||
+			gate.ReceiptMatchPolicy != antflyv1.HAReceiptMatchPolicyExact || gate.RequiredReceipt == nil {
+			return action, false, fmt.Errorf("HA target activation conflicts with the configured startup gate")
+		}
+		required := gate.RequiredReceipt
+		if action.TopologyID != strings.TrimSpace(required.TopologyID) || action.TopologyGeneration != required.TopologyGeneration ||
+			action.TopologyNodeID != strings.TrimSpace(required.NodeID) || action.TargetPVCName != strings.TrimSpace(required.TargetPVCName) ||
+			action.TargetPVCUID != strings.TrimSpace(required.TargetPVCUID) ||
+			strings.TrimSpace(action.SlotName) != strings.TrimSpace(required.SlotName) ||
+			strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) {
+			return action, false, fmt.Errorf("HA target activation topology binding is stale relative to the startup gate")
+		}
+	}
+	pvc := &corev1.PersistentVolumeClaim{}
+	err := r.Get(ctx, types.NamespacedName{Name: action.TargetPVCName, Namespace: cluster.Namespace}, pvc)
+	if errors.IsNotFound(err) {
+		return action, false, nil
+	}
+	if err != nil {
+		return action, false, err
+	}
+	pvcUID := strings.TrimSpace(string(pvc.UID))
+	if pvcUID == "" || action.TargetPVCUID != pvcUID {
+		return action, false, nil
+	}
+	return action, true, nil
+}
+
+func (r *AntflyClusterReconciler) haActivationReceiptMatchesCurrentTarget(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (bool, error) {
+	gate := haRuntimeStartupGate(cluster)
+	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed {
+		return true, nil
+	}
+	if gate.RequiredReceipt == nil {
+		return false, nil
+	}
+	required := *gate.RequiredReceipt
+	pvc := &corev1.PersistentVolumeClaim{}
+	err := r.Get(ctx, types.NamespacedName{Name: required.TargetPVCName, Namespace: cluster.Namespace}, pvc)
+	if errors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	receipt := action.SeedArtifactReceipt
+	if receipt == nil || strings.TrimSpace(string(pvc.UID)) == "" ||
+		receipt.TopologyID != required.TopologyID || receipt.NodeID != required.NodeID ||
+		receipt.SlotName != required.SlotName || receipt.Generation != required.Generation ||
+		receipt.TargetPVCName != required.TargetPVCName || receipt.TargetPVCUID != string(pvc.UID) ||
+		receipt.GenerationPath != path.Join("live-generations", required.Generation) ||
+		receipt.RawGenerationPath != path.Join("generations", required.Generation) ||
+		receipt.TargetLocalNodeID == 0 || receipt.TargetReplicaID == 0 ||
+		!isLowerHexDigest(receipt.CaptureReceiptSHA256) ||
+		!isLowerHexDigest(receipt.MaterializedReceiptSHA256) ||
+		!isLowerHexDigest(receipt.MaterializedAggregateSHA256) {
+		return false, nil
+	}
+	if required.TopologyGeneration != 0 && receipt.TopologyGeneration != required.TopologyGeneration {
+		return false, nil
+	}
+	if required.TargetPVCUID != "" && receipt.TargetPVCUID != required.TargetPVCUID {
+		return false, nil
+	}
+	if (required.ManifestSHA256 != "" && receipt.ManifestSHA256 != required.ManifestSHA256) ||
+		(required.AggregateSHA256 != "" && receipt.AggregateSHA256 != required.AggregateSHA256) ||
+		(required.SeedReceiptSHA256 != "" && receipt.SeedReceiptSHA256 != required.SeedReceiptSHA256) ||
+		(required.CaptureReceiptSHA256 != "" && receipt.CaptureReceiptSHA256 != required.CaptureReceiptSHA256) ||
+		(required.MaterializedReceiptSHA256 != "" && receipt.MaterializedReceiptSHA256 != required.MaterializedReceiptSHA256) ||
+		(required.MaterializedAggregateSHA256 != "" && receipt.MaterializedAggregateSHA256 != required.MaterializedAggregateSHA256) ||
+		(required.TargetLocalNodeID != 0 && receipt.TargetLocalNodeID != required.TargetLocalNodeID) ||
+		(required.TargetReplicaID != 0 && receipt.TargetReplicaID != required.TargetReplicaID) {
+		return false, nil
+	}
+	return true, nil
 }
 
 func haAdminActionCanRunAsFallbackJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus, err error) bool {
@@ -3961,6 +5654,13 @@ func haPlannedActionRequiresAdminTarget(action antflyv1.HAPlannedActionStatus) b
 	return len(action.AdminCommand) > 0 ||
 		strings.TrimSpace(action.AdminMethod) != "" ||
 		strings.TrimSpace(action.AdminPath) != ""
+}
+
+func haPlannedActionRequiresAdminURL(action antflyv1.HAPlannedActionStatus) bool {
+	if haPlannedActionKindIsPortableArtifact(haActionKind(action.Kind)) {
+		return false
+	}
+	return haPlannedActionRequiresAdminTarget(action)
 }
 
 func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Context, cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) (bool, error) {
@@ -4095,6 +5795,77 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromBaseBackupFinishSDK(*value))
 		}
 		return true, err
+	case string(haActionCaptureSeedArtifact):
+		if err := r.validateHASeedCaptureBinding(ctx, cluster, *action); err != nil {
+			return true, err
+		}
+		if !haPlannedActionHasDirectAdminOperation(*action) {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		// validateHASeedCaptureBinding rejects non-positive generations, and every
+		// positive int64 value is exactly representable as uint64.
+		topologyGeneration := uint64(action.TopologyGeneration) //nolint:gosec // G115: validated positive int64 widens without overflow
+		body := adminsdk.SeedArtifactCaptureRequest{
+			SlotName:           action.SlotName,
+			Generation:         action.SeedArtifactGeneration,
+			TopologyId:         action.TopologyID,
+			TopologyGeneration: topologyGeneration,
+			NodeId:             action.TopologyNodeID,
+			TargetPvcName:      action.TargetPVCName,
+			TargetPvcUid:       action.TargetPVCUID,
+		}
+		result, err := adminClient.CaptureSeedArtifactResponse(ctx, body)
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil {
+			if !haSeedCaptureResponseMatchesAction(cluster, *action, *value) {
+				err = fmt.Errorf("HA seed capture response does not match the planned runtime-owned generation and identity")
+			} else {
+				err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromSeedCaptureSDK(*value))
+			}
+		}
+		return true, err
+	case string(haActionActivateSeededSlot):
+		receipt := haSeedActivationReceiptForAction(cluster, *action)
+		if receipt == nil {
+			return true, fmt.Errorf("HA seeded slot activation requires matching durable target activation evidence")
+		}
+		if !haPlannedActionHasDirectAdminOperation(*action) {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		body := adminsdk.SeededSlotActivateRequest{
+			SlotName:             action.SlotName,
+			Generation:           receipt.Generation,
+			ManifestId:           receipt.ManifestID,
+			TimelineId:           receipt.TimelineID,
+			CheckpointLsn:        receipt.CheckpointLSN,
+			SeedReceiptSha256:    receipt.SeedReceiptSHA256,
+			CaptureReceiptSha256: receipt.CaptureReceiptSHA256,
+			ManifestSha256:       receipt.ManifestSHA256,
+			AggregateSha256:      receipt.AggregateSHA256,
+		}
+		result, err := adminClient.ActivateSeededSlotResponse(ctx, body)
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil {
+			if !haSeededSlotActivationResponseMatchesRequest(*value, body) {
+				err = fmt.Errorf("HA seeded slot activation response does not match the durable target activation receipt")
+			} else {
+				raw, rawErr := haExactSeededSlotActivationReceipt(result.Body, body)
+				if rawErr != nil {
+					err = rawErr
+				} else {
+					adminResult := haAdminActionResultFromSeededSlotActivateSDK(*value)
+					adminResult.RawReceiptJSON = raw
+					err = requireHADirectAdminActionResultStatus(action, adminResult)
+				}
+			}
+		}
+		return true, err
 	case string(haActionBootstrapStandbySeed):
 		if strings.TrimSpace(action.SeedManifestPath) == "" {
 			return false, nil
@@ -4115,8 +5886,14 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromStandbyBootstrapSDK(*value))
 		}
 		return true, err
-	case string(haActionAcquireFence):
-		body, ok := haFenceAcquireBody(cluster, *action)
+	case string(haActionAcquireFence), string(haActionFenceFormerPrimary):
+		var body adminsdk.FenceAcquireRequest
+		var ok bool
+		if haActionKind(action.Kind) == haActionFenceFormerPrimary {
+			body, ok = haFormerPrimaryFenceAcquireBody(cluster, *action)
+		} else {
+			body, ok = haFenceAcquireBody(cluster, *action)
+		}
 		if !ok {
 			return false, nil
 		}
@@ -4225,6 +6002,42 @@ func haPlannedActionHasDirectAdminOperation(action antflyv1.HAPlannedActionStatu
 	return ok
 }
 
+func (r *AntflyClusterReconciler) validateHASeedCaptureBinding(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) error {
+	if r == nil || r.Client == nil {
+		return fmt.Errorf("HA seed capture requires Kubernetes PVC observation")
+	}
+	artifact := haSeedArtifactForAction(cluster, action)
+	if artifact == nil || artifact.SourcePVC == nil || artifact.TargetPVC == nil {
+		return fmt.Errorf("HA seed capture requires distinct configured source and target PVCs")
+	}
+	if strings.TrimSpace(action.TopologyID) == "" || action.TopologyGeneration <= 0 ||
+		strings.TrimSpace(action.TopologyNodeID) == "" || strings.TrimSpace(action.TargetPVCName) == "" ||
+		strings.TrimSpace(action.TargetPVCUID) == "" ||
+		action.TopologyID != strings.TrimSpace(artifact.TopologyID) ||
+		action.TopologyGeneration != artifact.TopologyGeneration ||
+		action.TopologyNodeID != strings.TrimSpace(artifact.NodeID) ||
+		action.TargetPVCName != strings.TrimSpace(artifact.TargetPVC.ClaimName) ||
+		action.TargetPVCUID != strings.TrimSpace(artifact.TargetPVCUID) {
+		return fmt.Errorf("HA seed capture requires one exact persisted topology and target PVC binding")
+	}
+	for _, expected := range []struct {
+		name string
+		uid  string
+	}{
+		{name: strings.TrimSpace(artifact.SourcePVC.ClaimName)},
+		{name: action.TargetPVCName, uid: action.TargetPVCUID},
+	} {
+		pvc := &corev1.PersistentVolumeClaim{}
+		if err := r.Get(ctx, types.NamespacedName{Name: expected.name, Namespace: cluster.Namespace}, pvc); err != nil {
+			return fmt.Errorf("verify HA seed capture PVC %s: %w", expected.name, err)
+		}
+		if strings.TrimSpace(string(pvc.UID)) == "" || (expected.uid != "" && expected.uid != string(pvc.UID)) {
+			return fmt.Errorf("HA seed capture PVC %s identity is stale", expected.name)
+		}
+	}
+	return nil
+}
+
 func haAdminSDKResponseValue[T any](value *adminsdk.HAResponse[T], err error) (*T, error) {
 	if err != nil {
 		var apiErr *adminsdk.HAAPIError
@@ -4274,6 +6087,97 @@ func haAdminActionResultFromBaseBackupFinishSDK(response adminsdk.HABaseBackupFi
 	result.BackupLSN = response.BackupLsn
 	result.EndRecordLSN = response.EndRecordLsn
 	return result
+}
+
+func haAdminActionResultFromSeedCaptureSDK(response adminsdk.HASeedArtifactCaptureResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	result.SlotName = strings.TrimSpace(response.SlotName)
+	result.ManifestID = strings.TrimSpace(response.ManifestId)
+	result.BackupLSN = response.BackupLsn
+	result.CheckpointLSN = response.CheckpointLsn
+	result.EndRecordLSN = response.EndRecordLsn
+	result.SeedArtifactGeneration = strings.TrimSpace(response.Generation)
+	result.ManifestSHA256 = strings.TrimSpace(response.ManifestSha256)
+	result.CaptureReceiptSHA256 = strings.TrimSpace(response.CaptureReceiptSha256)
+	result.SeedClusterID = response.ClusterId
+	result.SeedShardID = response.ShardId
+	result.SeedTableID = response.TableId
+	result.SeedTimelineID = response.TimelineId
+	result.SeedEpoch = response.Epoch
+	result.SeedSourcePlanSHA256 = strings.TrimSpace(response.SourcePlanSha256)
+	result.SeedFileCount = response.FileCount
+	result.SeedTotalBytes = response.TotalBytes
+	result.SeedGenerationRoot = strings.TrimSpace(response.GenerationRoot)
+	result.SeedContentRoot = strings.TrimSpace(response.ContentRoot)
+	result.SeedManifestPath = strings.TrimSpace(response.ManifestPath)
+	result.SeedAlreadyCaptured = response.AlreadyCaptured
+	return result
+}
+
+func haSeedCaptureResponseMatchesAction(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus, response adminsdk.HASeedArtifactCaptureResponse) bool {
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	return identity != nil &&
+		strings.TrimSpace(response.SlotName) == strings.TrimSpace(action.SlotName) &&
+		strings.TrimSpace(response.Generation) == strings.TrimSpace(action.SeedArtifactGeneration) &&
+		strings.TrimSpace(response.ManifestId) == strings.TrimSpace(action.SeedArtifactGeneration) &&
+		response.ClusterId == identity.ClusterID &&
+		response.ShardId == identity.ShardID &&
+		response.TableId == identity.TableID &&
+		response.TimelineId == identity.TimelineID &&
+		response.Epoch == identity.Epoch &&
+		isLowerHexDigest(response.CaptureReceiptSha256) &&
+		response.BackupLsn >= action.TargetLSN &&
+		response.CheckpointLsn >= response.BackupLsn &&
+		response.EndRecordLsn >= response.CheckpointLsn
+}
+
+func haAdminActionResultFromSeededSlotActivateSDK(response adminsdk.HASeededSlotActivateResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	result.SlotName = strings.TrimSpace(response.SlotName)
+	result.ManifestID = strings.TrimSpace(response.ManifestId)
+	result.CheckpointLSN = response.CheckpointLsn
+	result.SeedArtifactGeneration = strings.TrimSpace(response.Generation)
+	result.SeedReceiptSHA256 = strings.TrimSpace(response.SeedReceiptSha256)
+	result.CaptureReceiptSHA256 = strings.TrimSpace(response.CaptureReceiptSha256)
+	result.ManifestSHA256 = strings.TrimSpace(response.ManifestSha256)
+	result.AggregateSHA256 = strings.TrimSpace(response.AggregateSha256)
+	result.SeedTimelineID = response.TimelineId
+	return result
+}
+
+func haExactSeededSlotActivationReceipt(body []byte, request adminsdk.SeededSlotActivateRequest) (string, error) {
+	if len(body) == 0 || len(body) > maxHASeededSlotActivationReceiptBytes {
+		return "", fmt.Errorf("HA seeded slot activation response body must contain at most %d bytes", maxHASeededSlotActivationReceiptBytes)
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	var response adminsdk.HASeededSlotActivateResponse
+	if err := decoder.Decode(&response); err != nil {
+		return "", fmt.Errorf("decode exact HA seeded slot activation response: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return "", fmt.Errorf("HA seeded slot activation response contains trailing JSON")
+	}
+	if err := adminsdk.ValidateHASeededSlotActivateResponse(response); err != nil {
+		return "", fmt.Errorf("validate exact HA seeded slot activation response: %w", err)
+	}
+	if !haSeededSlotActivationResponseMatchesRequest(response, request) {
+		return "", fmt.Errorf("exact HA seeded slot activation response does not match the activation request")
+	}
+	return string(body), nil
+}
+
+func haSeededSlotActivationResponseMatchesRequest(response adminsdk.HASeededSlotActivateResponse, request adminsdk.SeededSlotActivateRequest) bool {
+	return strings.TrimSpace(response.SlotName) == strings.TrimSpace(request.SlotName) &&
+		strings.TrimSpace(response.Generation) == strings.TrimSpace(request.Generation) &&
+		strings.TrimSpace(response.ManifestId) == strings.TrimSpace(request.ManifestId) &&
+		response.TimelineId == request.TimelineId &&
+		response.CheckpointLsn == request.CheckpointLsn &&
+		strings.TrimSpace(response.SeedReceiptSha256) == strings.TrimSpace(request.SeedReceiptSha256) &&
+		strings.TrimSpace(response.CaptureReceiptSha256) == strings.TrimSpace(request.CaptureReceiptSha256) &&
+		strings.TrimSpace(response.ManifestSha256) == strings.TrimSpace(request.ManifestSha256) &&
+		strings.TrimSpace(response.AggregateSha256) == strings.TrimSpace(request.AggregateSha256)
 }
 
 func haAdminActionResultFromStandbyBootstrapSDK(response adminsdk.HAStandbyBootstrapResponse) *antflyv1.HAAdminActionResultStatus {
@@ -4391,9 +6295,13 @@ func haDirectAdminActionReceiptSpec(kind haActionKind) (string, string, bool) {
 		expectation = adminsdk.HABaseBackupBeginReceiptExpectation()
 	case haActionFinishStandbySeed:
 		expectation = adminsdk.HABaseBackupFinishReceiptExpectation()
+	case haActionCaptureSeedArtifact:
+		expectation = adminsdk.HASeedCaptureReceiptExpectation()
+	case haActionActivateSeededSlot:
+		expectation = adminsdk.HASeededSlotActivateReceiptExpectation()
 	case haActionBootstrapStandbySeed:
 		expectation = adminsdk.HAStandbyBootstrapReceiptExpectation()
-	case haActionAcquireFence:
+	case haActionAcquireFence, haActionFenceFormerPrimary:
 		expectation = adminsdk.HAFenceAcquireReceiptExpectation()
 	case haActionAssessPromotion:
 		expectation = adminsdk.HAPromotionAssessReceiptExpectation()
@@ -4460,6 +6368,25 @@ func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 	if identity == nil || identity.CurrentPrimaryID == "" || strings.TrimSpace(action.StandbyName) == "" {
 		return adminsdk.FenceAcquireRequest{}, false
 	}
+	if frozen := haSucceededFormerPrimaryFenceResult(cluster.Status.HAStatus, action.StandbyName, action.FenceGeneration); frozen != nil {
+		return adminsdk.FenceAcquireRequest{
+			Identity: adminsdk.HAIdentity{
+				ClusterId:  frozen.FenceClusterID,
+				ShardId:    frozen.FenceShardID,
+				TableId:    frozen.FenceTableID,
+				TimelineId: frozen.FenceParentTimelineID,
+				Epoch:      frozen.FenceParentEpoch,
+			},
+			OldPrimaryId:   frozen.FenceOldPrimaryID,
+			PromotedNodeId: frozen.FencePromotedNodeID,
+			NewTimelineId:  frozen.FenceNewTimelineID,
+			NewEpoch:       frozen.FenceNewEpoch,
+			RequiredLsn:    frozen.FenceRequiredLSN,
+			ObservedLsn:    frozen.FenceObservedLSN,
+			Force:          frozen.FenceForced,
+			Reason:         frozen.FenceReason,
+		}, true
+	}
 	reason := action.FenceReason
 	if strings.TrimSpace(reason) == "" {
 		reason = action.Reason
@@ -4474,6 +6401,109 @@ func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 		ObservedLsn:    action.TargetLSN,
 		Reason:         reason,
 	}, true
+}
+
+func haFormerPrimaryFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (adminsdk.FenceAcquireRequest, bool) {
+	if cluster == nil {
+		return adminsdk.FenceAcquireRequest{}, false
+	}
+	promotion := haPromotionReceipt(cluster.Status.HAStatus)
+	if promotion == nil {
+		identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+		oldPrimaryID := strings.TrimSpace(action.StandbyName)
+		promotedNodeID := strings.TrimSpace(action.RouteTo)
+		if identity == nil ||
+			oldPrimaryID == "" ||
+			promotedNodeID == "" ||
+			oldPrimaryID != strings.TrimSpace(identity.CurrentPrimaryID) ||
+			promotedNodeID != strings.TrimSpace(action.FenceHolder) ||
+			action.TargetLSN == 0 {
+			return adminsdk.FenceAcquireRequest{}, false
+		}
+		reason := action.FenceReason
+		if strings.TrimSpace(reason) == "" {
+			reason = action.Reason
+		}
+		return adminsdk.FenceAcquireRequest{
+			Identity:       haAdminIdentityRequestFromSpec(identity),
+			OldPrimaryId:   oldPrimaryID,
+			PromotedNodeId: promotedNodeID,
+			NewTimelineId:  identity.TimelineID + 1,
+			NewEpoch:       identity.Epoch + 1,
+			RequiredLsn:    action.TargetLSN,
+			ObservedLsn:    action.TargetLSN,
+			Reason:         reason,
+		}, true
+	}
+	if strings.TrimSpace(promotion.OldPrimaryID) == "" ||
+		strings.TrimSpace(promotion.PromotedStandbyID) == "" ||
+		promotion.ParentTimelineID == 0 ||
+		promotion.ParentEpoch == 0 ||
+		promotion.NewTimelineID == 0 ||
+		promotion.NewEpoch == 0 ||
+		haPromotionRequiredLSN(promotion) == 0 ||
+		haPromotionObservedLSN(promotion) < haPromotionRequiredLSN(promotion) {
+		return adminsdk.FenceAcquireRequest{}, false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil ||
+		promotion.OldPrimaryID != identity.CurrentPrimaryID ||
+		promotion.ParentTimelineID != identity.TimelineID ||
+		promotion.ParentEpoch != identity.Epoch ||
+		strings.TrimSpace(action.StandbyName) != strings.TrimSpace(promotion.OldPrimaryID) ||
+		strings.TrimSpace(action.RouteTo) != strings.TrimSpace(promotion.PromotedStandbyID) {
+		return adminsdk.FenceAcquireRequest{}, false
+	}
+	return adminsdk.FenceAcquireRequest{
+		Identity: adminsdk.HAIdentity{
+			ClusterId:  identity.ClusterID,
+			ShardId:    identity.ShardID,
+			TableId:    identity.TableID,
+			TimelineId: promotion.ParentTimelineID,
+			Epoch:      promotion.ParentEpoch,
+		},
+		OldPrimaryId:   promotion.OldPrimaryID,
+		PromotedNodeId: promotion.PromotedStandbyID,
+		NewTimelineId:  promotion.NewTimelineID,
+		NewEpoch:       promotion.NewEpoch,
+		RequiredLsn:    haPromotionRequiredLSN(promotion),
+		ObservedLsn:    haPromotionObservedLSN(promotion),
+		Force:          promotion.Forced,
+		Reason:         promotion.FenceReason,
+	}, true
+}
+
+func haSucceededFormerPrimaryFenceResult(status *antflyv1.HAStatus, promotedNodeID string, generation uint64) *antflyv1.HAAdminActionResultStatus {
+	if status == nil {
+		return nil
+	}
+	for i := range status.PlannedActions {
+		action := &status.PlannedActions[i]
+		if haActionKind(action.Kind) != haActionFenceFormerPrimary ||
+			action.AdminJobPhase != haAdminJobPhaseSucceeded ||
+			strings.TrimSpace(action.RouteTo) != strings.TrimSpace(promotedNodeID) ||
+			(generation != 0 && action.FenceGeneration != generation) ||
+			action.AdminResult == nil {
+			continue
+		}
+		result := action.AdminResult
+		if result.FenceClusterID == 0 ||
+			strings.TrimSpace(result.FenceOldPrimaryID) == "" ||
+			strings.TrimSpace(result.FencePromotedNodeID) != strings.TrimSpace(promotedNodeID) ||
+			result.FenceParentTimelineID == 0 ||
+			result.FenceParentEpoch == 0 ||
+			result.FenceNewTimelineID == 0 ||
+			result.FenceNewEpoch == 0 ||
+			result.FenceRequiredLSN == 0 ||
+			result.FenceObservedLSN != result.FenceRequiredLSN ||
+			result.FenceGeneration == 0 ||
+			(generation != 0 && result.FenceGeneration != generation) ||
+			strings.TrimSpace(result.FenceToken) == "" {
+			continue
+		}
+		return result
+	}
+	return nil
 }
 
 func haPromotionAssessBody(action antflyv1.HAPlannedActionStatus) adminsdk.PromotionAssessRequest {
@@ -4938,8 +6968,31 @@ func requireHADirectPromotionAssessmentResultStatus(action *antflyv1.HAPlannedAc
 		haPromotionAssessmentResultMatchesAction(*action, action.AdminResult) {
 		return nil
 	}
+	if haPromotionAssessmentWaitingForBoundary(*action, result) {
+		return fmt.Errorf("%w: required_lsn=%d received_lsn=%d applied_lsn=%d", errHAPromotionBoundaryNotApplied, result.PromotionRequiredLSN, result.PromotionReceivedLSN, result.PromotionAppliedLSN)
+	}
 	action.AdminResult = nil
 	return fmt.Errorf("HA admin action %s succeeded without safe typed promotion assessment", action.Kind)
+}
+
+func haPromotionAssessmentWaitingForBoundary(action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
+	if result == nil || result.SchemaVersion == 0 || action.TargetLSN == 0 ||
+		result.ActionKind != "promotion_assess" ||
+		result.ActionTarget != action.StandbyName ||
+		result.ActionState != "assessed" ||
+		(strings.TrimSpace(action.AdminNodeID) != "" && result.ActionNodeID != action.AdminNodeID) ||
+		result.PromotionRequiredLSN != action.TargetLSN ||
+		!result.PromotionFenced ||
+		result.PromotionForce ||
+		result.PromotionRequiresFencing {
+		return false
+	}
+	return !result.PromotionCanPromote &&
+		!result.PromotionSafe &&
+		result.PromotionDataLossPossible &&
+		result.PromotionRequiresForce &&
+		(result.PromotionReceivedLSN < action.TargetLSN ||
+			result.PromotionAppliedLSN < action.TargetLSN)
 }
 
 func haFenceAcquireResultMatchesAction(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
@@ -4949,6 +7002,59 @@ func haFenceAcquireResultMatchesAction(cluster *antflyv1.AntflyCluster, action *
 	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
 	if identity == nil || strings.TrimSpace(action.StandbyName) == "" {
 		return false
+	}
+	if haActionKind(action.Kind) == haActionFenceFormerPrimary {
+		promotion := haPromotionReceipt(cluster.Status.HAStatus)
+		if promotion != nil {
+			return result.FenceClusterID != 0 &&
+				(promotion.ClusterID == 0 || result.FenceClusterID == promotion.ClusterID) &&
+				(promotion.ClusterID == 0 || result.FenceShardID == promotion.ShardID) &&
+				(promotion.ClusterID == 0 || result.FenceTableID == promotion.TableID) &&
+				result.FenceOldPrimaryID == promotion.OldPrimaryID &&
+				result.FencePromotedNodeID == promotion.PromotedStandbyID &&
+				result.FenceParentTimelineID == promotion.ParentTimelineID &&
+				result.FenceParentEpoch == promotion.ParentEpoch &&
+				result.FenceNewTimelineID == promotion.NewTimelineID &&
+				result.FenceNewEpoch == promotion.NewEpoch &&
+				result.FenceRequiredLSN == haPromotionRequiredLSN(promotion) &&
+				result.FenceObservedLSN == haPromotionObservedLSN(promotion) &&
+				result.FenceGeneration == promotion.FenceGeneration &&
+				result.FenceToken == promotion.FenceToken &&
+				result.FenceForced == promotion.Forced &&
+				result.FenceReason == promotion.FenceReason
+		}
+		return result.FenceClusterID == identity.ClusterID &&
+			result.FenceShardID == identity.ShardID &&
+			result.FenceTableID == identity.TableID &&
+			result.FenceOldPrimaryID == strings.TrimSpace(action.StandbyName) &&
+			result.FencePromotedNodeID == strings.TrimSpace(action.RouteTo) &&
+			result.FenceParentTimelineID == identity.TimelineID &&
+			result.FenceParentEpoch == identity.Epoch &&
+			result.FenceNewTimelineID == identity.TimelineID+1 &&
+			result.FenceNewEpoch == identity.Epoch+1 &&
+			result.FenceRequiredLSN >= action.TargetLSN &&
+			result.FenceObservedLSN == result.FenceRequiredLSN &&
+			result.FenceGeneration == action.FenceGeneration &&
+			strings.TrimSpace(result.FenceToken) != "" &&
+			!result.FenceForced &&
+			result.FenceReason == action.FenceReason
+	}
+	if frozen := haSucceededFormerPrimaryFenceResult(cluster.Status.HAStatus, action.StandbyName, action.FenceGeneration); frozen != nil {
+		return result.FenceClusterID == frozen.FenceClusterID &&
+			result.FenceShardID == frozen.FenceShardID &&
+			result.FenceTableID == frozen.FenceTableID &&
+			result.FenceOldPrimaryID == frozen.FenceOldPrimaryID &&
+			result.FencePromotedNodeID == frozen.FencePromotedNodeID &&
+			result.FenceParentTimelineID == frozen.FenceParentTimelineID &&
+			result.FenceParentEpoch == frozen.FenceParentEpoch &&
+			result.FenceNewTimelineID == frozen.FenceNewTimelineID &&
+			result.FenceNewEpoch == frozen.FenceNewEpoch &&
+			result.FenceRequiredLSN == frozen.FenceRequiredLSN &&
+			result.FenceObservedLSN == frozen.FenceObservedLSN &&
+			result.FenceGeneration == frozen.FenceGeneration &&
+			result.FenceToken == frozen.FenceToken &&
+			result.FenceForced == frozen.FenceForced &&
+			result.FenceReason == frozen.FenceReason
 	}
 	if result.FenceClusterID == 0 ||
 		result.FenceClusterID != identity.ClusterID ||
@@ -4987,6 +7093,10 @@ func (r *AntflyClusterReconciler) updateHAAdminActionResultFromJobLogs(ctx conte
 		action.AdminResult = haCompletedSlotAdminJobResult(*action)
 		return
 	}
+	if haActionRequiresSeedArtifactReceipt(haActionKind(action.Kind)) {
+		action.SeedArtifactReceipt = parseHASeedArtifactReceipt(body, *action)
+		return
+	}
 	result, ok := parseHAAdminActionResultTable(body)
 	if !ok {
 		action.AdminResult = haCompletedSlotAdminJobResult(*action)
@@ -4996,6 +7106,189 @@ func (r *AntflyClusterReconciler) updateHAAdminActionResultFromJobLogs(ctx conte
 		enrichHAPromotionAdminActionResult(result, haReplicationIdentity(cluster.Spec.HighAvailability), *action)
 	}
 	action.AdminResult = result
+}
+
+func parseHASeedArtifactReceipt(body string, action antflyv1.HAPlannedActionStatus) *antflyv1.HASeedArtifactReceiptStatus {
+	type chunkReceipt struct {
+		Index     uint64 `json:"index"`
+		SizeBytes uint64 `json:"size_bytes"`
+		SHA256    string `json:"sha256"`
+	}
+	type fileReceipt struct {
+		Path      string         `json:"path"`
+		SizeBytes uint64         `json:"size_bytes"`
+		CRC32     uint32         `json:"crc32"`
+		SHA256    string         `json:"sha256"`
+		Chunks    []chunkReceipt `json:"chunks"`
+	}
+	type artifactReceipt struct {
+		FormatVersion               int32         `json:"format_version"`
+		Generation                  string        `json:"generation"`
+		SlotName                    string        `json:"slot_name"`
+		ClusterID                   uint64        `json:"cluster_id"`
+		ShardID                     uint64        `json:"shard_id"`
+		TableID                     uint64        `json:"table_id"`
+		TimelineID                  uint64        `json:"timeline_id"`
+		Epoch                       uint64        `json:"epoch"`
+		ManifestID                  string        `json:"manifest_id"`
+		BackupLSN                   uint64        `json:"backup_lsn"`
+		CheckpointLSN               uint64        `json:"checkpoint_lsn"`
+		ManifestSHA256              string        `json:"manifest_sha256"`
+		AggregateSHA256             string        `json:"aggregate_sha256"`
+		SeedReceiptSHA256           string        `json:"seed_receipt_sha256"`
+		CaptureReceiptSHA256        string        `json:"capture_receipt_sha256"`
+		GenerationPath              string        `json:"generation_path"`
+		RawGenerationPath           string        `json:"raw_generation_path"`
+		MaterializedReceiptSHA256   string        `json:"materialized_receipt_sha256"`
+		MaterializedAggregateSHA256 string        `json:"materialized_aggregate_sha256"`
+		TargetLocalNodeID           uint64        `json:"target_local_node_id"`
+		TargetReplicaID             uint64        `json:"target_replica_id"`
+		TopologyID                  string        `json:"topology_id"`
+		TopologyGeneration          int64         `json:"topology_generation"`
+		NodeID                      string        `json:"node_id"`
+		TargetPVCName               string        `json:"target_pvc_name"`
+		TargetPVCUID                string        `json:"target_pvc_uid"`
+		TotalBytes                  uint64        `json:"total_bytes"`
+		Files                       []fileReceipt `json:"files"`
+	}
+	type pruneReceipt struct {
+		FormatVersion      int32  `json:"format_version"`
+		SlotName           string `json:"slot_name"`
+		CurrentGeneration  string `json:"current_generation"`
+		RetainedGeneration int32  `json:"retained_generations"`
+		DeletedGeneration  int32  `json:"deleted_generations"`
+	}
+	type localGCReceipt struct {
+		SchemaVersion        int32  `json:"schema_version"`
+		ActionKind           string `json:"action_kind"`
+		Scope                string `json:"scope"`
+		SlotName             string `json:"slot_name"`
+		CurrentGeneration    string `json:"current_generation"`
+		CheckpointSHA256     string `json:"checkpoint_sha256"`
+		RetainedGenerations  int32  `json:"retained_generations"`
+		ProtectedGenerations int32  `json:"protected_generations"`
+		DeletedGenerations   int32  `json:"deleted_generations"`
+		ResumedTombstones    int32  `json:"resumed_tombstones"`
+		SkippedIneligible    int32  `json:"skipped_ineligible"`
+	}
+
+	kind := haActionKind(action.Kind)
+	if kind == haActionGCSourceSeedGenerations || kind == haActionGCTargetSeedGenerations {
+		var receipt localGCReceipt
+		decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(body)))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&receipt); err != nil {
+			return nil
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			return nil
+		}
+		result := &antflyv1.HASeedArtifactReceiptStatus{
+			FormatVersion: receipt.SchemaVersion, ActionKind: strings.TrimSpace(receipt.ActionKind),
+			Scope: strings.TrimSpace(receipt.Scope), Generation: strings.TrimSpace(receipt.CurrentGeneration),
+			SlotName: strings.TrimSpace(receipt.SlotName), CheckpointSHA256: strings.TrimSpace(receipt.CheckpointSHA256),
+			RetainedCount: receipt.RetainedGenerations, ProtectedCount: receipt.ProtectedGenerations,
+			DeletedCount: receipt.DeletedGenerations, ResumedTombstoneCount: receipt.ResumedTombstones,
+			SkippedIneligibleCount: receipt.SkippedIneligible,
+		}
+		if !haSeedArtifactReceiptMatchesStatus(action, result) {
+			return nil
+		}
+		return result
+	}
+
+	if kind == haActionPruneSeedArtifacts {
+		var receipt pruneReceipt
+		if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &receipt); err != nil {
+			return nil
+		}
+		result := &antflyv1.HASeedArtifactReceiptStatus{
+			FormatVersion: receipt.FormatVersion,
+			Generation:    strings.TrimSpace(receipt.CurrentGeneration),
+			SlotName:      strings.TrimSpace(receipt.SlotName),
+			RetainedCount: receipt.RetainedGeneration,
+			DeletedCount:  receipt.DeletedGeneration,
+		}
+		if !haSeedArtifactReceiptMatchesStatus(action, result) {
+			return nil
+		}
+		return result
+	}
+
+	var receipt artifactReceipt
+	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(body)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&receipt); err != nil {
+		return nil
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil
+	}
+	if len(receipt.Files) > math.MaxInt32 {
+		return nil
+	}
+	result := &antflyv1.HASeedArtifactReceiptStatus{
+		FormatVersion:               receipt.FormatVersion,
+		Generation:                  strings.TrimSpace(receipt.Generation),
+		SlotName:                    strings.TrimSpace(receipt.SlotName),
+		ClusterID:                   receipt.ClusterID,
+		ShardID:                     receipt.ShardID,
+		TableID:                     receipt.TableID,
+		TimelineID:                  receipt.TimelineID,
+		Epoch:                       receipt.Epoch,
+		ManifestID:                  strings.TrimSpace(receipt.ManifestID),
+		BackupLSN:                   receipt.BackupLSN,
+		CheckpointLSN:               receipt.CheckpointLSN,
+		ManifestSHA256:              strings.TrimSpace(receipt.ManifestSHA256),
+		AggregateSHA256:             strings.TrimSpace(receipt.AggregateSHA256),
+		SeedReceiptSHA256:           strings.TrimSpace(receipt.SeedReceiptSHA256),
+		CaptureReceiptSHA256:        strings.TrimSpace(receipt.CaptureReceiptSHA256),
+		GenerationPath:              strings.TrimSpace(receipt.GenerationPath),
+		RawGenerationPath:           strings.TrimSpace(receipt.RawGenerationPath),
+		MaterializedReceiptSHA256:   strings.TrimSpace(receipt.MaterializedReceiptSHA256),
+		MaterializedAggregateSHA256: strings.TrimSpace(receipt.MaterializedAggregateSHA256),
+		TargetLocalNodeID:           receipt.TargetLocalNodeID,
+		TargetReplicaID:             receipt.TargetReplicaID,
+		TopologyID:                  strings.TrimSpace(receipt.TopologyID),
+		TopologyGeneration:          receipt.TopologyGeneration,
+		NodeID:                      strings.TrimSpace(receipt.NodeID),
+		TargetPVCName:               strings.TrimSpace(receipt.TargetPVCName),
+		TargetPVCUID:                strings.TrimSpace(receipt.TargetPVCUID),
+		TotalBytes:                  receipt.TotalBytes,
+		FileCount:                   int32(len(receipt.Files)), // #nosec G115 -- bounded by math.MaxInt32 above
+	}
+	if !haSeedArtifactReceiptMatchesStatus(action, result) {
+		return nil
+	}
+	return result
+}
+
+func haSeedActivationReceiptForAction(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) *antflyv1.HASeedArtifactReceiptStatus {
+	if cluster == nil || cluster.Status.HAStatus == nil {
+		return nil
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil {
+		return nil
+	}
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		dependency := cluster.Status.HAStatus.PlannedActions[i]
+		if haActionKind(dependency.Kind) != haActionActivateSeedArtifact ||
+			dependency.SlotName != action.SlotName ||
+			dependency.SeedArtifactGeneration != action.SeedArtifactGeneration ||
+			!haAdminActionSucceededWithEvidence(dependency) {
+			continue
+		}
+		receipt := dependency.SeedArtifactReceipt
+		if receipt == nil || receipt.ClusterID != identity.ClusterID || receipt.ShardID != identity.ShardID ||
+			receipt.TableID != identity.TableID || receipt.TimelineID != identity.TimelineID || receipt.Epoch != identity.Epoch {
+			return nil
+		}
+		return receipt.DeepCopy()
+	}
+	return nil
 }
 
 func haCompletedSlotAdminJobResult(action antflyv1.HAPlannedActionStatus) *antflyv1.HAAdminActionResultStatus {
@@ -5307,7 +7600,7 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context
 			action.StandbyName == "" {
 			continue
 		}
-		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
+		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i, cluster) {
 			continue
 		}
 		if action.AdminResult == nil {
@@ -5475,17 +7768,13 @@ func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv
 	if action.StandbyName != "" && result.FormerNodeID != action.StandbyName {
 		return false
 	}
-	if haActionKind(action.Kind) == haActionDemoteFormerPrimary {
-		if action.ObservedLSN > 0 && result.FormerLastLSN != action.ObservedLSN {
-			return false
-		}
-	} else {
-		if action.TargetLSN > 0 && result.ForkLSN != action.TargetLSN {
-			return false
-		}
-		if action.ObservedLSN > 0 && result.FormerLastLSN != action.ObservedLSN {
-			return false
-		}
+	if result.Action == "rewind" &&
+		(result.FormerLastLSN != result.ForkLSN || result.DataLossDiscarded) {
+		return false
+	}
+	if haActionKind(action.Kind) != haActionDemoteFormerPrimary &&
+		action.TargetLSN > 0 && result.ForkLSN != action.TargetLSN {
+		return false
 	}
 	if action.RetainedFromLSN > 0 && result.RetainedFromLSN != action.RetainedFromLSN {
 		return false
@@ -5564,7 +7853,7 @@ func (r *AntflyClusterReconciler) updateHAFormerPrimaryFromAdminJobs(ctx context
 			action.AdminJobName == "" {
 			continue
 		}
-		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
+		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i, cluster) {
 			continue
 		}
 		if action.AdminResult == nil {
@@ -6035,6 +8324,10 @@ func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
 		return haRejoinJobResult{}, false
 	}
 	result.DataLossDiscarded, _ = parseHAResultBool(lines, assessmentPrefix+"data_loss_discarded")
+	if result.Action == "rewind" &&
+		(result.FormerLastLSN != result.ForkLSN || result.DataLossDiscarded) {
+		return haRejoinJobResult{}, false
+	}
 	switch resultName {
 	case "rejoin_rewind":
 		if strings.TrimSpace(result.Action) != "rewind" {
@@ -6069,12 +8362,14 @@ func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
 			return haRejoinJobResult{}, false
 		}
 		rewindDataLossDiscarded, _ := parseHAResultBool(lines, "rewind.data_loss_discarded")
-		if result.RewindPreviousLastLSN != result.FormerLastLSN ||
-			result.RewindCurrentLastLSN != result.ForkLSN ||
-			result.RewindPreviousLastLSN < result.RewindCurrentLastLSN ||
-			result.RewindCurrentLastLSN == ^uint64(0) ||
-			result.RewindNextLSN != result.RewindCurrentLastLSN+1 ||
-			result.RewindDiscardedLSNCount != result.RewindPreviousLastLSN-result.RewindCurrentLastLSN {
+		if !haSafeRejoinRewindBounds(
+			result.ForkLSN,
+			result.FormerLastLSN,
+			result.RewindPreviousLastLSN,
+			result.RewindCurrentLastLSN,
+			result.RewindNextLSN,
+			result.RewindDiscardedLSNCount,
+		) || result.DataLossDiscarded || rewindDataLossDiscarded {
 			return haRejoinJobResult{}, false
 		}
 		result.RewindExecuted = true
@@ -6214,6 +8509,10 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 		RetainedFromLSN:   retainedFromLSN,
 		DataLossDiscarded: haBoolJSONValue(assessment.DataLossDiscarded),
 	}
+	if result.Action == "rewind" &&
+		(result.FormerLastLSN != result.ForkLSN || result.DataLossDiscarded) {
+		return haRejoinJobResult{}, false
+	}
 	if rewind := envelope.Rewind; rewind != nil {
 		rewindForkLSN := haUint64JSONValue(rewind.ForkLSN)
 		rewindPreviousLastLSN := haUint64JSONValue(rewind.PreviousLastLSN)
@@ -6229,11 +8528,14 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 			rewindPreviousLastLSN != formerLastLSN ||
 			rewindTargetTimelineID != targetTimelineID ||
 			rewindTargetEpoch != targetEpoch ||
-			rewindCurrentLastLSN != forkLSN ||
-			rewindPreviousLastLSN < rewindCurrentLastLSN ||
-			rewindCurrentLastLSN == ^uint64(0) ||
-			rewindNextLSN != rewindCurrentLastLSN+1 ||
-			rewindDiscardedLSNCount != rewindPreviousLastLSN-rewindCurrentLastLSN {
+			!haSafeRejoinRewindBounds(
+				forkLSN,
+				formerLastLSN,
+				rewindPreviousLastLSN,
+				rewindCurrentLastLSN,
+				rewindNextLSN,
+				rewindDiscardedLSNCount,
+			) || haBoolJSONValue(assessment.DataLossDiscarded) || haBoolJSONValue(rewind.DataLossDiscarded) {
 			return haRejoinJobResult{}, false
 		}
 		result.RewindExecuted = true
@@ -6464,6 +8766,28 @@ func parseHAResultUint(lines map[string]string, key string) (uint64, bool) {
 	return value, err == nil
 }
 
+func haSafeRejoinRewindBounds(
+	forkLSN uint64,
+	formerLastLSN uint64,
+	previousLastLSN uint64,
+	currentLastLSN uint64,
+	nextLSN uint64,
+	discardedLSNCount uint64,
+) bool {
+	// A logical HA WAL rewind cannot undo writes already applied to the LSM.
+	// Safe in-place reuse is therefore limited to an exact-fork former primary.
+	// The operation appends the promoted timeline switch at fork+1; it never
+	// reports discarded data.
+	if forkLSN == ^uint64(0) || currentLastLSN == ^uint64(0) {
+		return false
+	}
+	return formerLastLSN == forkLSN &&
+		previousLastLSN == forkLSN &&
+		currentLastLSN == forkLSN+1 &&
+		nextLSN == currentLastLSN+1 &&
+		discardedLSNCount == 0
+}
+
 func parseHAResultBool(lines map[string]string, key string) (bool, bool) {
 	raw, ok := lines[key]
 	if !ok {
@@ -6562,20 +8886,48 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 	}
 	status, err := r.observeHAPrimaryStatusTyped(ctx, cluster, adminURL, ha)
 	if err != nil {
-		cluster.Status.HAStatus.PrimaryAdminReachable = false
-		cluster.Status.HAStatus.PrimaryAdminLastError = err.Error()
-		if statusCode, ok := adminsdk.HAStatusCode(err); ok {
-			cluster.Status.HAStatus.PrimaryAdminStatusCode = statusCode
-		} else {
-			cluster.Status.HAStatus.PrimaryAdminStatusCode = 0
+		haStatus := cluster.Status.HAStatus
+		// A pending proof is authenticated process capability, not primary
+		// health. Retain only that proof so the exact current owner can advance
+		// the just-created Lease once; do not merge LSN, slots, retention, sync,
+		// or mark the admin endpoint reachable until authority is granted.
+		if status.WatchdogProof != nil && status.WatchdogProof.Active && !status.WatchdogProof.AuthorityGranted {
+			haStatus.PrimaryWatchdogProof = status.WatchdogProof.DeepCopy()
 		}
+		now := r.haNow()
+		if haStatus.PrimaryAdminReachable || haStatus.PrimaryAdminUnreachableSince == nil {
+			since := metav1.NewTime(now)
+			haStatus.PrimaryAdminUnreachableSince = &since
+			haStatus.PrimaryAdminConsecutiveFailures = 1
+		} else if haStatus.PrimaryAdminConsecutiveFailures < math.MaxInt32 {
+			haStatus.PrimaryAdminConsecutiveFailures++
+		}
+		haStatus.PrimaryAdminReachable = false
+		haStatus.PrimaryAdminLastError = err.Error()
+		if statusCode, ok := adminsdk.HAStatusCode(err); ok {
+			haStatus.PrimaryAdminStatusCode = statusCode
+		} else {
+			haStatus.PrimaryAdminStatusCode = 0
+		}
+		minimumFailures, minimumDuration := haAutomaticFailoverFailureThresholds(ha)
+		haStatus.PrimaryAdminFailureThresholdMet =
+			haStatus.PrimaryAdminStatusCode != http.StatusUnauthorized &&
+				haStatus.PrimaryAdminConsecutiveFailures >= minimumFailures &&
+				haStatus.PrimaryAdminUnreachableSince != nil &&
+				now.Sub(haStatus.PrimaryAdminUnreachableSince.Time) >= minimumDuration
 		return err
 	}
 	cluster.Status.HAStatus.PrimaryAdminReachable = true
 	cluster.Status.HAStatus.PrimaryAdminLastError = ""
 	cluster.Status.HAStatus.PrimaryAdminStatusCode = 0
+	cluster.Status.HAStatus.PrimaryAdminConsecutiveFailures = 0
+	cluster.Status.HAStatus.PrimaryAdminUnreachableSince = nil
+	cluster.Status.HAStatus.PrimaryAdminFailureThresholdMet = false
 	cluster.Status.HAStatus.PrimaryLSN = status.PrimaryLSN
 	cluster.Status.HAStatus.Retention = status.Retention
+	if status.WatchdogProof != nil {
+		cluster.Status.HAStatus.PrimaryWatchdogProof = status.WatchdogProof.DeepCopy()
+	}
 	cluster.Status.HAStatus.Standbys = status.Standbys
 	if status.Sync != nil {
 		cluster.Status.HAStatus.Sync = *status.Sync
@@ -6621,16 +8973,28 @@ func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Contex
 	if err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
+	requestStartedAt := r.haNow()
 	response, err := adminClient.PrimaryStatusParsedResponse(ctx, haPrimaryStatusParams(ha))
 	if err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
+	observedAt := r.haNow()
 	status := haObservedPrimaryStatusFromAdminSDK(*response.Value)
 	if err := haValidateObservedStatusIdentity(status.Identity, ha, cluster.Status.HAStatus); err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
 	if err := haValidateObservedPrimaryNodeID(status.NodeID, ha, cluster.Status.HAStatus); err != nil {
 		return haObservedPrimaryStatus{}, err
+	}
+	if haRuntimeLeaseWatchdogEnabled(cluster) {
+		proof, err := haWatchdogProofFromAdmin(status.RawWatchdogProof, cluster, status.NodeID, false, requestStartedAt, observedAt)
+		if err != nil {
+			return haObservedPrimaryStatus{}, err
+		}
+		status.WatchdogProof = proof
+		if !proof.AuthorityGranted {
+			return status, fmt.Errorf("HA Lease watchdog authority is pending for node %s", status.NodeID)
+		}
 	}
 	return status, nil
 }
@@ -6640,16 +9004,25 @@ func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Contex
 	if err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
+	requestStartedAt := r.haNow()
 	response, err := adminClient.StandbyStatusParsedResponse(ctx, haStandbyStatusParams(upstreamLSN))
 	if err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
+	observedAt := r.haNow()
 	observed := haObservedStandbyStatusFromAdminSDK(*response.Value, standbyName, slotName)
 	if err := haValidateObservedStatusIdentity(observed.Identity, ha, cluster.Status.HAStatus); err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
 	if err := haValidateObservedNodeID(observed.NodeID, standbyName, "standby"); err != nil {
 		return antflyv1.HAStandbyStatus{}, err
+	}
+	if haRuntimeLeaseWatchdogEnabled(cluster) {
+		proof, err := haWatchdogProofFromAdmin(observed.RawWatchdogProof, cluster, observed.NodeID, false, requestStartedAt, observedAt)
+		if err != nil {
+			return antflyv1.HAStandbyStatus{}, err
+		}
+		observed.Status.WatchdogProof = proof
 	}
 	return observed.Status, nil
 }
@@ -6730,18 +9103,21 @@ func haAdminSyncFailureParam(policy antflyv1.HAFailurePolicy) adminsdk.HAPrimary
 }
 
 type haObservedPrimaryStatus struct {
-	NodeID     string
-	PrimaryLSN uint64
-	Retention  antflyv1.HARetentionStatus
-	Standbys   []antflyv1.HAStandbyStatus
-	Sync       *antflyv1.HASyncStatus
-	Identity   haObservedIdentity
+	NodeID           string
+	PrimaryLSN       uint64
+	Retention        antflyv1.HARetentionStatus
+	Standbys         []antflyv1.HAStandbyStatus
+	Sync             *antflyv1.HASyncStatus
+	Identity         haObservedIdentity
+	RawWatchdogProof *adminsdk.HALeaseWatchdogProof
+	WatchdogProof    *antflyv1.HAWatchdogProofStatus
 }
 
 type haObservedStandbyStatus struct {
-	NodeID   string
-	Status   antflyv1.HAStandbyStatus
-	Identity haObservedIdentity
+	NodeID           string
+	Status           antflyv1.HAStandbyStatus
+	Identity         haObservedIdentity
+	RawWatchdogProof *adminsdk.HALeaseWatchdogProof
 }
 
 type haObservedIdentity struct {
@@ -6782,6 +9158,10 @@ func haObservedPrimaryStatusFromAdminSDK(parsed adminsdk.ParsedHAPrimaryStatus) 
 			ActiveSlots:       haUint64ToInt32(snapshot.Retention.ActiveSlots),
 			ReseedRecommended: haUint64ToInt32(snapshot.Retention.ReseedRecommended),
 		},
+	}
+	if parsed.Response.Snapshot.LeaseWatchdog.CapabilityVersion != 0 {
+		proof := parsed.Response.Snapshot.LeaseWatchdog
+		status.RawWatchdogProof = &proof
 	}
 	for _, slot := range snapshot.Slots {
 		status.Standbys = append(status.Standbys, antflyv1.HAStandbyStatus{
@@ -6914,10 +9294,16 @@ func haObservedStandbyStatusFromAdminSDK(response adminsdk.HAStandbyStatusRespon
 	} else if status.CanServeSafeReads && status.Status == "" {
 		status.Status = "healthy"
 	}
+	var rawWatchdogProof *adminsdk.HALeaseWatchdogProof
+	if snapshot.LeaseWatchdog.CapabilityVersion != 0 {
+		proof := snapshot.LeaseWatchdog
+		rawWatchdogProof = &proof
+	}
 	return haObservedStandbyStatus{
-		NodeID:   strings.TrimSpace(snapshot.NodeId),
-		Status:   status,
-		Identity: haObservedIdentityFromAdminSDK(snapshot.Identity),
+		NodeID:           strings.TrimSpace(snapshot.NodeId),
+		Status:           status,
+		Identity:         haObservedIdentityFromAdminSDK(snapshot.Identity),
+		RawWatchdogProof: rawWatchdogProof,
 	}
 }
 
@@ -6929,6 +9315,83 @@ func haObservedIdentityFromAdminSDK(identity adminsdk.HAIdentity) haObservedIden
 		TimelineID: identity.TimelineId,
 		Epoch:      identity.Epoch,
 	}
+}
+
+func haWatchdogProofFromAdmin(raw *adminsdk.HALeaseWatchdogProof, cluster *antflyv1.AntflyCluster, nodeID string, requireAuthority bool, requestStartedAt, observedAt time.Time) (*antflyv1.HAWatchdogProofStatus, error) {
+	if raw == nil {
+		return nil, fmt.Errorf("HA Lease watchdog capability proof is missing")
+	}
+	lease := cluster.Spec.HighAvailability.Runtime.FencingLease
+	if raw.CapabilityVersion != 1 || !raw.Active || (requireAuthority && !raw.AuthorityGranted) {
+		return nil, fmt.Errorf("HA Lease watchdog is not active for node %s", nodeID)
+	}
+	expectedMaxFenceLatencyMS := int32(10_000)
+	if lease.WatchdogGraceSeconds > 0 {
+		expectedMaxFenceLatencyMS = lease.WatchdogGraceSeconds * 1000
+	}
+	rtt := observedAt.Sub(requestStartedAt)
+	if rtt < 0 {
+		return nil, fmt.Errorf("HA Lease watchdog proof request clock moved backwards")
+	}
+	authorityRemainingMS := int32(0)
+	if raw.AuthorityGranted {
+		const responseSafetyMarginMS = int64(250)
+		rttMS := int64((rtt + time.Millisecond - 1) / time.Millisecond)
+		if raw.AuthorityRemainingMs == 0 || raw.AuthorityRemainingMs > math.MaxInt32 {
+			return nil, fmt.Errorf("HA Lease watchdog authority expired or has insufficient margin after admin response RTT")
+		}
+		remainingMS := int64(raw.AuthorityRemainingMs) // #nosec G115 -- rejected above unless the unsigned value is at most MaxInt32.
+		remainingMS -= rttMS + responseSafetyMarginMS
+		if remainingMS <= 0 {
+			return nil, fmt.Errorf("HA Lease watchdog authority expired or has insufficient margin after admin response RTT")
+		}
+		authorityRemainingMS = int32(remainingMS) // #nosec G115 -- raw and adjusted values are bounded above and below before conversion.
+	} else if raw.AuthorityRemainingMs != 0 {
+		return nil, fmt.Errorf("HA Lease watchdog denied authority but reported a nonzero authority remainder")
+	}
+	if strings.TrimSpace(raw.LeaseName) != strings.TrimSpace(lease.Name) ||
+		strings.TrimSpace(raw.LeaseNamespace) != cluster.Namespace ||
+		strings.TrimSpace(raw.StableTopologyId) != strings.TrimSpace(lease.TopologyID) ||
+		strings.TrimSpace(raw.LocalNodeId) != strings.TrimSpace(nodeID) ||
+		strings.TrimSpace(raw.ObservedHolderNodeId) == "" ||
+		(raw.AuthorityGranted && strings.TrimSpace(raw.ObservedHolderNodeId) != strings.TrimSpace(raw.LocalNodeId)) ||
+		strings.TrimSpace(raw.PodUid) == "" ||
+		raw.ObservedLeaseTransitions == 0 || raw.ObservedLeaseTransitions > math.MaxInt32 ||
+		raw.MaxFenceLatencyMs != uint64(expectedMaxFenceLatencyMS) ||
+		!haWatchdogProcessBootIDValid(raw.ProcessBootId) {
+		return nil, fmt.Errorf("HA Lease watchdog proof does not match the configured topology and exact runtime process")
+	}
+	return &antflyv1.HAWatchdogProofStatus{
+		CapabilityVersion:        1,
+		Active:                   true,
+		AuthorityGranted:         raw.AuthorityGranted,
+		AuthorityRemainingMS:     authorityRemainingMS,
+		LeaseName:                strings.TrimSpace(raw.LeaseName),
+		LeaseNamespace:           strings.TrimSpace(raw.LeaseNamespace),
+		TopologyID:               strings.TrimSpace(raw.StableTopologyId),
+		LocalNodeID:              strings.TrimSpace(raw.LocalNodeId),
+		ObservedHolderNodeID:     strings.TrimSpace(raw.ObservedHolderNodeId),
+		PodUID:                   strings.TrimSpace(raw.PodUid),
+		ProcessBootID:            strings.TrimSpace(raw.ProcessBootId),
+		ObservedLeaseTransitions: int32(raw.ObservedLeaseTransitions), // #nosec G115 -- the proof is rejected above unless it is in (0, MaxInt32].
+		MaxFenceLatencyMS:        expectedMaxFenceLatencyMS,
+		// Anchor process identity at request start. A response delayed across a
+		// same-Pod container restart must not be combined with the replacement
+		// container's Kubernetes identity by the later uncached Pod check.
+		ObservedAt: metav1.NewTime(requestStartedAt),
+	}, nil
+}
+
+func haWatchdogProcessBootIDValid(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, ch := range value {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func haValidateObservedStatusIdentity(observed haObservedIdentity, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) error {
@@ -7062,6 +9525,9 @@ func mergeHAStandbyStatus(status *antflyv1.HAStatus, observed antflyv1.HAStandby
 		existing.LastAttemptNs = observed.LastAttemptNs
 		existing.LastSuccessNs = observed.LastSuccessNs
 		existing.ReplicationFailuresTotal = observed.ReplicationFailuresTotal
+		if observed.WatchdogProof != nil {
+			existing.WatchdogProof = observed.WatchdogProof.DeepCopy()
+		}
 		if observed.Status != "" {
 			existing.Status = observed.Status
 		}
@@ -7143,11 +9609,21 @@ func (r *AntflyClusterReconciler) reconcileHAPrimaryRoute(ctx context.Context, c
 		if action.Kind != string(haActionUpdatePrimaryRoute) {
 			continue
 		}
-		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
+		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i, cluster) {
 			return nil
 		}
 		if !haPrimaryRouteActionHasPromotionEvidence(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
 			return nil
+		}
+		if haRuntimeLeaseWatchdogEnabled(cluster) {
+			ready, err := r.haPromotedRuntimeWatchdogReady(ctx, cluster, action.RouteTo, action.FenceGeneration)
+			if err != nil || !ready {
+				return err
+			}
+			ready, err = r.haCurrentLeaseAuthorizesRoute(ctx, cluster, action.RouteTo, action.FenceGeneration)
+			if err != nil || !ready {
+				return err
+			}
 		}
 		if action.RouteTo == "" {
 			return nil
@@ -7155,6 +9631,80 @@ func (r *AntflyClusterReconciler) reconcileHAPrimaryRoute(ctx context.Context, c
 		return r.updateHAPrimaryRouteService(ctx, cluster, action)
 	}
 	return nil
+}
+
+func (r *AntflyClusterReconciler) haCurrentLeaseAuthorizesRoute(ctx context.Context, cluster *antflyv1.AntflyCluster, nodeID string, generation uint64) (bool, error) {
+	lease := &coordinationv1.Lease{}
+	if err := r.haBoundaryReader().Get(ctx, types.NamespacedName{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != strings.TrimSpace(nodeID) ||
+		lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions <= 0 ||
+		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) {
+		return false, nil
+	}
+	observedGeneration := uint64(*lease.Spec.LeaseTransitions) // #nosec G115 -- non-positive Kubernetes Lease transitions are rejected above.
+	if observedGeneration != generation {
+		return false, nil
+	}
+	ready, _ := haLeaseFenceReady(lease, generation, r.haNow())
+	return ready, nil
+}
+
+func (r *AntflyClusterReconciler) haPromotedRuntimeWatchdogReady(ctx context.Context, cluster *antflyv1.AntflyCluster, nodeID string, fenceGeneration uint64) (bool, error) {
+	if cluster == nil || cluster.Status.HAStatus == nil || cluster.Status.HAStatus.PrimaryWatchdogProof == nil ||
+		cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil ||
+		cluster.Spec.HighAvailability.Runtime.FencingLease == nil {
+		return false, nil
+	}
+	proof := cluster.Status.HAStatus.PrimaryWatchdogProof
+	lease := cluster.Spec.HighAvailability.Runtime.FencingLease
+	if proof.ObservedLeaseTransitions <= 0 {
+		return false, nil
+	}
+	observedLeaseTransitions := uint64(proof.ObservedLeaseTransitions) // #nosec G115 -- non-positive persisted proof transitions are rejected above.
+	expectedMaxFenceLatencyMS := int32(10_000)
+	if lease.WatchdogGraceSeconds > 0 {
+		expectedMaxFenceLatencyMS = lease.WatchdogGraceSeconds * 1000
+	}
+	now := r.haNow()
+	if proof.ObservedAt.IsZero() || now.Before(proof.ObservedAt.Time) ||
+		now.Sub(proof.ObservedAt.Time) > time.Duration(proof.MaxFenceLatencyMS)*time.Millisecond ||
+		proof.AuthorityRemainingMS <= 0 ||
+		now.Sub(proof.ObservedAt.Time) >= time.Duration(proof.AuthorityRemainingMS)*time.Millisecond ||
+		proof.MaxFenceLatencyMS != expectedMaxFenceLatencyMS ||
+		!(proof.Active && proof.AuthorityGranted && proof.CapabilityVersion == 1 &&
+			proof.LocalNodeID == strings.TrimSpace(nodeID) && proof.ObservedHolderNodeID == strings.TrimSpace(nodeID) &&
+			proof.PodUID != "" && proof.ProcessBootID != "" &&
+			proof.LeaseName == strings.TrimSpace(lease.Name) && proof.LeaseNamespace == cluster.Namespace &&
+			proof.TopologyID == strings.TrimSpace(lease.TopologyID) &&
+			observedLeaseTransitions == fenceGeneration) {
+		return false, nil
+	}
+
+	pods := &corev1.PodList{}
+	if err := r.haBoundaryReader().List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
+		return false, err
+	}
+	matches := 0
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if string(pod.UID) != proof.PodUID || pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		for j := range pod.Status.ContainerStatuses {
+			container := &pod.Status.ContainerStatuses[j]
+			if container.Name == "antfly" && container.State.Running != nil &&
+				!proof.ObservedAt.Before(&container.State.Running.StartedAt) {
+				matches++
+				break
+			}
+		}
+	}
+	return matches == 1, nil
 }
 
 func (r *AntflyClusterReconciler) updateHAPrimaryRouteService(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) error {
@@ -7221,7 +9771,7 @@ func haPriorAdminActionsSucceeded(actions []antflyv1.HAPlannedActionStatus) bool
 	return true
 }
 
-func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStatus, index int) bool {
+func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStatus, index int, clusters ...*antflyv1.AntflyCluster) bool {
 	if index < 0 || index >= len(actions) {
 		return false
 	}
@@ -7229,21 +9779,56 @@ func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStat
 	if action.DependsOn == "" {
 		return haPriorAdminActionsSucceeded(actions[:index])
 	}
-	for i := 0; i < index; i++ {
+	for i := index - 1; i >= 0; i-- {
 		dependency := actions[i]
-		if dependency.Kind != action.DependsOn {
+		if dependency.Kind != action.DependsOn || !haPlannedActionDependencyScopeMatches(action, dependency) {
 			continue
 		}
-		if dependency.AdminJobName != haAdminDirectAPIName && !haPlannedActionRequiresAdminTarget(dependency) {
-			return true
+		if dependency.Executor == string(haActionExecutorControllerAction) {
+			if haActionKind(dependency.Kind) == haActionIsolateFormerPrimary {
+				if len(clusters) > 0 && clusters[0] != nil {
+					return haPhysicalIsolationSucceededWithEvidence(clusters[0], dependency)
+				}
+				return haPhysicalIsolationSucceededStructurallyWithEvidence(dependency)
+			}
+			return dependency.AdminJobPhase == haAdminJobPhaseSucceeded
 		}
 		return haAdminActionSucceededWithEvidence(dependency)
 	}
 	return false
 }
 
-func haPlannedActionDependenciesSucceededForStatus(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int) bool {
-	if !haPlannedActionDependenciesSucceeded(actions, index) {
+func haPlannedActionDependencyScopeMatches(action, dependency antflyv1.HAPlannedActionStatus) bool {
+	// Former-primary repair deliberately crosses node identities (for example,
+	// demote primary-a depends on promotion of standby-a).
+	if haFormerPrimaryActionKind(action.Kind) || haFormerPrimaryActionKind(dependency.Kind) ||
+		haActionKind(dependency.Kind) == haActionFenceFormerPrimary || haActionKind(dependency.Kind) == haActionIsolateFormerPrimary ||
+		haActionKind(action.Kind) == haActionDemoteFormerPrimary {
+		return true
+	}
+	actionTarget := firstNonEmptyString(action.SlotName, action.StandbyName, action.RouteTo)
+	dependencyTarget := firstNonEmptyString(dependency.SlotName, dependency.StandbyName, dependency.RouteTo)
+	if actionTarget != "" && dependencyTarget != "" && actionTarget != dependencyTarget {
+		return false
+	}
+	if action.SeedArtifactGeneration != "" && dependency.SeedArtifactGeneration != "" &&
+		dependency.SeedArtifactGeneration != action.SeedArtifactGeneration {
+		return false
+	}
+	return true
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func haPlannedActionDependenciesSucceededForStatus(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int, clusters ...*antflyv1.AntflyCluster) bool {
+	if !haPlannedActionDependenciesSucceeded(actions, index, clusters...) {
 		return false
 	}
 	action := actions[index]
@@ -7361,6 +9946,9 @@ func haAdminActionSucceededWithEvidence(action antflyv1.HAPlannedActionStatus) b
 	if action.AdminJobPhase != haAdminJobPhaseSucceeded {
 		return false
 	}
+	if haActionRequiresSeedArtifactReceipt(haActionKind(action.Kind)) {
+		return haSeedArtifactReceiptMatches(action)
+	}
 	if !haActionRequiresAdminResult(haActionKind(action.Kind)) {
 		return true
 	}
@@ -7372,6 +9960,115 @@ func haAdminActionSucceededWithEvidence(action antflyv1.HAPlannedActionStatus) b
 		return false
 	}
 	return haActionHasRequiredAdminResult(action)
+}
+
+func haActionRequiresSeedArtifactReceipt(kind haActionKind) bool {
+	return haPlannedActionKindIsPortableArtifact(kind)
+}
+
+func haSeedArtifactReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
+	return haSeedArtifactReceiptMatchesStatus(action, action.SeedArtifactReceipt)
+}
+
+func haSeedArtifactReceiptMatchesStatus(action antflyv1.HAPlannedActionStatus, receipt *antflyv1.HASeedArtifactReceiptStatus) bool {
+	if receipt == nil ||
+		strings.TrimSpace(receipt.Generation) != strings.TrimSpace(action.SeedArtifactGeneration) ||
+		strings.TrimSpace(receipt.SlotName) != strings.TrimSpace(action.SlotName) {
+		return false
+	}
+	kind := haActionKind(action.Kind)
+	if kind == haActionGCSourceSeedGenerations || kind == haActionGCTargetSeedGenerations {
+		expectedScope := "source_capture"
+		if kind == haActionGCTargetSeedGenerations {
+			expectedScope = "target_activation"
+		}
+		return receipt.FormatVersion == 1 && receipt.ActionKind == "gc_local_seed_generations" &&
+			receipt.Scope == expectedScope && isLowerHexDigest(receipt.CheckpointSHA256) &&
+			receipt.RetainedCount > 0 && receipt.ProtectedCount >= 0 && receipt.DeletedCount >= 0 &&
+			receipt.ResumedTombstoneCount >= 0 && receipt.SkippedIneligibleCount >= 0
+	}
+	switch kind {
+	case haActionPublishSeedArtifact, haActionRestoreSeedArtifact:
+		if receipt.FormatVersion != 1 && receipt.FormatVersion != 2 && receipt.FormatVersion != 3 && receipt.FormatVersion != 4 {
+			return false
+		}
+	case haActionActivateSeedArtifact:
+		if receipt.FormatVersion != 2 {
+			return false
+		}
+	default:
+		// Prune receipts have a distinct v1 schema. Transport and activation
+		// versions must never silently widen that evidence contract.
+		if receipt.FormatVersion != 1 {
+			return false
+		}
+	}
+	if (kind == haActionPublishSeedArtifact || kind == haActionRestoreSeedArtifact || kind == haActionActivateSeedArtifact) &&
+		!haSeedArtifactTopologyReceiptMatchesAction(action, receipt) {
+		return false
+	}
+	if kind == haActionPruneSeedArtifacts {
+		return receipt.RetainedCount > 0 &&
+			receipt.RetainedCount <= action.SeedArtifactRetainGenerations &&
+			receipt.DeletedCount >= 0
+	}
+	if kind == haActionActivateSeedArtifact {
+		return receipt.FileCount == 0 &&
+			strings.TrimSpace(receipt.ManifestID) != "" &&
+			receipt.BackupLSN > 0 &&
+			receipt.CheckpointLSN >= receipt.BackupLSN &&
+			receipt.CheckpointLSN >= action.TargetLSN &&
+			isLowerHexDigest(receipt.SeedReceiptSHA256) &&
+			isLowerHexDigest(receipt.CaptureReceiptSHA256) &&
+			receipt.CaptureReceiptSHA256 == strings.TrimSpace(action.SeedCaptureReceiptSHA256) &&
+			isLowerHexDigest(receipt.ManifestSHA256) &&
+			isLowerHexDigest(receipt.AggregateSHA256) &&
+			isLowerHexDigest(receipt.MaterializedReceiptSHA256) &&
+			isLowerHexDigest(receipt.MaterializedAggregateSHA256) &&
+			receipt.TargetLocalNodeID == action.TargetLocalNodeID &&
+			receipt.TargetReplicaID == action.TargetReplicaID &&
+			strings.TrimSpace(receipt.GenerationPath) == "live-generations/"+strings.TrimSpace(action.SeedArtifactGeneration) &&
+			strings.TrimSpace(receipt.RawGenerationPath) == "generations/"+strings.TrimSpace(action.SeedArtifactGeneration)
+	}
+	return receipt.FileCount > 0 &&
+		strings.TrimSpace(receipt.ManifestID) != "" &&
+		receipt.BackupLSN > 0 &&
+		receipt.CheckpointLSN >= receipt.BackupLSN &&
+		receipt.CheckpointLSN >= action.TargetLSN &&
+		isLowerHexDigest(receipt.ManifestSHA256) &&
+		isLowerHexDigest(receipt.AggregateSHA256) &&
+		(strings.TrimSpace(action.SeedCaptureReceiptSHA256) == "" ||
+			(receipt.CaptureReceiptSHA256 == strings.TrimSpace(action.SeedCaptureReceiptSHA256) && isLowerHexDigest(receipt.CaptureReceiptSHA256)))
+}
+
+func haSeedArtifactTopologyReceiptMatchesAction(action antflyv1.HAPlannedActionStatus, receipt *antflyv1.HASeedArtifactReceiptStatus) bool {
+	bound := strings.TrimSpace(action.TopologyID) != "" || action.TopologyGeneration != 0 ||
+		strings.TrimSpace(action.TopologyNodeID) != "" || strings.TrimSpace(action.TargetPVCName) != "" ||
+		strings.TrimSpace(action.TargetPVCUID) != ""
+	if !bound {
+		return true
+	}
+	if receipt == nil || receipt.TopologyID != strings.TrimSpace(action.TopologyID) ||
+		receipt.TopologyGeneration != action.TopologyGeneration || receipt.NodeID != strings.TrimSpace(action.TopologyNodeID) ||
+		receipt.TargetPVCName != strings.TrimSpace(action.TargetPVCName) || receipt.TargetPVCUID != strings.TrimSpace(action.TargetPVCUID) {
+		return false
+	}
+	if (haActionKind(action.Kind) == haActionPublishSeedArtifact || haActionKind(action.Kind) == haActionRestoreSeedArtifact) && receipt.FormatVersion != 4 {
+		return false
+	}
+	return true
+}
+
+func isLowerHexDigest(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func haAdminActionSucceededWithStatusEvidence(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
@@ -7446,6 +10143,25 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 		return haResultManifestMatches(result.ManifestID, expectedManifestID) &&
 			haResultBackupLSNMatches(result.BackupLSN, action.TargetLSN) &&
 			result.EndRecordLSN > 0
+	case haActionCaptureSeedArtifact:
+		return haResultSlotNameMatches(result.SlotName, expectedSlotName) &&
+			strings.TrimSpace(result.ManifestID) == strings.TrimSpace(action.SeedArtifactGeneration) &&
+			strings.TrimSpace(result.SeedArtifactGeneration) == strings.TrimSpace(action.SeedArtifactGeneration) &&
+			result.BackupLSN >= action.TargetLSN && result.CheckpointLSN >= result.BackupLSN &&
+			result.EndRecordLSN >= result.CheckpointLSN && result.SeedClusterID > 0 &&
+			result.SeedTimelineID > 0 && result.SeedEpoch > 0 && result.SeedFileCount > 0 &&
+			isLowerHexDigest(result.SeedSourcePlanSHA256) && isLowerHexDigest(result.ManifestSHA256) &&
+			isLowerHexDigest(result.CaptureReceiptSHA256) &&
+			path.IsAbs(result.SeedGenerationRoot) && path.IsAbs(result.SeedContentRoot) && path.IsAbs(result.SeedManifestPath)
+	case haActionActivateSeededSlot:
+		return haResultSlotNameMatches(result.SlotName, expectedSlotName) &&
+			strings.TrimSpace(result.ManifestID) != "" &&
+			result.CheckpointLSN >= action.TargetLSN &&
+			strings.TrimSpace(result.SeedArtifactGeneration) == strings.TrimSpace(action.SeedArtifactGeneration) &&
+			isLowerHexDigest(result.SeedReceiptSHA256) &&
+			isLowerHexDigest(result.CaptureReceiptSHA256) &&
+			isLowerHexDigest(result.ManifestSHA256) &&
+			isLowerHexDigest(result.AggregateSHA256)
 	case haActionBootstrapStandbySeed:
 		return haResultManifestMatches(result.ManifestID, expectedManifestID) &&
 			haResultBackupLSNMatches(result.BackupLSN, action.TargetLSN) &&
@@ -7455,6 +10171,12 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 			(action.FenceGeneration == 0 || result.FenceGeneration == action.FenceGeneration) &&
 			result.FenceToken != "" &&
 			(action.StandbyName == "" || result.FencePromotedNodeID == action.StandbyName)
+	case haActionFenceFormerPrimary:
+		return result.FenceGeneration > 0 &&
+			(action.FenceGeneration == 0 || result.FenceGeneration == action.FenceGeneration) &&
+			result.FenceToken != "" &&
+			(action.StandbyName == "" || result.FenceOldPrimaryID == action.StandbyName) &&
+			(action.RouteTo == "" || result.FencePromotedNodeID == action.RouteTo)
 	case haActionAssessPromotion:
 		return haPromotionAssessmentResultMatchesAction(action, result)
 	case haActionPromoteStandby:
@@ -7502,6 +10224,7 @@ func haAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
 	}
 	expectedKind, expectedTarget, expectedState := haDirectAdminActionReceiptExpectation(action)
 	requireExpectedNode := haAdminActionReceiptRequiresPlannedNode(action)
+	expectedNodeID := action.AdminNodeID
 	return adminsdk.HAReceiptMatchesNode(adminsdk.HAActionReceipt{
 		ActionId:   result.ActionID,
 		ActionKind: adminsdk.HAActionReceiptActionKind(strings.TrimSpace(result.ActionKind)),
@@ -7511,7 +10234,7 @@ func haAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
 	}, adminsdk.HAReceiptExpectation{
 		ActionKind: adminsdk.HAActionReceiptActionKind(strings.TrimSpace(expectedKind)),
 		State:      adminsdk.HAActionReceiptState(strings.TrimSpace(expectedState)),
-	}, expectedTarget, action.AdminNodeID, requireExpectedNode)
+	}, expectedTarget, expectedNodeID, requireExpectedNode)
 }
 
 func haAdminActionReceiptRequiresPlannedNode(action antflyv1.HAPlannedActionStatus) bool {
@@ -7539,8 +10262,14 @@ func haDirectAdminActionReceiptTarget(action antflyv1.HAPlannedActionStatus) str
 		return expectedManifestID
 	case haActionFinishStandbySeed, haActionBootstrapStandbySeed:
 		return expectedManifestID
+	case haActionCaptureSeedArtifact:
+		return strings.TrimSpace(action.SeedArtifactGeneration)
+	case haActionActivateSeededSlot:
+		return strings.TrimSpace(action.SeedArtifactGeneration)
 	case haActionAcquireFence, haActionAssessPromotion, haActionPromoteStandby, haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
 		return strings.TrimSpace(action.StandbyName)
+	case haActionFenceFormerPrimary:
+		return strings.TrimSpace(action.RouteTo)
 	default:
 		return ""
 	}
@@ -7592,12 +10321,15 @@ func haRejoinResultMatchesRequiredAdminResult(action antflyv1.HAPlannedActionSta
 		if result.RejoinAction != "rewind" {
 			return false
 		}
-		if !result.RewindExecuted ||
-			result.RewindPreviousLastLSN == 0 ||
-			result.RewindCurrentLastLSN != result.ForkLSN ||
-			result.RewindNextLSN != result.ForkLSN+1 ||
-			result.RewindPreviousLastLSN < result.RewindCurrentLastLSN ||
-			result.RewindDiscardedLSNCount != result.RewindPreviousLastLSN-result.RewindCurrentLastLSN {
+		if !result.RewindExecuted || result.DataLossDiscarded ||
+			!haSafeRejoinRewindBounds(
+				result.ForkLSN,
+				result.FormerLastLSN,
+				result.RewindPreviousLastLSN,
+				result.RewindCurrentLastLSN,
+				result.RewindNextLSN,
+				result.RewindDiscardedLSNCount,
+			) {
 			return false
 		}
 	case haActionReseedFormerPrimary:
@@ -7615,11 +10347,6 @@ func haRejoinResultMatchesRequiredAdminResult(action antflyv1.HAPlannedActionSta
 	}
 	if action.StandbyName != "" && result.FormerNodeID != action.StandbyName {
 		return false
-	}
-	if haActionKind(action.Kind) == haActionDemoteFormerPrimary {
-		if action.ObservedLSN > 0 && result.FormerLastLSN != action.ObservedLSN {
-			return false
-		}
 	}
 	if action.RetainedFromLSN > 0 && result.RetainedFromLSN != action.RetainedFromLSN {
 		return false
@@ -7649,10 +10376,7 @@ func haRejoinResultMatchesPromotion(status *antflyv1.HAStatus, action antflyv1.H
 	if result.TargetTimelineID != promotion.NewTimelineID || result.TargetEpoch != promotion.NewEpoch {
 		return false
 	}
-	if promotion.SwitchLSN != 0 && result.ForkLSN != promotion.SwitchLSN {
-		return false
-	}
-	if promotion.RequiredLSN != 0 && result.ForkLSN != promotion.RequiredLSN {
+	if forkLSN := haPromotionObservedLSN(promotion); forkLSN != 0 && result.ForkLSN != forkLSN {
 		return false
 	}
 	if haActionKind(action.Kind) == haActionRewindFormerPrimary &&
@@ -7745,12 +10469,17 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 		if jobName == "" {
 			jobName = "unknown"
 		}
-		message := fmt.Sprintf("HA admin action %s failed in Job %s", action.Kind, jobName)
+		message := fmt.Sprintf("HA admin action %s failed in executor %s after %d attempt(s)", action.Kind, jobName, action.AttemptCount)
+		if strings.TrimSpace(action.ErrorClass) != "" {
+			message = fmt.Sprintf("%s (class %s)", message, strings.TrimSpace(action.ErrorClass))
+		}
 		if strings.TrimSpace(action.AdminError) != "" {
 			message = fmt.Sprintf("%s: %s", message, strings.TrimSpace(action.AdminError))
 		}
 		reason := antflyv1.ReasonHAAdminJobFailed
-		if action.AdminStatusCode == http.StatusUnauthorized {
+		if action.ErrorClass == "RetryBudgetExhausted" {
+			reason = antflyv1.ReasonHAAdminRetryBudgetExhausted
+		} else if action.AdminStatusCode == http.StatusUnauthorized {
 			reason = antflyv1.ReasonHAAdminUnauthorized
 		}
 		setHACondition(
@@ -7781,7 +10510,8 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 	}
 	for _, action := range cluster.Status.HAStatus.PlannedActions {
 		if action.AdminJobPhase != haAdminJobPhaseSucceeded ||
-			!haActionRequiresAdminResult(haActionKind(action.Kind)) ||
+			(!haActionRequiresAdminResult(haActionKind(action.Kind)) &&
+				!haActionRequiresSeedArtifactReceipt(haActionKind(action.Kind))) ||
 			haAdminActionSucceededWithStatusEvidence(cluster.Status.HAStatus, action) {
 			continue
 		}
@@ -7809,7 +10539,7 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 			action.StandbyName == "" {
 			continue
 		}
-		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
+		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i, cluster) {
 			continue
 		}
 		if !haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, action) {
@@ -7833,19 +10563,188 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 	}
 }
 
-func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) *batchv1.Job {
-	args := []string{"ha", "--ha-url", action.AdminURL}
-	if tokenEnvVar := haAdminConfiguredTokenEnvVar(admin); tokenEnvVar != "" {
-		args = append(args, "--ha-token-env", tokenEnvVar)
+var haSeedIdentityAnnotationKeys = [...]string{
+	haSeedRoleAnnotation,
+	haTopologyIDAnnotation,
+	haTopologyGenerationAnnotation,
+	haNodeIDAnnotation,
+	haSlotNameAnnotation,
+	haSeedGenerationAnnotation,
+	haSeedManifestIDAnnotation,
+	haSeedManifestSHA256Annotation,
+	haSeedSourcePVCNameAnnotation,
+	haSeedSourcePVCUIDAnnotation,
+	haSeedTargetPVCNameAnnotation,
+	haSeedTargetPVCUIDAnnotation,
+	haSeedCheckpointLSNAnnotation,
+}
+
+type haSeedIdentityEvidence struct {
+	manifestID     string
+	manifestSHA256 string
+	checkpointLSN  uint64
+}
+
+// haPortableSeedIdentityAnnotations freezes only evidence that is authoritative
+// before this Job is created. In particular, the Job's own eventual receipt is
+// never folded back into its identity after the immutable Pod template exists.
+func haPortableSeedIdentityAnnotations(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) map[string]string {
+	kind := haActionKind(action.Kind)
+	if !haPlannedActionKindIsPortableArtifact(kind) {
+		return nil
 	}
-	args = append(args, "--")
+	annotations := map[string]string{}
+	setHASeedIdentityAnnotation(annotations, haTopologyIDAnnotation, action.TopologyID)
+	if action.TopologyGeneration > 0 {
+		annotations[haTopologyGenerationAnnotation] = strconv.FormatInt(action.TopologyGeneration, 10)
+	}
+	setHASeedIdentityAnnotation(annotations, haNodeIDAnnotation, action.TopologyNodeID)
+	setHASeedIdentityAnnotation(annotations, haSlotNameAnnotation, action.SlotName)
+	setHASeedIdentityAnnotation(annotations, haSeedGenerationAnnotation, action.SeedArtifactGeneration)
+
+	evidence := haPortableSeedPrerequisiteEvidence(cluster, action)
+	setHASeedIdentityAnnotation(annotations, haSeedManifestIDAnnotation, evidence.manifestID)
+	setHASeedIdentityAnnotation(annotations, haSeedManifestSHA256Annotation, evidence.manifestSHA256)
+	if evidence.checkpointLSN > 0 {
+		annotations[haSeedCheckpointLSNAnnotation] = strconv.FormatUint(evidence.checkpointLSN, 10)
+	}
+
+	switch kind {
+	case haActionPublishSeedArtifact, haActionGCSourceSeedGenerations:
+		setHASeedIdentityAnnotation(annotations, haSeedSourcePVCNameAnnotation, action.SourcePVCName)
+		setHASeedIdentityAnnotation(annotations, haSeedSourcePVCUIDAnnotation, action.SourcePVCUID)
+	default:
+		setHASeedIdentityAnnotation(annotations, haSeedTargetPVCNameAnnotation, action.TargetPVCName)
+		setHASeedIdentityAnnotation(annotations, haSeedTargetPVCUIDAnnotation, action.TargetPVCUID)
+	}
+	if kind == haActionRestoreSeedArtifact {
+		annotations[haSeedRoleAnnotation] = "restore"
+	}
+	return annotations
+}
+
+func setHASeedIdentityAnnotation(annotations map[string]string, key, value string) {
+	if value = strings.TrimSpace(value); value != "" {
+		annotations[key] = value
+	}
+}
+
+func haPortableSeedPrerequisiteEvidence(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) haSeedIdentityEvidence {
+	if cluster == nil || cluster.Status.HAStatus == nil {
+		return haSeedIdentityEvidence{}
+	}
+	for _, prerequisiteKind := range haPortableSeedEvidencePrerequisiteKinds(haActionKind(action.Kind)) {
+		for i := len(cluster.Status.HAStatus.PlannedActions) - 1; i >= 0; i-- {
+			candidate := cluster.Status.HAStatus.PlannedActions[i]
+			if haActionKind(candidate.Kind) != prerequisiteKind ||
+				!haSeedChainBindingMatchesAction(candidate, action) ||
+				!haAdminActionSucceededWithEvidence(candidate) {
+				continue
+			}
+			if receipt := candidate.SeedArtifactReceipt; receipt != nil {
+				return haSeedIdentityEvidence{
+					manifestID: strings.TrimSpace(receipt.ManifestID), manifestSHA256: strings.TrimSpace(receipt.ManifestSHA256),
+					checkpointLSN: receipt.CheckpointLSN,
+				}
+			}
+			if result := candidate.AdminResult; result != nil {
+				return haSeedIdentityEvidence{
+					manifestID: strings.TrimSpace(result.ManifestID), manifestSHA256: strings.TrimSpace(result.ManifestSHA256),
+					checkpointLSN: result.CheckpointLSN,
+				}
+			}
+		}
+	}
+	return haSeedIdentityEvidence{}
+}
+
+func haPortableSeedEvidencePrerequisiteKinds(kind haActionKind) []haActionKind {
+	switch kind {
+	case haActionPublishSeedArtifact:
+		return []haActionKind{haActionCaptureSeedArtifact, haActionFinishStandbySeed}
+	case haActionGCSourceSeedGenerations, haActionRestoreSeedArtifact:
+		return []haActionKind{haActionPublishSeedArtifact, haActionCaptureSeedArtifact, haActionFinishStandbySeed}
+	case haActionActivateSeedArtifact:
+		return []haActionKind{haActionRestoreSeedArtifact, haActionPublishSeedArtifact, haActionCaptureSeedArtifact, haActionFinishStandbySeed}
+	case haActionGCTargetSeedGenerations, haActionPruneSeedArtifacts:
+		return []haActionKind{
+			haActionActivateSeededSlot, haActionActivateSeedArtifact, haActionRestoreSeedArtifact,
+			haActionPublishSeedArtifact, haActionCaptureSeedArtifact, haActionFinishStandbySeed,
+		}
+	default:
+		return nil
+	}
+}
+
+func haSeedChainBindingMatchesAction(candidate, action antflyv1.HAPlannedActionStatus) bool {
+	if strings.TrimSpace(candidate.StandbyName) != strings.TrimSpace(action.StandbyName) ||
+		strings.TrimSpace(candidate.SlotName) != strings.TrimSpace(action.SlotName) ||
+		strings.TrimSpace(candidate.TopologyID) != strings.TrimSpace(action.TopologyID) ||
+		candidate.TopologyGeneration != action.TopologyGeneration ||
+		strings.TrimSpace(candidate.TopologyNodeID) != strings.TrimSpace(action.TopologyNodeID) ||
+		strings.TrimSpace(candidate.TargetPVCName) != strings.TrimSpace(action.TargetPVCName) ||
+		strings.TrimSpace(candidate.TargetPVCUID) != strings.TrimSpace(action.TargetPVCUID) {
+		return false
+	}
+	candidateGeneration := strings.TrimSpace(candidate.SeedArtifactGeneration)
+	if candidateGeneration != "" {
+		return candidateGeneration == strings.TrimSpace(action.SeedArtifactGeneration)
+	}
+	// Legacy caller-owned captures do not carry the portable generation on the
+	// FinishStandbySeed action. In that case the frozen manifest path is the only
+	// exact bridge into the portable publish chain; a slot name alone is not.
+	candidateManifestPath := strings.TrimSpace(candidate.SeedManifestPath)
+	return candidateManifestPath != "" && candidateManifestPath == strings.TrimSpace(action.SeedManifestPath)
+}
+
+func haSeedIdentityAnnotationsEqual(actual, desired map[string]string) bool {
+	for _, key := range haSeedIdentityAnnotationKeys {
+		actualValue, actualExists := actual[key]
+		desiredValue, desiredExists := desired[key]
+		if actualExists != desiredExists || actualValue != desiredValue {
+			return false
+		}
+	}
+	return true
+}
+
+func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) *batchv1.Job {
+	portableArtifactAction := haPlannedActionKindIsPortableArtifact(haActionKind(action.Kind))
+	args := []string{"ha"}
+	if !portableArtifactAction {
+		args = append(args, "--ha-url", action.AdminURL)
+		if tokenEnvVar := haAdminConfiguredTokenEnvVar(admin); tokenEnvVar != "" {
+			args = append(args, "--ha-token-env", tokenEnvVar)
+		}
+		args = append(args, "--")
+	}
 	args = append(args, action.AdminCommand...)
+	envFrom := append([]corev1.EnvFromSource{}, admin.EnvFrom...)
+	if artifact := haSeedArtifactForAction(cluster, action); artifact != nil && artifact.CredentialsSecretRef != nil {
+		envFrom = append(envFrom, corev1.EnvFromSource{SecretRef: &corev1.SecretEnvSource{
+			LocalObjectReference: *artifact.CredentialsSecretRef.DeepCopy(),
+		}})
+	}
+	volumeMounts, volumes := haAdminJobStorage(cluster, admin, action)
 	labels := haAdminJobLabels(cluster, action)
+	podTemplateLabels := maps.Clone(labels)
+	if kind := haActionKind(action.Kind); kind == haActionPublishSeedArtifact || kind == haActionGCSourceSeedGenerations {
+		// Source-PVC jobs must co-locate with the exact live RWO consumer.
+		// Runtime identity labels make them match the AntflyCluster pods'
+		// required self anti-affinity, producing an impossible placement:
+		// podAffinity requires the source node while podAntiAffinity rejects it.
+		// Keep those labels on the Job object for ownership/discovery, but do not
+		// project runtime topology identity onto the Job's executable Pod.
+		delete(podTemplateLabels, "cloud.antfly.io/instance-id")
+		delete(podTemplateLabels, "app.kubernetes.io/instance")
+	}
 	annotations := map[string]string{
 		"antfly.io/ha-action-kind":  action.Kind,
 		"antfly.io/ha-admin-url":    action.AdminURL,
 		"antfly.io/ha-command-hash": haAdminActionHash(action),
 	}
+	seedIdentityAnnotations := haPortableSeedIdentityAnnotations(cluster, action)
+	maps.Copy(annotations, seedIdentityAnnotations)
 	if action.DependsOn != "" {
 		annotations["antfly.io/ha-action-depends-on"] = action.DependsOn
 	}
@@ -7857,7 +10756,6 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpe
 	}
 	deadlineSeconds := haAdminJobTimeoutSeconds(admin)
 	backoffLimit := haAdminJobBackoffLimit(admin)
-	ttlSecondsAfterFinished := haAdminJobTTLSecondsAfterFinished(admin)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -7867,14 +10765,13 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpe
 			Annotations: annotations,
 		},
 		Spec: batchv1.JobSpec{
-			ActiveDeadlineSeconds:   &deadlineSeconds,
-			BackoffLimit:            &backoffLimit,
-			TTLSecondsAfterFinished: &ttlSecondsAfterFinished,
+			ActiveDeadlineSeconds: &deadlineSeconds,
+			BackoffLimit:          &backoffLimit,
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: metav1.ObjectMeta{Labels: podTemplateLabels, Annotations: maps.Clone(seedIdentityAnnotations)},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: cluster.Spec.ServiceAccountName,
-					RestartPolicy:      corev1.RestartPolicyOnFailure,
+					RestartPolicy:      corev1.RestartPolicyNever,
 					SecurityContext:    antflyPodSecurityContext(),
 					Containers: []corev1.Container{{
 						Name:            "ha-admin",
@@ -7882,15 +10779,248 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpe
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						Command:         []string{"/antfly"},
 						Args:            args,
-						Env:             haAdminJobTokenEnv(cluster, admin),
-						EnvFrom:         append([]corev1.EnvFromSource{}, admin.EnvFrom...),
-						VolumeMounts:    append([]corev1.VolumeMount{}, admin.VolumeMounts...),
+						Env:             append(haAdminJobTokenEnv(cluster, admin), haPodUIDEnv()...),
+						EnvFrom:         envFrom,
+						VolumeMounts:    volumeMounts,
 					}},
-					Volumes: append([]corev1.Volume{}, admin.Volumes...),
+					Volumes: volumes,
 				},
 			},
 		},
 	}
+}
+
+// ensureHAAdminJobTTLAfterCheckpoint arms TTL cleanup only after a subsequent
+// reconcile loaded the terminal action state from the CR status. A fast TTL (or
+// TTL=0) therefore cannot delete the only terminal Job evidence before it has
+// been durably checkpointed in AntflyCluster status.
+func (r *AntflyClusterReconciler) ensureHAAdminJobTTLAfterCheckpoint(ctx context.Context, cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action *antflyv1.HAPlannedActionStatus) error {
+	if r == nil || cluster == nil || action == nil || action.AdminJobName == "" || action.AdminJobName == haAdminDirectAPIName {
+		return nil
+	}
+	job := &batchv1.Job{}
+	key := types.NamespacedName{Name: action.AdminJobName, Namespace: cluster.Namespace}
+	if err := r.Get(ctx, key, job); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get terminal HA admin Job %s before enabling TTL: %w", action.AdminJobName, err)
+	}
+	desired := haAdminJobTTLSecondsAfterFinished(admin)
+	if job.Spec.TTLSecondsAfterFinished != nil && *job.Spec.TTLSecondsAfterFinished == desired {
+		return nil
+	}
+	patch := client.MergeFrom(job.DeepCopy())
+	job.Spec.TTLSecondsAfterFinished = &desired
+	if err := r.Patch(ctx, job, patch); err != nil {
+		return fmt.Errorf("enable TTL cleanup for checkpointed HA admin Job %s: %w", action.AdminJobName, err)
+	}
+	return nil
+}
+
+func haAdminJobStorage(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) ([]corev1.VolumeMount, []corev1.Volume) {
+	artifact := haSeedArtifactForAction(cluster, action)
+	if artifact != nil {
+		switch haActionKind(action.Kind) {
+		case haActionPublishSeedArtifact:
+			if artifact.SourcePVC != nil {
+				return haSeedArtifactPVCStorage("ha-seed-source", artifact.SourcePVC, true)
+			}
+		case haActionGCSourceSeedGenerations:
+			if artifact.SourcePVC != nil {
+				return haSeedArtifactPVCStorage("ha-seed-source", artifact.SourcePVC, false)
+			}
+		case haActionRestoreSeedArtifact, haActionActivateSeedArtifact:
+			if artifact.TargetPVC != nil {
+				return haSeedArtifactPVCStorage("ha-seed-target", artifact.TargetPVC, false)
+			}
+		case haActionGCTargetSeedGenerations:
+			if artifact.TargetPVC != nil {
+				mounts, volumes := haSeedArtifactPVCStorage("ha-seed-target", artifact.TargetPVC, false)
+				mounts = append(mounts, corev1.VolumeMount{
+					Name: "ha-seeded-slot-activation", MountPath: path.Dir(haSeededSlotActivationReceiptPath), ReadOnly: true,
+				})
+				volumes = append(volumes, corev1.Volume{
+					Name: "ha-seeded-slot-activation",
+					VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: haSeededSlotActivationConfigMapName(cluster, action)},
+					}},
+				})
+				return mounts, volumes
+			}
+		case haActionPruneSeedArtifacts:
+			return nil, nil
+		}
+	}
+	return append([]corev1.VolumeMount{}, admin.VolumeMounts...), append([]corev1.Volume{}, admin.Volumes...)
+}
+
+func haPodUIDEnv() []corev1.EnvVar {
+	return []corev1.EnvVar{{
+		Name: "ANTFLY_POD_UID",
+		ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+			APIVersion: "v1", FieldPath: "metadata.uid",
+		}},
+	}}
+}
+
+// bindHAAdminJobToPVCConsumer prevents a portable artifact Job from being
+// scheduled on a different node while its ReadWriteOnce source claim is mounted
+// by a runtime pod. Target restores are allowed only with no live consumer, as
+// enforced by the startup gate. RWX/ROX claims require no co-location, while
+// ReadWriteOncePod can never be shared with a live runtime pod.
+func (r *AntflyClusterReconciler) bindHAAdminJobToPVCConsumer(ctx context.Context, job *batchv1.Job) error {
+	if r == nil || job == nil {
+		return nil
+	}
+	claimName := ""
+	for _, volume := range job.Spec.Template.Spec.Volumes {
+		if volume.PersistentVolumeClaim == nil || strings.TrimSpace(volume.PersistentVolumeClaim.ClaimName) == "" {
+			continue
+		}
+		if claimName != "" && claimName != volume.PersistentVolumeClaim.ClaimName {
+			return fmt.Errorf("HA admin Job %s mounts multiple PVCs; portable artifact actions must remain action-scoped", job.Name)
+		}
+		claimName = volume.PersistentVolumeClaim.ClaimName
+	}
+	if claimName == "" {
+		return nil
+	}
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, types.NamespacedName{Name: claimName, Namespace: job.Namespace}, pvc); err != nil {
+		return fmt.Errorf("get PVC %s for HA admin Job %s: %w", claimName, job.Name, err)
+	}
+	if r.Scheme != nil {
+		if err := controllerutil.SetOwnerReference(pvc, job, r.Scheme); err != nil {
+			return fmt.Errorf("bind HA admin Job %s to PVC incarnation %s/%s: %w", job.Name, claimName, pvc.UID, err)
+		}
+	}
+	multiNode := slices.Contains(pvc.Spec.AccessModes, corev1.ReadWriteMany) ||
+		slices.Contains(pvc.Spec.AccessModes, corev1.ReadOnlyMany)
+	readWriteOncePod := slices.Contains(pvc.Spec.AccessModes, corev1.ReadWriteOncePod)
+	readWriteOnce := slices.Contains(pvc.Spec.AccessModes, corev1.ReadWriteOnce)
+	actionKind := haActionKind(strings.TrimSpace(job.Annotations["antfly.io/ha-action-kind"]))
+	isPublishSource := actionKind == haActionPublishSeedArtifact || actionKind == haActionGCSourceSeedGenerations
+	isGatedTarget := actionKind == haActionRestoreSeedArtifact || actionKind == haActionActivateSeedArtifact || actionKind == haActionGCTargetSeedGenerations
+	if multiNode && !isGatedTarget {
+		return nil
+	}
+	if !multiNode && !readWriteOnce && !readWriteOncePod {
+		return fmt.Errorf("PVC %s for HA admin Job %s has no supported access mode", claimName, job.Name)
+	}
+
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(job.Namespace)); err != nil {
+		return fmt.Errorf("list PVC consumers for HA admin Job %s: %w", job.Name, err)
+	}
+	consumerPodName := ""
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if haPodControlledByJob(pod, job) {
+			continue
+		}
+		if pod.DeletionTimestamp == nil && (pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed) {
+			continue
+		}
+		mountsClaim := false
+		for _, volume := range pod.Spec.Volumes {
+			if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == claimName {
+				mountsClaim = true
+				break
+			}
+		}
+		if !mountsClaim {
+			continue
+		}
+		if isGatedTarget {
+			return fmt.Errorf("target PVC %s still has consumer pod %s; refusing HA restore/activation until the startup gate has stopped all consumers", claimName, pod.Name)
+		}
+		if readWriteOncePod {
+			return fmt.Errorf("ReadWriteOncePod PVC %s is still mounted by pod %s; HA admin Job %s cannot share it", claimName, pod.Name, job.Name)
+		}
+		stableName := strings.TrimSpace(pod.Labels[appsv1.StatefulSetPodNameLabel])
+		if stableName == "" || stableName != pod.Name {
+			return fmt.Errorf("PVC %s consumer pod %s lacks its stable StatefulSet pod-name label", claimName, pod.Name)
+		}
+		if consumerPodName != "" && consumerPodName != stableName {
+			return fmt.Errorf("PVC %s has multiple live consumer pods (%s, %s); refusing ambiguous HA Job placement", claimName, consumerPodName, stableName)
+		}
+		consumerPodName = stableName
+	}
+	if consumerPodName == "" {
+		if isPublishSource && (pvc.Status.Phase != corev1.ClaimBound || strings.TrimSpace(pvc.Spec.VolumeName) == "") {
+			return fmt.Errorf("publish-source PVC %s has no live stable runtime consumer and is not bound to a stable PV; refusing unpinned HA seed publication", claimName)
+		}
+		return nil
+	}
+	if job.Spec.Template.Spec.Affinity == nil {
+		job.Spec.Template.Spec.Affinity = &corev1.Affinity{}
+	}
+	if job.Spec.Template.Spec.Affinity.PodAffinity == nil {
+		job.Spec.Template.Spec.Affinity.PodAffinity = &corev1.PodAffinity{}
+	}
+	job.Spec.Template.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution = append(
+		job.Spec.Template.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution,
+		corev1.PodAffinityTerm{
+			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+				appsv1.StatefulSetPodNameLabel: consumerPodName,
+			}},
+			TopologyKey: corev1.LabelHostname,
+		},
+	)
+	if job.Annotations == nil {
+		job.Annotations = map[string]string{}
+	}
+	job.Annotations["antfly.io/ha-pvc-consumer"] = consumerPodName
+	job.Annotations["antfly.io/ha-pvc-claim"] = claimName
+	return nil
+}
+
+func haPodControlledByJob(pod *corev1.Pod, job *batchv1.Job) bool {
+	if pod == nil || job == nil || job.UID == "" {
+		return false
+	}
+	for _, owner := range pod.OwnerReferences {
+		if owner.Controller == nil || !*owner.Controller || owner.Kind != "Job" || owner.Name != job.Name {
+			continue
+		}
+		if owner.UID != job.UID {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func haSeedArtifactPVCStorage(name string, pvc *antflyv1.HASeedArtifactPVCSpec, readOnly bool) ([]corev1.VolumeMount, []corev1.Volume) {
+	if pvc == nil {
+		return nil, nil
+	}
+	return []corev1.VolumeMount{{
+			Name:      name,
+			MountPath: pvc.MountPath,
+			ReadOnly:  readOnly,
+		}}, []corev1.Volume{{
+			Name: name,
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: pvc.ClaimName,
+				ReadOnly:  readOnly,
+			}},
+		}}
+}
+
+func haSeedArtifactForAction(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) *antflyv1.HASeedArtifactSpec {
+	if cluster == nil || cluster.Spec.HighAvailability == nil {
+		return nil
+	}
+	for i := range cluster.Spec.HighAvailability.Standbys {
+		standby := &cluster.Spec.HighAvailability.Standbys[i]
+		if strings.TrimSpace(standby.Name) == strings.TrimSpace(action.StandbyName) ||
+			strings.TrimSpace(standbySlotName(*standby)) == strings.TrimSpace(action.SlotName) {
+			return standby.SeedArtifact
+		}
+	}
+	return nil
 }
 
 func haAdminJobTokenEnv(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec) []corev1.EnvVar {
@@ -7973,6 +11103,21 @@ func haAdminJobPhase(job *batchv1.Job) string {
 	return haAdminJobPhasePending
 }
 
+func haAdminJobFailureClass(job *batchv1.Job) string {
+	if job == nil {
+		return "JobFailed"
+	}
+	for _, condition := range job.Status.Conditions {
+		if condition.Type != batchv1.JobFailed || condition.Status != corev1.ConditionTrue {
+			continue
+		}
+		if reason := strings.TrimSpace(condition.Reason); reason != "" {
+			return reason
+		}
+	}
+	return "JobFailed"
+}
+
 func haAdminJobName(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) string {
 	hash := haAdminActionHash(action)[:10]
 	kind := strings.ToLower(action.Kind)
@@ -7989,53 +11134,81 @@ func haAdminJobName(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedAc
 
 func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 	rendered, err := json.Marshal(struct {
-		Kind         string   `json:"kind"`
-		Phase        string   `json:"phase,omitempty"`
-		Executor     string   `json:"executor,omitempty"`
-		DependsOn    string   `json:"dependsOn,omitempty"`
-		StandbyName  string   `json:"standbyName,omitempty"`
-		SlotName     string   `json:"slotName,omitempty"`
-		TargetLSN    uint64   `json:"targetLSN,omitempty"`
-		ObservedLSN  uint64   `json:"observedLSN,omitempty"`
-		RetainedLSN  uint64   `json:"retainedFromLSN,omitempty"`
-		RouteFrom    string   `json:"routeFrom,omitempty"`
-		RouteTo      string   `json:"routeTo,omitempty"`
-		FenceAuth    string   `json:"fenceAuthority,omitempty"`
-		FenceHolder  string   `json:"fenceHolder,omitempty"`
-		FenceGen     uint64   `json:"fenceGeneration,omitempty"`
-		FenceReason  string   `json:"fenceReason,omitempty"`
-		SeedManifest string   `json:"seedManifestPath,omitempty"`
-		SeedRoot     string   `json:"seedContentRoot,omitempty"`
-		AdminURL     string   `json:"adminURL,omitempty"`
-		AdminNodeID  string   `json:"adminNodeID,omitempty"`
-		AdminMethod  string   `json:"adminMethod,omitempty"`
-		AdminPath    string   `json:"adminPath,omitempty"`
-		AdminCommand []string `json:"adminCommand,omitempty"`
-		Reason       string   `json:"reason,omitempty"`
+		Kind               string   `json:"kind"`
+		Phase              string   `json:"phase,omitempty"`
+		Executor           string   `json:"executor,omitempty"`
+		DependsOn          string   `json:"dependsOn,omitempty"`
+		StandbyName        string   `json:"standbyName,omitempty"`
+		SlotName           string   `json:"slotName,omitempty"`
+		TargetLSN          uint64   `json:"targetLSN,omitempty"`
+		ObservedLSN        uint64   `json:"observedLSN,omitempty"`
+		RetainedLSN        uint64   `json:"retainedFromLSN,omitempty"`
+		RouteFrom          string   `json:"routeFrom,omitempty"`
+		RouteTo            string   `json:"routeTo,omitempty"`
+		FenceAuth          string   `json:"fenceAuthority,omitempty"`
+		FenceHolder        string   `json:"fenceHolder,omitempty"`
+		FenceGen           uint64   `json:"fenceGeneration,omitempty"`
+		FenceReason        string   `json:"fenceReason,omitempty"`
+		SeedManifest       string   `json:"seedManifestPath,omitempty"`
+		SeedRoot           string   `json:"seedContentRoot,omitempty"`
+		SeedTargetRoot     string   `json:"seedArtifactTargetRoot,omitempty"`
+		SeedLocation       string   `json:"seedArtifactLocation,omitempty"`
+		SeedGeneration     string   `json:"seedArtifactGeneration,omitempty"`
+		SeedRetention      int32    `json:"seedArtifactRetainGenerations,omitempty"`
+		SeedCaptureRoot    string   `json:"seedArtifactCaptureRoot,omitempty"`
+		SeedProtected      []string `json:"seedArtifactProtectedGenerations,omitempty"`
+		TopologyID         string   `json:"topologyID,omitempty"`
+		TopologyGeneration int64    `json:"topologyGeneration,omitempty"`
+		TopologyNodeID     string   `json:"topologyNodeID,omitempty"`
+		TargetPVCName      string   `json:"targetPVCName,omitempty"`
+		TargetPVCUID       string   `json:"targetPVCUID,omitempty"`
+		SourcePVCName      string   `json:"sourcePVCName,omitempty"`
+		SourcePVCUID       string   `json:"sourcePVCUID,omitempty"`
+		AdminURL           string   `json:"adminURL,omitempty"`
+		AdminNodeID        string   `json:"adminNodeID,omitempty"`
+		AdminMethod        string   `json:"adminMethod,omitempty"`
+		AdminPath          string   `json:"adminPath,omitempty"`
+		AdminCommand       []string `json:"adminCommand,omitempty"`
+		OperationID        string   `json:"operationID,omitempty"`
+		Reason             string   `json:"reason,omitempty"`
 	}{
-		Kind:         action.Kind,
-		Phase:        action.Phase,
-		Executor:     action.Executor,
-		DependsOn:    action.DependsOn,
-		StandbyName:  action.StandbyName,
-		SlotName:     action.SlotName,
-		TargetLSN:    action.TargetLSN,
-		ObservedLSN:  action.ObservedLSN,
-		RetainedLSN:  action.RetainedFromLSN,
-		RouteFrom:    action.RouteFrom,
-		RouteTo:      action.RouteTo,
-		FenceAuth:    string(action.FenceAuthority),
-		FenceHolder:  action.FenceHolder,
-		FenceGen:     action.FenceGeneration,
-		FenceReason:  action.FenceReason,
-		SeedManifest: action.SeedManifestPath,
-		SeedRoot:     action.SeedContentRoot,
-		AdminURL:     action.AdminURL,
-		AdminNodeID:  action.AdminNodeID,
-		AdminMethod:  action.AdminMethod,
-		AdminPath:    action.AdminPath,
-		AdminCommand: action.AdminCommand,
-		Reason:       action.Reason,
+		Kind:               action.Kind,
+		Phase:              action.Phase,
+		Executor:           action.Executor,
+		DependsOn:          action.DependsOn,
+		StandbyName:        action.StandbyName,
+		SlotName:           action.SlotName,
+		TargetLSN:          action.TargetLSN,
+		ObservedLSN:        action.ObservedLSN,
+		RetainedLSN:        action.RetainedFromLSN,
+		RouteFrom:          action.RouteFrom,
+		RouteTo:            action.RouteTo,
+		FenceAuth:          string(action.FenceAuthority),
+		FenceHolder:        action.FenceHolder,
+		FenceGen:           action.FenceGeneration,
+		FenceReason:        action.FenceReason,
+		SeedManifest:       action.SeedManifestPath,
+		SeedRoot:           action.SeedContentRoot,
+		SeedTargetRoot:     action.SeedArtifactTargetRoot,
+		SeedLocation:       action.SeedArtifactLocation,
+		SeedGeneration:     action.SeedArtifactGeneration,
+		SeedRetention:      action.SeedArtifactRetainGenerations,
+		SeedCaptureRoot:    action.SeedArtifactCaptureRoot,
+		SeedProtected:      action.SeedArtifactProtectedGenerations,
+		TopologyID:         action.TopologyID,
+		TopologyGeneration: action.TopologyGeneration,
+		TopologyNodeID:     action.TopologyNodeID,
+		TargetPVCName:      action.TargetPVCName,
+		TargetPVCUID:       action.TargetPVCUID,
+		SourcePVCName:      action.SourcePVCName,
+		SourcePVCUID:       action.SourcePVCUID,
+		AdminURL:           action.AdminURL,
+		AdminNodeID:        action.AdminNodeID,
+		AdminMethod:        action.AdminMethod,
+		AdminPath:          action.AdminPath,
+		AdminCommand:       action.AdminCommand,
+		OperationID:        action.OperationID,
+		Reason:             action.Reason,
 	})
 	if err != nil {
 		rendered = []byte(fmt.Sprintf("%s/%s/%s/%d/%s/%d/%s/%s/%v/%s", action.Kind, action.StandbyName, action.SlotName, action.TargetLSN, action.FenceAuthority, action.FenceGeneration, action.FenceHolder, action.AdminURL, action.AdminCommand, action.Reason))
@@ -8108,13 +11281,13 @@ func statefulSetRolloutAppearsBlocked(sts *appsv1.StatefulSet, replicas int32) b
 func (r *AntflyClusterReconciler) repairBlockedStatefulSetRollouts(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
 	if effectiveTopologyMode(cluster) == topologyModeStandalone {
 		standaloneSts := &appsv1.StatefulSet{}
-		if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-standalone", Namespace: cluster.Namespace}, standaloneSts); err != nil {
+		if err := r.Get(ctx, types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}, standaloneSts); err != nil {
 			if !errors.IsNotFound(err) {
 				return false, err
 			}
 			return false, nil
 		}
-		return r.repairBlockedStatefulSetRollout(ctx, cluster, standaloneSts, "standalone")
+		return r.repairBlockedStatefulSetRollout(ctx, cluster, standaloneSts, standaloneComponent(cluster))
 	}
 
 	metadataSts := &appsv1.StatefulSet{}
@@ -9114,7 +12287,7 @@ func (r *AntflyClusterReconciler) checkPVCTopologyHealth(ctx context.Context, cl
 	mode := effectiveTopologyMode(cluster)
 	components := []string{"metadata", "data"}
 	if mode == topologyModeStandalone {
-		components = []string{"standalone"}
+		components = []string{standaloneComponent(cluster)}
 	}
 
 	// Check pods for topology issues
@@ -9189,6 +12362,13 @@ func hasAnyPrefix(name string, prefixes []string) bool {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := ctrl.NewControllerManagedBy(mgr).
+		Named("antflycluster-ha-lease-renewal").
+		WithOptions(controller.Options{MaxConcurrentReconciles: 16}).
+		For(&antflyv1.AntflyCluster{}).
+		Complete(&haLeaseRenewalReconciler{parent: r}); err != nil {
+		return err
+	}
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&antflyv1.AntflyCluster{}).
 		Owns(&appsv1.StatefulSet{}).
@@ -9207,7 +12387,7 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *AntflyClusterReconciler) requestsForPod(ctx context.Context, obj client.Object) []reconcile.Request {
 	clusterName := obj.GetLabels()["app.kubernetes.io/instance"]
 	component := obj.GetLabels()["app.kubernetes.io/component"]
-	if clusterName == "" || (component != "metadata" && component != "data" && component != "standalone") {
+	if clusterName == "" || (component != "metadata" && component != "data" && component != "standalone" && component != "swarm") {
 		return nil
 	}
 	cluster := &antflyv1.AntflyCluster{}

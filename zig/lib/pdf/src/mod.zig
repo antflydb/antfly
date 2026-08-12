@@ -13,6 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const darwin_render = if (builtin.os.tag == .macos) @import("darwin_render.zig") else struct {};
 
 pub const text_encoding = @import("text_encoding.zig");
 pub const reader = @import("reader.zig");
@@ -20,6 +22,21 @@ pub const syntax = @import("syntax.zig");
 pub const render = @import("render.zig");
 
 const Allocator = std.mem.Allocator;
+const minimum_direct_render_dpi: u16 = 72;
+const minimum_requested_render_dpi: u16 = 72;
+
+pub const RenderedPagePng = struct {
+    png: []u8,
+    requested_dpi: u16,
+    effective_dpi: u16,
+    width: u32,
+    height: u32,
+
+    pub fn deinit(self: *RenderedPagePng, alloc: Allocator) void {
+        alloc.free(self.png);
+        self.* = undefined;
+    }
+};
 
 pub const Backend = struct {
     ptr: *const anyopaque,
@@ -61,22 +78,67 @@ fn renderFirstPagePngNative(_: *const anyopaque, alloc: Allocator, pdf_bytes: []
     return try renderPagePngAlloc(alloc, pdf_bytes, 1, 72, 40_000_000);
 }
 
-/// Render a one-based PDF page at the requested raster resolution.
+/// Renders a one-based PDF page at the requested raster resolution. Geometry is
+/// scaled before rasterization so embedded page images are sampled directly at
+/// the target resolution rather than upscaling a 72-DPI preview.
 pub fn renderPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
-    if (page_number == 0) return error.InvalidPageNumber;
-    if (dpi < 72 or dpi > 600) return error.InvalidRenderDpi;
     var parsed = try reader.Reader.init(alloc, pdf_bytes);
     defer parsed.deinit();
-    const page_count = try parsed.pageCount();
-    if (page_number > page_count) return error.InvalidPageNumber;
-    // Reject oversized pages before decoding images and font resources.
+    return try renderParsedPagePngAlloc(alloc, &parsed, page_number, dpi, max_pixels);
+}
+
+pub fn renderParsedPagePngAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+    if (dpi < minimum_requested_render_dpi or dpi > 600) return error.InvalidRenderDpi;
+    return try renderParsedPagePngEffectiveAlloc(alloc, parsed, page_number, dpi, max_pixels);
+}
+
+fn renderParsedPagePngEffectiveAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+    if (page_number == 0 or page_number > try parsed.pageCount()) return error.InvalidPageNumber;
+    const rotation = try normalizedPageRotation(try parsed.extractPageRotation(page_number));
+    return try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation);
+}
+
+fn renderParsedPagePngEffectiveWithRotationAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    rotation: render.PageRotation,
+) ![]u8 {
+    return renderParsedPagePngNativeAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation) catch |err| switch (err) {
+        error.UnsupportedStreamFilter,
+        error.UnsupportedNativeDecode,
+        error.UnsupportedPdfRendering,
+        error.InvalidFlateStream,
+        error.MissingEndStream,
+        error.UnexpectedEof,
+        => if (builtin.os.tag == .macos)
+            try darwin_render.renderPagePngAlloc(alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation)
+        else
+            return err,
+        else => return err,
+    };
+}
+
+fn renderParsedPagePngNativeAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    rotation: render.PageRotation,
+) ![]u8 {
+    const reader_alloc = parsed.allocator();
+    if (dpi < minimum_direct_render_dpi or dpi > 600) return error.InvalidRenderDpi;
+    // Reject oversized pages before decoding page images and font resources.
     const unscaled_box = try parsed.extractPageBox(page_number);
     const scale = @as(f64, @floatFromInt(dpi)) / 72.0;
     const preflight_width = @max(1.0, unscaled_box.max_x - unscaled_box.min_x) * scale;
     const preflight_height = @max(1.0, unscaled_box.max_y - unscaled_box.min_y) * scale;
     if (preflight_width * preflight_height > @as(f64, @floatFromInt(max_pixels))) return error.RenderedPageTooLarge;
     var render_runs = try parsed.extractPageRenderRunsAlloc(page_number);
-    defer render_runs.deinit(alloc);
+    defer render_runs.deinit(reader_alloc);
     scalePageRenderRuns(&render_runs, scale);
     const page_box = render_runs.page_box;
     const page_width = @max(1.0, page_box.max_x - page_box.min_x);
@@ -90,10 +152,10 @@ pub fn renderPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: 
     var text_pattern_runs: []reader.PatternRun = &.{};
     var text_shape_runs: []reader.ShapeRun = &.{};
     defer {
-        for (text_pattern_runs) |*run| run.deinit(alloc);
-        if (text_pattern_runs.len > 0) alloc.free(text_pattern_runs);
-        for (text_shape_runs) |*run| run.deinit(alloc);
-        if (text_shape_runs.len > 0) alloc.free(text_shape_runs);
+        for (text_pattern_runs) |*run| run.deinit(reader_alloc);
+        if (text_pattern_runs.len > 0) reader_alloc.free(text_pattern_runs);
+        for (text_shape_runs) |*run| run.deinit(reader_alloc);
+        if (text_shape_runs.len > 0) reader_alloc.free(text_shape_runs);
     }
     var plain_runs = std.ArrayList(reader.TextRun).empty;
     defer plain_runs.deinit(alloc);
@@ -124,60 +186,30 @@ pub fn renderPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: 
         all_shape_runs.deinit(alloc);
     }
     for (shape_runs) |run| {
-        try all_shape_runs.append(alloc, .{
-            .paint_order = run.paint_order,
-            .blend_mode = run.blend_mode,
-            .group_id = run.group_id,
-            .group_parent_id = run.group_parent_id,
-            .group_isolated = run.group_isolated,
-            .group_knockout = run.group_knockout,
-            .kind = run.kind,
-            .fill_rule = run.fill_rule,
-            .line_cap = run.line_cap,
-            .line_join = run.line_join,
-            .miter_limit = run.miter_limit,
-            .dash_array = if (run.dash_array) |dash| try alloc.dupe(f64, dash) else null,
-            .dash_phase = run.dash_phase,
-            .color = run.color,
-            .stroke_width = run.stroke_width,
-            .closed = run.closed,
-            .clip_box = run.clip_box,
-            .clip_points = if (run.clip_points) |pts| try alloc.dupe([2]f64, pts) else null,
-            .clip_fill_rule = run.clip_fill_rule,
-            .points = try alloc.dupe([2]f64, run.points),
-        });
+        var cloned = try dupShapeRunAlloc(alloc, run);
+        errdefer cloned.deinit(alloc);
+        try all_shape_runs.append(alloc, cloned);
     }
     for (text_shape_runs) |run| {
-        try all_shape_runs.append(alloc, .{
-            .paint_order = run.paint_order,
-            .blend_mode = run.blend_mode,
-            .group_id = run.group_id,
-            .group_parent_id = run.group_parent_id,
-            .group_isolated = run.group_isolated,
-            .group_knockout = run.group_knockout,
-            .kind = run.kind,
-            .fill_rule = run.fill_rule,
-            .line_cap = run.line_cap,
-            .line_join = run.line_join,
-            .miter_limit = run.miter_limit,
-            .dash_array = if (run.dash_array) |dash| try alloc.dupe(f64, dash) else null,
-            .dash_phase = run.dash_phase,
-            .color = run.color,
-            .stroke_width = run.stroke_width,
-            .closed = run.closed,
-            .clip_box = run.clip_box,
-            .clip_points = if (run.clip_points) |pts| try alloc.dupe([2]f64, pts) else null,
-            .clip_fill_rule = run.clip_fill_rule,
-            .points = try alloc.dupe([2]f64, run.points),
-        });
+        var cloned = try dupShapeRunAlloc(alloc, run);
+        errdefer cloned.deinit(alloc);
+        try all_shape_runs.append(alloc, cloned);
     }
     var all_pattern_runs = std.ArrayList(reader.PatternRun).empty;
     defer {
         for (all_pattern_runs.items) |*run| run.deinit(alloc);
         all_pattern_runs.deinit(alloc);
     }
-    for (pattern_runs) |run| try all_pattern_runs.append(alloc, try dupPatternRunAlloc(alloc, run));
-    for (text_pattern_runs) |run| try all_pattern_runs.append(alloc, try dupPatternRunAlloc(alloc, run));
+    for (pattern_runs) |run| {
+        var cloned = try dupPatternRunAlloc(alloc, run);
+        errdefer cloned.deinit(alloc);
+        try all_pattern_runs.append(alloc, cloned);
+    }
+    for (text_pattern_runs) |run| {
+        var cloned = try dupPatternRunAlloc(alloc, run);
+        errdefer cloned.deinit(alloc);
+        try all_pattern_runs.append(alloc, cloned);
+    }
     std.mem.sort(reader.TextRun, plain_runs.items, {}, struct {
         fn lessThan(_: void, a: reader.TextRun, b: reader.TextRun) bool {
             return a.paint_order < b.paint_order;
@@ -193,7 +225,71 @@ pub fn renderPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: 
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    return try render.renderPageContentPngInBox(alloc, page_box, plain_runs.items, image_runs, shading_runs, all_pattern_runs.items, all_shape_runs.items);
+    return try render.renderPageContentPngInBoxRotated(alloc, page_box, plain_runs.items, image_runs, shading_runs, all_pattern_runs.items, all_shape_runs.items, rotation);
+}
+
+fn normalizedPageRotation(rotation: ?i32) !render.PageRotation {
+    const normalized = @mod(rotation orelse 0, 360);
+    return switch (normalized) {
+        0 => .none,
+        90 => .clockwise_90,
+        180 => .clockwise_180,
+        270 => .clockwise_270,
+        else => error.InvalidPageRotation,
+    };
+}
+
+/// Renders at the requested DPI when safe, reducing it only enough to satisfy
+/// both the dimension and pixel guards without crossing the 72-DPI quality
+/// floor. Pages that cannot fit safely at that floor fail explicitly rather
+/// than silently producing an OCR input below the documented minimum.
+pub fn renderParsedPagePngAdaptiveAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+) !RenderedPagePng {
+    if (page_number == 0) return error.InvalidPageNumber;
+    if (requested_dpi < 72 or requested_dpi > 600) return error.InvalidRenderDpi;
+    if (max_pixels == 0 or max_dimension == 0) return error.RenderedPageTooLarge;
+    const page_count = try parsed.pageCount();
+    if (page_number > page_count) return error.InvalidPageNumber;
+    const box = try parsed.extractPageBox(page_number);
+    const rotation = try normalizedPageRotation(try parsed.extractPageRotation(page_number));
+    const unrotated_width = @max(1.0, box.max_x - box.min_x);
+    const unrotated_height = @max(1.0, box.max_y - box.min_y);
+    const swaps_dimensions = rotation == .clockwise_90 or rotation == .clockwise_270;
+    const page_width = if (swaps_dimensions) unrotated_height else unrotated_width;
+    const page_height = if (swaps_dimensions) unrotated_width else unrotated_height;
+
+    var effective_dpi = requested_dpi;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    while (true) {
+        const scale = @as(f64, @floatFromInt(effective_dpi)) / 72.0;
+        const width_f = @ceil(page_width * scale);
+        const height_f = @ceil(page_height * scale);
+        const fits_integer = width_f <= @as(f64, @floatFromInt(std.math.maxInt(u32))) and
+            height_f <= @as(f64, @floatFromInt(std.math.maxInt(u32)));
+        if (fits_integer) {
+            width = @intFromFloat(width_f);
+            height = @intFromFloat(height_f);
+            const pixels = @as(u64, width) * @as(u64, height);
+            if (width <= max_dimension and height <= max_dimension and pixels <= max_pixels) break;
+        }
+        if (effective_dpi == minimum_direct_render_dpi) return error.RenderedPageTooLarge;
+        effective_dpi -= 1;
+    }
+
+    return .{
+        .png = try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, effective_dpi, max_pixels, rotation),
+        .requested_dpi = requested_dpi,
+        .effective_dpi = effective_dpi,
+        .width = width,
+        .height = height,
+    };
 }
 
 fn scaleBox(box: *reader.PageBox, scale: f64) void {
@@ -285,8 +381,9 @@ fn scalePatternRuns(runs: []reader.PatternRun, scale: f64) void {
         }
         if (run.clip_box) |*box| scaleBox(box, scale);
         scalePoints(run.clip_points, scale);
-        // Tile geometry and tile-local runs remain in pattern space. The
-        // pattern matrix is the single mapping into scaled page space.
+        // Tiling geometry and tile-local runs remain in pattern space. The
+        // pattern matrix is the single mapping into the scaled page space;
+        // scaling both produced tiles that grew by scale^2 at higher DPI.
         run.pattern_matrix.a *= scale;
         run.pattern_matrix.b *= scale;
         run.pattern_matrix.c *= scale;
@@ -306,204 +403,288 @@ fn scalePageRenderRuns(runs: *reader.PageRenderRuns, scale: f64) void {
     scaleShapeRuns(runs.shape_runs, scale);
 }
 
+fn dupTextRunAlloc(alloc: Allocator, run: reader.TextRun) !reader.TextRun {
+    var out = run;
+    out.text = &.{};
+    out.raw_text = null;
+    out.fill_pattern_name = null;
+    out.stroke_pattern_name = null;
+    out.clip_points = null;
+    errdefer out.deinit(alloc);
+
+    out.text = try alloc.dupe(u8, run.text);
+    if (run.raw_text) |raw| out.raw_text = try alloc.dupe(u8, raw);
+    if (run.fill_pattern_name) |name| out.fill_pattern_name = try alloc.dupe(u8, name);
+    if (run.stroke_pattern_name) |name| out.stroke_pattern_name = try alloc.dupe(u8, name);
+    if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
+    return out;
+}
+
+fn dupImageRunAlloc(alloc: Allocator, run: reader.ImageRun) !reader.ImageRun {
+    var out = run;
+    out.rgba = &.{};
+    out.clip_points = null;
+    errdefer out.deinit(alloc);
+
+    out.rgba = try alloc.dupe(u8, run.rgba);
+    if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
+    return out;
+}
+
+fn dupShadingRunAlloc(alloc: Allocator, run: reader.ShadingRun) !reader.ShadingRun {
+    var out = run;
+    out.clip_points = null;
+    errdefer out.deinit(alloc);
+
+    if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
+    return out;
+}
+
+fn dupShapeRunAlloc(alloc: Allocator, run: reader.ShapeRun) !reader.ShapeRun {
+    var out = run;
+    out.dash_array = null;
+    out.clip_points = null;
+    out.points = &.{};
+    errdefer out.deinit(alloc);
+
+    if (run.dash_array) |dash| out.dash_array = try alloc.dupe(f64, dash);
+    if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
+    out.points = try alloc.dupe([2]f64, run.points);
+    return out;
+}
+
 fn dupPatternRunAlloc(alloc: Allocator, run: reader.PatternRun) !reader.PatternRun {
-    var out = reader.PatternRun{
-        .kind = run.kind,
-        .mode = run.mode,
-        .paint_order = run.paint_order,
-        .blend_mode = run.blend_mode,
-        .group_id = run.group_id,
-        .group_parent_id = run.group_parent_id,
-        .group_isolated = run.group_isolated,
-        .group_knockout = run.group_knockout,
-        .fill_rule = run.fill_rule,
-        .line_cap = run.line_cap,
-        .line_join = run.line_join,
-        .miter_limit = run.miter_limit,
-        .dash_array = if (run.dash_array) |dash| try alloc.dupe(f64, dash) else null,
-        .dash_phase = run.dash_phase,
-        .stroke_width = run.stroke_width,
-        .closed = run.closed,
-        .clip_box = run.clip_box,
-        .clip_points = if (run.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-        .clip_fill_rule = run.clip_fill_rule,
-        .points = try alloc.dupe([2]f64, run.points),
-        .pattern_matrix = run.pattern_matrix,
-        .pattern_bbox = run.pattern_bbox,
-        .pattern_x_step = run.pattern_x_step,
-        .pattern_y_step = run.pattern_y_step,
-        .base_color = run.base_color,
-        .shading = null,
-        .tile_text_runs = &.{},
-        .tile_image_runs = &.{},
-        .tile_shading_runs = &.{},
-        .tile_pattern_runs = &.{},
-        .tile_shape_runs = &.{},
-    };
-    if (run.shading) |shading| {
-        out.shading = .{
-            .kind = shading.kind,
-            .paint_order = shading.paint_order,
-            .blend_mode = shading.blend_mode,
-            .group_id = shading.group_id,
-            .group_parent_id = shading.group_parent_id,
-            .group_isolated = shading.group_isolated,
-            .group_knockout = shading.group_knockout,
-            .clip_box = shading.clip_box,
-            .clip_points = if (shading.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-            .clip_fill_rule = shading.clip_fill_rule,
-            .x0 = shading.x0,
-            .y0 = shading.y0,
-            .r0 = shading.r0,
-            .x1 = shading.x1,
-            .y1 = shading.y1,
-            .r1 = shading.r1,
-            .c0 = shading.c0,
-            .c1 = shading.c1,
-            .extend_start = shading.extend_start,
-            .extend_end = shading.extend_end,
-        };
-    }
+    var out = run;
+    out.dash_array = null;
+    out.clip_points = null;
+    out.points = &.{};
+    out.shading = null;
+    out.tile_text_runs = &.{};
+    out.tile_image_runs = &.{};
+    out.tile_shading_runs = &.{};
+    out.tile_pattern_runs = &.{};
+    out.tile_shape_runs = &.{};
+    errdefer out.deinit(alloc);
+
+    if (run.dash_array) |dash| out.dash_array = try alloc.dupe(f64, dash);
+    if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
+    out.points = try alloc.dupe([2]f64, run.points);
+    if (run.shading) |shading| out.shading = try dupShadingRunAlloc(alloc, shading);
+
     if (run.tile_text_runs.len > 0) {
-        var list = std.ArrayList(reader.TextRun).empty;
+        var list = try std.ArrayList(reader.TextRun).initCapacity(alloc, run.tile_text_runs.len);
         defer list.deinit(alloc);
-        for (run.tile_text_runs) |text| {
-            try list.append(alloc, .{
-                .text = try alloc.dupe(u8, text.text),
-                .raw_text = if (text.raw_text) |raw| try alloc.dupe(u8, raw) else null,
-                .font_index = text.font_index,
-                .vectorizable = text.vectorizable,
-                .x = text.x,
-                .y = text.y,
-                .font_size = text.font_size,
-                .a = text.a,
-                .b = text.b,
-                .c = text.c,
-                .d = text.d,
-                .alpha = text.alpha,
-                .stroke_alpha = text.stroke_alpha,
-                .render_mode = text.render_mode,
-                .fill_color = text.fill_color,
-                .stroke_color = text.stroke_color,
-                .stroke_width = text.stroke_width,
-                .horizontal_scale = text.horizontal_scale,
-                .char_spacing = text.char_spacing,
-                .word_spacing = text.word_spacing,
-                .advance_width = text.advance_width,
-                .ascent = text.ascent,
-                .descent = text.descent,
-                .paint_order = text.paint_order,
-                .blend_mode = text.blend_mode,
-                .group_id = text.group_id,
-                .group_parent_id = text.group_parent_id,
-                .group_isolated = text.group_isolated,
-                .group_knockout = text.group_knockout,
-                .fill_pattern_name = text.fill_pattern_name,
-                .stroke_pattern_name = text.stroke_pattern_name,
-                .clip_box = text.clip_box,
-                .clip_points = if (text.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                .clip_fill_rule = text.clip_fill_rule,
-            });
+        errdefer for (list.items) |*item| item.deinit(alloc);
+        for (run.tile_text_runs) |item| {
+            var cloned = try dupTextRunAlloc(alloc, item);
+            errdefer cloned.deinit(alloc);
+            list.appendAssumeCapacity(cloned);
         }
         out.tile_text_runs = try list.toOwnedSlice(alloc);
     }
     if (run.tile_image_runs.len > 0) {
-        var list = std.ArrayList(reader.ImageRun).empty;
+        var list = try std.ArrayList(reader.ImageRun).initCapacity(alloc, run.tile_image_runs.len);
         defer list.deinit(alloc);
-        for (run.tile_image_runs) |image_run| {
-            try list.append(alloc, .{
-                .rgba = try alloc.dupe(u8, image_run.rgba),
-                .width = image_run.width,
-                .height = image_run.height,
-                .alpha = image_run.alpha,
-                .paint_order = image_run.paint_order,
-                .blend_mode = image_run.blend_mode,
-                .group_id = image_run.group_id,
-                .group_parent_id = image_run.group_parent_id,
-                .group_isolated = image_run.group_isolated,
-                .group_knockout = image_run.group_knockout,
-                .clip_box = image_run.clip_box,
-                .clip_points = if (image_run.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                .clip_fill_rule = image_run.clip_fill_rule,
-                .a = image_run.a,
-                .b = image_run.b,
-                .c = image_run.c,
-                .d = image_run.d,
-                .e = image_run.e,
-                .f = image_run.f,
-                .x = image_run.x,
-                .y = image_run.y,
-                .draw_width = image_run.draw_width,
-                .draw_height = image_run.draw_height,
-            });
+        errdefer for (list.items) |*item| item.deinit(alloc);
+        for (run.tile_image_runs) |item| {
+            var cloned = try dupImageRunAlloc(alloc, item);
+            errdefer cloned.deinit(alloc);
+            list.appendAssumeCapacity(cloned);
         }
         out.tile_image_runs = try list.toOwnedSlice(alloc);
     }
     if (run.tile_shading_runs.len > 0) {
-        var list = std.ArrayList(reader.ShadingRun).empty;
+        var list = try std.ArrayList(reader.ShadingRun).initCapacity(alloc, run.tile_shading_runs.len);
         defer list.deinit(alloc);
-        for (run.tile_shading_runs) |shading| {
-            try list.append(alloc, .{
-                .kind = shading.kind,
-                .paint_order = shading.paint_order,
-                .blend_mode = shading.blend_mode,
-                .group_id = shading.group_id,
-                .group_parent_id = shading.group_parent_id,
-                .group_isolated = shading.group_isolated,
-                .group_knockout = shading.group_knockout,
-                .clip_box = shading.clip_box,
-                .clip_points = if (shading.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                .clip_fill_rule = shading.clip_fill_rule,
-                .x0 = shading.x0,
-                .y0 = shading.y0,
-                .r0 = shading.r0,
-                .x1 = shading.x1,
-                .y1 = shading.y1,
-                .r1 = shading.r1,
-                .c0 = shading.c0,
-                .c1 = shading.c1,
-                .extend_start = shading.extend_start,
-                .extend_end = shading.extend_end,
-            });
+        errdefer for (list.items) |*item| item.deinit(alloc);
+        for (run.tile_shading_runs) |item| {
+            var cloned = try dupShadingRunAlloc(alloc, item);
+            errdefer cloned.deinit(alloc);
+            list.appendAssumeCapacity(cloned);
         }
         out.tile_shading_runs = try list.toOwnedSlice(alloc);
     }
     if (run.tile_pattern_runs.len > 0) {
-        var list = std.ArrayList(reader.PatternRun).empty;
+        var list = try std.ArrayList(reader.PatternRun).initCapacity(alloc, run.tile_pattern_runs.len);
         defer list.deinit(alloc);
-        for (run.tile_pattern_runs) |pattern_run| try list.append(alloc, try dupPatternRunAlloc(alloc, pattern_run));
+        errdefer for (list.items) |*item| item.deinit(alloc);
+        for (run.tile_pattern_runs) |item| {
+            var cloned = try dupPatternRunAlloc(alloc, item);
+            errdefer cloned.deinit(alloc);
+            list.appendAssumeCapacity(cloned);
+        }
         out.tile_pattern_runs = try list.toOwnedSlice(alloc);
     }
     if (run.tile_shape_runs.len > 0) {
-        var list = std.ArrayList(reader.ShapeRun).empty;
+        var list = try std.ArrayList(reader.ShapeRun).initCapacity(alloc, run.tile_shape_runs.len);
         defer list.deinit(alloc);
-        for (run.tile_shape_runs) |shape| {
-            try list.append(alloc, .{
-                .kind = shape.kind,
-                .paint_order = shape.paint_order,
-                .blend_mode = shape.blend_mode,
-                .group_id = shape.group_id,
-                .group_parent_id = shape.group_parent_id,
-                .group_isolated = shape.group_isolated,
-                .group_knockout = shape.group_knockout,
-                .fill_rule = shape.fill_rule,
-                .line_cap = shape.line_cap,
-                .line_join = shape.line_join,
-                .miter_limit = shape.miter_limit,
-                .dash_array = if (shape.dash_array) |dash| try alloc.dupe(f64, dash) else null,
-                .dash_phase = shape.dash_phase,
-                .color = shape.color,
-                .stroke_width = shape.stroke_width,
-                .closed = shape.closed,
-                .clip_box = shape.clip_box,
-                .clip_points = if (shape.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                .clip_fill_rule = shape.clip_fill_rule,
-                .points = try alloc.dupe([2]f64, shape.points),
-            });
+        errdefer for (list.items) |*item| item.deinit(alloc);
+        for (run.tile_shape_runs) |item| {
+            var cloned = try dupShapeRunAlloc(alloc, item);
+            errdefer cloned.deinit(alloc);
+            list.appendAssumeCapacity(cloned);
         }
         out.tile_shape_runs = try list.toOwnedSlice(alloc);
     }
     return out;
+}
+
+test "PDF render pattern cloning is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var pattern_dash = [_]f64{ 1, 2 };
+            var pattern_clip = [_][2]f64{ .{ 0, 0 }, .{ 8, 8 } };
+            var pattern_points = [_][2]f64{ .{ 0, 0 }, .{ 8, 0 }, .{ 8, 8 }, .{ 0, 8 } };
+            var text_clip = [_][2]f64{ .{ 1, 1 }, .{ 2, 2 } };
+            var tile_text = [_]reader.TextRun{.{
+                .text = "visible",
+                .raw_text = "raw",
+                .x = 1,
+                .y = 2,
+                .font_size = 12,
+                .fill_pattern_name = "fill-pattern",
+                .stroke_pattern_name = "stroke-pattern",
+                .clip_points = &text_clip,
+            }};
+            var rgba = [_]u8{ 0, 64, 128, 255 };
+            var image_clip = [_][2]f64{ .{ 2, 2 }, .{ 3, 3 } };
+            var tile_images = [_]reader.ImageRun{.{
+                .rgba = &rgba,
+                .width = 1,
+                .height = 1,
+                .clip_points = &image_clip,
+                .a = 1,
+                .b = 0,
+                .c = 0,
+                .d = 1,
+                .e = 0,
+                .f = 0,
+                .x = 0,
+                .y = 0,
+                .draw_width = 1,
+                .draw_height = 1,
+            }};
+            var shading_clip = [_][2]f64{ .{ 3, 3 }, .{ 4, 4 } };
+            var tile_shadings = [_]reader.ShadingRun{.{
+                .kind = .axial,
+                .clip_points = &shading_clip,
+                .x0 = 0,
+                .y0 = 0,
+                .x1 = 8,
+                .y1 = 8,
+                .c0 = .{ 0, 0, 0, 255 },
+                .c1 = .{ 255, 255, 255, 255 },
+            }};
+            var shape_dash = [_]f64{ 3, 4 };
+            var shape_clip = [_][2]f64{ .{ 4, 4 }, .{ 5, 5 } };
+            var shape_points = [_][2]f64{ .{ 0, 0 }, .{ 4, 4 } };
+            var tile_shapes = [_]reader.ShapeRun{.{
+                .kind = .stroke,
+                .dash_array = &shape_dash,
+                .color = .{ 0, 0, 0, 255 },
+                .stroke_width = 1,
+                .closed = false,
+                .clip_points = &shape_clip,
+                .points = &shape_points,
+            }};
+            var nested_points = [_][2]f64{ .{ 0, 0 }, .{ 2, 2 } };
+            var nested_patterns = [_]reader.PatternRun{.{
+                .kind = .fill,
+                .points = &nested_points,
+                .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 2, .max_y = 2 },
+                .pattern_x_step = 2,
+                .pattern_y_step = 2,
+            }};
+            const source = reader.PatternRun{
+                .kind = .fill,
+                .dash_array = &pattern_dash,
+                .clip_points = &pattern_clip,
+                .points = &pattern_points,
+                .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 8, .max_y = 8 },
+                .pattern_x_step = 8,
+                .pattern_y_step = 8,
+                .shading = tile_shadings[0],
+                .tile_text_runs = &tile_text,
+                .tile_image_runs = &tile_images,
+                .tile_shading_runs = &tile_shadings,
+                .tile_pattern_runs = &nested_patterns,
+                .tile_shape_runs = &tile_shapes,
+            };
+
+            var cloned = try dupPatternRunAlloc(alloc, source);
+            defer cloned.deinit(alloc);
+            try std.testing.expectEqualStrings("fill-pattern", cloned.tile_text_runs[0].fill_pattern_name.?);
+            try std.testing.expect(cloned.tile_text_runs[0].fill_pattern_name.?.ptr != source.tile_text_runs[0].fill_pattern_name.?.ptr);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+fn buildRotatedTestPdfAlloc(alloc: Allocator, rotation: i32) ![]u8 {
+    const content = "0 0 10 10 re f\n";
+    const pages_object = try std.fmt.allocPrint(alloc, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 20 30] /Rotate {d} >>\nendobj\n", .{rotation});
+    defer alloc.free(pages_object);
+    const content_object = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        pages_object,
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n",
+        content_object,
+    };
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "%PDF-1.4\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |object, index| {
+        offsets[index] = out.items.len;
+        try out.appendSlice(alloc, object);
+    }
+    const xref_offset = out.items.len;
+    try out.appendSlice(alloc, "xref\n0 5\n0000000000 65535 f \n");
+    for (offsets) |offset| {
+        const entry = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{offset});
+        defer alloc.free(entry);
+        try out.appendSlice(alloc, entry);
+    }
+    const trailer = try std.fmt.allocPrint(alloc, "trailer\n<< /Root 1 0 R /Size 5 >>\nstartxref\n{d}\n%%EOF\n", .{xref_offset});
+    defer alloc.free(trailer);
+    try out.appendSlice(alloc, trailer);
+    return try out.toOwnedSlice(alloc);
+}
+
+test "page rotation normalization accepts equivalent quarter turns" {
+    try std.testing.expectEqual(render.PageRotation.none, try normalizedPageRotation(null));
+    try std.testing.expectEqual(render.PageRotation.clockwise_90, try normalizedPageRotation(450));
+    try std.testing.expectEqual(render.PageRotation.clockwise_270, try normalizedPageRotation(-90));
+    try std.testing.expectError(error.InvalidPageRotation, normalizedPageRotation(45));
+}
+
+test "native and adaptive page rendering honor inherited rotation" {
+    const alloc = std.testing.allocator;
+    const fixture = try buildRotatedTestPdfAlloc(alloc, 90);
+    defer alloc.free(fixture);
+
+    const png = try renderPagePngAlloc(alloc, fixture, 1, 72, 40_000_000);
+    defer alloc.free(png);
+    const decoded = try @import("antfly_image").png.decodeRgba(alloc, png);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(@as(u32, 30), decoded.width);
+    try std.testing.expectEqual(@as(u32, 20), decoded.height);
+
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    var adaptive = try renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 40);
+    defer adaptive.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 96), adaptive.effective_dpi);
+    try std.testing.expectEqual(@as(u32, 40), adaptive.width);
+    try std.testing.expectEqual(@as(u32, 27), adaptive.height);
+    const adaptive_decoded = try @import("antfly_image").png.decodeRgba(alloc, adaptive.png);
+    defer alloc.free(adaptive_decoded.rgba);
+    try std.testing.expectEqual(adaptive.width, adaptive_decoded.width);
+    try std.testing.expectEqual(adaptive.height, adaptive_decoded.height);
 }
 
 fn encryptType1EexecAlloc(alloc: Allocator, plain: []const u8) ![]u8 {
@@ -701,6 +882,21 @@ test "native backend renders embedded fixture pdf first page png" {
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
 }
 
+test "parsed rendering releases reader-owned runs with the reader allocator" {
+    const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
+
+    var reader_gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(reader_gpa.deinit() == .ok);
+    var output_gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(output_gpa.deinit() == .ok);
+
+    var parsed = try reader.Reader.init(reader_gpa.allocator(), fixture);
+    defer parsed.deinit();
+    const png = try renderParsedPagePngAlloc(output_gpa.allocator(), &parsed, 1, 150, 40_000_000);
+    defer output_gpa.allocator().free(png);
+    try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
+}
+
 test "native backend renders type1 cleartext fixture pdf first page png" {
     const alloc = std.testing.allocator;
     const fixture = @embedFile("../testdata/type1_cleartext_fixture.pdf");
@@ -769,6 +965,14 @@ test "native backend renders simple image xobject pdf first page png" {
     const png = try backend.renderFirstPagePng(alloc, out.items);
     defer alloc.free(png);
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
+    const scanned_ocr_png = try renderPagePngAlloc(alloc, out.items, 1, 150, 40_000_000);
+    defer alloc.free(scanned_ocr_png);
+    const scanned_native_page = try @import("antfly_image").png.decodeRgba(alloc, png);
+    defer alloc.free(scanned_native_page.rgba);
+    const scanned_ocr_page = try @import("antfly_image").png.decodeRgba(alloc, scanned_ocr_png);
+    defer alloc.free(scanned_ocr_page.rgba);
+    try std.testing.expect(scanned_ocr_page.width > scanned_native_page.width);
+    try std.testing.expect(scanned_ocr_page.height > scanned_native_page.height);
 }
 
 test "native backend renders Type3 text glyphs through shape path" {
@@ -2421,4 +2625,137 @@ test {
     _ = reader;
     _ = syntax;
     _ = render;
+}
+
+test "native page renderer honors OCR DPI and pixel guard" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
+    const png_72 = try renderPagePngAlloc(alloc, fixture, 1, 72, 40_000_000);
+    defer alloc.free(png_72);
+    const png_150 = try renderPagePngAlloc(alloc, fixture, 1, 150, 40_000_000);
+    defer alloc.free(png_150);
+    const decoded_72 = try @import("antfly_image").png.decodeRgba(alloc, png_72);
+    defer alloc.free(decoded_72.rgba);
+    const decoded_150 = try @import("antfly_image").png.decodeRgba(alloc, png_150);
+    defer alloc.free(decoded_150.rgba);
+    try std.testing.expect(decoded_150.width > decoded_72.width);
+    try std.testing.expect(decoded_150.height > decoded_72.height);
+    try std.testing.expectError(error.RenderedPageTooLarge, renderPagePngAlloc(alloc, fixture, 1, 150, 10));
+    try std.testing.expectError(error.InvalidPageNumber, renderPagePngAlloc(alloc, fixture, 2, 150, 40_000_000));
+}
+
+test "adaptive OCR rendering records effective DPI and enforces safety caps" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+
+    var adaptive = try renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 1000);
+    defer adaptive.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 150), adaptive.requested_dpi);
+    try std.testing.expect(adaptive.effective_dpi >= 72);
+    try std.testing.expect(adaptive.effective_dpi < adaptive.requested_dpi);
+    try std.testing.expect(adaptive.width <= 1000);
+    try std.testing.expect(adaptive.height <= 1000);
+    const decoded = try @import("antfly_image").png.decodeRgba(alloc, adaptive.png);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(adaptive.width, decoded.width);
+    try std.testing.expectEqual(adaptive.height, decoded.height);
+
+    try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 700));
+    try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 400));
+    try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 10, 4096));
+    try std.testing.expectError(error.InvalidRenderDpi, renderParsedPagePngAlloc(alloc, &parsed, 1, 48, 40_000_000));
+}
+
+test "OCR DPI scaling maps tiling patterns exactly once" {
+    const alloc = std.testing.allocator;
+    const tile_points = try alloc.dupe([2]f64, &.{ .{ 0, 0 }, .{ 5, 0 }, .{ 5, 5 }, .{ 0, 5 } });
+    var tile_shapes = try alloc.alloc(reader.ShapeRun, 1);
+    tile_shapes[0] = .{
+        .kind = .fill,
+        .color = .{ 0, 0, 0, 0xff },
+        .stroke_width = 0,
+        .closed = true,
+        .points = tile_points,
+    };
+    const target_points = try alloc.dupe([2]f64, &.{ .{ 0, 0 }, .{ 20, 0 }, .{ 20, 20 }, .{ 0, 20 } });
+    var runs = [_]reader.PatternRun{.{
+        .kind = .fill,
+        .points = target_points,
+        .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 5, .max_y = 5 },
+        .pattern_x_step = 5,
+        .pattern_y_step = 5,
+        .tile_shape_runs = tile_shapes,
+    }};
+    defer runs[0].deinit(alloc);
+
+    scalePatternRuns(&runs, 2);
+    try std.testing.expectApproxEqAbs(@as(f64, 40), runs[0].points[1][0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2), runs[0].pattern_matrix.a, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].pattern_x_step, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].pattern_bbox.max_x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].tile_shape_runs[0].points[1][0], 0.001);
+}
+
+test "native page renderer renders the requested one-based PDF page" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    const second_text = try parsed.extractPageTextAlloc(2);
+    defer alloc.free(second_text);
+    try std.testing.expect(std.mem.indexOf(u8, second_text, "SECOND PAGE") != null);
+
+    const first_png = try renderPagePngAlloc(alloc, fixture, 1, 150, 40_000_000);
+    defer alloc.free(first_png);
+    const second_png = try renderPagePngAlloc(alloc, fixture, 2, 150, 40_000_000);
+    defer alloc.free(second_png);
+    const first = try @import("antfly_image").png.decodeRgba(alloc, first_png);
+    defer alloc.free(first.rgba);
+    const second = try @import("antfly_image").png.decodeRgba(alloc, second_png);
+    defer alloc.free(second.rgba);
+    try std.testing.expectEqual(first.width, second.width);
+    try std.testing.expectEqual(first.height, second.height);
+    try std.testing.expect(!std.mem.eql(u8, first.rgba, second.rgba));
+}
+
+test "reader ignores stale positive page-tree Count hints" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    const mutated = try alloc.dupe(u8, fixture);
+    defer alloc.free(mutated);
+    const marker = std.mem.indexOf(u8, mutated, "/Count 2") orelse return error.InvalidTestFixture;
+    mutated[marker + "/Count ".len] = '1';
+
+    var parsed = try reader.Reader.init(alloc, mutated);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try parsed.pageCount());
+    const second = try parsed.extractPageTextAlloc(2);
+    defer alloc.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, second, "SECOND PAGE") != null);
+}
+
+test "native page renderer preserves a raster scanned-table fixture for OCR" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/scanned_table_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    const embedded_text = try parsed.extractPageTextAlloc(1);
+    defer alloc.free(embedded_text);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, embedded_text, &std.ascii.whitespace).len);
+
+    const png = try renderPagePngAlloc(alloc, fixture, 1, 150, 40_000_000);
+    defer alloc.free(png);
+    const page = try @import("antfly_image").png.decodeRgba(alloc, png);
+    defer alloc.free(page.rgba);
+    try std.testing.expect(page.width >= 133);
+    try std.testing.expect(page.height >= 100);
+
+    var dark_pixels: usize = 0;
+    var i: usize = 0;
+    while (i + 3 < page.rgba.len) : (i += 4) {
+        if (page.rgba[i] < 128 and page.rgba[i + 1] < 128 and page.rgba[i + 2] < 128) dark_pixels += 1;
+    }
+    try std.testing.expect(dark_pixels > 500);
 }

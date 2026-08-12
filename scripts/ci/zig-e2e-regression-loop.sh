@@ -63,7 +63,9 @@ fi
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   (
     cd "$repo_root/zig"
-    zig build -Dedition=full install -fincremental
+    python3 tools/run_bounded_zig_build.py --zig zig -- build \
+      antfly \
+      -fincremental
   )
 fi
 

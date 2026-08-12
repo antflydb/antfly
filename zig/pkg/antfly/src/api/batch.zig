@@ -872,6 +872,7 @@ fn transformOpTypeFromString(op: []const u8) !db_mod.types.TransformOpType {
     if (std.mem.eql(u8, op, "$inc")) return .inc;
     if (std.mem.eql(u8, op, "$push")) return .push;
     if (std.mem.eql(u8, op, "$addToSet")) return .add_to_set;
+    if (std.mem.eql(u8, op, "$min")) return .min;
     if (std.mem.eql(u8, op, "$max")) return .max;
     return error.InvalidBatchRequest;
 }
@@ -1231,13 +1232,14 @@ test "batch parser rejects removed aknn sync level" {
 
 test "batch parser accepts transforms" {
     var owned = try parseBatchRequest(std.testing.allocator,
-        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$max","path":"version","value":3},{"op":"$set","path":"status","value":"updated"}],"upsert":true}]}
+        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$min","path":"priority","value":2},{"op":"$max","path":"version","value":3},{"op":"$set","path":"status","value":"updated"}],"upsert":true}]}
     );
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), owned.transforms.len);
     try std.testing.expect(owned.transforms[0].upsert);
-    try std.testing.expectEqual(db_mod.types.TransformOpType.max, owned.transforms[0].operations[0].op);
-    try std.testing.expectEqualStrings("version", owned.transforms[0].operations[0].path);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.min, owned.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("priority", owned.transforms[0].operations[0].path);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.max, owned.transforms[0].operations[1].op);
 }
 
 test "batch parser accepts supported Go transform op spelling" {
@@ -1264,7 +1266,6 @@ test "batch parser rejects every recognized but unsupported transform operator" 
         "$pull",
         "$pop",
         "$mul",
-        "$min",
         "$currentDate",
         "$rename",
     };

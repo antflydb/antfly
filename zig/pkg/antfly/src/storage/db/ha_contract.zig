@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const primary_mod = @import("../ha/primary.zig");
+const mutation_barrier_mod = @import("../ha/mutation_barrier.zig");
 const standby_mod = @import("../ha/standby.zig");
 const write_gate_mod = @import("../ha/write_gate.zig");
 const public_gate_state_mod = @import("../ha/public_gate_state.zig");
@@ -31,6 +32,13 @@ pub const SyncWaitFn = *const fn (
 
 pub const AsyncEffectMirror = struct {
     primary: *primary_mod.Primary,
+    /// Shared across every writer owned by one HA runtime. Mutations hold a
+    /// shared lease through WAL publication and the sync durability decision;
+    /// seed capture takes the exclusive lease before choosing its checkpoint.
+    mutation_barrier: ?*mutation_barrier_mod.MutationBarrier = null,
+    /// Serializes the final write-gate check, WAL append, and acknowledgement
+    /// with a node-local promotion fence.
+    transition_mutex: ?*std.atomic.Mutex = null,
     last_lsn: ?*std.atomic.Value(u64) = null,
     failure_count: ?*std.atomic.Value(u64) = null,
     sync_policy: primary_mod.SyncPolicy = .{},

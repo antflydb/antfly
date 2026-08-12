@@ -2250,6 +2250,7 @@ fn mapTransformOpType(op_name: []const u8) !db_mod.types.TransformOpType {
     if (std.mem.eql(u8, op_name, "$unset")) return .unset;
     if (std.mem.eql(u8, op_name, "$inc")) return .inc;
     if (std.mem.eql(u8, op_name, "$addToSet")) return .add_to_set;
+    if (std.mem.eql(u8, op_name, "$min")) return .min;
     if (std.mem.eql(u8, op_name, "$max")) return .max;
     return error.UnsupportedReplicationTransform;
 }
@@ -3970,7 +3971,10 @@ test "metadata replication backfill applies configured update transforms" {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             const rows = try inner_alloc.alloc(std.json.Value, 1);
-            rows[0] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"doc:7\",\"user_name\":\"Alice\",\"profile\":{\"city\":\"sf\"}}", .{});
+            errdefer inner_alloc.free(rows);
+            var parsed = try std.json.parseFromSlice(std.json.Value, inner_alloc, "{\"id\":\"doc:7\",\"user_name\":\"Alice\",\"score\":10,\"profile\":{\"city\":\"sf\"}}", .{});
+            defer parsed.deinit();
+            rows[0] = try cloneJsonValueAllocLocal(inner_alloc, parsed.value);
             return .{ .rows = rows, .total = 1 };
         }
 
@@ -4021,7 +4025,7 @@ test "metadata replication backfill applies configured update transforms" {
     const summary = try runner.runTableSource(&status_sink, .{
         .table_id = 11,
         .name = "docs",
-        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\",\"on_update\":[{\"op\":\"$set\",\"path\":\"name\",\"value\":\"{{user_name}}\"},{\"op\":\"$merge\",\"value\":\"{{profile}}\"}]}]",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\",\"on_update\":[{\"op\":\"$set\",\"path\":\"name\",\"value\":\"{{user_name}}\"},{\"op\":\"$min\",\"path\":\"score\",\"value\":4},{\"op\":\"$merge\",\"value\":\"{{profile}}\"}]}]",
     }, 0);
 
     try std.testing.expectEqual(@as(usize, 1), summary.rows_applied);
@@ -4029,6 +4033,7 @@ test "metadata replication backfill applies configured update transforms" {
     defer result.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"name\":\"Alice\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"city\":\"sf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.json, "\"score\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"user_name\"") == null);
 }
 
@@ -5544,7 +5549,7 @@ test "metadata replication stream applies configured update and derived delete t
     _ = try runner.runTableSourceFromCheckpoint(&status_sink, .{
         .table_id = 11,
         .name = "docs",
-        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\",\"on_update\":[{\"op\":\"$set\",\"path\":\"name\",\"value\":\"{{name}}\"},{\"op\":\"$merge\",\"value\":\"{{profile}}\"}],\"on_delete\":[{\"op\":\"$unset\",\"path\":\"name\"},{\"op\":\"$unset\",\"path\":\"city\"}]}]",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\",\"on_update\":[{\"op\":\"$set\",\"path\":\"name\",\"value\":\"{{name}}\"},{\"op\":\"$min\",\"path\":\"age\",\"value\":5},{\"op\":\"$merge\",\"value\":\"{{profile}}\"}],\"on_delete\":[{\"op\":\"$unset\",\"path\":\"name\"},{\"op\":\"$unset\",\"path\":\"city\"}]}]",
     }, 0, 2, "slot_first", null, null);
 
     var after_update = (try db.lookup(alloc, "doc:9", .{})).?;
@@ -5552,11 +5557,12 @@ test "metadata replication stream applies configured update and derived delete t
     try std.testing.expect(std.mem.indexOf(u8, after_update.json, "\"after\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, after_update.json, "\"city\":\"sf\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, after_update.json, "\"stale\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_update.json, "\"age\":5") != null);
 
     _ = try runner.runTableSourceFromCheckpoint(&status_sink, .{
         .table_id = 11,
         .name = "docs",
-        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\",\"on_update\":[{\"op\":\"$set\",\"path\":\"name\",\"value\":\"{{name}}\"},{\"op\":\"$merge\",\"value\":\"{{profile}}\"}],\"on_delete\":[{\"op\":\"$unset\",\"path\":\"name\"},{\"op\":\"$unset\",\"path\":\"city\"}]}]",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\",\"on_update\":[{\"op\":\"$set\",\"path\":\"name\",\"value\":\"{{name}}\"},{\"op\":\"$min\",\"path\":\"age\",\"value\":5},{\"op\":\"$merge\",\"value\":\"{{profile}}\"}],\"on_delete\":[{\"op\":\"$unset\",\"path\":\"name\"},{\"op\":\"$unset\",\"path\":\"city\"}]}]",
     }, 0, 2, "slot_first", "lsn:10", null);
 
     var after_delete = (try db.lookup(alloc, "doc:9", .{})).?;

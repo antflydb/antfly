@@ -2336,7 +2336,7 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
         .former_primary = .{
             .node_id = "primary-a",
             .identity = parent_identity.identity,
-            .last_lsn = 12,
+            .last_lsn = 10,
         },
         .promotion_receipt = receipt,
         .fencing = .{
@@ -2365,7 +2365,7 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
         .promoted_node_id = receipt.promoted_node_id,
         .new_timeline_id = receipt.new_timeline_id,
         .new_epoch = receipt.new_epoch,
-        .former_last_lsn = 12,
+        .former_last_lsn = 10,
         .retained_from_lsn = 8,
         .fence_generation = receipt.generation,
         .fence_token = receipt.token,
@@ -2377,7 +2377,7 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
     const rewind_rejoin = rewind_command_plan.command.rejoin_rewind;
     try std.testing.expectEqualStrings("primary-a", rewind_rejoin.former.node_id);
     try std.testing.expectEqual(@as(u64, 1), rewind_rejoin.former.identity.timeline_id);
-    try std.testing.expectEqual(@as(u64, 12), rewind_rejoin.former.last_lsn);
+    try std.testing.expectEqual(@as(u64, 10), rewind_rejoin.former.last_lsn);
     try std.testing.expectEqual(@as(u64, 8), rewind_rejoin.policy.retained_from_lsn);
     try std.testing.expectEqualStrings("standby-b", rewind_rejoin.receipt.?.promoted_node_id);
     try std.testing.expectEqual(@as(u64, 2), rewind_rejoin.receipt.?.new_timeline_id);

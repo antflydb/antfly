@@ -4157,14 +4157,15 @@ test "transaction commit parser keeps table transforms" {
     var req = try parseCommitRequest(std.testing.allocator,
         \\{
         \\  "read_set":[],
-        \\  "tables":{"docs":{"transforms":[{"key":"doc:a","operations":[{"op":"$set","path":"status","value":"updated"},{"op":"$max","path":"version","value":3}],"upsert":true}]}}
+        \\  "tables":{"docs":{"transforms":[{"key":"doc:a","operations":[{"op":"$set","path":"status","value":"updated"},{"op":"$min","path":"priority","value":2},{"op":"$max","path":"version","value":3}],"upsert":true}]}}
         \\}
     );
     defer req.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), req.tables.len);
     try std.testing.expectEqual(@as(usize, 1), req.tables[0].batch.transforms.len);
     try std.testing.expect(req.tables[0].batch.transforms[0].upsert);
-    try std.testing.expectEqual(db_mod.types.TransformOpType.max, req.tables[0].batch.transforms[0].operations[1].op);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.min, req.tables[0].batch.transforms[0].operations[1].op);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.max, req.tables[0].batch.transforms[0].operations[2].op);
 }
 
 test "multi batch parser accepts the public batch envelope without a read set" {

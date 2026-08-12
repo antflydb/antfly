@@ -183,6 +183,20 @@ pub const EnrichmentRenderPdfRequest = extern struct {
     _reserved0: u32 = 0,
     pdf_bytes: BorrowedBytes = .{},
     page_number: u64 = 1,
+    dpi: u16 = 150,
+    _reserved1: u16 = 0,
+    max_dimension: u32 = 4096,
+    max_pixels: u64 = 40_000_000,
+    max_decoded_stream_bytes: u64 = 64 * 1024 * 1024,
+    max_working_set_bytes: u64 = 96 * 1024 * 1024,
+};
+
+pub const EnrichmentRenderedPdfPage = extern struct {
+    requested_dpi: u16 = 0,
+    effective_dpi: u16 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    _reserved0: u32 = 0,
 };
 
 /// Stable stages for failures originating in the enrichment compute unit.
@@ -1660,6 +1674,7 @@ pub extern fn antfly_enrichment_extract_stream(
 pub extern fn antfly_enrichment_render_pdf_page_png(
     request: *const EnrichmentRenderPdfRequest,
     out_png: *OwnedBytes,
+    out_page: *EnrichmentRenderedPdfPage,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 

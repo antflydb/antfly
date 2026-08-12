@@ -74,6 +74,11 @@ pub const Request = struct {
     source_text: []const u8,
     source_parts_json: ?[]const u8 = null,
     content_type: []const u8 = "",
+    /// Only producers that generated the inline media themselves may set this
+    /// value. User-authored fields and URLs remain untrusted by default.
+    inline_media_trusted: bool = false,
+    /// Stable source fingerprint for opt-in producer/inference profiling.
+    source_fingerprint: ?[]const u8 = null,
 };
 
 pub const Producer = struct {
@@ -83,6 +88,7 @@ pub const Producer = struct {
     pub const VTable = struct {
         produce: *const fn (ptr: *anyopaque, alloc: Allocator, request: Request) anyerror![]u8,
         produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror![][]u8 = null,
+        can_produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!bool = null,
         deinit: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
     };
 
@@ -105,6 +111,17 @@ pub const Producer = struct {
             out[i] = try self.produce(alloc, request);
         }
         return out;
+    }
+
+    /// Reports whether produceBatch can execute the request set as one native
+    /// operation. A missing hook preserves the existing producer contract: a
+    /// provided batch function is assumed native, while the generic fallback is
+    /// explicitly sequential.
+    pub fn canProduceBatch(self: Producer, alloc: Allocator, requests: []const Request) !bool {
+        if (self.vtable.produce_batch == null) return false;
+        if (self.vtable.can_produce_batch) |can_produce_batch|
+            return try can_produce_batch(self.ptr, alloc, requests);
+        return true;
     }
 
     pub fn deinit(self: Producer, alloc: Allocator) void {

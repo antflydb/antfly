@@ -23,6 +23,7 @@ const std = @import("std");
 const manifest_mod = @import("manifest.zig");
 const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
+const gguf_writer = @import("../gguf/writer.zig");
 
 pub const Level = enum {
     compatible,
@@ -177,6 +178,17 @@ fn assessWithFacts(
         return makeCompatible(architecture, "GLiNER2 extraction runtime is enabled");
     }
 
+    // A standalone GGUF commonly has no config.json and may live under an
+    // owner/model directory rather than the optional generators/ taxonomy.
+    // In that case ModelManifest retains its neutral default role, but the
+    // inspected GGUF architecture is authoritative. Promote only a selected
+    // GGUF with no explicit role or bundle metadata; this prevents a colocated
+    // decoder-shaped artifact from relabeling an embedder contract.
+    if (mayInferStandaloneGgufDecoder(man)) {
+        const decoder_assessment = assessGenerator(architecture, expert_count);
+        if (decoder_assessment.level != .unknown) return decoder_assessment;
+    }
+
     switch (man.model_type) {
         .rewriter => return makeIncompatible(
             architecture,
@@ -242,6 +254,21 @@ fn assessWithFacts(
         .unknown_architecture,
         "unrecognized model architecture; start the server with --allow-unknown-models to opt in",
     );
+}
+
+fn mayInferStandaloneGgufDecoder(man: *const manifest_mod.ModelManifest) bool {
+    return man.model_type == .embedder and
+        man.model_type_origin == .default and
+        man.usesGgufWeights() and
+        man.config_model_arch.len == 0 and
+        man.config_path == null and
+        man.model_manifest_path == null and
+        man.onnx_path == null and
+        man.tasks.len == 0 and
+        man.capabilities.len == 0 and
+        man.inputs.len == 0 and
+        man.gliner_model_type.len == 0 and
+        man.inference_bundle_family.len == 0;
 }
 
 fn assessGenerator(architecture: []const u8, expert_count: u32) Assessment {
@@ -423,6 +450,158 @@ test "gemma 4 E4B architecture is enabled while unified layout is blocked" {
         Level.incompatible,
         assessWithFacts(&man, "gemma4", 128).level,
     );
+}
+
+test "standalone GGUF decoder architecture does not depend on directory taxonomy" {
+    var man = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .gguf_path = "model.gguf",
+    };
+    try std.testing.expectEqual(Level.compatible, assessWithFacts(&man, "gemma4", 0).level);
+    try std.testing.expectEqual(Level.incompatible, assessWithFacts(&man, "gemma4", 128).level);
+    try std.testing.expectEqual(Level.incompatible, assessWithFacts(&man, "deepseek4", 0).level);
+    try std.testing.expectEqual(Level.unknown, assessWithFacts(&man, "brand_new_decoder", 0).level);
+
+    // Explicit classification remains authoritative even when its final enum
+    // value happens to equal ModelManifest's neutral default.
+    man.model_type_origin = .config;
+    try std.testing.expectEqual(Level.unknown, assessWithFacts(&man, "gemma4", 0).level);
+}
+
+test "standalone decoder inference requires an artifact-only default manifest" {
+    var man = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .gguf_path = "model.gguf",
+    };
+
+    man.model_type_origin = .path;
+    try std.testing.expectEqual(Level.unknown, assessWithFacts(&man, "gemma4", 0).level);
+    man.model_type_origin = .manifest;
+    try std.testing.expectEqual(Level.unknown, assessWithFacts(&man, "gemma4", 0).level);
+    man.model_type_origin = .tasks;
+    try std.testing.expectEqual(Level.unknown, assessWithFacts(&man, "gemma4", 0).level);
+
+    man.model_type_origin = .default;
+    man.config_path = "config.json";
+    try std.testing.expectEqual(Level.unknown, assessWithFacts(&man, "gemma4", 0).level);
+    man.config_path = null;
+    man.model_manifest_path = "model_manifest.json";
+    try std.testing.expectEqual(Level.unknown, assessWithFacts(&man, "gemma4", 0).level);
+    man.model_manifest_path = null;
+    man.onnx_path = "model.onnx";
+    try std.testing.expectEqual(Level.unknown, assessWithFacts(&man, "gemma4", 0).level);
+
+    man.onnx_path = null;
+    man.gguf_path = null;
+    try std.testing.expectEqual(Level.unknown, assessWithFacts(&man, "gemma4", 0).level);
+}
+
+test "listing inspection recognizes standalone GGUF decoder outside taxonomy" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeCompatibilityTestGguf(tmp.dir, allocator, "gemma-4-e2b-it-q4_k_xl.gguf", "gemma4");
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    var listing_man = try manifest_mod.loadListingFromDir(allocator, model_dir);
+    defer listing_man.deinit();
+    try expectLoadedGgufAssessment(allocator, &listing_man, .default, .compatible);
+
+    var full_man = try manifest_mod.loadFromDir(allocator, model_dir);
+    defer full_man.deinit();
+    try expectLoadedGgufAssessment(allocator, &full_man, .default, .compatible);
+}
+
+test "loader-derived embedder roles cannot be relabeled by GGUF architecture" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cases = [_]struct {
+        dir: []const u8,
+        sidecar_name: ?[]const u8,
+        sidecar_data: []const u8,
+        origin: manifest_mod.ModelTypeOrigin,
+    }{
+        .{
+            .dir = "embedders/acme/model",
+            .sidecar_name = null,
+            .sidecar_data = "",
+            .origin = .path,
+        },
+        .{
+            .dir = "manifest-role",
+            .sidecar_name = "model_manifest.json",
+            .sidecar_data = "{\"type\":\"embedder\"}",
+            .origin = .manifest,
+        },
+        .{
+            .dir = "task-role",
+            .sidecar_name = "model_manifest.json",
+            .sidecar_data = "{\"tasks\":[\"embed\"]}",
+            .origin = .tasks,
+        },
+        .{
+            .dir = "config-role",
+            .sidecar_name = "config.json",
+            .sidecar_data = "{\"model_type\":\"bert\"}",
+            .origin = .config,
+        },
+    };
+
+    for (cases) |case| {
+        try tmp.dir.createDirPath(io, case.dir);
+        const gguf_rel = try std.fs.path.join(allocator, &.{ case.dir, "model.gguf" });
+        defer allocator.free(gguf_rel);
+        try writeCompatibilityTestGguf(tmp.dir, allocator, gguf_rel, "gemma4");
+        if (case.sidecar_name) |sidecar_name| {
+            const sidecar_rel = try std.fs.path.join(allocator, &.{ case.dir, sidecar_name });
+            defer allocator.free(sidecar_rel);
+            try tmp.dir.writeFile(io, .{ .sub_path = sidecar_rel, .data = case.sidecar_data });
+        }
+
+        const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], case.dir });
+        defer allocator.free(model_dir);
+        var listing_man = try manifest_mod.loadListingFromDir(allocator, model_dir);
+        defer listing_man.deinit();
+        try expectLoadedGgufAssessment(allocator, &listing_man, case.origin, .unknown);
+
+        var full_man = try manifest_mod.loadFromDir(allocator, model_dir);
+        defer full_man.deinit();
+        try expectLoadedGgufAssessment(allocator, &full_man, case.origin, .unknown);
+    }
+}
+
+fn expectLoadedGgufAssessment(
+    allocator: std.mem.Allocator,
+    man: *const manifest_mod.ModelManifest,
+    expected_origin: manifest_mod.ModelTypeOrigin,
+    expected_level: Level,
+) !void {
+    try std.testing.expectEqual(manifest_mod.ModelType.embedder, man.model_type);
+    try std.testing.expectEqual(expected_origin, man.model_type_origin);
+    try std.testing.expect(man.usesGgufWeights());
+    var inspection = try inspectAlloc(allocator, man);
+    defer inspection.deinit(allocator);
+    try std.testing.expectEqualStrings("gemma4", inspection.architecture);
+    try std.testing.expectEqual(expected_level, assessInspection(man, inspection).level);
+}
+
+fn writeCompatibilityTestGguf(
+    dir: anytype,
+    allocator: std.mem.Allocator,
+    sub_path: []const u8,
+    architecture: []const u8,
+) !void {
+    const metadata = [_]gguf_format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = architecture } },
+    };
+    var layout = try gguf_writer.buildLayout(allocator, &metadata, &.{});
+    defer layout.deinit(allocator);
+    try dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = layout.header_bytes });
 }
 
 test "release encoder contracts cover DeBERTa reranking and GLiNER2" {

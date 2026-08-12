@@ -25,6 +25,7 @@ const platform = @import("antfly_platform");
 const tracing = @import("../tracing/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const platform_time = @import("antfly_platform").time;
+const thread_config = @import("../runtime_thread_config.zig");
 
 const storage_kernel_experiment = storage_source_options.control_only;
 const StorageKernelContext = if (storage_kernel_experiment)

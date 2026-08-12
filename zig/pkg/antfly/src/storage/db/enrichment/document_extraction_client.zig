@@ -270,25 +270,45 @@ pub fn extractDownloadedAllocWithFailure(
     return try collector.finish();
 }
 
-pub fn renderPdfPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: usize) ![]u8 {
-    var failure: abi.FailureIdentity = .{};
-    return renderPdfPagePngAllocWithFailure(alloc, pdf_bytes, page_number, &failure);
-}
-
-pub fn renderPdfPagePngAllocWithFailure(
+pub fn renderPdfPagePngAdaptiveAlloc(
     alloc: Allocator,
     pdf_bytes: []const u8,
     page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+    max_decoded_stream_bytes: usize,
+    max_working_set_bytes: usize,
+) !extraction.RenderedPdfPage {
+    var failure: abi.FailureIdentity = .{};
+    return renderPdfPagePngAdaptiveAllocWithFailure(alloc, pdf_bytes, page_number, dpi, max_pixels, max_dimension, max_decoded_stream_bytes, max_working_set_bytes, &failure);
+}
+
+pub fn renderPdfPagePngAdaptiveAllocWithFailure(
+    alloc: Allocator,
+    pdf_bytes: []const u8,
+    page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+    max_decoded_stream_bytes: usize,
+    max_working_set_bytes: usize,
     out_failure: *abi.FailureIdentity,
-) ![]u8 {
+) !extraction.RenderedPdfPage {
     out_failure.* = .{};
     var provider_png: abi.OwnedBytes = .{};
     defer abi.antfly_enrichment_buffer_destroy(&provider_png);
+    var provider_page: abi.EnrichmentRenderedPdfPage = .{};
     var failure: abi.FailureIdentity = .{};
     const status = abi.antfly_enrichment_render_pdf_page_png(&.{
         .pdf_bytes = .fromSlice(pdf_bytes),
         .page_number = @intCast(page_number),
-    }, &provider_png, &failure);
+        .dpi = dpi,
+        .max_pixels = max_pixels,
+        .max_dimension = max_dimension,
+        .max_decoded_stream_bytes = @intCast(max_decoded_stream_bytes),
+        .max_working_set_bytes = @intCast(max_working_set_bytes),
+    }, &provider_png, &provider_page, &failure);
     try acceptProviderFailure(
         status,
         failure,
@@ -299,7 +319,13 @@ pub fn renderPdfPagePngAllocWithFailure(
         if (status == .internal) logProviderFailure("enrichment PDF render", failure);
         return err;
     };
-    return try alloc.dupe(u8, provider_png.slice());
+    return .{
+        .png = try alloc.dupe(u8, provider_png.slice()),
+        .requested_dpi = provider_page.requested_dpi,
+        .effective_dpi = provider_page.effective_dpi,
+        .width = provider_page.width,
+        .height = provider_page.height,
+    };
 }
 
 pub fn acceptProviderFailure(

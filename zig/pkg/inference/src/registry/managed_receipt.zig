@@ -26,8 +26,15 @@ pub const ArtifactReceipt = struct {
     sha256: ?[]const u8 = null,
 };
 
+pub const DownloadSource = struct {
+    owner: []const u8,
+    name: []const u8,
+    variant: []const u8,
+};
+
 pub const DownloadReceipt = struct {
     version: u32 = 1,
+    source: ?DownloadSource = null,
     artifacts: []const ArtifactReceipt,
 };
 
@@ -255,7 +262,7 @@ fn loadValidatedSource(
         else => return error.InvalidManagedDownload,
     };
     errdefer parsed.deinit();
-    if (parsed.value.version != 1 or
+    if ((parsed.value.version != 1 and parsed.value.version != 2) or
         parsed.value.artifacts.len == 0 or
         parsed.value.artifacts.len > max_artifact_count)
     {

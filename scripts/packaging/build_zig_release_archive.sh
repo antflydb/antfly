@@ -106,6 +106,13 @@ case "$strip" in
 esac
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "$repo_root" show -s --format=%ct HEAD)}"
+if ! [[ "$source_date_epoch" =~ ^[0-9]+$ ]]; then
+  echo "SOURCE_DATE_EPOCH must be a non-negative integer, got: $source_date_epoch" >&2
+  exit 2
+fi
+export SOURCE_DATE_EPOCH="$source_date_epoch"
+
 work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${target}"
 prefix="${work_root}/zig-out"
 stage="${work_root}/stage"
@@ -143,12 +150,12 @@ zig_build_options=(
   -Doptimize="$optimize"
   -Dstrip="$strip"
   -Dcpu=baseline
-  -Dedition=full
   -Dlinked-runtime-libraries=true
   -Dantfly-bin-name=antfly
   -Dantfly-version="$version"
   -Donnx=false
   -Dmetal="$metal"
+  -Dcuda=false
   -Dsystem-blas="$system_blas"
 )
 
@@ -158,22 +165,17 @@ zig_install_args=(
   --global-cache-dir "$cache_root/global"
 )
 
-zig_lib_dir="$(zig env | sed -n 's/^[[:space:]]*\.lib_dir = "\(.*\)",$/\1/p')"
-if [ -z "$zig_lib_dir" ] || [ ! -f "$zig_lib_dir/compiler/build_runner.zig" ]; then
-  echo "unable to locate Zig 0.16 build_runner.zig from 'zig env'" >&2
-  exit 1
-fi
-patched_build_runner="$work_root/zig-build-runner-maxrss.zig"
-python3 "$repo_root/zig/tools/patch_zig_0_16_build_runner_maxrss.py" \
-  "$zig_lib_dir/compiler/build_runner.zig" \
-  "$patched_build_runner"
-zig_install_args+=(
-  --build-runner "$patched_build_runner"
-  --maxrss "${ANTFLY_ZIG_MAX_RSS:-20971520000}"
-)
-
 run_zig_build_steps() {
-  local -a command=(zig build)
+  local -a command=(
+    python3
+    "$repo_root/zig/tools/run_bounded_zig_build.py"
+    --zig
+    zig
+    --max-rss-cap
+    21474836480
+    --
+    build
+  )
 
   if [ -n "$jobs" ]; then
     command+=("-j$jobs")
@@ -225,7 +227,7 @@ run_zig_build_steps_with_retry() {
   # running application unit within a 19GiB group. Explicit build dependencies
   # keep Zig's randomized dependency traversal from admitting the short remote
   # CLI unit ahead of either critical compiler unit.
-  run_zig_build_steps_with_retry archive install lite-capi
+  run_zig_build_steps_with_retry archive antfly capi
 )
 
 test -x "$prefix/bin/antfly"
@@ -248,7 +250,10 @@ fi
 cp "$repo_root/README.md" "$stage/README.md"
 cp "$repo_root/LICENSE" "$stage/LICENSE"
 
-tar -C "$stage" -czf "$out_dir/$archive_name" .
+python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
+  --source "$stage" \
+  --output "$out_dir/$archive_name" \
+  --mtime "$source_date_epoch"
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
 grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null

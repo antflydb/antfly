@@ -177,18 +177,39 @@ pub fn extractStream(
 pub fn renderPdfPagePng(
     request: *const abi.EnrichmentRenderPdfRequest,
     out_png: *abi.OwnedBytes,
+    out_page: *abi.EnrichmentRenderedPdfPage,
     out_failure: *abi.FailureIdentity,
 ) callconv(.c) abi.Status {
     out_png.* = .{};
+    out_page.* = .{};
     out_failure.* = .{};
     if (request.version != abi.abi_version)
         return fail(error.InvalidAbiVersion, .render_pdf_page, out_failure);
     const page_number = std.math.cast(usize, request.page_number) orelse
         return fail(error.InvalidArgument, .render_pdf_page, out_failure);
-    const png = extraction.renderPdfPagePngAlloc(std.heap.c_allocator, request.pdf_bytes.slice(), page_number) catch |err| {
+    var session = extraction.PdfRenderSession.initWithDecodeLimits(std.heap.c_allocator, request.pdf_bytes.slice(), .{
+        .max_decoded_stream_bytes = std.math.cast(usize, request.max_decoded_stream_bytes) orelse
+            return fail(error.InvalidPdfDecodeLimits, .render_pdf_page, out_failure),
+        .max_working_set_bytes = std.math.cast(usize, request.max_working_set_bytes) orelse
+            return fail(error.InvalidPdfDecodeLimits, .render_pdf_page, out_failure),
+    }) catch |err| return fail(err, .render_pdf_page, out_failure);
+    defer session.deinit();
+    const rendered = session.renderPagePngAdaptiveAlloc(
+        std.heap.c_allocator,
+        page_number,
+        request.dpi,
+        request.max_pixels,
+        request.max_dimension,
+    ) catch |err| {
         return fail(err, .render_pdf_page, out_failure);
     };
-    out_png.* = .{ .ptr = png.ptr, .len = @intCast(png.len) };
+    out_png.* = .{ .ptr = rendered.png.ptr, .len = @intCast(rendered.png.len) };
+    out_page.* = .{
+        .requested_dpi = rendered.requested_dpi,
+        .effective_dpi = rendered.effective_dpi,
+        .width = rendered.width,
+        .height = rendered.height,
+    };
     return .ok;
 }
 

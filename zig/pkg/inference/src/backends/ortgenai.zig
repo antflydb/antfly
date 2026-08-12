@@ -698,6 +698,7 @@ pub const GenerateOptions = struct {
 /// Result of a generation call.
 pub const GenerateResult = struct {
     text: []const u8,
+    prompt_tokens: usize,
     tokens_used: usize,
     finish_reason: []const u8,
     allocator: std.mem.Allocator,
@@ -716,6 +717,44 @@ pub const FirstTokenDebug = struct {
         self.allocator.free(self.text);
     }
 };
+
+fn checkedTensorElementCount(shape: []const i64) !usize {
+    if (shape.len == 0) return error.InvalidOrtGenAiInputShape;
+
+    var count: usize = 1;
+    for (shape) |dimension| {
+        if (dimension <= 0) return error.InvalidOrtGenAiInputShape;
+        count = std.math.mul(usize, count, std.math.cast(usize, dimension) orelse return error.InvalidOrtGenAiInputShape) catch
+            return error.InvalidOrtGenAiInputShape;
+    }
+    return count;
+}
+
+fn checkedMaxLength(prompt_tokens: usize, max_tokens: i32, context_length: i32) !i32 {
+    if (max_tokens <= 0) return context_length;
+    const requested = std.math.add(usize, prompt_tokens, @intCast(max_tokens)) catch
+        return error.OrtGenAiSequenceTooLong;
+    return std.math.cast(i32, requested) orelse error.OrtGenAiSequenceTooLong;
+}
+
+fn multimodalPromptTokenCount(
+    allocator: std.mem.Allocator,
+    named_tensors: *c.OgaNamedTensors,
+) !usize {
+    var input_ids: ?*c.OgaTensor = null;
+    try check(c.OgaNamedTensorsGet(named_tensors, "input_ids", &input_ids));
+    const input_ids_tensor = input_ids orelse return error.OrtGenAiMissingInputIds;
+    defer c.OgaDestroyTensor(input_ids_tensor);
+
+    var rank: usize = 0;
+    try check(c.OgaTensorGetShapeRank(input_ids_tensor, &rank));
+    if (rank == 0) return error.InvalidOrtGenAiInputShape;
+
+    const shape = try allocator.alloc(i64, rank);
+    defer allocator.free(shape);
+    try check(c.OgaTensorGetShape(input_ids_tensor, shape.ptr, shape.len));
+    return checkedTensorElementCount(shape);
+}
 
 /// Generate text from a prompt using ortgenai.
 pub fn generate(allocator: std.mem.Allocator, model: *const GenAiModel, prompt: []const u8, opts: GenerateOptions) !GenerateResult {
@@ -736,7 +775,8 @@ pub fn generate(allocator: std.mem.Allocator, model: *const GenAiModel, prompt: 
     defer c.OgaDestroyGeneratorParams(params.?);
 
     // Set generation parameters
-    const max_length = if (opts.max_tokens > 0) opts.max_tokens + @as(i32, @intCast(c.OgaSequencesGetSequenceCount(sequences.?, 0))) else model.context_length;
+    const prompt_tokens = c.OgaSequencesGetSequenceCount(sequences.?, 0);
+    const max_length = try checkedMaxLength(prompt_tokens, opts.max_tokens, model.context_length);
     try check(c.OgaGeneratorParamsSetSearchNumber(params.?, "max_length", @floatFromInt(max_length)));
 
     if (opts.temperature > 0) {
@@ -802,6 +842,7 @@ pub fn generate(allocator: std.mem.Allocator, model: *const GenAiModel, prompt: 
     const text = try allocator.dupe(u8, buf.items);
     return .{
         .text = text,
+        .prompt_tokens = prompt_tokens,
         .tokens_used = token_count,
         .finish_reason = if (hit_max) "length" else "stop",
         .allocator = allocator,
@@ -826,7 +867,8 @@ pub fn generateFirstTokenDebug(
     try check(c.OgaCreateGeneratorParams(model.model, &params));
     defer c.OgaDestroyGeneratorParams(params.?);
 
-    const max_length = if (opts.max_tokens > 0) opts.max_tokens + @as(i32, @intCast(c.OgaSequencesGetSequenceCount(sequences.?, 0))) else model.context_length;
+    const prompt_tokens = c.OgaSequencesGetSequenceCount(sequences.?, 0);
+    const max_length = try checkedMaxLength(prompt_tokens, opts.max_tokens, model.context_length);
     try check(c.OgaGeneratorParamsSetSearchNumber(params.?, "max_length", @floatFromInt(max_length)));
     try check(c.OgaGeneratorParamsSetSearchBool(params.?, "do_sample", false));
 
@@ -900,13 +942,19 @@ pub fn generateWithImages(
     try check(c.OgaProcessorProcessImages(processor.?, prompt_z.ptr, images.?, &named_tensors));
     defer c.OgaDestroyNamedTensors(named_tensors.?);
 
+    // The processor expands image placeholders into the exact input_ids that
+    // seed generation. Account from that tensor rather than guessing a fixed
+    // visual-token allowance: the expansion is model- and image-dependent.
+    const prompt_tokens = try multimodalPromptTokenCount(allocator, named_tensors.?);
+
     // Create generator params
     var params: ?*c.OgaGeneratorParams = null;
     try check(c.OgaCreateGeneratorParams(model.model, &params));
     defer c.OgaDestroyGeneratorParams(params.?);
 
     // Set generation parameters
-    try check(c.OgaGeneratorParamsSetSearchNumber(params.?, "max_length", @floatFromInt(if (opts.max_tokens > 0) opts.max_tokens + 1024 else model.context_length)));
+    const max_length = try checkedMaxLength(prompt_tokens, opts.max_tokens, model.context_length);
+    try check(c.OgaGeneratorParamsSetSearchNumber(params.?, "max_length", @floatFromInt(max_length)));
 
     if (opts.temperature > 0) {
         try check(c.OgaGeneratorParamsSetSearchNumber(params.?, "temperature", opts.temperature));
@@ -927,6 +975,9 @@ pub fn generateWithImages(
     defer c.OgaDestroyGenerator(generator.?);
 
     try check(c.OgaGenerator_SetInputs(generator.?, named_tensors.?));
+    if (c.OgaGenerator_TokenCount(generator.?) != prompt_tokens) {
+        return error.OrtGenAiPromptTokenCountMismatch;
+    }
 
     // Create tokenizer stream for decoding
     var stream: ?*c.OgaTokenizerStream = null;
@@ -966,6 +1017,7 @@ pub fn generateWithImages(
     const text = try allocator.dupe(u8, buf.items);
     return .{
         .text = text,
+        .prompt_tokens = prompt_tokens,
         .tokens_used = token_count,
         .finish_reason = if (hit_max) "length" else "stop",
         .allocator = allocator,
@@ -999,7 +1051,8 @@ pub fn generateStreaming(
     try check(c.OgaCreateGeneratorParams(model.model, &params));
     defer c.OgaDestroyGeneratorParams(params.?);
 
-    const max_length = if (opts.max_tokens > 0) opts.max_tokens + @as(i32, @intCast(c.OgaSequencesGetSequenceCount(sequences.?, 0))) else model.context_length;
+    const prompt_tokens = c.OgaSequencesGetSequenceCount(sequences.?, 0);
+    const max_length = try checkedMaxLength(prompt_tokens, opts.max_tokens, model.context_length);
     try check(c.OgaGeneratorParamsSetSearchNumber(params.?, "max_length", @floatFromInt(max_length)));
 
     if (opts.temperature > 0) {
@@ -1040,6 +1093,7 @@ pub fn generateStreaming(
         try check(c.OgaGenerator_GetNextTokens(generator.?, &next_tokens, &next_count));
         if (next_count == 0) break;
         const new_token = next_tokens[0];
+        token_count += 1;
 
         var decoded: [*c]const u8 = null;
         try check(c.OgaTokenizerStreamDecode(stream.?, new_token, &decoded));
@@ -1053,7 +1107,6 @@ pub fn generateStreaming(
             }
         }
 
-        token_count += 1;
         if (opts.max_tokens > 0 and token_count >= @as(usize, @intCast(opts.max_tokens))) {
             hit_max = true;
             break;
@@ -1063,6 +1116,7 @@ pub fn generateStreaming(
     const text = try allocator.dupe(u8, buf.items);
     return .{
         .text = text,
+        .prompt_tokens = prompt_tokens,
         .tokens_used = token_count,
         .finish_reason = if (stopped_by_callback) "stop" else if (hit_max) "length" else "stop",
         .allocator = allocator,

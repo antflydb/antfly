@@ -25,6 +25,7 @@ const json_helpers = @import("json_helpers.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
+const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
 
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     if (body.len == 0) return error.InvalidCreateIndexRequest;
@@ -352,12 +353,15 @@ pub fn validateArtifactEnrichmentsForTableIndexesJson(
 ) !void {
     const enrichments = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
     defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
-    try validateArtifactEnrichmentConfigs(enrichments);
+    try validateArtifactEnrichmentConfigs(alloc, enrichments);
 }
 
-pub fn validateArtifactEnrichmentConfigs(configs: []const db_mod.types.EnrichmentConfig) !void {
+pub fn validateArtifactEnrichmentConfigs(
+    alloc: std.mem.Allocator,
+    configs: []const db_mod.types.EnrichmentConfig,
+) !void {
     for (configs, 0..) |cfg, i| {
-        try validateArtifactEnrichmentConfigShape(cfg);
+        try enrichment_config_validation.validatePublicConfig(alloc, cfg);
         for (configs[0..i]) |prior| {
             if (!std.mem.eql(u8, prior.name, cfg.name)) continue;
             if (!artifactEnrichmentConfigsEqual(prior, cfg)) return error.ConflictingEnrichmentConfig;
@@ -391,18 +395,20 @@ fn collectArtifactEnrichmentsFromValue(
     switch (value) {
         .object => |object| {
             if (object.get("enrichments")) |enrichments| {
-                if (enrichments == .array) {
-                    for (enrichments.array.items) |item| {
-                        if (item != .object) continue;
-                        const parsed = try std.json.parseFromValue(db_mod.types.EnrichmentConfig, alloc, item, .{
-                            .allocate = .alloc_always,
-                            .ignore_unknown_fields = true,
-                        });
-                        defer parsed.deinit();
-                        var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
-                        errdefer owned.deinit(alloc);
-                        try out.append(alloc, owned);
-                    }
+                if (enrichments != .array) return error.InvalidEnrichmentConfig;
+                for (enrichments.array.items) |item| {
+                    if (item != .object) return error.InvalidEnrichmentConfig;
+                    const parsed = std.json.parseFromValue(db_mod.types.EnrichmentConfig, alloc, item, .{
+                        .allocate = .alloc_always,
+                        .ignore_unknown_fields = true,
+                    }) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => return error.InvalidEnrichmentConfig,
+                    };
+                    defer parsed.deinit();
+                    var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
+                    errdefer owned.deinit(alloc);
+                    try out.append(alloc, owned);
                 }
             }
             var it = object.iterator();
@@ -415,16 +421,6 @@ fn collectArtifactEnrichmentsFromValue(
             for (array.items) |item| try collectArtifactEnrichmentsFromValue(alloc, item, out);
         },
         else => {},
-    }
-}
-
-fn validateArtifactEnrichmentConfigShape(cfg: db_mod.types.EnrichmentConfig) !void {
-    if (cfg.name.len == 0 or (cfg.field.len == 0 and cfg.template.len == 0)) return error.InvalidEnrichmentConfig;
-    switch (cfg.kind) {
-        .chunk => {
-            if (cfg.chunk_size == 0 and cfg.chunker_json.len == 0) return error.InvalidEnrichmentConfig;
-        },
-        .embedding, .asset => {},
     }
 }
 

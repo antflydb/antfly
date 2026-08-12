@@ -536,6 +536,7 @@ const (
 	TransformOpTypeUnset       = oapi.TransformOpTypeUNSET
 	TransformOpTypeInc         = oapi.TransformOpTypeINC
 	TransformOpTypePush        = oapi.TransformOpTypePUSH
+	TransformOpTypeMin         = oapi.TransformOpTypeMIN
 	TransformOpTypeMax         = oapi.TransformOpTypeMAX
 	TransformOpTypeAddToSet    = oapi.TransformOpTypeADDTOSET
 

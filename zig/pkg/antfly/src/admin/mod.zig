@@ -22,7 +22,9 @@ pub const ServerRouter = openapi.ServerRouter;
 pub const ReplicationSlotCreateRequest = openapi.ReplicationSlotCreateRequest;
 pub const BaseBackupStartRequest = openapi.BaseBackupStartRequest;
 pub const BaseBackupManifestPathRequest = openapi.BaseBackupManifestPathRequest;
+pub const SeedArtifactCaptureRequest = openapi.SeedArtifactCaptureRequest;
 pub const StandbyBootstrapRequest = openapi.StandbyBootstrapRequest;
+pub const SeededSlotActivateRequest = openapi.SeededSlotActivateRequest;
 pub const HASyncPolicy = openapi.HASyncPolicy;
 pub const CommitCheckRequest = openapi.CommitCheckRequest;
 pub const CommitAppendRequest = openapi.CommitAppendRequest;
@@ -30,12 +32,14 @@ pub const ReadCheckRequest = openapi.ReadCheckRequest;
 pub const WriteCheckRequest = openapi.WriteCheckRequest;
 pub const OwnerJobCheckRequest = openapi.OwnerJobCheckRequest;
 pub const HAIdentity = openapi.HAIdentity;
+pub const HALeaseWatchdogProof = openapi.HALeaseWatchdogProof;
 pub const FenceAcquireRequest = openapi.FenceAcquireRequest;
 pub const HAFenceReceipt = openapi.HAFenceReceipt;
 pub const PromotionAssessRequest = openapi.PromotionAssessRequest;
 pub const RejoinAssessRequest = openapi.RejoinAssessRequest;
 
 pub const HAPrimaryStatusResponse = openapi.HAPrimaryStatusResponse;
+pub const HAWatchdogProofResponse = openapi.HAWatchdogProofResponse;
 pub const HAStandbyStatusResponse = openapi.HAStandbyStatusResponse;
 pub const HACommitCheckResponse = openapi.HACommitCheckResponse;
 pub const HACommitAppendResponse = openapi.HACommitAppendResponse;
@@ -46,7 +50,12 @@ pub const HAReplicationSlotActionResponse = openapi.HAReplicationSlotActionRespo
 pub const HAReplicationSlotListResponse = openapi.HAReplicationSlotListResponse;
 pub const HABaseBackupBeginResponse = openapi.HABaseBackupBeginResponse;
 pub const HABaseBackupFinishResponse = openapi.HABaseBackupFinishResponse;
+pub const HASeedArtifactCaptureResponse = openapi.HASeedArtifactCaptureResponse;
+pub const HASeedLifecycleReceiptEvent = openapi.HASeedLifecycleReceiptEvent;
+pub const HASeedLifecycleReceiptInventoryResponse = openapi.HASeedLifecycleReceiptInventoryResponse;
+pub const HARuntimeLifecycleObservation = openapi.HARuntimeLifecycleObservation;
 pub const HAStandbyBootstrapResponse = openapi.HAStandbyBootstrapResponse;
+pub const HASeededSlotActivateResponse = openapi.HASeededSlotActivateResponse;
 pub const HAFenceResponse = openapi.HAFenceResponse;
 pub const HACurrentFenceResponse = openapi.HACurrentFenceResponse;
 pub const HAPromotionAssessResponse = openapi.HAPromotionAssessResponse;
@@ -82,6 +91,9 @@ test {
     _ = HARejoinRewindResult;
     _ = HARejoinReseedResult;
     _ = HAActionReceipt;
+    _ = HASeedLifecycleReceiptEvent;
+    _ = HASeedLifecycleReceiptInventoryResponse;
+    _ = HARuntimeLifecycleObservation;
 }
 
 test "admin facade mirrors generated HA OpenAPI contract types" {
@@ -226,6 +238,7 @@ const ha_contract_type_names = [_][]const u8{
     "BaseBackupStartRequest",
     "BaseBackupManifestPathRequest",
     "StandbyBootstrapRequest",
+    "SeededSlotActivateRequest",
     "HASyncPolicy",
     "CommitCheckRequest",
     "CommitAppendRequest",
@@ -238,6 +251,7 @@ const ha_contract_type_names = [_][]const u8{
     "PromotionAssessRequest",
     "RejoinAssessRequest",
     "HAPrimaryStatusResponse",
+    "HAWatchdogProofResponse",
     "HAStandbyStatusResponse",
     "HACommitCheckResponse",
     "HACommitAppendResponse",
@@ -249,6 +263,7 @@ const ha_contract_type_names = [_][]const u8{
     "HABaseBackupBeginResponse",
     "HABaseBackupFinishResponse",
     "HAStandbyBootstrapResponse",
+    "HASeededSlotActivateResponse",
     "HAFenceResponse",
     "HACurrentFenceResponse",
     "HAPromotionAssessResponse",

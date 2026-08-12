@@ -80,8 +80,8 @@ fn readBuildFileAlloc(b: *std.Build, path: []const u8) []const u8 {
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
     const sdk_root = b.sysroot orelse
-        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         b.graph.environ_map.get("SDK_PATH") orelse
+        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         return;
     module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
     module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });

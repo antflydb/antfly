@@ -503,7 +503,13 @@ fn hasCmykComponentIds(info: Info) bool {
 
 fn colorEncodingForStructure(structure: Structure) ?ColorEncoding {
     return switch (structure.info.component_count) {
-        3 => if (structure.info.components[0].id == 1 and structure.info.components[1].id == 2 and structure.info.components[2].id == 3)
+        3 => if (structure.adobe_transform) |transform|
+            switch (transform) {
+                0 => .rgb,
+                1 => .ycbcr,
+                else => null,
+            }
+        else if (structure.info.components[0].id == 1 and structure.info.components[1].id == 2 and structure.info.components[2].id == 3)
             .ycbcr
         else if (structure.info.components[0].id == 'R' and structure.info.components[1].id == 'G' and structure.info.components[2].id == 'B')
             .rgb
@@ -1306,7 +1312,8 @@ fn canPureZigDecodeGrayscaleBaseline(structure: Structure) bool {
     if (structure.info.component_count != 1) return false;
 
     const component = structure.info.components[0];
-    return component.horizontal_sampling == 1 and component.vertical_sampling == 1;
+    if (component.horizontal_sampling == 0 or component.vertical_sampling == 0) return false;
+    return @as(usize, component.horizontal_sampling) * @as(usize, component.vertical_sampling) <= max_component_blocks;
 }
 
 fn canPureZigDecodeColorBaseline(structure: Structure) bool {
@@ -2514,6 +2521,8 @@ fn decodeRgbaPureZigGrayscaleBaseline(
 
     var reader = EntropyBitReader.init(entropy_bytes);
     var dc_predictor: i64 = 0;
+    // A one-component scan is non-interleaved, so each MCU contains one
+    // 8x8 block even when the frame carries non-unit sampling factors.
     const blocks_x = @divFloor(@as(usize, width) + 7, 8);
     const blocks_y = @divFloor(@as(usize, height) + 7, 8);
     const restart_interval = structure.restart_interval orelse 0;
@@ -4777,6 +4786,28 @@ test "decode rgba matches manifest-backed grayscale jpeg fixture" {
     const actual_hex = try test_support.sha256HexAlloc(alloc, decoded.rgba);
     defer alloc.free(actual_hex);
     try std.testing.expectEqualStrings(fixture.pixel_hashes[0], actual_hex);
+}
+
+test "decode grayscale jpeg ignores non-unit frame sampling for a non-interleaved scan" {
+    const alloc = std.testing.allocator;
+    const fixture_bytes = try test_support.readFixtureAlloc(alloc, std.testing.io, "jpeg/baseline/gray-3x2.jpg");
+    defer alloc.free(fixture_bytes);
+
+    const sof = std.mem.indexOf(u8, fixture_bytes, &.{ 0xff, 0xc0 }) orelse return error.MissingImageFixture;
+    const sampling_offset = sof + 11;
+    if (sampling_offset >= fixture_bytes.len) return error.MissingImageFixture;
+    try std.testing.expectEqual(@as(u8, 0x11), fixture_bytes[sampling_offset]);
+    fixture_bytes[sampling_offset] = 0x22;
+
+    const structure = try parseStructure(fixture_bytes);
+    try std.testing.expectEqual(@as(u8, 2), structure.info.components[0].horizontal_sampling);
+    try std.testing.expectEqual(@as(u8, 2), structure.info.components[0].vertical_sampling);
+    try std.testing.expect(canPureZigDecodeGrayscaleBaseline(structure));
+
+    const decoded = try decodeRgba(alloc, fixture_bytes);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(@as(u32, 3), decoded.width);
+    try std.testing.expectEqual(@as(u32, 2), decoded.height);
 }
 
 test "parse structure matches grayscale jpeg tables and scan" {
@@ -8009,4 +8040,25 @@ test "grayscale baseline fixture first block decodes from scan entropy" {
 
     try std.testing.expect(block.coefficients[0] != 0);
     try std.testing.expectEqual(block.coefficients[0], block.dc_predictor);
+}
+
+test "adobe transform classifies zero-based three-component color ids" {
+    const alloc = std.testing.allocator;
+    const manifest = try test_support.loadManifest(alloc, std.testing.io);
+    defer test_support.freeManifest(alloc, manifest);
+    const fixture = test_support.findFixture(manifest, "jpeg/baseline/white-2x1.jpg") orelse return error.MissingImageFixture;
+    const fixture_bytes = try test_support.readFixtureAlloc(alloc, std.testing.io, fixture.path);
+    defer alloc.free(fixture_bytes);
+
+    var structure = try parseStructure(fixture_bytes);
+    structure.info.components[0].id = 0;
+    structure.info.components[1].id = 1;
+    structure.info.components[2].id = 2;
+    structure.adobe_transform = 1;
+    try std.testing.expectEqual(ColorEncoding.ycbcr, colorEncodingForStructure(structure).?);
+    try std.testing.expect(canPureZigDecodeColorBaseline(structure));
+
+    structure.adobe_transform = 0;
+    try std.testing.expectEqual(ColorEncoding.rgb, colorEncodingForStructure(structure).?);
+    try std.testing.expect(canPureZigDecodeColorBaseline(structure));
 }

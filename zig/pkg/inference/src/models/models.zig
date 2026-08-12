@@ -32,6 +32,7 @@ pub const florence = @import("florence.zig");
 pub const clip = @import("clip.zig");
 pub const clap = @import("clap.zig");
 pub const manifest = @import("manifest.zig");
+pub const compatibility = @import("compatibility.zig");
 
 test {
     _ = safetensors;
@@ -47,4 +48,5 @@ test {
     _ = clip;
     _ = clap;
     _ = manifest;
+    _ = compatibility;
 }

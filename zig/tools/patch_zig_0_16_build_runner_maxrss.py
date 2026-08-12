@@ -30,18 +30,29 @@ NEW_WAKE_LOOP = """\
 """
 
 
-def patch_build_runner(source: Path, destination: Path) -> None:
+def patch_build_runner(source: Path, destination: Path) -> str:
     contents = source.read_text(encoding="utf-8")
-    occurrences = contents.count(OLD_WAKE_LOOP)
-    if occurrences != 1:
+    old_occurrences = contents.count(OLD_WAKE_LOOP)
+    new_occurrences = contents.count(NEW_WAKE_LOOP)
+    if old_occurrences == 1 and new_occurrences == 0:
+        patched = contents.replace(OLD_WAKE_LOOP, NEW_WAKE_LOOP)
+        result = "patched"
+    elif old_occurrences == 0 and new_occurrences == 1:
+        # Accept an upstream runner that already contains the corrected
+        # accounting. Keeping a copied runner makes the CI/release CLI stable
+        # across the transition to a fixed Zig toolchain.
+        patched = contents
+        result = "already-fixed"
+    else:
         raise RuntimeError(
-            "expected exactly one Zig 0.16 max_rss wake loop in "
-            f"{source}, found {occurrences}; do not apply this backport to an "
-            "unknown or already-fixed Zig build runner"
+            "expected exactly one known max_rss wake loop in "
+            f"{source}, found old={old_occurrences} fixed={new_occurrences}; "
+            "do not apply this backport to an unknown Zig build runner"
         )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(contents.replace(OLD_WAKE_LOOP, NEW_WAKE_LOOP), encoding="utf-8")
+    destination.write_text(patched, encoding="utf-8")
+    return result
 
 
 def main() -> None:

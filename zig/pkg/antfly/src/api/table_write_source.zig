@@ -26,6 +26,7 @@ const table_create_contract = @import("table_create_contract.zig");
 const backup_contract = @import("backup_contract.zig");
 const distributed_txn = @import("distributed_txn_contract.zig");
 const runtime_status = @import("runtime_status.zig");
+const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 
 pub const LocalStructuralReconcileState = enum {
     complete,
@@ -52,6 +53,7 @@ pub const LocalStructuralReconcileResult = struct {
 pub const TableWriteSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         create_table: ?*const fn (
@@ -423,6 +425,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
         ) anyerror!?void = null,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn batch(
         self: TableWriteSource,
@@ -430,12 +433,12 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
     ) !?void {
-        return try self.vtable.batch(self.ptr, alloc, table_name, req);
+        return try BoundaryAbi.call("batch", self.boundary_dispatch, self.vtable.batch, .{ self.ptr, alloc, table_name, req });
     }
 
     pub fn beginBulkIngest(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8) !?void {
         const fn_ptr = self.vtable.begin_bulk_ingest orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name);
+        return try BoundaryAbi.call("begin_bulk_ingest", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
     }
 
     pub fn finishBulkIngest(
@@ -445,7 +448,7 @@ pub const TableWriteSource = struct {
         options: backend_types.BulkIngestFinishOptions,
     ) !?void {
         const fn_ptr = self.vtable.finish_bulk_ingest orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, options);
+        return try BoundaryAbi.call("finish_bulk_ingest", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, options });
     }
 
     pub fn abortBulkIngest(self: TableWriteSource, table_name: []const u8) void {
@@ -459,7 +462,7 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.begin_bulk_ingest_group_local orelse return null;
-        return try fn_ptr(self.ptr, group_id, table_name);
+        return try BoundaryAbi.call("begin_bulk_ingest_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name });
     }
 
     pub fn finishBulkIngestGroupLocal(
@@ -469,7 +472,7 @@ pub const TableWriteSource = struct {
         options: backend_types.BulkIngestFinishOptions,
     ) !?void {
         const fn_ptr = self.vtable.finish_bulk_ingest_group_local orelse return null;
-        return try fn_ptr(self.ptr, group_id, table_name, options);
+        return try BoundaryAbi.call("finish_bulk_ingest_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, options });
     }
 
     pub fn abortBulkIngestGroupLocal(
@@ -488,7 +491,7 @@ pub const TableWriteSource = struct {
         req: table_create_contract.CreateTableRequest,
     ) !?void {
         const fn_ptr = self.vtable.create_table orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, req);
+        return try BoundaryAbi.call("create_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, req });
     }
 
     pub fn updateSchema(
@@ -498,7 +501,7 @@ pub const TableWriteSource = struct {
         schema_json: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.update_schema orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, schema_json);
+        return try BoundaryAbi.call("update_schema", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, schema_json });
     }
 
     pub fn createIndex(
@@ -509,7 +512,7 @@ pub const TableWriteSource = struct {
         index_json: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.create_index orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, index_name, index_json);
+        return try BoundaryAbi.call("create_index", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name, index_json });
     }
 
     pub fn putArtifactEnrichment(
@@ -520,7 +523,7 @@ pub const TableWriteSource = struct {
         enrichment_json: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.put_artifact_enrichment orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, artifact_name, enrichment_json);
+        return try BoundaryAbi.call("put_artifact_enrichment", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, artifact_name, enrichment_json });
     }
 
     pub fn deleteArtifactEnrichment(
@@ -530,7 +533,7 @@ pub const TableWriteSource = struct {
         artifact_name: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.delete_artifact_enrichment orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, artifact_name);
+        return try BoundaryAbi.call("delete_artifact_enrichment", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, artifact_name });
     }
 
     pub fn dropIndex(
@@ -540,7 +543,7 @@ pub const TableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.drop_index orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, index_name);
+        return try BoundaryAbi.call("drop_index", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name });
     }
 
     pub fn dropTable(
@@ -550,7 +553,7 @@ pub const TableWriteSource = struct {
         group_ids: []const u64,
     ) !?void {
         const fn_ptr = self.vtable.drop_table orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, group_ids);
+        return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, group_ids });
     }
 
     pub fn backupTable(
@@ -560,7 +563,9 @@ pub const TableWriteSource = struct {
         plan: backup_contract.TableBackupPlan,
     ) !?[]backup_contract.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, plan);
+        var owner_plan = plan;
+        if (self.boundary_dispatch != BoundaryAbi.local_dispatch) owner_plan.io = null;
+        return try BoundaryAbi.call("backup_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, owner_plan });
     }
 
     pub fn backupTableGroupLocal(
@@ -571,7 +576,9 @@ pub const TableWriteSource = struct {
         plan: backup_contract.TableBackupPlan,
     ) !?[]backup_contract.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, plan);
+        var owner_plan = plan;
+        if (self.boundary_dispatch != BoundaryAbi.local_dispatch) owner_plan.io = null;
+        return try BoundaryAbi.call("backup_table_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, owner_plan });
     }
 
     pub fn backupTableToLocation(
@@ -585,7 +592,7 @@ pub const TableWriteSource = struct {
         location: *anyopaque,
     ) !?[]backup_contract.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table_to_location orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, location_uri, connection, location);
+        return try BoundaryAbi.call("backup_table_to_location", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, backup_id, format, location_uri, connection, location });
     }
 
     pub fn restoreTable(
@@ -610,12 +617,17 @@ pub const TableWriteSource = struct {
         plan: backup_contract.TableRestorePlan,
     ) !?void {
         const fn_ptr = self.vtable.restore_table orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, plan);
+        var owner_plan = plan;
+        // Restore materialization performs all I/O in the storage runtime that
+        // owns the callback. Do not pass the API archive's std.Io vtable across
+        // this boundary.
+        if (self.boundary_dispatch != BoundaryAbi.local_dispatch) owner_plan.io = null;
+        return try BoundaryAbi.call("restore_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, owner_plan });
     }
 
     pub fn beginRestoreLifecycle(self: TableWriteSource, table_name: []const u8) !bool {
         const fn_ptr = self.vtable.begin_restore_lifecycle orelse return false;
-        try fn_ptr(self.ptr, table_name);
+        try BoundaryAbi.call("begin_restore_lifecycle", self.boundary_dispatch, fn_ptr, .{ self.ptr, table_name });
         return true;
     }
 
@@ -631,7 +643,7 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
         const fn_ptr = self.vtable.commit_transaction orelse return null;
-        return try fn_ptr(self.ptr, alloc, tables, sync_level);
+        return try BoundaryAbi.call("commit_transaction", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level });
     }
 
     pub fn commitBatch(
@@ -641,7 +653,7 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
         const fn_ptr = self.vtable.commit_batch orelse self.vtable.commit_transaction orelse return null;
-        return try fn_ptr(self.ptr, alloc, tables, sync_level);
+        return try BoundaryAbi.call("commit_batch", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level });
     }
 
     pub fn commitTransactionWithId(
@@ -653,7 +665,7 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
         const fn_ptr = self.vtable.commit_transaction_with_id orelse return null;
-        return try fn_ptr(self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level);
+        return try BoundaryAbi.call("commit_transaction_with_id", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level });
     }
 
     pub fn acknowledgeTransactionCommit(
@@ -664,7 +676,7 @@ pub const TableWriteSource = struct {
         coordinator_table_name: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.acknowledge_transaction_commit orelse return null;
-        return try fn_ptr(self.ptr, alloc, txn_id, coordinator_group_id, coordinator_table_name);
+        return try BoundaryAbi.call("acknowledge_transaction_commit", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, coordinator_group_id, coordinator_table_name });
     }
 
     pub fn batchGroupLocal(
@@ -675,7 +687,7 @@ pub const TableWriteSource = struct {
         req: db_mod.types.BatchRequest,
     ) !?void {
         const fn_ptr = self.vtable.batch_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req);
+        return try BoundaryAbi.call("batch_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req });
     }
 
     pub fn txnBeginGroupLocal(
@@ -690,7 +702,7 @@ pub const TableWriteSource = struct {
         participants: []const []const u8,
     ) !?void {
         const fn_ptr = self.vtable.txn_begin_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants);
+        return try BoundaryAbi.call("txn_begin_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants });
     }
 
     pub fn txnPrepareGroupLocal(
@@ -703,7 +715,7 @@ pub const TableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
         const fn_ptr = self.vtable.txn_prepare_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, topology_epoch, req);
+        return try BoundaryAbi.call("txn_prepare_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, topology_epoch, req });
     }
 
     pub fn txnResolveGroupLocal(
@@ -718,7 +730,7 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
     ) !?void {
         const fn_ptr = self.vtable.txn_resolve_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
+        return try BoundaryAbi.call("txn_resolve_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level });
     }
 
     pub fn txnStatusGroupLocal(
@@ -729,7 +741,7 @@ pub const TableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
     ) !?db_mod.types.TxnStatus {
         const fn_ptr = self.vtable.txn_status_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id);
+        return try BoundaryAbi.call("txn_status_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id });
     }
 
     pub fn txnAcknowledgeGroupLocal(
@@ -741,7 +753,7 @@ pub const TableWriteSource = struct {
         participant: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.txn_acknowledge_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, participant);
+        return try BoundaryAbi.call("txn_acknowledge_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, participant });
     }
 
     pub fn corruptEmbeddingArtifact(
@@ -752,7 +764,7 @@ pub const TableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.corrupt_embedding_artifact orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, doc_key, index_name);
+        return try BoundaryAbi.call("corrupt_embedding_artifact", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, doc_key, index_name });
     }
 
     pub fn corruptEmbeddingArtifactGroupLocal(
@@ -764,7 +776,7 @@ pub const TableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.corrupt_embedding_artifact_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, index_name);
+        return try BoundaryAbi.call("corrupt_embedding_artifact_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, doc_key, index_name });
     }
 
     pub fn reprocessDocumentArtifact(
@@ -775,7 +787,7 @@ pub const TableWriteSource = struct {
         artifact_name: []const u8,
     ) !?bool {
         const fn_ptr = self.vtable.reprocess_document_artifact orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name);
+        return try BoundaryAbi.call("reprocess_document_artifact", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, doc_key, artifact_name });
     }
 
     pub fn reprocessDocumentArtifactGroupLocal(
@@ -787,7 +799,7 @@ pub const TableWriteSource = struct {
         artifact_name: []const u8,
     ) !?bool {
         const fn_ptr = self.vtable.reprocess_document_artifact_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name);
+        return try BoundaryAbi.call("reprocess_document_artifact_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, doc_key, artifact_name });
     }
 
     pub fn reprocessDocumentArtifactRange(
@@ -798,7 +810,7 @@ pub const TableWriteSource = struct {
         req: db_mod.types.DocumentArtifactTableReprocessRequest,
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const fn_ptr = self.vtable.reprocess_document_artifact_range orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, artifact_name, req);
+        return try BoundaryAbi.call("reprocess_document_artifact_range", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, artifact_name, req });
     }
 
     pub fn listArtifactRepairIssues(
@@ -808,7 +820,7 @@ pub const TableWriteSource = struct {
         req: db_mod.types.ArtifactRepairListRequest,
     ) !?db_mod.types.ArtifactRepairListResult {
         const fn_ptr = self.vtable.list_artifact_repair_issues orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, req);
+        return try BoundaryAbi.call("list_artifact_repair_issues", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, req });
     }
 
     pub fn repairArtifactIssues(
@@ -818,7 +830,7 @@ pub const TableWriteSource = struct {
         req: db_mod.types.ArtifactRepairRunRequest,
     ) !?db_mod.types.ArtifactRepairResult {
         const fn_ptr = self.vtable.repair_artifact_issues orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, req);
+        return try BoundaryAbi.call("repair_artifact_issues", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, req });
     }
 
     pub fn repairArtifactIssuesControlled(
@@ -832,7 +844,7 @@ pub const TableWriteSource = struct {
             if (options.cancelled()) return error.Canceled;
             return try self.repairArtifactIssues(alloc, table_name, req);
         };
-        return try fn_ptr(self.ptr, alloc, table_name, req, options);
+        return try BoundaryAbi.call("repair_artifact_issues_controlled", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, req, options });
     }
 
     pub fn listArtifactRepairIssuesGroupLocal(
@@ -843,7 +855,7 @@ pub const TableWriteSource = struct {
         req: db_mod.types.ArtifactRepairListRequest,
     ) !?db_mod.types.ArtifactRepairListResult {
         const fn_ptr = self.vtable.list_artifact_repair_issues_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req);
+        return try BoundaryAbi.call("list_artifact_repair_issues_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req });
     }
 
     pub fn repairArtifactIssuesGroupLocal(
@@ -854,7 +866,7 @@ pub const TableWriteSource = struct {
         req: db_mod.types.ArtifactRepairRunRequest,
     ) !?db_mod.types.ArtifactRepairResult {
         const fn_ptr = self.vtable.repair_artifact_issues_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req);
+        return try BoundaryAbi.call("repair_artifact_issues_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req });
     }
 
     pub fn repairArtifactIssuesGroupLocalControlled(
@@ -869,7 +881,7 @@ pub const TableWriteSource = struct {
             if (options.cancelled()) return error.Canceled;
             return try self.repairArtifactIssuesGroupLocal(alloc, group_id, table_name, req);
         };
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, options);
+        return try BoundaryAbi.call("repair_artifact_issues_group_local_controlled", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, options });
     }
 
     pub fn updateDocumentArtifactChildRangePlacement(
@@ -881,7 +893,7 @@ pub const TableWriteSource = struct {
         update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
     ) !?bool {
         const fn_ptr = self.vtable.update_document_artifact_child_range_placement orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name, update);
+        return try BoundaryAbi.call("update_document_artifact_child_range_placement", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, doc_key, artifact_name, update });
     }
 
     pub fn applyDocumentArtifactChildRangeBatch(
@@ -894,7 +906,7 @@ pub const TableWriteSource = struct {
         child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
     ) !?u64 {
         const fn_ptr = self.vtable.apply_document_artifact_child_range_batch orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
+        return try BoundaryAbi.call("apply_document_artifact_child_range_batch", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch });
     }
 
     pub fn reprocessDocumentArtifactRangeGroupLocal(
@@ -906,7 +918,7 @@ pub const TableWriteSource = struct {
         req: db_mod.types.DocumentArtifactTableReprocessRequest,
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const fn_ptr = self.vtable.reprocess_document_artifact_range_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, artifact_name, req);
+        return try BoundaryAbi.call("reprocess_document_artifact_range_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, artifact_name, req });
     }
 
     pub fn updateDocumentArtifactChildRangePlacementGroupLocal(
@@ -919,7 +931,7 @@ pub const TableWriteSource = struct {
         update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
     ) !?bool {
         const fn_ptr = self.vtable.update_document_artifact_child_range_placement_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, update);
+        return try BoundaryAbi.call("update_document_artifact_child_range_placement_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, doc_key, artifact_name, update });
     }
 
     pub fn applyDocumentArtifactChildRangeBatchGroupLocal(
@@ -932,7 +944,7 @@ pub const TableWriteSource = struct {
         child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
     ) !?u64 {
         const fn_ptr = self.vtable.apply_document_artifact_child_range_batch_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
+        return try BoundaryAbi.call("apply_document_artifact_child_range_batch_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch });
     }
 
     pub fn localRuntimeStatuses(
@@ -941,7 +953,7 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const fn_ptr = self.vtable.local_runtime_statuses orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name);
+        return try BoundaryAbi.call("local_runtime_statuses", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
     }
 
     pub fn textMemoryAttributionStatsBestEffort(
@@ -957,7 +969,7 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.request_table_structural_reconcile orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name);
+        return try BoundaryAbi.call("request_table_structural_reconcile", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
     }
 
     pub fn preflightWriteAdmissionGroupLocal(
@@ -966,7 +978,7 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.preflight_write_admission_group_local orelse return null;
-        return try fn_ptr(self.ptr, group_id, table_name);
+        return try BoundaryAbi.call("preflight_write_admission_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name });
     }
 
     pub fn findMedianKeyGroupLocal(
@@ -976,7 +988,7 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
     ) !?[]u8 {
         const fn_ptr = self.vtable.find_median_key_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name);
+        return try BoundaryAbi.call("find_median_key_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name });
     }
 
     pub fn requestTableIndexStructuralReconcile(
@@ -986,7 +998,7 @@ pub const TableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.request_table_index_structural_reconcile orelse return try self.requestTableStructuralReconcile(alloc, table_name);
-        return try fn_ptr(self.ptr, alloc, table_name, index_name);
+        return try BoundaryAbi.call("request_table_index_structural_reconcile", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name });
     }
 
     pub fn reconcileTableGroupLocal(
@@ -997,7 +1009,7 @@ pub const TableWriteSource = struct {
         advance_index_repair: bool,
     ) !?LocalStructuralReconcileResult {
         const fn_ptr = self.vtable.reconcile_table_group_local orelse return null;
-        return try fn_ptr(self.ptr, group_id, table_name, target_index_name, advance_index_repair);
+        return try BoundaryAbi.call("reconcile_table_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, target_index_name, advance_index_repair });
     }
 
     /// Reconcile through a resident owner when one already exists, but do not
@@ -1016,7 +1028,7 @@ pub const TableWriteSource = struct {
                 target_index_name,
                 advance_index_repair,
             );
-        return try fn_ptr(self.ptr, group_id, table_name, target_index_name, advance_index_repair);
+        return try BoundaryAbi.call("reconcile_table_group_local_transient", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, target_index_name, advance_index_repair });
     }
 
     pub fn retireTableGroupLocal(
@@ -1025,6 +1037,6 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
     ) !?void {
         const fn_ptr = self.vtable.retire_table_group_local orelse return null;
-        return try fn_ptr(self.ptr, group_id, table_name);
+        return try BoundaryAbi.call("retire_table_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name });
     }
 };

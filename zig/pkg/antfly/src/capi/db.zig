@@ -6006,18 +6006,18 @@ fn restorePortableBackupToLiteFile(
     if (backup.len == 0) return error.InvalidArgument;
     try portable_backup.validatePortable(alloc, backup);
 
-    const dest_exists = liteCapiPathExists(io, dest_path);
+    const dest_exists = capiPathExists(io, dest_path);
     if (dest_exists and !replace) return error.PathAlreadyExists;
 
     var dest_lock = try antfly.lite.native.lockWriterPath(alloc, dest_path);
     defer dest_lock.close();
 
-    if (!dest_exists and !replace and liteCapiPathExists(io, dest_path)) return error.PathAlreadyExists;
+    if (!dest_exists and !replace and capiPathExists(io, dest_path)) return error.PathAlreadyExists;
 
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.restore-tmp.aflite", .{dest_path});
     defer alloc.free(tmp_path);
-    try liteCapiDeleteFileIfExists(io, tmp_path);
-    errdefer liteCapiDeleteFilePath(io, tmp_path) catch {};
+    try capiDeleteFileIfExists(io, tmp_path);
+    errdefer capiDeleteFilePath(io, tmp_path) catch {};
 
     {
         var backend = try lite_backend.Handle.create(alloc, tmp_path, true);
@@ -6034,13 +6034,13 @@ fn restorePortableBackupToLiteFile(
         try lite_restore_staging.importPortableIntoLiteDb(alloc, &db, backup);
     }
 
-    liteCapiRenameFilePath(io, tmp_path, dest_path) catch |err| {
-        liteCapiDeleteFilePath(io, tmp_path) catch {};
+    capiRenameFilePath(io, tmp_path, dest_path) catch |err| {
+        capiDeleteFilePath(io, tmp_path) catch {};
         return err;
     };
 }
 
-fn liteCapiPathExists(io: std.Io, path: []const u8) bool {
+fn capiPathExists(io: std.Io, path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
         std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
     } else {
@@ -6049,14 +6049,14 @@ fn liteCapiPathExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-fn liteCapiDeleteFileIfExists(io: std.Io, path: []const u8) !void {
-    liteCapiDeleteFilePath(io, path) catch |err| switch (err) {
+fn capiDeleteFileIfExists(io: std.Io, path: []const u8) !void {
+    capiDeleteFilePath(io, path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
 }
 
-fn liteCapiRenameFilePath(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
+fn capiRenameFilePath(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
     if (std.fs.path.isAbsolute(old_path) or std.fs.path.isAbsolute(new_path)) {
         try std.Io.Dir.renameAbsolute(old_path, new_path, io);
     } else {
@@ -6064,7 +6064,7 @@ fn liteCapiRenameFilePath(io: std.Io, old_path: []const u8, new_path: []const u8
     }
 }
 
-fn liteCapiDeleteFilePath(io: std.Io, path: []const u8) !void {
+fn capiDeleteFilePath(io: std.Io, path: []const u8) !void {
     if (std.fs.path.isAbsolute(path)) {
         try std.Io.Dir.deleteFileAbsolute(io, path);
     } else {
@@ -11235,8 +11235,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     {
         var io_impl = std.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
-        try std.testing.expect(!liteCapiPathExists(io_impl.io(), locked_restore_path));
-        try std.testing.expect(!liteCapiPathExists(io_impl.io(), locked_restore_tmp_path));
+        try std.testing.expect(!capiPathExists(io_impl.io(), locked_restore_path));
+        try std.testing.expect(!capiPathExists(io_impl.io(), locked_restore_tmp_path));
     }
 
     var restore_existing: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
@@ -11257,7 +11257,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     {
         var io_impl = std.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
-        try std.testing.expect(!liteCapiPathExists(io_impl.io(), restore_malformed_path));
+        try std.testing.expect(!capiPathExists(io_impl.io(), restore_malformed_path));
     }
 
     var readonly_handle: ?*anyopaque = null;

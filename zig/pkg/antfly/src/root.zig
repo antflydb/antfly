@@ -171,6 +171,11 @@ pub const schema = @import("storage/schema.zig");
 pub const db = @import("storage/db/mod.zig");
 
 test {
+    // Storage shard builds compile this authoritative discovery root and then
+    // select disjoint test-name prefixes. Keep it unconditional in test mode:
+    // an unimported test file must fail the pre-build audit, never disappear.
+    _ = @import("storage/test_manifest.zig");
+
     if (comptime build_options.standalone_runtime_focused_test) {
         _ = standalone;
         return;

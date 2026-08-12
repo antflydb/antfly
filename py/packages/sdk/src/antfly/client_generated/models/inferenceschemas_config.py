@@ -15,12 +15,13 @@ T = TypeVar("T", bound="InferenceschemasConfig")
 
 @_attrs_define
 class InferenceschemasConfig:
-    """Logging configuration for inference services
+    """Legacy inference-local logging configuration. The current unified Zig runtime ignores it; configure the top-level
+    `log` object instead.
 
-    Attributes:
-        level (InferenceLevel | Unset): Logging verbosity level Example: info.
-        style (InferenceStyle | Unset): Logging output format style. 'terminal' for colorized console, 'json' for
-            structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent. Example: terminal.
+        Attributes:
+            level (InferenceLevel | Unset): Logging verbosity level Example: info.
+            style (InferenceStyle | Unset): Logging output format style. 'terminal' for colorized console, 'json' for
+                structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent. Example: terminal.
     """
 
     level: InferenceLevel | Unset = UNSET

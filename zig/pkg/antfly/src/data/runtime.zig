@@ -65,6 +65,7 @@ const process_memory_mod = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const raft_engine = @import("raft_engine");
+const thread_config = @import("../runtime_thread_config.zig");
 
 fn seedControlOnlyStorageOwnerForTest(
     path: []const u8,
@@ -119,7 +120,7 @@ else
     antfly.data.storage.raft_apply_store.SplitHandoffMetadata;
 
 const health_metrics = antfly.common.health_server;
-const setup_io_thread_stack_size = 1 * 1024 * 1024;
+const setup_io_thread_stack_size = thread_config.minimum_partitioned_stack_size;
 const local_group_status_cache_ttl_ms: u64 = 60 * std.time.ms_per_s;
 const store_status_report_interval_ticks: usize = 40;
 const store_status_heartbeat_interval_ms: u64 = 30 * std.time.ms_per_s;
@@ -2726,12 +2727,169 @@ pub const DataServerHAConfig = struct {
     admin_context: ?antfly.ha.admin_exec.Context = null,
     standby_owner: ?*?antfly.ha.standby.Standby = null,
     admin_bearer_token: ?[]const u8 = null,
+    /// Durable primary-local root for immutable runtime-owned seed generations.
+    /// The admin API never accepts caller-selected source or destination paths.
+    seed_capture_root: ?[]const u8 = null,
+    /// Durable activated-generation root used to expose standby activation
+    /// lifecycle receipts through the authenticated admin inventory.
+    seed_activation_root: ?[]const u8 = null,
+    /// Kubernetes pod identity attached to durable lifecycle evidence.
+    pod_uid: ?[]const u8 = null,
+    /// Runtime-originated evidence that this exact process is actively
+    /// enforcing the shared Kubernetes Lease authority.
+    lease_watchdog_proof: ?antfly.ha.http_admin.Server.AuthOptions.LeaseWatchdogProofSource = null,
+    /// Runtime-owned durable authorization written only after a successful
+    /// former-primary rewind on this exact data volume.
+    repair_receipt: ?antfly.ha.http_admin.Server.AuthOptions.RepairReceiptSink = null,
+    /// Optional storage-specific producer for an immutable logical snapshot.
+    /// DataServer still validates and packages the result; providers cannot
+    /// select the published generation root or bypass the mutation barrier.
+    seed_snapshot_provider: ?HASeedSnapshotProvider = null,
     internal_primary: ?*antfly.ha.primary.Primary = null,
     primary_retention_policy: antfly.ha.slot_store.RetentionPolicy = .{},
     primary_sync_policy: antfly.ha.primary.SyncPolicy = .{},
     primary_sync_wait: HASyncWaitConfig = .{},
     standby_replication: ?HAStandbyReplicationConfig = null,
 };
+
+pub const HASeedSnapshotRequest = struct {
+    capture_root: []const u8,
+    generation: []const u8,
+    auth_artifact_json: ?[]const u8 = null,
+};
+
+pub const HASeedPreparedSnapshot = struct {
+    root: []u8,
+
+    pub fn deinit(self: *HASeedPreparedSnapshot, alloc: std.mem.Allocator) void {
+        alloc.free(self.root);
+        self.* = undefined;
+    }
+};
+
+pub const HASeedSnapshotProvider = struct {
+    ptr: *anyopaque,
+    prepare_fn: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: HASeedSnapshotRequest,
+    ) anyerror!HASeedPreparedSnapshot,
+
+    pub fn prepare(
+        self: HASeedSnapshotProvider,
+        alloc: std.mem.Allocator,
+        request: HASeedSnapshotRequest,
+    ) !HASeedPreparedSnapshot {
+        return try self.prepare_fn(self.ptr, alloc, request);
+    }
+};
+
+const ha_seed_snapshot_format_version = antfly.ha.seed_materialization.topology_format_version;
+const ha_seed_snapshot_topology_name = antfly.ha.seed_materialization.topology_name;
+const ha_seed_snapshot_max_topology_bytes = 16 * 1024 * 1024;
+const ha_seed_snapshot_max_store_bytes: u64 = 64 * 1024 * 1024 * 1024;
+
+const HASeedSnapshotTopologyReplica = antfly.ha.seed_materialization.ReplicaSnapshot;
+const HASeedSnapshotExtensionArtifact = antfly.ha.seed_materialization.ExtensionArtifact;
+const HASeedSnapshotAuthArtifact = antfly.ha.seed_materialization.AuthArtifact;
+const HASeedSnapshotTopology = antfly.ha.seed_materialization.Topology;
+
+const HASeedExtensionCaptureProbe = struct {
+    ptr: *anyopaque,
+    after_copy_fn: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!void,
+
+    fn afterCopy(self: @This(), alloc: std.mem.Allocator) !void {
+        try self.after_copy_fn(self.ptr, alloc);
+    }
+};
+
+fn freeHASeedSnapshotExtensionArtifacts(
+    alloc: std.mem.Allocator,
+    artifacts: *std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact),
+) void {
+    for (artifacts.items) |artifact| {
+        alloc.free(artifact.path);
+        alloc.free(artifact.sha256);
+    }
+    artifacts.deinit(alloc);
+}
+
+fn haSeedSnapshotFileSha256HexAlloc(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) ![]u8 {
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+    if (stat.kind != .file) return error.HASeedSnapshotUnexpectedArtifact;
+    if (stat.size > ha_seed_snapshot_max_store_bytes) return error.HASeedSnapshotStoreTooLarge;
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var total: u64 = 0;
+    while (true) {
+        const read = try reader.interface.readSliceShort(&buffer);
+        if (read == 0) break;
+        total = try std.math.add(u64, total, read);
+        if (total > ha_seed_snapshot_max_store_bytes) return error.HASeedSnapshotStoreTooLarge;
+        hasher.update(buffer[0..read]);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const encoded = try alloc.alloc(u8, digest.len * 2);
+    for (digest, 0..) |byte, index| {
+        encoded[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        encoded[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return encoded;
+}
+
+fn validLowerSha256(value: []const u8) bool {
+    if (value.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return false;
+    for (value) |byte| {
+        if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return false;
+    }
+    return true;
+}
+
+fn haSeedPackageManifestsEqual(
+    alloc: std.mem.Allocator,
+    left: antfly.extensions.PackageManifest,
+    right: antfly.extensions.PackageManifest,
+) !bool {
+    const left_json = try std.json.Stringify.valueAlloc(alloc, left, .{});
+    defer alloc.free(left_json);
+    const right_json = try std.json.Stringify.valueAlloc(alloc, right, .{});
+    defer alloc.free(right_json);
+    return std.mem.eql(u8, left_json, right_json);
+}
+
+fn haSeedExtensionEntryForPath(
+    path: []const u8,
+    entries: []const antfly.extensions.PackageStoreEntry,
+) !usize {
+    var found: ?usize = null;
+    for (entries, 0..) |entry, index| {
+        if (!antfly.ha.validation.isAbsoluteNormalizedPathWithinRoot(path, entry.package_root_path)) continue;
+        if (found != null) return error.HASeedExtensionOverlappingPackageRoots;
+        found = index;
+    }
+    return found orelse error.HASeedExtensionUnexpectedArtifact;
+}
+
+fn haSeedExtensionArtifactDirectory(
+    artifacts: []const HASeedSnapshotExtensionArtifact,
+    path: []const u8,
+) bool {
+    for (artifacts) |artifact| {
+        if (artifact.path.len > path.len and
+            std.mem.startsWith(u8, artifact.path, path) and
+            artifact.path[path.len] == std.fs.path.sep)
+            return true;
+    }
+    return false;
+}
 
 pub const HASyncWaitConfig = struct {
     max_rounds: usize = 200,
@@ -2752,6 +2910,10 @@ fn haPrimarySyncWaitFromConfig(cfg: HASyncWaitConfig) antfly.db.HAPrimaryProgres
 pub const HAStandbyReplicationConfig = struct {
     upstream_base_uri: []const u8,
     slot_name: []const u8,
+    /// Authentication authority for the upstream internal HA endpoints.
+    /// Standalone wires this from the same env-backed secret used by its
+    /// authenticated HA admin listener; it is never accepted on argv.
+    bearer_token: ?[]const u8 = null,
     standby_log_path: ?[]const u8 = null,
     standby_progress_path: ?[]const u8 = null,
     options: HAStandbyReplicationOptions = .{},
@@ -2770,6 +2932,7 @@ const HAStandbyReplicationErrorCode = enum(u8) {
     ConnectionRefused,
     BrokenPipe,
     EndOfStream,
+    NoAddressReturned,
     InvalidInternalReplicationRequest,
     InternalReplicationEndpointNotFound,
     UnsupportedOperation,
@@ -2815,6 +2978,7 @@ fn haStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
         error.ConnectionRefused => .ConnectionRefused,
         error.BrokenPipe => .BrokenPipe,
         error.EndOfStream => .EndOfStream,
+        error.NoAddressReturned => .NoAddressReturned,
         error.InvalidInternalReplicationRequest => .InvalidInternalReplicationRequest,
         error.InternalReplicationEndpointNotFound => .InternalReplicationEndpointNotFound,
         error.UnsupportedOperation => .UnsupportedOperation,
@@ -2862,6 +3026,7 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
         .ConnectionRefused => "ConnectionRefused",
         .BrokenPipe => "BrokenPipe",
         .EndOfStream => "EndOfStream",
+        .NoAddressReturned => "NoAddressReturned",
         .InvalidInternalReplicationRequest => "InvalidInternalReplicationRequest",
         .InternalReplicationEndpointNotFound => "InternalReplicationEndpointNotFound",
         .UnsupportedOperation => "UnsupportedOperation",
@@ -2911,13 +3076,17 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
         error.HAPromotedPrimarySlotsMissing,
         error.HAStandbyOwnershipRequired,
         error.HAStandbyOwnerMismatch,
+        error.HAStandbyStateChanged,
         error.PromotedLogMismatch,
         error.PromotedProgressMismatch,
+        error.LsmRootWriterAlreadyOpen,
+        error.WriterLocked,
         error.InvalidPromotionHandoff,
         error.MissingPromotionSwitch,
         error.HttpConnectionClosing,
         error.ConnectionResetByPeer,
         error.ConnectionRefused,
+        error.NoAddressReturned,
         error.BrokenPipe,
         error.EndOfStream,
         // Upstream route/resource availability and protocol negotiation are
@@ -3018,6 +3187,11 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         error.ProposalDropped,
         error.LeaderTransferInProgress,
         error.StoreRegistrationNotVisible,
+        // Metadata listeners can accept connections before their first
+        // authoritative incarnation has been established. Data nodes that
+        // start in that window must retry; an actual incarnation mismatch or
+        // invalid incarnation remains fatal.
+        error.MetadataIncarnationUnavailable,
         // Destination admission intentionally fails closed while another
         // table/group lifecycle owner is active. Retrying through the bounded
         // control-plane backoff preserves that exclusion without terminating
@@ -3070,9 +3244,11 @@ test "data runtime treats metadata leadership churn as retryable bootstrap failu
     try std.testing.expect(isRetryableMetadataBootstrapError(error.LeaderTransferInProgress));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionRefused));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.StoreRegistrationNotVisible));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataIncarnationUnavailable));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MissingAuthoritativeBootstrapVoters));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.TransitionDestinationProvisioningBusy));
     try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidArguments));
+    try std.testing.expect(!isRetryableMetadataBootstrapError(error.MetadataIncarnationMismatch));
 }
 
 test "replicated transition action lanes fail fast without serializing unrelated groups" {
@@ -4018,6 +4194,7 @@ pub const DataServer = struct {
     borrowed_storage_kernel_context: ?*anyopaque = null,
     read_source: antfly.public_api.ProvisionedTableReadSource,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
+    replica_catalog_path: ?[]const u8 = null,
     /// Long-lived backing for the cross-shard entity-resolution candidate
     /// source; its `CandidateSource` vtable points into this field, so it must
     /// not move. Wraps `read_source.source()` and is handed to the write
@@ -4033,6 +4210,10 @@ pub const DataServer = struct {
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     ha_cfg: DataServerHAConfig = .{},
     ha_state_mutex: std.atomic.Mutex = .unlocked,
+    /// Global primary mutation/capture ordering point. All DB/catalog writers
+    /// share this instance through their HA mirror configuration.
+    ha_mutation_barrier: antfly.db.HAMutationBarrier = .{},
+    ha_seed_capture_active: std.atomic.Value(bool) = .init(false),
     ha_public_gate_state: antfly.ha.public_gate_state.State = .{},
     ha_admin_server: ?antfly.ha.http_admin.Server = null,
     ha_internal_server: ?antfly.ha.http_internal.Server = null,
@@ -4050,6 +4231,7 @@ pub const DataServer = struct {
     ha_standby_replication_last_error: std.atomic.Value(u8) = .init(@intFromEnum(HAStandbyReplicationErrorCode.none)),
     ha_standby_replication_last_attempt_ns: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_last_success_ns: std.atomic.Value(u64) = .init(0),
+    ha_standby_replication_next_attempt_ns: std.atomic.Value(u64) = .init(0),
     query_async_limit: std.Io.Limit,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -4083,6 +4265,15 @@ pub const DataServer = struct {
     const dense_posting_maintenance_retry_interval_ns = 1 * std.time.ns_per_s;
     const ha_replication_default_max_records_per_apply = 256;
     const ha_replication_default_max_encoded_bytes_per_apply = 4 * 1024 * 1024;
+    const ha_replication_default_max_response_bytes = 8 * 1024 * 1024;
+    const ha_standby_replication_retry_interval_ns = 1 * std.time.ns_per_s;
+
+    fn haStandbyReplicationHTTPExecutorConfig() antfly.common.http.StdHttpExecutorConfig {
+        return .{
+            .max_response_bytes = ha_replication_default_max_response_bytes,
+            .resolve_before_connect = true,
+        };
+    }
 
     const ProvisionedWarmupStats = struct {
         warmed_group_count: u64 = 0,
@@ -4242,6 +4433,7 @@ pub const DataServer = struct {
                 cfg.replica_root_dir,
                 catalog,
             ),
+            .replica_catalog_path = cfg.replica_catalog_path,
             .status_source = status_source,
             .api_server_cfg = cfg.api_server_cfg,
             .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
@@ -4279,6 +4471,7 @@ pub const DataServer = struct {
                 cfg.replica_root_dir,
                 antfly.public_api.table_catalog.CatalogSource.fromMetadataService(svc),
             ),
+            .replica_catalog_path = cfg.replica_catalog_path,
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataService(svc),
             .api_server_cfg = cfg.api_server_cfg,
             .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
@@ -4315,6 +4508,7 @@ pub const DataServer = struct {
                 cfg.replica_root_dir,
                 antfly.public_api.table_catalog.CatalogSource.fromMetadataHttpService(svc),
             ),
+            .replica_catalog_path = cfg.replica_catalog_path,
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataHttpService(svc),
             .api_server_cfg = cfg.api_server_cfg,
             .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
@@ -4513,6 +4707,8 @@ pub const DataServer = struct {
     }
 
     pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.ha.replication_record.RecordView) !void {
+        if (isWholeInstanceHAControlRecord(record)) return;
+
         var snapshot = try self.write_source.catalog.adminSnapshot();
         defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
         const route = try resolveHAReplicationRecordRoute(&snapshot, record);
@@ -4550,7 +4746,11 @@ pub const DataServer = struct {
         options: HAStandbyReplicationOptions,
     ) !HAStandbyReplicationResult {
         if (self.http_server == null) try self.initApiServer();
-        var client = antfly.ha.http_replication_client.Client.init(self.alloc, executor);
+        var client = antfly.ha.http_replication_client.Client.initWithOptions(
+            self.alloc,
+            executor,
+            self.haStandbyReplicationAuth(),
+        );
         return try self.replicateHAStandbyAvailableWithClient(&client, upstream_base_uri, slot_name, options);
     }
 
@@ -4562,7 +4762,11 @@ pub const DataServer = struct {
         options: HAStandbyReplicationOptions,
     ) !HAStandbyReplicationLoopResult {
         if (self.http_server == null) try self.initApiServer();
-        var client = antfly.ha.http_replication_client.Client.init(self.alloc, executor);
+        var client = antfly.ha.http_replication_client.Client.initWithOptions(
+            self.alloc,
+            executor,
+            self.haStandbyReplicationAuth(),
+        );
         var iterations: usize = 0;
         var received_count: usize = 0;
         var applied_count: usize = 0;
@@ -4595,6 +4799,11 @@ pub const DataServer = struct {
                 return error.InternalReplicationDidNotAdvance;
             }
         }
+    }
+
+    fn haStandbyReplicationAuth(self: *const DataServer) antfly.ha.http_replication_client.AuthOptions {
+        const configured = if (self.ha_cfg.standby_replication) |cfg| cfg.bearer_token else null;
+        return .{ .bearer_token = configured orelse self.ha_cfg.admin_bearer_token };
     }
 
     fn replicateHAStandbyAvailableWithClient(
@@ -4683,11 +4892,14 @@ pub const DataServer = struct {
         defer self.ha_state_mutex.unlock();
         const ctx = self.ha_cfg.admin_context orelse return error.HAStandbyNotConfigured;
         const standby = ctx.standby orelse return error.HAStandbyNotConfigured;
-        const snapshot = standby.snapshot();
-        return .{
-            .identity = snapshot.identity,
-            .requested_lsn = snapshot.progress.nextReceiveLsn(),
+        _ = standby.promotedPrimaryHandoff() catch |err| switch (err) {
+            error.StandbyNotPromoted, error.PromotionNotApplied => return .{
+                .identity = standby.snapshot().identity,
+                .requested_lsn = standby.snapshot().progress.nextReceiveLsn(),
+            },
+            else => return err,
         };
+        return error.HAStandbyStateChanged;
     }
 
     fn runHAStandbyReplicationRound(self: *DataServer) !void {
@@ -4757,6 +4969,7 @@ pub const DataServer = struct {
         errdefer promoted_primary.close();
 
         self.ha_public_gate_state.beginPromotion();
+        self.ha_cfg.standby_owner.?.* = null;
         self.ha_cfg.admin_context.?.standby = null;
         if (self.ha_admin_server) |*server| {
             server.ctx.standby = null;
@@ -4774,6 +4987,14 @@ pub const DataServer = struct {
             server.ctx.primary = promoted_primary_handle;
             server.ctx.primary_node_id = promoted_node_id;
             server.ctx.promoted_standby_handoff = handoff;
+            server.auth.seed_capture = if (self.ha_cfg.seed_capture_root != null) .{
+                .ptr = self,
+                .run_fn = DataServer.captureHASeedCallback,
+            } else null;
+            if (server.auth.lifecycle_receipts) |*receipts| {
+                receipts.node_id = promoted_node_id;
+                receipts.role = .primary;
+            }
         }
         self.ha_internal_server = null;
         self.api_server_cfg.ha_internal_executor = null;
@@ -4817,7 +5038,10 @@ pub const DataServer = struct {
     ) !antfly.common.http.RequestExecutor {
         if (cfg.executor) |executor| return executor;
         if (self.ha_standby_replication_http_executor == null) {
-            self.ha_standby_replication_http_executor = antfly.common.http.StdHttpExecutor.init(self.alloc, .{});
+            self.ha_standby_replication_http_executor = antfly.common.http.StdHttpExecutor.init(
+                self.alloc,
+                haStandbyReplicationHTTPExecutorConfig(),
+            );
         }
         return self.ha_standby_replication_http_executor.?.executor();
     }
@@ -4888,6 +5112,14 @@ pub const DataServer = struct {
         self.refreshHAPublicGateState();
     }
 
+    fn haPrimaryFenceStartedCallback(ptr: *anyopaque) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        // Called while ha_state_mutex is held. HA WAL mirror/ack paths take
+        // the same mutex, so publishing the fence here establishes a strict
+        // linearization point before the durable primary tail is sampled.
+        self.ha_public_gate_state.publishPrimaryFence(true);
+    }
+
     fn haWriteGate(self: *DataServer) ?antfly.db.HAWriteGate {
         const ctx = self.ha_cfg.admin_context orelse return null;
         if (ctx.standby != null or ctx.primary != null) return .{ .shared = .{
@@ -4908,6 +5140,8 @@ pub const DataServer = struct {
     fn haPrimaryMirrorFor(self: *DataServer, primary: *antfly.ha.primary.Primary) antfly.db.HAAsyncEffectMirror {
         var mirror = antfly.db.HAAsyncEffectMirror{
             .primary = primary,
+            .mutation_barrier = &self.ha_mutation_barrier,
+            .transition_mutex = &self.ha_state_mutex,
             .last_lsn = &self.ha_primary_mirror_last_lsn,
             .failure_count = &self.ha_primary_mirror_failure_count,
             .sync_policy = self.ha_cfg.primary_sync_policy,
@@ -4938,12 +5172,614 @@ pub const DataServer = struct {
         return self.ha_public_gate_state.ownerJobsCanRun();
     }
 
+    fn defaultHASeedSnapshotProvider(self: *DataServer) HASeedSnapshotProvider {
+        return .{ .ptr = self, .prepare_fn = prepareDefaultHASeedSnapshotCallback };
+    }
+
+    fn prepareDefaultHASeedSnapshotCallback(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: HASeedSnapshotRequest,
+    ) !HASeedPreparedSnapshot {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return try self.prepareDefaultHASeedSnapshot(alloc, request);
+    }
+
+    fn prepareDefaultHASeedSnapshot(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        request: HASeedSnapshotRequest,
+    ) !HASeedPreparedSnapshot {
+        const catalog_path = self.replica_catalog_path orelse return error.HASeedCaptureCatalogMissing;
+        const snapshots_root = try std.fmt.allocPrint(alloc, "{s}.runtime-snapshots", .{request.capture_root});
+        defer alloc.free(snapshots_root);
+        const building_name = try std.fmt.allocPrint(alloc, ".building-{s}", .{request.generation});
+        defer alloc.free(building_name);
+        const building_root = try std.fs.path.join(alloc, &.{ snapshots_root, building_name });
+        defer alloc.free(building_root);
+        const published_root = try std.fs.path.join(alloc, &.{ snapshots_root, request.generation });
+        errdefer alloc.free(published_root);
+
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        // Prepared roots are staging state only. A process stop can leave a
+        // published generation or .building-* tree behind, so reset the
+        // provider-owned staging namespace before constructing the next exact
+        // generation. Canonical capture generations live under capture_root
+        // and are unaffected.
+        std.Io.Dir.cwd().deleteTree(io, snapshots_root) catch {};
+        try fs_paths.createDirPathPortable(io, snapshots_root);
+        try fs_paths.createDirPathPortable(io, building_root);
+        errdefer std.Io.Dir.cwd().deleteTree(io, building_root) catch {};
+
+        var replica_catalog = try antfly.raft.FileReplicaCatalog.init(alloc, catalog_path);
+        defer replica_catalog.deinit();
+        const records = try replica_catalog.catalog().listReplicas(alloc);
+        defer {
+            for (records) |*record| record.deinit(alloc);
+            alloc.free(records);
+        }
+
+        var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
+        if (records.len == 0 and !self.api_server_cfg.deployment_mode.isStandalone())
+            return error.HASeedSnapshotEmptyCatalog;
+        const group_ids = try alloc.alloc(
+            u64,
+            if (records.len > 0) records.len else metadata_snapshot.ranges.len,
+        );
+        defer alloc.free(group_ids);
+        if (records.len > 0) {
+            for (records, 0..) |record, index| group_ids[index] = record.group_id;
+        } else {
+            for (metadata_snapshot.ranges, 0..) |range, index| group_ids[index] = range.group_id;
+        }
+        std.mem.sort(u64, group_ids, {}, std.sort.asc(u64));
+
+        if (metadata_snapshot.status.metadata_epoch == 0 or
+            metadata_snapshot.tables.len == 0 or
+            metadata_snapshot.ranges.len == 0 or
+            group_ids.len != metadata_snapshot.ranges.len)
+            return error.HASeedSnapshotIncompleteTopology;
+        std.mem.sort(antfly.metadata.TableRecord, metadata_snapshot.tables, {}, struct {
+            fn lessThan(_: void, left: antfly.metadata.TableRecord, right: antfly.metadata.TableRecord) bool {
+                return left.table_id < right.table_id;
+            }
+        }.lessThan);
+        std.mem.sort(antfly.metadata.RangeRecord, metadata_snapshot.ranges, {}, struct {
+            fn lessThan(_: void, left: antfly.metadata.RangeRecord, right: antfly.metadata.RangeRecord) bool {
+                return left.group_id < right.group_id;
+            }
+        }.lessThan);
+        std.mem.sort(antfly.extensions.PackageManifest, metadata_snapshot.extension_packages, {}, struct {
+            fn lessThan(_: void, left: antfly.extensions.PackageManifest, right: antfly.extensions.PackageManifest) bool {
+                const name_order = std.mem.order(u8, left.name, right.name);
+                if (name_order != .eq) return name_order == .lt;
+                return std.mem.order(u8, left.version, right.version) == .lt;
+            }
+        }.lessThan);
+
+        var topology_replicas = std.ArrayListUnmanaged(HASeedSnapshotTopologyReplica).empty;
+        defer {
+            for (topology_replicas.items) |replica| {
+                alloc.free(replica.snapshot_path);
+                alloc.free(replica.logical_sha256);
+            }
+            topology_replicas.deinit(alloc);
+        }
+
+        for (group_ids, 0..) |group_id, index| {
+            if (index > 0 and group_ids[index - 1] == group_id)
+                return error.HASeedSnapshotDuplicateReplica;
+            const range = findHASeedRange(metadata_snapshot.ranges, group_id) orelse
+                return error.HASeedSnapshotReplicaMissingFromTopology;
+            const table = findHASeedTable(metadata_snapshot.tables, range.table_id) orelse
+                return error.HASeedSnapshotTableMissingFromTopology;
+            const snapshot_path = try std.fmt.allocPrint(alloc, "replicas/group-{d}", .{group_id});
+            errdefer alloc.free(snapshot_path);
+            const destination_root = try std.fs.path.join(alloc, &.{ building_root, snapshot_path });
+            defer alloc.free(destination_root);
+            const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g{d}", .{ request.generation, group_id });
+            defer alloc.free(snapshot_token);
+            try self.write_source.captureHASeedReplicaSnapshot(
+                alloc,
+                table.name,
+                group_id,
+                snapshot_token,
+                destination_root,
+            );
+            const store_path = try std.fs.path.join(alloc, &.{ destination_root, "store.bin" });
+            defer alloc.free(store_path);
+            const digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, store_path);
+            errdefer alloc.free(digest);
+            try topology_replicas.append(alloc, .{
+                .group_id = group_id,
+                .table_id = range.table_id,
+                .table_name = table.name,
+                .snapshot_path = snapshot_path,
+                .logical_sha256 = digest,
+                .identity_table_id = table.table_id,
+                .identity_shard_id = range.doc_identity_shard_id,
+                .identity_range_id = range.doc_identity_range_id,
+            });
+        }
+
+        var topology_extension_artifacts = std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact).empty;
+        defer freeHASeedSnapshotExtensionArtifacts(alloc, &topology_extension_artifacts);
+        try self.captureHASeedExtensionArtifacts(
+            alloc,
+            io,
+            building_root,
+            metadata_snapshot.extension_packages,
+            &topology_extension_artifacts,
+            null,
+        );
+
+        var topology_auth_artifact: ?HASeedSnapshotAuthArtifact = null;
+        var auth_digest_owned: ?[]u8 = null;
+        defer if (auth_digest_owned) |digest| alloc.free(digest);
+        if (request.auth_artifact_json) |auth_json| {
+            const auth_path = try std.fs.path.join(alloc, &.{ building_root, "auth/auth-seed.json" });
+            defer alloc.free(auth_path);
+            const auth_parent = std.fs.path.dirname(auth_path) orelse return error.InvalidHASeedSnapshotRoot;
+            try fs_paths.createDirPathPortable(io, auth_parent);
+            {
+                var auth_file = try std.Io.Dir.cwd().createFile(io, auth_path, .{ .exclusive = true });
+                defer auth_file.close(io);
+                try auth_file.writeStreamingAll(io, auth_json);
+                try auth_file.sync(io);
+            }
+            try fs_paths.syncDirPortable(io, auth_parent);
+            auth_digest_owned = try haSeedSnapshotFileSha256HexAlloc(alloc, io, auth_path);
+            topology_auth_artifact = .{
+                .path = "auth/auth-seed.json",
+                .size_bytes = auth_json.len,
+                .sha256 = auth_digest_owned.?,
+            };
+        }
+
+        const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
+            .generation = request.generation,
+            .catalog = .{
+                .epoch = metadata_snapshot.status.metadata_epoch,
+                .tables = metadata_snapshot.tables,
+                .ranges = metadata_snapshot.ranges,
+                .extension_packages = metadata_snapshot.extension_packages,
+                .installed_extensions = metadata_snapshot.installed_extensions,
+                .extension_members = metadata_snapshot.extension_members,
+                .extension_dependencies = metadata_snapshot.extension_dependencies,
+            },
+            .replicas = topology_replicas.items,
+            .extension_artifacts = topology_extension_artifacts.items,
+            .auth_enabled = request.auth_artifact_json != null,
+            .auth_artifact = topology_auth_artifact,
+        }, .{});
+        defer alloc.free(topology_json);
+        if (topology_json.len > ha_seed_snapshot_max_topology_bytes) return error.HASeedSnapshotTopologyTooLarge;
+        const topology_path = try std.fs.path.join(alloc, &.{ building_root, ha_seed_snapshot_topology_name });
+        defer alloc.free(topology_path);
+        const topology_temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{topology_path});
+        defer alloc.free(topology_temp_path);
+        {
+            var file = try std.Io.Dir.cwd().createFile(io, topology_temp_path, .{ .truncate = true });
+            defer file.close(io);
+            try file.writeStreamingAll(io, topology_json);
+            try file.sync(io);
+        }
+        if (std.fs.path.isAbsolute(topology_path))
+            try std.Io.Dir.renameAbsolute(topology_temp_path, topology_path, io)
+        else
+            try std.Io.Dir.rename(std.Io.Dir.cwd(), topology_temp_path, std.Io.Dir.cwd(), topology_path, io);
+        try fs_paths.syncDirPortable(io, building_root);
+
+        if (std.fs.path.isAbsolute(published_root))
+            try std.Io.Dir.renameAbsolute(building_root, published_root, io)
+        else
+            try std.Io.Dir.rename(std.Io.Dir.cwd(), building_root, std.Io.Dir.cwd(), published_root, io);
+        try fs_paths.syncDirPortable(io, snapshots_root);
+        return .{ .root = published_root };
+    }
+
+    fn findHASeedRange(ranges: []const antfly.metadata.RangeRecord, group_id: u64) ?antfly.metadata.RangeRecord {
+        for (ranges) |range| if (range.group_id == group_id) return range;
+        return null;
+    }
+
+    fn findHASeedTable(tables: []const antfly.metadata.TableRecord, table_id: u64) ?antfly.metadata.TableRecord {
+        for (tables) |table| if (table.table_id == table_id) return table;
+        return null;
+    }
+
+    fn captureHASeedExtensionArtifacts(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        building_root: []const u8,
+        packages: []const antfly.extensions.PackageManifest,
+        artifacts: *std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact),
+        probe: ?HASeedExtensionCaptureProbe,
+    ) !void {
+        const store_root = self.api_server_cfg.extension_package_store_dir orelse {
+            if (packages.len != 0) return error.HASeedExtensionCatalogMismatch;
+            return;
+        };
+        if (!antfly.ha.validation.isAbsoluteNormalizedPath(store_root))
+            return error.InvalidHASeedExtensionStoreRoot;
+
+        const entries = try antfly.extensions.scanPackageStoreAlloc(alloc, io, store_root);
+        defer antfly.extensions.freePackageStoreEntries(alloc, entries);
+        if (entries.len != packages.len) return error.HASeedExtensionCatalogMismatch;
+
+        const catalog_index_by_entry = try alloc.alloc(usize, entries.len);
+        defer if (catalog_index_by_entry.len > 0) alloc.free(catalog_index_by_entry);
+        @memset(catalog_index_by_entry, std.math.maxInt(usize));
+        for (packages, 0..) |package, package_index| {
+            package.validate() catch return error.HASeedExtensionCatalogMismatch;
+            var matched_entry: ?usize = null;
+            for (entries, 0..) |entry, entry_index| {
+                if (!std.mem.eql(u8, package.name, entry.manifest.name) or
+                    !std.mem.eql(u8, package.version, entry.manifest.version)) continue;
+                if (matched_entry != null) return error.HASeedExtensionCatalogMismatch;
+                matched_entry = entry_index;
+            }
+            const entry_index = matched_entry orelse return error.HASeedExtensionCatalogMismatch;
+            if (catalog_index_by_entry[entry_index] != std.math.maxInt(usize) or
+                !try haSeedPackageManifestsEqual(alloc, package, entries[entry_index].manifest))
+                return error.HASeedExtensionCatalogMismatch;
+            catalog_index_by_entry[entry_index] = package_index;
+        }
+        for (catalog_index_by_entry) |package_index| {
+            if (package_index == std.math.maxInt(usize)) return error.HASeedExtensionCatalogMismatch;
+        }
+
+        var store_dir = std.Io.Dir.cwd().openDir(io, store_root, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return error.HASeedExtensionCatalogMismatch,
+            else => return err,
+        };
+        defer store_dir.close(io);
+        var walker = try store_dir.walk(alloc);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind == .directory) continue;
+            if (entry.kind != .file) return error.HASeedExtensionUnsafeArtifact;
+            if (artifacts.items.len >= antfly.ha.seed_materialization.max_files)
+                return error.HASeedExtensionTooManyArtifacts;
+
+            const source_path = try std.fs.path.join(alloc, &.{ store_root, entry.path });
+            defer alloc.free(source_path);
+            const entry_index = try haSeedExtensionEntryForPath(source_path, entries);
+            const package = packages[catalog_index_by_entry[entry_index]];
+            const source_before = try std.Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
+            if (source_before.kind != .file or source_before.size > antfly.ha.seed_materialization.max_file_bytes)
+                return error.HASeedExtensionUnsafeArtifact;
+            const digest_before = try haSeedSnapshotFileSha256HexAlloc(alloc, io, source_path);
+            errdefer alloc.free(digest_before);
+            const artifact_path = try std.fs.path.join(alloc, &.{ "extensions", entry.path });
+            errdefer alloc.free(artifact_path);
+            if (!antfly.ha.validation.isNormalizedPath(artifact_path)) return error.HASeedExtensionUnsafeArtifact;
+            const destination_path = try std.fs.path.join(alloc, &.{ building_root, artifact_path });
+            defer alloc.free(destination_path);
+            try std.Io.Dir.copyFile(std.Io.Dir.cwd(), source_path, std.Io.Dir.cwd(), destination_path, io, .{
+                .make_path = true,
+                .replace = false,
+            });
+            try fs_paths.syncFileAndParentPortable(io, destination_path);
+
+            const source_after = try std.Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
+            const digest_after = try haSeedSnapshotFileSha256HexAlloc(alloc, io, source_path);
+            defer alloc.free(digest_after);
+            const destination_after = try std.Io.Dir.cwd().statFile(io, destination_path, .{ .follow_symlinks = false });
+            const destination_digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, destination_path);
+            defer alloc.free(destination_digest);
+            if (source_after.kind != .file or destination_after.kind != .file or
+                source_before.size != source_after.size or source_before.size != destination_after.size or
+                !std.mem.eql(u8, digest_before, digest_after) or
+                !std.mem.eql(u8, digest_before, destination_digest))
+                return error.HASeedExtensionChangedDuringCapture;
+            try artifacts.append(alloc, .{
+                .package_name = package.name,
+                .package_version = package.version,
+                .path = artifact_path,
+                .size_bytes = source_before.size,
+                .sha256 = digest_before,
+            });
+        }
+
+        std.mem.sort(HASeedSnapshotExtensionArtifact, artifacts.items, {}, struct {
+            fn lessThan(_: void, left: HASeedSnapshotExtensionArtifact, right: HASeedSnapshotExtensionArtifact) bool {
+                return std.mem.order(u8, left.path, right.path) == .lt;
+            }
+        }.lessThan);
+        for (artifacts.items, 0..) |artifact, index| {
+            if (index > 0 and std.mem.eql(u8, artifacts.items[index - 1].path, artifact.path))
+                return error.HASeedExtensionUnexpectedArtifact;
+        }
+
+        // A second full walk binds the published image to one filesystem
+        // observation. It detects source additions, removals, type changes,
+        // and mutations that race the per-file copy loop.
+        if (probe) |capture_probe| try capture_probe.afterCopy(alloc);
+        var verify_walker = try store_dir.walk(alloc);
+        defer verify_walker.deinit();
+        var verified_files: usize = 0;
+        while (try verify_walker.next(io)) |entry| {
+            if (entry.kind == .directory) continue;
+            if (entry.kind != .file) return error.HASeedExtensionChangedDuringCapture;
+            const source_path = try std.fs.path.join(alloc, &.{ store_root, entry.path });
+            defer alloc.free(source_path);
+            const entry_index = haSeedExtensionEntryForPath(source_path, entries) catch
+                return error.HASeedExtensionChangedDuringCapture;
+            const package = packages[catalog_index_by_entry[entry_index]];
+            const artifact_path = try std.fs.path.join(alloc, &.{ "extensions", entry.path });
+            defer alloc.free(artifact_path);
+            var found: ?HASeedSnapshotExtensionArtifact = null;
+            for (artifacts.items) |artifact| {
+                if (std.mem.eql(u8, artifact.path, artifact_path) and
+                    std.mem.eql(u8, artifact.package_name, package.name) and
+                    std.mem.eql(u8, artifact.package_version, package.version))
+                {
+                    found = artifact;
+                    break;
+                }
+            }
+            const artifact = found orelse return error.HASeedExtensionChangedDuringCapture;
+            const stat = try std.Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
+            const digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, source_path);
+            defer alloc.free(digest);
+            if (stat.kind != .file or stat.size != artifact.size_bytes or
+                !std.mem.eql(u8, digest, artifact.sha256))
+                return error.HASeedExtensionChangedDuringCapture;
+            verified_files += 1;
+        }
+        if (verified_files != artifacts.items.len) return error.HASeedExtensionChangedDuringCapture;
+    }
+
+    fn validateHASeedPreparedSnapshot(
+        alloc: std.mem.Allocator,
+        capture_root: []const u8,
+        generation: []const u8,
+        prepared_root: []const u8,
+    ) !void {
+        const allowed_root = try std.fmt.allocPrint(alloc, "{s}.runtime-snapshots", .{capture_root});
+        defer alloc.free(allowed_root);
+        if (!antfly.ha.validation.isAbsoluteNormalizedPathWithinRoot(prepared_root, allowed_root) or
+            std.mem.eql(u8, prepared_root, allowed_root)) return error.InvalidHASeedSnapshotRoot;
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const topology_path = try std.fs.path.join(alloc, &.{ prepared_root, ha_seed_snapshot_topology_name });
+        defer alloc.free(topology_path);
+        const topology_json = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            topology_path,
+            alloc,
+            .limited(ha_seed_snapshot_max_topology_bytes),
+        );
+        defer alloc.free(topology_json);
+        var parsed = std.json.parseFromSlice(
+            HASeedSnapshotTopology,
+            alloc,
+            topology_json,
+            .{ .ignore_unknown_fields = false },
+        ) catch return error.InvalidHASeedSnapshotTopology;
+        defer parsed.deinit();
+        const topology = parsed.value;
+        if (topology.format_version != ha_seed_snapshot_format_version or
+            !std.mem.eql(u8, topology.generation, generation) or topology.replicas.len == 0)
+            return error.InvalidHASeedSnapshotTopology;
+        antfly.ha.seed_materialization.validateTopology(
+            alloc,
+            io,
+            prepared_root,
+            generation,
+            topology,
+        ) catch |err| switch (err) {
+            error.SeedLogicalDigestMismatch => return error.HASeedSnapshotLogicalDigestMismatch,
+            else => return error.InvalidHASeedSnapshotTopology,
+        };
+
+        for (topology.replicas, 0..) |replica, index| {
+            if (index > 0 and topology.replicas[index - 1].group_id >= replica.group_id)
+                return error.InvalidHASeedSnapshotTopology;
+            const expected_path = try std.fmt.allocPrint(alloc, "replicas/group-{d}", .{replica.group_id});
+            defer alloc.free(expected_path);
+            if (!std.mem.eql(u8, replica.snapshot_path, expected_path) or
+                replica.table_id == 0 or replica.table_name.len == 0 or
+                !validLowerSha256(replica.logical_sha256))
+                return error.InvalidHASeedSnapshotTopology;
+            const store_path = try std.fs.path.join(alloc, &.{ prepared_root, replica.snapshot_path, "store.bin" });
+            defer alloc.free(store_path);
+            const actual_digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, store_path);
+            defer alloc.free(actual_digest);
+            if (!std.mem.eql(u8, actual_digest, replica.logical_sha256))
+                return error.HASeedSnapshotLogicalDigestMismatch;
+        }
+
+        var root = try std.Io.Dir.cwd().openDir(io, prepared_root, .{ .iterate = true });
+        defer root.close(io);
+        var walker = try root.walk(alloc);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind == .directory) {
+                if (std.mem.eql(u8, entry.path, "replicas")) continue;
+                if (topology.auth_artifact != null and std.mem.eql(u8, entry.path, "auth")) continue;
+                for (topology.replicas) |replica| {
+                    if (std.mem.eql(u8, entry.path, replica.snapshot_path)) break;
+                } else if (!haSeedExtensionArtifactDirectory(topology.extension_artifacts, entry.path)) {
+                    return error.HASeedSnapshotUnexpectedArtifact;
+                }
+                continue;
+            }
+            if (entry.kind != .file) return error.HASeedSnapshotUnexpectedArtifact;
+            if (std.mem.eql(u8, entry.path, ha_seed_snapshot_topology_name)) continue;
+            for (topology.extension_artifacts) |artifact| {
+                if (std.mem.eql(u8, entry.path, artifact.path)) break;
+            } else {
+                if (topology.auth_artifact) |artifact| {
+                    if (std.mem.eql(u8, entry.path, artifact.path)) continue;
+                }
+                for (topology.replicas) |replica| {
+                    const store_rel = try std.fs.path.join(alloc, &.{ replica.snapshot_path, "store.bin" });
+                    defer alloc.free(store_rel);
+                    if (std.mem.eql(u8, entry.path, store_rel)) break;
+                    const journal_rel = try std.fs.path.join(alloc, &.{ replica.snapshot_path, "change-journal.bin" });
+                    defer alloc.free(journal_rel);
+                    if (std.mem.eql(u8, entry.path, journal_rel)) break;
+                } else return error.HASeedSnapshotUnexpectedArtifact;
+                continue;
+            }
+        }
+    }
+
+    fn cleanupHASeedPreparedSnapshot(
+        alloc: std.mem.Allocator,
+        capture_root: []const u8,
+        prepared_root: []const u8,
+    ) void {
+        const allowed_root = std.fmt.allocPrint(alloc, "{s}.runtime-snapshots", .{capture_root}) catch return;
+        defer alloc.free(allowed_root);
+        if (!antfly.ha.validation.isAbsoluteNormalizedPathWithinRoot(prepared_root, allowed_root) or
+            std.mem.eql(u8, prepared_root, allowed_root)) return;
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), prepared_root) catch |err| {
+            std.log.warn("failed to remove prepared HA seed snapshot root={s} err={s}", .{ prepared_root, @errorName(err) });
+        };
+    }
+
+    fn captureHASeedCallback(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        slot_name: []const u8,
+        generation: []const u8,
+        binding: antfly.ha.seed_artifact.LifecycleBinding,
+    ) !antfly.ha.http_admin.Server.SeedCaptureResult {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+
+        if (self.ha_seed_capture_active.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+            return error.HASeedCaptureAlreadyInProgress;
+        }
+        defer self.ha_seed_capture_active.store(false, .release);
+
+        // Global ordering is non-negotiable: capture excludes every durable
+        // mutation before freezing the role pointer that keeps Primary alive.
+        var lease = self.ha_mutation_barrier.acquireExclusive();
+        var lease_held = true;
+        defer if (lease_held) lease.release();
+        lockAtomic(&self.ha_state_mutex);
+        var state_mutex_held = true;
+        defer if (state_mutex_held) self.ha_state_mutex.unlock();
+
+        const ctx = self.ha_cfg.admin_context orelse return error.HASeedCaptureUnavailable;
+        if (ctx.standby != null) return error.HASeedCaptureRequiresPrimary;
+        if (haContextPrimaryIsFenced(ctx)) return error.PrimaryFenced;
+        const primary = ctx.primary orelse return error.HASeedCaptureRequiresPrimary;
+        if (self.ha_cfg.internal_primary) |current| {
+            if (current != primary) return error.HASeedCapturePrimaryChanged;
+        }
+        const capture_root = self.ha_cfg.seed_capture_root orelse return error.HASeedCaptureRootMissing;
+        const node_id = ctx.primary_node_id orelse return error.HAPrimaryNodeIdMissing;
+        var auth_lease: ?antfly.usermgr.UserManager.SeedCaptureLease = null;
+        defer if (auth_lease) |*auth_capture_lease| auth_capture_lease.release();
+        var auth_artifact_json: ?[]u8 = null;
+        defer if (auth_artifact_json) |body| alloc.free(body);
+        if (self.api_server_cfg.auth_enabled) {
+            const manager = self.api_server_cfg.user_manager orelse return error.HASeedCaptureAuthManagerMissing;
+            auth_lease = manager.acquireSeedCaptureLease();
+            auth_artifact_json = try manager.exportPortableSeedWithLease(alloc, generation, &auth_lease.?);
+        }
+        if (self.lsm_maintenance_active.load(.acquire) or self.auto_bulk_finish_active.load(.acquire))
+            return error.HASeedSnapshotRuntimeBusy;
+        var activity_lease = try self.write_source.acquireHASeedCaptureActivityLease();
+        defer activity_lease.release();
+        const provider = self.ha_cfg.seed_snapshot_provider orelse self.defaultHASeedSnapshotProvider();
+        var prepared = try provider.prepare(alloc, .{
+            .capture_root = capture_root,
+            .generation = generation,
+            .auth_artifact_json = auth_artifact_json,
+        });
+        defer {
+            cleanupHASeedPreparedSnapshot(alloc, capture_root, prepared.root);
+            prepared.deinit(alloc);
+        }
+        try validateHASeedPreparedSnapshot(alloc, capture_root, generation, prepared.root);
+
+        const sources = [_]antfly.ha.seed_capture.Source{.{ .tree = .{
+            .source_root = prepared.root,
+            .artifact_prefix = "",
+            .kind = .artifact,
+        } }};
+        const CheckpointRelease = struct {
+            lease: *antfly.db.HAMutationBarrier.ExclusiveLease,
+            lease_held: *bool,
+            state_mutex: *std.atomic.Mutex,
+            state_mutex_held: *bool,
+
+            fn run(raw: ?*anyopaque) void {
+                const release: *@This() = @ptrCast(@alignCast(raw.?));
+                if (release.state_mutex_held.*) {
+                    release.state_mutex.unlock();
+                    release.state_mutex_held.* = false;
+                }
+                if (release.lease_held.*) {
+                    release.lease.release();
+                    release.lease_held.* = false;
+                }
+            }
+        };
+        var checkpoint_release = CheckpointRelease{
+            .lease = &lease,
+            .lease_held = &lease_held,
+            .state_mutex = &self.ha_state_mutex,
+            .state_mutex_held = &state_mutex_held,
+        };
+        var capture = try antfly.ha.seed_capture.capturePreparedWithExclusiveLease(alloc, .{
+            .primary = primary,
+            .barrier = &self.ha_mutation_barrier,
+            .slot_name = slot_name,
+            .generation = generation,
+            .capture_root = capture_root,
+            .sources = &sources,
+            .binding = binding,
+            .pod_uid = self.ha_cfg.pod_uid,
+        }, &lease, &checkpoint_release, CheckpointRelease.run);
+        errdefer capture.deinit(alloc);
+        return .{
+            .capture = capture,
+            .node_id = try alloc.dupe(u8, node_id),
+        };
+    }
+
     fn attachHaExecutors(self: *DataServer, api_server_cfg: *antfly.public_api.http_server.ApiHttpServerConfig) void {
+        const ha_admin_bearer_token = api_server_cfg.ha_admin_bearer_token orelse
+            self.ha_cfg.admin_bearer_token orelse
+            api_server_cfg.admin_bearer_token;
+        api_server_cfg.ha_admin_bearer_token = ha_admin_bearer_token;
         if (api_server_cfg.ha_admin_executor == null) {
             if (self.ha_cfg.admin_context) |ctx| {
                 self.ha_admin_server = antfly.ha.http_admin.Server.initWithOptions(platform.allocator.processAllocator(std.heap.smp_allocator), ctx, .{
-                    .bearer_token = self.ha_cfg.admin_bearer_token,
+                    .bearer_token = ha_admin_bearer_token,
+                    .require_bearer_token = true,
                     .state_mutex = if (ctx.primary != null or ctx.standby != null) &self.ha_state_mutex else null,
+                    .seed_capture = if (ctx.primary != null and self.ha_cfg.seed_capture_root != null) .{
+                        .ptr = self,
+                        .run_fn = DataServer.captureHASeedCallback,
+                    } else null,
+                    .lifecycle_receipts = if (self.ha_cfg.seed_capture_root != null or self.ha_cfg.seed_activation_root != null) .{
+                        .capture_root = self.ha_cfg.seed_capture_root,
+                        .activation_root = self.ha_cfg.seed_activation_root,
+                        .node_id = if (ctx.primary != null) ctx.primary_node_id else ctx.standby_node_id,
+                        .role = if (ctx.primary != null) .primary else if (ctx.standby != null) .standby else .unknown,
+                        .pod_uid = self.ha_cfg.pod_uid,
+                    } else null,
+                    .lease_watchdog_proof = self.ha_cfg.lease_watchdog_proof,
+                    .repair_receipt = self.ha_cfg.repair_receipt,
+                    .primary_fence_barrier = &self.ha_mutation_barrier,
+                    .primary_fence_started = .{
+                        .ptr = self,
+                        .run_fn = DataServer.haPrimaryFenceStartedCallback,
+                    },
                     .state_changed = .{
                         .ptr = self,
                         .run_fn = DataServer.haPublicGateStateChangedCallback,
@@ -5132,18 +5968,27 @@ pub const DataServer = struct {
     /// Callers must concurrently drive `runRaftRoundOnly` at the configured
     /// tick cadence.
     pub fn runControlRoundOnly(self: *DataServer) !void {
-        const ha_standby_replication_ok = blk: {
-            self.runHAStandbyReplicationRound() catch |err| {
-                if (isSupersededHAStandbyReplicationRound(err)) break :blk true;
-                _ = self.ha_standby_replication_failure_count.fetchAdd(1, .monotonic);
-                self.recordHAStandbyReplicationError(err);
-                if (!isNonFatalHAStandbyReplicationError(err)) return err;
-                std.log.warn("HA standby replication round skipped err={}", .{err});
-                break :blk false;
-            };
-            break :blk true;
-        };
-        if (ha_standby_replication_ok) self.clearHAStandbyReplicationError();
+        const now_ns = platform_time.monotonicNs();
+        if (self.haStandbyReplicationRetryDue(now_ns)) {
+            if (self.runHAStandbyReplicationRound()) |_| {
+                self.clearHAStandbyReplicationRetry();
+                self.clearHAStandbyReplicationError();
+            } else |err| {
+                if (isSupersededHAStandbyReplicationRound(err)) {
+                    self.clearHAStandbyReplicationRetry();
+                    self.clearHAStandbyReplicationError();
+                } else {
+                    _ = self.ha_standby_replication_failure_count.fetchAdd(1, .monotonic);
+                    self.recordHAStandbyReplicationError(err);
+                    self.deferHAStandbyReplicationRetry(now_ns);
+                    if (!isNonFatalHAStandbyReplicationError(err)) return err;
+                    // Replication is a fail-closed maintenance loop. Keep the runtime
+                    // and HA admin surface alive so the operator can observe and
+                    // repair transport, compatibility, or durable-state failures.
+                    std.log.warn("HA standby replication round skipped err={}", .{err});
+                }
+            }
+        }
         self.requestAutoBulkFinishBackground() catch |err| {
             std.log.warn("auto bulk ingest finish start deferred err={}", .{err});
         };
@@ -5403,6 +6248,22 @@ pub const DataServer = struct {
 
     fn clearHAStandbyReplicationError(self: *DataServer) void {
         self.ha_standby_replication_last_error.store(@intFromEnum(HAStandbyReplicationErrorCode.none), .release);
+    }
+
+    fn haStandbyReplicationRetryDue(self: *DataServer, now_ns: u64) bool {
+        const next_attempt_ns = self.ha_standby_replication_next_attempt_ns.load(.acquire);
+        return next_attempt_ns == 0 or now_ns >= next_attempt_ns;
+    }
+
+    fn deferHAStandbyReplicationRetry(self: *DataServer, now_ns: u64) void {
+        self.ha_standby_replication_next_attempt_ns.store(
+            now_ns +| ha_standby_replication_retry_interval_ns,
+            .release,
+        );
+    }
+
+    fn clearHAStandbyReplicationRetry(self: *DataServer) void {
+        self.ha_standby_replication_next_attempt_ns.store(0, .release);
     }
 
     fn recordHAStandbyReplicationAttempt(self: *DataServer) void {
@@ -14594,6 +15455,20 @@ const HAReplicationRecordRoute = struct {
     table_name: []const u8,
 };
 
+fn isWholeInstanceHAControlRecord(record: antfly.ha.replication_record.RecordView) bool {
+    if (record.shard_id != 0 or record.table_id != 0) return false;
+    return switch (record.kind) {
+        .backup_start,
+        .backup_end,
+        .checkpoint,
+        .manifest,
+        .truncate,
+        .timeline_switch,
+        => true,
+        else => false,
+    };
+}
+
 fn resolveHAReplicationRecordRoute(
     snapshot: *const antfly.metadata_api.AdminSnapshot,
     record: antfly.ha.replication_record.RecordView,
@@ -16486,7 +17361,7 @@ test "data runtime live writer source follows raft apply ownership" {
 
         fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
             return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 7, .metrics = .{} },
                 .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
                 .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
                 .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
@@ -23589,12 +24464,268 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_phase{phase=\"opening_db\"} 1") != null);
 }
 
+const TestHASeedSnapshotProvider = struct {
+    db_path: []const u8,
+    calls: usize = 0,
+    unsupported: bool = false,
+
+    fn iface(self: *@This()) HASeedSnapshotProvider {
+        return .{ .ptr = self, .prepare_fn = prepare };
+    }
+
+    fn prepare(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: HASeedSnapshotRequest,
+    ) !HASeedPreparedSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        if (self.unsupported) return error.HASeedSnapshotUnsupportedBackend;
+
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const provider_root = try std.fmt.allocPrint(alloc, "{s}.runtime-snapshots", .{request.capture_root});
+        defer alloc.free(provider_root);
+        const prepared_root = try std.fs.path.join(alloc, &.{ provider_root, request.generation });
+        errdefer alloc.free(prepared_root);
+        std.Io.Dir.cwd().deleteTree(io, prepared_root) catch {};
+        const replica_snapshot_root = try std.fs.path.join(alloc, &.{ prepared_root, "replicas/group-1" });
+        defer alloc.free(replica_snapshot_root);
+
+        var snapshot_db = try antfly.db.DB.open(alloc, self.db_path, .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .start_index_workers = false,
+        });
+        defer snapshot_db.close();
+        const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g1", .{request.generation});
+        defer alloc.free(snapshot_token);
+        _ = try snapshot_db.snapshot(snapshot_token);
+        const source_snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ self.db_path, snapshot_token });
+        defer alloc.free(source_snapshot_root);
+        try antfly.public_api.backups.copyDirectoryRecursive(alloc, source_snapshot_root, replica_snapshot_root);
+
+        const store_path = try std.fs.path.join(alloc, &.{ replica_snapshot_root, "store.bin" });
+        defer alloc.free(store_path);
+        const store_bytes = try std.Io.Dir.cwd().readFileAlloc(io, store_path, alloc, .limited(16 * 1024 * 1024));
+        defer alloc.free(store_bytes);
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(store_bytes, &digest, .{});
+        var digest_hex: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
+        for (digest, 0..) |byte, index| {
+            digest_hex[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+            digest_hex[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+        }
+
+        const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
+            .generation = request.generation,
+            .catalog = .{
+                .epoch = 7,
+                .tables = &.{.{
+                    .table_id = 20,
+                    .name = "docs",
+                    .placement_role = "data",
+                }},
+                .ranges = &.{.{
+                    .group_id = 1,
+                    .range_id = 1,
+                    .table_id = 20,
+                    .start_key = "",
+                    .end_key = null,
+                    .doc_identity_shard_id = 10,
+                    .doc_identity_range_id = 1,
+                }},
+            },
+            .replicas = &.{.{
+                .group_id = 1,
+                .table_id = 20,
+                .table_name = "docs",
+                .snapshot_path = "replicas/group-1",
+                .logical_sha256 = digest_hex[0..],
+                .identity_table_id = 20,
+                .identity_shard_id = 10,
+                .identity_range_id = 1,
+            }},
+        }, .{});
+        defer alloc.free(topology_json);
+        const topology_path = try std.fs.path.join(alloc, &.{ prepared_root, "TOPOLOGY.json" });
+        defer alloc.free(topology_path);
+        var topology_file = try std.Io.Dir.cwd().createFile(io, topology_path, .{ .truncate = true });
+        try topology_file.writeStreamingAll(io, topology_json);
+        try topology_file.sync(io);
+        topology_file.close(io);
+        try fs_paths.syncDirPortable(io, prepared_root);
+        return .{ .root = prepared_root };
+    }
+};
+
+test "storage.ha data runtime rejects concurrent seed capture before waiting on mutation barrier" {
+    var server: DataServer = undefined;
+    server.ha_seed_capture_active = .init(true);
+    try std.testing.expectError(
+        error.HASeedCaptureAlreadyInProgress,
+        DataServer.captureHASeedCallback(
+            &server,
+            std.testing.allocator,
+            "standby-a",
+            "seed-standby-a-1",
+            .{
+                .topology_id = "topology-a",
+                .topology_generation = 1,
+                .node_id = "standby-a",
+                .target_pvc_name = "standby-a-data",
+                .target_pvc_uid = "pvc-uid-1",
+            },
+        ),
+    );
+}
+
+test "storage.ha data runtime default seed snapshot derives standalone groups from metadata only" {
+    const alloc = std.testing.allocator;
+
+    const FakeMetadata = struct {
+        fn catalogSource() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn statusSource() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metadata_epoch = 7, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 7, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .range_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                    .doc_identity_shard_id = 77,
+                    .doc_identity_range_id = 77,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const fixture_root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/data-runtime-ha-standalone-seed",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(fixture_root);
+    const replica_root = try std.fs.path.join(alloc, &.{ fixture_root, "replicas" });
+    defer alloc.free(replica_root);
+    const replica_catalog_path = try std.fs.path.join(alloc, &.{ fixture_root, "catalog.txt" });
+    defer alloc.free(replica_catalog_path);
+    const capture_root = try std.fs.path.join(alloc, &.{ fixture_root, "seed-captures" });
+    defer alloc.free(capture_root);
+    const replica_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root, 77);
+    defer alloc.free(replica_db_path);
+
+    {
+        var replica_catalog = try antfly.raft.FileReplicaCatalog.init(alloc, replica_catalog_path);
+        replica_catalog.deinit();
+    }
+    {
+        var db = try antfly.db.DB.open(alloc, replica_db_path, .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:seed", .value = "{\"title\":\"standalone seed\"}" }},
+            .sync_level = .full_index,
+        });
+    }
+
+    var standalone = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .api_server_cfg = .{ .deployment_mode = .standalone },
+    }, FakeMetadata.catalogSource(), FakeMetadata.statusSource());
+    defer standalone.deinit();
+
+    var prepared = try standalone.prepareDefaultHASeedSnapshot(alloc, .{
+        .capture_root = capture_root,
+        .generation = "standalone-empty-catalog",
+    });
+    defer prepared.deinit(alloc);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const topology_path = try std.fs.path.join(alloc, &.{ prepared.root, ha_seed_snapshot_topology_name });
+    defer alloc.free(topology_path);
+    const topology_json = try std.Io.Dir.cwd().readFileAlloc(
+        io_impl.io(),
+        topology_path,
+        alloc,
+        .limited(1024 * 1024),
+    );
+    defer alloc.free(topology_json);
+    var topology = try std.json.parseFromSlice(
+        HASeedSnapshotTopology,
+        alloc,
+        topology_json,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer topology.deinit();
+    try std.testing.expectEqual(@as(usize, 1), topology.value.replicas.len);
+    try std.testing.expectEqual(@as(u64, 77), topology.value.replicas[0].group_id);
+    try std.testing.expectEqualStrings("docs", topology.value.replicas[0].table_name);
+
+    var distributed = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .api_server_cfg = .{ .deployment_mode = .distributed },
+    }, FakeMetadata.catalogSource(), FakeMetadata.statusSource());
+    defer distributed.deinit();
+    try std.testing.expectError(error.HASeedSnapshotEmptyCatalog, distributed.prepareDefaultHASeedSnapshot(alloc, .{
+        .capture_root = capture_root,
+        .generation = "distributed-empty-catalog",
+    }));
+}
+
 test "data server wires configured HA executors into API server" {
     const alloc = std.testing.allocator;
     const FakeStatus = struct {
-        fn iface() antfly.public_api.http_server.StatusSource {
+        include_extension: bool = false,
+
+        fn iface(self: *@This()) antfly.public_api.http_server.StatusSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .status = status,
                     .admin_snapshot = adminSnapshot,
@@ -23607,13 +24738,35 @@ test "data server wires configured HA executors into API server" {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
 
-        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
-                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 7, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 20,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 1,
+                    .range_id = 1,
+                    .table_id = 20,
+                    .start_key = "",
+                    .end_key = null,
+                    .doc_identity_shard_id = 10,
+                    .doc_identity_range_id = 1,
+                }})[0..]),
                 .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .extension_packages = if (self.include_extension)
+                    @constCast((&[_]antfly.extensions.PackageManifest{.{
+                        .name = "memoryaf",
+                        .version = "1.0.0",
+                        .digest = "sha256:fixture",
+                        .install = .{ .scopes_supported = &.{.cluster} },
+                    }})[0..])
+                else
+                    @constCast((&[_]antfly.extensions.PackageManifest{})[0..]),
                 .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
             };
@@ -23623,9 +24776,11 @@ test "data server wires configured HA executors into API server" {
     };
 
     const FakeCatalog = struct {
-        fn iface() antfly.public_api.table_catalog.CatalogSource {
+        status: *FakeStatus,
+
+        fn iface(self: *@This()) antfly.public_api.table_catalog.CatalogSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
@@ -23633,33 +24788,125 @@ test "data server wires configured HA executors into API server" {
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
-            return try FakeStatus.adminSnapshot(undefined);
+        fn adminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try FakeStatus.adminSnapshot(self.status);
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
     };
 
-    const nonce = platform_time.monotonicNs();
-    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-log-{d}", .{nonce});
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const fixture_root_rel = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-ha-executors", .{tmp.sub_path});
+    defer alloc.free(fixture_root_rel);
+    const capture_fixture_root = try std.fs.path.resolve(alloc, &.{ cwd, fixture_root_rel });
+    defer alloc.free(capture_fixture_root);
+
+    const primary_log_raw = try std.fs.path.join(alloc, &.{ capture_fixture_root, "primary.log" });
     defer alloc.free(primary_log_raw);
     const primary_log = try alloc.dupeZ(u8, primary_log_raw);
     defer alloc.free(primary_log);
-    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-slots-{d}", .{nonce});
+    const primary_slots_raw = try std.fs.path.join(alloc, &.{ capture_fixture_root, "primary-slots" });
     defer alloc.free(primary_slots_raw);
     const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
     defer alloc.free(primary_slots);
-    const restore_jobs_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-restore-jobs-{d}", .{nonce});
+    const restore_jobs_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "restore-jobs" });
     defer alloc.free(restore_jobs_path);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
+    const replica_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "replicas" });
+    defer alloc.free(replica_root);
+    const replica_db_path = try std.fs.path.join(alloc, &.{ replica_root, "group-1/table-db" });
+    defer alloc.free(replica_db_path);
+    const raft_wal_sentinel = try std.fs.path.join(alloc, &.{ replica_root, "group-1/raft/wal-000001" });
+    defer alloc.free(raft_wal_sentinel);
+    const replica_catalog_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "catalog.txt" });
+    defer alloc.free(replica_catalog_path);
+    const seed_capture_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "seed-captures" });
+    defer alloc.free(seed_capture_root);
+    const extension_store_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "extensions" });
+    defer alloc.free(extension_store_root);
+    const extension_manifest_path = try std.fs.path.join(alloc, &.{ extension_store_root, "memoryaf/extension.json" });
+    defer alloc.free(extension_manifest_path);
+    const extension_runtime_path = try std.fs.path.join(alloc, &.{ extension_store_root, "memoryaf/runtime.wasm" });
+    defer alloc.free(extension_runtime_path);
+    const capture_binding = antfly.ha.seed_artifact.LifecycleBinding{
+        .topology_id = "topology-a",
+        .topology_generation = 7,
+        .node_id = "standby-a",
+        .target_pvc_name = "standby-a-data",
+        .target_pvc_uid = "pvc-uid-7",
+    };
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), capture_fixture_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), capture_fixture_root) catch {};
+    {
+        var db = try antfly.db.DB.open(alloc, replica_db_path, .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .identity_namespace = .{ .table_id = 20, .shard_id = 10, .range_id = 1 },
+            .start_index_workers = false,
+        });
+        defer db.close();
+        const schema_json =
+            \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"title":{"type":"string","x-antfly-field":{"type":"text"}}}}}}}
+        ;
+        try db.setSchemaJson(alloc, schema_json);
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:seed", .value = "{\"title\":\"seed state\"}" }},
+            .sync_level = .full_index,
+        });
+        const txn_id = try db.beginTransaction(10_000);
+        try db.writeIntents(txn_id, &.{.{ .key = "doc:txn", .value = "{\"title\":\"txn state\"}" }}, &.{});
+        try db.commitTransaction(txn_id, 10_001);
+        try db.core.store.appendReplayOpaque(
+            alloc,
+            db.core.nextDerivedAppendSequence(),
+            "derived-change-journal-state",
+        );
+    }
+    try fs_paths.createDirPathPortable(io_impl.io(), std.fs.path.dirname(raft_wal_sentinel).?);
+    var raft_fixture = try std.Io.Dir.cwd().createFile(io_impl.io(), raft_wal_sentinel, .{ .truncate = true });
+    try raft_fixture.writeStreamingAll(io_impl.io(), "node-local-raft-wal-must-not-ship");
+    try raft_fixture.sync(io_impl.io());
+    raft_fixture.close(io_impl.io());
+    {
+        var replica_catalog = try antfly.raft.FileReplicaCatalog.init(alloc, replica_catalog_path);
+        defer replica_catalog.deinit();
+        try replica_catalog.catalog().upsertReplica(.{
+            .group_id = 1,
+            .replica_id = 101,
+            .local_node_id = 11,
+            .bootstrap_mode = .persisted,
+            .metadata_version = 1,
+        });
+    }
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), restore_jobs_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), restore_jobs_path) catch {};
+
+    try fs_paths.createDirPathPortable(io_impl.io(), std.fs.path.dirname(extension_manifest_path).?);
+    var extension_manifest_file = try std.Io.Dir.cwd().createFile(io_impl.io(), extension_manifest_path, .{ .truncate = true });
+    try extension_manifest_file.writeStreamingAll(io_impl.io(),
+        \\{"manifest_api_version":"extensions/v1","name":"memoryaf","version":"1.0.0","kind":"extension","digest":"sha256:fixture","install":{"scopes_supported":["cluster"]}}
+    );
+    try extension_manifest_file.sync(io_impl.io());
+    extension_manifest_file.close(io_impl.io());
+    var extension_runtime_file = try std.Io.Dir.cwd().createFile(io_impl.io(), extension_runtime_path, .{ .truncate = true });
+    try extension_runtime_file.writeStreamingAll(io_impl.io(), "portable-extension-runtime");
+    try extension_runtime_file.sync(io_impl.io());
+    extension_runtime_file.close(io_impl.io());
+    try fs_paths.syncDirPortable(io_impl.io(), std.fs.path.dirname(extension_manifest_path).?);
 
     var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, .{
         .cluster_id = 100,
@@ -23672,19 +24919,33 @@ test "data server wires configured HA executors into API server" {
     try primary.createSlot("standby-a", 0);
     _ = try primary.append(.{ .payload = "one" });
     _ = try primary.append(.{ .payload = "two" });
+    // Keep the metrics fixture independent of backup-log growth: this slot is
+    // the one unhealthy streaming standby whose reseed signal we exercise.
+    try primary.markSlotReseedRequired("standby-a");
 
+    var fake_status = FakeStatus{};
+    var fake_catalog = FakeCatalog{ .status = &fake_status };
+    var seed_snapshot_provider = TestHASeedSnapshotProvider{ .db_path = replica_db_path };
     var server = DataServer.initFromLocalMetadataSources(alloc, .{
-        .replica_root_dir = ".",
-        .api_server_cfg = .{ .restore_job_store_path = restore_jobs_path },
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .api_server_cfg = .{
+            .restore_job_store_path = restore_jobs_path,
+            .extension_package_store_dir = extension_store_root,
+            .admin_bearer_token = "runtime-secret-token",
+        },
         .ha = .{
             .admin_context = .{
                 .primary = &primary,
                 .primary_node_id = "primary-a",
             },
             .admin_bearer_token = "runtime-secret-token",
-            .primary_retention_policy = .{ .max_lag_lsn = 1 },
+            .seed_capture_root = seed_capture_root,
+            .pod_uid = "pod-primary-a",
+            .seed_snapshot_provider = seed_snapshot_provider.iface(),
+            .primary_retention_policy = .{},
         },
-    }, FakeCatalog.iface(), FakeStatus.iface());
+    }, fake_catalog.iface(), fake_status.iface());
     defer server.deinit();
     try server.initApiServer();
 
@@ -23709,9 +24970,420 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, admin_resp.body, "\"current_lsn\"") != null);
 
+    const capture_body = "{\"slot_name\":\"standby-capture\",\"generation\":\"seed-standby-capture-3\",\"topology_id\":\"topology-a\",\"topology_generation\":7,\"node_id\":\"standby-a\",\"target_pvc_name\":\"standby-a-data\",\"target_pvc_uid\":\"pvc-uid-7\"}";
+    var capture_resp = try server.http_server.?.handle(.{
+        .method = .POST,
+        .uri = antfly.admin.routes.ha_base_backups_capture,
+        .authorization = "Bearer runtime-secret-token",
+        .content_type = "application/json",
+        .body = capture_body,
+    });
+    defer capture_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), capture_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"action_kind\":\"seed_capture\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"state\":\"applied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"manifest_path\":") != null);
+    const prepared_generation_root = try std.fmt.allocPrint(
+        alloc,
+        "{s}.runtime-snapshots/{s}",
+        .{ seed_capture_root, "seed-standby-capture-3" },
+    );
+    defer alloc.free(prepared_generation_root);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(io_impl.io(), prepared_generation_root, .{}),
+    );
+    const CaptureDigestResponse = struct { capture_receipt_sha256: []const u8 };
+    var capture_response = try std.json.parseFromSlice(CaptureDigestResponse, alloc, capture_resp.body, .{ .ignore_unknown_fields = true });
+    defer capture_response.deinit();
+    const runtime_capture_receipt_path = try std.fs.path.join(alloc, &.{
+        seed_capture_root,
+        "generations/seed-standby-capture-3/COMPLETE.json",
+    });
+    defer alloc.free(runtime_capture_receipt_path);
+    const runtime_capture_receipt = try std.Io.Dir.cwd().readFileAlloc(
+        io_impl.io(),
+        runtime_capture_receipt_path,
+        alloc,
+        .limited(1024 * 1024),
+    );
+    defer alloc.free(runtime_capture_receipt);
+    var runtime_capture_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(runtime_capture_receipt, &runtime_capture_digest, .{});
+    var runtime_capture_digest_hex: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
+    for (runtime_capture_digest, 0..) |byte, index| {
+        runtime_capture_digest_hex[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        runtime_capture_digest_hex[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    try std.testing.expectEqualStrings(&runtime_capture_digest_hex, capture_response.value.capture_receipt_sha256);
+    // Contract: DataServer must package only provider-produced logical output,
+    // never recursively copy the live replica tree (which contains Raft WAL).
+    try std.testing.expectEqual(@as(usize, 1), seed_snapshot_provider.calls);
+    const captured_raft_wal = try std.fs.path.join(alloc, &.{
+        seed_capture_root,
+        "generations/seed-standby-capture-3/content/replicas/group-1/raft/wal-000001",
+    });
+    defer alloc.free(captured_raft_wal);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io_impl.io(), captured_raft_wal, .{}));
+
+    const captured_topology_path = try std.fs.path.join(alloc, &.{
+        seed_capture_root,
+        "generations/seed-standby-capture-3/content/TOPOLOGY.json",
+    });
+    defer alloc.free(captured_topology_path);
+    const captured_topology_json = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), captured_topology_path, alloc, .limited(1024 * 1024));
+    defer alloc.free(captured_topology_json);
+    var captured_topology = try std.json.parseFromSlice(
+        antfly.ha.seed_materialization.Topology,
+        alloc,
+        captured_topology_json,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer captured_topology.deinit();
+    try std.testing.expectEqual(antfly.ha.seed_materialization.topology_format_version, captured_topology.value.format_version);
+    try std.testing.expectEqualStrings("seed-standby-capture-3", captured_topology.value.generation);
+    try std.testing.expectEqual(@as(u64, 7), captured_topology.value.catalog.epoch);
+    try std.testing.expectEqual(@as(usize, 1), captured_topology.value.catalog.tables.len);
+    try std.testing.expectEqual(@as(usize, 1), captured_topology.value.catalog.ranges.len);
+    try std.testing.expectEqual(@as(usize, 1), captured_topology.value.replicas.len);
+    const captured_replica = captured_topology.value.replicas[0];
+    try std.testing.expectEqual(@as(u64, 1), captured_replica.group_id);
+    try std.testing.expectEqual(@as(u64, 20), captured_replica.table_id);
+    try std.testing.expectEqualStrings("docs", captured_replica.table_name);
+    try std.testing.expectEqual(@as(u64, 20), captured_replica.identity_table_id);
+    try std.testing.expectEqual(@as(u64, 10), captured_replica.identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 1), captured_replica.identity_range_id);
+
+    const captured_snapshot_root = try std.fs.path.join(alloc, &.{
+        seed_capture_root,
+        "generations/seed-standby-capture-3/content",
+        captured_replica.snapshot_path,
+    });
+    defer alloc.free(captured_snapshot_root);
+    const captured_journal_path = try std.fs.path.join(alloc, &.{ captured_snapshot_root, "change-journal.bin" });
+    defer alloc.free(captured_journal_path);
+    try std.Io.Dir.accessAbsolute(io_impl.io(), captured_journal_path, .{});
+    const restored_db_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "restored/group-1/table-db" });
+    defer alloc.free(restored_db_path);
+    {
+        var transition = try antfly.db.generation_lifecycle.beginProcessExclusiveWithRuntime(restored_db_path, null);
+        defer transition.deinit();
+        var staged = try transition.beginStaging();
+        defer staged.deinit();
+        try antfly.db.DB.restoreSnapshotToStagedGeneration(&staged, alloc, captured_snapshot_root, staged.path(), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .start_index_workers = false,
+        });
+        try std.testing.expectEqual(antfly.db.generation_lifecycle.PublicationOutcome.durable, try staged.publish());
+    }
+    var restored_db = try antfly.db.DB.open(alloc, restored_db_path, .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .start_index_workers = false,
+    });
+    defer restored_db.close();
+    const restored_schema = (try restored_db.getSchemaJson(alloc)) orelse return error.TestExpectedEqual;
+    defer alloc.free(restored_schema);
+    try std.testing.expect(std.mem.indexOf(u8, restored_schema, "title") != null);
+    const restored_doc = (try restored_db.get(alloc, "doc:seed")) orelse return error.TestExpectedEqual;
+    defer alloc.free(restored_doc);
+    try std.testing.expectEqualStrings("{\"title\":\"seed state\"}", restored_doc);
+    const restored_txn_doc = (try restored_db.get(alloc, "doc:txn")) orelse return error.TestExpectedEqual;
+    defer alloc.free(restored_txn_doc);
+    try std.testing.expectEqualStrings("{\"title\":\"txn state\"}", restored_txn_doc);
+    var restored_search = try restored_db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "title", .text = "seed" } },
+    });
+    defer restored_search.deinit();
+    try std.testing.expectEqual(@as(u32, 1), restored_search.total_hits);
+    // Restore may legitimately advance runtime-owned replay metadata while it
+    // rebuilds derived indexes. The captured digest is verified before install;
+    // validate the restored logical documents and query view rather than
+    // requiring a post-repair store image to remain byte-identical.
+    const captured_slot = primary.slot("standby-capture") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(antfly.ha.slot_store.SlotLifecycle.seeding, captured_slot.lifecycle);
+    try std.testing.expect(!captured_slot.active);
+    try std.testing.expect(!captured_slot.reseed_required);
+
+    var capture_retry = try server.http_server.?.handle(.{
+        .method = .POST,
+        .uri = antfly.admin.routes.ha_base_backups_capture,
+        .authorization = "Bearer runtime-secret-token",
+        .content_type = "application/json",
+        .body = capture_body,
+    });
+    defer capture_retry.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), capture_retry.status);
+    try std.testing.expect(std.mem.indexOf(u8, capture_retry.body, "\"state\":\"already_applied\"") != null);
+    var capture_retry_response = try std.json.parseFromSlice(CaptureDigestResponse, alloc, capture_retry.body, .{ .ignore_unknown_fields = true });
+    defer capture_retry_response.deinit();
+    try std.testing.expectEqualStrings(capture_response.value.capture_receipt_sha256, capture_retry_response.value.capture_receipt_sha256);
+
+    server.ha_cfg.seed_snapshot_provider = null;
+    fake_status.include_extension = true;
+    var default_capture = try DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-default-provider",
+        "seed-default-provider-4",
+        capture_binding,
+    );
+    defer default_capture.deinit(alloc);
+    const default_topology_path = try std.fs.path.join(alloc, &.{ default_capture.capture.content_root, "TOPOLOGY.json" });
+    defer alloc.free(default_topology_path);
+    try std.Io.Dir.accessAbsolute(io_impl.io(), default_topology_path, .{});
+    const default_topology_json = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), default_topology_path, alloc, .limited(1024 * 1024));
+    defer alloc.free(default_topology_json);
+    var default_topology = try std.json.parseFromSlice(
+        antfly.ha.seed_materialization.Topology,
+        alloc,
+        default_topology_json,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer default_topology.deinit();
+    try std.testing.expectEqual(@as(usize, 1), default_topology.value.catalog.extension_packages.len);
+    try std.testing.expectEqual(@as(usize, 2), default_topology.value.extension_artifacts.len);
+    for (default_topology.value.extension_artifacts) |artifact| {
+        const captured_extension_path = try std.fs.path.join(alloc, &.{ default_capture.capture.content_root, artifact.path });
+        defer alloc.free(captured_extension_path);
+        const source_extension_path = try std.fs.path.join(alloc, &.{ extension_store_root, artifact.path["extensions/".len..] });
+        defer alloc.free(source_extension_path);
+        const captured_extension = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), captured_extension_path, alloc, .limited(1024 * 1024));
+        defer alloc.free(captured_extension);
+        const source_extension = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), source_extension_path, alloc, .limited(1024 * 1024));
+        defer alloc.free(source_extension);
+        try std.testing.expectEqualStrings(source_extension, captured_extension);
+    }
+
+    // Deterministically mutate a source binary after the first copy pass.
+    // Capture must discard the whole building generation rather than publish
+    // a mixed package-store observation.
+    const extension_race_building_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "extension-race-building" });
+    defer alloc.free(extension_race_building_root);
+    try fs_paths.createDirPathPortable(io_impl.io(), extension_race_building_root);
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), extension_race_building_root) catch {};
+    const ExtensionRaceProbe = struct {
+        runtime_path: []const u8,
+
+        fn afterCopy(ptr: *anyopaque, hook_alloc: std.mem.Allocator) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var hook_io_impl = std.Io.Threaded.init(hook_alloc, .{});
+            defer hook_io_impl.deinit();
+            var file = try std.Io.Dir.cwd().createFile(hook_io_impl.io(), self.runtime_path, .{ .truncate = true });
+            defer file.close(hook_io_impl.io());
+            try file.writeStreamingAll(hook_io_impl.io(), "raced-extension-runtime");
+            try file.sync(hook_io_impl.io());
+        }
+    };
+    var extension_race_probe = ExtensionRaceProbe{ .runtime_path = extension_runtime_path };
+    var raced_artifacts = std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact).empty;
+    defer freeHASeedSnapshotExtensionArtifacts(alloc, &raced_artifacts);
+    try std.testing.expectError(error.HASeedExtensionChangedDuringCapture, server.captureHASeedExtensionArtifacts(
+        alloc,
+        io_impl.io(),
+        extension_race_building_root,
+        &.{.{
+            .name = "memoryaf",
+            .version = "1.0.0",
+            .digest = "sha256:fixture",
+            .install = .{ .scopes_supported = &.{.cluster} },
+        }},
+        &raced_artifacts,
+        .{ .ptr = &extension_race_probe, .after_copy_fn = ExtensionRaceProbe.afterCopy },
+    ));
+    const default_raft_wal = try std.fs.path.join(alloc, &.{ default_capture.capture.content_root, "replicas/group-1/raft/wal-000001" });
+    defer alloc.free(default_raft_wal);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io_impl.io(), default_raft_wal, .{}));
+    const default_captured_slot = primary.slot("standby-default-provider") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(antfly.ha.slot_store.SlotLifecycle.seeding, default_captured_slot.lifecycle);
+    try std.testing.expect(!default_captured_slot.reseed_required);
+
+    // Auth-enabled capture is generation-bound and materializes a complete
+    // standalone auth backend alongside the restored data replicas.
+    var auth_backend = antfly.lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1 });
+    defer auth_backend.close();
+    var auth_runtime = try auth_backend.runtimeNamespaceStore(alloc);
+    defer auth_runtime.deinit();
+    var auth_users = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime);
+    var auth_casbin = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime);
+    var auth_manager = try antfly.usermgr.UserManager.init(
+        alloc,
+        auth_users.iface(),
+        try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin.iface()),
+    );
+    defer auth_manager.deinit();
+    var auth_admin = try antfly.usermgr.Permission.initOwned(alloc, .@"*", "*", .admin);
+    defer auth_admin.deinit(alloc);
+    var auth_alice = try auth_manager.createUserWithMetadata("alice", "seed-secret", &.{auth_admin}, "{\"tenant_id\":\"acme\"}");
+    defer auth_alice.deinit(alloc);
+    var auth_reader = try antfly.usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+    defer auth_reader.deinit(alloc);
+    try auth_manager.addPermissionToSubject("role:tenant-reader", auth_reader);
+    try auth_manager.addRoleToUser("alice", "role:tenant-reader");
+    try auth_manager.setSubjectRowFilter("role:tenant-reader", "docs", "{\"term\":{\"tenant_id\":\"acme\"}}");
+    var auth_key_filter = try antfly.usermgr.RowFilterEntry.initOwned(alloc, "docs", "{\"term\":{\"tier\":\"gold\"}}");
+    defer auth_key_filter.deinit(alloc);
+    var auth_key = try auth_manager.createApiKey("alice", "seed-ci", &.{auth_reader}, &.{auth_key_filter}, null);
+    defer auth_key.deinit(alloc);
+    server.api_server_cfg.auth_enabled = true;
+    server.api_server_cfg.user_manager = &auth_manager;
+    var auth_capture = try DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-auth-enabled",
+        "seed-standby-auth-enabled-5",
+        capture_binding,
+    );
+    defer auth_capture.deinit(alloc);
+    server.api_server_cfg.auth_enabled = false;
+    server.api_server_cfg.user_manager = null;
+    const auth_topology_path = try std.fs.path.join(alloc, &.{ auth_capture.capture.content_root, "TOPOLOGY.json" });
+    defer alloc.free(auth_topology_path);
+    const auth_topology_json = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), auth_topology_path, alloc, .limited(16 * 1024 * 1024));
+    defer alloc.free(auth_topology_json);
+    var auth_topology = try std.json.parseFromSlice(HASeedSnapshotTopology, alloc, auth_topology_json, .{ .ignore_unknown_fields = false });
+    defer auth_topology.deinit();
+    try std.testing.expect(auth_topology.value.auth_enabled);
+    try std.testing.expect(auth_topology.value.auth_artifact != null);
+    const auth_live_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "auth-materialized" });
+    defer alloc.free(auth_live_root);
+    var auth_materialized = try antfly.ha.seed_materialization.materialize(alloc, .{
+        .raw_generation_root = auth_capture.capture.content_root,
+        .live_installing_root = auth_live_root,
+        .generation = "seed-standby-auth-enabled-5",
+        .target_local_node_id = 22,
+        .seed_receipt_sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+        .capture_receipt_sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
+        .raw_manifest_sha256 = "2222222222222222222222222222222222222222222222222222222222222222",
+        .raw_aggregate_sha256 = "3333333333333333333333333333333333333333333333333333333333333333",
+    });
+    defer auth_materialized.deinit(alloc);
+    const restored_auth_root = try std.fs.path.join(alloc, &.{ auth_live_root, "metadata/auth" });
+    defer alloc.free(restored_auth_root);
+    {
+        var restored_auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, restored_auth_root, .{ .flush_threshold = 1 });
+        defer restored_auth_backend.close();
+        var restored_auth_runtime = try restored_auth_backend.backend.runtimeNamespaceStore(alloc);
+        defer restored_auth_runtime.deinit();
+        var restored_auth_users = antfly.usermgr.StorageUserStore.init(alloc, restored_auth_runtime);
+        var restored_auth_casbin = antfly.usermgr.StorageCasbinAdapter.init(alloc, restored_auth_runtime);
+        var restored_auth = try antfly.usermgr.UserManager.init(
+            alloc,
+            restored_auth_users.iface(),
+            try antfly.usermgr.initDefaultEnforcer(alloc, restored_auth_casbin.iface()),
+        );
+        defer restored_auth.deinit();
+        var restored_alice = try restored_auth.authenticateUser("alice", "seed-secret");
+        defer restored_alice.deinit(alloc);
+        try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", restored_alice.metadata_json);
+        try std.testing.expect(try restored_auth.enforce("alice", .table, "docs", .read));
+        var restored_key = try restored_auth.validateApiKey(auth_key.key.key_id, auth_key.key_secret);
+        defer restored_key.deinit(alloc);
+        try std.testing.expectEqualStrings("alice", restored_key.username);
+        try std.testing.expectEqual(@as(usize, 1), restored_key.roles.len);
+        try std.testing.expectEqualStrings("role:tenant-reader", restored_key.roles[0]);
+        try std.testing.expectEqual(@as(usize, 1), restored_key.row_filter.len);
+        try restored_auth.updatePassword("alice", "post-seed-secret");
+    }
+    // Materialization is a one-shot install. Subsequent auth mutations survive
+    // restart and are not replayed over by the immutable seed artifact.
+    {
+        var restarted_backend = try antfly.lsm_backend.BackendHandle.open(alloc, restored_auth_root, .{ .flush_threshold = 1 });
+        defer restarted_backend.close();
+        var restarted_runtime = try restarted_backend.backend.runtimeNamespaceStore(alloc);
+        defer restarted_runtime.deinit();
+        var restarted_users = antfly.usermgr.StorageUserStore.init(alloc, restarted_runtime);
+        var restarted_casbin = antfly.usermgr.StorageCasbinAdapter.init(alloc, restarted_runtime);
+        var restarted_auth = try antfly.usermgr.UserManager.init(
+            alloc,
+            restarted_users.iface(),
+            try antfly.usermgr.initDefaultEnforcer(alloc, restarted_casbin.iface()),
+        );
+        defer restarted_auth.deinit();
+        var restarted_alice = try restarted_auth.authenticateUser("alice", "post-seed-secret");
+        defer restarted_alice.deinit(alloc);
+        try std.testing.expectError(error.InvalidPassword, restarted_auth.authenticateUser("alice", "seed-secret"));
+    }
+
+    // A store package absent from the catalog must not ride along in a seed.
+    fake_status.include_extension = false;
+    try std.testing.expectError(error.HASeedExtensionCatalogMismatch, DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-unregistered-extension",
+        "seed-standby-unregistered-extension-5",
+        capture_binding,
+    ));
+    try std.testing.expect(primary.slot("standby-unregistered-extension") == null);
+    fake_status.include_extension = true;
+
+    // Conversely, every catalog package must have an exact package-store
+    // image. Missing binaries cannot yield a standby that only looks healthy.
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), extension_store_root) catch {};
+    try std.testing.expectError(error.HASeedExtensionCatalogMismatch, DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-missing-extension",
+        "seed-standby-missing-extension-6",
+        capture_binding,
+    ));
+    try std.testing.expect(primary.slot("standby-missing-extension") == null);
+
+    // Auth-enabled capture without a concrete manager still fails before a
+    // slot is burned; it can never silently emit an empty auth artifact.
+    server.api_server_cfg.auth_enabled = true;
+    if (DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-auth-missing-manager",
+        "seed-standby-auth-missing-manager-5",
+        capture_binding,
+    )) |unexpected_value| {
+        var unexpected = unexpected_value;
+        unexpected.deinit(alloc);
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(error.HASeedCaptureAuthManagerMissing, err);
+    try std.testing.expect(primary.slot("standby-auth-missing-manager") == null);
+    server.api_server_cfg.auth_enabled = false;
+
+    // Contract: maintenance, bulk/structural activity, or an unsupported
+    // snapshot provider must fail closed before backup_start burns a slot.
+    var active_group_operation = server.write_source.tryBeginGroupRefreshActivity("docs", 1) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectError(error.HASeedSnapshotRuntimeBusy, DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-structural-busy",
+        "seed-standby-structural-busy-5",
+        capture_binding,
+    ));
+    active_group_operation.deinit();
+
+    server.lsm_maintenance_active.store(true, .release);
+    defer server.lsm_maintenance_active.store(false, .release);
+    try std.testing.expectError(error.HASeedSnapshotRuntimeBusy, DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-busy",
+        "seed-standby-busy-6",
+        capture_binding,
+    ));
+    server.lsm_maintenance_active.store(false, .release);
+
+    server.ha_cfg.seed_snapshot_provider = seed_snapshot_provider.iface();
+    seed_snapshot_provider.unsupported = true;
+    try std.testing.expectError(error.HASeedSnapshotUnsupportedBackend, DataServer.captureHASeedCallback(
+        &server,
+        alloc,
+        "standby-unsupported",
+        "seed-standby-unsupported-7",
+        capture_binding,
+    ));
+
     var internal_resp = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.internal.routes.ha_replication_identify,
+        .authorization = "Bearer runtime-secret-token",
     });
     defer internal_resp.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
@@ -23723,7 +25395,7 @@ test "data server wires configured HA executors into API server" {
     try health.metricsWriter().writeMetrics(&writer);
     const metrics = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_runtime_configured 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_slot_count 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_slot_count 4\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_retained_age_ns 0\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_active_slots 0\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_reseed_recommended 1\n") != null);
@@ -24364,6 +26036,7 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
     var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, identity, .{});
     defer primary.close();
     _ = try primary.append(.{ .payload = "before-fence" });
+    _ = try primary.append(.{ .payload = "after-controller-observation" });
 
     var fence_store = try antfly.ha.fencing.Store.open(alloc, fence_path.ptr, .{});
     defer fence_store.close();
@@ -24376,6 +26049,7 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
                 .primary_node_id = "primary-a",
                 .fence_store = &fence_store,
             },
+            .admin_bearer_token = "runtime-secret-token",
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
@@ -24394,11 +26068,15 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
     var fence_response = try server.http_server.?.handle(.{
         .method = .POST,
         .uri = antfly.admin.routes.ha_fence,
+        .authorization = "Bearer runtime-secret-token",
         .content_type = "application/json",
         .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"data-server-test\"}",
     });
     defer fence_response.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 200), fence_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, fence_response.body, "\"node_id\":\"primary-a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fence_response.body, "\"required_lsn\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fence_response.body, "\"observed_lsn\":2") != null);
     try std.testing.expectError(error.HAFencedPrimary, source_gate.check());
     try std.testing.expect((try server.read_source.source().lookup(alloc, "docs", "doc:local", .{}, .stale)) == null);
     try std.testing.expectError(
@@ -24499,8 +26177,8 @@ test "data server applies routed HA replication records through standby write ga
 
     var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
         .cluster_id = 100,
-        .shard_id = 77,
-        .table_id = 7,
+        .shard_id = 0,
+        .table_id = 0,
         .timeline_id = 1,
         .epoch = 1,
     }, .{});
@@ -24513,6 +26191,7 @@ test "data server applies routed HA replication records through standby write ga
                 .standby = &standby,
                 .standby_node_id = "standby-a",
             },
+            .admin_bearer_token = "runtime-secret-token",
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
@@ -24536,6 +26215,37 @@ test "data server applies routed HA replication records through standby write ga
         .previous_lsn = 0,
         .payload = payload,
     });
+
+    try standby.bootstrapCheckpoint(1, "seed-checkpoint");
+    _ = try standby.receive(.{
+        .kind = .backup_end,
+        .payload_codec = .binary,
+        .cluster_id = 100,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 2,
+        .previous_lsn = 1,
+        .payload = "seed-manifest",
+    });
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try standby.applyAvailable(&server, DataServer.applyHAReplicationRecordCallback),
+    );
+    try std.testing.expectEqual(@as(u64, 2), standby.currentProgress().applied_lsn);
+    try std.testing.expectError(error.HAReplicationRecordMissingTableId, server.applyHAReplicationRecord(.{
+        .kind = .batch_mutation,
+        .payload_codec = .json,
+        .cluster_id = 100,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 3,
+        .previous_lsn = 2,
+        .payload = payload,
+    }));
 
     var lookup = (try server.read_source.source().lookupGroupLocal(
         alloc,
@@ -24609,6 +26319,36 @@ test "data server pulls and applies HA standby replication through internal HTTP
         fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
     };
 
+    const AuthenticatedExecutor = struct {
+        upstream: antfly.common.http.RequestExecutor,
+        accepted: usize = 0,
+        rejected: usize = 0,
+
+        fn executor(self: *@This()) antfly.common.http.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(
+            ptr: *anyopaque,
+            response_alloc: std.mem.Allocator,
+            request: antfly.common.http.HttpRequest,
+        ) !antfly.common.http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.authorization == null or
+                !std.mem.eql(u8, request.authorization.?, "Bearer runtime-secret-token"))
+            {
+                self.rejected += 1;
+                return .{
+                    .status = 401,
+                    .content_type = try response_alloc.dupe(u8, "text/plain"),
+                    .body = try response_alloc.dupe(u8, "unauthorized"),
+                };
+            }
+            self.accepted += 1;
+            return try self.upstream.execute(response_alloc, request);
+        }
+    };
+
     const nonce = platform_time.monotonicNs();
     const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-root-{d}", .{nonce});
     defer alloc.free(replica_root_raw);
@@ -24663,6 +26403,7 @@ test "data server pulls and applies HA standby replication through internal HTTP
     defer standby.close();
 
     var primary_internal = antfly.ha.http_internal.Server.init(alloc, &primary);
+    var authenticated_executor = AuthenticatedExecutor{ .upstream = primary_internal.executor() };
     var server = DataServer.initFromLocalMetadataSources(alloc, .{
         .replica_root_dir = replica_root,
         .ha = .{
@@ -24670,12 +26411,13 @@ test "data server pulls and applies HA standby replication through internal HTTP
                 .standby = &standby,
                 .standby_node_id = "standby-a",
             },
+            .admin_bearer_token = "runtime-secret-token",
             .standby_replication = .{
                 .upstream_base_uri = "http://primary.internal.test",
                 .slot_name = "standby-a",
                 .options = .{ .max_records = 1 },
                 .catch_up_until_end_of_wal = true,
-                .executor = primary_internal.executor(),
+                .executor = authenticated_executor.executor(),
             },
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
@@ -24686,6 +26428,8 @@ test "data server pulls and applies HA standby replication through internal HTTP
     const progress = standby.currentProgress();
     try std.testing.expectEqual(@as(u64, 1), progress.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), progress.applied_lsn);
+    try std.testing.expect(authenticated_executor.accepted >= 3);
+    try std.testing.expectEqual(@as(usize, 0), authenticated_executor.rejected);
     try std.testing.expect(server.ha_standby_replication_last_attempt_ns.load(.acquire) > 0);
     try std.testing.expect(server.ha_standby_replication_last_success_ns.load(.acquire) > 0);
 
@@ -24696,6 +26440,7 @@ test "data server pulls and applies HA standby replication through internal HTTP
     var admin_status = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.admin.routes.ha_standby_status,
+        .authorization = "Bearer runtime-secret-token",
     });
     defer admin_status.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 200), admin_status.status);
@@ -24807,7 +26552,7 @@ test "data server HA replication network wait leaves state mutex available" {
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            self.server.runHAStandbyReplicationRound() catch |err| {
+            self.server.runRound() catch |err| {
                 self.err = err;
             };
         }
@@ -24869,6 +26614,7 @@ test "data server HA replication network wait leaves state mutex available" {
                 .standby = &standby,
                 .standby_node_id = "standby-a",
             },
+            .admin_bearer_token = "runtime-secret-token",
             .standby_replication = .{
                 .upstream_base_uri = "http://primary.internal.test",
                 .slot_name = "standby-a",
@@ -24912,8 +26658,20 @@ test "data server HA replication network wait leaves state mutex available" {
 
     try std.testing.expect(mutex_available);
     try std.testing.expect(promotion_err == null);
-    const replication_err = replication_thread.err orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(error.HAStandbyStateChanged, replication_err);
+    try std.testing.expect(replication_thread.err == null);
+    try std.testing.expectEqual(@as(u64, 0), server.ha_standby_replication_failure_count.load(.acquire));
+
+    // A round that begins after the durable promotion but before runtime
+    // adoption must not issue another pull against the former primary.
+    try std.testing.expectError(
+        error.HAStandbyStateChanged,
+        server.replicateHAStandbyAvailable(
+            primary_internal.executor(),
+            "http://primary.internal.test",
+            "standby-a",
+            .{ .verify_upstream = false },
+        ),
+    );
 }
 
 test "data server HA state change synchronously adopts promotion and rewires live HTTP executor" {
@@ -25007,6 +26765,9 @@ test "data server HA state change synchronously adopts promotion and rewires liv
 
     var server = DataServer.initFromLocalMetadataSources(alloc, .{
         .replica_root_dir = replica_root,
+        .api_server_cfg = .{
+            .admin_bearer_token = "runtime-secret-token",
+        },
         .ha = .{
             .admin_context = .{
                 .standby = if (standby) |*handle| handle else null,
@@ -25032,6 +26793,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     var before = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.internal.routes.ha_replication_identify,
+        .authorization = "Bearer runtime-secret-token",
     });
     defer before.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 404), before.status);
@@ -25044,6 +26806,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     try std.testing.expect(server.ha_cfg.admin_context.?.standby == null);
     try std.testing.expect(server.ha_cfg.admin_context.?.promoted_standby_handoff != null);
     try std.testing.expect(server.ha_admin_server.?.auth.state_mutex == &server.ha_state_mutex);
+    try std.testing.expect(server.ha_admin_server.?.auth.primary_fence_barrier == &server.ha_mutation_barrier);
     try std.testing.expect(server.ha_internal_server.?.state_mutex == &server.ha_state_mutex);
     const public_read_gate_after = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
     const public_write_gate_after = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
@@ -25055,6 +26818,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     var write_check = try server.http_server.?.handle(.{
         .method = .POST,
         .uri = antfly.admin.routes.ha_write_check,
+        .authorization = "Bearer runtime-secret-token",
         .content_type = "application/json",
         .body = "{\"role\":\"standby\",\"expected_identity\":{\"cluster_id\":100,\"shard_id\":77,\"table_id\":7,\"timeline_id\":2,\"epoch\":2}}",
     });
@@ -25067,6 +26831,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     var owner_job_check = try server.http_server.?.handle(.{
         .method = .POST,
         .uri = antfly.admin.routes.ha_owner_job_check,
+        .authorization = "Bearer runtime-secret-token",
         .content_type = "application/json",
         .body = "{\"role\":\"standby\",\"kind\":\"retention_advance\",\"expected_identity\":{\"cluster_id\":100,\"shard_id\":77,\"table_id\":7,\"timeline_id\":2,\"epoch\":2}}",
     });
@@ -25078,10 +26843,11 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     var internal_resp = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.internal.routes.ha_replication_identify,
+        .authorization = "Bearer runtime-secret-token",
     });
     defer internal_resp.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, internal_resp.body, "\"record_format_version\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, internal_resp.body, "\"timeline_id\":2") != null);
 }
 
 test "data server promotion open failure preserves retryable standby" {
@@ -25151,6 +26917,10 @@ test "data server promotion open failure preserves retryable standby" {
     defer alloc.free(wrong_log_raw);
     const wrong_log = try alloc.dupeZ(u8, wrong_log_raw);
     defer alloc.free(wrong_log);
+    const promoted_slots_raw = try std.fmt.allocPrint(alloc, "{s}.promoted-primary-slots", .{standby_progress});
+    defer alloc.free(promoted_slots_raw);
+    const promoted_slots = try alloc.dupeZ(u8, promoted_slots_raw);
+    defer alloc.free(promoted_slots);
     const standby_log_alias = try std.fmt.allocPrint(alloc, "./{s}", .{standby_log});
     defer alloc.free(standby_log_alias);
     const standby_progress_alias = try std.fmt.allocPrint(alloc, "./{s}", .{standby_progress});
@@ -25162,17 +26932,12 @@ test "data server promotion open failure preserves retryable standby" {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), wrong_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), promoted_slots) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), wrong_log) catch {};
-    defer {
-        const promoted_slots = std.fmt.allocPrint(alloc, "{s}.promoted-primary-slots", .{standby_progress}) catch null;
-        if (promoted_slots) |path| {
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-            alloc.free(path);
-        }
-    }
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), promoted_slots) catch {};
 
     var standby: ?antfly.ha.standby.Standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
         .cluster_id = 100,
@@ -25214,6 +26979,15 @@ test "data server promotion open failure preserves retryable standby" {
     try std.testing.expectError(error.HAReadRequiresPrimary, public_read_gate.check(.stale));
     try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate.check());
 
+    var slot_blocker: ?antfly.ha.primary.Primary = try antfly.ha.primary.Primary.open(alloc, wrong_log.ptr, promoted_slots.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 2,
+        .epoch = 2,
+    }, .{});
+    defer if (slot_blocker) |*handle| handle.close();
+
     try std.testing.expectError(error.PromotedLogMismatch, server.runHAStandbyReplicationRound());
     try std.testing.expect(standby != null);
     try std.testing.expect(server.ha_promoted_primary == null);
@@ -25229,6 +27003,15 @@ test "data server promotion open failure preserves retryable standby" {
 
     server.ha_cfg.standby_replication.?.standby_log_path = standby_log_alias;
     server.ha_cfg.standby_replication.?.standby_progress_path = standby_progress_alias;
+    try std.testing.expectError(error.LsmRootWriterAlreadyOpen, server.runHAStandbyReplicationRound());
+    server.clearHAStandbyReplicationRetry();
+    try server.runRound();
+    try std.testing.expectEqual(@as(u64, 2), server.ha_standby_replication_failure_count.load(.acquire));
+    try std.testing.expect(standby != null);
+    try std.testing.expect(server.ha_promoted_primary == null);
+
+    if (slot_blocker) |*handle| handle.close();
+    slot_blocker = null;
     try server.runHAStandbyReplicationRound();
     try std.testing.expect(standby == null);
     try std.testing.expect(server.ha_promoted_primary != null);
@@ -25465,7 +27248,7 @@ test "data server resumes HA standby replication from durable progress after res
     }
 }
 
-test "data runtime records HA standby replication round failures" {
+test "data runtime records and backs off HA standby replication round failures" {
     const alloc = std.testing.allocator;
     const FakeStatus = struct {
         fn iface() antfly.public_api.http_server.StatusSource {
@@ -25525,7 +27308,7 @@ test "data runtime records HA standby replication round failures" {
         }
 
         fn execute(_: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
-            return error.ConnectionRefused;
+            return error.NoAddressReturned;
         }
     };
 
@@ -25569,6 +27352,7 @@ test "data runtime records HA standby replication round failures" {
                 .standby = &standby,
                 .standby_node_id = "standby-a",
             },
+            .admin_bearer_token = "runtime-secret-token",
             .standby_replication = .{
                 .upstream_base_uri = "http://primary.internal.test",
                 .slot_name = "standby-a",
@@ -25582,14 +27366,19 @@ test "data runtime records HA standby replication round failures" {
     try std.testing.expectEqual(@as(u64, 1), server.ha_standby_replication_failure_count.load(.acquire));
     try std.testing.expect(server.ha_standby_replication_last_attempt_ns.load(.acquire) > 0);
     try std.testing.expectEqual(@as(u64, 0), server.ha_standby_replication_last_success_ns.load(.acquire));
+    const next_attempt_ns = server.ha_standby_replication_next_attempt_ns.load(.acquire);
+    try std.testing.expect(next_attempt_ns > 0);
+    try std.testing.expect(!server.haStandbyReplicationRetryDue(next_attempt_ns - 1));
+    try std.testing.expect(server.haStandbyReplicationRetryDue(next_attempt_ns));
 
     var admin_status = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.admin.routes.ha_standby_status,
+        .authorization = "Bearer runtime-secret-token",
     });
     defer admin_status.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 200), admin_status.status);
-    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_error\":\"ConnectionRefused\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_error\":\"NoAddressReturned\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_attempt_ns\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"replication_failures_total\":1") != null);
 
@@ -25602,6 +27391,15 @@ test "data runtime records HA standby replication round failures" {
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_failures_total 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_attempt_ns ") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_success_ns 0\n") != null);
+}
+
+test "data runtime HA replication HTTP budget covers base64 apply envelope" {
+    const cfg = DataServer.haStandbyReplicationHTTPExecutorConfig();
+    const encoded_batch_bytes = std.base64.standard.Encoder.calcSize(
+        DataServer.ha_replication_default_max_encoded_bytes_per_apply,
+    );
+    try std.testing.expect(cfg.max_response_bytes >= encoded_batch_bytes + 64 * 1024);
+    try std.testing.expect(cfg.resolve_before_connect);
 }
 
 test "data runtime records HA standby apply failures without stopping run round" {
@@ -25716,6 +27514,7 @@ test "data runtime records HA standby apply failures without stopping run round"
                 .standby = &standby,
                 .standby_node_id = "standby-a",
             },
+            .admin_bearer_token = "runtime-secret-token",
             .standby_replication = .{
                 .upstream_base_uri = "http://primary.internal.test",
                 .slot_name = "standby-a",
@@ -25741,6 +27540,7 @@ test "data runtime records HA standby apply failures without stopping run round"
     var admin_status = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.admin.routes.ha_standby_status,
+        .authorization = "Bearer runtime-secret-token",
     });
     defer admin_status.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 200), admin_status.status);

@@ -1,9 +1,10 @@
-import { AntflyClient } from "./client.js";
+import { AntflyClient, authorizationHeader } from "./client.js";
 import { InferenceClient } from "./inference-client.js";
 import type { AntflyConfig } from "./types.js";
 
 export interface SDKConfig extends AntflyConfig {
   inferenceBaseUrl?: string;
+  inferenceMaxBinaryResponseBytes?: number;
 }
 
 export class Client {
@@ -12,9 +13,14 @@ export class Client {
 
   constructor(config: SDKConfig) {
     this.antflyClient = new AntflyClient(config);
+    const authorization = authorizationHeader(config.auth);
     this.inferenceClient = new InferenceClient({
       baseUrl: config.inferenceBaseUrl ?? config.baseUrl,
-      headers: config.headers,
+      headers: {
+        ...config.headers,
+        ...(authorization ? { Authorization: authorization } : {}),
+      },
+      maxBinaryResponseBytes: config.inferenceMaxBinaryResponseBytes,
     });
   }
 

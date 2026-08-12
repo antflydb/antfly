@@ -17,6 +17,7 @@ dependencies = [
 
 [tool.pytest.ini_options]
 markers = [
+    "cuda_l4: opt-in Gemma 4 CUDA qualification requiring a dedicated NVIDIA L4",
     "slow: marks tests that require large models or long inference",
     "multimodal: marks tests requiring vision/audio model capabilities",
     "model_integration: marks tests requiring local model weights or downloads",

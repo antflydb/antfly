@@ -146,6 +146,14 @@ pub const BatchAppendResult = struct {
     }
 };
 
+/// Result of an append guarded by a durable idempotency key. The key and
+/// digest live in the same transaction and namespace as the WAL entry, so a
+/// crash can expose neither half of the publication boundary.
+pub const IdempotentAppendResult = struct {
+    lsn: u64,
+    appended: bool,
+};
+
 pub const WalStats = struct {
     append_calls: u64 = 0,
     append_batch_calls: u64 = 0,
@@ -565,6 +573,77 @@ pub const WAL = struct {
         self.stats.total_wait_ns += self.elapsedSince(wait_started);
         if (request.err) |err| return err;
         return request.result;
+    }
+
+    /// Append one entry exactly once for `idempotency_key`.
+    ///
+    /// A retry with the same digest returns the original LSN without appending.
+    /// Reusing the key for different bytes fails closed. The compact key index
+    /// is deliberately retained when old WAL payloads are truncated, preserving
+    /// replay safety without retaining the unbounded receipt bodies.
+    pub fn appendIdempotent(
+        self: *WAL,
+        idempotency_key: []const u8,
+        digest: []const u8,
+        data: []const u8,
+    ) !IdempotentAppendResult {
+        if (idempotency_key.len == 0 or idempotency_key.len > 1024 or digest.len == 0 or digest.len > 1024)
+            return error.InvalidIdempotencyKey;
+        const metadata_key = try idempotencyMetadataKeyAlloc(idempotency_key);
+        defer std.heap.page_allocator.free(metadata_key);
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        while (self.coordinator_active or self.pending_head != null) {
+            self.mutex.unlock();
+            std.Thread.yield() catch {};
+            lockAtomic(&self.mutex);
+        }
+
+        var txn = try self.beginWriteTxn();
+        errdefer txn.abort();
+        if (txn.get(metadata_key)) |raw| {
+            const existing = try decodeIdempotencyMetadata(raw);
+            if (!std.mem.eql(u8, existing.digest, digest)) return error.IdempotencyConflict;
+            txn.abort();
+            return .{ .lsn = existing.lsn, .appended = false };
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+
+        const lsn = self.next_lsn;
+        const next_lsn = try std.math.add(u64, lsn, 1);
+        try putEncodedEntry(&txn, lsn, data);
+        try putNextLsnMeta(&txn, next_lsn);
+        const metadata = try encodeIdempotencyMetadataAlloc(digest, lsn);
+        defer std.heap.page_allocator.free(metadata);
+        try txn.put(metadata_key, metadata);
+        try txn.commit();
+        self.next_lsn = next_lsn;
+        if (self.sync_after_commit) _ = try self.store_owner.syncCommitDurability();
+        try self.waitForCommitCompletion(self.commit_completion_delay_ns);
+        return .{ .lsn = lsn, .appended = true };
+    }
+
+    /// Test-only corruption hook used by higher-level durable protocols to
+    /// prove that a missing/torn tail is detected rather than silently skipped.
+    pub fn injectCorruptEntryForTest(self: *WAL, lsn: u64) !void {
+        if (!builtin.is_test) return error.Unsupported;
+        if (lsn == 0 or lsn > self.lastLsn()) return error.InvalidLsn;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        while (self.coordinator_active or self.pending_head != null) {
+            self.mutex.unlock();
+            std.Thread.yield() catch {};
+            lockAtomic(&self.mutex);
+        }
+        var txn = try self.beginWriteTxn();
+        errdefer txn.abort();
+        const key = std.mem.toBytes(std.mem.nativeToBig(u64, lsn));
+        try txn.put(&key, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+        try txn.commit();
+        if (self.sync_after_commit) _ = try self.store_owner.syncCommitDurability();
     }
 
     pub fn statsSnapshot(self: *WAL) WalStats {
@@ -1272,6 +1351,38 @@ fn putEncodedEntry(txn: anytype, lsn: u64, data: []const u8) !void {
 }
 
 const meta_next_lsn_key = [_]u8{0};
+const idempotency_metadata_prefix = "\x00\x01wal-idempotency/";
+
+const IdempotencyMetadata = struct {
+    digest: []const u8,
+    lsn: u64,
+};
+
+fn idempotencyMetadataKeyAlloc(key: []const u8) ![]u8 {
+    const out = try std.heap.page_allocator.alloc(u8, idempotency_metadata_prefix.len + key.len);
+    @memcpy(out[0..idempotency_metadata_prefix.len], idempotency_metadata_prefix);
+    @memcpy(out[idempotency_metadata_prefix.len..], key);
+    return out;
+}
+
+fn encodeIdempotencyMetadataAlloc(digest: []const u8, lsn: u64) ![]u8 {
+    const digest_len: u16 = std.math.cast(u16, digest.len) orelse return error.InvalidIdempotencyKey;
+    const out = try std.heap.page_allocator.alloc(u8, 2 + digest.len + 8);
+    out[0..2].* = std.mem.toBytes(std.mem.nativeToLittle(u16, digest_len));
+    @memcpy(out[2..][0..digest.len], digest);
+    out[2 + digest.len ..][0..8].* = std.mem.toBytes(std.mem.nativeToLittle(u64, lsn));
+    return out;
+}
+
+fn decodeIdempotencyMetadata(raw: []const u8) !IdempotencyMetadata {
+    if (raw.len < 10) return error.Corrupted;
+    const digest_len: usize = std.mem.readInt(u16, raw[0..2], .little);
+    const lsn_offset = std.math.add(usize, 2, digest_len) catch return error.Corrupted;
+    if (lsn_offset + 8 != raw.len) return error.Corrupted;
+    const lsn = std.mem.readInt(u64, raw[lsn_offset..][0..8], .little);
+    if (lsn == 0) return error.Corrupted;
+    return .{ .digest = raw[2..lsn_offset], .lsn = lsn };
+}
 
 fn putNextLsnMeta(txn: anytype, next_lsn: u64) !void {
     const bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, next_lsn));

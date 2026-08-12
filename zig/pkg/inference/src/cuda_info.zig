@@ -26,6 +26,7 @@ const print = std.debug.print;
 const cuda_context = if (build_options.enable_cuda) @import("ops/cuda/context.zig") else struct {};
 const cuda_compute = if (build_options.enable_cuda) @import("ops/cuda/cuda_compute.zig") else struct {};
 const cuda_kernels = if (build_options.enable_cuda) @import("ops/cuda/kernels.zig") else struct {};
+const cuda_artifact = if (build_options.enable_cuda) @import("ops/cuda/artifact.zig") else struct {};
 const cuda_buffer = if (build_options.enable_cuda) @import("ops/cuda/buffer.zig") else struct {};
 const cuda_cublaslt = if (build_options.enable_cuda) @import("ops/cuda/cublaslt.zig") else struct {};
 
@@ -43,6 +44,7 @@ const NormRopeParityCase = struct {
 
 pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !void {
     var smoke = false;
+    var artifact_identity = false;
     var e4b_q8_prefill_smoke = false;
     var gemma4_parity_path: ?[]const u8 = null;
     var gemma4_hf_parity_path: ?[]const u8 = null;
@@ -58,6 +60,8 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--smoke")) {
             smoke = true;
+        } else if (std.mem.eql(u8, arg, "--artifact-identity")) {
+            artifact_identity = true;
         } else if (std.mem.eql(u8, arg, "--e4b-q8-prefill-smoke")) {
             e4b_q8_prefill_smoke = true;
         } else if (std.mem.eql(u8, arg, "--gguf-meta")) {
@@ -145,6 +149,18 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
     }
 
     if (comptime build_options.enable_cuda) {
+        if (artifact_identity) {
+            var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(cuda_artifact.image, &digest, .{});
+            const digest_hex = std.fmt.bytesToHex(digest, .lower);
+            print("cuda_artifact_identity_schema: antfly.cuda_artifact_identity.v1\n", .{});
+            print("cuda_artifact_mode: {s}\n", .{cuda_artifact.mode});
+            print("cuda_artifact_format: {s}\n", .{cuda_artifact.format});
+            print("cuda_artifact_target: {s}\n", .{cuda_artifact.target});
+            print("cuda_artifact_image_bytes: {d}\n", .{cuda_artifact.image.len});
+            print("cuda_artifact_image_sha256: {s}\n", .{digest_hex});
+            return;
+        }
         const info = cuda_context.probeDefault() catch |err| {
             print("cuda: unavailable\nreason: {s}\n", .{@errorName(err)});
             std.process.exit(1);
@@ -292,7 +308,7 @@ fn smokeCublasLtBf16(allocator: std.mem.Allocator) !bool {
 
     var module = try cuda_kernels.KernelModule.load(&ctx);
     defer module.unload(&ctx);
-    var blas = cuda_cublaslt.CublasLt.open() catch return false;
+    var blas = cuda_cublaslt.CublasLt.open(&ctx) catch return false;
     defer blas.deinit();
 
     const rows: usize = 2;
@@ -334,10 +350,12 @@ fn bf16Bits(value: f32) u16 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference cuda-info [--smoke] [--gemma4-parity <gguf>] [--gemma4-hf-parity <model-dir>]
+        \\usage: antfly inference cuda-info [--artifact-identity] [--smoke] [--gemma4-parity <gguf>] [--gemma4-hf-parity <model-dir>]
         \\                                      [--gguf-meta <gguf>]
         \\
         \\  --smoke   Run CUDA smoke checks for fill, graph capture, dense/quant kernels, Gemma4 primitives, decoder-runtime slots, and cuBLASLt.
+        \\  --artifact-identity
+        \\            Print the format, target, byte count, and SHA-256 of the CUDA image embedded in this binary without initializing a GPU.
         \\  --e4b-q8-prefill-smoke
         \\            Run the Gemma 4 E4B row-aware Q4_0 gate/up Q8_1 prefill kernel smoke check.
         \\  --gguf-meta <gguf>

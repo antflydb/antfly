@@ -168,6 +168,16 @@ fn cliHelpRequested(args: *std.process.Args.Iterator) bool {
     return false;
 }
 
+fn isStandaloneSubcommand(subcommand: []const u8) bool {
+    return std.mem.eql(u8, subcommand, "standalone") or std.mem.eql(u8, subcommand, "swarm");
+}
+
+test "legacy swarm subcommand selects the standalone runtime" {
+    try std.testing.expect(isStandaloneSubcommand("standalone"));
+    try std.testing.expect(isStandaloneSubcommand("swarm"));
+    try std.testing.expect(!isStandaloneSubcommand("data"));
+}
+
 fn runAntflyCloud(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u8 {
     var argv_list = std.ArrayListUnmanaged([]const u8).empty;
     defer argv_list.deinit(allocator);
@@ -220,21 +230,15 @@ fn printMissingAntflyCloud() void {
 }
 
 fn runCliCommand(allocator: std.mem.Allocator, subcommand: []const u8, args: *std.process.Args.Iterator) !void {
-    // Read global config from env vars (ANTFLY_URL, ANTFLY_TOKEN)
     const config = cmd.cli.parseGlobalFlags();
-
-    // Initialize IO and HTTP client
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var http = httpx.Client.initWithConfig(allocator, io, .{});
     defer http.deinit();
-
-    // Initialize Antfly client
     var client = try cmd.cli.initClient(allocator, &http, config);
     defer client.deinit();
 
-    // Dispatch to the specific command
     if (std.mem.eql(u8, subcommand, "table")) return cmd.cli.table.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "index")) return cmd.cli.index.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "artifact")) return cmd.cli.artifact.run(allocator, io, &client, args);

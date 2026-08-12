@@ -72,6 +72,20 @@ export const DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20;
 export const DEFAULT_WRITE_MAX_RESPONSE_BYTES = 1 << 20;
 const MAX_ERROR_RESPONSE_BYTES = 1 << 20;
 
+export function authorizationHeader(auth: AntflyAuth | undefined): string | undefined {
+  if (!auth) return undefined;
+  if (!("type" in auth)) return `Basic ${btoa(`${auth.username}:${auth.password}`)}`;
+
+  switch (auth.type) {
+    case "basic":
+      return `Basic ${btoa(`${auth.username}:${auth.password}`)}`;
+    case "apiKey":
+      return `ApiKey ${btoa(`${auth.keyId}:${auth.keySecret}`)}`;
+    case "token":
+      return `Bearer ${auth.token}`;
+  }
+}
+
 type UserOperations = {
   getCurrentUser: () => Promise<CurrentUser | undefined>;
   list: () => Promise<UserSummary[] | undefined>;
@@ -156,12 +170,12 @@ function encodeBoundedJSON(value: unknown, maxBytes: number): string {
   return encoded;
 }
 
-async function readLimitedResponseText(
+export async function readLimitedResponseBytes(
   response: Response,
   maxBytes: number
-): Promise<{ text: string; truncated: boolean }> {
+): Promise<{ bytes: Uint8Array<ArrayBuffer>; truncated: boolean }> {
   if (!response.body) {
-    return { text: await response.text(), truncated: false };
+    return { bytes: new Uint8Array(0), truncated: false };
   }
 
   const reader = response.body.getReader();
@@ -169,24 +183,33 @@ async function readLimitedResponseText(
   let total = 0;
   let truncated = false;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const remaining = maxBytes - total;
-    if (remaining <= 0) {
-      truncated = true;
-      await reader.cancel();
-      break;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = maxBytes - total;
+      if (remaining <= 0) {
+        truncated = true;
+        break;
+      }
+      if (value.byteLength > remaining) {
+        chunks.push(value.slice(0, remaining));
+        total += remaining;
+        truncated = true;
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
     }
-    if (value.byteLength > remaining) {
-      chunks.push(value.slice(0, remaining));
-      total += remaining;
-      truncated = true;
-      await reader.cancel();
-      break;
+  } finally {
+    if (truncated) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Preserve the response limit result when cancellation itself fails.
+      }
     }
-    chunks.push(value);
-    total += value.byteLength;
+    reader.releaseLock();
   }
 
   const bytes = new Uint8Array(total);
@@ -195,6 +218,14 @@ async function readLimitedResponseText(
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  return { bytes, truncated };
+}
+
+export async function readLimitedResponseText(
+  response: Response,
+  maxBytes: number
+): Promise<{ text: string; truncated: boolean }> {
+  const { bytes, truncated } = await readLimitedResponseBytes(response, maxBytes);
   return { text: new TextDecoder().decode(bytes), truncated };
 }
 
@@ -219,22 +250,7 @@ export class AntflyClient {
    * Returns undefined if no auth is configured.
    */
   private getAuthHeader(): string | undefined {
-    const auth = this.config.auth;
-    if (!auth) return undefined;
-
-    if ("type" in auth) {
-      switch (auth.type) {
-        case "basic":
-          return `Basic ${btoa(`${auth.username}:${auth.password}`)}`;
-        case "apiKey":
-          return `ApiKey ${btoa(`${auth.keyId}:${auth.keySecret}`)}`;
-        case "token":
-          return `Bearer ${auth.token}`;
-      }
-    }
-
-    // Backwards compat: { username, password } without 'type' field
-    return `Basic ${btoa(`${auth.username}:${auth.password}`)}`;
+    return authorizationHeader(this.config.auth);
   }
 
   /**

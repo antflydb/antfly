@@ -15,6 +15,7 @@
 const std = @import("std");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const tables_api = @import("tables.zig");
+const indexes_api = @import("indexes.zig");
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
@@ -86,6 +87,10 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
             alloc,
             fallback.indexes_json orelse tables_api.default_indexes_json,
         );
+        try validateCreateTableArtifactEnrichments(
+            alloc,
+            fallback.indexes_json orelse tables_api.default_indexes_json,
+        );
         return fallback;
     };
     defer parsed.deinit();
@@ -108,6 +113,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     } else {
         req.indexes_json = try alloc.dupe(u8, tables_api.default_indexes_json);
     }
+    try validateCreateTableArtifactEnrichments(alloc, req.indexes_json.?);
 
     if (raw_root.get("schema")) |schema_value| {
         if (schema_value != .null) {
@@ -157,8 +163,12 @@ pub fn normalizeTableDefinitionIndexesValueAlloc(alloc: std.mem.Allocator, value
         const is_full_text = isPublicFullTextType(index_type);
 
         if (is_full_text) {
-            if (!isReservedFullTextIndexName(entry.key_ptr.*)) continue;
-            saw_full_text = true;
+            if (isArtifactBackedFullTextIndex(entry.value_ptr.object)) {
+                if (isReservedFullTextIndexName(entry.key_ptr.*)) return error.InvalidCreateTableRequest;
+            } else {
+                if (!isReservedFullTextIndexName(entry.key_ptr.*)) continue;
+                saw_full_text = true;
+            }
         } else if (isReservedFullTextIndexName(entry.key_ptr.*)) {
             return error.InvalidCreateTableRequest;
         }
@@ -274,12 +284,25 @@ pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8,
     }
     if (isReservedPublicCreateIndexName(index_name)) return error.InvalidCreateIndexRequest;
 
-    return normalizeIndexConfigJson(alloc, root, index_name, .{
+    const normalized = normalizeIndexConfigJson(alloc, root, index_name, .{
         .include_name = true,
         .default_type = true,
     }) catch |err| switch (err) {
-        error.InvalidCreateIndexRequest => error.InvalidCreateIndexRequest,
-        else => err,
+        error.InvalidCreateIndexRequest => return error.InvalidCreateIndexRequest,
+        else => return err,
+    };
+    errdefer alloc.free(normalized);
+    indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, normalized) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateIndexRequest,
+    };
+    return normalized;
+}
+
+fn validateCreateTableArtifactEnrichments(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
+    indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateTableRequest,
     };
 }
 
@@ -368,6 +391,7 @@ fn validatePublicIndexObject(object: anytype) !void {
     }
     const index_type = extractPublicIndexType(object) orelse "full_text";
     if (!isSupportedPublicIndexType(index_type)) return error.InvalidCreateIndexRequest;
+    try validatePublicInlineArtifactEnrichments(object);
     if (std.mem.eql(u8, index_type, "full_text")) {
         try validatePublicFullTextIndexObject(object);
         return;
@@ -379,6 +403,21 @@ fn validatePublicIndexObject(object: anytype) !void {
         return;
     }
     return error.InvalidCreateIndexRequest;
+}
+
+fn validatePublicInlineArtifactEnrichments(object: anytype) !void {
+    const Object = @TypeOf(object);
+    const enrichments = if (@hasField(Object, "map"))
+        object.map.get("enrichments")
+    else
+        object.get("enrichments");
+    const value = enrichments orelse return;
+    if (value != .array) return error.InvalidCreateIndexRequest;
+    for (value.array.items) |item| {
+        if (item != .object) return error.InvalidCreateIndexRequest;
+        validatePublicArtifactEnrichmentObject(item.object) catch
+            return error.InvalidCreateIndexRequest;
+    }
 }
 
 fn validateCreateTableIndexesValue(value: std.json.Value) !void {
@@ -446,12 +485,31 @@ fn validatePublicArtifactEnrichmentObject(object: anytype) !void {
         while (it.next()) |entry| {
             if (!isAllowedPublicArtifactEnrichmentField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
         }
-        return;
+    } else {
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            if (!isAllowedPublicArtifactEnrichmentField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
+        }
     }
 
-    var it = object.iterator();
+    const execution = if (@hasField(Object, "map"))
+        object.map.get("execution")
+    else
+        object.get("execution");
+    if (execution) |value| try validatePublicEnrichmentExecution(value);
+}
+
+fn validatePublicEnrichmentExecution(value: std.json.Value) !void {
+    if (value != .object) return error.InvalidArtifactEnrichmentRequest;
+    var it = value.object.iterator();
     while (it.next()) |entry| {
-        if (!isAllowedPublicArtifactEnrichmentField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
+        if (!std.mem.eql(u8, entry.key_ptr.*, "batch_items") and
+            !std.mem.eql(u8, entry.key_ptr.*, "batch_bytes"))
+        {
+            return error.InvalidArtifactEnrichmentRequest;
+        }
+        if (entry.value_ptr.* != .integer or entry.value_ptr.integer <= 0)
+            return error.InvalidArtifactEnrichmentRequest;
     }
 }
 
@@ -503,11 +561,22 @@ fn validatePublicFullTextIndexObject(object: anytype) !void {
     }
 }
 
+fn isArtifactBackedFullTextIndex(object: anytype) bool {
+    const Object = @TypeOf(object);
+    if (@hasField(Object, "map")) {
+        return object.map.contains("artifact_name") or object.map.contains("enrichments");
+    }
+    return object.contains("artifact_name") or object.contains("enrichments");
+}
+
 fn isAllowedPublicFullTextField(field_name: []const u8) bool {
     return std.mem.eql(u8, field_name, "name") or
         std.mem.eql(u8, field_name, "type") or
         std.mem.eql(u8, field_name, "description") or
-        std.mem.eql(u8, field_name, "mem_only");
+        std.mem.eql(u8, field_name, "mem_only") or
+        std.mem.eql(u8, field_name, "field") or
+        std.mem.eql(u8, field_name, "artifact_name") or
+        std.mem.eql(u8, field_name, "enrichments");
 }
 
 fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -533,7 +602,8 @@ fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.jso
             else => return err,
         };
         defer alloc.free(normalized);
-        if (isPublicFullTextType(extractPublicIndexType(entry.value_ptr.object) orelse "full_text")) continue;
+        if (isPublicFullTextType(extractPublicIndexType(entry.value_ptr.object) orelse "full_text") and
+            !isArtifactBackedFullTextIndex(entry.value_ptr.object)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
@@ -845,21 +915,77 @@ test "table contract accepts public full text create index" {
     );
 }
 
-test "table contract rejects artifact-backed public full text create index" {
-    try std.testing.expectError(
-        error.InvalidCreateIndexRequest,
-        parseCreateIndexRequest(
-            std.testing.allocator,
-            "document_text",
-            "{\"type\":\"full_text\",\"artifact_name\":\"document_chunks_v1\",\"enrichments\":[{\"name\":\"document_units_v1\",\"kind\":\"asset\",\"field\":\"url\",\"content_type\":\"application/json\",\"producer_json\":\"{\\\"type\\\":\\\"document_extraction\\\",\\\"config\\\":{}}\"},{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"source_artifact_name\":\"document_units_v1\",\"field\":\"text\",\"chunk_size\":512,\"chunk_overlap\":50}]}",
-        ),
+test "table contract preserves artifact-backed public full text indexes" {
+    const artifact_index =
+        "{\"type\":\"full_text\",\"field\":\"text\",\"artifact_name\":\"document_chunks_v1\",\"enrichments\":[{\"name\":\"document_units_v1\",\"kind\":\"asset\",\"field\":\"url\",\"content_type\":\"application/json\",\"producer_json\":\"{\\\"type\\\":\\\"document_extraction\\\",\\\"config\\\":{}}\"},{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"source_artifact_name\":\"document_units_v1\",\"field\":\"text\",\"chunk_size\":512,\"chunk_overlap\":50}]}";
+    const config_json = try parseCreateIndexRequest(std.testing.allocator, "document_text", artifact_index);
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"artifact_name\":\"document_chunks_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"enrichments\"") != null);
+
+    var table_req = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"indexes\":{\"document_text\":" ++ artifact_index ++ "}}",
     );
+    defer table_req.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, table_req.indexes_json.?, "\"document_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, table_req.indexes_json.?, "\"artifact_name\":\"document_chunks_v1\"") != null);
+
     try std.testing.expectError(
         error.InvalidCreateIndexRequest,
         parseCreateIndexRequest(
             std.testing.allocator,
             "full_text_index_v1",
             "{}",
+        ),
+    );
+}
+
+test "table contract rejects invalid inline artifact enrichments before admission" {
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"document_text\":{\"type\":\"full_text\",\"artifact_name\":\"chunks\",\"enrichments\":[{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\"}]}}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"document_text\":{\"type\":\"full_text\",\"enrichments\":\"not-an-array\"}}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "document_text",
+            "{\"type\":\"full_text\",\"enrichments\":[false]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "document_text",
+            "{\"type\":\"full_text\",\"enrichments\":[{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\",\"chunk_size\":512,\"chunk_overalp\":50}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "document_text",
+            "{\"type\":\"full_text\",\"enrichments\":[{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\",\"chunk_size\":512,\"execution\":{\"batch_itmes\":4}}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "document_text",
+            "{\"type\":\"full_text\",\"enrichments\":[{\"name\":\"units\",\"kind\":\"asset\",\"field\":\"url\",\"producer_json\":\"{\"}]}",
         ),
     );
 }

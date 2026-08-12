@@ -90,6 +90,7 @@ pub const OpenMode = @import("db.zig").OpenMode;
 pub const HAAsyncEffectMirror = @import("db.zig").HAAsyncEffectMirror;
 pub const HAAsyncBatchMirror = @import("db.zig").HAAsyncBatchMirror;
 pub const HAAsyncMetadataMirror = @import("db.zig").HAAsyncMetadataMirror;
+pub const HAMutationBarrier = @import("db.zig").HAMutationBarrier;
 pub const HAProgressPollFn = @import("db.zig").HAProgressPollFn;
 pub const HAPrimaryProgressSyncWait = @import("db.zig").HAPrimaryProgressSyncWait;
 pub const HAWriteGate = @import("db.zig").HAWriteGate;

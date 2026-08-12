@@ -18,8 +18,10 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const httpx = @import("httpx");
 const platform = @import("antfly_platform");
 const bridge = @import("runtime_bridge.zig");
+const api_kernel_abi = @import("api/kernel_abi.zig");
 const unit_options = @import("runtime_library_options");
 const owns_storage_kernel = unit_options.unit == .storage_kernel or unit_options.unit == .data_pic_probe or
     unit_options.unit == .storage_runtime_pic_probe or unit_options.unit == .application_pic_probe or
@@ -288,7 +290,95 @@ fn exportApiKernel() void {
     exportInternal(&api_kernel_exports.handlerInit, "antfly_api_kernel_handler_init");
     exportInternal(&api_kernel_exports.handlerStats, "antfly_api_kernel_handler_stats");
     exportInternal(&api_kernel_exports.handlerRegisterRoutes, "antfly_api_kernel_handler_register_routes");
+    exportInternal(&api_kernel_exports.handlerHandleHttp, "antfly_api_kernel_handler_handle_http");
+    exportInternal(&api_kernel_exports.handlerDestroyHttpResponse, "antfly_api_kernel_handler_destroy_http_response");
     exportInternal(&api_kernel_exports.handlerDestroy, "antfly_api_kernel_handler_destroy");
+}
+
+extern fn antfly_api_kernel_handler_handle_http(context: *const api_kernel_abi.HttpHandleContext) callconv(.c) api_kernel_abi.Status;
+extern fn antfly_api_kernel_handler_destroy_http_response(handle: *anyopaque) callconv(.c) void;
+
+fn distributedHttpxRegister(context: *const api_kernel_abi.RouteContext) callconv(.c) api_kernel_abi.Status {
+    if (context.abi_version != api_kernel_abi.abi_version or context._reserved != 0)
+        return api_kernel_abi.statusFromError(error.UnsupportedVersion);
+    const server: *httpx.Server = @ptrCast(@alignCast(context.server));
+    const path = context.path_ptr[0..context.path_len];
+    const method: httpx.Method = switch (context.method) {
+        .get => .GET,
+        .post => .POST,
+        .put => .PUT,
+        .delete => .DELETE,
+    };
+    const result = server.routeWithData(method, path, distributedApiHttpHandler, context.route_handle);
+    result catch |err| return api_kernel_abi.statusFromError(err);
+    return .ok;
+}
+
+fn distributedApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
+    const route_handle = context.route_data orelse return error.ApiKernelUnavailable;
+    const source_headers = context.request.headers.iterator();
+    const headers = try context.allocator.alloc(api_kernel_abi.HeaderView, source_headers.len);
+    defer context.allocator.free(headers);
+    for (source_headers, 0..) |header, i| {
+        headers[i] = .{
+            .name = api_kernel_abi.Bytes.init(header.name),
+            .value = api_kernel_abi.Bytes.init(header.value),
+        };
+    }
+    const params = try context.allocator.alloc(api_kernel_abi.RouteParamView, context.params.len);
+    defer context.allocator.free(params);
+    for (context.params, 0..) |param, i| {
+        params[i] = .{
+            .name = api_kernel_abi.Bytes.init(param.name),
+            .value = api_kernel_abi.Bytes.init(param.value),
+        };
+    }
+
+    var response_handle: ?*anyopaque = null;
+    var response_view: api_kernel_abi.HttpResponseView = undefined;
+    const request_view: api_kernel_abi.HttpRequestView = .{
+        .method = switch (context.request.method) {
+            .GET => .get,
+            .POST => .post,
+            .PUT => .put,
+            .DELETE => .delete,
+            else => return error.MethodNotAllowed,
+        },
+        .path = api_kernel_abi.Bytes.init(context.request.uri.path),
+        .query = api_kernel_abi.OptionalBytes.init(context.request.uri.query),
+        .headers_ptr = if (headers.len == 0) null else headers.ptr,
+        .headers_len = headers.len,
+        .params_ptr = if (params.len == 0) null else params.ptr,
+        .params_len = params.len,
+        .body = api_kernel_abi.Bytes.init(context.request.body orelse ""),
+        .authorization = api_kernel_abi.OptionalBytes.init(context.request.headers.get("Authorization")),
+        .content_type = api_kernel_abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
+    };
+    const status = antfly_api_kernel_handler_handle_http(&.{
+        .abi_version = api_kernel_abi.abi_version,
+        .route_handle = route_handle,
+        .request = &request_view,
+        .out_response_handle = &response_handle,
+        .out_response = &response_view,
+    });
+    if (!status.isOk()) return api_kernel_abi.errorFromStatus(status);
+    const owned_response_handle = response_handle orelse return error.RuntimeBoundaryFailure;
+    defer antfly_api_kernel_handler_destroy_http_response(owned_response_handle);
+
+    var response = httpx.Response.init(context.allocator, response_view.status);
+    errdefer response.deinit();
+    if (response_view.content_type.slice()) |content_type|
+        try response.headers.set("Content-Type", content_type);
+    const response_headers = if (response_view.headers_ptr) |ptr| ptr[0..response_view.headers_len] else &.{};
+    for (response_headers) |header| {
+        if (response_view.content_type.slice() != null and
+            std.ascii.eqlIgnoreCase(header.name.slice(), "Content-Type")) continue;
+        try response.headers.append(header.name.slice(), header.value.slice());
+    }
+    const body = try context.allocator.dupe(u8, response_view.body.slice());
+    response.body = body;
+    response.body_owned = true;
+    return response;
 }
 
 comptime {
@@ -304,7 +394,10 @@ comptime {
             exportInternal(&dataEntry, "antfly_runtime_data");
             exportInternal(&haEntry, "antfly_runtime_ha");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
-            if (unit_options.storage_kernel_experiment) exportApiKernel();
+            if (unit_options.storage_kernel_experiment) {
+                exportApiKernel();
+                exportInternal(&distributedHttpxRegister, "antfly_distributed_httpx_register");
+            }
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
             if (unit_options.storage_kernel_experiment)
                 exportInternal(&standaloneLiteEntry, "antfly_runtime_standalone_lite");
