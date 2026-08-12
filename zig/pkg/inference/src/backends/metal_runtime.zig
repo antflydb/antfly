@@ -35321,7 +35321,9 @@ test "metal native paged attention f16 single row uses 1x kernel across pages" {
     if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
 
     const q_len: usize = 1;
-    const kv_tokens: usize = 640;
+    // Stay just below the split-GQA production threshold so this test keeps
+    // exercising the legacy paged-1x route it is named for.
+    const kv_tokens: usize = 511;
     const num_heads: usize = 8;
     const num_kv_heads: usize = 2;
     const head_dim: usize = 256;

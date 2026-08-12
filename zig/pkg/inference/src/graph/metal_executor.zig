@@ -673,10 +673,11 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
-        "metal_attention_dispatch: paged_1x={d} decode_gqa_split={d} generated_decode_1x={d} generated_flash_prefill={d} generated_flash_prefill_hd512={d} prefill_direct_kv={d} prefill_paged_kv={d} generated_rms_norm={d}\n",
+        "metal_attention_dispatch: paged_1x={d} decode_gqa_split={d} decode_gqa_split_fallback={d} generated_decode_1x={d} generated_flash_prefill={d} generated_flash_prefill_hd512={d} prefill_direct_kv={d} prefill_paged_kv={d} generated_rms_norm={d}\n",
         .{
             provider_stats.metal_runtime_paged_attention_1x_calls,
             provider_stats.metal_runtime_decode_gqa_split_calls,
+            provider_stats.metal_runtime_decode_gqa_split_fallback_calls,
             provider_stats.metal_runtime_generated_attention_decode_1x_calls,
             provider_stats.metal_runtime_generated_attention_flash_prefill_calls,
             provider_stats.metal_runtime_generated_attention_flash_prefill_hd512_calls,

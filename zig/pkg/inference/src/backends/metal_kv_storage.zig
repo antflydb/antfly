@@ -104,6 +104,26 @@ const SlotBinding = struct {
     fn ownsSlot(self: SlotBinding) bool {
         return self.sequence_owned;
     }
+
+    fn covers(self: SlotBinding, token_count: usize) bool {
+        return self.written_tokens >= token_count;
+    }
+
+    fn coversBeforePendingSuffix(self: SlotBinding, token_count: usize, pending_suffix_token_count: usize) bool {
+        if (pending_suffix_token_count > token_count) return false;
+        return self.covers(token_count - pending_suffix_token_count);
+    }
+
+    fn commitWrite(self: *SlotBinding, total_token_count: usize, position_offset: usize) bool {
+        if (total_token_count < self.written_tokens or position_offset < self.position_offset) return false;
+        self.written_tokens = total_token_count;
+        self.position_offset = position_offset;
+        return true;
+    }
+
+    fn truncateTo(self: *SlotBinding, retained_token_count: usize) void {
+        self.written_tokens = @min(self.written_tokens, retained_token_count);
+    }
 };
 
 pub const MetalKvStorage = struct {
@@ -235,6 +255,11 @@ pub const MetalKvStorage = struct {
     fn envFlagEnabled(name: [*:0]const u8) bool {
         const value = std.c.getenv(name) orelse return false;
         return flagValueEnabled(std.mem.span(value));
+    }
+
+    pub fn splitSwaKvRingEnabled() bool {
+        return !envFlagEnabled("TERMITE_METAL_DISABLE_SPLIT_SWA_KV_RING") and
+            !envFlagEnabled("TERMITE_METAL_DISABLE_PAGED_SLOT_ATTENTION");
     }
 
     fn requestedRingPageCount(
@@ -622,6 +647,18 @@ pub const MetalKvStorage = struct {
         );
     }
 
+    fn commitLayerKvDeviceWrite(
+        ctx: *anyopaque,
+        commit: storage_runtime.DeviceKvLayerWriteCommit,
+    ) anyerror!void {
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        const binding = self.slot_map.getPtr(.{
+            .sequence_id = commit.sequence_id,
+            .layer_index = @intCast(commit.layer_index),
+        }) orelse return error.DeviceWriteFallback;
+        if (!binding.commitWrite(commit.total_token_count, commit.position_offset)) return error.DeviceWriteFallback;
+    }
+
     fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
         for (&self.leased_slots, 0..) |*leased, slot| {
@@ -638,6 +675,19 @@ pub const MetalKvStorage = struct {
     fn releaseSequenceOp(ctx: *anyopaque, sequence_id: storage_runtime.SequenceId) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
         self.releaseSequenceSlots(sequence_id);
+    }
+
+    fn truncateSequenceOp(
+        ctx: *anyopaque,
+        sequence_id: storage_runtime.SequenceId,
+        retained_token_count: usize,
+    ) void {
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        var it = self.slot_map.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.sequence_id != sequence_id) continue;
+            entry.value_ptr.truncateTo(retained_token_count);
+        }
     }
 
     fn gatherLayerKv(
@@ -813,7 +863,14 @@ pub const MetalKvStorage = struct {
             if (!active_frame) return err;
             break :blk null;
         };
-        if (!active_frame and binding.written_tokens < gather.token_count) return error.DeviceReadFallback;
+        // A fused operation may expose a reserved slot before it encodes the
+        // current suffix, but only while an ordered frame is active. Every
+        // token before that explicitly declared suffix must already be
+        // committed; otherwise the slot contains unreadable capacity.
+        if (gather.pending_suffix_token_count != 0 and !active_frame) return error.DeviceReadFallback;
+        if (!binding.coversBeforePendingSuffix(gather.token_count, gather.pending_suffix_token_count)) {
+            return error.DeviceReadFallback;
+        }
         if (info_opt) |info| {
             if (info.key_row_bytes != 0 and info.key_row_bytes != key_row_bytes) return error.DeviceReadFallback;
             if (info.v_row_stride != 0 and info.v_row_stride != token_width) return error.DeviceReadFallback;
@@ -887,12 +944,35 @@ test "Metal KV rollout flags recognize common false values" {
     try std.testing.expect(MetalKvStorage.flagValueEnabled("true"));
 }
 
+test "Metal KV binding only covers successfully encoded tokens" {
+    var binding = SlotBinding{
+        .slot = 0,
+        .written_tokens = 32,
+    };
+    try std.testing.expect(binding.covers(32));
+    try std.testing.expect(!binding.covers(33));
+    try std.testing.expect(binding.coversBeforePendingSuffix(40, 8));
+    try std.testing.expect(!binding.coversBeforePendingSuffix(40, 7));
+    try std.testing.expect(!binding.coversBeforePendingSuffix(32, 33));
+    try std.testing.expect(binding.commitWrite(40, 4));
+    try std.testing.expectEqual(@as(usize, 40), binding.written_tokens);
+    try std.testing.expectEqual(@as(usize, 4), binding.position_offset);
+    try std.testing.expect(!binding.commitWrite(39, 4));
+    try std.testing.expect(!binding.commitWrite(40, 3));
+    binding.truncateTo(32);
+    try std.testing.expectEqual(@as(usize, 32), binding.written_tokens);
+    try std.testing.expectEqual(@as(usize, 4), binding.position_offset);
+    try std.testing.expect(binding.commitWrite(33, 4));
+}
+
 const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{
     .writeLayerKvSuffix = MetalKvStorage.writeLayerKvSuffix,
     .gatherLayerKv = MetalKvStorage.gatherLayerKv,
     .gatherLayerKvDevice = MetalKvStorage.gatherLayerKvDevice,
     .pagedLayerKvDevice = MetalKvStorage.pagedLayerKvDevice,
     .reserveLayerKvDevice = MetalKvStorage.reserveLayerKvDevice,
+    .commitLayerKvDeviceWrite = MetalKvStorage.commitLayerKvDeviceWrite,
+    .truncateSequence = MetalKvStorage.truncateSequenceOp,
     .releaseSequence = MetalKvStorage.releaseSequenceOp,
     .deinit = MetalKvStorage.hookDeinit,
 };
