@@ -362,6 +362,10 @@ fn enableContiguousSliceDeviceView() bool {
     return !getenvBool("TERMITE_METAL_DISABLE_CONTIGUOUS_SLICE_DEVICE_VIEW");
 }
 
+fn decoderRuntimeLayerRopeTheta(layer: *const ops.DecoderRuntimeLayerSpec) f32 {
+    return layer.rope_theta;
+}
+
 pub const MetalCompute = if (build_options.enable_metal) struct {
     const mlx_quant = struct {
         pub const Provider = void;
@@ -19607,10 +19611,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         );
     }
 
-    fn decodeLayerRopeTheta(layer: *const ops.DecoderRuntimeLayerSpec) f32 {
-        return layer.rope_theta;
-    }
-
     fn maybeApplyDecodeRopeCt(
         ctx: *anyopaque,
         input: CT,
@@ -19626,7 +19626,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             attention.query_sequence_len,
             layer.head_dim,
             layer.rope_active_dim,
-            layer.rope_theta,
+            decoderRuntimeLayerRopeTheta(layer),
             request.rope_freq_scale,
             position_offset,
             request.rope_consecutive_pairs,
@@ -22781,6 +22781,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_deberta_attention_gemm_fallbacks = runtime_stats.deberta_attention_gemm_fallbacks;
         stats.metal_runtime_paged_attention_1x_calls = runtime_stats.paged_attention_1x_calls;
         stats.metal_runtime_decode_gqa_split_calls = runtime_stats.decode_gqa_split_calls;
+        if (metal_runtime.decodeGqaSplitScheduleSnapshot(self.provider_impl.raw_decode_runtime)) |schedule_stats| {
+            stats.metal_runtime_decode_gqa_split_fallback_calls = schedule_stats.fallback_calls;
+        } else |_| {}
         stats.metal_runtime_generated_attention_decode_1x_calls = runtime_stats.generated_attention_decode_1x_calls;
         stats.metal_runtime_generated_attention_flash_prefill_calls = runtime_stats.generated_attention_flash_prefill_calls;
         stats.metal_runtime_generated_attention_flash_prefill_hd512_calls = runtime_stats.generated_attention_flash_prefill_hd512_calls;
@@ -30979,5 +30982,5 @@ test "metal decoder runtime consumes effective RoPE theta once" {
     layer.rope_dim = 512;
     layer.rope_active_dim = 128;
     layer.rope_theta = std.math.pow(f32, 1_000_000.0, 0.25);
-    try std.testing.expectApproxEqAbs(layer.rope_theta, MetalCompute.decodeLayerRopeTheta(&layer), 1e-6);
+    try std.testing.expectApproxEqAbs(layer.rope_theta, decoderRuntimeLayerRopeTheta(&layer), 1e-6);
 }

@@ -304,6 +304,7 @@ pub fn metalSplitSwaRingRequestEligible(
     model_config: gpt_mod.Config,
     generation_config: GenerationConfig,
 ) bool {
+    if (comptime !build_options.enable_metal) return false;
     return model_config.supportsSplitSwaGlobalKvRing() and
         !gemma4_runtime.wholeFramePrefillExplicitlyDisabled() and
         !generation_config.prompt_cache_enabled and
