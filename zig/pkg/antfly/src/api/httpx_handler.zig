@@ -333,6 +333,8 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.graph_expand_suffix, httpx.Handler.bind(self, internalGraphExpand));
         try server.post(table_prefix ++ routes.graph_hydrate_suffix, httpx.Handler.bind(self, internalGraphHydrate));
         try server.post(table_prefix ++ routes.graph_edges_suffix, httpx.Handler.bind(self, internalGraphEdges));
+        try server.post(table_prefix ++ routes.text_stats_suffix, httpx.Handler.bind(self, internalTextStats));
+        try server.post(table_prefix ++ routes.algebraic_partials_suffix, httpx.Handler.bind(self, internalAlgebraicPartials));
         try server.post(table_prefix ++ routes.routed_batch_suffix, httpx.Handler.bind(self, internalGroupRoutedBatch));
         try server.post(table_prefix ++ routes.txn_begin_suffix, httpx.Handler.bind(self, internalTxnBegin));
         try server.post(table_prefix ++ routes.txn_prepare_suffix, httpx.Handler.bind(self, internalTxnPrepare));
@@ -347,8 +349,6 @@ pub const AntflyApiHandler = struct {
         try server.post(document_artifact_prefix ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalDocumentArtifactReprocess));
         try server.post(table_prefix ++ routes.artifacts_marker ++ ":artifact_name" ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalTableArtifactReprocess));
         const internal_posts = [_][]const u8{
-            table_prefix ++ routes.text_stats_suffix,
-            table_prefix ++ routes.algebraic_partials_suffix,
             table_prefix ++ routes.query_suffix,
             table_prefix ++ routes.query_preflight_suffix,
             table_prefix ++ routes.vector_worker_suffix,
@@ -1467,6 +1467,34 @@ pub const AntflyApiHandler = struct {
             return if (err == error.InvalidArgument) textResponse(ctx, 400, "invalid graph edges request") else internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
         return ctx.json(result);
+    }
+
+    fn internalTextStats(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse "";
+        var result = self.internalGroupOperations().textStats(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, body) catch |err|
+            return if (err == error.InvalidArgument) textResponse(ctx, 400, "invalid text stats request") else internalGroupErrorResponse(ctx, err);
+        defer result.deinit(ctx.allocator);
+        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena_impl.deinit();
+        var response = table_reads.parseTextStatsHttpResponse(arena_impl.allocator(), body, result.json) catch
+            return textResponse(ctx, 500, "internal server error");
+        defer response.deinit(arena_impl.allocator());
+        return switch (response) {
+            .fields => |value| ctx.json(value),
+            .background_fields => |value| ctx.json(value),
+        };
+    }
+
+    fn internalAlgebraicPartials(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse "";
+        var result = self.internalGroupOperations().algebraicPartials(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, body) catch |err|
+            return if (err == error.InvalidArgument) textResponse(ctx, 400, "invalid algebraic partials request") else internalGroupErrorResponse(ctx, err);
+        defer result.deinit(ctx.allocator);
+        return jsonResponse(ctx, 200, result.json);
     }
 
     fn internalGroupRoutedBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

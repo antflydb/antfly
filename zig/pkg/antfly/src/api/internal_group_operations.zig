@@ -16,6 +16,7 @@ const operation = @import("operation.zig");
 const raft_mod = @import("../raft/mod.zig");
 const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_write_source.zig");
+const query_api = @import("query.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const platform_time = @import("antfly_platform").time;
 
@@ -639,6 +640,34 @@ pub const Operations = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
             error.UnknownGroup, error.TableNotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
+    pub fn textStats(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, body: []const u8) Error!query_api.QueryResponse {
+        try request.ensureActive();
+        const reads = self.reads orelse return error.NotFound;
+        return (reads.textStatsGroupLocal(alloc, group_id, table_name, body) catch |err| switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidArgument,
+            error.TableNotFound, error.UnknownGroup => return error.NotFound,
+            error.TopologyChanged => return error.TopologyChanged,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
+    pub fn algebraicPartials(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, body: []const u8) Error!query_api.QueryResponse {
+        try request.ensureActive();
+        const reads = self.reads orelse return error.NotFound;
+        return (reads.algebraicPartialsGroupLocal(alloc, group_id, table_name, body) catch |err| switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidArgument,
+            error.TableNotFound, error.UnknownGroup => return error.NotFound,
+            error.TopologyChanged => return error.TopologyChanged,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
             else => return error.Internal,
         }) orelse error.NotFound;
     }

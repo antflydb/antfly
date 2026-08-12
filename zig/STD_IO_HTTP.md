@@ -145,6 +145,10 @@ that end state:
   adapters over typed group operations. Request ownership stays at ingress;
   the operations own read consistency and storage error classification, and
   all three manual-dispatch branches are gone.
+- Internal text-statistics and algebraic-partials workers now call typed
+  operations from concrete handlers. Their raw JSON is an intentional worker
+  protocol payload, while consistency and storage errors are transport-free;
+  both manual branches have been removed.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

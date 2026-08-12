@@ -39,6 +39,7 @@ const tables_api = @import("tables.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const routes = @import("http_routes.zig");
+const internal_group_operations = @import("internal_group_operations.zig");
 
 const QueryPreflightRequestWire = struct {
     query_request: std.json.Value,
@@ -572,50 +573,12 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             defer summary.deinit(alloc);
             return try http_route_helpers.jsonResponse(alloc, summary);
         }
-
-        if (routes.Routes.matchGroupTextStats(path)) |text_stats_route| {
-            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            var text_stats_result = reads.textStatsGroupLocal(alloc, text_stats_route.group_id, text_stats_route.table_name, req.body) catch |err| switch (err) {
-                error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(alloc, 400, "invalid text stats request"),
-                error.TableNotFound, error.UnknownGroup => return try http_route_helpers.textResponse(alloc, 404, "not found"),
-                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
-                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
-                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
-                error.StorageReadTemporarilyUnavailable => return try http_route_helpers.textResponse(alloc, 503, "storage read temporarily unavailable"),
-                else => return err,
-            } orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            defer text_stats_result.deinit(alloc);
-            const body = try alloc.dupe(u8, text_stats_result.json);
-            defer alloc.free(body);
-            var arena_impl = std.heap.ArenaAllocator.init(alloc);
-            defer arena_impl.deinit();
-            var response = try table_reads.parseTextStatsHttpResponse(arena_impl.allocator(), req.body, body);
-            defer response.deinit(arena_impl.allocator());
-            return switch (response) {
-                .fields => |value| try http_route_helpers.jsonResponse(alloc, value),
-                .background_fields => |value| try http_route_helpers.jsonResponse(alloc, value),
-            };
-        }
-        if (routes.Routes.matchGroupAlgebraicPartials(path)) |partials_route| {
-            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            var partials_result = reads.algebraicPartialsGroupLocal(alloc, partials_route.group_id, partials_route.table_name, req.body) catch |err| switch (err) {
-                error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(alloc, 400, "invalid algebraic partials request"),
-                error.TableNotFound, error.UnknownGroup => return try http_route_helpers.textResponse(alloc, 404, "not found"),
-                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
-                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
-                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
-                error.StorageReadTemporarilyUnavailable => return try http_route_helpers.textResponse(alloc, 503, "storage read temporarily unavailable"),
-                else => return err,
-            } orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            defer partials_result.deinit(alloc);
-            return try http_route_helpers.jsonResponse(alloc, partials_result);
-        }
     }
 
     return null;
 }
 
-test "internal group read routes handle text stats errors" {
+test "typed internal group operations classify text stats errors" {
     const alloc = std.testing.allocator;
 
     const FakeReads = struct {
@@ -675,27 +638,11 @@ test "internal group read routes handle text stats errors" {
         }
     };
 
-    var resp = (try handle(.{
-        .alloc = alloc,
+    const operations = internal_group_operations.Operations{
         .reads = FakeReads.source(),
-        .catalog = .{
-            .ptr = undefined,
-        },
-        .query_router = .{
-            .ptr = undefined,
-            .route_query_to_read_schema = struct {
-                fn route(_: *anyopaque, _: []const u8, _: *@import("../storage/db/mod.zig").types.SearchRequest) !void {}
-            }.route,
-        },
-    }, .{
-        .method = .POST,
-        .uri = "/internal/v1/groups/7/tables/docs/text-stats",
-        .body = "{}",
-    }, "/internal/v1/groups/7/tables/docs/text-stats", "")).?;
-    defer resp.deinit(alloc);
-
-    try std.testing.expectEqual(@as(u16, 400), resp.status);
-    try std.testing.expectEqualStrings("invalid text stats request", resp.body);
+        .shard_db_adapter = null,
+    };
+    try std.testing.expectError(error.InvalidArgument, operations.textStats(alloc, .{}, 7, "docs", "{}"));
 }
 
 test "internal group read routes preserve retryable resident storage failures" {
