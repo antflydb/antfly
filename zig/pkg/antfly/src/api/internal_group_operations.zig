@@ -9,6 +9,7 @@ const std = @import("std");
 const batch_api = @import("batch.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const internal_keys = @import("../storage/internal_keys.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const operation = @import("operation.zig");
 const raft_mod = @import("../raft/mod.zig");
@@ -258,6 +259,91 @@ pub const Operations = struct {
         }) orelse return error.NotFound;
     }
 
+    pub fn updateDocumentArtifactChildRangePlacement(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) Error!void {
+        try request.ensureActive();
+        const writes = self.writes orelse return error.NotFound;
+        const handled = (writes.updateDocumentArtifactChildRangePlacementGroupLocal(
+            alloc,
+            group_id,
+            table_name,
+            doc_key,
+            artifact_name,
+            update,
+        ) catch |err| switch (err) {
+            error.InvalidBatchRequest, error.InvalidArgument => return error.InvalidArgument,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse return error.NotFound;
+        if (!handled) return error.NotFound;
+    }
+
+    pub fn applyDocumentArtifactChildRangeBatch(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) Error!u64 {
+        try request.ensureActive();
+        try validateDocumentArtifactChildRangeBatchScope(alloc, doc_key, artifact_name, child_batch);
+        const writes = self.writes orelse return error.NotFound;
+        return (writes.applyDocumentArtifactChildRangeBatchGroupLocal(
+            alloc,
+            group_id,
+            table_name,
+            doc_key,
+            artifact_name,
+            child_batch,
+        ) catch |err| switch (err) {
+            error.InvalidBatchRequest, error.InvalidArgument => return error.InvalidArgument,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
+    pub fn reprocessDocumentArtifact(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) Error!void {
+        try request.ensureActive();
+        const writes = self.writes orelse return error.NotFound;
+        const handled = (writes.reprocessDocumentArtifactGroupLocal(
+            alloc,
+            group_id,
+            table_name,
+            doc_key,
+            artifact_name,
+        ) catch |err| switch (err) {
+            error.InvalidBatchRequest, error.InvalidArgument => return error.InvalidArgument,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse return error.NotFound;
+        if (!handled) return error.NotFound;
+    }
+
     fn transitionActionMatchesGroup(action: @import("../metadata/domain.zig").TransitionAction, group_id: u64) bool {
         return switch (action) {
             .none => group_id == 0,
@@ -315,6 +401,63 @@ pub const Operations = struct {
         };
     }
 };
+
+const DocumentArtifactChildKeyPrefixes = struct {
+    unit: []u8,
+    chunk: []u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.unit);
+        alloc.free(self.chunk);
+        self.* = undefined;
+    }
+};
+
+fn documentArtifactChildKeyPrefixesAlloc(alloc: std.mem.Allocator, doc_key: []const u8, artifact_name: []const u8) !DocumentArtifactChildKeyPrefixes {
+    var unit = std.ArrayListUnmanaged(u8).empty;
+    errdefer unit.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&unit, alloc, doc_key);
+    try unit.append(alloc, internal_keys.artifact_kind);
+    try internal_keys.appendEncodedComponent(&unit, alloc, "asset");
+    try internal_keys.appendEncodedComponent(&unit, alloc, artifact_name);
+    try unit.append(alloc, internal_keys.document_unit_record_kind);
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    errdefer chunk.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&chunk, alloc, doc_key);
+    try chunk.append(alloc, internal_keys.artifact_kind);
+    try internal_keys.appendEncodedComponent(&chunk, alloc, "chunk");
+    try internal_keys.appendEncodedComponent(&chunk, alloc, artifact_name);
+    try chunk.append(alloc, internal_keys.document_unit_record_kind);
+
+    const owned_unit = try unit.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_unit);
+    return .{ .unit = owned_unit, .chunk = try chunk.toOwnedSlice(alloc) };
+}
+
+fn validateDocumentArtifactChildRangeBatchScope(
+    alloc: std.mem.Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+) Error!void {
+    var prefixes = documentArtifactChildKeyPrefixesAlloc(alloc, doc_key, artifact_name) catch return error.Internal;
+    defer prefixes.deinit(alloc);
+    const matches = struct {
+        fn call(p: DocumentArtifactChildKeyPrefixes, key: []const u8) bool {
+            return std.mem.startsWith(u8, key, p.unit) or std.mem.startsWith(u8, key, p.chunk);
+        }
+    }.call;
+    for (child_batch.artifact_writes) |write| if (!matches(prefixes, write.key)) return error.InvalidArgument;
+    for (child_batch.artifact_delete_keys) |key| if (!matches(prefixes, key)) return error.InvalidArgument;
+    for (child_batch.documents) |doc| if (!matches(prefixes, doc.key)) return error.InvalidArgument;
+    for (child_batch.dense_embeddings) |embedding| if (embedding.artifact_key) |key| {
+        if (!matches(prefixes, key)) return error.InvalidArgument;
+    };
+    for (child_batch.sparse_embeddings) |embedding| if (embedding.artifact_key) |key| {
+        if (!matches(prefixes, key)) return error.InvalidArgument;
+    };
+}
 
 test "internal group reads are callable without an HTTP request" {
     const alloc = std.testing.allocator;

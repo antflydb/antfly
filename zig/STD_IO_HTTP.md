@@ -114,6 +114,10 @@ that end state:
   cancellation, and conflict classification; JSON ownership remains at the
   transport edge. Their dead synthetic-dispatch branches and the legacy
   transaction-validator hook have been deleted.
+- Document-artifact placement updates, child-range batches, and single-document
+  reprocessing now have concrete `httpx` adapters over typed group operations.
+  Artifact key-scope validation lives below the transport, and the three
+  synthetic-dispatch branches have been removed.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

@@ -331,6 +331,10 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.txn_resolve_suffix, httpx.Handler.bind(self, internalTxnResolve));
         try server.post(table_prefix ++ routes.txn_status_suffix, httpx.Handler.bind(self, internalTxnStatus));
         try server.post(table_prefix ++ routes.txn_acknowledge_suffix, httpx.Handler.bind(self, internalTxnAcknowledge));
+        const document_artifact_prefix = table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ ":artifact_name";
+        try server.post(document_artifact_prefix ++ routes.placement_update_suffix, httpx.Handler.bind(self, internalDocumentArtifactPlacementUpdate));
+        try server.post(document_artifact_prefix ++ routes.child_range_batch_suffix, httpx.Handler.bind(self, internalDocumentArtifactChildRangeBatch));
+        try server.post(document_artifact_prefix ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalDocumentArtifactReprocess));
         const internal_posts = [_][]const u8{
             table_prefix ++ routes.documents_suffix,
             table_prefix ++ routes.graph_expand_suffix,
@@ -1035,6 +1039,94 @@ pub const AntflyApiHandler = struct {
             input.value.index_name,
         ) catch |err| return internalGroupErrorResponse(ctx, err);
         return ctx.json(struct {}{});
+    }
+
+    const InternalDocumentArtifactParams = struct {
+        group_id: u64,
+        table_name: []u8,
+        key: []u8,
+        artifact_name: []u8,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.table_name);
+            alloc.free(self.key);
+            alloc.free(self.artifact_name);
+            self.* = undefined;
+        }
+    };
+
+    fn internalDocumentArtifactParams(ctx: *httpx.Context) !?InternalDocumentArtifactParams {
+        const group_id = (try internalGroupId(ctx)) orelse return null;
+        const table_name = (try decodePathParamOrBadRequest(ctx, ctx.param("table_name") orelse return null)) orelse return null;
+        errdefer ctx.allocator.free(table_name);
+        const key = (try decodePathParamOrBadRequest(ctx, ctx.param("key") orelse return null)) orelse return null;
+        errdefer ctx.allocator.free(key);
+        const artifact_name = (try decodePathParamOrBadRequest(ctx, ctx.param("artifact_name") orelse return null)) orelse return null;
+        return .{ .group_id = group_id, .table_name = table_name, .key = key, .artifact_name = artifact_name };
+    }
+
+    fn internalArtifactWriteErrorResponse(ctx: *httpx.Context, err: internal_group_operations.Error, invalid_message: []const u8) !httpx.Response {
+        return switch (err) {
+            error.InvalidArgument => textResponse(ctx, 400, invalid_message),
+            error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
+            error.Unsupported => textResponse(ctx, 405, "method not allowed"),
+            error.NotFound => textResponse(ctx, 404, "not found"),
+            error.Canceled => textResponse(ctx, 408, "request canceled"),
+            error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            else => textResponse(ctx, 500, "internal server error"),
+        };
+    }
+
+    fn internalDocumentArtifactPlacementUpdate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalDocumentArtifactParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid document artifact placement request");
+        var input = std.json.parseFromSlice(db_mod.types.DocumentArtifactChildRangePlacementUpdate, ctx.allocator, body, .{ .allocate = .alloc_always }) catch
+            return textResponse(ctx, 400, "invalid document artifact placement request");
+        defer input.deinit();
+        self.internalGroupOperations().updateDocumentArtifactChildRangePlacement(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            params.key,
+            params.artifact_name,
+            input.value,
+        ) catch |err| return internalArtifactWriteErrorResponse(ctx, err, "invalid document artifact placement request");
+        return ctx.json(.{ .placement = "updated" });
+    }
+
+    fn internalDocumentArtifactChildRangeBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalDocumentArtifactParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid document artifact child range batch request");
+        var input = std.json.parseFromSlice(db_mod.DocumentArtifactChildRangeApplyBatch, ctx.allocator, body, .{ .allocate = .alloc_always }) catch
+            return textResponse(ctx, 400, "invalid document artifact child range batch request");
+        defer input.deinit();
+        const sequence = self.internalGroupOperations().applyDocumentArtifactChildRangeBatch(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            params.key,
+            params.artifact_name,
+            input.value,
+        ) catch |err| return internalArtifactWriteErrorResponse(ctx, err, "invalid document artifact child range batch request");
+        return ctx.json(.{ .sequence = sequence });
+    }
+
+    fn internalDocumentArtifactReprocess(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalDocumentArtifactParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        self.internalGroupOperations().reprocessDocumentArtifact(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            params.key,
+            params.artifact_name,
+        ) catch |err| return internalArtifactWriteErrorResponse(ctx, err, "invalid document artifact reprocess request");
+        return ctx.json(.{ .reprocess = "triggered" });
     }
 
     fn internalGroupId(ctx: *httpx.Context) !?u64 {
@@ -5383,6 +5475,18 @@ test "httpx internal control routes call typed operations directly" {
     defer invalid_batch.deinit();
     try std.testing.expectEqual(@as(u16, 400), invalid_batch.status.code);
     try std.testing.expectEqualStrings("invalid batch request", invalid_batch.body.?);
+
+    inline for (.{
+        .{ "document_units_v1:placement", "invalid document artifact placement request" },
+        .{ "document_units_v1:child-range-batch", "invalid document artifact child range batch request" },
+    }) |case| {
+        const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/documents/doc-a/artifacts/{s}", .{ base_url, case[0] });
+        defer alloc.free(url);
+        var response = try requestWithRetry(&client, client_io.io(), .POST, url, "[]", &headers, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expectEqualStrings(case[1], response.body.?);
+    }
 
     inline for (.{ "txn-begin", "txn-prepare", "txn-resolve", "txn-status", "txn-acknowledge" }) |suffix| {
         const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/{s}", .{ base_url, suffix });
