@@ -73,6 +73,11 @@ that end state:
   legacy request/response conversion have been deleted. Metadata integration
   and simulation fixtures use a real `httpx` test runtime with owned listener
   tasks and stop/join teardown.
+- Internal repair cancellation-state lookup is the first internal control
+  endpoint extracted into a transport-neutral operation. Its concrete `httpx`
+  handler owns path decoding and status mapping, while the operation owns job
+  lookup and cancellation semantics; it no longer enters the synthetic
+  internal `HttpRequest` dispatcher.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

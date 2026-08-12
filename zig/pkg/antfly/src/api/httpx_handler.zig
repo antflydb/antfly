@@ -28,6 +28,7 @@ const http_server_mod = @import("http_server.zig");
 const operation_contract = @import("operation.zig");
 const probe_operations = @import("probe_operations.zig");
 const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
+const internal_repair_operations = @import("internal_repair_operations.zig");
 const ApiHttpServer = http_server_mod.ApiHttpServer;
 const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
 
@@ -308,7 +309,7 @@ pub const AntflyApiHandler = struct {
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, handler);
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", handler);
-        try server.get(internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix, handler);
+        try server.get(internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix, httpx.Handler.bind(self, internalRepairCancelState));
         const internal_posts = [_][]const u8{
             internal_table_prefix ++ routes.corrupt_embedding_artifact_suffix,
             group_prefix ++ routes.shard_ops_observe_split_suffix,
@@ -739,6 +740,31 @@ pub const AntflyApiHandler = struct {
 
     fn cancelStorageMaintenanceJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.readStorageMaintenanceJob(ctx, true);
+    }
+
+    fn internalRepairCancelState(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const encoded_table_name = ctx.param("table_name") orelse return textResponse(ctx, 400, "invalid path parameter");
+        const table_name = (try decodePathParamOrBadRequest(ctx, encoded_table_name)) orelse
+            return textResponse(ctx, 400, "invalid path parameter");
+        defer ctx.allocator.free(table_name);
+        const job_id_raw = ctx.param("job_id") orelse return textResponse(ctx, 400, "invalid repair job id");
+        const job_id = std.fmt.parseUnsigned(u64, job_id_raw, 10) catch
+            return textResponse(ctx, 400, "invalid repair job id");
+        const attempt_id_raw = ctx.param("attempt_id") orelse return textResponse(ctx, 400, "invalid repair attempt id");
+        const attempt_id = std.fmt.parseUnsigned(u64, attempt_id_raw, 10) catch
+            return textResponse(ctx, 400, "invalid repair attempt id");
+        const result = (internal_repair_operations.Operations{ .store = &self.api_server.repair_job_store }).cancelState(
+            ctx.allocator,
+            operationContext(ctx, null),
+            .{ .table_name = table_name, .job_id = job_id, .attempt_id = attempt_id },
+        ) catch |err| return switch (err) {
+            error.NotFound => textResponse(ctx, 404, "not found"),
+            error.Canceled => textResponse(ctx, 408, "request canceled"),
+            error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            error.Internal => textResponse(ctx, 500, "invalid repair job state"),
+            else => textResponse(ctx, 500, "internal server error"),
+        };
+        return ctx.json(result);
     }
 
     // ---------------------------------------------------------------
@@ -4751,6 +4777,21 @@ test "httpx shared registrar keeps root probes and rejects removed data aliases"
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 200), response.status.code);
     }
+
+    const encoded_job = try api_server.repair_job_store.startJob(alloc, "documents", .{});
+    defer alloc.free(encoded_job);
+    var parsed_job = try std.json.parseFromSlice(@import("repair_jobs.zig").JobState, alloc, encoded_job, .{});
+    defer parsed_job.deinit();
+    const cancel_state_url = try std.fmt.allocPrint(
+        alloc,
+        "{s}/internal/v1/tables/documents/repair/jobs/{d}/attempts/{d}/cancel-state",
+        .{ base_url, parsed_job.value.job_id, parsed_job.value.attempt_id },
+    );
+    defer alloc.free(cancel_state_url);
+    var cancel_state_response = try getWithRetry(&client, client_io.io(), cancel_state_url, null, 20);
+    defer cancel_state_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), cancel_state_response.status.code);
+    try std.testing.expectEqualStrings("{\"cancel_requested\":false}", cancel_state_response.body.?);
 
     inline for (.{ "/status", "/tables", "/secrets", "/transactions", "/backup", "/restore" }) |path| {
         const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, path });
