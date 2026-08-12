@@ -335,7 +335,7 @@ class ImportGraphTest(unittest.TestCase):
         object_path = self.write_elf_object(
             "candidate.o",
             [
-                (".text..Lstorage.db.db.DB.open", 64, 0x6),
+                (".text..Lstorage.db.db.DB.open.412", 64, 0x6),
                 (".rodata..Lstorage.db.db.DB.open", 16, 0x2),
                 (".debug_info", 4096, 0),
             ],
@@ -350,8 +350,12 @@ class ImportGraphTest(unittest.TestCase):
             analyzer.ModuleEmission(bytes=80, text_bytes=64, sections=2),
             report.modules["storage.db.db"],
         )
+        self.assertEqual(
+            analyzer.SectionEmission(module="storage.db.db", bytes=64, text_bytes=64),
+            report.named_sections[".text..Lstorage.db.db.DB.open"],
+        )
 
-    def test_object_overlap_counts_only_bytes_beyond_largest_instance(self):
+    def test_object_overlap_separates_same_module_from_repeated_named_sections(self):
         one = analyzer.ObjectReport(
             "one",
             self.root / "one.o",
@@ -359,6 +363,10 @@ class ImportGraphTest(unittest.TestCase):
             100,
             80,
             0,
+            {
+                ".text..Lstorage.db.db.DB.open": analyzer.SectionEmission("storage.db.db", 80, 80),
+                ".rodata..Lstorage.db.db.onlyOne": analyzer.SectionEmission("storage.db.db", 20, 0),
+            },
         )
         two = analyzer.ObjectReport(
             "two",
@@ -370,13 +378,22 @@ class ImportGraphTest(unittest.TestCase):
             110,
             85,
             0,
+            {
+                ".text..Lstorage.db.db.DB.open": analyzer.SectionEmission("storage.db.db", 70, 70),
+                ".text..Lstorage.db.db.onlyTwo": analyzer.SectionEmission("storage.db.db", 20, 0),
+                ".text..Lapi.query.parse": analyzer.SectionEmission("api.query", 20, 15),
+            },
         )
 
         stats = analyzer.aggregate_object_overlap_stats([one, two])
 
-        self.assertEqual(1, stats["duplicated_modules"])
-        self.assertEqual(90, stats["duplicate_bytes"])
+        self.assertEqual(1, stats["coemitted_modules"])
+        self.assertEqual(90, stats["coemitted_module_bytes"])
+        self.assertEqual(1, stats["duplicated_sections"])
+        self.assertEqual(70, stats["duplicate_bytes"])
         self.assertEqual(70, stats["duplicate_text_bytes"])
+        self.assertEqual("storage.db.db", stats["modules"][0]["name"])
+        self.assertEqual(1, stats["modules"][0]["duplicated_sections"])
 
 
 if __name__ == "__main__":

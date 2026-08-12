@@ -6,8 +6,8 @@ accidental barrel imports and surprising paths visible, but includes imports in
 lazy declarations and tests. A Zig ``--time-report`` JSON is the authoritative
 view of files that a particular compiler invocation loaded and declarations it
 analyzed. A cross-compiled ELF object is the authoritative view of emitted
-machine-code/data sections. Passing multiple reports ranks both lazy file
-overlap and actual duplicate emitted modules.
+machine-code/data sections. Passing multiple reports ranks lazy file overlap,
+same-module co-emission, and repeated named codegen sections separately.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import json
 import re
 import struct
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -27,6 +27,7 @@ SCRIPT = Path(__file__).resolve()
 REPO_ROOT = SCRIPT.parents[2]
 DEFAULT_SOURCE_ROOT = REPO_ROOT / "zig/pkg/antfly/src"
 IMPORT_RE = re.compile(r'@import\(\s*"([^"]+)"\s*\)')
+GENERATED_SECTION_ID_RE = re.compile(r"\.\d+$")
 
 DEFAULT_ROOTS = {
     "data": "data/mod.zig",
@@ -130,6 +131,13 @@ class ModuleEmission:
 
 
 @dataclass(frozen=True)
+class SectionEmission:
+    module: str
+    bytes: int
+    text_bytes: int
+
+
+@dataclass(frozen=True)
 class ObjectReport:
     name: str
     path: Path
@@ -137,6 +145,7 @@ class ObjectReport:
     alloc_bytes: int
     text_bytes: int
     unassigned_bytes: int
+    named_sections: dict[str, SectionEmission] = field(default_factory=dict)
 
 
 class ImportGraph:
@@ -406,9 +415,17 @@ def section_source_module(section_name: str, module_tokens: Iterable[str]) -> st
     return None
 
 
+def normalized_codegen_section_name(section_name: str) -> str:
+    """Remove only Zig's compilation-local trailing declaration identifier."""
+
+    return GENERATED_SECTION_ID_RE.sub("", section_name)
+
+
 def load_object_report(name: str, path: Path, source_root: Path = DEFAULT_SOURCE_ROOT) -> ObjectReport:
     module_tokens = source_module_tokens(source_root.resolve())
     mutable: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0, 0])
+    mutable_sections: dict[str, list[object]] = {}
+    ambiguous_section_names: set[str] = set()
     alloc_bytes = 0
     text_bytes = 0
     unassigned_bytes = 0
@@ -428,11 +445,40 @@ def load_object_report(name: str, path: Path, source_root: Path = DEFAULT_SOURCE
         row[0] += size
         row[1] += size if is_text else 0
         row[2] += 1
+        normalized_name = normalized_codegen_section_name(section_name)
+        if normalized_name in ambiguous_section_names:
+            continue
+        section_row = mutable_sections.setdefault(normalized_name, [module, 0, 0])
+        # A normalized name must continue to resolve to the same source module.
+        # If Zig ever violates that assumption, retaining neither attribution is
+        # safer than manufacturing cross-module overlap.
+        if section_row[0] != module:
+            mutable_sections.pop(normalized_name, None)
+            ambiguous_section_names.add(normalized_name)
+            continue
+        section_row[1] = int(section_row[1]) + size
+        section_row[2] = int(section_row[2]) + (size if is_text else 0)
     modules = {
         module: ModuleEmission(bytes=row[0], text_bytes=row[1], sections=row[2])
         for module, row in mutable.items()
     }
-    return ObjectReport(name, path, modules, alloc_bytes, text_bytes, unassigned_bytes)
+    named_sections = {
+        section_name: SectionEmission(
+            module=str(row[0]),
+            bytes=int(row[1]),
+            text_bytes=int(row[2]),
+        )
+        for section_name, row in mutable_sections.items()
+    }
+    return ObjectReport(
+        name,
+        path,
+        modules,
+        alloc_bytes,
+        text_bytes,
+        unassigned_bytes,
+        named_sections,
+    )
 
 
 def integer(value: object) -> int:
@@ -587,38 +633,91 @@ def object_report_stats(report: ObjectReport) -> dict[str, object]:
 
 def aggregate_object_overlap_stats(reports: Iterable[ObjectReport]) -> dict[str, object]:
     materialized = tuple(reports)
-    occurrences: dict[str, list[ModuleEmission]] = collections.defaultdict(list)
+    module_occurrences: dict[str, list[ModuleEmission]] = collections.defaultdict(list)
     for report in materialized:
         for module, emission in report.modules.items():
-            occurrences[module].append(emission)
-    duplicated = {
+            module_occurrences[module].append(emission)
+    coemitted_modules = {
         module: emissions
-        for module, emissions in occurrences.items()
+        for module, emissions in module_occurrences.items()
         if len(emissions) > 1
     }
-    rows = []
-    for module, emissions in duplicated.items():
+    coemitted_rows = []
+    for module, emissions in coemitted_modules.items():
         total_bytes = sum(item.bytes for item in emissions)
         total_text_bytes = sum(item.text_bytes for item in emissions)
-        rows.append(
+        coemitted_rows.append(
             {
                 "name": module,
                 "instances": len(emissions),
                 "total_bytes": total_bytes,
-                "duplicate_bytes": total_bytes - max(item.bytes for item in emissions),
-                "duplicate_text_bytes": total_text_bytes - max(item.text_bytes for item in emissions),
+                "coemitted_bytes": total_bytes - max(item.bytes for item in emissions),
+                "coemitted_text_bytes": total_text_bytes - max(item.text_bytes for item in emissions),
             }
         )
-    rows.sort(key=lambda row: (-int(row["duplicate_bytes"]), str(row["name"])))
+    coemitted_rows.sort(key=lambda row: (-int(row["coemitted_bytes"]), str(row["name"])))
+
+    section_occurrences: dict[str, list[SectionEmission]] = collections.defaultdict(list)
+    for report in materialized:
+        for section_name, emission in report.named_sections.items():
+            section_occurrences[section_name].append(emission)
+    duplicated_sections = {
+        section_name: emissions
+        for section_name, emissions in section_occurrences.items()
+        if len(emissions) > 1
+    }
+    section_rows = []
+    module_rows: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0, 0])
+    for section_name, emissions in duplicated_sections.items():
+        total_bytes = sum(item.bytes for item in emissions)
+        total_text_bytes = sum(item.text_bytes for item in emissions)
+        duplicate_bytes = total_bytes - max(item.bytes for item in emissions)
+        duplicate_text_bytes = total_text_bytes - max(item.text_bytes for item in emissions)
+        modules = {item.module for item in emissions}
+        module = next(iter(modules)) if len(modules) == 1 else "<ambiguous>"
+        section_rows.append(
+            {
+                "name": section_name,
+                "module": module,
+                "instances": len(emissions),
+                "total_bytes": total_bytes,
+                "duplicate_bytes": duplicate_bytes,
+                "duplicate_text_bytes": duplicate_text_bytes,
+            }
+        )
+        module_row = module_rows[module]
+        module_row[0] += duplicate_bytes
+        module_row[1] += duplicate_text_bytes
+        module_row[2] += 1
+    section_rows.sort(key=lambda row: (-int(row["duplicate_bytes"]), str(row["name"])))
+    rows = sorted(
+        (
+            {
+                "name": module,
+                "duplicate_bytes": values[0],
+                "duplicate_text_bytes": values[1],
+                "duplicated_sections": values[2],
+            }
+            for module, values in module_rows.items()
+        ),
+        key=lambda row: (-int(row["duplicate_bytes"]), str(row["name"])),
+    )
     return {
         "available": bool(materialized),
         "report_count": len(materialized),
-        "module_instances": sum(len(items) for items in occurrences.values()),
-        "unique_modules": len(occurrences),
-        "duplicated_modules": len(duplicated),
+        "module_instances": sum(len(items) for items in module_occurrences.values()),
+        "unique_modules": len(module_occurrences),
+        "coemitted_modules": len(coemitted_modules),
+        "coemitted_module_bytes": sum(int(row["coemitted_bytes"]) for row in coemitted_rows),
+        "coemitted_module_text_bytes": sum(int(row["coemitted_text_bytes"]) for row in coemitted_rows),
+        "coemitted_module_groups": coemitted_rows,
+        "section_instances": sum(len(items) for items in section_occurrences.values()),
+        "unique_sections": len(section_occurrences),
+        "duplicated_sections": len(duplicated_sections),
         "duplicate_bytes": sum(int(row["duplicate_bytes"]) for row in rows),
         "duplicate_text_bytes": sum(int(row["duplicate_text_bytes"]) for row in rows),
         "modules": rows,
+        "sections": section_rows,
     }
 
 
@@ -645,16 +744,20 @@ def print_aggregate_object_overlap(reports: Iterable[ObjectReport], top_groups: 
     print(f"\naggregate emitted overlap ({stats['report_count']} objects)")
     print(f"module instances\t{stats['module_instances']}")
     print(f"unique modules\t{stats['unique_modules']}")
-    print(f"duplicated modules\t{stats['duplicated_modules']}")
-    print(f"duplicate alloc bytes\t{stats['duplicate_bytes']}")
-    print(f"duplicate text bytes\t{stats['duplicate_text_bytes']}")
-    print("top duplicated emitting modules\tinstances\tduplicate bytes\tduplicate text bytes")
+    print(f"co-emitted modules\t{stats['coemitted_modules']}")
+    print(f"co-emitted module alloc-byte lower bound\t{stats['coemitted_module_bytes']}")
+    print(f"named section instances\t{stats['section_instances']}")
+    print(f"unique named sections\t{stats['unique_sections']}")
+    print(f"repeated named sections\t{stats['duplicated_sections']}")
+    print(f"repeated named-section alloc bytes\t{stats['duplicate_bytes']}")
+    print(f"repeated named-section text bytes\t{stats['duplicate_text_bytes']}")
+    print("top repeated-section modules\tsections\tduplicate bytes\tduplicate text bytes")
     modules = stats["modules"]
     assert isinstance(modules, list)
     for row in modules[:top_groups]:
         assert isinstance(row, dict)
         print(
-            f"{row['name']}\t{row['instances']}\t"
+            f"{row['name']}\t{row['duplicated_sections']}\t"
             f"{row['duplicate_bytes']}\t{row['duplicate_text_bytes']}"
         )
 

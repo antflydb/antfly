@@ -4124,8 +4124,18 @@ gate. Distributed analyzed 544 repository files / 765,202 lines and 28,618
 declarations; inference analyzed 523 / 577,239 and 25,051 declarations. Across
 all five units there are 1,747 repository-file instances, 1,223 unique files,
 and 524 duplicate instances, versus 1,744 / 1,221 / 523 before the cut. The
-complete emitted overlap is 1,947,510 B, effectively identical to the prior
-1,947,522 B. The raw provider table therefore was an unsupported ABI and a
+legacy same-module co-emission lower bound is 1,947,510 B, effectively
+identical to the prior 1,947,522 B. A refinement to the repository analyzer
+showed why that number must not be treated as literal duplicate code: it
+credited every byte from the smaller instance of a shared source module even
+when the two objects emitted different functions. Normalizing only Zig's
+compilation-local trailing declaration IDs and intersecting actual allocated
+ELF section names finds 950 repeated sections / 1,529,268 B instead. The prior
+candidate objects produce exactly the same refined result. The largest real
+repeated-section groups are `api.query_contract` (235,904 B / 135 sections),
+`schema.table_schema_impl` (116,694 B / 65), `foreign.postgres_libpq`
+(109,388 B / 74), `common.config` (100,400 B / 30), and `api.table_reads`
+(80,570 B / 20). Thus the raw provider table was an unsupported ABI and a
 correctness liability, but Zig's lazy analysis had already prevented it from
 causing the large compiler-graph leak hypothesized in Phase 4v.
 
@@ -4142,8 +4152,9 @@ correctness**. As a compilation experiment it misses the documented 30--45
 second material-improvement threshold and does not reduce aggregate graph or
 emitted duplication, so it is not the next build-performance solution. Normal
 runner timing/RSS and repeated reliability evidence remain required. Continue
-the goal loop with the actual remaining emitted overlap, led by API/control and
-storage sources, without merging inference back into the critical unit.
+the goal loop with the repeated named-section evidence, led by API/query
+contracts shared by distributed control and local-query storage, without
+merging inference back into the critical unit.
 
 ## Holistic target architecture
 
