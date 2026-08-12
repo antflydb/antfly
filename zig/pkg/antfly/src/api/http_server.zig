@@ -8616,7 +8616,34 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
+    pub const SessionForwardRequest = struct {
+        method: contextual_operations.Method,
+        target: []const u8,
+        authorization: ?[]const u8,
+        content_type: ?[]const u8,
+        body: []const u8,
+    };
+
+    pub fn forwardSessionOperation(
+        self: *ApiHttpServer,
+        txn_id: db_mod.types.TxnId,
+        request: SessionForwardRequest,
+    ) !?http_common.HttpResponse {
+        return self.forwardSessionRequest(txn_id, .{
+            .method = switch (request.method) {
+                .get => .GET,
+                .post => .POST,
+                .put => .PUT,
+                .delete => .DELETE,
+            },
+            .uri = request.target,
+            .authorization = request.authorization,
+            .content_type = request.content_type,
+            .body = request.body,
+        });
+    }
+
+    fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
         const owner_node_id = (try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id)) orelse
             if (self.txn_sessions.durableMissIsAuthoritative())
                 return null

@@ -545,43 +545,27 @@ pub const AntflyApiHandler = struct {
         return respondApiResponseBody(ctx, resp.status, resp.body);
     }
 
-    const ContextOperationRequest = struct {
-        value: http_common.HttpRequest,
-        alloc: std.mem.Allocator,
-
-        pub fn deinit(self: *@This()) void {
-            self.alloc.free(self.value.headers);
-            self.* = undefined;
-        }
-    };
-
-    fn operationRequestFromContext(ctx: *httpx.Context, body_data_opt: ?[]const u8) !ContextOperationRequest {
-        const method: http_common.Method = switch (ctx.request.method) {
-            .GET => .GET,
-            .POST => .POST,
-            .PUT => .PUT,
-            .DELETE => .DELETE,
-            else => {
-                return error.UnsupportedMethod;
-            },
+    fn forwardTransactionSession(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        txn_id: db_mod.types.TxnId,
+        body: []const u8,
+    ) !?httpx.Response {
+        const method: contextual_operations.Method = switch (ctx.request.method) {
+            .GET => .get,
+            .POST => .post,
+            .PUT => .put,
+            .DELETE => .delete,
+            else => return error.UnsupportedMethod,
         };
-        const headers = try ctx.allocator.alloc(http_common.RequestHeader, ctx.request.headers.entries.items.len);
-        errdefer ctx.allocator.free(headers);
-        for (ctx.request.headers.entries.items, 0..) |entry, i| {
-            headers[i] = .{ .name = entry.name, .value = entry.value };
-        }
-        const body_data = body_data_opt orelse (try ctx.body()) orelse "";
-        return .{
-            .value = .{
-                .method = method,
-                .uri = ctx.request.uri.raw,
-                .headers = headers,
-                .authorization = ctx.header("authorization"),
-                .content_type = ctx.header("content-type"),
-                .body = body_data,
-            },
-            .alloc = ctx.allocator,
-        };
+        var response = (try self.api_server.forwardSessionOperation(txn_id, .{
+            .method = method,
+            .target = ctx.request.uri.raw,
+            .authorization = ctx.header("authorization"),
+            .content_type = ctx.header("content-type"),
+            .body = body,
+        })) orelse return null;
+        return try respond(ctx, &response);
     }
 
     fn haRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -2539,15 +2523,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = operationRequestFromContext(ctx, "") catch {
-            _ = ctx.status(405);
-            return ctx.text("method not allowed");
-        };
-        defer converted_req.deinit();
-        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
-            var resp = forwarded;
-            return respond(ctx, &resp);
-        }
+        if (try self.forwardTransactionSession(ctx, txn_id, "")) |response| return response;
         if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -2579,15 +2555,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = operationRequestFromContext(ctx, body_data) catch {
-            _ = ctx.status(405);
-            return ctx.text("method not allowed");
-        };
-        defer converted_req.deinit();
-        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
-            var resp = forwarded;
-            return respond(ctx, &resp);
-        }
+        if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
         if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -2634,15 +2602,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = operationRequestFromContext(ctx, body_data) catch {
-            _ = ctx.status(405);
-            return ctx.text("method not allowed");
-        };
-        defer converted_req.deinit();
-        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
-            var resp = forwarded;
-            return respond(ctx, &resp);
-        }
+        if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
         if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -2756,15 +2716,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = operationRequestFromContext(ctx, body_data) catch {
-            _ = ctx.status(405);
-            return ctx.text("method not allowed");
-        };
-        defer converted_req.deinit();
-        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
-            var resp = forwarded;
-            return respond(ctx, &resp);
-        }
+        if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
         if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -2814,15 +2766,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = operationRequestFromContext(ctx, body_data) catch {
-            _ = ctx.status(405);
-            return ctx.text("method not allowed");
-        };
-        defer converted_req.deinit();
-        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
-            var resp = forwarded;
-            return respond(ctx, &resp);
-        }
+        if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
         if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -2864,15 +2808,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid savepoint id");
         };
-        var converted_req = operationRequestFromContext(ctx, body_data) catch {
-            _ = ctx.status(405);
-            return ctx.text("method not allowed");
-        };
-        defer converted_req.deinit();
-        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
-            var resp = forwarded;
-            return respond(ctx, &resp);
-        }
+        if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
         if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -2910,15 +2846,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = operationRequestFromContext(ctx, body_data) catch {
-            _ = ctx.status(405);
-            return ctx.text("method not allowed");
-        };
-        defer converted_req.deinit();
-        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
-            var resp = forwarded;
-            return respond(ctx, &resp);
-        }
+        if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
         if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -3232,15 +3160,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        var converted_req = operationRequestFromContext(ctx, body_data) catch {
-            _ = ctx.status(405);
-            return ctx.text("method not allowed");
-        };
-        defer converted_req.deinit();
-        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
-            var resp = forwarded;
-            return respond(ctx, &resp);
-        }
+        if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
         if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
