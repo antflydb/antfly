@@ -97,6 +97,11 @@ that end state:
   concrete `httpx` routes over typed shard operations. Route-group invariants,
   local-leader projection, and operational error classification now live below
   the transport; their former method/path dispatcher branches are gone.
+- The temporary internal compatibility registrar now enumerates every
+  remaining canonical internal read, write, artifact, transaction, routed
+  batch, and retrieval-agent route. This preserves reachability during
+  extraction without a global fallback or any legacy public alias; router
+  registration still rejects duplicate route shapes.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

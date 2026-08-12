@@ -311,6 +311,8 @@ pub const AntflyApiHandler = struct {
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
+        try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_suffix, handler);
+        try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ "*", handler);
         try server.get(internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix, httpx.Handler.bind(self, internalRepairCancelState));
         try server.post(table_prefix ++ routes.join_job_state_suffix, httpx.Handler.bind(self, internalJoinJobState));
         try server.post(table_prefix ++ routes.join_finalize_suffix, httpx.Handler.bind(self, internalJoinFinalize));
@@ -325,15 +327,26 @@ pub const AntflyApiHandler = struct {
             table_prefix ++ routes.documents_suffix,
             table_prefix ++ routes.graph_expand_suffix,
             table_prefix ++ routes.graph_hydrate_suffix,
+            table_prefix ++ routes.graph_edges_suffix,
             table_prefix ++ routes.text_stats_suffix,
+            table_prefix ++ routes.algebraic_partials_suffix,
             table_prefix ++ routes.query_suffix,
+            table_prefix ++ routes.query_preflight_suffix,
+            table_prefix ++ routes.vector_worker_suffix,
             table_prefix ++ routes.batch_suffix,
+            table_prefix ++ routes.routed_batch_suffix,
+            table_prefix ++ routes.artifact_repair_suffix,
+            table_prefix ++ routes.artifact_repair_run_suffix,
+            table_prefix ++ routes.artifacts_marker ++ "*",
+            table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ "*",
             table_prefix ++ routes.txn_begin_suffix,
             table_prefix ++ routes.txn_prepare_suffix,
             table_prefix ++ routes.txn_resolve_suffix,
             table_prefix ++ routes.txn_status_suffix,
+            table_prefix ++ routes.txn_acknowledge_suffix,
         };
         inline for (internal_posts) |path| try server.post(path, handler);
+        try server.post(routes.agents_retrieval, handler);
     }
 
     fn registerProbes(self: *AntflyApiHandler, server: anytype) !void {
