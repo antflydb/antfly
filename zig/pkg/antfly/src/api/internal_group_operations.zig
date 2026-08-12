@@ -579,6 +579,28 @@ pub const Operations = struct {
         }) orelse error.NotFound;
     }
 
+    /// The returned NDJSON response is owned by `alloc`.
+    pub fn scan(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        from: []const u8,
+        to: []const u8,
+        options: db_mod.types.ScanOptions,
+    ) Error!table_reads.ScanResponse {
+        try request.ensureActive();
+        const reads = self.reads orelse return error.NotFound;
+        return (reads.scanGroupLocal(alloc, group_id, table_name, from, to, options, .read_index) catch |err| switch (err) {
+            error.TopologyChanged => return error.TopologyChanged,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
     /// The returned key, when present, is owned by `alloc`.
     pub fn medianKey(
         self: Operations,

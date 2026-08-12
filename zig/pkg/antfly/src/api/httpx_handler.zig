@@ -328,6 +328,7 @@ pub const AntflyApiHandler = struct {
         try server.post(group_prefix ++ routes.shard_ops_observe_merge_suffix, httpx.Handler.bind(self, internalObserveMerge));
         try server.post(group_prefix ++ routes.shard_ops_execute_suffix, httpx.Handler.bind(self, internalExecuteTransition));
         try server.post(table_prefix ++ routes.batch_suffix, httpx.Handler.bind(self, internalGroupBatch));
+        try server.post(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
         try server.post(table_prefix ++ routes.routed_batch_suffix, httpx.Handler.bind(self, internalGroupRoutedBatch));
         try server.post(table_prefix ++ routes.txn_begin_suffix, httpx.Handler.bind(self, internalTxnBegin));
         try server.post(table_prefix ++ routes.txn_prepare_suffix, httpx.Handler.bind(self, internalTxnPrepare));
@@ -342,7 +343,6 @@ pub const AntflyApiHandler = struct {
         try server.post(document_artifact_prefix ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalDocumentArtifactReprocess));
         try server.post(table_prefix ++ routes.artifacts_marker ++ ":artifact_name" ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalTableArtifactReprocess));
         const internal_posts = [_][]const u8{
-            table_prefix ++ routes.documents_suffix,
             table_prefix ++ routes.graph_expand_suffix,
             table_prefix ++ routes.graph_hydrate_suffix,
             table_prefix ++ routes.graph_edges_suffix,
@@ -1405,6 +1405,31 @@ pub const AntflyApiHandler = struct {
             .deleted = result.deleted,
             .transformed = result.transformed,
         });
+    }
+
+    fn internalGroupScan(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse "";
+        var input = http_route_helpers.parseScanKeysRequest(ctx.allocator, body) catch |err| return switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => textResponse(ctx, 400, "invalid scan request"),
+            else => err,
+        };
+        defer input.deinit(ctx.allocator);
+        var result = self.internalGroupOperations().scan(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            input.from,
+            input.to,
+            input.opts,
+        ) catch |err| return internalGroupErrorResponse(ctx, err);
+        defer result.deinit(ctx.allocator);
+        _ = ctx.status(200);
+        try ctx.setHeader("content-type", "application/x-ndjson");
+        _ = ctx.response.body(result.ndjson);
+        return ctx.response.build();
     }
 
     fn internalGroupRoutedBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -5693,6 +5718,13 @@ test "httpx internal control routes call typed operations directly" {
     defer missing_forwarding.deinit();
     try std.testing.expectEqual(@as(u16, 400), missing_forwarding.status.code);
     try std.testing.expectEqualStrings("missing raft batch forwarding headers", missing_forwarding.body.?);
+
+    const scan_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/documents", .{base_url});
+    defer alloc.free(scan_url);
+    var invalid_scan = try requestWithRetry(&client, client_io.io(), .POST, scan_url, "[]", &headers, 20);
+    defer invalid_scan.deinit();
+    try std.testing.expectEqual(@as(u16, 400), invalid_scan.status.code);
+    try std.testing.expectEqualStrings("invalid scan request", invalid_scan.body.?);
 
     inline for (.{
         .{ "document_units_v1:placement", "invalid document artifact placement request" },

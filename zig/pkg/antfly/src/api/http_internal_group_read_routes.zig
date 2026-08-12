@@ -454,29 +454,6 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
     const alloc = ctx.alloc;
     const source = ctx.reads;
     if (req.method == .POST) {
-        if (routes.Routes.matchGroupScan(path)) |scan| {
-            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            var scan_req = try http_route_helpers.parseScanKeysRequest(alloc, req.body);
-            defer scan_req.deinit(alloc);
-
-            var result = (reads.scanGroupLocal(
-                alloc,
-                scan.group_id,
-                scan.table_name,
-                scan_req.from,
-                scan_req.to,
-                scan_req.opts,
-                .read_index,
-            ) catch |err| switch (err) {
-                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
-                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
-                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
-                error.StorageReadTemporarilyUnavailable => return try http_route_helpers.textResponse(alloc, 503, "storage read temporarily unavailable"),
-                else => return err,
-            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
-            defer result.deinit(alloc);
-            return try http_route_helpers.ndjsonResponse(alloc, 200, result.ndjson);
-        }
         if (routes.Routes.matchGroupGraphExpand(path)) |graph_expand_route| {
             const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             var expand_req = distributed_graph.parseGraphExpandRequest(alloc, req.body) catch |err| switch (err) {

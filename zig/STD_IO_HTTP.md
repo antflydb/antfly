@@ -137,6 +137,10 @@ that end state:
 - Single and list document-artifact reads now use concrete `httpx` handlers
   over typed operations returning owned storage-domain manifests. Their legacy
   GET branches and duplicate response-projection structs have been removed.
+- Internal group scans now parse their wire request at the `httpx` edge and
+  call a typed scan operation returning owned NDJSON. The operation owns
+  read-consistency selection and storage error classification; the manual
+  scan branch has been removed.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those
