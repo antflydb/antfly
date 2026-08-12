@@ -11830,7 +11830,7 @@ pub const ProvisionedTableWriteSource = struct {
                     break :matches ProvisionedTableWriteCache.entryManagedConfigMatches(cached.entry.?, indexes_json);
                 };
                 if (!managed_config_matches) {
-                    try reconfigureManagedDbEnrichments(
+                    try reconfigureManagedDbEnrichmentRuntime(
                         alloc,
                         cached.db,
                         indexes_json,
@@ -17777,16 +17777,7 @@ fn applyIndexCreateToCachedDb(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
-    var lookup = (try indexes_api.lookupSingleIndexConfig(alloc, indexes_json, index_name)) orelse return error.InvalidTableIndexMetadata;
-    defer lookup.deinit();
-
-    const kind = try parseIndexKind(lookup.config);
-    const config_json = try extractIndexConfigJson(alloc, index_name, lookup.config);
-    defer alloc.free(config_json);
-
-    const owned_name = try alloc.dupe(u8, index_name);
-    defer alloc.free(owned_name);
-    try reconfigureManagedDbEnrichments(
+    try reconfigureManagedDbEnrichmentRuntime(
         alloc,
         db,
         indexes_json,
@@ -17796,23 +17787,7 @@ fn applyIndexCreateToCachedDb(
         secret_store,
         remote_content,
     );
-    const cfg = db_mod.types.IndexConfig{
-        .name = owned_name,
-        .kind = kind,
-        .config_json = config_json,
-        .coverage_generation = coverage_policy_mod.incarnation(lookup.config) orelse 0,
-    };
-    const admission_error: ?anyerror = if (!db_mod.DB.indexKindSupportsManagedGenerationRepair(kind)) ordinary: {
-        db.addIndex(cfg) catch |err| break :ordinary err;
-        break :ordinary null;
-    } else managed: {
-        _ = db.admitManagedIndex(cfg) catch |err| break :managed err;
-        break :managed null;
-    };
-    if (admission_error) |err| switch (err) {
-        error.IndexAlreadyExists => {},
-        else => return err,
-    };
+    _ = try metadata_table_provisioner.reconcileDbIndexTarget(alloc, db, indexes_json, index_name);
 }
 
 fn reconcileDbArtifactEnrichmentsFromIndexesJson(
@@ -17957,15 +17932,7 @@ fn reconcileCachedLocalTableIndexDrop(
         defer if (cached_active) cached.deinit(alloc);
         cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
 
-        _ = cached.db.deleteIndex(index_name) catch |err| switch (err) {
-            error.IndexNotFound => {},
-            else => {
-                cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
-                cached_active = false;
-                return err;
-            },
-        };
-        reconfigureManagedDbEnrichments(
+        reconfigureManagedDbEnrichmentRuntime(
             alloc,
             cached.db,
             metadata.indexes_json,
@@ -17974,6 +17941,16 @@ fn reconcileCachedLocalTableIndexDrop(
             self.inference_api_url,
             self.secret_store,
             self.remote_content,
+        ) catch |err| {
+            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+            cached_active = false;
+            return err;
+        };
+        _ = metadata_table_provisioner.reconcileDbIndexTarget(
+            alloc,
+            cached.db,
+            metadata.indexes_json,
+            index_name,
         ) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
             cached_active = false;
@@ -18156,7 +18133,8 @@ fn reconcileUncachedLocalTableIndexCreate(
     table_name: []const u8,
     index_name: []const u8,
 ) !bool {
-    _ = index_name;
+    const indexes_json = (try loadTableIndexesJson(alloc, self.catalog, table_name)) orelse return error.TableNotFound;
+    defer alloc.free(indexes_json);
     const group_ids = try table_catalog.resolveGroupsForSpanEventually(
         alloc,
         self.catalog,
@@ -18173,8 +18151,19 @@ fn reconcileUncachedLocalTableIndexCreate(
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
 
-        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+        const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+        var db = try db_mod.DB.open(alloc, path, .{
+            .backend_runtime = self.backend_runtime,
+            .identity_namespace = identity_namespace,
+            .prefer_existing_identity_namespace = identity_namespace != null,
+            .ha_write_gate = self.ha_write_gate,
+            .ha_async_effect_mirror = self.ha_async_mirror,
+            .ha_async_batch_mirror = self.ha_async_mirror,
+            .ha_async_metadata_mirror = self.ha_async_mirror,
+        });
         defer db.close();
+        try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
+        _ = try metadata_table_provisioner.reconcileDbIndexTarget(alloc, &db, indexes_json, index_name);
 
         try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, &db);
         managed_visibility_changed = true;
@@ -18202,6 +18191,8 @@ fn dropLocalTableIndex(
     table_name: []const u8,
     index_name: []const u8,
 ) !void {
+    const indexes_json = (try loadTableIndexesJson(alloc, catalog, table_name)) orelse return error.TableNotFound;
+    defer alloc.free(indexes_json);
     const group_ids = try table_catalog.resolveGroupsForSpanEventually(
         alloc,
         catalog,
@@ -18221,10 +18212,7 @@ fn dropLocalTableIndex(
             .backend_runtime = backend_runtime,
         });
         defer db.close();
-        _ = db.deleteIndex(index_name) catch |err| switch (err) {
-            error.IndexNotFound => {},
-            else => return err,
-        };
+        _ = try metadata_table_provisioner.reconcileDbIndexTarget(alloc, &db, indexes_json, index_name);
     }
 }
 
@@ -19075,6 +19063,29 @@ fn reconfigureManagedDbEnrichments(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
+    try reconfigureManagedDbEnrichmentRuntime(
+        alloc,
+        db,
+        indexes_json,
+        backend_runtime,
+        antfly_provider,
+        inference_api_url,
+        secret_store,
+        remote_content,
+    );
+    try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json);
+}
+
+fn reconfigureManagedDbEnrichmentRuntime(
+    _: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    antfly_provider: ?managed_embedder.AntflyProvider,
+    inference_api_url: ?[]const u8,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+) !void {
     var enrichments = try createManagedDbEnrichments(
         db.runtime_alloc,
         indexes_json,
@@ -19088,7 +19099,6 @@ fn reconfigureManagedDbEnrichments(
     // An empty replacement is meaningful: dropping the last managed producer
     // must retire the old provider instead of leaving an unused runtime alive.
     try db.reconfigureEnrichmentRuntime(enrichments.takeConfig());
-    try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json);
 }
 
 pub const StartupCatchUpMetadata = struct {

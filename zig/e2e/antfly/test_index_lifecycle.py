@@ -434,7 +434,7 @@ def test_stateful_table_registers_public_artifact_enrichment_for_default_full_te
     assert stateful_api.delete(f"/tables/{table_name}/artifacts/document_units_v1/enrichment") == {}
 
 
-def test_stateful_table_accepts_document_full_text_create_index_with_inline_enrichments(stateful_api):
+def test_stateful_table_cleans_document_full_text_inline_enrichments_on_index_delete(stateful_api):
     table_name = f"document_full_text_inline_{time.time_ns()}"
 
     created = stateful_api.create_table(table_name, num_shards=1)
@@ -474,6 +474,24 @@ def test_stateful_table_accepts_document_full_text_create_index_with_inline_enri
     detail = json.dumps(index, sort_keys=True)
     assert "document_units_v1" in detail
     assert "document_chunks_v1" in detail
+
+    assert stateful_api.delete_index(table_name, "document_text") == {}
+    table = stateful_api.get_table(table_name)
+    enrichment_names = {
+        enrichment["name"] for enrichment in table.get("artifact_enrichments", [])
+    }
+    assert "document_units_v1" not in enrichment_names
+    assert "document_chunks_v1" not in enrichment_names
+
+    # Exercise the first post-delete write through the same resident writer.
+    # A dangling generated-enrichment target must not retain full-index debt.
+    batch = stateful_api.batch_write(
+        table_name,
+        inserts={"doc:after-delete": {"body": "index and inline producers are gone"}},
+        sync_level="full_index",
+    )
+    assert batch["status"] == "committed"
+    assert batch["inserted"] == 1
 
 
 def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_query(stateful_api):

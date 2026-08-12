@@ -2799,6 +2799,24 @@ pub const ApiHttpServer = struct {
         snapshot: ?*const metadata_api.AdminSnapshot,
         snapshot_index: ?*const RuntimeStatusSnapshotIndex,
     ) !?runtime_status.LocalTableRuntimeStatuses {
+        return try self.localTableRuntimeStatusesWithSnapshotIndexOptions(table_name, snapshot, snapshot_index, false);
+    }
+
+    fn lifecycleTableRuntimeStatusesWithSnapshot(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        snapshot: *const metadata_api.AdminSnapshot,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        return try self.localTableRuntimeStatusesWithSnapshotIndexOptions(table_name, snapshot, null, true);
+    }
+
+    fn localTableRuntimeStatusesWithSnapshotIndexOptions(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        snapshot: ?*const metadata_api.AdminSnapshot,
+        snapshot_index: ?*const RuntimeStatusSnapshotIndex,
+        force_write_refresh: bool,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
         var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
         var item_indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
         defer item_indexes.deinit(self.alloc);
@@ -2829,7 +2847,7 @@ pub const ApiHttpServer = struct {
                 try self.appendRemoteRuntimeStatusesFromSnapshot(&items, &item_indexes, table_name, admin_snapshot);
             }
         }
-        const should_query_writes = if (snapshot == null)
+        const should_query_writes = force_write_refresh or if (snapshot == null)
             self.table_reads == null or !read_statuses_present or read_needs_refresh
         else
             items.items.len == 0 or !read_statuses_present or read_needs_refresh;
@@ -9981,10 +9999,22 @@ pub const ApiHttpServer = struct {
         unavailable,
     };
 
-    fn runtimeIndexLifecycle(statuses: []const runtime_status.LocalTableRuntimeStatus, index_name: []const u8) RuntimeIndexLifecycle {
-        if (statuses.len == 0) return .unavailable;
+    fn runtimeStatusHasCurrentLifecycleEvidence(metadata: runtime_status.RuntimeStatusMetadata) bool {
+        return metadata.freshness == .fresh or metadata.freshness == .catching_up;
+    }
+
+    fn runtimeIndexLifecycle(
+        statuses: []const runtime_status.LocalTableRuntimeStatus,
+        expected_group_ids: []const u64,
+        index_name: []const u8,
+    ) RuntimeIndexLifecycle {
+        if (expected_group_ids.len == 0) return .unavailable;
         var observed_active_build = false;
-        for (statuses) |status| {
+        for (expected_group_ids) |group_id| {
+            const status = for (statuses) |candidate| {
+                if (candidate.group_id == group_id) break candidate;
+            } else return .unavailable;
+            if (!runtimeStatusHasCurrentLifecycleEvidence(status.metadata)) return .unavailable;
             const index = for (status.stats.indexes) |item| {
                 if (std.mem.eql(u8, item.name, index_name)) break item;
             } else return .unavailable;
@@ -10010,10 +10040,11 @@ pub const ApiHttpServer = struct {
 
     fn observeRuntimeIndexLifecycle(
         statuses: []const runtime_status.LocalTableRuntimeStatus,
+        expected_group_ids: []const u64,
         index_name: []const u8,
         observed_rebuilding: *bool,
     ) bool {
-        return switch (runtimeIndexLifecycle(statuses, index_name)) {
+        return switch (runtimeIndexLifecycle(statuses, expected_group_ids, index_name)) {
             .healthy => true,
             .rebuilding => blk: {
                 observed_rebuilding.* = true;
@@ -10058,11 +10089,13 @@ pub const ApiHttpServer = struct {
         }
         if (!referenced) return false;
 
-        // Unknown runtime state is not proof of an active build. Create
-        // admission installs write capability before returning, so callers
-        // after that boundary have an observable lifecycle fact.
-        const write_source = self.table_writes orelse return false;
-        var statuses = (try write_source.localRuntimeStatuses(self.alloc, table_name)) orelse return false;
+        // Unknown or partial runtime state is not proof of an active build.
+        // Merge local and remotely published observations, then require one
+        // current lifecycle fact for every catalog group below.
+        const expected_group_ids = try indexes_api.expectedTableGroupIds(self.alloc, &snapshot, table.table_id);
+        defer if (expected_group_ids.len > 0) self.alloc.free(expected_group_ids);
+        if (expected_group_ids.len == 0) return false;
+        var statuses = (try self.lifecycleTableRuntimeStatusesWithSnapshot(table_name, &snapshot)) orelse return false;
         defer statuses.deinit(self.alloc);
 
         // IndexNotFound is retryable only when every referenced catalog index
@@ -10070,19 +10103,19 @@ pub const ApiHttpServer = struct {
         // failed or missing sibling must retain the actionable original error.
         var observed_rebuilding = false;
         if (req.index_name) |name| {
-            if (!observeRuntimeIndexLifecycle(statuses.items, name, &observed_rebuilding)) return false;
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, name, &observed_rebuilding)) return false;
         }
         for (req.full_text_queries) |query| {
-            if (!observeRuntimeIndexLifecycle(statuses.items, query.index_name, &observed_rebuilding)) return false;
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.index_name, &observed_rebuilding)) return false;
         }
         for (req.dense_queries) |query| {
-            if (!observeRuntimeIndexLifecycle(statuses.items, query.index_name, &observed_rebuilding)) return false;
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.index_name, &observed_rebuilding)) return false;
         }
         for (req.sparse_queries) |query| {
-            if (!observeRuntimeIndexLifecycle(statuses.items, query.index_name, &observed_rebuilding)) return false;
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.index_name, &observed_rebuilding)) return false;
         }
         for (req.graph_queries) |query| {
-            if (!observeRuntimeIndexLifecycle(statuses.items, query.query.index_name, &observed_rebuilding)) return false;
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.query.index_name, &observed_rebuilding)) return false;
         }
         return observed_rebuilding;
     }
@@ -18279,16 +18312,31 @@ test "api http missing index classification requires active rebuild evidence" {
         .index_repair_phase = "building",
     }};
     const active_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{ .indexes = @constCast(active_indexes[0..]) },
     }};
+    const expected_group_ids = [_]u64{10};
     try std.testing.expectEqual(
         ApiHttpServer.RuntimeIndexLifecycle.rebuilding,
-        ApiHttpServer.runtimeIndexLifecycle(active_statuses[0..], "semantic_idx"),
+        ApiHttpServer.runtimeIndexLifecycle(active_statuses[0..], &expected_group_ids, "semantic_idx"),
     );
 
     try std.testing.expectEqual(
         ApiHttpServer.RuntimeIndexLifecycle.unavailable,
-        ApiHttpServer.runtimeIndexLifecycle(&.{}, "semantic_idx"),
+        ApiHttpServer.runtimeIndexLifecycle(&.{}, &expected_group_ids, "semantic_idx"),
+    );
+
+    const two_group_ids = [_]u64{ 10, 11 };
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(active_statuses[0..], &two_group_ids, "semantic_idx"),
+    );
+    var stale_statuses = active_statuses;
+    stale_statuses[0].metadata.freshness = .stale;
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(stale_statuses[0..], &expected_group_ids, "semantic_idx"),
     );
 
     const terminal_indexes = [_]db_mod.types.DBIndexStats{.{
@@ -18299,11 +18347,13 @@ test "api http missing index classification requires active rebuild evidence" {
         .index_repair_phase = "terminal",
     }};
     const terminal_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{ .indexes = @constCast(terminal_indexes[0..]) },
     }};
     try std.testing.expectEqual(
         ApiHttpServer.RuntimeIndexLifecycle.unavailable,
-        ApiHttpServer.runtimeIndexLifecycle(terminal_statuses[0..], "semantic_idx"),
+        ApiHttpServer.runtimeIndexLifecycle(terminal_statuses[0..], &expected_group_ids, "semantic_idx"),
     );
 
     const paused_indexes = [_]db_mod.types.DBIndexStats{.{
@@ -18314,11 +18364,13 @@ test "api http missing index classification requires active rebuild evidence" {
         .index_repair_automation = "paused",
     }};
     const paused_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{ .indexes = @constCast(paused_indexes[0..]) },
     }};
     try std.testing.expectEqual(
         ApiHttpServer.RuntimeIndexLifecycle.unavailable,
-        ApiHttpServer.runtimeIndexLifecycle(paused_statuses[0..], "semantic_idx"),
+        ApiHttpServer.runtimeIndexLifecycle(paused_statuses[0..], &expected_group_ids, "semantic_idx"),
     );
 
     const degraded_indexes = [_]db_mod.types.DBIndexStats{.{
@@ -18327,15 +18379,17 @@ test "api http missing index classification requires active rebuild evidence" {
         .repair_degraded = true,
     }};
     const degraded_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{ .indexes = @constCast(degraded_indexes[0..]) },
     }};
     try std.testing.expectEqual(
         ApiHttpServer.RuntimeIndexLifecycle.unavailable,
-        ApiHttpServer.runtimeIndexLifecycle(degraded_statuses[0..], "semantic_idx"),
+        ApiHttpServer.runtimeIndexLifecycle(degraded_statuses[0..], &expected_group_ids, "semantic_idx"),
     );
     try std.testing.expectEqual(
         ApiHttpServer.RuntimeIndexLifecycle.unavailable,
-        ApiHttpServer.runtimeIndexLifecycle(degraded_statuses[0..], "missing_idx"),
+        ApiHttpServer.runtimeIndexLifecycle(degraded_statuses[0..], &expected_group_ids, "missing_idx"),
     );
 
     // An active build cannot mask an actionable failure from another index in
@@ -18356,12 +18410,14 @@ test "api http missing index classification requires active rebuild evidence" {
         },
     };
     const mixed_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{ .indexes = @constCast(mixed_indexes[0..]) },
     }};
     var observed_rebuilding = false;
-    try std.testing.expect(ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], "building_idx", &observed_rebuilding));
+    try std.testing.expect(ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], &expected_group_ids, "building_idx", &observed_rebuilding));
     try std.testing.expect(observed_rebuilding);
-    try std.testing.expect(!ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], "failed_idx", &observed_rebuilding));
+    try std.testing.expect(!ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], &expected_group_ids, "failed_idx", &observed_rebuilding));
 }
 
 test "api http plain public query preserves outer absolute request deadline" {

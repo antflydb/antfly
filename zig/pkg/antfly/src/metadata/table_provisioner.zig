@@ -341,10 +341,27 @@ pub fn reconcileDbIndexTarget(
         else => return error.InvalidTableIndexMetadata,
     };
 
+    var desired_enrichments = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
+    defer {
+        for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
+        desired_enrichments.deinit(alloc);
+    }
+    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, &desired_enrichments);
+    try indexes_api.validateArtifactEnrichmentConfigs(alloc, desired_enrichments.items);
+    dedupeDesiredEnrichments(alloc, &desired_enrichments);
+    indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
+
+    var target_enrichments = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
+    defer {
+        for (target_enrichments.items) |*cfg| cfg.deinit(alloc);
+        target_enrichments.deinit(alloc);
+    }
+
     const current = try db.listIndexes(alloc);
     defer db_mod.types.freeIndexConfigs(alloc, current);
     var target_summary: IndexEnsureSummary = .{};
-    var found = false;
+    var target_value: ?std.json.Value = null;
+    var target_array_form = false;
 
     if (object.get("indexes")) |indexes_value| {
         const items = switch (indexes_value) {
@@ -354,39 +371,44 @@ pub fn reconcileDbIndexTarget(
         for (items) |item| {
             const name = try indexDefinitionName(item);
             if (!std.mem.eql(u8, name, index_name)) continue;
-            if (found) return error.InvalidTableIndexMetadata;
-            found = true;
-            try ensureIndexDefinition(
-                alloc,
-                db,
-                current,
-                &target_summary,
-                name,
-                try parseIndexKind(item),
-                indexDefinitionConfigValue(item),
-                true,
-            );
+            if (target_value != null) return error.InvalidTableIndexMetadata;
+            target_value = item;
+            target_array_form = true;
         }
     } else {
         if (object.get(index_name)) |config_value| {
-            found = true;
-            try ensureIndexDefinition(
-                alloc,
-                db,
-                current,
-                &target_summary,
-                index_name,
-                try parseIndexKind(config_value),
-                config_value,
-                false,
-            );
+            target_value = config_value;
         }
     }
 
-    if (!found) {
+    if (target_value) |value| {
+        try indexes_api.collectArtifactEnrichmentsFromValue(alloc, value, &target_enrichments);
+        dedupeDesiredEnrichments(alloc, &target_enrichments);
+        indexes_api.sortArtifactEnrichmentsByDependency(target_enrichments.items);
+    }
+    const enrichment_summary = try ensureEnrichments(db, target_enrichments.items);
+
+    if (target_value) |value| {
+        try ensureIndexDefinition(
+            alloc,
+            db,
+            current,
+            &target_summary,
+            index_name,
+            try parseIndexKind(value),
+            if (target_array_form) indexDefinitionConfigValue(value) else value,
+            target_array_form,
+        );
+    } else {
         if (try db.deleteIndex(index_name)) target_summary.removed += 1;
     }
-    if (target_summary.added > 0 or target_summary.removed > 0) {
+    // Removing every persisted enrichment absent from the current catalog is
+    // target-safe: it never applies a sibling addition or update, while also
+    // making deletion retryable after a crash between index and enrichment
+    // retirement. Definitions still referenced by another index or by the
+    // table-level enrichment catalog remain in desired_enrichments.
+    const enrichments_removed = try removeAbsentEnrichments(alloc, db, desired_enrichments.items);
+    if (target_summary.added > 0 or target_summary.removed > 0 or enrichment_summary.changed() or enrichments_removed > 0) {
         const pending = db.pendingWorkStats();
         if (pending.enrichment.error_count == 0) try db.core.index_manager.syncAll(false);
     }
@@ -394,6 +416,9 @@ pub fn reconcileDbIndexTarget(
         .indexes_added = target_summary.added,
         .indexes_removed = target_summary.removed,
         .indexes_pending = target_summary.pending,
+        .enrichments_added = enrichment_summary.added,
+        .enrichments_updated = enrichment_summary.updated,
+        .enrichments_removed = enrichments_removed,
     };
 }
 
@@ -1202,6 +1227,30 @@ fn removeMissingEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired: [
     return removed;
 }
 
+fn removeAbsentEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired: []const db_mod.types.EnrichmentConfig) !usize {
+    const existing = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, existing);
+
+    var removed: usize = 0;
+    var i = existing.len;
+    while (i > 0) {
+        i -= 1;
+        const cfg = existing[i];
+        // Target reconciliation may observe a newer sibling definition. Its
+        // named operation must not delete the old sibling config merely because
+        // that config still needs a whole-table update; only catalog absence is
+        // globally safe cleanup.
+        if (findEnrichmentByName(desired, cfg.name) != null) continue;
+        if (db.deleteEnrichment(cfg.kind, cfg.name)) |deleted| {
+            if (deleted) removed += 1;
+        } else |err| switch (err) {
+            error.EnrichmentInUse => continue,
+            else => return err,
+        }
+    }
+    return removed;
+}
+
 fn findEnrichmentByName(
     configs: []const db_mod.types.EnrichmentConfig,
     name: []const u8,
@@ -1795,6 +1844,57 @@ test "target index reconciliation never mutates sibling indexes" {
     try std.testing.expect(findIndexConfig(configs, "keep_idx") == null);
     try std.testing.expect(findIndexConfig(configs, "target_idx") != null);
     try std.testing.expect(findIndexConfig(configs, "unrelated_new") == null);
+}
+
+test "target index reconciliation retires orphaned inline enrichments after deletion retry" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-target-enrichment-delete";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const initial =
+        \\{
+        \\  "target_idx":{"type":"full_text","artifact_name":"target_chunks","enrichments":[
+        \\    {"name":"target_units","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},
+        \\    {"name":"target_chunks","kind":"chunk","source_artifact_name":"target_units","field":"text","chunk_size":128}
+        \\  ]},
+        \\  "keep_idx":{"type":"full_text","artifact_name":"keep_chunks","enrichments":[
+        \\    {"name":"keep_units","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},
+        \\    {"name":"keep_chunks","kind":"chunk","source_artifact_name":"keep_units","field":"text","chunk_size":128}
+        \\  ]}
+        \\}
+    ;
+    _ = try reconcileDbIndexes(alloc, &db, initial);
+    try std.testing.expect(try db.deleteIndex("target_idx"));
+
+    // Simulate a crash after the index catalog commit but before its inline
+    // enrichments were retired. The retry has no old index config to inspect,
+    // so cleanup must be derived from complete current catalog ownership.
+    const desired =
+        \\{"keep_idx":{"type":"full_text","artifact_name":"keep_chunks","enrichments":[
+        \\  {"name":"keep_units","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},
+        \\  {"name":"keep_chunks","kind":"chunk","source_artifact_name":"keep_units","field":"text","chunk_size":128}
+        \\]}}
+    ;
+    const summary = try reconcileDbIndexTarget(alloc, &db, desired, "target_idx");
+    try std.testing.expectEqual(@as(usize, 0), summary.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 2), summary.enrichments_removed);
+
+    const enrichments = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    try std.testing.expectEqual(@as(usize, 2), enrichments.len);
+    try std.testing.expect(findEnrichment(enrichments, .asset, "keep_units") != null);
+    try std.testing.expect(findEnrichment(enrichments, .chunk, "keep_chunks") != null);
+    try std.testing.expect(findEnrichment(enrichments, .asset, "target_units") == null);
+    try std.testing.expect(findEnrichment(enrichments, .chunk, "target_chunks") == null);
 }
 
 test "table provisioner durably enqueues existing corpus full text backfill" {
