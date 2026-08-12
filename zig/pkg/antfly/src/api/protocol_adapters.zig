@@ -558,8 +558,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
     };
     const ExtensionToolContext = struct {
         server: Server,
-        authorization: ?[]const u8,
-        trusted_principal: ?[]const u8,
+        authenticated_identity: @TypeOf(authenticated_identity),
         permissions: ?[]const usermgr.Permission,
         installed: *const extension_domain.InstalledExtension,
         tool: *const ExtensionMcpTool,
@@ -575,7 +574,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
                     return mcpError(alloc, "permission denied");
                 }
             }
-            return try callExtensionMcpTool(alloc, ctx.server, ctx.authorization, ctx.trusted_principal, ctx.installed, ctx.tool.*, args);
+            return try callExtensionMcpTool(alloc, ctx.server, ctx.authenticated_identity, ctx.installed, ctx.tool.*, args);
         }
     };
 
@@ -621,8 +620,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         const installed = findInstalledExtensionForRuntimeTool(snapshot_opt.?.installed_extensions, extension_tools.items[i].member.extension_name) orelse return try contextual_operations.textAlloc(server_ptr.alloc, 404, "extension not found");
         ctx.* = .{
             .server = server_ptr,
-            .authorization = request.authorization,
-            .trusted_principal = request.trusted_principal,
+            .authenticated_identity = authenticated_identity,
             .permissions = if (authenticated_identity) |identity| identity.permissions else null,
             .installed = installed,
             .tool = &extension_tools.items[i],
@@ -1090,7 +1088,7 @@ fn findInstalledExtensionForRuntimeTool(installed_extensions: []const extension_
     return null;
 }
 
-fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authorization: ?[]const u8, trusted_principal: ?[]const u8, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value) !mcp.CallToolResult {
+fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated_identity: anytype, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value) !mcp.CallToolResult {
     if (parseWasmHandler(tool.handler)) |handler| {
         const tool_name = handler.tool_name;
         if (!std.mem.eql(u8, tool_name, tool.member.object_name)) {
@@ -1099,19 +1097,18 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authorization
         const binding = tool.runtime_binding orelse return try mcpError(alloc, "extension wasm runtime binding is unavailable");
         const request_json = try stringifyJsonValue(alloc, args);
         defer alloc.free(request_json);
-        var host_context = ExtensionHostContext(@TypeOf(server)){
+        var host_context = ExtensionHostContext(@TypeOf(server), @TypeOf(authenticated_identity)){
             .server = server,
-            .authorization = authorization,
-            .trusted_principal = trusted_principal,
+            .authenticated_identity = authenticated_identity,
             .installed = installed,
         };
         if (wasmtime_runtime.invokeExtensionWithOptions(alloc, binding.runtime(), tool_name, request_json, .{
             .package_store_root = server.cfg.extension_package_store_dir,
             .host_imports = .{
                 .ptr = &host_context,
-                .db_query = ExtensionHostContext(@TypeOf(server)).dbQuery,
-                .db_write = ExtensionHostContext(@TypeOf(server)).dbWrite,
-                .ai_embed = ExtensionHostContext(@TypeOf(server)).aiEmbed,
+                .db_query = ExtensionHostContext(@TypeOf(server), @TypeOf(authenticated_identity)).dbQuery,
+                .db_write = ExtensionHostContext(@TypeOf(server), @TypeOf(authenticated_identity)).dbWrite,
+                .ai_embed = ExtensionHostContext(@TypeOf(server), @TypeOf(authenticated_identity)).aiEmbed,
             },
         })) |body| {
             return try mcpResultFromExtensionJson(alloc, body);
@@ -1137,11 +1134,10 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authorization
     return mcpError(alloc, message);
 }
 
-fn ExtensionHostContext(comptime Server: type) type {
+fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
     return struct {
         server: Server,
-        authorization: ?[]const u8,
-        trusted_principal: ?[]const u8,
+        authenticated_identity: Identity,
         installed: *const extension_domain.InstalledExtension,
 
         fn dbQuery(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, query_json: []const u8) anyerror![]u8 {
@@ -1150,7 +1146,7 @@ fn ExtensionHostContext(comptime Server: type) type {
             const table_name = try ctx.resolveTableName(table);
             const body = try extensionQueryBodyAlloc(alloc, query_json);
             defer alloc.free(body);
-            return try ctx.dispatchJson(alloc, .POST, table_name, "query", body);
+            return try ctx.server.executeExtensionHostQuery(alloc, table_name, body, ctx.authenticated_identity);
         }
 
         fn dbWrite(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, writes_json: []const u8) anyerror![]u8 {
@@ -1159,7 +1155,7 @@ fn ExtensionHostContext(comptime Server: type) type {
             const table_name = try ctx.resolveTableName(table);
             const body = try extensionBatchBodyAlloc(alloc, writes_json);
             defer alloc.free(body);
-            return try ctx.dispatchJson(alloc, .POST, table_name, "batch", body);
+            return try ctx.server.executeExtensionHostBatch(alloc, table_name, body);
         }
 
         fn aiEmbed(ptr: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, text: []const u8) anyerror![]f32 {
@@ -1200,26 +1196,6 @@ fn ExtensionHostContext(comptime Server: type) type {
                 .cluster => requested,
                 .embedded_db => error.UnsupportedExtensionScope,
             };
-        }
-
-        fn dispatchJson(ctx: *@This(), alloc: std.mem.Allocator, method: http_common.Method, table_name: []const u8, route: []const u8, body: []const u8) ![]u8 {
-            const uri = try std.fmt.allocPrint(alloc, "/tables/{s}/{s}", .{ table_name, route });
-            defer alloc.free(uri);
-            const headers: []const http_common.RequestHeader = if (ctx.trusted_principal) |principal|
-                &[_]http_common.RequestHeader{.{ .name = trusted_principal_header, .value = principal }}
-            else
-                &.{};
-            var resp = try ctx.server.handle(.{
-                .method = method,
-                .uri = uri,
-                .headers = headers,
-                .authorization = ctx.authorization,
-                .content_type = "application/json",
-                .body = body,
-            });
-            defer resp.deinit(ctx.server.alloc);
-            if (resp.status < 200 or resp.status >= 300) return error.ExtensionHostApiFailed;
-            return try alloc.dupe(u8, resp.body);
         }
     };
 }

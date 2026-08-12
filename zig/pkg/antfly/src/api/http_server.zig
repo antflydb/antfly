@@ -11245,6 +11245,42 @@ pub const ApiHttpServer = struct {
         return response;
     }
 
+    pub fn executeExtensionHostBatch(
+        self: *ApiHttpServer,
+        result_alloc: std.mem.Allocator,
+        table_name: []const u8,
+        body: []const u8,
+    ) ![]u8 {
+        var response = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi());
+        defer response.deinit(self.alloc);
+        if (response.status < 200 or response.status >= 300) return error.ExtensionHostApiFailed;
+        return try result_alloc.dupe(u8, response.body);
+    }
+
+    pub fn executeExtensionHostQuery(
+        self: *ApiHttpServer,
+        result_alloc: std.mem.Allocator,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) ![]u8 {
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        const source = self.table_reads orelse return error.TableNotFound;
+        db_mod.resetLastSortRejectionDiagnostic();
+        const response_body = try self.executePublicTableQueryDispatchWithReadinessRetry(
+            self.alloc,
+            source,
+            table_name,
+            body,
+            row_filter_json,
+            authenticated_identity,
+            null,
+        );
+        defer self.alloc.free(response_body);
+        return try result_alloc.dupe(u8, response_body);
+    }
+
     pub fn handlePublicTableQueryWithContentType(
         self: *ApiHttpServer,
         table_name: []const u8,
