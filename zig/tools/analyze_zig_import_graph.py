@@ -1058,16 +1058,21 @@ def check_compiled_storage_boundary(
     reports: dict[str, TimeReport],
     source_root: Path = DEFAULT_SOURCE_ROOT,
 ) -> bool:
-    report = reports.get("distributed")
-    if report is None:
+    distributed = reports.get("distributed")
+    if distributed is None:
         print(
             "compiled storage boundary check requires --time-report distributed=PATH",
             file=sys.stderr,
         )
         return False
-    if not report.has_file_list:
+    candidates = [distributed]
+    if serverless := reports.get("serverless"):
+        candidates.append(serverless)
+    for report in candidates:
+        if report.has_file_list:
+            continue
         print(
-            "distributed compiler report has no authoritative all_files list",
+            f"{report.name} compiler report has no authoritative all_files list",
             file=sys.stderr,
         )
         return False
@@ -1076,15 +1081,18 @@ def check_compiled_storage_boundary(
         (source_root / relative).resolve(): relative
         for relative in DISTRIBUTED_FORBIDDEN_STORAGE_FILES
     }
-    leaked = sorted(
-        (forbidden[path] for path in report.repo_files if path in forbidden)
-    )
-    for relative in leaked:
-        print(
-            f"compiled storage boundary violation: distributed analyzes {relative}",
-            file=sys.stderr,
+    clean = True
+    for report in candidates:
+        leaked = sorted(
+            forbidden[path] for path in report.repo_files if path in forbidden
         )
-    return not leaked
+        for relative in leaked:
+            clean = False
+            print(
+                f"compiled storage boundary violation: {report.name} analyzes {relative}",
+                file=sys.stderr,
+            )
+    return clean
 
 
 def check_ha_seed_failure_registry(source_root: Path = DEFAULT_SOURCE_ROOT) -> bool:

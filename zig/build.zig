@@ -62,10 +62,13 @@ const RuntimeLibraryUnit = enum {
     // Measurement-only control island combining the public API kernel with
     // data, metadata, and HA control over the opaque storage-owner ABI.
     control_api_probe,
-    // Distributed/API control plus serverless and standalone/Lite composition.
+    // Distributed/API control plus standalone composition.
     // Under the storage-kernel experiment, physical storage and restore
     // staging live in the separate storage unit.
     distributed,
+    // Serverless execution over immutable published artifacts. Physical
+    // aggregation folds cross the existing coarse storage-owner ABI.
+    serverless,
     // Physical document/media extraction compute. Storage retains replay,
     // durability, manifests, and index ownership and calls this unit once per
     // bounded extraction operation.
@@ -9231,6 +9234,7 @@ pub fn build(b: *std.Build) void {
                 unit != .application_pic_probe and unit != .control_probe and
                 unit != .cli_pic_probe and unit != .control_api_probe and
                 unit != .local_query and
+                (unit != .cli or !storage_kernel_experiment) and
                 (unit != .api_kernel or !storage_kernel_experiment) and
                 (unit != .storage_kernel or storage_kernel_experiment) and
                 (unit != .enrichment_compute or storage_kernel_experiment);
@@ -9284,6 +9288,7 @@ pub fn build(b: *std.Build) void {
                         "antfly-runtime-distributed"
                     else
                         "antfly-storage-kernel",
+                    .serverless => "antfly-runtime-serverless",
                     .local_query => "antfly-runtime-local_query",
                     else => b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
                 },
@@ -9310,6 +9315,7 @@ pub fn build(b: *std.Build) void {
                     .cli_pic_probe => 8 * 1024 * 1024 * 1024,
                     .control_api_probe => 11 * 1024 * 1024 * 1024,
                     .distributed => @as(usize, if (storage_kernel_experiment) 9 else 11) * 1024 * 1024 * 1024,
+                    .serverless => 5 * 1024 * 1024 * 1024,
                     .enrichment_compute => 4 * 1024 * 1024 * 1024,
                     .local_query => 8 * 1024 * 1024 * 1024,
                     .inference => 8 * 1024 * 1024 * 1024,
@@ -9317,14 +9323,15 @@ pub fn build(b: *std.Build) void {
             });
             // Zig 0.16 intentionally randomizes dependency traversal, so enum
             // order cannot define a reliable bounded-RSS launch group. These
-            // two edges deterministically preserve useful overlap. The
-            // default topology schedules API (7 GiB) with combined
+            // dependency edges below deterministically preserve useful
+            // overlap. The default topology schedules API (7 GiB) with combined
             // application/storage (11 GiB), then inference (8 GiB) with the
             // latter after API. The physical-source experiment schedules
             // storage (10.25 GiB) with distributed/API/composition (9 GiB),
             // then admits inference after distributed so its 8 GiB claim can
-            // overlap the storage tail at 18.25 GiB. The build scheduler holds
-            // the 4 GiB enrichment unit until either claim becomes available.
+            // overlap the storage tail at 18.25 GiB. Serverless/CLI and
+            // enrichment wait for storage; together with inference their
+            // claims total only 17 GiB.
             //
             // This is still concurrent code generation; it only prevents a
             // short or later unit from consuming the claim needed by a
@@ -9340,9 +9347,18 @@ pub fn build(b: *std.Build) void {
                 .enrichment_compute => {
                     enrichment_compute_artifact = role_artifact;
                     // Preserve the measured 19.25 GiB storage+distributed
-                    // launch group. This small unit overlaps the tail after
-                    // distributed without delaying either critical root.
-                    role_artifact.step.dependOn(&application_runtime_artifact.?.step);
+                    // launch group and reserve the first released claim for
+                    // inference. This small unit overlaps inference after
+                    // storage without delaying a critical root.
+                    role_artifact.step.dependOn(&storage_runtime_artifact.?.step);
+                },
+                .serverless => {
+                    // Keep the initial storage+distributed admission group
+                    // unchanged and reserve the first post-distributed claim
+                    // for inference. Once storage completes, this short
+                    // serverless/remote-CLI unit overlaps inference without
+                    // extending the critical path.
+                    role_artifact.step.dependOn(&storage_runtime_artifact.?.step);
                 },
                 .local_query => {
                     // Test-only provider for the CAPI root that deliberately
@@ -9567,7 +9583,7 @@ pub fn build(b: *std.Build) void {
                 );
                 metadata_runtime_owner_test_step.dependOn(&run_metadata_runtime_owner_tests.step);
             }
-            if (owns_storage_kernel or unit == .enrichment_compute or unit == .local_query or
+            if (owns_storage_kernel or unit == .serverless or unit == .enrichment_compute or unit == .local_query or
                 unit == .control_api_probe or
                 (storage_kernel_experiment and unit == .distributed))
             {
@@ -9575,18 +9591,19 @@ pub fn build(b: *std.Build) void {
                 // PIC object. Give the final links enough section granularity
                 // to retain only the C ABI roots in the shared libraries while
                 // the executable retains the runtime entry points as well. The
-                // excluded control/API probe and experimental distributed unit
-                // use the same granularity so the graph analyzer can attribute
-                // remaining cross-unit code and the final executable can drop
-                // unused composition helpers after the ownership move.
+                // excluded control/API probe, experimental distributed unit,
+                // and serverless/CLI product unit use the same granularity so
+                // the graph analyzer can attribute remaining cross-unit code
+                // and the final executable can drop unused composition helpers
+                // after the ownership move.
                 role_artifact.link_function_sections = true;
                 role_artifact.link_data_sections = true;
             }
             // Zig's build runner uses these claims to run as many LLVM codegen
             // steps concurrently as fit in available RAM. The explicit gates
             // above establish the initial groups described above, then overlap
-            // inference and CLI with the opposite long path as claims become
-            // available. Storage and enrichment are PIC because the
+            // inference with the storage tail and the two short units after
+            // storage. Storage and enrichment are PIC because the
             // executable and C ABI libraries share both archives; all three
             // consumers reuse the same analyzed and optimized graphs.
             if (unit_enabled and (owns_storage_kernel or unit == .enrichment_compute)) {
@@ -9604,9 +9621,9 @@ pub fn build(b: *std.Build) void {
         }
 
         // These focused suites exercise the storage archive exactly as it is
-        // composed into the final executable. The archive owns standalone and
-        // serverless, whose intentionally external API and embedded-inference
-        // entry points are supplied by their independently generated units.
+        // composed into the final executable. Their intentionally external API,
+        // product-edge, and embedded-inference entry points are supplied by
+        // independently generated units.
         for ([_]?*std.Build.Step.Compile{
             storage_owner_tests,
             storage_provisioned_owner_tests,

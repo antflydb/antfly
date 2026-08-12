@@ -7,6 +7,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const token = @import("token.zig");
+const index_config = @import("index_config.zig");
+
+pub const Config = index_config.Config;
+pub const validateConfig = index_config.validateConfig;
 
 pub const path_fact_exists_constraint_value = "pathfact-exists:v1";
 const path_fact_any_constraint_tag = "pathfact-any:v1";

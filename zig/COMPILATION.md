@@ -4290,47 +4290,150 @@ with opaque handles and complete batch/query/lifecycle operations, before
 committing to that larger ABI. It must not duplicate DB/index implementation
 or introduce per-record/backend callbacks.
 
+### Phase 4z: production mutation canary corrects the probe conclusion
+
+Two hand-written measurement probes initially failed ARM64 Linux musl
+`ReleaseFast`: an `IndexManager` owner and a synthetic mutation provider. Those
+failures remain useful Zig 0.16 codegen evidence, but they were not sufficient
+to reject the architecture. The exact existing production
+`storageOwnerBatchJson` entry point, rooted alone without changing its types or
+control flow, compiled successfully from a cold cache in 172.640 seconds. Its
+object contained 14,797,943 B of text and repeated 6.10 MB of named sections
+already present in the complete storage object. Physical DB, algebraic index,
+index manager, enrichment runtime, and aggregations led that repetition.
+
+The corrected conclusion is narrower: the synthetic provider shape was
+compiler-unsafe; the coarse production owner ABI is compiler-safe and large
+enough to be architecturally relevant. The measurement-only roots were still
+removed. Future cuts must first root the exact production operation, then
+reduce imports while preserving that shape, rather than extrapolating from a
+new hand-written provider.
+
+The same investigation found a more immediate source-selection leak.
+`cli_root.zig` and `serverless/api/http_handler.zig` imported the physical
+`storage/db/mod.zig` even in control-only units. A raw serverless composition
+canary took 224.670 seconds and co-emitted 5.47 MB with the mutation canary,
+including DB and index implementation. This was the next boundary to repair
+before creating another storage API.
+
+### Phase 4aa: source-selected serverless product unit
+
+Serverless now imports `storage/db/selected_root.zig`. The control facade uses
+a new pure `algebraic/index_config.zig` for the exact shared configuration and
+`InvalidAlgebraicConfig` validation identity. It does not import the physical
+algebraic index. Complete aggregation folding crosses the already-versioned
+storage-owner aggregation operation:
+
+```text
+serverless request and published hits
+    -> one borrowed hit-descriptor batch plus aggregation/context payloads
+    -> compiled storage owner performs the complete fold
+    -> one owned result payload or canonical FailureIdentity
+```
+
+There is no per-hit, per-bucket, or backend callback. Provider-owned output is
+destroyed by the provider after the consumer parses its owned result. The
+existing status registry preserves `InvalidAggregation` and
+`UnsupportedAggregation` exactly; the 101-case cross-archive owner suite
+proves success and both semantic failures. Config validation remains outside
+the boundary and preserves `InvalidAlgebraicConfig` directly.
+
+The focused cold serverless canary fell from 118.810 to 96.780 seconds after
+the aggregation move, and its overlap with the production mutation root fell
+from 1.271 MB to 244.5 KB. Co-generating serverless with distributed control
+was then rejected: storage improved to 271.271 seconds, but distributed grew
+to 305.439 seconds, improving the Phase 4y 321.719-second critical path by only
+16.280 seconds and missing the 30--45 second materiality threshold.
+
+The accepted local candidate instead makes serverless an independently
+compiled product unit. It waits for storage so Zig's randomized dependency
+traversal cannot consume the memory claim reserved for inference. Serverless
+then overlaps inference. Remote CLI is co-generated in the same short unit:
+its 36 shared repository files are almost entirely HTTPX/Handlebars support,
+and adding it costs 13.219 seconds instead of retaining a separate 39.629-
+second LLVM unit. Both commands remain independent hidden entry points linked
+into the one executable.
+
+A matched cold Apple-Silicon cross-build used Zig 0.16.0, fresh local and
+global caches, ARM64 Linux musl `ReleaseFast`, stripping, baseline CPU,
+production LSM-only mode, normal concurrency, and the five-unit topology. All
+39 steps succeeded:
+
+| Unit | Cold time | LLVM | Files | Declarations |
+|---|---:|---:|---:|---:|
+| Storage + local query | 265.177 s | 259.018 s | 668 | 30,625 |
+| Distributed/API control | 263.269 s | 256.752 s | 757 | 31,818 |
+| Serverless + remote CLI | 123.528 s | 120.204 s | 565 | 15,196 |
+| Inference | 233.260 s | 221.732 s | 712 | 26,645 |
+| Enrichment compute | 19.286 s | 18.175 s | 132 | 3,510 |
+
+The local critical path is now storage at 265.177 seconds, 56.542 seconds
+below Phase 4y and below the preferred 350-second gate. Across the five reports
+there are 2,037 repository-file instances, 1,257 unique files, and 780
+duplicate instances. Function/data sectioning on the product unit makes its
+emission attributable and permits final-link garbage collection. Across all
+five objects, repeated named text is 2,493,188 B; this deliberately accepts
+some repeated query/schema/provider contracts in exchange for moving physical
+serverless execution off the critical storage and distributed units.
+
+The stripped static executable is 69,385,656 B, 5.90% above the Phase 4y
+65,522,864 B artifact and close to the approximate 5% design budget. The C API
+is 18,910,424 B, slightly smaller than Phase 4y and below 20 MiB. It still links
+only storage/CAPI and enrichment; adding the product unit does not enlarge it.
+The executable is static AArch64, has no dynamic section, and contains no LMDB
+entry-point strings. The shared library exports no private runtime, API,
+inference, storage-owner, snapshot, restore, or data-apply symbols.
+
+Decision: **keep as the next normal-runner candidate**. It repairs the concrete
+post-main source leak, crosses only an existing coarse identity-preserving ABI,
+and produces a material local critical-path reduction without merging
+inference into application code. The 5.90% executable increase is a measured
+tradeoff, not an unnoticed regression. Acceptance still requires a clean
+normal-runner build proving timing, RSS admission, artifact size, and graph
+gates on the exact tree.
+
 ## Holistic target architecture
 
-The current structural candidate is the opt-in five-unit source-selected topology above:
-storage plus local query, distributed/API control, enrichment compute,
-inference, and remote CLI. Unlike the rejected source-only coalescing probes, it gives the
-distributed/API unit only control sources, co-generates physical local-query
-execution with its storage owner, and keeps compute-heavy
-inference/enrichment isolated.
-The local cold combined storage/query unit is now 321.719 seconds, below the
-350-second preferred gate. On the normal Linux runner the five-unit candidate
+The current structural candidate is the opt-in five-unit source-selected
+topology above: storage plus local query, distributed/API control, serverless
+plus remote CLI, enrichment compute, and inference. It gives distributed/API
+and serverless only control sources, co-generates physical local-query
+execution with its storage owner, and keeps compute-heavy inference/enrichment
+isolated. The local cold combined storage/query unit is now 265.177 seconds,
+below the 350-second preferred gate. The preceding Phase 4y topology on the
+normal Linux runner
 measured 599.665 seconds for storage/query, versus 664.411 seconds for the
 immediately preceding matched six-unit repeat. The topology therefore has
 runner reliability evidence and a controlled 64.746-second improvement. The
-Phase 4y source-selection repair has not yet been measured on that runner, so
-it is not yet the production baseline despite meeting the local critical-unit
-gate.
+Phase 4y source-selection repair has now passed on that runner. It is the
+ownership/reliability baseline; Phase 4aa still needs exact normal-runner proof
+against the 380-second gate.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:
 
 ```text
 thin linked main
-├── API protocol and distributed-control consumer islands
+├── API protocol and distributed control
 │   ├── HTTP/auth/public translation, routing, topology, fanout and merge
-│   ├── serverless orchestration plus standalone/Lite product composition
-│   └── opaque storage handles plus coarse request/result/callback ABIs
+│   └── standalone composition over opaque storage/inference handles
+├── serverless plus remote-CLI product edge
+│   └── published artifacts, request orchestration, and remote administration
 ├── provisioned storage/local-query kernel (PIC, sectioned, compiled once)
 │   ├── DB/LSM/index ownership and complete group-local query execution
 │   ├── writes, transaction participants, snapshots, restore and maintenance
 │   └── public C API exports reused by the shared libraries
+├── enrichment-compute island
 └── inference island
     └── model lifecycle plus the linked standalone inference host
 ```
 
-The current candidate grouping keeps remote CLI separate; co-generates API,
-serverless orchestration, standalone/Lite composition, and the data, metadata,
-and HA control consumers; and keeps restore staging, physical storage/local
-query execution, and the C API in the storage unit. Standalone remains a
-product composition mode and always links the separately compiled inference
-host. Fresh Linux reports determine whether this placement is accepted or
-revised again.
+The current grouping co-generates API, standalone composition, and the data,
+metadata, and HA control consumers; co-generates serverless with remote CLI;
+and keeps Lite, restore staging, physical storage/local query execution, and
+the C API in the storage unit. Standalone remains a product composition mode
+and always links the separately compiled inference host. Fresh Linux reports
+determine whether this placement is accepted or revised again.
 
 The kernel is not a per-backend wrapper and not an internal RPC service. It is
 one static PIC artifact linked into the executable and the C API libraries.
@@ -4507,10 +4610,10 @@ Once distributed control and standalone no longer import storage
 implementations:
 
 1. Compile the storage/local-query kernel once.
-2. Compile data + metadata + serverless control together.
-3. Keep API and inference separate.
-4. Make standalone/Lite a thin composition layer over the compiled units.
-5. Compile all independent units concurrently with normal job scheduling.
+2. Compile API, data, metadata, HA, and standalone control together.
+3. Compile serverless and remote CLI as one short product-edge unit.
+4. Keep inference and enrichment compute separate; keep Lite with storage.
+5. Compile all independent units concurrently with bounded normal scheduling.
 
 The earlier data + metadata result of approximately 376.9 seconds suggests a
 possible critical path below the current 425.652 seconds once standalone and

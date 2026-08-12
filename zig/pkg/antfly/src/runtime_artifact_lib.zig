@@ -56,7 +56,7 @@ const local_query_exports = if (owns_storage_kernel or unit_options.unit == .loc
 else
     struct {};
 
-const cli_runtime = if (unit_options.unit == .cli or unit_options.unit == .control_probe or
+const cli_runtime = if (unit_options.unit == .cli or unit_options.unit == .serverless or unit_options.unit == .control_probe or
     unit_options.unit == .cli_pic_probe)
     @import("cli_runtime.zig")
 else
@@ -77,11 +77,10 @@ const metadata_runtime = if (unit_options.unit == .distributed or unit_options.u
     @import("metadata/runtime.zig")
 else
     struct {};
-// Serverless is a complete local-query implementation over published
-// artifacts. Keep that physical execution with the storage kernel; only the
-// legacy compile-once topology roots it in distributed.
-const serverless_runtime = if ((unit_options.unit == .distributed and !unit_options.storage_kernel_experiment) or
-    unit_options.unit == .storage_kernel or unit_options.unit == .application_pic_probe)
+// Serverless executes over immutable published artifacts. Its aggregation
+// fold crosses the coarse storage-owner ABI, so its product composition stays
+// outside the physical DB owner.
+const serverless_runtime = if (unit_options.unit == .serverless or unit_options.unit == .application_pic_probe)
     @import("cmd/serverless.zig")
 else
     struct {};
@@ -404,7 +403,6 @@ comptime {
                 exportInternal(&standaloneLiteEntry, "antfly_runtime_standalone_lite");
             if (!unit_options.storage_kernel_experiment) {
                 exportInternal(&liteEntry, "antfly_runtime_lite");
-                exportInternal(&serverlessEntry, "antfly_runtime_serverless");
                 exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
                 exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
                 // The legacy compile-once archive owns both sides of the
@@ -468,7 +466,6 @@ comptime {
             // owner and restore-staging entry points.
             _ = storage_kernel_exports;
             exportInternal(&liteEntry, "antfly_runtime_lite");
-            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
             exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
             exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
             exportInternal(&storage_kernel_exports.storageOwnerContextCreate, "antfly_storage_context_create");
@@ -586,6 +583,10 @@ comptime {
             exportInternal(&storage_kernel_exports.storageOwnerBufferDestroy, "antfly_storage_owner_buffer_destroy");
             exportInternal(&local_query_exports.execute, "antfly_local_query_execute");
             exportInternal(&local_query_exports.bufferDestroy, "antfly_local_query_buffer_destroy");
+        },
+        .serverless => {
+            exportInternal(&cliEntry, "antfly_runtime_cli");
+            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
         },
         .enrichment_compute => {
             exportInternal(&enrichment_compute_exports.extractStream, "antfly_enrichment_extract_stream");

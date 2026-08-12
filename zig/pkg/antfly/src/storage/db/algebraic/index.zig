@@ -28,6 +28,7 @@ const tensor_mod = @import("tensor.zig");
 const token = @import("token.zig");
 const value_mod = @import("value.zig");
 const symbol = @import("symbol.zig");
+const index_config = @import("index_config.zig");
 const backend_types = @import("../../backend_types.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
@@ -79,11 +80,7 @@ const expression_bucket_output_dims = [_]ir.Dimension{.bucket};
 const expression_kind_scalar_output_dims = [_]ir.Dimension{ .kind, .scalar };
 const expression_time_bucket_scalar_output_dims = [_]ir.Dimension{ .time, .bucket, .scalar };
 
-pub const FieldConfig = struct {
-    name: []const u8,
-    path: []const u8,
-    type: []const u8,
-};
+pub const FieldConfig = index_config.FieldConfig;
 
 pub const ResolvedField = struct {
     public: []const u8,
@@ -97,265 +94,15 @@ pub const ResolvedMeasureField = struct {
     field: ResolvedField,
 };
 
-pub const JoinConfig = struct {
-    name: []const u8,
-    left_fields: []const []const u8 = &.{},
-    right_fields: []const []const u8 = &.{},
-    left_type_field: ?[]const u8 = null,
-    left_type_value: ?[]const u8 = null,
-    right_type_field: ?[]const u8 = null,
-    right_type_value: ?[]const u8 = null,
-    left_time_field: ?[]const u8 = null,
-    right_time_field: ?[]const u8 = null,
-    temporal_bucket: ?[]const u8 = null,
-    temporal_window_seconds: ?i64 = null,
-    max_fanout: ?usize = null,
-};
+pub const JoinConfig = index_config.JoinConfig;
+pub const MaterializationConfig = index_config.MaterializationConfig;
+pub const LawConfig = index_config.LawConfig;
+pub const AdaptiveConfig = index_config.AdaptiveConfig;
+pub const PathFactPolicyConfig = index_config.PathFactPolicyConfig;
+pub const Config = index_config.Config;
 
-pub const MaterializationConfig = struct {
-    name: []const u8,
-    op: []const u8,
-    group_by: []const []const u8 = &.{},
-    measure: ?[]const u8 = null,
-    time: ?[]const u8 = null,
-    bucket: ?[]const u8 = null,
-    join: ?[]const u8 = null,
-    group_side: ?[]const u8 = null,
-    measure_side: ?[]const u8 = null,
-    implicit_query: bool = false,
-    law: ?[]const u8 = null,
-    axes: []const []const u8 = &.{},
-};
-
-pub const LawConfig = struct {
-    name: []const u8,
-    id: []const u8,
-    structure: []const u8 = "",
-    invertible: bool = false,
-};
-
-pub const AdaptiveConfig = struct {
-    observe: bool = true,
-    lazy_materialization: bool = false,
-    dematerialization: bool = false,
-    min_observations: u64 = 3,
-    max_auto_materializations_per_index: u64 = 32,
-    max_backfill_rows_per_tick: u64 = 10_000,
-    min_estimated_scan_rows_saved: u64 = 1_000,
-    dematerialize_after_observation_misses: u64 = 3,
-    observation_decay_after_misses: u64 = 0,
-    observation_decay_retain_percent: u8 = 50,
-    path_profile_history_retention: u64 = 64,
-
-    pub fn policy(self: AdaptiveConfig) adaptive_mod.Policy {
-        return .{
-            .observe = self.observe,
-            .lazy_materialization = self.lazy_materialization,
-            .dematerialization = self.dematerialization,
-            .min_observations = self.min_observations,
-            .max_auto_materializations_per_index = self.max_auto_materializations_per_index,
-            .max_backfill_rows_per_tick = self.max_backfill_rows_per_tick,
-            .min_estimated_scan_rows_saved = self.min_estimated_scan_rows_saved,
-            .dematerialize_after_observation_misses = self.dematerialize_after_observation_misses,
-            .observation_decay_after_misses = self.observation_decay_after_misses,
-            .observation_decay_retain_percent = self.observation_decay_retain_percent,
-            .path_profile_history_retention = self.path_profile_history_retention,
-        };
-    }
-};
-
-pub const PathFactPolicyConfig = struct {
-    allow_numeric_string_coercion: bool = true,
-    allow_datetime_string_coercion: bool = true,
-};
-
-pub const Config = struct {
-    version: u16 = 2,
-    table: []const u8 = "",
-    schema_version: u32 = 0,
-    capability_fingerprint: []const u8 = "",
-    capability_lifecycle_status: []const u8 = "current",
-    capability_change_added_fields: u32 = 0,
-    capability_change_removed_fields: u32 = 0,
-    capability_change_changed_type_fields: u32 = 0,
-    skipped_dynamic_fields: u32 = 0,
-    skipped_complex_fields: u32 = 0,
-    skipped_unbounded_fields: u32 = 0,
-    group_fields: []const FieldConfig = &.{},
-    measure_fields: []const FieldConfig = &.{},
-    time_fields: []const FieldConfig = &.{},
-    laws: []const LawConfig = &.{},
-    joins: []const JoinConfig = &.{},
-    materializations: []const MaterializationConfig = &.{},
-    adaptive: AdaptiveConfig = .{},
-    pathfact_policy: PathFactPolicyConfig = .{},
-    max_result_buckets: ?usize = null,
-    max_planner_scan_rows: ?usize = null,
-    max_batch_accumulator_entries: ?usize = null,
-    min_max_candidate_cache_size: ?usize = null,
-    enable_temporal_range_pruning: bool = true,
-};
-
-pub fn validateConfig(cfg: Config) !void {
-    if (cfg.version != 1 and cfg.version != 2) return error.InvalidAlgebraicConfig;
-    if (cfg.version == 2) {
-        if (cfg.table.len == 0) return error.InvalidAlgebraicConfig;
-        if (cfg.schema_version == 0) return error.InvalidAlgebraicConfig;
-        if (cfg.capability_fingerprint.len == 0) return error.InvalidAlgebraicConfig;
-    }
-
-    try validateUniqueFieldNames(cfg.group_fields);
-    try validateUniqueFieldNames(cfg.measure_fields);
-    try validateUniqueFieldNames(cfg.time_fields);
-
-    for (cfg.group_fields) |field| {
-        if (field.name.len == 0 or field.path.len == 0 or field.type.len == 0) return error.InvalidAlgebraicConfig;
-    }
-    for (cfg.measure_fields) |field| {
-        if (field.name.len == 0 or field.path.len == 0 or field.type.len == 0) return error.InvalidAlgebraicConfig;
-    }
-    for (cfg.time_fields) |field| {
-        if (field.name.len == 0 or field.path.len == 0 or field.type.len == 0) return error.InvalidAlgebraicConfig;
-    }
-    for (cfg.joins, 0..) |join_cfg, i| {
-        if (join_cfg.name.len == 0) return error.InvalidAlgebraicConfig;
-        for (cfg.joins[0..i]) |prior| {
-            if (std.mem.eql(u8, prior.name, join_cfg.name)) return error.InvalidAlgebraicConfig;
-        }
-        if (join_cfg.left_fields.len == 0 or join_cfg.left_fields.len != join_cfg.right_fields.len) return error.InvalidAlgebraicConfig;
-        for (join_cfg.left_fields) |field_name| {
-            if (!fieldConfigExists(cfg.group_fields, field_name)) return error.InvalidAlgebraicConfig;
-        }
-        for (join_cfg.right_fields) |field_name| {
-            if (!fieldConfigExists(cfg.group_fields, field_name)) return error.InvalidAlgebraicConfig;
-        }
-        if ((join_cfg.left_type_field == null) != (join_cfg.left_type_value == null)) return error.InvalidAlgebraicConfig;
-        if ((join_cfg.right_type_field == null) != (join_cfg.right_type_value == null)) return error.InvalidAlgebraicConfig;
-        if (join_cfg.left_type_field) |field_name| {
-            if (fieldConfigRoleCount(cfg, field_name) != 1) return error.InvalidAlgebraicConfig;
-        }
-        if (join_cfg.right_type_field) |field_name| {
-            if (fieldConfigRoleCount(cfg, field_name) != 1) return error.InvalidAlgebraicConfig;
-        }
-        if (join_cfg.left_time_field) |field_name| {
-            if (!fieldConfigExists(cfg.time_fields, field_name)) return error.InvalidAlgebraicConfig;
-        }
-        if (join_cfg.right_time_field) |field_name| {
-            if (!fieldConfigExists(cfg.time_fields, field_name)) return error.InvalidAlgebraicConfig;
-        }
-        try join_mod.validateTemporal(join_cfg.left_time_field, join_cfg.right_time_field, join_cfg.temporal_bucket, join_cfg.temporal_window_seconds);
-        if (join_cfg.max_fanout) |value| {
-            if (value == 0) return error.InvalidAlgebraicConfig;
-        }
-    }
-
-    for (cfg.laws, 0..) |law_cfg, i| {
-        if (law_cfg.name.len == 0) return error.InvalidAlgebraicConfig;
-        for (cfg.laws[0..i]) |prior| {
-            if (std.mem.eql(u8, prior.name, law_cfg.name)) return error.InvalidAlgebraicConfig;
-        }
-        const law_id = law_mod.Id.parse(law_cfg.id) orelse return error.InvalidAlgebraicConfig;
-        if (law_cfg.structure.len > 0) {
-            const structure = std.meta.stringToEnum(law_mod.Structure, law_cfg.structure) orelse return error.InvalidAlgebraicConfig;
-            if (structure != law_mod.descriptor(law_id).structure) return error.InvalidAlgebraicConfig;
-        }
-        if (law_cfg.invertible and !law_mod.descriptor(law_id).invertible) return error.InvalidAlgebraicConfig;
-    }
-
-    for (cfg.materializations, 0..) |mat, i| {
-        if (mat.name.len == 0) return error.InvalidAlgebraicConfig;
-        for (cfg.materializations[0..i]) |prior| {
-            if (std.mem.eql(u8, prior.name, mat.name)) return error.InvalidAlgebraicConfig;
-        }
-        const op = algebra.Op.parse(mat.op) orelse return error.InvalidAlgebraicConfig;
-        const implicit_law = law_mod.fromOp(op);
-        if (mat.law) |law_name| {
-            const law_id = lawConfigId(cfg, law_name) orelse return error.InvalidAlgebraicConfig;
-            if (law_id != implicit_law) return error.InvalidAlgebraicConfig;
-        }
-        _ = law_mod.descriptor(implicit_law);
-        const group_fields = if (mat.axes.len > 0) mat.axes else mat.group_by;
-        for (mat.group_by) |field_name| {
-            if (!fieldConfigExists(cfg.group_fields, field_name)) return error.InvalidAlgebraicConfig;
-        }
-        for (group_fields) |field_name| {
-            if (!fieldConfigExists(cfg.group_fields, field_name)) return error.InvalidAlgebraicConfig;
-        }
-        if (mat.measure) |measure| {
-            if (!fieldConfigExists(cfg.measure_fields, measure)) return error.InvalidAlgebraicConfig;
-        } else if (op != .count) {
-            return error.InvalidAlgebraicConfig;
-        }
-        if (mat.time) |time| {
-            if (!fieldConfigExists(cfg.time_fields, time)) return error.InvalidAlgebraicConfig;
-            const bucket = mat.bucket orelse return error.InvalidAlgebraicConfig;
-            if (cylinder.Bucket.parse(bucket) == null) return error.InvalidAlgebraicConfig;
-        } else if (mat.bucket != null) {
-            return error.InvalidAlgebraicConfig;
-        }
-        if (mat.join) |join_name| {
-            if (!joinConfigExists(cfg.joins, join_name)) return error.InvalidAlgebraicConfig;
-            if (mat.group_side == null or mat.measure_side == null) return error.InvalidAlgebraicConfig;
-        } else {
-            if (mat.group_side != null or mat.measure_side != null) return error.InvalidAlgebraicConfig;
-        }
-        if (mat.implicit_query) {
-            const join_name = mat.join orelse return error.InvalidAlgebraicConfig;
-            const join_cfg = joinConfigForValidation(cfg.joins, join_name) orelse return error.InvalidAlgebraicConfig;
-            if (!join_mod.implicitQueryMaterializationProof(join_cfg, mat).safe()) return error.InvalidAlgebraicConfig;
-        }
-        if (mat.group_side) |side| {
-            if (!isJoinSide(side)) return error.InvalidAlgebraicConfig;
-        }
-        if (mat.measure_side) |side| {
-            if (!isJoinSide(side)) return error.InvalidAlgebraicConfig;
-        }
-    }
-    if (cfg.adaptive.observation_decay_retain_percent > 100) return error.InvalidAlgebraicConfig;
-}
-
-fn validateUniqueFieldNames(fields: []const FieldConfig) !void {
-    for (fields, 0..) |field, i| {
-        for (fields[0..i]) |prior| {
-            if (std.mem.eql(u8, prior.name, field.name)) return error.InvalidAlgebraicConfig;
-        }
-    }
-}
-
-fn fieldConfigExists(fields: []const FieldConfig, name: []const u8) bool {
-    for (fields) |field| {
-        if (std.mem.eql(u8, field.name, name)) return true;
-    }
-    return false;
-}
-
-fn joinConfigExists(joins: []const JoinConfig, name: []const u8) bool {
-    return joinConfigForValidation(joins, name) != null;
-}
-
-fn joinConfigForValidation(joins: []const JoinConfig, name: []const u8) ?JoinConfig {
-    for (joins) |join_cfg| {
-        if (std.mem.eql(u8, join_cfg.name, name)) return join_cfg;
-    }
-    return null;
-}
-
-fn lawConfigId(cfg: Config, name: []const u8) ?law_mod.Id {
-    for (cfg.laws) |law_cfg| {
-        if (std.mem.eql(u8, law_cfg.name, name)) return law_mod.Id.parse(law_cfg.id);
-    }
-    return null;
-}
-
-fn fieldConfigRoleCount(cfg: Config, name: []const u8) usize {
-    return @as(usize, @intFromBool(fieldConfigExists(cfg.group_fields, name))) +
-        @as(usize, @intFromBool(fieldConfigExists(cfg.measure_fields, name))) +
-        @as(usize, @intFromBool(fieldConfigExists(cfg.time_fields, name)));
-}
-
-fn isJoinSide(side: []const u8) bool {
-    return std.mem.eql(u8, side, "left") or std.mem.eql(u8, side, "right");
-}
+pub const validateConfig = index_config.validateConfig;
+const lawConfigId = index_config.lawConfigId;
 
 pub const FoldEntry = struct {
     group_key: []u8,

@@ -31,7 +31,14 @@ const tables_api = @import("../../api/tables.zig");
 const table_writes = @import("../../api/table_writes.zig");
 const analysis_mod = @import("../../search/analysis.zig");
 const shared_vector = @import("antfly_vector").vector;
-const db_mod = @import("../../storage/db/mod.zig");
+const storage_source_options = @import("storage_source_options");
+const control_only_storage_sources = storage_source_options.control_only;
+const db_mod = @import("../../storage/db/selected_root.zig").db;
+const aggregation_contract = @import("../../storage/db/aggregations_contract.zig");
+const kernel_owner_client = if (control_only_storage_sources)
+    @import("../../storage/kernel_owner_client.zig")
+else
+    struct {};
 const db_transform = @import("../../storage/db/transform.zig");
 const db_types = @import("../../storage/db/types.zig");
 const db_query_graph = @import("../../storage/db/query/graph_exec.zig");
@@ -1619,20 +1626,75 @@ pub const HttpHandler = struct {
         const db_hits = try allocDbAggregationHitsAlloc(self.alloc, &execution.session.?, source_hits);
         defer freeDbSearchHits(self.alloc, db_hits);
 
+        const total_hits: u32 = @intCast(@min(source_hits.len, std.math.maxInt(u32)));
         return .{
-            .total_hits = @intCast(@min(source_hits.len, std.math.maxInt(u32))),
+            .total_hits = total_hits,
             .requests = requests,
-            .results = try db_mod.aggregations.computeSearchAggregations(
-                self.alloc,
-                requests,
-                .{
-                    .alloc = self.alloc,
-                    .hits = db_hits,
-                    .total_hits = @intCast(@min(source_hits.len, std.math.maxInt(u32))),
-                },
-                ctx_owned.ctx,
-            ),
+            .results = if (comptime control_only_storage_sources)
+                try computeServerlessAggregationsThroughKernel(
+                    self.alloc,
+                    aggregations_json,
+                    total_hits,
+                    db_hits,
+                    ctx_owned.ctx,
+                )
+            else
+                try db_mod.aggregations.computeSearchAggregations(
+                    self.alloc,
+                    requests,
+                    .{
+                        .alloc = self.alloc,
+                        .hits = db_hits,
+                        .total_hits = total_hits,
+                    },
+                    ctx_owned.ctx,
+                ),
         };
+    }
+
+    fn computeServerlessAggregationsThroughKernel(
+        alloc: Allocator,
+        aggregations_json: []const u8,
+        total_hits: u32,
+        db_hits: []const db_types.SearchHit,
+        ctx: db_mod.aggregations.Context,
+    ) ![]db_mod.aggregations.SearchAggregationResult {
+        const hits = try alloc.alloc(kernel_owner_client.AggregationHit, db_hits.len);
+        defer if (hits.len > 0) alloc.free(hits);
+        for (db_hits, 0..) |hit, i| hits[i] = .{
+            .stored_data = .fromSlice(hit.stored_data orelse ""),
+        };
+
+        const context_json = try std.json.Stringify.valueAlloc(alloc, aggregation_contract.ComputeContextWire{
+            .text_analysis = if (ctx.text_analysis) |value| value.* else null,
+            .distributed_text_stats = ctx.distributed_text_stats,
+            .distributed_background_text_stats = ctx.distributed_background_text_stats,
+        }, .{});
+        defer alloc.free(context_json);
+
+        var response = try kernel_owner_client.aggregate(.{
+            .total_hits = total_hits,
+            .aggregations_json = .fromSlice(aggregations_json),
+            .context_json = .fromSlice(context_json),
+            .hits = if (hits.len == 0) null else hits.ptr,
+            .hit_count = @intCast(hits.len),
+        });
+        defer response.deinit();
+        const results = std.json.parseFromSliceLeaky(
+            []db_mod.aggregations.SearchAggregationResult,
+            alloc,
+            response.bytes(),
+            .{},
+        ) catch return error.StorageKernelFailure;
+        for (results) |*aggregation| markServerlessAggregationLabelsOwned(aggregation);
+        return results;
+    }
+
+    fn markServerlessAggregationLabelsOwned(result: *db_mod.aggregations.SearchAggregationResult) void {
+        result.owns_labels = true;
+        for (result.buckets) |*bucket| {
+            for (bucket.aggregations) |*child| markServerlessAggregationLabelsOwned(child);
+        }
     }
 
     fn allocDbAggregationHitsAlloc(
