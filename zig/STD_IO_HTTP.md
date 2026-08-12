@@ -943,34 +943,38 @@ systems and architectures, and the real ARM64 `ReleaseFast` linked build. The
 linked-runtime bridge needs both ABI-focused tests and an executable smoke test;
 a host Debug build alone does not validate the original compiler-memory issue.
 
-## Remaining migration order
+## Implemented migration sequence
 
-1. Define common lifecycle states, shutdown deadlines, supervisor failure
+The branch completed the migration in this order:
+
+1. Defined common lifecycle states, one shutdown deadline, supervisor failure
    propagation, `RequestContext`, `ApiError`, and typed operation results.
-2. Keep contextual handlers on `httpx`; regenerate routers without
-   `active_impl` globals.
-3. Make the `httpx.Server` listener an owned Future on the appropriate executor
-   lane, with an owned connection Group and deterministic shutdown.
-4. Extract one vertical route family at a time into transport-independent
-   `ApiKernel` operations. Run canonical wire-contract and direct-operation
-   parity tests during this phase.
-5. Move internal, HA, protocol, extension, and maintenance routes to explicit
+2. Kept contextual handlers on `httpx` and removed generated `active_impl`
+   globals.
+3. Made each `httpx.Server` listener an owned Future on the appropriate
+   executor lane, with an owned connection Group and deterministic shutdown.
+4. Extracted route families into transport-independent operations with direct
+   operation and canonical wire-contract tests.
+5. Moved internal, HA, protocol, extension, and maintenance routes to explicit
    contextual registrars and typed operations.
-6. Preserve data and metadata public and admin listeners on `httpx.Server` while
-   removing their residual transport conversions.
-7. Keep `/healthz` and `/readyz` at the root on a control or reserved API lane.
-8. Move standalone's unified listener to `BackendRuntime`'s API lane; its
-   duplicated bridge handlers are already removed.
-9. Remove the residual public dispatcher, public executors, request/response
-   conversions, duplicated handler logic, and public `StdHttpListener` use.
-10. Replace the embedded inference server's detached thread with an owned
-    Future.
-11. Add lane leases, bounded executor capacity, and lifecycle metrics.
-12. Audit Raft, maintenance, observer, and inference background threads and
-    migrate them where structured `std.Io` concurrency is appropriate.
-13. Harden the API-kernel and linked-inference ABIs.
-14. Add adversarial lifecycle, routing, cancellation, shutdown, ABI, and
-    resource-leak tests.
+6. Kept data and metadata public/admin listeners on `httpx.Server` while
+   deleting their residual transport conversions.
+7. Kept `/healthz` and `/readyz` root-only on control or reserved API capacity.
+8. Moved standalone's unified listener to `BackendRuntime`'s API lane and
+   removed its duplicated bridge handlers.
+9. Deleted the residual public dispatcher, public executors, request/response
+   conversions, duplicated public response adapters, and public
+   `StdHttpListener` use.
+10. Replaced embedded inference listener threads with owned Futures.
+11. Added API/control lane leases, bounded HTTP capacity, and lifecycle and
+    listener metrics.
+12. Audited long-lived background work and retained explicit OS threads only
+    where they remain owned, stopped, and joined.
+13. Hardened the API-kernel and linked-inference boundaries with versioned
+    function tables, owned route manifests, prefix validation, and duplicate
+    route rejection.
+14. Added lifecycle, routing, cancellation, shutdown, ABI, restart, and
+    resource-leak tests plus linked native and ARM64 Linux build coverage.
 
 Each migration should preserve a strict stop-and-await-before-deinit invariant.
 Executor backend changes should occur only after the blocking and cancellation
