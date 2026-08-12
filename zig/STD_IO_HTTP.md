@@ -108,6 +108,11 @@ that end state:
   versioned routed-forwarding endpoint retains the temporary legacy
   cancellation adapter; forwarding headers on the ordinary route are rejected
   directly from `httpx` headers without manufacturing an `HttpRequest`.
+- Internal transaction begin, prepare, resolve, status, and acknowledge are
+  registered as concrete `httpx` handlers over typed group operations. The
+  operation layer owns schema validation, participant writes, status lookup,
+  cancellation, and conflict classification; JSON ownership remains at the
+  transport edge.
 - Remaining non-generated route families share one explicitly temporary
   request/response compatibility module, preventing per-runtime wire glue from
   diverging while each family is extracted. Data and metadata register those

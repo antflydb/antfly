@@ -326,6 +326,11 @@ pub const AntflyApiHandler = struct {
         try server.post(group_prefix ++ routes.shard_ops_observe_merge_suffix, httpx.Handler.bind(self, internalObserveMerge));
         try server.post(group_prefix ++ routes.shard_ops_execute_suffix, httpx.Handler.bind(self, internalExecuteTransition));
         try server.post(table_prefix ++ routes.batch_suffix, httpx.Handler.bind(self, internalGroupBatch));
+        try server.post(table_prefix ++ routes.txn_begin_suffix, httpx.Handler.bind(self, internalTxnBegin));
+        try server.post(table_prefix ++ routes.txn_prepare_suffix, httpx.Handler.bind(self, internalTxnPrepare));
+        try server.post(table_prefix ++ routes.txn_resolve_suffix, httpx.Handler.bind(self, internalTxnResolve));
+        try server.post(table_prefix ++ routes.txn_status_suffix, httpx.Handler.bind(self, internalTxnStatus));
+        try server.post(table_prefix ++ routes.txn_acknowledge_suffix, httpx.Handler.bind(self, internalTxnAcknowledge));
         const internal_posts = [_][]const u8{
             table_prefix ++ routes.documents_suffix,
             table_prefix ++ routes.graph_expand_suffix,
@@ -341,11 +346,6 @@ pub const AntflyApiHandler = struct {
             table_prefix ++ routes.artifact_repair_run_suffix,
             table_prefix ++ routes.artifacts_marker ++ "*",
             table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ "*",
-            table_prefix ++ routes.txn_begin_suffix,
-            table_prefix ++ routes.txn_prepare_suffix,
-            table_prefix ++ routes.txn_resolve_suffix,
-            table_prefix ++ routes.txn_status_suffix,
-            table_prefix ++ routes.txn_acknowledge_suffix,
         };
         inline for (internal_posts) |path| try server.post(path, handler);
         try server.post(routes.agents_retrieval, handler);
@@ -800,6 +800,15 @@ pub const AntflyApiHandler = struct {
                 }.call,
             },
             .reject_unrouted_batch = self.api_server.cfg.routed_raft_batch_writer != null,
+            .txn_validator = .{
+                .ptr = self.api_server,
+                .validate_fn = struct {
+                    fn call(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
+                        const server: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+                        return server.validateTableWritesAgainstSchema(table_name, writes);
+                    }
+                }.call,
+            },
         };
     }
 
@@ -1141,6 +1150,75 @@ pub const AntflyApiHandler = struct {
             .deleted = result.deleted,
             .transformed = result.transformed,
         });
+    }
+
+    fn internalTxnErrorResponse(ctx: *httpx.Context, err: internal_group_operations.Error) !httpx.Response {
+        return switch (err) {
+            error.InvalidArgument => textResponse(ctx, 400, "invalid transaction request"),
+            error.DecisionConflict => textResponse(ctx, 409, "decision conflict"),
+            error.TransactionConflict => textResponse(ctx, 409, "transaction conflict"),
+            error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
+            error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
+            error.Unsupported => textResponse(ctx, 405, "method not allowed"),
+            error.NotFound => textResponse(ctx, 404, "not found"),
+            error.Canceled => textResponse(ctx, 408, "request canceled"),
+            error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            error.Unavailable => textResponse(ctx, 503, "transaction unavailable"),
+            else => textResponse(ctx, 500, "internal server error"),
+        };
+    }
+
+    fn internalTxnBegin(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
+        var input = distributed_txn.parseTxnBeginRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
+        defer distributed_txn.freeTxnBeginRequest(ctx.allocator, &input);
+        self.internalGroupOperations().txnBegin(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+            return internalTxnErrorResponse(ctx, err);
+        return ctx.json(struct {}{});
+    }
+
+    fn internalTxnPrepare(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
+        var input = distributed_txn.parseTxnPrepareRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
+        defer distributed_txn.freeTxnPrepareRequest(ctx.allocator, &input);
+        self.internalGroupOperations().txnPrepare(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+            return internalTxnErrorResponse(ctx, err);
+        return ctx.json(struct {}{});
+    }
+
+    fn internalTxnResolve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
+        const input = distributed_txn.parseTxnResolveRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
+        self.internalGroupOperations().txnResolve(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+            return internalTxnErrorResponse(ctx, err);
+        return ctx.json(struct {}{});
+    }
+
+    fn internalTxnStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
+        const txn_id = distributed_txn.parseTxnStatusRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
+        const status = self.internalGroupOperations().txnStatus(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, txn_id) catch |err|
+            return internalTxnErrorResponse(ctx, err);
+        return ctx.json(distributed_txn.TxnStatusResponse{ .status = status });
+    }
+
+    fn internalTxnAcknowledge(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
+        var input = distributed_txn.parseTxnAcknowledgeRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
+        defer distributed_txn.freeTxnAcknowledgeRequest(ctx.allocator, &input);
+        self.internalGroupOperations().txnAcknowledge(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+            return internalTxnErrorResponse(ctx, err);
+        return ctx.json(struct {}{});
     }
 
     // ---------------------------------------------------------------
@@ -5305,6 +5383,15 @@ test "httpx internal control routes call typed operations directly" {
     defer invalid_batch.deinit();
     try std.testing.expectEqual(@as(u16, 400), invalid_batch.status.code);
     try std.testing.expectEqualStrings("invalid batch request", invalid_batch.body.?);
+
+    inline for (.{ "txn-begin", "txn-prepare", "txn-resolve", "txn-status", "txn-acknowledge" }) |suffix| {
+        const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/{s}", .{ base_url, suffix });
+        defer alloc.free(url);
+        var response = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &headers, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expectEqualStrings("invalid transaction request", response.body.?);
+    }
 }
 
 test "httpx storage maintenance routes call typed operations directly" {

@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const batch_api = @import("batch.zig");
+const distributed_txn = @import("distributed_txn.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const operation = @import("operation.zig");
@@ -21,6 +22,8 @@ pub const Error = operation.ApiError || error{
     StorageReadTemporarilyUnavailable,
     GroupLeaderUnavailable,
     RaftBatchWriteOutcomeUnknown,
+    DecisionConflict,
+    TransactionConflict,
 };
 
 pub const BatchValidator = struct {
@@ -28,6 +31,15 @@ pub const BatchValidator = struct {
     validate_fn: *const fn (*anyopaque, []const u8, []const db_mod.types.BatchWrite) anyerror!void,
 
     fn validate(self: BatchValidator, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
+        return self.validate_fn(self.ptr, table_name, writes);
+    }
+};
+
+pub const TxnValidator = struct {
+    ptr: *anyopaque,
+    validate_fn: *const fn (*anyopaque, []const u8, []const db_mod.types.TransactionWrite) anyerror!void,
+
+    fn validate(self: TxnValidator, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
         return self.validate_fn(self.ptr, table_name, writes);
     }
 };
@@ -46,6 +58,7 @@ pub const Operations = struct {
     shard_ops: ?raft_mod.ShardOperationAdapter = null,
     batch_validator: ?BatchValidator = null,
     reject_unrouted_batch: bool = false,
+    txn_validator: ?TxnValidator = null,
 
     pub fn corruptEmbeddingArtifact(
         self: Operations,
@@ -176,6 +189,73 @@ pub const Operations = struct {
             .deleted = @intCast(input.deletes.len),
             .transformed = @intCast(input.transforms.len),
         };
+    }
+
+    pub fn txnBegin(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnBeginRequest) Error!void {
+        try request.ensureActive();
+        const writes = self.writes orelse return error.NotFound;
+        _ = (writes.txnBeginGroupLocal(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants) catch |err| switch (err) {
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.DecisionConflict => return error.DecisionConflict,
+            error.TopologyChanged => return error.TopologyChanged,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse return error.NotFound;
+    }
+
+    pub fn txnPrepare(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnPrepareRequest) Error!void {
+        try request.ensureActive();
+        const writes = self.writes orelse return error.NotFound;
+        const validator = self.txn_validator orelse return error.Unavailable;
+        validator.validate(table_name, input.req.writes) catch |err| switch (err) {
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            else => return error.Internal,
+        };
+        _ = (writes.txnPrepareGroupLocal(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req) catch |err| switch (err) {
+            error.TopologyChanged => return error.TopologyChanged,
+            error.VersionConflict, error.IntentConflict => return error.TransactionConflict,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse return error.NotFound;
+    }
+
+    pub fn txnResolve(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnResolveRequest) Error!void {
+        try request.ensureActive();
+        const writes = self.writes orelse return error.NotFound;
+        _ = (writes.txnResolveGroupLocal(alloc, group_id, table_name, input.txn_id, input.status, input.commit_version, input.topology_epoch, input.sync_level) catch |err| switch (err) {
+            error.DecisionConflict => return error.DecisionConflict,
+            error.TopologyChanged => return error.TopologyChanged,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse return error.NotFound;
+    }
+
+    pub fn txnStatus(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) Error!db_mod.types.TxnStatus {
+        try request.ensureActive();
+        const writes = self.writes orelse return error.NotFound;
+        return (writes.txnStatusGroupLocal(alloc, group_id, table_name, txn_id) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse error.NotFound;
+    }
+
+    pub fn txnAcknowledge(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnAcknowledgeRequest) Error!void {
+        try request.ensureActive();
+        const writes = self.writes orelse return error.NotFound;
+        _ = (writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, input.txn_id, input.participant) catch |err| switch (err) {
+            error.InvalidParticipant, error.DecisionConflict => return error.DecisionConflict,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            else => return error.Internal,
+        }) orelse return error.NotFound;
     }
 
     fn transitionActionMatchesGroup(action: @import("../metadata/domain.zig").TransitionAction, group_id: u64) bool {
