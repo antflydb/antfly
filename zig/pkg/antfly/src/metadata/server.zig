@@ -23,7 +23,6 @@ const metadata_storage = @import("storage/mod.zig");
 const metadata_http_server = @import("http_server.zig");
 const public_api_http_server = @import("../api/http_server.zig");
 const public_api_kernel = @import("../api/kernel_bridge.zig");
-const public_api_httpx_handler = @import("../api/httpx_handler.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("../api/table_reads.zig");
 const api_table_router = @import("../api/table_router.zig");
@@ -558,8 +557,15 @@ const MetadataAdminHttpRuntime = struct {
     }
 
     fn metadataNotLeader(_: *MetadataAdminHttpRuntime, ctx: *httpx.Context) !httpx.Response {
-        var response = try public_api_http_server.metadataNotLeaderResponse(ctx.allocator);
-        return public_api_httpx_handler.AntflyApiHandler.respondWithAllocator(ctx, &response, ctx.allocator);
+        _ = ctx.status(503);
+        try ctx.setHeader("content-type", "application/json");
+        try ctx.setHeader("Retry-After", "1");
+        try ctx.setHeader(
+            raft_transport.http_common.metadata_not_leader_header,
+            raft_transport.http_common.metadata_not_leader_value,
+        );
+        _ = ctx.response.body("{\"error\":\"metadata leader unavailable\"}");
+        return ctx.response.build();
     }
 };
 

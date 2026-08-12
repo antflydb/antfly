@@ -261,15 +261,17 @@ pub fn parseScanKeysRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedSc
     };
 }
 
-pub fn scanRequestErrorResponse(
-    alloc: std.mem.Allocator,
-    err: anyerror,
-) !?http_common.HttpResponse {
+pub const ScanRequestError = struct {
+    status: u16,
+    message: []const u8,
+};
+
+pub fn scanRequestError(err: anyerror) ?ScanRequestError {
     return switch (err) {
-        error.InvalidQueryRequest => try textResponse(alloc, 400, "invalid scan request"),
+        error.InvalidQueryRequest => .{ .status = 400, .message = "invalid scan request" },
         // scanKeys declares BadRequest, not an operation-specific 422, in the
         // public OpenAPI contract. Keep every server and generated SDK aligned.
-        error.UnsupportedQueryRequest => try textResponse(alloc, 400, "unsupported scan filter query"),
+        error.UnsupportedQueryRequest => .{ .status = 400, .message = "unsupported scan filter query" },
         else => null,
     };
 }
@@ -321,16 +323,13 @@ test "parse scan request rejects text-index-only filter clauses" {
 }
 
 test "scan request errors map to stable client responses" {
-    const alloc = std.testing.allocator;
-    var invalid = (try scanRequestErrorResponse(alloc, error.InvalidQueryRequest)).?;
-    defer invalid.deinit(alloc);
+    const invalid = scanRequestError(error.InvalidQueryRequest).?;
     try std.testing.expectEqual(@as(u16, 400), invalid.status);
-    try std.testing.expectEqualStrings("invalid scan request", invalid.body);
+    try std.testing.expectEqualStrings("invalid scan request", invalid.message);
 
-    var unsupported = (try scanRequestErrorResponse(alloc, error.UnsupportedQueryRequest)).?;
-    defer unsupported.deinit(alloc);
+    const unsupported = scanRequestError(error.UnsupportedQueryRequest).?;
     try std.testing.expectEqual(@as(u16, 400), unsupported.status);
-    try std.testing.expectEqualStrings("unsupported scan filter query", unsupported.body);
+    try std.testing.expectEqualStrings("unsupported scan filter query", unsupported.message);
 
-    try std.testing.expect((try scanRequestErrorResponse(alloc, error.OutOfMemory)) == null);
+    try std.testing.expect(scanRequestError(error.OutOfMemory) == null);
 }

@@ -1708,64 +1708,7 @@ const ParsedTextStatsRequest = union(TextStatsRequestMode) {
 };
 
 pub const TableReadSource = table_read_source.TableReadSource;
-pub fn searchRequestFromVectorWorkerEnvelope(envelope: *const query_contract.OwnedAlgebraicVectorWorkerRequestEnvelope) db_mod.types.SearchRequest {
-    var req = switch (envelope.query) {
-        .dense => |dense| db_mod.types.SearchRequest{
-            .index_name = envelope.index_name,
-            .limit = envelope.options.limit,
-            .offset = envelope.options.offset,
-            .count_only = envelope.options.count_only,
-            .profile = envelope.options.profile,
-            .include_stored = envelope.options.include_stored,
-            .fields = envelope.options.fields,
-            .filter_query_json = envelope.options.filter_query_json,
-            .exclusion_query_json = envelope.options.exclusion_query_json,
-            .filter_prefix = envelope.options.filter_prefix,
-            .filter_ids = envelope.options.filter_ids,
-            .exclude_ids = envelope.options.exclude_ids,
-            .require_algebraic_filter_resolution = envelope.options.require_algebraic_filter_resolution,
-            .include_all_fields = envelope.options.include_all_fields,
-            .defer_stored_projection = envelope.options.defer_stored_projection,
-            .search_effort = envelope.options.search_effort,
-            .distance_over = envelope.options.distance_over,
-            .distance_under = envelope.options.distance_under,
-            .return_mode = envelope.options.return_mode,
-            .max_chunks_per_parent = envelope.options.max_chunks_per_parent,
-            .identity_read_generation = envelope.options.identity_read_generation,
-            .resolved_doc_filter = envelope.resolved_doc_filter,
-            .resolved_doc_filter_wire_context = envelope.resolved_doc_filter_wire_context,
-            .query = .{ .dense_knn = dense },
-        },
-        .sparse => |sparse| db_mod.types.SearchRequest{
-            .index_name = envelope.index_name,
-            .limit = envelope.options.limit,
-            .offset = envelope.options.offset,
-            .count_only = envelope.options.count_only,
-            .profile = envelope.options.profile,
-            .include_stored = envelope.options.include_stored,
-            .fields = envelope.options.fields,
-            .filter_query_json = envelope.options.filter_query_json,
-            .exclusion_query_json = envelope.options.exclusion_query_json,
-            .filter_prefix = envelope.options.filter_prefix,
-            .filter_ids = envelope.options.filter_ids,
-            .exclude_ids = envelope.options.exclude_ids,
-            .require_algebraic_filter_resolution = envelope.options.require_algebraic_filter_resolution,
-            .include_all_fields = envelope.options.include_all_fields,
-            .defer_stored_projection = envelope.options.defer_stored_projection,
-            .search_effort = envelope.options.search_effort,
-            .distance_over = envelope.options.distance_over,
-            .distance_under = envelope.options.distance_under,
-            .return_mode = envelope.options.return_mode,
-            .max_chunks_per_parent = envelope.options.max_chunks_per_parent,
-            .identity_read_generation = envelope.options.identity_read_generation,
-            .resolved_doc_filter = envelope.resolved_doc_filter,
-            .resolved_doc_filter_wire_context = envelope.resolved_doc_filter_wire_context,
-            .query = .{ .sparse_knn = sparse },
-        },
-    };
-    query_contract.applyNativeDocIdConstraintEnvelope(&req, envelope.native_doc_id_constraints.constraints);
-    return req;
-}
+pub const searchRequestFromVectorWorkerEnvelope = query_contract.searchRequestFromVectorWorkerEnvelope;
 
 const AlgebraicVectorWorkerCandidate = struct {
     index_name: []const u8,

@@ -36,6 +36,7 @@ pub const LinkedInferenceState = struct {
     resource_budget: ?inference_bridge.ResourceBudget = null,
     routes: std.ArrayListUnmanaged(*RouteState) = .empty,
     route_manifest: std.ArrayListUnmanaged(inference_bridge.RouteManifestEntry) = .empty,
+    route_validator: httpx.Router,
     route_manifest_mutex: std.atomic.Mutex = .unlocked,
     route_manifest_ready: bool = false,
 };
@@ -61,6 +62,28 @@ const ProviderResponseState = struct {
     alloc: std.mem.Allocator,
     json: []u8,
 };
+
+test "standalone linked inference ABI validates the supported function-table prefix" {
+    try std.testing.expect(inference_bridge.validContext(
+        inference_bridge.RouteManifestContext,
+        inference_bridge.abi_version,
+        @sizeOf(inference_bridge.RouteManifestContext),
+    ));
+    try std.testing.expect(!inference_bridge.validContext(
+        inference_bridge.RouteManifestContext,
+        inference_bridge.abi_version - 1,
+        @sizeOf(inference_bridge.RouteManifestContext),
+    ));
+
+    var table: inference_bridge.FunctionTable = undefined;
+    table.abi_version = inference_bridge.abi_version;
+    table.struct_size = @sizeOf(inference_bridge.FunctionTable);
+    table.capabilities = inference_bridge.Capability.provider;
+    try std.testing.expect(inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
+    try std.testing.expect(!inference_bridge.validFunctionTable(&table, inference_bridge.Capability.route_manifest));
+    table.struct_size -= 1;
+    try std.testing.expect(!inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
+}
 
 const ModelTextsRequest = struct {
     model: []const u8,
@@ -263,7 +286,9 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
         .runtime_config = runtime_config,
         .owned_models_dir = owned_models_dir,
         .owned_ml_dir = owned_ml_dir,
+        .route_validator = httpx.Router.init(alloc),
     };
+    errdefer state.route_validator.deinit();
     errdefer state.io_impl.deinit();
     state.node = try inference.server.Node.init(alloc, node_config);
     state.node.attachIo(state.io_impl.io());
@@ -443,12 +468,20 @@ fn rollbackRouteManifest(state: *LinkedInferenceState, routes_start: usize, mani
     for (state.routes.items[routes_start..]) |route| state.alloc.destroy(route);
     state.routes.shrinkRetainingCapacity(routes_start);
     state.route_manifest.shrinkRetainingCapacity(manifest_start);
+    state.route_validator.deinit();
+    state.route_validator = httpx.Router.init(state.alloc);
 }
 
 const ManifestServer = struct {
     owner: *LinkedInferenceState,
 
     fn register(self: *const ManifestServer, method: http_abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.owner.route_validator.add(switch (method) {
+            .get => .GET,
+            .post => .POST,
+            .put => .PUT,
+            .delete => .DELETE,
+        }, path, handler);
         const route = try self.owner.alloc.create(RouteState);
         errdefer self.owner.alloc.destroy(route);
         route.* = .{ .owner = self.owner, .handler = handler };
@@ -592,6 +625,7 @@ pub fn linkedInferenceDestroy(handle: *anyopaque) void {
     for (state.routes.items) |route| alloc.destroy(route);
     state.routes.deinit(alloc);
     state.route_manifest.deinit(alloc);
+    state.route_validator.deinit();
     state.warm_models.deinit(alloc);
     if (state.content_security) |*parsed| parsed.deinit();
     if (state.s3_credentials) |*parsed| parsed.deinit();

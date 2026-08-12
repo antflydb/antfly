@@ -6734,8 +6734,8 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         txn_id: db_mod.types.TxnId,
         request: SessionForwardRequest,
-    ) !?http_common.HttpResponse {
-        return self.forwardSessionRequest(txn_id, .{
+    ) !?contextual_operations.OwnedResponse {
+        var response = (try self.forwardSessionRequest(txn_id, .{
             .method = switch (request.method) {
                 .get => .GET,
                 .post => .POST,
@@ -6746,7 +6746,26 @@ pub const ApiHttpServer = struct {
             .authorization = request.authorization,
             .content_type = request.content_type,
             .body = request.body,
-        });
+        })) orelse return null;
+        defer response.deinit(self.alloc);
+
+        const headers = try self.alloc.alloc(contextual_operations.Header, response.headers.len);
+        errdefer self.alloc.free(headers);
+        var initialized: usize = 0;
+        errdefer for (headers[0..initialized]) |*header| header.deinit(self.alloc);
+        for (response.headers, headers) |source, *target| {
+            target.* = try ownedContextualHeader(self.alloc, source.name, source.value);
+            initialized += 1;
+        }
+        return .{
+            .status = response.status,
+            .content_type = response.content_type orelse if (response.status >= 200 and response.status < 300)
+                "application/json"
+            else
+                "text/plain; charset=utf-8",
+            .body = try self.alloc.dupe(u8, response.body),
+            .headers = headers,
+        };
     }
 
     fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
@@ -9258,35 +9277,6 @@ pub const ApiHttpServer = struct {
         return term != 0 and guard.is_current(guard.ptr, term);
     }
 
-    pub fn handlePublicTableBatch(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi());
-        defer resp.deinit(self.alloc);
-        var response = switch (resp.status) {
-            201 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(metadata_openapi.BatchResponse, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
-            },
-            else => if (resp.json)
-                try jsonBodyResponseWithStatus(self.alloc, resp.status, resp.body)
-            else
-                try textResponse(self.alloc, resp.status, resp.body),
-        };
-        if (resp.retry_after_seconds) |seconds| {
-            response.headers = try self.alloc.alloc(http_common.Header, 1);
-            errdefer {
-                self.alloc.free(response.headers);
-                response.headers = &.{};
-                response.deinit(self.alloc);
-            }
-            const value = try std.fmt.allocPrint(self.alloc, "{d}", .{seconds});
-            defer self.alloc.free(value);
-            response.headers[0] = try ownedHeader(self.alloc, "Retry-After", value);
-        }
-        return response;
-    }
-
     pub fn executeExtensionHostBatch(
         self: *ApiHttpServer,
         result_alloc: std.mem.Allocator,
@@ -9771,162 +9761,6 @@ pub const ApiHttpServer = struct {
         if (emitted == 0) return try contextual_operations.textAlloc(self.alloc, 400, "invalid query request");
         try out.writer.writeAll("]}");
         return contextual_operations.json(try self.alloc.dupe(u8, out.written()), false);
-    }
-
-    pub fn handlePublicTableListIndexes(self: *ApiHttpServer, table_name: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableListIndexes(self.alloc, table_name, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicTableGetIndex(self: *ApiHttpServer, table_name: []const u8, index_name: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableGetIndex(self.alloc, table_name, index_name, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicListArtifactEnrichments(self: *ApiHttpServer, table_name: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleListArtifactEnrichments(self.alloc, table_name, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicTableCreateIndex(self: *ApiHttpServer, table_name: []const u8, index_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableCreateIndex(self.alloc, table_name, index_name, body, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            201 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
-            },
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicTableDeleteIndex(self: *ApiHttpServer, table_name: []const u8, index_name: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableDeleteIndex(self.alloc, table_name, index_name, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            201 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
-            },
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicPutArtifactEnrichment(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
-        defer self.alloc.free(artifact_name);
-        var resp = try public_table_http.handlePutArtifactEnrichment(self.alloc, table_name, artifact_name, body, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            201 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
-            },
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicDeleteArtifactEnrichment(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8) !http_common.HttpResponse {
-        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
-        defer self.alloc.free(artifact_name);
-        var resp = try public_table_http.handleDeleteArtifactEnrichment(self.alloc, table_name, artifact_name, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            201 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
-            },
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicDocumentArtifactManifest(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        const doc_key = try decodeRequestPathParamAlloc(self.alloc, encoded_doc_key);
-        defer self.alloc.free(doc_key);
-        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
-        defer self.alloc.free(artifact_name);
-        const opts = self.documentArtifactManifestOptionsForRequest(table_name, query, authenticated_identity) catch |err| switch (err) {
-            error.InvalidDetail => return try textResponse(self.alloc, 400, "invalid artifact detail"),
-            error.Forbidden => return try textResponse(self.alloc, 403, "forbidden"),
-        };
-
-        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
-            return try textResponse(self.alloc, 404, "not found");
-        }
-        var resp = try public_table_http.handleDocumentArtifactManifest(self.alloc, table_name, doc_key, artifact_name, opts, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicDocumentArtifactManifests(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        const doc_key = try decodeRequestPathParamAlloc(self.alloc, encoded_doc_key);
-        defer self.alloc.free(doc_key);
-        const opts = self.documentArtifactManifestOptionsForRequest(table_name, query, authenticated_identity) catch |err| switch (err) {
-            error.InvalidDetail => return try textResponse(self.alloc, 400, "invalid artifact detail"),
-            error.Forbidden => return try textResponse(self.alloc, 403, "forbidden"),
-        };
-
-        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
-            return try textResponse(self.alloc, 404, "not found");
-        }
-        var resp = try public_table_http.handleDocumentArtifactManifests(self.alloc, table_name, doc_key, opts, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicReprocessDocumentArtifact(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        const doc_key = try decodeRequestPathParamAlloc(self.alloc, encoded_doc_key);
-        defer self.alloc.free(doc_key);
-        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
-        defer self.alloc.free(artifact_name);
-
-        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
-            return try textResponse(self.alloc, 404, "not found");
-        }
-        var resp = try public_table_http.handleReprocessDocumentArtifact(self.alloc, table_name, doc_key, artifact_name, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicReprocessDocumentArtifactRange(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
-        defer self.alloc.free(artifact_name);
-
-        var resp = try public_table_http.handleReprocessDocumentArtifactRange(self.alloc, table_name, artifact_name, body, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
     }
 
     const PublicRepairListRequest = struct {
@@ -10562,23 +10396,6 @@ pub const ApiHttpServer = struct {
         return try publicOperationJsonResponse(self.alloc, 202, updated);
     }
 
-    pub fn handlePublicTableBackup(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableBackup(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            201 => blk: {
-                const BackupSuccess = struct {
-                    backup: []const u8,
-                };
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(BackupSuccess, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
-            },
-            else => try jsonErrorResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
     pub fn handlePublicTableRestore(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -10616,29 +10433,6 @@ pub const ApiHttpServer = struct {
         if (!restore_jobs.isTerminal(state.value.phase)) self.schedulePendingRestoreJobs() catch |err|
             std.log.err("accepted table restore job scheduling deferred job_id={d} err={s}", .{ state.value.job_id, @errorName(err) });
         return try self.restoreJobResponse(202, encoded);
-    }
-
-    pub fn handlePublicClusterBackupList(self: *ApiHttpServer, location_uri: []const u8, connection: ?[]const u8, options: backups_api.BackupListOptions) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterBackupList(self.alloc, location_uri, connection, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo(), options);
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicClusterBackup(self: *ApiHttpServer, body: []const u8) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterBackup(self.alloc, body, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(metadata_openapi.ClusterBackupResponse, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponse(self.alloc, parsed);
-            },
-            else => try jsonErrorResponse(self.alloc, resp.status, resp.body),
-        };
     }
 
     pub fn handlePublicClusterRestore(
@@ -12232,20 +12026,6 @@ fn tableNamesFromClusterManifestAlloc(
     return names;
 }
 
-fn unauthorizedResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    return .{
-        .status = 401,
-        .headers = try alloc.dupe(http_common.Header, &[_]http_common.Header{
-            .{
-                .name = try alloc.dupe(u8, "WWW-Authenticate"),
-                .value = try alloc.dupe(u8, "Basic realm=\"antfly\""),
-            },
-        }),
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try std.fmt.allocPrint(alloc, "{{\"error\":{f}}}", .{std.json.fmt("unauthorized", .{})}),
-    };
-}
-
 fn jsonBodyOrEmptyObject(body: []const u8) []const u8 {
     return if (body.len == 0) "{}" else body;
 }
@@ -13551,83 +13331,6 @@ fn applyAuthenticatedIdentityToJoinRequest(
     }
 }
 
-fn jsonResponseWithStatus(alloc: std.mem.Allocator, status: u16, value: anytype) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}),
-    };
-}
-
-fn jsonResponse(alloc: std.mem.Allocator, value: anytype) !http_common.HttpResponse {
-    return try jsonResponseWithStatus(alloc, 200, value);
-}
-
-fn queryCandidateBudgetExceededResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{
-        .reason = "candidate_budget_exceeded",
-        .detail = "candidate_budget_exceeded",
-    };
-    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
-    return try jsonResponseWithStatus(alloc, 422, .{
-        .status = 422,
-        .@"error" = "query_candidate_budget_exceeded",
-        .message = "query candidate budget exceeded",
-        .reason = public_rejection.reason,
-        .budget_rejection_reason = diagnostic.detail,
-        .sort_rejection_reason = public_rejection.reason,
-        .sort_rejection_detail = public_rejection.detail,
-        .sort_rejection_field = diagnostic.field,
-    });
-}
-
-pub fn storageReadTemporarilyUnavailableResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    var response = try jsonBodyResponseWithStatus(alloc, 503, public_table_http.storage_read_temporarily_unavailable_body);
-    errdefer response.deinit(alloc);
-
-    response.headers = try alloc.alloc(http_common.Header, 1);
-    errdefer {
-        alloc.free(response.headers);
-        response.headers = &.{};
-    }
-    response.headers[0] = try ownedHeader(alloc, "Retry-After", "1");
-    return response;
-}
-
-fn unsupportedPublicQueryResponse(alloc: std.mem.Allocator, body: []const u8) !http_common.HttpResponse {
-    if (queryBodyHasSortPageControls(alloc, body)) {
-        return try unsupportedExactSortResponse(alloc);
-    }
-    return try textResponse(alloc, 422, "unsupported query request");
-}
-
-fn invalidPublicQueryRequestResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    if (db_mod.peekLastSortRejectionDiagnostic() != null) {
-        return try unsupportedExactSortResponse(alloc);
-    }
-    return try textResponse(alloc, 400, "invalid query request");
-}
-
-fn publicFilterQueryErrorResponseForBody(
-    alloc: std.mem.Allocator,
-    body: []const u8,
-    field: []const u8,
-    kind: query_api.PublicFilterQueryErrorKind,
-) !http_common.HttpResponse {
-    const response_body = try query_api.encodePublicFilterQueryErrorBodyAlloc(
-        alloc,
-        body,
-        field,
-        kind,
-    );
-    errdefer alloc.free(response_body);
-    return .{
-        .status = query_api.publicFilterQueryErrorStatus(kind),
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = response_body,
-    };
-}
-
 pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
     return switch (err) {
         error.QueryEmbeddingInputTooLarge,
@@ -13673,20 +13376,6 @@ fn unsupportedPublicTableQueryDispatchError(alloc: std.mem.Allocator, body: []co
     return error.InvalidQueryRequest;
 }
 
-fn unsupportedExactSortResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{};
-    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
-    return try jsonResponseWithStatus(alloc, 422, .{
-        .status = 422,
-        .@"error" = "unsupported_exact_sort",
-        .message = "exact sort is unsupported for this query",
-        .reason = public_rejection.reason,
-        .sort_rejection_reason = public_rejection.reason,
-        .sort_rejection_detail = public_rejection.detail,
-        .sort_rejection_field = diagnostic.field,
-    });
-}
-
 fn queryBodyHasSortPageControls(alloc: std.mem.Allocator, body: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return false;
     defer parsed.deinit();
@@ -13709,18 +13398,6 @@ fn writeMaybeAbsoluteUrl(writer: *std.Io.Writer, base_url: ?[]const u8, url: []c
     try std.json.Stringify.value(resolved, .{}, writer);
 }
 
-fn jsonBodyResponseWithStatus(
-    alloc: std.mem.Allocator,
-    status: u16,
-    body: []const u8,
-) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try alloc.dupe(u8, body),
-    };
-}
-
 fn publicOperationTextResponse(
     alloc: std.mem.Allocator,
     status: u16,
@@ -13741,48 +13418,6 @@ fn publicOperationJsonResponse(
         .status = status,
         .body = try alloc.dupe(u8, body),
         .json = true,
-    };
-}
-
-fn jsonResponseWithStatusOmitNullOptionals(
-    alloc: std.mem.Allocator,
-    status: u16,
-    value: anytype,
-) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false }),
-    };
-}
-
-fn jsonResponseOmitNullOptionals(alloc: std.mem.Allocator, value: anytype) !http_common.HttpResponse {
-    return try jsonResponseWithStatusOmitNullOptionals(alloc, 200, value);
-}
-
-fn parseJsonResponseBody(
-    comptime T: type,
-    alloc: std.mem.Allocator,
-    body: []const u8,
-) !T {
-    return try std.json.parseFromSliceLeaky(T, alloc, body, .{
-        .allocate = .alloc_always,
-    });
-}
-
-fn jsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try std.fmt.allocPrint(alloc, "{{\"error\":{f}}}", .{std.json.fmt(message, .{})}),
-    };
-}
-
-fn modelNotFoundResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    return .{
-        .status = 404,
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
     };
 }
 
@@ -15605,102 +15240,6 @@ pub fn makeCurrentUserResponse(
     };
 }
 
-fn eventStreamResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "text/event-stream"),
-        .body = try alloc.dupe(u8, body),
-    };
-}
-
-fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "text/plain"),
-        .body = try alloc.dupe(u8, body),
-    };
-}
-
-fn ownedHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !http_common.Header {
-    const owned_name = try alloc.dupe(u8, name);
-    errdefer alloc.free(owned_name);
-    return .{ .name = owned_name, .value = try alloc.dupe(u8, value) };
-}
-
-fn retryableTextResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
-    const headers = try alloc.alloc(http_common.Header, 1);
-    errdefer alloc.free(headers);
-    headers[0] = .{
-        .name = try alloc.dupe(u8, "Retry-After"),
-        .value = alloc.dupe(u8, "1") catch |err| {
-            alloc.free(headers[0].name);
-            return err;
-        },
-    };
-    errdefer headers[0].deinit(alloc);
-
-    const content_type = try alloc.dupe(u8, "text/plain");
-    errdefer alloc.free(content_type);
-    const owned_body = try alloc.dupe(u8, body);
-    return .{
-        .status = status,
-        .content_type = content_type,
-        .headers = headers,
-        .body = owned_body,
-    };
-}
-
-fn queryEmbeddingOperationalResponse(alloc: std.mem.Allocator, err: anyerror) !?http_common.HttpResponse {
-    const normalized = normalizeQueryEmbeddingOperationalError(err) orelse return null;
-    return switch (normalized) {
-        error.QueryEmbeddingInputTooLarge => try textResponse(alloc, 413, "query embedding input too large"),
-        error.QueryEmbeddingOverloaded => try retryableTextResponse(alloc, 429, "query embedding overloaded"),
-        error.EmbedRateLimited => try retryableTextResponse(alloc, 429, "query embedding rate limited"),
-        error.EmbedTransientFailure => try retryableTextResponse(alloc, 503, "query embedding temporarily unavailable"),
-        error.EmbedUpstreamFailure => try textResponse(alloc, 502, "query embedding provider failed"),
-        error.Timeout => try textResponse(alloc, 504, "query embedding timed out"),
-        else => null,
-    };
-}
-
-pub fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    const headers = try alloc.alloc(http_common.Header, 2);
-    var initialized_headers: usize = 0;
-    errdefer {
-        for (headers[0..initialized_headers]) |*header| header.deinit(alloc);
-        alloc.free(headers);
-    }
-
-    var retry_after_name: ?[]u8 = try alloc.dupe(u8, "Retry-After");
-    errdefer if (retry_after_name) |value| alloc.free(value);
-    var retry_after_value: ?[]u8 = try alloc.dupe(u8, "1");
-    errdefer if (retry_after_value) |value| alloc.free(value);
-    headers[0] = .{ .name = retry_after_name.?, .value = retry_after_value.? };
-    retry_after_name = null;
-    retry_after_value = null;
-    initialized_headers += 1;
-
-    var not_leader_name: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_header);
-    errdefer if (not_leader_name) |value| alloc.free(value);
-    var not_leader_value: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_value);
-    errdefer if (not_leader_value) |value| alloc.free(value);
-    headers[1] = .{ .name = not_leader_name.?, .value = not_leader_value.? };
-    not_leader_name = null;
-    not_leader_value = null;
-    initialized_headers += 1;
-
-    const content_type = try alloc.dupe(u8, "application/json");
-    errdefer alloc.free(content_type);
-    const body = try alloc.dupe(u8, "{\"error\":\"metadata leader unavailable\"}");
-    errdefer alloc.free(body);
-    return .{
-        .status = 503,
-        .content_type = content_type,
-        .headers = headers,
-        .body = body,
-    };
-}
-
 fn restoreIdempotencyNamespaceAlloc(
     alloc: std.mem.Allocator,
     principal: ?[]const u8,
@@ -15915,16 +15454,16 @@ test "api http server serves status" {
 test "api http query budget rejection response exposes stable sort reason" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
-    db_mod.testing.recordSortRejectionDiagnostic(
+    db_mod.recordSortRejectionDiagnostic(
         "full_text_index_v0",
         "candidate_budget_exceeded",
         "text_field_sort_candidate_window",
     );
-    var resp = try queryCandidateBudgetExceededResponse(alloc);
+    var resp = try contextualQueryCandidateBudgetExceededResponse(alloc);
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
 
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
@@ -15951,11 +15490,11 @@ test "api http query budget rejection response exposes stable sort reason" {
 test "api http unsupported sorted query response exposes stable sort reason" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
-    var resp = try unsupportedPublicQueryResponse(alloc, "{\"order_by\":[{\"field\":\"created_at\"}]}");
+    var resp = try contextualUnsupportedExactSortResponse(alloc);
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
 
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
@@ -15979,16 +15518,16 @@ test "api http unsupported sorted query response exposes stable sort reason" {
 
 test "api http unsupported sorted query response surfaces exact sort diagnostics" {
     const alloc = std.testing.allocator;
-    db_mod.testing.recordSortRejectionDiagnostic(
+    db_mod.recordSortRejectionDiagnostic(
         "created_at",
         "missing_doc_values_coverage",
         "missing_doc_values_section",
     );
-    var resp = try unsupportedPublicQueryResponse(alloc, "{\"order_by\":[{\"field\":\"created_at\"}]}");
+    var resp = try contextualUnsupportedExactSortResponse(alloc);
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
 
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
@@ -16012,18 +15551,16 @@ test "api http unsupported sorted query response surfaces exact sort diagnostics
 
 test "api http unsupported count ordered page response exposes stable sort reason" {
     const alloc = std.testing.allocator;
-    db_mod.testing.recordSortRejectionDiagnostic(
+    db_mod.recordSortRejectionDiagnostic(
         "*",
         "unsupported_exact_sort",
         "count_only_ordered_page",
     );
-    var resp = try unsupportedPublicQueryResponse(alloc,
-        \\{"count":true,"order_by":[{"field":"created_at"}]}
-    );
+    var resp = try contextualUnsupportedExactSortResponse(alloc);
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
 
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
@@ -16046,16 +15583,16 @@ test "api http unsupported count ordered page response exposes stable sort reaso
 test "api http invalid query with sort diagnostic returns exact sort response" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
-    db_mod.testing.recordSortRejectionDiagnostic(
+    db_mod.recordSortRejectionDiagnostic(
         "_score",
         "invalid_sort_tuple",
         "non_numeric_score",
     );
-    var resp = try invalidPublicQueryRequestResponse(alloc);
+    var resp = try contextualUnsupportedExactSortResponse(alloc);
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
 
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
@@ -16080,7 +15617,7 @@ test "api http invalid query with sort diagnostic returns exact sort response" {
 test "api http invalid filter query response names the offending node" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
-    var resp = try publicFilterQueryErrorResponseForBody(
+    var resp = try contextualPublicFilterQueryErrorResponseForBody(
         alloc,
         \\{"filter_query":{"prefix":17,"field":"path"}}
     ,
@@ -16090,7 +15627,7 @@ test "api http invalid filter query response names the offending node" {
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
@@ -16113,7 +15650,7 @@ test "api http invalid filter query response names the offending node" {
 
 test "api http unsupported filter query response names the offending node" {
     const alloc = std.testing.allocator;
-    var resp = try publicFilterQueryErrorResponseForBody(
+    var resp = try contextualPublicFilterQueryErrorResponseForBody(
         alloc,
         \\{"filter_query":{"query_string":"path:tenant/*"}}
     ,
@@ -16123,7 +15660,7 @@ test "api http unsupported filter query response names the offending node" {
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
@@ -16145,11 +15682,11 @@ test "api http unsupported filter query response names the offending node" {
 test "api http unsupported unsorted query response remains generic" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
-    var resp = try unsupportedPublicQueryResponse(alloc, "{\"join\":{}}");
+    var resp = try contextual_operations.textAlloc(alloc, 422, "unsupported query request");
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
+    try std.testing.expectEqualStrings("text/plain", resp.content_type);
     try std.testing.expectEqualStrings("unsupported query request", resp.body);
 }
 
@@ -16479,7 +16016,7 @@ test "api http retryable embedding failures provide retry guidance" {
         "{\"semantic_search\":\"bounded failure mapping\",\"indexes\":[\"semantic_idx\"]}",
     ));
 
-    var response = try retryableTextResponse(std.testing.allocator, 429, "query embedding overloaded");
+    var response = try contextualRetryableTextResponse(std.testing.allocator, 429, "query embedding overloaded");
     defer response.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 429), response.status);

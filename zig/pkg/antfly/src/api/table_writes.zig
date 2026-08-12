@@ -56,6 +56,7 @@ const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
 const coverage_policy_mod = @import("coverage_policy.zig");
 const query_api = @import("query.zig");
+const public_table_http = @import("public_table_http.zig");
 const runtime_status = @import("runtime_status.zig");
 
 fn publishRuntimeStatusGroupForTest(
@@ -34419,7 +34420,12 @@ test "provisioned table read source survives many external write-sync batches be
 
     var ready = false;
     for (0..200) |_| {
-        var detail = try server.handlePublicTableGetIndex("docs", "semantic_idx");
+        var detail = try public_table_http.handleTableGetIndex(
+            alloc,
+            "docs",
+            "semantic_idx",
+            server.tableApi(),
+        );
         defer detail.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 200), detail.status);
         var parsed_detail = try std.json.parseFromSlice(IndexDetail, alloc, detail.body, .{ .ignore_unknown_fields = true });

@@ -63,6 +63,7 @@ pub const internal_query_operations = @import("internal_query_operations.zig");
 pub const internal_transition_wire = @import("internal_transition_wire.zig");
 pub const http_server = @import("http_server.zig");
 pub const kernel_bridge = @import("kernel_bridge.zig");
+const kernel_abi = @import("kernel_abi.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
 pub const connections = @import("connections.zig");
@@ -254,6 +255,8 @@ test "api module compiles" {
     _ = internal_query_operations;
     _ = internal_transition_wire;
     _ = http_server;
+    _ = kernel_abi;
+    _ = kernel_bridge;
     _ = http_client;
     _ = httpx_handler;
     _ = connections;

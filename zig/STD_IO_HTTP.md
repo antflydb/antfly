@@ -220,21 +220,19 @@ that end state:
   owned contextual contract, so MCP no longer contains a legacy application
   response conversion.
 - Public table-repair and document-artifact reprocess job handlers now return
-  owned typed responses directly to their concrete `httpx` routes. The
-  residual synthetic public dispatcher has a temporary one-way adapter for
-  its test and compatibility callers; production ingress does not allocate a
-  legacy `HttpResponse` for these route families.
+  owned typed responses directly to their concrete `httpx` routes. Their
+  synthetic public-dispatch adapters and legacy `HttpResponse` projections
+  have been deleted.
 - Cluster/table restore submission and restore-job list/get/cancel operations
   now return the shared owned contextual response directly to generated
   `httpx` handlers. Location, retry, and metadata-authority headers are owned by
-  that result contract; only the residual synthetic dispatcher clones it into
-  a legacy response for compatibility tests.
+  that result contract and projected once at the transport edge.
 - Public single-query and NDJSON multi-query execution now return owned
   contextual results for success, cancellation, validation, retryable, and
   storage-error outcomes. Generated `httpx` handlers and MCP consume those
-  results directly; the listener-side `respondWithAllocator` and the last
-  legacy-to-contextual response converter have been deleted. The residual
-  synthetic dispatcher has the only typed-to-legacy query adapter.
+  results directly; the listener-side `respondWithAllocator`, the last
+  legacy-to-contextual response converter, and the typed-to-legacy query
+  adapters have been deleted.
 - The in-repository API client now resolves generated public operations below
   the canonical `/db/v1` namespace while keeping internal group RPCs and the
   contextual retrieval worker rooted. Stateful public multi-node fixtures use
@@ -256,22 +254,25 @@ that end state:
 - `ApiHttpServer` no longer exposes public buffered or streaming request
   executors. The last executor-based lookup test now verifies the canonical
   generated route through the owned `httpx` runtime, including its version
-  header. The static executor adapters and legacy A2A streaming executor entry
+  header. The static executor adapters, synthetic `handle` dispatcher, public
+  response compatibility wrappers, and legacy A2A streaming executor entry
   point have been deleted.
 - The former shared non-generated compatibility manifest and listener
   catch-alls are gone. Metadata has no manual dispatcher, and data and
   standalone register generated and contextual families explicitly. Unknown
-  paths therefore retain native `httpx` 404 behavior. The remaining legacy
-  surface is inside the public application helpers and the synthetic
-  `ApiHttpServer.handle()` adapter, not in runtime route registration.
+  paths therefore retain native `httpx` 404 behavior. Route-manifest
+  registration uses the router's normalized duplicate-shape validation, wire
+  tests keep `/healthz` and `/readyz` root-only while proving removed data
+  aliases return 404, and API-kernel and linked-inference ABI tests validate
+  their supported function-table prefixes.
 
-The remaining application migration is intentionally explicit: generated
-public API handlers still delegate substantial business behavior to
-`ApiHttpServer`, and its synthetic dispatcher remains for legacy tests and
-in-process fixtures. That adapter is deletion scaffolding, not a second
-supported transport. Completion requires extracting the remaining typed
-kernel operations, migrating those fixtures to direct operations or real
-`httpx` test listeners, and then deleting the compatibility path.
+The legacy public transport migration is complete on this branch: public test
+fixtures exercise direct operations or owned real-`httpx` listeners, and no
+public in-process caller manufactures an HTTP request merely to invoke
+application logic. The remaining architectural work is to continue splitting
+the large `AntflyApiHandler` application surface into cohesive typed services
+so generated handlers are thin adapters. That is an operation-layer
+maintainability improvement, not retention of a second public HTTP stack.
 
 ## Goals
 
@@ -793,42 +794,21 @@ generated or contextual `httpx` routes. The API-kernel ABI no longer advertises
 executor, generic-handle, or internal-handle function-table entries. Unknown
 and removed alias paths are rejected by the router before application code.
 
-That boundary cleanup must not be confused with completion of the operation
-extraction. The remaining contextual adapters must be reduced in this order:
+That boundary cleanup is complete on this branch. MCP, A2A, ARD, extensions,
+HA, metadata administration, internal group/table workers, storage
+maintenance, and root probes all have explicit generated or contextual
+registrars. The public synthetic dispatcher, manual metadata dispatcher,
+public request executors, context/request conversion, response conversion,
+catch-all bridges, and obsolete API-kernel dispatch ABI entries have been
+deleted. Historical data aliases are not registered.
 
-1. Give MCP, A2A, ARD, extensions, and HA shared contextual registrars, with
-   runtime-specific dependencies supplied explicitly. Storage maintenance and
-   the root health/readiness probes have already crossed this boundary and
-   must remain direct typed-operation routes.
-2. Split metadata administration into typed operations and bind each concrete
-   route directly to its operation; remove the method/path dispatcher.
-3. Convert internal group and table modules to typed inputs and results, then
-   adapt their real internal HTTP routes at the edge.
-4. Replace MCP, A2A, and extension-host calls that construct an `HttpRequest`
-   with direct calls to the same table, query, batch, backup, restore, and agent
-   operations used by public handlers.
-5. Delete the residual contextual request/response conversion and manual data
-   dispatcher once the last route and in-process caller uses typed operations.
-
-At completion, remove:
-
-- The residual `ApiHttpServer.handle()` adapter
-- The manual method/path dispatcher behind that adapter
-- Business logic in the current `AntflyApiHandler`, replacing it with a thin
-  generated transport adapter
-- Public `RequestExecutor` and `StreamingRequestExecutor` adapters
-- `httpx.Context` to `http_common.HttpRequest` conversion
-- `http_common.HttpResponse` to `httpx.Response` conversion
-- Standalone protocol, internal, HA, and extension catch-all bridge handlers
-- Duplicated standalone route arrays covered by generated or contextual routes
-- Duplicated authentication, parsing, retry, error, and response logic
-- `StdHttpListener` usage for public, admin, and health APIs
-- API-kernel handler create/register ABI calls once the route manifest and
-  operation dispatcher replace them
-
-The underlying kernel state and extracted operations remain. Legacy transport
-types may be deleted only after Raft and any other internal consumers either
-migrate or adopt an explicitly supported internal-only compatibility module.
+Further operation extraction should keep the same boundary: move cohesive
+business behavior out of `AntflyApiHandler` into typed services without
+reintroducing request/response compatibility types. `StdHttpListener` remains
+an explicitly internal transport for Raft and selected test/provider peers; it
+is not used as an alternative public, admin, or probe listener. It can be
+migrated independently if those internal consumers need the `httpx` lifecycle
+or backpressure model.
 
 Migration enforcement belongs in ordinary Zig behavior and invariant tests,
 not in a checked-in source-scanning shell script or an extra build dependency.

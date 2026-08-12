@@ -41,6 +41,7 @@ const HandlerState = struct {
     io_impl: ?std.Io.Threaded = null,
     routes: std.ArrayListUnmanaged(*RouteState) = .empty,
     route_manifest: std.ArrayListUnmanaged(abi.RouteManifestEntry) = .empty,
+    route_validator: httpx.Router,
     route_manifest_mutex: std.atomic.Mutex = .unlocked,
     route_manifest_ready: bool = false,
 };
@@ -251,6 +252,7 @@ pub fn handlerCreate(context: *const HandlerCreateContext) callconv(.c) abi.Stat
     state.* = .{
         .alloc = api_state.owner_alloc,
         .handler = .{ .api_server = &api_state.server },
+        .route_validator = httpx.Router.init(api_state.owner_alloc),
     };
     context.out_handle.* = state;
     return .ok;
@@ -307,6 +309,8 @@ pub fn handlerRouteManifest(context: *const abi.RouteManifestContext) callconv(.
             for (state.routes.items[routes_start..]) |route| state.alloc.destroy(route);
             state.routes.shrinkRetainingCapacity(routes_start);
             state.route_manifest.shrinkRetainingCapacity(manifest_start);
+            state.route_validator.deinit();
+            state.route_validator = httpx.Router.init(state.alloc);
             return fail(err);
         };
         state.route_manifest_ready = true;
@@ -397,6 +401,7 @@ pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
     for (state.routes.items) |route| alloc.destroy(route);
     state.routes.deinit(alloc);
     state.route_manifest.deinit(alloc);
+    state.route_validator.deinit();
     state.handler.deinitRuntime();
     if (state.io_impl) |*io_impl| io_impl.deinit();
     alloc.destroy(state);
@@ -438,6 +443,12 @@ fn ManifestServer(comptime prefix: []const u8) type {
         owner: *HandlerState,
 
         fn register(self: *const @This(), method: abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
+            try self.owner.route_validator.add(switch (method) {
+                .get => .GET,
+                .post => .POST,
+                .put => .PUT,
+                .delete => .DELETE,
+            }, prefix ++ path, handler);
             const route = try self.owner.alloc.create(RouteState);
             errdefer self.owner.alloc.destroy(route);
             route.* = .{ .owner = self.owner, .handler = handler };

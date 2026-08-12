@@ -16,9 +16,8 @@
 /// (metadata_openapi and usermgr_openapi) by calling business logic directly
 /// on ApiHttpServer and its underlying services.
 ///
-/// Each handler method extracts parameters from the httpx Context, calls the
-/// appropriate business logic, and returns an httpx.Response natively or via
-/// the respond() helper for methods that return http_common.HttpResponse.
+/// Each handler method extracts wire parameters from the httpx Context, calls
+/// a typed operation, and adapts its owned result to an httpx.Response.
 const std = @import("std");
 const httpx = @import("httpx");
 const http_common = @import("../raft/transport/http_common.zig");
@@ -397,28 +396,6 @@ pub const AntflyApiHandler = struct {
         self.peer_observer = null;
     }
 
-    // ---------------------------------------------------------------
-    // Response conversion: http_common.HttpResponse -> httpx.Response
-    // ---------------------------------------------------------------
-
-    pub fn respond(ctx: *httpx.Context, resp: *http_common.HttpResponse) !httpx.Response {
-        defer resp.deinit(ctx.allocator);
-        _ = ctx.status(resp.status);
-        if (resp.content_type) |ct| {
-            try ctx.setHeader("content-type", ct);
-        } else if (resp.status >= 200 and resp.status < 300) {
-            // Legacy API responses without an explicit type are JSON.  Keep
-            // this compatibility default at the shared adapter so every
-            // successful route presents the same wire contract.
-            try ctx.setHeader("content-type", "application/json");
-        }
-        for (resp.headers) |hdr| {
-            try ctx.setHeader(hdr.name, hdr.value);
-        }
-        _ = ctx.response.body(resp.body);
-        return ctx.response.build();
-    }
-
     fn respondOwnedApiResponse(ctx: *httpx.Context, resp: anytype) !httpx.Response {
         return respondOwnedApiResponseWithAllocator(ctx, resp, ctx.allocator);
     }
@@ -591,7 +568,7 @@ pub const AntflyApiHandler = struct {
             .content_type = ctx.header("content-type"),
             .body = body,
         })) orelse return null;
-        return try respond(ctx, &response);
+        return try respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
     }
 
     fn haRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -1732,7 +1709,7 @@ pub const AntflyApiHandler = struct {
             else => return textResponse(ctx, 400, "invalid vector worker request"),
         };
         defer envelope.deinit(ctx.allocator);
-        var query_request = table_reads.searchRequestFromVectorWorkerEnvelope(&envelope);
+        var query_request = query_contract.searchRequestFromVectorWorkerEnvelope(&envelope);
         defer if (query_request.primary_text_index_name) |index_name| ctx.allocator.free(index_name);
         query_request.cancellation = ctx.cancellation;
         const query_context = self.internalQueryContext(ctx);
@@ -1847,15 +1824,7 @@ pub const AntflyApiHandler = struct {
         var result = self.internalGroupOperations().textStats(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, body) catch |err|
             return if (err == error.InvalidArgument) textResponse(ctx, 400, "invalid text stats request") else internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-        defer arena_impl.deinit();
-        var response = table_reads.parseTextStatsHttpResponse(arena_impl.allocator(), body, result.json) catch
-            return textResponse(ctx, 500, "internal server error");
-        defer response.deinit(arena_impl.allocator());
-        return switch (response) {
-            .fields => |value| ctx.json(value),
-            .background_fields => |value| ctx.json(value),
-        };
+        return jsonResponse(ctx, 200, result.json);
     }
 
     fn internalAlgebraicPartials(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -4101,9 +4070,9 @@ pub const AntflyApiHandler = struct {
         // unbounded-range scan, just like an explicitly empty legacy request.
         const body_data = (try ctx.body()) orelse "";
         var scan_req = http_route_helpers.parseScanKeysRequest(alloc, body_data) catch |err| {
-            if (try http_route_helpers.scanRequestErrorResponse(alloc, err)) |response| {
-                var owned_response = response;
-                return respond(ctx, &owned_response);
+            if (http_route_helpers.scanRequestError(err)) |response| {
+                _ = ctx.status(response.status);
+                return ctx.text(response.message);
             }
             return err;
         };
