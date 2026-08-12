@@ -29776,7 +29776,9 @@ int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device(
         return -6;
     }
     const bool direct_packed_dense = direct_packed_dense_requested && weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32;
-    if (runtime->active_planned_compute_encoder != nil && !direct_packed_dense) return -2;
+    // A planned encoder can be closed before the MPS transition below. Rejecting
+    // it here makes GLiNER abandon the whole fused DeBERTa layer instead of using
+    // its already-prepared F16 QKV mirrors.
     if (runtime->linear_in_dims[q_slot] != in_dim || runtime->linear_in_dims[k_slot] != in_dim || runtime->linear_in_dims[v_slot] != in_dim) return -7;
     if (runtime->linear_out_dims[q_slot] != q_out_dim || runtime->linear_out_dims[k_slot] != kv_out_dim || runtime->linear_out_dims[v_slot] != kv_out_dim) return -8;
     if (rows == 0 || in_dim == 0 || q_out_dim == 0 || kv_out_dim == 0 || rows > UINT32_MAX || in_dim > UINT32_MAX || q_out_dim > UINT32_MAX || kv_out_dim > UINT32_MAX) return -9;

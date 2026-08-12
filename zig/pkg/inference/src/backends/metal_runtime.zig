@@ -36947,11 +36947,16 @@ test "metal native decoder runtime f16 BERT fused paths match decomposed device 
 
     try beginFrame(runtime);
     errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    // GLiNER's fused DeBERTa layer opens a planned layer encoder before QKV.
+    // Packed F16 MPS QKV must close that encoder for the transition rather than
+    // decline the operation and force the entire layer onto the fallback path.
+    try beginPlannedComputeScope(runtime, @intFromEnum(ComputeSource.layer), .layer);
     var packed_qkv = (try tryApplyDenseRuntimeLinearQkv(&provider, 0, 1, 2, input, rows, hidden, hidden, hidden)) orelse
         return error.UnexpectedNull;
     defer packed_qkv.first.deinit();
     defer packed_qkv.second.deinit();
     defer packed_qkv.third.deinit();
+    try endPlannedComputeScope(runtime);
     try submitFrame(runtime);
     try waitFrame(runtime);
     const packed_stats = runtimeMemorySnapshot(runtime);
