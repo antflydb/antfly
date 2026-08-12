@@ -6459,10 +6459,10 @@ pub const DataServer = struct {
         };
     }
 
-    fn routedRaftBatchWriter(self: *DataServer) antfly.public_api.http_internal_group_write_routes.RoutedRaftBatchWriter {
+    fn routedRaftBatchWriter(self: *DataServer) antfly.public_api.internal_group_operations.RoutedRaftBatchWriter {
         return .{
             .ptr = self,
-            .write = localRaftBatchGroupForwarded,
+            .write_fn = localRaftBatchGroupForwarded,
         };
     }
 
@@ -6562,9 +6562,10 @@ pub const DataServer = struct {
         table_name: []const u8,
         req: antfly.db.types.BatchRequest,
         forwarding: antfly.public_api.internal_batch_forwarding.Context,
-        cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
+        cancellation_signal: ?*const std.atomic.Value(bool),
     ) !?void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const cancellation = antfly.raft.transport.http_common.RequestCancellation{ .borrowed = cancellation_signal };
         const leader_wait_ns = dataRaftForwardedLeaderWaitNs(forwarding);
         if (leader_wait_ns == 0) return error.LeaderUnavailable;
         try self.proposeRaftBatchGroupWithLeaderWait(
@@ -6576,7 +6577,7 @@ pub const DataServer = struct {
                 .refresh_metadata = false,
                 .campaign_allowed = forwarding.campaign_allowed,
                 .forwards_remaining = forwarding.forwards_remaining,
-                .cancellation = cancellation,
+                .cancellation = if (cancellation_signal != null) &cancellation else null,
             },
             leader_wait_ns,
         );

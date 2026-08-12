@@ -15,6 +15,7 @@ const operation = @import("operation.zig");
 const raft_mod = @import("../raft/mod.zig");
 const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_write_source.zig");
+const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const platform_time = @import("antfly_platform").time;
 
 pub const Error = operation.ApiError || error{
@@ -36,6 +37,23 @@ pub const RepairCancellationLookup = struct {
 
     fn isRequested(self: @This(), alloc: std.mem.Allocator, table_name: []const u8, job_id: u64, attempt_id: u64, base_uri: ?[]const u8) !bool {
         return self.is_requested_fn(self.ptr, alloc, table_name, job_id, attempt_id, base_uri);
+    }
+};
+
+pub const RoutedRaftBatchWriter = struct {
+    ptr: *anyopaque,
+    write_fn: *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        u64,
+        []const u8,
+        db_mod.types.BatchRequest,
+        internal_batch_forwarding.Context,
+        ?*const std.atomic.Value(bool),
+    ) anyerror!?void,
+
+    fn write(self: @This(), alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, cancellation: ?*const std.atomic.Value(bool)) !?void {
+        return self.write_fn(self.ptr, alloc, group_id, table_name, input, forwarding, cancellation);
     }
 };
 
@@ -73,6 +91,7 @@ pub const Operations = struct {
     reject_unrouted_batch: bool = false,
     txn_validator: ?TxnValidator = null,
     repair_cancellation_lookup: ?RepairCancellationLookup = null,
+    routed_raft_batch_writer: ?RoutedRaftBatchWriter = null,
 
     pub fn corruptEmbeddingArtifact(
         self: Operations,
@@ -192,6 +211,37 @@ pub const Operations = struct {
             else => return error.Internal,
         };
         _ = (writes.batchGroupLocal(alloc, group_id, table_name, input) catch |err| switch (err) {
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,
+            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
+            else => return error.Internal,
+        }) orelse return error.NotFound;
+        return .{
+            .inserted = @intCast(input.writes.len),
+            .deleted = @intCast(input.deletes.len),
+            .transformed = @intCast(input.transforms.len),
+        };
+    }
+
+    pub fn routedBatch(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        input: db_mod.types.BatchRequest,
+        forwarding: internal_batch_forwarding.Context,
+        cancellation_signal: ?*const std.atomic.Value(bool),
+    ) Error!batch_api.BatchResult {
+        try request.ensureActive();
+        const validator = self.batch_validator orelse return error.Unavailable;
+        validator.validate(table_name, input.writes) catch |err| switch (err) {
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            else => return error.Internal,
+        };
+        const writer = self.routed_raft_batch_writer orelse return error.Unavailable;
+        _ = (writer.write(alloc, group_id, table_name, input, forwarding, cancellation_signal) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,

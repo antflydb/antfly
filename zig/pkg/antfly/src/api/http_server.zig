@@ -90,7 +90,7 @@ const admin_routes = @import("../admin/routes.zig");
 const internal_api_routes = @import("../internal/routes.zig");
 const http_internal_routes = @import("http_internal_routes.zig");
 const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
-const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
+const internal_group_operations = @import("internal_group_operations.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const transactions_api = @import("transactions.zig");
 const docstore_mod = if (builtin.is_test) @import("../storage/docstore.zig") else struct {};
@@ -618,7 +618,7 @@ pub const ApiHttpServerConfig = struct {
     foreign_registry: ?*const foreign_mod.Registry = null,
     shard_ops: ?raft_mod.ShardOperationAdapter = null,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
-    routed_raft_batch_writer: ?http_internal_group_write_routes.RoutedRaftBatchWriter = null,
+    routed_raft_batch_writer: ?internal_group_operations.RoutedRaftBatchWriter = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_key: ?[]const u8 = null,
@@ -5622,17 +5622,6 @@ pub const ApiHttpServer = struct {
                 },
                 .query_planning = self.internalQueryPlanningContext(),
             },
-            .write_ctx = .{
-                .alloc = self.alloc,
-                .shard_ops = self.cfg.shard_ops,
-                .shard_db_adapter = self.cfg.shard_db_adapter,
-                .writes = self.table_writes,
-                .routed_raft_batch_writer = self.cfg.routed_raft_batch_writer,
-                .batch_validator = .{
-                    .ptr = self,
-                    .validate = validateInternalGroupBatchWrites,
-                },
-            },
             .retrieval_executor = .{
                 .ptr = self,
                 .execute = executeInternalRetrievalRoute,
@@ -6706,11 +6695,6 @@ pub const ApiHttpServer = struct {
     fn routeInternalGroupQueryToReadSchema(ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         return try self.maybeRouteQueryToReadSchema(table_name, req);
-    }
-
-    fn validateInternalGroupBatchWrites(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
-        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.validateTableWritesAgainstSchema(table_name, writes);
     }
 
     pub fn maybeRouteQueryToReadSchema(self: *ApiHttpServer, table_name: []const u8, query_req: *db_mod.types.SearchRequest) !void {

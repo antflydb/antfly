@@ -328,6 +328,7 @@ pub const AntflyApiHandler = struct {
         try server.post(group_prefix ++ routes.shard_ops_observe_merge_suffix, httpx.Handler.bind(self, internalObserveMerge));
         try server.post(group_prefix ++ routes.shard_ops_execute_suffix, httpx.Handler.bind(self, internalExecuteTransition));
         try server.post(table_prefix ++ routes.batch_suffix, httpx.Handler.bind(self, internalGroupBatch));
+        try server.post(table_prefix ++ routes.routed_batch_suffix, httpx.Handler.bind(self, internalGroupRoutedBatch));
         try server.post(table_prefix ++ routes.txn_begin_suffix, httpx.Handler.bind(self, internalTxnBegin));
         try server.post(table_prefix ++ routes.txn_prepare_suffix, httpx.Handler.bind(self, internalTxnPrepare));
         try server.post(table_prefix ++ routes.txn_resolve_suffix, httpx.Handler.bind(self, internalTxnResolve));
@@ -350,7 +351,6 @@ pub const AntflyApiHandler = struct {
             table_prefix ++ routes.query_suffix,
             table_prefix ++ routes.query_preflight_suffix,
             table_prefix ++ routes.vector_worker_suffix,
-            table_prefix ++ routes.routed_batch_suffix,
             table_prefix ++ routes.artifacts_marker ++ "*",
             table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ "*",
         };
@@ -807,6 +807,7 @@ pub const AntflyApiHandler = struct {
                 }.call,
             },
             .reject_unrouted_batch = self.api_server.cfg.routed_raft_batch_writer != null,
+            .routed_raft_batch_writer = self.api_server.cfg.routed_raft_batch_writer,
             .txn_validator = .{
                 .ptr = self.api_server,
                 .validate_fn = struct {
@@ -1370,6 +1371,54 @@ pub const AntflyApiHandler = struct {
             .deleted = result.deleted,
             .transformed = result.transformed,
         });
+    }
+
+    fn internalGroupRoutedBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const forwarding = internal_batch_forwarding.parseValues(
+            ctx.header(internal_batch_forwarding.remaining_ms_header),
+            ctx.header(internal_batch_forwarding.forwards_remaining_header),
+            ctx.header(internal_batch_forwarding.campaign_allowed_header),
+        ) catch return textResponse(ctx, 400, "invalid raft batch forwarding headers");
+        const forwarding_context = forwarding orelse return textResponse(ctx, 400, "missing raft batch forwarding headers");
+        const body = (try ctx.body()) orelse "";
+        var input = batch_api.parseInternalBatchRequest(ctx.allocator, body) catch |err| return switch (err) {
+            error.InvalidBatchRequest => textResponse(ctx, 400, "invalid batch request"),
+            error.ValueTooLong => textResponse(ctx, 413, "value too large"),
+            else => textResponse(ctx, 500, "internal server error"),
+        };
+        defer input.deinit(ctx.allocator);
+        const result = self.internalGroupOperations().routedBatch(
+            ctx.allocator,
+            operationContext(ctx, null),
+            params.group_id,
+            params.table_name,
+            input.req,
+            forwarding_context,
+            ctx.cancellation,
+        ) catch |err| return switch (err) {
+            error.InvalidArgument => textResponse(ctx, 400, "invalid batch request"),
+            error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
+            error.RaftBatchWriteOutcomeUnknown => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+                break :blk textResponse(ctx, 409, "write outcome unknown");
+            },
+            error.GroupLeaderUnavailable => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
+                break :blk textResponse(ctx, 503, "group leader unavailable");
+            },
+            error.Unavailable => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
+                break :blk textResponse(ctx, 503, "routed raft batch unavailable");
+            },
+            error.NotFound => textResponse(ctx, 404, "not found"),
+            error.Canceled => textResponse(ctx, 408, "request canceled"),
+            error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            else => textResponse(ctx, 500, "internal server error"),
+        };
+        _ = ctx.status(201);
+        return ctx.json(.{ .inserted = result.inserted, .deleted = result.deleted, .transformed = result.transformed });
     }
 
     fn internalTxnErrorResponse(ctx: *httpx.Context, err: internal_group_operations.Error) !httpx.Response {
@@ -5603,6 +5652,13 @@ test "httpx internal control routes call typed operations directly" {
     defer invalid_batch.deinit();
     try std.testing.expectEqual(@as(u16, 400), invalid_batch.status.code);
     try std.testing.expectEqualStrings("invalid batch request", invalid_batch.body.?);
+
+    const routed_batch_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/batch-routed-v1", .{base_url});
+    defer alloc.free(routed_batch_url);
+    var missing_forwarding = try requestWithRetry(&client, client_io.io(), .POST, routed_batch_url, "{}", &headers, 20);
+    defer missing_forwarding.deinit();
+    try std.testing.expectEqual(@as(u16, 400), missing_forwarding.status.code);
+    try std.testing.expectEqualStrings("missing raft batch forwarding headers", missing_forwarding.body.?);
 
     inline for (.{
         .{ "document_units_v1:placement", "invalid document artifact placement request" },

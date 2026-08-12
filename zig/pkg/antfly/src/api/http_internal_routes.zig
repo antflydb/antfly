@@ -15,7 +15,6 @@
 const std = @import("std");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
-const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
 
 pub const RetrievalExecutor = struct {
     ptr: *anyopaque,
@@ -31,13 +30,11 @@ pub const Context = struct {
     path: []const u8,
     query: []const u8,
     read_ctx: http_internal_group_read_routes.Context,
-    write_ctx: http_internal_group_write_routes.Context,
     retrieval_executor: RetrievalExecutor,
 };
 
 pub fn handle(ctx: Context, req: http_common.HttpRequest) !?http_common.HttpResponse {
     if (try ctx.retrieval_executor.run(req, ctx.path)) |resp| return resp;
     if (try http_internal_group_read_routes.handle(ctx.read_ctx, req, ctx.path, ctx.query)) |resp| return resp;
-    if (try http_internal_group_write_routes.handle(ctx.write_ctx, req, ctx.path)) |resp| return resp;
     return null;
 }

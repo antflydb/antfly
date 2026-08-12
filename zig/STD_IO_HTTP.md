@@ -98,16 +98,17 @@ that end state:
   local-leader projection, and operational error classification now live below
   the transport; their former method/path dispatcher branches are gone.
 - The temporary internal compatibility registrar now enumerates every
-  remaining canonical internal read, write, artifact, routed-batch, and
-  retrieval-agent route. This preserves reachability during
+  remaining canonical internal read and retrieval-agent route. This preserves
+  reachability during
   extraction without a global fallback or any legacy public alias; router
   registration still rejects duplicate route shapes.
 - The ordinary internal group batch route now decodes directly into an owned
   batch request and invokes a typed operation for schema validation, local
-  group write, cancellation, and outcome classification. Only the explicitly
-  versioned routed-forwarding endpoint retains the temporary legacy
-  cancellation adapter; forwarding headers on the ordinary route are rejected
-  directly from `httpx` headers without manufacturing an `HttpRequest`.
+  group write, cancellation, and outcome classification. The explicitly
+  versioned routed-forwarding endpoint now does the same, passes the listener's
+  borrowed atomic cancellation signal to the data runtime, and preserves its
+  outcome headers without manufacturing an `HttpRequest`. The residual
+  internal dispatcher no longer receives any write route.
 - Internal transaction begin, prepare, resolve, status, and acknowledge are
   registered as concrete `httpx` handlers over typed group operations. The
   operation layer owns schema validation, participant writes, status lookup,
