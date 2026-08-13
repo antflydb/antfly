@@ -2123,6 +2123,7 @@ const ParsedGroupStatus = struct {
     empty: ?bool = null,
     created_at_millis: ?u64 = null,
     updated_at_millis: ?u64 = null,
+    observed_reallocation_request_id: ?u128 = null,
     local_leader: ?bool = null,
     local_voter: ?bool = null,
     voter_count: ?u16 = null,
@@ -2367,6 +2368,7 @@ fn cloneParsedGroupStatuses(
             .empty = parsed.empty orelse true,
             .created_at_millis = parsed.created_at_millis orelse 0,
             .updated_at_millis = parsed.updated_at_millis orelse 0,
+            .observed_reallocation_request_id = parsed.observed_reallocation_request_id orelse 0,
             .local_leader = parsed.local_leader orelse false,
             .local_voter = parsed.local_voter orelse false,
             .voter_count = parsed.voter_count orelse 0,
@@ -4215,6 +4217,12 @@ test "metadata http server accepts internal reallocate and split merge routes" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(u64, 7), report.store_id);
             try std.testing.expectEqualStrings("healthy", report.health_class);
+            try std.testing.expectEqual(@as(usize, 1), report.group_statuses.len);
+            try std.testing.expectEqual(@as(u64, 9), report.group_statuses[0].group_id);
+            try std.testing.expectEqual(
+                @as(u128, 0x1234_5678_9abc_def0_1234_5678_9abc_def0),
+                report.group_statuses[0].observed_reallocation_request_id,
+            );
             self.store_status_count += 1;
         }
 
@@ -4317,7 +4325,7 @@ test "metadata http server accepts internal reallocate and split merge routes" {
     var store_status = try server.handle(.{
         .method = .POST,
         .uri = "/internal/v1/nodes/7/status",
-        .body = "{\"store_id\":7,\"health_class\":\"healthy\"}",
+        .body = "{\"store_id\":7,\"health_class\":\"healthy\",\"group_statuses\":[{\"group_id\":9,\"observed_reallocation_request_id\":24197857203266734864793317670504947440}]}",
         .content_type = "application/json",
     });
     defer store_status.deinit(std.testing.allocator);
