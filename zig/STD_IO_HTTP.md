@@ -771,6 +771,25 @@ and outbound HTTP. This avoids the semantic hole where linked runtimes could
 observe cancellation at ingress but deep work continued unless a same-process
 atomic fast path happened to be available.
 
+Outbound HTTP must translate that semantic token at the transport boundary,
+not wrap an inbound executor task in another long-lived task race. An HTTP/1
+request owns its socket, so `httpx.Client` installs the borrowed cancellation
+callback on that socket and checks it before retries and during bounded
+read/write operations; cancellation therefore closes out the same synchronous
+request before control returns. The token is rechecked before retries and after
+connection establishment, and the absolute request deadline is installed on
+the socket before any bytes are sent. DNS lookup and the initial TCP connect do
+not yet accept the semantic token directly; completing that transport work
+requires a cancellation-aware resolver plus a deadline-aware nonblocking
+connect operation rather than wrapping the entire request in another task
+race. HTTP/2 shares a connection across streams, so its adapter races the
+stream operation against one short-interval watchdog and resets only the
+affected stream. The watchdog combines cancellation and the absolute request
+deadline in one task: separate losing timeout and cancellation sleepers can
+otherwise retain `std.Io.Threaded` workers until a long deadline after a
+successful request. Provider code sees one request context in both cases and
+does not choose an executor-specific mechanism.
+
 Component stop signals and Future cancellation are complementary:
 
 - First use the component's semantic stop operation so it can stop admission,
@@ -1151,6 +1170,10 @@ HTTP and kernel migration tests should also cover:
 - Linked lazy-body admission before transport buffering
 - Absolute H1 and H2 phase deadlines under byte-trickle traffic
 - Required HTTP/1 disconnect cancellation on every supported OS
+- Successful cancellable outbound HTTP/1 requests returning promptly even
+  when their configured deadline is long
+- Outbound HTTP/1 cancellation interrupting an active response read and HTTP/2
+  cancellation resetting only the selected stream
 
 The CI matrix should include sanitizer and stress coverage, supported operating
 systems and architectures, and the real ARM64 `ReleaseFast` linked build. The

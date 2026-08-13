@@ -607,6 +607,23 @@ pub const RestoreExecutionGuard = struct {
 /// public application operations below.
 pub const RequestAdmission = @import("../common/request_admission.zig").RequestAdmission;
 
+pub const HAMutationPolicySnapshot = struct {
+    failover_safe_mutations_only: bool = false,
+    remote_apply_mutations_enabled: bool = false,
+};
+
+/// Live HA ingress policy owned by the process runtime. Promotion changes the
+/// authority role without rebuilding the HTTP router, so policy cannot be a
+/// startup-only boolean.
+pub const HAMutationPolicySource = struct {
+    ptr: *const anyopaque,
+    snapshot_fn: *const fn (ptr: *const anyopaque) HAMutationPolicySnapshot,
+
+    pub fn snapshot(self: HAMutationPolicySource) HAMutationPolicySnapshot {
+        return self.snapshot_fn(self.ptr);
+    }
+};
+
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     experimental: bool = false,
@@ -658,6 +675,9 @@ pub const ApiHttpServerConfig = struct {
     /// synchronous RemoteApply. The route classifier alone cannot establish
     /// the active durability policy.
     ha_remote_apply_mutations_enabled: bool = false,
+    /// Optional live source supplied by HA-aware runtimes. Static fields above
+    /// remain the policy for kernels and tests without a mutable role.
+    ha_mutation_policy_source: ?HAMutationPolicySource = null,
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
@@ -1803,6 +1823,14 @@ pub const ApiHttpServer = struct {
         return ApiHttpServer.initWithRequestAllocator(alloc, request_alloc, cfg, source, table_read_source, table_write_source);
     }
 
+    pub fn haMutationPolicy(self: *const ApiHttpServer) HAMutationPolicySnapshot {
+        if (self.cfg.ha_mutation_policy_source) |source| return source.snapshot();
+        return .{
+            .failover_safe_mutations_only = self.cfg.ha_failover_safe_mutations_only,
+            .remote_apply_mutations_enabled = self.cfg.ha_remote_apply_mutations_enabled,
+        };
+    }
+
     pub fn initWithProcessRequestAllocator(
         owner_alloc: std.mem.Allocator,
         cfg: ApiHttpServerConfig,
@@ -2501,7 +2529,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn mutationBackgroundExecutionPermitted(self: *const ApiHttpServer) bool {
-        return !self.cfg.ha_failover_safe_mutations_only;
+        return !self.haMutationPolicy().failover_safe_mutations_only;
     }
 
     fn retryPendingTransactionRecovery(self: *ApiHttpServer, limit: usize) !void {
@@ -9560,7 +9588,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn restoreExecutionPermitted(self: *ApiHttpServer) bool {
-        if (self.cfg.ha_failover_safe_mutations_only) return false;
+        if (self.haMutationPolicy().failover_safe_mutations_only) return false;
         if (self.restore_dispatch_paused.load(.acquire)) return false;
         const guard = self.cfg.restore_execution_guard orelse return true;
         const term = self.restore_leadership_term.load(.acquire);
@@ -10827,7 +10855,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn resumeRestoreJobsOnce(self: *ApiHttpServer) !void {
-        if (self.cfg.ha_failover_safe_mutations_only) return;
+        if (self.haMutationPolicy().failover_safe_mutations_only) return;
         if (self.restore_jobs_resumed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         self.schedulePendingRestoreJobs() catch |err| {
             self.restore_jobs_resumed.store(false, .release);

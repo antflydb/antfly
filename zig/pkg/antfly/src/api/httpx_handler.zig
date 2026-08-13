@@ -176,11 +176,12 @@ pub const AntflyApiHandler = struct {
     }
 
     fn haMutationRejection(self: *AntflyApiHandler, ctx: *httpx.Context) !?httpx.Response {
-        if (!self.api_server.cfg.ha_failover_safe_mutations_only) return null;
+        const policy = self.api_server.haMutationPolicy();
+        if (!policy.failover_safe_mutations_only) return null;
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
         const mutation = classifyHaMutation(ctx.request.method, path) orelse return null;
         if (mutation.disposition != .reject and
-            (mutation.disposition != .remote_apply or self.api_server.cfg.ha_remote_apply_mutations_enabled))
+            (mutation.disposition != .remote_apply or policy.remote_apply_mutations_enabled))
         {
             return null;
         }

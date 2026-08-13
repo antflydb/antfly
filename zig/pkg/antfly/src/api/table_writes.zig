@@ -32573,7 +32573,10 @@ test "provisioned table write source read cache overlay preserves live replay st
         defer db.close();
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
-            .sync_level = .write,
+            // The replay fields exercised below are supplied by the live
+            // status fixture. Make the separate read-cache/HBC precondition
+            // deterministic instead of racing asynchronous dense indexing.
+            .sync_level = .full_index,
         });
     }
 

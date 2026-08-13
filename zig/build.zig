@@ -6313,7 +6313,7 @@ pub fn build(b: *std.Build) void {
             "standalone HA standby replication flags require upstream and slot",
             "standalone HA string classifier distinguishes missing padded and valid values",
             "standalone HA runtime rejects ambiguous role flags",
-            "standalone HA roles freeze startup-local mutation producers",
+            "standalone continuous HA mutation guard follows role lifecycle",
             "antfly config uses cli override before common config",
             "standalone public api caps keep alive request reuse",
             "standalone public api body limit matches common http listener",
@@ -9111,8 +9111,13 @@ pub fn build(b: *std.Build) void {
                 // scheduling reservations, not hard process limits. A 24 GiB
                 // budget can overlap all four units while a smaller cgroup
                 // automatically schedules only the subset that fits.
-                .api_kernel => 4 * 1024 * 1024 * 1024,
-                .distributed => 8 * 1024 * 1024 * 1024,
+                // aarch64-macOS includes platform framework codegen and peaks
+                // just above 4 GiB; Linux CI retains the tighter reservation.
+                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 5 else 4) * 1024 * 1024 * 1024,
+                // Clean aarch64-macOS ReleaseFast codegen peaks around
+                // 10.9 GB with the platform frameworks enabled. Keep the
+                // tighter Linux reservation, where CI remains below 8 GiB.
+                .distributed => @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024,
                 // Debug codegen currently peaks around 6.7 GB on aarch64
                 // macOS; reserve headroom for mode- and target-dependent IR.
                 .inference => 7 * 1024 * 1024 * 1024,

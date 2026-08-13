@@ -1637,7 +1637,8 @@ pub fn runFromIterator(
     // Validate and freeze the HA role before any startup helper can mutate a
     // primary-local sidecar that is not part of the continuous HA WAL.
     try validateHARole(cli);
-    const ha_role_requested = haContinuousMutationGuardRequested(cli);
+    const ha_role_requested = haPrimaryRequested(cli) or haStandbyRequested(cli);
+    const ha_mutation_guard_enabled = haContinuousMutationGuardEnabled(cli);
 
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
@@ -2000,7 +2001,7 @@ pub fn runFromIterator(
             .role = "data",
         },
         .api_server_cfg = .{
-            .ha_failover_safe_mutations_only = ha_role_requested,
+            .ha_failover_safe_mutations_only = ha_mutation_guard_enabled,
             .ha_remote_apply_mutations_enabled = haRemoteApplyMutationsEnabled(ha_sync_policy.policy),
             .auth_enabled = auth_enabled,
             .experimental = cli.experimental,
@@ -3824,8 +3825,18 @@ fn haStandbyRequested(cli: CliConfig) bool {
         cli.ha_standby_slot != null;
 }
 
-fn haContinuousMutationGuardRequested(cli: CliConfig) bool {
-    return haPrimaryRequested(cli) or haStandbyRequested(cli);
+fn haContinuousMutationGuardEnabled(cli: CliConfig) bool {
+    // A standby can never acknowledge public state changes: its only legal
+    // mutation source is the authenticated replication stream. A primary,
+    // however, has a supported catalog-bootstrap phase before a table identity
+    // exists. Its continuous WAL is table-scoped, so enabling the fail-closed
+    // ingress guard before both identity components are configured would make
+    // it impossible to create the table whose identity must be supplied on the
+    // HA restart.
+    if (haStandbyRequested(cli)) return true;
+    return haPrimaryRequested(cli) and
+        cli.ha_shard_id != null and
+        cli.ha_table_id != null;
 }
 
 fn haRemoteApplyMutationsEnabled(policy: antfly.ha.primary.SyncPolicy) bool {
@@ -4907,10 +4918,19 @@ test "standalone runtime leaves auth disabled unless config or cli enables it" {
     try std.testing.expect(!resolveAuthEnabled(.{ .auth_enabled = false }, null));
 }
 
-test "standalone HA roles freeze startup-local mutation producers" {
-    try std.testing.expect(!haContinuousMutationGuardRequested(.{}));
-    try std.testing.expect(haContinuousMutationGuardRequested(.{ .ha_primary_log = "/ha/primary.wal" }));
-    try std.testing.expect(haContinuousMutationGuardRequested(.{ .ha_standby_log = "/ha/standby.wal" }));
+test "standalone continuous HA mutation guard follows role lifecycle" {
+    try std.testing.expect(!haContinuousMutationGuardEnabled(.{}));
+    try std.testing.expect(!haContinuousMutationGuardEnabled(.{ .ha_primary_log = "/ha/primary.wal" }));
+    try std.testing.expect(!haContinuousMutationGuardEnabled(.{
+        .ha_primary_log = "/ha/primary.wal",
+        .ha_shard_id = 10,
+    }));
+    try std.testing.expect(haContinuousMutationGuardEnabled(.{
+        .ha_primary_log = "/ha/primary.wal",
+        .ha_shard_id = 10,
+        .ha_table_id = 20,
+    }));
+    try std.testing.expect(haContinuousMutationGuardEnabled(.{ .ha_standby_log = "/ha/standby.wal" }));
     try std.testing.expect(!haRemoteApplyMutationsEnabled(.{}));
     try std.testing.expect(!haRemoteApplyMutationsEnabled(.{
         .mode = .remote_write,

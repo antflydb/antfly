@@ -70,6 +70,7 @@ class HAStandaloneNode:
         table_id: int | None = None,
         upstream_url: str | None = None,
         slot_name: str | None = None,
+        sync_standby_name: str | None = None,
         admin_token_env: str | None = None,
         admin_token: str | None = None,
     ):
@@ -90,6 +91,7 @@ class HAStandaloneNode:
         self.epoch = epoch
         self.upstream_url = upstream_url
         self.slot_name = slot_name
+        self.sync_standby_name = sync_standby_name
         self.admin_token_env = admin_token_env
         self.admin_token = admin_token
         self.proc: subprocess.Popen[str] | None = None
@@ -151,6 +153,21 @@ class HAStandaloneNode:
             command.extend(["--ha-shard-id", str(self.shard_id)])
         if self.table_id is not None:
             command.extend(["--ha-table-id", str(self.table_id)])
+        if self.role == "primary" and self.sync_standby_name is not None and self.table_id is not None:
+            command.extend(
+                [
+                    "--ha-sync-mode",
+                    "remote_apply",
+                    "--ha-sync-selection",
+                    "first",
+                    "--ha-sync-required",
+                    "1",
+                    "--ha-sync-standby",
+                    self.sync_standby_name,
+                    "--ha-sync-failure",
+                    "block",
+                ]
+            )
         command.extend(
             [
                 "--ha-timeline-id",
@@ -303,6 +320,7 @@ class HACluster:
             cluster_id=100,
             timeline_id=1,
             epoch=1,
+            sync_standby_name="standby-a",
             admin_token_env=self.admin_token_env,
             admin_token=self.admin_token,
         )
