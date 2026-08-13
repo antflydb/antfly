@@ -2480,6 +2480,71 @@ pub const Client = struct {
         var iov = [_][]u8{buf};
         return reader.readVec(&iov);
     }
+    const ResponseContentCoding = enum {
+        gzip,
+        deflate,
+    };
+
+    fn responseContentCoding(headers: *const Headers) ?ResponseContentCoding {
+        const raw_value = headers.get(HeaderName.CONTENT_ENCODING) orelse return null;
+        const value = std.mem.trim(u8, raw_value, " \t");
+        if (std.ascii.eqlIgnoreCase(value, "gzip") or std.ascii.eqlIgnoreCase(value, "x-gzip")) return .gzip;
+        if (std.ascii.eqlIgnoreCase(value, "deflate")) return .deflate;
+        return null;
+    }
+
+    /// RFC 9110 defines `deflate` as a zlib-wrapped stream. Some deployed HTTP
+    /// servers instead send a raw RFC 1951 stream. A valid raw stream can begin
+    /// with bytes that also form an RFC 1950 header, so this is only a hint:
+    /// callers must fall back to raw decoding if zlib validation fails.
+    fn hasZlibHeader(prefix: []const u8) bool {
+        if (prefix.len < 2) return false;
+        const cmf = prefix[0];
+        const flg = prefix[1];
+        const header = (@as(u16, cmf) << 8) | flg;
+        return cmf & 0x0f == 8 and cmf >> 4 <= 7 and header % 31 == 0;
+    }
+
+    fn appendDecompressed(
+        allocator: Allocator,
+        encoded: []const u8,
+        container: flate.Container,
+        output: *std.ArrayListUnmanaged(u8),
+        max_size: usize,
+    ) !void {
+        var encoded_reader: Io.Reader = .fixed(encoded);
+        var decompress_window: [flate.max_window_len]u8 = undefined;
+        var decompressor = flate.Decompress.init(&encoded_reader, container, &decompress_window);
+        var read_buf: [16 * 1024]u8 = undefined;
+
+        while (true) {
+            const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
+                if (err == error.EndOfStream) break;
+                return error.DecompressionFailed;
+            };
+            if (n == 0) break;
+            _ = try checkedResponseSize(output.items.len, n, max_size);
+            try output.appendSlice(allocator, read_buf[0..n]);
+        }
+    }
+
+    fn appendDeflateDecompressed(
+        allocator: Allocator,
+        encoded: []const u8,
+        output: *std.ArrayListUnmanaged(u8),
+        max_size: usize,
+    ) !void {
+        const original_len = output.items.len;
+        if (hasZlibHeader(encoded)) {
+            appendDecompressed(allocator, encoded, .zlib, output, max_size) catch |err| {
+                output.items.len = original_len;
+                if (err != error.DecompressionFailed) return err;
+                try appendDecompressed(allocator, encoded, .raw, output, max_size);
+            };
+            return;
+        }
+        try appendDecompressed(allocator, encoded, .raw, output, max_size);
+    }
 
     /// Builds a Response by streaming the body through an Io.Reader chain.
     /// After headers are parsed, the chain is: leftover bytes → network → framing → decompress → output.
@@ -2506,13 +2571,7 @@ pub const Client = struct {
             (parser.chunked or (parser.content_length orelse 1) > 0);
         if (!has_body) return res;
 
-        // Detect Content-Encoding for transparent decompression.
-        const container: ?flate.Container = if (res.headers.get(HeaderName.CONTENT_ENCODING)) |raw_enc| blk: {
-            const enc = std.mem.trim(u8, raw_enc, " \t");
-            if (std.ascii.eqlIgnoreCase(enc, "gzip")) break :blk .gzip;
-            if (std.ascii.eqlIgnoreCase(enc, "deflate")) break :blk .raw;
-            break :blk null;
-        } else null;
+        const content_coding = responseContentCoding(&res.headers);
 
         // --- Build the Io.Reader chain (all stack-allocated) ---
 
@@ -2555,7 +2614,7 @@ pub const Client = struct {
         const max_size = max_response_size;
 
         // Pre-allocate hint: use content_length if known (and not compressed).
-        if (container == null) {
+        if (content_coding == null) {
             if (parser.content_length) |len| {
                 if (len > max_size) return error.ResponseTooLarge;
                 if (len <= std.math.maxInt(usize)) {
@@ -2566,7 +2625,7 @@ pub const Client = struct {
 
         var read_buf: [16 * 1024]u8 = undefined;
 
-        if (container) |ctr| {
+        if (content_coding) |coding| {
             var compressed = std.ArrayListUnmanaged(u8).empty;
             defer compressed.deinit(self.allocator);
 
@@ -2581,18 +2640,20 @@ pub const Client = struct {
                 try compressed.appendSlice(self.allocator, read_buf[0..n]);
             }
 
-            var compressed_reader: Io.Reader = .fixed(compressed.items);
-            var decompress_window: [flate.max_window_len]u8 = undefined;
-            var decompressor = flate.Decompress.init(&compressed_reader, ctr, &decompress_window);
-
-            while (true) {
-                const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
-                    if (err == error.EndOfStream) break;
-                    return error.DecompressionFailed;
-                };
-                if (n == 0) break;
-                _ = try checkedResponseSize(result.items.len, n, max_size);
-                try result.appendSlice(self.allocator, read_buf[0..n]);
+            switch (coding) {
+                .gzip => try appendDecompressed(
+                    self.allocator,
+                    compressed.items,
+                    .gzip,
+                    &result,
+                    max_size,
+                ),
+                .deflate => try appendDeflateDecompressed(
+                    self.allocator,
+                    compressed.items,
+                    &result,
+                    max_size,
+                ),
             }
         } else {
             while (true) {
@@ -2613,7 +2674,7 @@ pub const Client = struct {
         }
 
         // Remove encoding/length headers when decompression was applied.
-        if (container != null) {
+        if (content_coding != null) {
             _ = res.headers.remove(HeaderName.CONTENT_ENCODING);
             _ = res.headers.remove(HeaderName.CONTENT_LENGTH);
         }
@@ -2644,12 +2705,7 @@ pub const Client = struct {
             (parser.chunked or (parser.content_length orelse 1) > 0);
         if (!has_body) return res;
 
-        const container: ?flate.Container = if (res.headers.get(HeaderName.CONTENT_ENCODING)) |raw_enc| blk: {
-            const enc = std.mem.trim(u8, raw_enc, " \t");
-            if (std.ascii.eqlIgnoreCase(enc, "gzip")) break :blk .gzip;
-            if (std.ascii.eqlIgnoreCase(enc, "deflate")) break :blk .raw;
-            break :blk null;
-        } else null;
+        const content_coding = responseContentCoding(&res.headers);
 
         var source_io_buf: [8192]u8 = undefined;
         var socket_reader: SocketIoReader = undefined;
@@ -2673,7 +2729,7 @@ pub const Client = struct {
             break :blk &chunked_reader.reader_iface;
         } else if (parser.content_length) |len| blk: {
             if (len > std.math.maxInt(usize)) return error.ResponseTooLarge;
-            if (container == null and len > max_response_size) return error.ResponseTooLarge;
+            if (content_coding == null and len > max_response_size) return error.ResponseTooLarge;
             cl_reader = ContentLengthReader.init(body_source, @intCast(len), &cl_buf);
             break :blk &cl_reader.reader_iface;
         } else blk: {
@@ -2682,7 +2738,7 @@ pub const Client = struct {
 
         const close_delimited_body = !parser.chunked and parser.content_length == null;
         const is_redirect = code >= 300 and code < 400;
-        const progress_total = if (container == null and !parser.chunked) parser.content_length else null;
+        const progress_total = if (content_coding == null and !parser.chunked) parser.content_length else null;
         var written_total: usize = 0;
 
         var read_buf: [16 * 1024]u8 = undefined;
@@ -2701,28 +2757,85 @@ pub const Client = struct {
                     max_response_size,
                 );
             }
-        } else if (container) |ctr| {
-            var decompress_window: [flate.max_window_len]u8 = undefined;
-            var decompressor = flate.Decompress.init(framed_reader, ctr, &decompress_window);
-
-            while (true) {
-                const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
+        } else if (content_coding) |coding| {
+            var encoded_prefix: [2]u8 = undefined;
+            var encoded_prefix_len: usize = 0;
+            while (encoded_prefix_len < encoded_prefix.len) {
+                const n = readSomeOnce(framed_reader, encoded_prefix[encoded_prefix_len..]) catch |err| {
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
-                    return error.DecompressionFailed;
+                    return error.InvalidResponse;
                 };
                 if (n == 0) break;
-                const next_total = try checkedResponseSize(
-                    written_total,
-                    n,
+                encoded_prefix_len += n;
+            }
+
+            var encoded_prefix_buffer: [8192]u8 = undefined;
+            var encoded_reader = PrefixedReader.init(
+                encoded_prefix[0..encoded_prefix_len],
+                framed_reader,
+                &encoded_prefix_buffer,
+            );
+
+            if (coding == .deflate and hasZlibHeader(encoded_prefix[0..encoded_prefix_len])) {
+                var encoded = std.ArrayListUnmanaged(u8).empty;
+                defer encoded.deinit(parser.allocator);
+                while (true) {
+                    const n = readSomeOnce(&encoded_reader.reader_iface, &read_buf) catch |err| {
+                        if (err == error.EndOfStream) break;
+                        if (err == error.ReadFailed and close_delimited_body) break;
+                        return error.InvalidResponse;
+                    };
+                    if (n == 0) break;
+                    _ = try checkedResponseSize(encoded.items.len, n, max_response_size);
+                    try encoded.appendSlice(parser.allocator, read_buf[0..n]);
+                }
+
+                var decoded = std.ArrayListUnmanaged(u8).empty;
+                defer decoded.deinit(parser.allocator);
+                try appendDeflateDecompressed(
+                    parser.allocator,
+                    encoded.items,
+                    &decoded,
                     max_response_size,
                 );
-                try writer.writeAll(read_buf[0..n]);
-                written_total = next_total;
+                try writer.writeAll(decoded.items);
+                written_total = decoded.items.len;
                 if (progress_cb) |cb| cb(.{
                     .bytes_written = @intCast(written_total),
                     .total_bytes = null,
                 }, progress_ctx);
+            } else {
+                const container: flate.Container = switch (coding) {
+                    .gzip => .gzip,
+                    .deflate => .raw,
+                };
+                var decompress_window: [flate.max_window_len]u8 = undefined;
+                var decompressor = flate.Decompress.init(
+                    &encoded_reader.reader_iface,
+                    container,
+                    &decompress_window,
+                );
+
+                while (true) {
+                    const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
+                        if (err == error.EndOfStream) break;
+                        if (err == error.ReadFailed and close_delimited_body) break;
+                        return error.DecompressionFailed;
+                    };
+                    if (n == 0) break;
+                    const next_total = try checkedResponseSize(
+                        written_total,
+                        n,
+                        max_response_size,
+                    );
+                    try writer.writeAll(read_buf[0..n]);
+                    written_total = next_total;
+                    if (progress_cb) |cb| cb(.{
+                        .bytes_written = @intCast(written_total),
+                        .total_bytes = null,
+                    }, progress_ctx);
+                }
             }
         } else {
             while (true) {
@@ -2746,7 +2859,7 @@ pub const Client = struct {
             }
         }
 
-        if (container != null) {
+        if (content_coding != null) {
             _ = res.headers.remove(HeaderName.CONTENT_ENCODING);
             _ = res.headers.remove(HeaderName.CONTENT_LENGTH);
         }
@@ -3539,6 +3652,22 @@ test "H2 stream cleanup detaches receiver before resetting a published stream" {
     allocator.destroy(idle_event);
 }
 
+test "raw deflate fallback handles a valid zlib-looking prefix" {
+    const allocator = std.testing.allocator;
+    var expected: [156]u8 = undefined;
+    for (&expected, 0..) |*byte, i| byte.* = @intCast(i);
+
+    var encoded: [166]u8 = undefined;
+    @memcpy(encoded[0..5], &[_]u8{ 0x78, 0x9c, 0x00, 0x63, 0xff });
+    @memcpy(encoded[5..161], &expected);
+    @memcpy(encoded[161..], &[_]u8{ 0x01, 0x00, 0x00, 0xff, 0xff });
+
+    var decoded = std.ArrayListUnmanaged(u8).empty;
+    defer decoded.deinit(allocator);
+    try Client.appendDeflateDecompressed(allocator, &encoded, &decoded, 1024);
+    try std.testing.expectEqualSlices(u8, &expected, decoded.items);
+}
+
 const test_tls_cert_pem =
     "-----BEGIN CERTIFICATE-----\n" ++
     "MIIDCTCCAfGgAwIBAgIUGjCWCIDqTRw/vKwQVR5QhFvTtqswDQYJKoZIhvcNAQEL\n" ++
@@ -3628,16 +3757,30 @@ const python_tls_server_script =
     "            continue\n" ++
     "listener.close()\n";
 
-const python_tls_chunked_gzip_server_script =
+const python_tls_chunked_compressed_server_script =
     "import gzip\n" ++
     "import socket\n" ++
     "import ssl\n" ++
     "import sys\n" ++
+    "import zlib\n" ++
     "\n" ++
     "port = int(sys.argv[1])\n" ++
     "cert = sys.argv[2]\n" ++
     "key = sys.argv[3]\n" ++
-    "payload = gzip.compress(b'{\"ok\":true}\\n')\n" ++
+    "mode = sys.argv[4]\n" ++
+    "body = b'{\"ok\":true}\\n'\n" ++
+    "if mode == 'gzip':\n" ++
+    "    payload = gzip.compress(body)\n" ++
+    "    content_encoding = b'GZip'\n" ++
+    "elif mode == 'deflate-zlib':\n" ++
+    "    payload = zlib.compress(body)\n" ++
+    "    content_encoding = b'deflate'\n" ++
+    "elif mode == 'deflate-raw':\n" ++
+    "    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)\n" ++
+    "    payload = compressor.compress(body) + compressor.flush()\n" ++
+    "    content_encoding = b'deflate'\n" ++
+    "else:\n" ++
+    "    raise ValueError('unknown compression mode: ' + mode)\n" ++
     "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n" ++
     "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
     "listener.bind(('127.0.0.1', port))\n" ++
@@ -3661,7 +3804,7 @@ const python_tls_chunked_gzip_server_script =
     "                    b'HTTP/1.1 200 OK\\r\\n'\n" ++
     "                    b'Content-Type: application/json\\r\\n'\n" ++
     "                    b'Transfer-Encoding: chunked\\r\\n'\n" ++
-    "                    b'Content-Encoding: gzip\\r\\n'\n" ++
+    "                    b'Content-Encoding: ' + content_encoding + b'\\r\\n'\n" ++
     "                    b'Connection: close\\r\\n\\r\\n'\n" ++
     "                )\n" ++
     "                tls_conn.sendall(format(len(payload), 'x').encode() + b'\\r\\n')\n" ++
@@ -4049,7 +4192,7 @@ test "HTTPS client round trip via local TLS server" {
     try std.testing.expect(std.mem.indexOf(u8, request, "Connection: close\r\n") != null);
 }
 
-test "HTTPS client handles chunked gzip body via local TLS server" {
+fn expectChunkedCompressedResponse(mode: []const u8, to_writer: bool) !void {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -4059,7 +4202,7 @@ test "HTTPS client handles chunked gzip body via local TLS server" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
     try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
-    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_tls_chunked_gzip_server_script });
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_tls_chunked_compressed_server_script });
 
     var port_buf: [16]u8 = undefined;
     const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
@@ -4071,6 +4214,7 @@ test "HTTPS client handles chunked gzip body via local TLS server" {
             port_arg,
             "cert.pem",
             "key.pem",
+            mode,
         },
         .cwd = .{ .dir = tmp.dir },
         .stdin = .ignore,
@@ -4095,67 +4239,36 @@ test "HTTPS client handles chunked gzip body via local TLS server" {
     });
     defer client.deinit();
 
-    var resp = try getWithRetry(&client, io, url, 50);
-    defer resp.deinit();
+    if (to_writer) {
+        var out = std.ArrayListUnmanaged(u8).empty;
+        defer out.deinit(allocator);
+        var resp = try client.getToWriter(url, .{}, arrayListWriter(&out, allocator), null, null);
+        defer resp.deinit();
 
-    try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-    try std.testing.expectEqualStrings("{\"ok\":true}\n", resp.body orelse "");
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expect(resp.body == null);
+        try std.testing.expectEqualStrings("{\"ok\":true}\n", out.items);
+    } else {
+        var resp = try getWithRetry(&client, io, url, 50);
+        defer resp.deinit();
+
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expectEqualStrings("{\"ok\":true}\n", resp.body orelse "");
+        try std.testing.expect(resp.headers.get(HeaderName.CONTENT_ENCODING) == null);
+        try std.testing.expect(resp.headers.get(HeaderName.CONTENT_LENGTH) == null);
+    }
 }
 
-test "HTTPS client streams chunked gzip body to writer via local TLS server" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
+test "HTTPS client handles supported chunked content encodings" {
+    for ([_][]const u8{ "gzip", "deflate-zlib", "deflate-raw" }) |mode| {
+        try expectChunkedCompressedResponse(mode, false);
+    }
+}
 
-    const port = try reserveEphemeralPort(io);
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
-    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
-    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_tls_chunked_gzip_server_script });
-
-    var port_buf: [16]u8 = undefined;
-    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
-
-    var child = std.process.spawn(io, .{
-        .argv = &.{
-            "python3",
-            "server.py",
-            port_arg,
-            "cert.pem",
-            "key.pem",
-        },
-        .cwd = .{ .dir = tmp.dir },
-        .stdin = .ignore,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer child.kill(io);
-
-    io.sleep(Io.Duration.fromMilliseconds(1000), .awake) catch {};
-
-    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
-    defer allocator.free(url);
-
-    var client = Client.initWithConfig(allocator, io, .{
-        .keep_alive = false,
-        .verify_ssl = false,
-        .retry_policy = .{ .max_retries = 0 },
-        .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
-    });
-    defer client.deinit();
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(allocator);
-    var resp = try client.getToWriter(url, .{}, arrayListWriter(&out, allocator), null, null);
-    defer resp.deinit();
-
-    try std.testing.expectEqual(@as(u16, 200), resp.status.code);
-    try std.testing.expect(resp.body == null);
-    try std.testing.expectEqualStrings("{\"ok\":true}\n", out.items);
+test "HTTPS client streams supported chunked content encodings to writer" {
+    for ([_][]const u8{ "gzip", "deflate-zlib", "deflate-raw" }) |mode| {
+        try expectChunkedCompressedResponse(mode, true);
+    }
 }
 
 test "requestToWriter follows redirects without streaming intermediate redirect body" {
