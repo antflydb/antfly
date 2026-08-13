@@ -1590,16 +1590,12 @@ const StoreEvidenceIndex = struct {
             ) orelse return false;
             if (evidence.status_ambiguous) return false;
             const status = evidence.status orelse return false;
-            if (status.observed_reallocation_request_id != 0) {
-                if (status.observed_reallocation_request_id != request.request_id) return false;
-                continue;
-            }
-            // Rolling-upgrade compatibility for reporters that do not yet
-            // carry the causal request ID. New reporters never rely on clocks.
-            if (status.updated_at_millis < request.requested_at_ms) return false;
-            if (evidence.runtime_reported and
-                evidence.latest_runtime_updated_at_millis < request.requested_at_ms)
-                return false;
+            // Legacy reporters fail closed. Their timestamps may use a
+            // different clock domain from the request, and wall clocks across
+            // hosts are not a causal ordering. The durable request remains
+            // pending through a rolling upgrade until every placed voter can
+            // echo the exact request ID.
+            if (status.observed_reallocation_request_id != request.request_id) return false;
         }
         return saw_placement;
     }
@@ -8658,11 +8654,29 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
     defer fresh_under_threshold_plan.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u128, 3), fresh_under_threshold_plan.clear_reallocation_request);
 
-    var forced_plan = try reconciler.computePlan(&manager, &.{1}, &candidates, .{
+    // Legacy reports used wall-clock status timestamps while origin/main
+    // stamped requests with monotonic uptime. Even an apparently much newer
+    // timestamp cannot prove that the reporter observed this request.
+    var legacy_timestamp_plan = try reconciler.computePlan(&manager, &.{1}, &candidates, .{
         .tables = tables,
         .ranges = ranges,
         .placement_intents = &placements,
         .stores = &stores,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
+    });
+    defer legacy_timestamp_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), legacy_timestamp_plan.split_admissions.len);
+    try std.testing.expect(legacy_timestamp_plan.clear_reallocation_request == null);
+
+    var acknowledged_reports = [_]table_manager.GroupStatusReport{stores[0].group_statuses[0]};
+    acknowledged_reports[0].observed_reallocation_request_id = 1;
+    var acknowledged_stores = stores;
+    acknowledged_stores[0].group_statuses = @constCast(acknowledged_reports[0..]);
+    var forced_plan = try reconciler.computePlan(&manager, &.{1}, &candidates, .{
+        .tables = tables,
+        .ranges = ranges,
+        .placement_intents = &placements,
+        .stores = &acknowledged_stores,
         .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer forced_plan.deinit(std.testing.allocator);

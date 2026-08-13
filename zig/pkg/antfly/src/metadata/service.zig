@@ -9740,6 +9740,12 @@ test "metadata service reports store status without losing placement attributes"
     });
     try svc.runRound();
 
+    var group_statuses = [_]metadata_table_manager.GroupStatusReport{.{
+        .group_id = 4201,
+        .disk_bytes = 4096,
+        .disk_bytes_known = true,
+        .updated_at_millis = 1_700_000_000_000,
+    }};
     try svc.reportStoreStatus(.{
         .store_id = 11,
         .live = false,
@@ -9751,6 +9757,25 @@ test "metadata service reports store status without losing placement attributes"
         .write_load = 130,
         .active_backfills = 2,
         .backfill_progress_millis = 375,
+        .group_statuses = group_statuses[0..],
+    });
+    try svc.runRound();
+
+    // The acknowledgement itself must be enough to publish another store
+    // record even when all coalesced status and capacity fields are unchanged.
+    group_statuses[0].observed_reallocation_request_id = 0x123456789abcdef00123456789abcdef;
+    try svc.reportStoreStatus(.{
+        .store_id = 11,
+        .live = false,
+        .health_class = "degraded",
+        .capacity_bytes = 2048,
+        .available_bytes = 0,
+        .lease_pressure = 92,
+        .read_load = 210,
+        .write_load = 130,
+        .active_backfills = 2,
+        .backfill_progress_millis = 375,
+        .group_statuses = group_statuses[0..],
     });
     try svc.runRound();
 
@@ -9771,6 +9796,11 @@ test "metadata service reports store status without losing placement attributes"
     try std.testing.expectEqual(@as(u32, 130), projected[0].write_load);
     try std.testing.expectEqual(@as(u32, 2), projected[0].active_backfills);
     try std.testing.expectEqual(@as(u16, 375), projected[0].backfill_progress_millis);
+    try std.testing.expectEqual(@as(usize, 1), projected[0].group_statuses.len);
+    try std.testing.expectEqual(
+        @as(u128, 0x123456789abcdef00123456789abcdef),
+        projected[0].group_statuses[0].observed_reallocation_request_id,
+    );
 
     const status = try svc.status();
     try std.testing.expectEqual(@as(usize, 1), status.backfill_stores);
