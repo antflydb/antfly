@@ -1,9 +1,18 @@
-import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@antfly/design-system";
+import {
+  Alert,
+  AlertDescription,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "@antfly/design-system";
 import type { IndexConfig } from "@antfly/sdk";
 import type React from "react";
+import { useEffect, useState } from "react";
 import type { TableSchema } from "../api";
 import { useApi } from "../hooks/use-api-config";
 import { useTable } from "../hooks/use-table";
+import { buildCreateTableRequest, createTableErrorMessage } from "../lib/create-table";
 import TableSchemaForm from "./schema-builder/TableSchemaForm";
 
 interface CreateTableDialogProps {
@@ -21,6 +30,13 @@ const CreateTableDialog: React.FC<CreateTableDialogProps> = ({
 }) => {
   const api = useApi();
   const { refreshTables, setSelectedTable } = useTable();
+  const [createError, setCreateError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setCreateError(null);
+    }
+  }, [open]);
 
   const handleCreateTable = async (data: {
     name: string;
@@ -28,14 +44,9 @@ const CreateTableDialog: React.FC<CreateTableDialogProps> = ({
     num_shards: number;
     indexes: IndexConfig[];
   }) => {
+    setCreateError(null);
     try {
-      const requestBody = {
-        num_shards: data.num_shards,
-        schema: {
-          version: 0, // Default version to 0 if not specified
-          ...data.schema,
-        },
-      };
+      const requestBody = buildCreateTableRequest(data.num_shards, data.schema);
       await api.tables.create(data.name, requestBody);
       for (const index of data.indexes) {
         await api.indexes.create(data.name, index);
@@ -46,6 +57,7 @@ const CreateTableDialog: React.FC<CreateTableDialogProps> = ({
       onClose();
     } catch (error) {
       console.error("Failed to create table:", error);
+      setCreateError(createTableErrorMessage(error));
     }
   };
 
@@ -54,6 +66,11 @@ const CreateTableDialog: React.FC<CreateTableDialogProps> = ({
       <DialogContent className="max-w-[900px]">
         <DialogTitle>Create New Table</DialogTitle>
         <DialogDescription>Define the schema for your new table.</DialogDescription>
+        {createError && (
+          <Alert variant="destructive">
+            <AlertDescription>{createError}</AlertDescription>
+          </Alert>
+        )}
         <TableSchemaForm onSubmit={handleCreateTable} theme={theme} />
       </DialogContent>
     </Dialog>
