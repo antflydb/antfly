@@ -781,14 +781,19 @@ connection establishment, and the absolute request deadline is installed on
 the socket before any bytes are sent. DNS lookup and the initial TCP connect do
 not yet accept the semantic token directly; completing that transport work
 requires a cancellation-aware resolver plus a deadline-aware nonblocking
-connect operation rather than wrapping the entire request in another task
-race. HTTP/2 shares a connection across streams, so its adapter races the
-stream operation against one short-interval watchdog and resets only the
-affected stream. The watchdog combines cancellation and the absolute request
-deadline in one task: separate losing timeout and cancellation sleepers can
-otherwise retain `std.Io.Threaded` workers until a long deadline after a
-successful request. Provider code sees one request context in both cases and
-does not choose an executor-specific mechanism.
+connect operation rather than wrapping cancellable HTTP/1 response I/O in
+another task race. Until connect itself is deadline-aware, ordinary HTTP/1
+requests and HTTP/2 streams retain one whole-operation race against a single
+short-interval watchdog. HTTP/2 resets only the affected stream. The watchdog
+combines cancellation and the absolute request deadline in one task: separate
+losing timeout and cancellation sleepers can otherwise retain
+`std.Io.Threaded` workers until a long deadline after a successful request.
+Every request race also owns an explicit atomic watchdog-stop signal. The
+request winner publishes it before draining the select because cancelling a
+select does not guarantee that a sleeper using the parent `Io` observes group
+cancellation. Cleanup is therefore bounded by one polling interval rather than
+the request timeout on every executor backend. Provider code sees one request
+context in both cases and does not choose an executor-specific mechanism.
 
 Component stop signals and Future cancellation are complementary:
 

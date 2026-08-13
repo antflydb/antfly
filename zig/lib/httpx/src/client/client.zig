@@ -151,21 +151,26 @@ pub const CancellationToken = struct {
 const cancellation_poll_interval_ms: u64 = 25;
 
 const RequestWatchdogOutcome = enum {
+    stopped,
     cancelled,
     timed_out,
 };
 
-/// Waits for either application cancellation or the whole-request deadline.
+/// Waits for request completion, application cancellation, or the
+/// whole-request deadline.
 ///
 /// Keep these signals in one select branch. `std.Io.Threaded` may implement a
 /// sleep with a blocking worker, and a select with separate cancellation and
 /// timeout sleepers can leave one losing sleeper alive until the full request
-/// timeout after a successful response. One short-interval watchdog bounds
+/// timeout after a successful response. The request winner explicitly stops
+/// this short-interval watchdog because cancelling a select does not
+/// necessarily interrupt a sleeper using the parent `Io`. This bounds
 /// successful-request cleanup while retaining cancellation and deadline
 /// enforcement for DNS, connect, TLS, and response work.
 fn waitForRequestCancellationOrTimeout(
     io: Io,
-    cancellation: CancellationToken,
+    stop: *const std.atomic.Value(bool),
+    cancellation: ?CancellationToken,
     timeout_ms: u64,
 ) anyerror!RequestWatchdogOutcome {
     const deadline_ns: ?i128 = if (timeout_ms == 0)
@@ -174,7 +179,10 @@ fn waitForRequestCancellationOrTimeout(
         Io.Clock.awake.now(io).nanoseconds +| @as(i128, timeout_ms) * std.time.ns_per_ms;
 
     while (true) {
-        if (cancellation.isCancelled()) return .cancelled;
+        if (stop.load(.acquire)) return .stopped;
+        if (cancellation) |signal| {
+            if (signal.isCancelled()) return .cancelled;
+        }
         const sleep_ms = if (deadline_ns) |deadline| blk: {
             const now_ns = Io.Clock.awake.now(io).nanoseconds;
             if (now_ns >= deadline) return .timed_out;
@@ -818,18 +826,17 @@ pub const Client = struct {
         if (timeout_ms == 0) return self.executeRequestWithRetries(req, timeout_override_ms, deadline_ms, &interrupt);
 
         const RequestResult = anyerror!Response;
-        const TimeoutResult = anyerror!void;
         const SelectResult = union(enum) {
             request: RequestResult,
-            timeout: TimeoutResult,
+            watchdog: anyerror!RequestWatchdogOutcome,
         };
         const Task = struct {
             fn requestTask(client: *Self, request_value: *Request, socket_timeout_ms: ?u64, request_deadline_ms: ?i64, request_interrupt: *RequestInterrupt) RequestResult {
                 return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms, request_interrupt);
             }
 
-            fn timeoutTask(io: Io, timeout: Io.Timeout) TimeoutResult {
-                return timeout.sleep(io);
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(bool), request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestCancellationOrTimeout(io, stop, null, request_timeout_ms);
             }
 
             fn drainLateResult(result: SelectResult) void {
@@ -840,33 +847,31 @@ pub const Client = struct {
                             response.deinit();
                         } else |_| {}
                     },
-                    .timeout => {},
+                    .watchdog => {},
                 }
             }
         };
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        var watchdog_stop = std.atomic.Value(bool).init(false);
         try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt });
-        select.async(.timeout, Task.timeoutTask, .{
-            self.io,
-            Io.Timeout{ .duration = .{
-                .raw = Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
-                .clock = .awake,
-            } },
-        });
+        select.async(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms });
 
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
+                watchdog_stop.store(true, .release);
                 select.cancelDiscard();
                 return try request_result;
             },
-            .timeout => |timeout_result| {
-                try timeout_result;
+            .watchdog => |watchdog_result| {
                 interrupt.cancel(self.io);
                 while (select.cancel()) |late| Task.drainLateResult(late);
-                return error.Timeout;
+                return switch (try watchdog_result) {
+                    .timed_out => error.Timeout,
+                    .cancelled, .stopped => unreachable,
+                };
             },
         }
     }
@@ -902,8 +907,8 @@ pub const Client = struct {
                 return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms, request_interrupt);
             }
 
-            fn watchdogTask(io: Io, signal: CancellationToken, request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
-                return waitForRequestCancellationOrTimeout(io, signal, request_timeout_ms);
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(bool), signal: CancellationToken, request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestCancellationOrTimeout(io, stop, signal, request_timeout_ms);
             }
 
             fn drainLateResult(result: SelectResult) void {
@@ -919,11 +924,13 @@ pub const Client = struct {
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        var watchdog_stop = std.atomic.Value(bool).init(false);
         try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt });
-        select.async(.watchdog, Task.watchdogTask, .{ self.io, cancellation, timeout_ms });
+        select.async(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms });
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
+                watchdog_stop.store(true, .release);
                 select.cancelDiscard();
                 if (cancellation.isCancelled()) {
                     if (request_result) |response_value| {
@@ -940,6 +947,7 @@ pub const Client = struct {
                 return switch (try watchdog_result) {
                     .cancelled => error.Cancelled,
                     .timed_out => error.Timeout,
+                    .stopped => unreachable,
                 };
             },
         }
@@ -1002,10 +1010,9 @@ pub const Client = struct {
 
         const Writer = @TypeOf(writer);
         const RequestResult = anyerror!Response;
-        const TimeoutResult = anyerror!void;
         const SelectResult = union(enum) {
             request: RequestResult,
-            timeout: TimeoutResult,
+            watchdog: anyerror!RequestWatchdogOutcome,
         };
         const Task = struct {
             fn requestTask(
@@ -1021,8 +1028,8 @@ pub const Client = struct {
                 return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context, request_interrupt);
             }
 
-            fn timeoutTask(io: Io, timeout: Io.Timeout) TimeoutResult {
-                return timeout.sleep(io);
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(bool), request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestCancellationOrTimeout(io, stop, null, request_timeout_ms);
             }
 
             fn drainLateResult(result: SelectResult) void {
@@ -1033,33 +1040,31 @@ pub const Client = struct {
                             response.deinit();
                         } else |_| {}
                     },
-                    .timeout => {},
+                    .watchdog => {},
                 }
             }
         };
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        var watchdog_stop = std.atomic.Value(bool).init(false);
         try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt });
-        select.async(.timeout, Task.timeoutTask, .{
-            self.io,
-            Io.Timeout{ .duration = .{
-                .raw = Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
-                .clock = .awake,
-            } },
-        });
+        select.async(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms });
 
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
+                watchdog_stop.store(true, .release);
                 select.cancelDiscard();
                 return try request_result;
             },
-            .timeout => |timeout_result| {
-                try timeout_result;
+            .watchdog => |watchdog_result| {
                 interrupt.cancel(self.io);
                 while (select.cancel()) |late| Task.drainLateResult(late);
-                return error.Timeout;
+                return switch (try watchdog_result) {
+                    .timed_out => error.Timeout,
+                    .cancelled, .stopped => unreachable,
+                };
             },
         }
     }
@@ -1102,8 +1107,8 @@ pub const Client = struct {
                 return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context, request_interrupt);
             }
 
-            fn watchdogTask(io: Io, signal: CancellationToken, request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
-                return waitForRequestCancellationOrTimeout(io, signal, request_timeout_ms);
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(bool), signal: CancellationToken, request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestCancellationOrTimeout(io, stop, signal, request_timeout_ms);
             }
 
             fn drainLateResult(result: SelectResult) void {
@@ -1119,11 +1124,13 @@ pub const Client = struct {
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        var watchdog_stop = std.atomic.Value(bool).init(false);
         try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt });
-        select.async(.watchdog, Task.watchdogTask, .{ self.io, cancellation, timeout_ms });
+        select.async(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms });
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
+                watchdog_stop.store(true, .release);
                 select.cancelDiscard();
                 if (cancellation.isCancelled()) {
                     if (request_result) |response_value| {
@@ -1140,6 +1147,7 @@ pub const Client = struct {
                 return switch (try watchdog_result) {
                     .cancelled => error.Cancelled,
                     .timed_out => error.Timeout,
+                    .stopped => unreachable,
                 };
             },
         }
@@ -3859,8 +3867,8 @@ const python_bounded_response_server_script =
     "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n" ++
     "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
     "listener.bind(('127.0.0.1', port))\n" ++
-    "listener.listen(2)\n" ++
-    "for _ in range(2):\n" ++
+    "listener.listen(4)\n" ++
+    "for _ in range(4):\n" ++
     "    conn, _ = listener.accept()\n" ++
     "    with conn:\n" ++
     "        data = b''\n" ++
@@ -3983,7 +3991,7 @@ test "per-request response limit rejects the body before allocation" {
     try std.testing.expectEqual(@as(usize, 0), streamed.items.len);
 }
 
-test "successful cancellable H1 requests do not wait for their timeout deadline" {
+test "successful H1 requests do not wait for their timeout deadline" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const port = try reserveEphemeralPort(io);
@@ -4017,6 +4025,21 @@ test "successful cancellable H1 requests do not wait for their timeout deadline"
     var cancellation = std.atomic.Value(bool).init(false);
 
     const started_ms = common.milliTimestamp(io);
+    var ordinary_response = try client.get(url, .{});
+    ordinary_response.deinit();
+
+    var ordinary_streamed = std.ArrayListUnmanaged(u8).empty;
+    defer ordinary_streamed.deinit(allocator);
+    var ordinary_streamed_response = try client.getToWriter(
+        url,
+        .{},
+        arrayListWriter(&ordinary_streamed, allocator),
+        null,
+        null,
+    );
+    ordinary_streamed_response.deinit();
+    try std.testing.expectEqual(@as(usize, 32), ordinary_streamed.items.len);
+
     var response = try client.get(url, .{ .cancellation = .fromAtomic(&cancellation) });
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
