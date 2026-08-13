@@ -41,6 +41,38 @@ const GatheredSpanKey = metal_runtime.GatheredSpanKey;
 const GatheredSpanEntry = metal_runtime.GatheredSpanEntry;
 // One primary pipeline plus an optional homogeneous QKV companion per winner.
 pub const exact_jit_pipeline_owner_capacity: usize = 2 * metal_runtime.workload_tuning_maximum_winners;
+
+pub const DebertaRelativeProjectionCacheEntry = struct {
+    q: ?MetalTensor = null,
+    k: ?MetalTensor = null,
+    k_slot: usize = 0,
+    seq_len: usize = 0,
+    relative_count: usize = 0,
+    hidden_size: usize = 0,
+    owner_token: usize = 0,
+    valid: bool = false,
+
+    pub fn deinit(self: *DebertaRelativeProjectionCacheEntry) void {
+        if (self.q) |*tensor| tensor.deinit();
+        if (self.k) |*tensor| tensor.deinit();
+        self.* = .{};
+    }
+};
+
+pub const DebertaRelativeEmbeddingCacheEntry = struct {
+    tensor: ?MetalTensor = null,
+    bucket_ids_hash: u64 = 0,
+    bucket_count: usize = 0,
+    hidden_size: usize = 0,
+    norm_eps_bits: u32 = 0,
+    owner_token: usize = 0,
+    valid: bool = false,
+
+    pub fn deinit(self: *DebertaRelativeEmbeddingCacheEntry) void {
+        if (self.tensor) |*tensor| tensor.deinit();
+        self.* = .{};
+    }
+};
 comptime {
     if (exact_jit_pipeline_owner_capacity < metal_runtime.workload_tuning_maximum_winners) {
         @compileError("Metal exact JIT owner capacity must cover every per-regime workload winner");
@@ -89,6 +121,10 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     raw_quant_runtime_mapped_fallbacks: u64 = 0,
     raw_quant_runtime_mapped_failures: u64 = 0,
     gathered_spans: std.AutoHashMapUnmanaged(GatheredSpanKey, GatheredSpanEntry) = .empty,
+    deberta_relative_projection_cache_mutex: std.atomic.Mutex = .unlocked,
+    deberta_relative_projection_cache: [decoder_runtime_linear_slot_capacity]DebertaRelativeProjectionCacheEntry =
+        [_]DebertaRelativeProjectionCacheEntry{.{}} ** decoder_runtime_linear_slot_capacity,
+    deberta_relative_embedding_cache: DebertaRelativeEmbeddingCacheEntry = .{},
 
     pub fn create() !MetalNativeProvider {
         return createWithKernelJit(.{});
@@ -170,6 +206,8 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             metal_runtime.waitFrame(self.raw_decode_runtime) catch {};
         }
         metal_runtime.resetGatheredSpans(self);
+        self.deberta_relative_embedding_cache.deinit();
+        for (&self.deberta_relative_projection_cache) |*entry| entry.deinit();
         for (0..decoder_runtime_linear_slot_capacity) |slot| metal_runtime.releaseRawLinearSlot(self, slot);
         for (0..decoder_runtime_layer_norm_slot_capacity) |slot| metal_runtime.releaseRawLayerNormSlot(self, slot);
         for (0..decoder_runtime_rms_norm_slot_capacity) |slot| metal_runtime.releaseRawRmsNormSlot(self, slot);

@@ -402,13 +402,17 @@ fn sessionEnablesDebertaRerankerWeightMirrors(
     return model_type == .reranker and arch_type == .deberta and task == .classifier;
 }
 
-/// Persistent Metal mirror and packed-cache bytes that ModelManager must
-/// reserve for a native DeBERTa reranker session. An absent architecture hint
-/// is treated conservatively because GGUF metadata can still identify DeBERTa
-/// at load.
-pub fn metalDebertaRerankerFastPathReservationBytes(mf: manifest_mod.ModelManifest) usize {
-    if (mf.model_type != .reranker) return 0;
-    if (mf.config_model_arch.len > 0 and !deberta_mod.isDebertaModel(mf.config_model_arch)) return 0;
+/// Persistent Metal mirror, packed-weight, and relative-position cache bytes
+/// that ModelManager must reserve for native DeBERTa reranker and GLiNER
+/// sessions. An absent reranker architecture hint is treated conservatively
+/// because GGUF metadata can still identify DeBERTa at load.
+pub fn metalDebertaFastPathReservationBytes(mf: manifest_mod.ModelManifest) usize {
+    const gliner_bundle = mf.gliner_head_gguf_path != null or
+        mf.gliner_head_safetensors_path != null or
+        mf.gliner_model_type.len != 0 or
+        std.mem.startsWith(u8, mf.inference_bundle_family, "gliner2");
+    if (mf.model_type != .reranker and !gliner_bundle) return 0;
+    if (!gliner_bundle and mf.config_model_arch.len > 0 and !deberta_mod.isDebertaModel(mf.config_model_arch)) return 0;
 
     return deberta_arch.metalRerankerFastPathReservationBytes(.{
         .hidden_size = mf.hidden_size,
@@ -4496,13 +4500,19 @@ test "DeBERTa reranker mirrors are reserved for material encoder workloads" {
         .model_type = .classifier,
         .config_model_arch = "deberta-v2",
     };
-    try std.testing.expectEqual(@as(usize, 0), metalDebertaRerankerFastPathReservationBytes(classifier_manifest));
+    try std.testing.expectEqual(@as(usize, 0), metalDebertaFastPathReservationBytes(classifier_manifest));
     const bert_reranker_manifest = manifest_mod.ModelManifest{
         .allocator = std.testing.allocator,
         .model_type = .reranker,
         .config_model_arch = "bert",
     };
-    try std.testing.expectEqual(@as(usize, 0), metalDebertaRerankerFastPathReservationBytes(bert_reranker_manifest));
+    try std.testing.expectEqual(@as(usize, 0), metalDebertaFastPathReservationBytes(bert_reranker_manifest));
+    const gliner_manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .recognizer,
+        .inference_bundle_family = "gliner2_split_bundle/v1",
+    };
+    try std.testing.expect(metalDebertaFastPathReservationBytes(gliner_manifest) > 0);
 }
 
 test "detectArchitecture recognizes generic deberta classifier configs" {

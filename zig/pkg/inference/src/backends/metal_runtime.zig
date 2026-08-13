@@ -5827,9 +5827,15 @@ pub fn decoderRuntimeDisentangledRelativeAttentionF32Device(self: anytype, reque
     if (request.seq_len > std.math.maxInt(usize) / 2) return null;
     const hidden = request.num_heads * request.head_dim;
     const total = request.batch * request.seq_len * hidden;
-    const rel_total = (request.seq_len * 2 - 1) * hidden;
+    const relative_index_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "relative_index")) request.relative_index else null;
+    const relative_count: usize = if (@hasField(@TypeOf(request), "relative_count")) request.relative_count else request.seq_len * 2 - 1;
+    if (relative_count == 0) return null;
+    const rel_total = relative_count * hidden;
     if (request.q.elemCount() != total or request.k.elemCount() != total or request.v.elemCount() != total) return null;
     if (request.q_r.elemCount() < rel_total or request.k_r.elemCount() < rel_total) return null;
+    if (relative_index_tensor) |relative_index| {
+        if (!relative_index.isDevice() or relative_index.elemCount() != request.seq_len * 2 - 1) return null;
+    } else if (relative_count != request.seq_len * 2 - 1) return null;
     const mask_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "mask")) request.mask else null;
     if (mask_tensor) |mask| {
         if (!mask.isDevice() or mask.elemCount() != request.batch * request.seq_len) return null;
@@ -5851,6 +5857,9 @@ pub fn decoderRuntimeDisentangledRelativeAttentionF32Device(self: anytype, reque
         request.q_r.deviceByteOffset(),
         request.k_r.deviceHandle(),
         request.k_r.deviceByteOffset(),
+        if (relative_index_tensor) |relative_index| relative_index.deviceHandle() else null,
+        if (relative_index_tensor) |relative_index| relative_index.deviceByteOffset() else 0,
+        relative_count,
         if (mask_mut) |*tensor| tensor.deviceHandle() else null,
         if (mask_mut) |*tensor| tensor.deviceByteOffset() else 0,
         request.batch,
@@ -9763,6 +9772,25 @@ test "metal DeBERTa flash4 eligibility dispatches the flash4 pipeline" {
     try std.testing.expect(dispatch < fallback);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, function_source, "runtime->deberta_attention_flash_calls += 1"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, function_source, "dispatchThreadgroups:MTLSizeMake((seq_len + flash_query_block - 1u) / flash_query_block, num_heads, batch)"));
+}
+
+test "metal DeBERTa MPS attention is budgeted before the flash4 fallback" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    const function_start = std.mem.indexOf(u8, source, "int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(").?;
+    const function_end = std.mem.indexOfPos(u8, source, function_start, "int termite_metal_decode_runtime_disentangled_relative_attention_backward_f32_device(").?;
+    const function_source = source[function_start..function_end];
+
+    const mps_policy = std.mem.indexOf(u8, function_source, "termite_metal_deberta_mps_attention_scratch_max_bytes()").?;
+    const retained_capacity = std.mem.indexOf(u8, function_source, "retained_scratch_bytes > mps_attention_scratch_max_bytes").?;
+    const mps_dispatch = std.mem.indexOf(u8, function_source, "encodeToCommandBuffer:command_buffer leftMatrix:packed_q rightMatrix:packed_k resultMatrix:cc").?;
+    const flash_dispatch = std.mem.indexOf(u8, function_source, "setComputePipelineState:runtime->disentangled_relative_attention_f32_flash4_pipeline").?;
+    try std.testing.expect(mps_policy < retained_capacity);
+    try std.testing.expect(retained_capacity < mps_dispatch);
+    try std.testing.expect(mps_dispatch < flash_dispatch);
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_DEBERTA_MPS_ATTENTION"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DEBERTA_MPS_ATTENTION_MAX_MB"));
 }
 
 test "metal paged attention masks value rows without divergent branching" {
@@ -17725,6 +17753,9 @@ pub extern fn termite_metal_decode_runtime_disentangled_relative_attention_f32_d
     q_r_offset: usize,
     k_r_handle: ?*anyopaque,
     k_r_offset: usize,
+    relative_index_handle: ?*anyopaque,
+    relative_index_offset: usize,
+    relative_count: usize,
     mask_handle: ?*anyopaque,
     mask_offset: usize,
     batch: usize,
@@ -20684,6 +20715,13 @@ pub fn releaseRawLinearSlot(self: anytype, slot: usize) void {
 }
 
 pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
+    if (comptime @hasField(@TypeOf(self.*), "deberta_relative_projection_cache")) {
+        while (!self.deberta_relative_projection_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.deberta_relative_projection_cache_mutex.unlock();
+        for (&self.deberta_relative_projection_cache, 0..) |*entry, q_slot| {
+            if (q_slot == slot or (entry.q != null and entry.k_slot == slot)) entry.deinit();
+        }
+    }
     releaseRawLinearSlot(self, slot);
     self.raw_linear_slot_dense_weights[slot] = null;
     self.raw_linear_slot_dense_biases[slot] = null;

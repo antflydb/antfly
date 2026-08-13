@@ -5975,7 +5975,7 @@ const ComponentArtifactEstimate = union(enum) {
     ) usize {
         if (backend != .metal) return 0;
         return switch (self.*) {
-            .native => |man| session_factory.metalDebertaRerankerFastPathReservationBytes(man),
+            .native => |man| session_factory.metalDebertaFastPathReservationBytes(man),
             .disabled, .onnx => 0,
         };
     }
@@ -6068,7 +6068,7 @@ fn estimateModelLoadAdmission(
     const uses_onnx_artifact = backend_runtime.backend == .onnx or !manifestHasNativeAssets(man);
     if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend_runtime);
     const extra_backend_resident_bytes = if (backend_runtime.backend == .metal)
-        session_factory.metalDebertaRerankerFastPathReservationBytes(man)
+        session_factory.metalDebertaFastPathReservationBytes(man)
     else
         0;
     return nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident_bytes);
