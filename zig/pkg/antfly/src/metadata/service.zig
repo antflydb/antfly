@@ -438,7 +438,7 @@ pub const MetadataServiceConfig = struct {
 
 pub const ReallocationProtocolPeer = struct {
     node_id: u64,
-    orchestration_url: []const u8,
+    orchestration_url: ?[]const u8 = null,
 };
 
 fn findReallocationProtocolPeer(peers: []const ReallocationProtocolPeer, node_id: u64) ?ReallocationProtocolPeer {
@@ -446,6 +446,37 @@ fn findReallocationProtocolPeer(peers: []const ReallocationProtocolPeer, node_id
         if (peer.node_id == node_id) return peer;
     }
     return null;
+}
+
+fn collectReallocationBarrierNodeIds(
+    alloc: std.mem.Allocator,
+    conf_state: raft_engine.core.ConfState,
+    configured_peers: []const ReallocationProtocolPeer,
+) ![]u64 {
+    var required = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer required.deinit(alloc);
+
+    const membership_sets = [_][]const u64{
+        conf_state.voters,
+        conf_state.voters_outgoing,
+        conf_state.learners,
+        conf_state.learners_next,
+    };
+    for (membership_sets) |node_ids| {
+        for (node_ids) |node_id| try required.put(alloc, node_id, {});
+    }
+    // The configured peer set is the target membership for this process.
+    // Probing it as well as the currently applied ConfState prevents a
+    // compatible request from racing a configured learner admission and later
+    // being exposed to an older leader after promotion.
+    for (configured_peers) |peer| try required.put(alloc, peer.node_id, {});
+
+    const node_ids = try alloc.alloc(u64, required.count());
+    var index: usize = 0;
+    var it = required.keyIterator();
+    while (it.next()) |node_id| : (index += 1) node_ids[index] = node_id.*;
+    std.mem.sort(u64, node_ids, {}, std.sort.asc(u64));
+    return node_ids;
 }
 
 fn reallocationBarrierStatusCompatible(peer_status: MetadataStatus, metadata_group_id: u64, node_id: u64) bool {
@@ -3869,6 +3900,11 @@ pub const MetadataHttpService = struct {
         const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
             return error.ReallocationProtocolUpgradeRequired;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
+        if (std.mem.indexOfScalar(u64, raft_status.conf_state.voters, local_node_id) == null and
+            std.mem.indexOfScalar(u64, raft_status.conf_state.voters_outgoing, local_node_id) == null)
+        {
+            return error.ReallocationProtocolUpgradeRequired;
+        }
         var client = metadata_http_client.MetadataHttpClient.init(
             self.alloc,
             self.raft.host.http_host.request_executor,
@@ -3877,19 +3913,15 @@ pub const MetadataHttpService = struct {
             .deadline_ns = platform_time.monotonicNs() +| reallocation_protocol_probe_timeout_ns,
         };
 
-        var local_voter = false;
-        for (raft_status.conf_state.voters) |node_id| {
-            local_voter = local_voter or node_id == local_node_id;
+        const required_node_ids = try collectReallocationBarrierNodeIds(
+            self.alloc,
+            raft_status.conf_state,
+            self.reallocation_protocol_peers,
+        );
+        defer if (required_node_ids.len > 0) self.alloc.free(required_node_ids);
+        for (required_node_ids) |node_id| {
             try self.requireReallocationBarrierPeer(&client, probe_budget, local_node_id, node_id);
         }
-        // During joint consensus an outgoing voter can still become leader, so
-        // it participates in the compatibility barrier until it is removed.
-        for (raft_status.conf_state.voters_outgoing) |node_id| {
-            local_voter = local_voter or node_id == local_node_id;
-            if (std.mem.indexOfScalar(u64, raft_status.conf_state.voters, node_id) != null) continue;
-            try self.requireReallocationBarrierPeer(&client, probe_budget, local_node_id, node_id);
-        }
-        if (!local_voter) return error.ReallocationProtocolUpgradeRequired;
     }
 
     fn requireReallocationBarrierPeer(
@@ -3901,11 +3933,19 @@ pub const MetadataHttpService = struct {
     ) !void {
         if (node_id == local_node_id) return;
         const peer = findReallocationProtocolPeer(self.reallocation_protocol_peers, node_id) orelse {
-            std.log.warn("reallocation barrier blocked: metadata voter {d} has no orchestration URL", .{node_id});
+            std.log.warn("reallocation barrier blocked: metadata member {d} is not in the configured peer set", .{node_id});
             return error.ReallocationProtocolUpgradeRequired;
         };
-        const peer_status = client.fetchStatusWithBudget(peer.orchestration_url, probe_budget) catch |err| {
-            std.log.warn("reallocation barrier blocked: metadata voter {d} capability probe failed: {s}", .{ node_id, @errorName(err) });
+        const orchestration_url = peer.orchestration_url orelse {
+            std.log.warn("reallocation barrier blocked: metadata member {d} has no orchestration URL", .{node_id});
+            return error.ReallocationProtocolUpgradeRequired;
+        };
+        if (orchestration_url.len == 0) {
+            std.log.warn("reallocation barrier blocked: metadata member {d} has an empty orchestration URL", .{node_id});
+            return error.ReallocationProtocolUpgradeRequired;
+        }
+        const peer_status = client.fetchStatusWithBudget(orchestration_url, probe_budget) catch |err| {
+            std.log.warn("reallocation barrier blocked: metadata member {d} capability probe failed: {s}", .{ node_id, @errorName(err) });
             return error.ReallocationProtocolUpgradeRequired;
         };
         if (!reallocationBarrierStatusCompatible(peer_status, self.metadata_group_id, node_id)) {
@@ -5610,6 +5650,26 @@ test "metadata service reallocation barrier requires a current protocol from the
     try std.testing.expect(reallocationBarrierStatusCompatible(current_status, 42, 7));
     try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 43, 7));
     try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 42, 8));
+}
+
+test "metadata service reallocation barrier covers configured and transitional members" {
+    const configured_peers = [_]ReallocationProtocolPeer{
+        .{ .node_id = 2, .orchestration_url = "http://127.0.0.1:12378" },
+        .{ .node_id = 6 },
+    };
+    const conf_state = raft_engine.core.ConfState{
+        .voters = @constCast((&[_]u64{ 1, 2 })[0..]),
+        .voters_outgoing = @constCast((&[_]u64{ 2, 3 })[0..]),
+        .learners = @constCast((&[_]u64{4})[0..]),
+        .learners_next = @constCast((&[_]u64{5})[0..]),
+    };
+    const required = try collectReallocationBarrierNodeIds(
+        std.testing.allocator,
+        conf_state,
+        &configured_peers,
+    );
+    defer std.testing.allocator.free(required);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4, 5, 6 }, required);
 }
 
 fn shutdownCdcRuntimeJobs(service: anytype) void {

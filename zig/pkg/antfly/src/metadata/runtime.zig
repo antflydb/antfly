@@ -402,7 +402,6 @@ pub const Server = struct {
     raft_storage_diagnostics: MetadataRaftStorageDiagnosticsCache = .{},
 
     pub fn init(alloc: std.mem.Allocator, cfg: ServerConfig) !Server {
-        try validateMetadataClusterOrchestrationPeers(cfg.metadata_cluster_peers, cfg.local_node_id);
         var result: Server = undefined;
         result.alloc = alloc;
         result.raft_storage_diagnostics = .{};
@@ -1304,24 +1303,21 @@ fn reallocationProtocolPeersFromClusterPeers(
     alloc: std.mem.Allocator,
     cluster_peers: []const MetadataClusterPeer,
 ) ![]antfly.metadata_service.ReallocationProtocolPeer {
-    var count: usize = 0;
-    for (cluster_peers) |peer| count += @intFromBool(peer.orchestration_url != null);
-    if (count == 0) return &.{};
-    const peers = try alloc.alloc(antfly.metadata_service.ReallocationProtocolPeer, count);
+    if (cluster_peers.len == 0) return &.{};
+    const peers = try alloc.alloc(antfly.metadata_service.ReallocationProtocolPeer, cluster_peers.len);
     var initialized: usize = 0;
     errdefer {
-        for (peers[0..initialized]) |peer| alloc.free(peer.orchestration_url);
+        for (peers[0..initialized]) |peer| {
+            if (peer.orchestration_url) |url| alloc.free(url);
+        }
         alloc.free(peers);
     }
-    var index: usize = 0;
-    for (cluster_peers) |peer| {
-        const orchestration_url = peer.orchestration_url orelse continue;
+    for (cluster_peers, 0..) |peer, index| {
         peers[index] = .{
             .node_id = peer.node_id,
-            .orchestration_url = try alloc.dupe(u8, orchestration_url),
+            .orchestration_url = if (peer.orchestration_url) |url| try alloc.dupe(u8, url) else null,
         };
         initialized += 1;
-        index += 1;
     }
     return peers;
 }
@@ -1330,20 +1326,10 @@ fn freeReallocationProtocolPeers(
     alloc: std.mem.Allocator,
     peers: []antfly.metadata_service.ReallocationProtocolPeer,
 ) void {
-    for (peers) |peer| alloc.free(peer.orchestration_url);
-    if (peers.len > 0) alloc.free(peers);
-}
-
-fn validateMetadataClusterOrchestrationPeers(
-    cluster_peers: []const MetadataClusterPeer,
-    local_node_id: u64,
-) !void {
-    if (cluster_peers.len <= 1) return;
-    for (cluster_peers) |peer| {
-        if (peer.node_id == local_node_id) continue;
-        const orchestration_url = peer.orchestration_url orelse return error.MissingMetadataOrchestrationPeer;
-        if (orchestration_url.len == 0) return error.MissingMetadataOrchestrationPeer;
+    for (peers) |peer| {
+        if (peer.orchestration_url) |url| alloc.free(url);
     }
+    if (peers.len > 0) alloc.free(peers);
 }
 
 pub fn metadataClusterPeersFromConfig(
@@ -1660,15 +1646,11 @@ test "metadata runtime cluster json carries raft and orchestration endpoints" {
 
     const protocol_peers = try reallocationProtocolPeersFromClusterPeers(alloc, peers);
     defer freeReallocationProtocolPeers(alloc, protocol_peers);
-    try std.testing.expectEqual(@as(usize, 1), protocol_peers.len);
+    try std.testing.expectEqual(@as(usize, 2), protocol_peers.len);
     try std.testing.expectEqual(@as(u64, 1), protocol_peers[0].node_id);
-    try std.testing.expectEqualStrings("http://127.0.0.1:12377", protocol_peers[0].orchestration_url);
-
-    try std.testing.expectError(
-        error.MissingMetadataOrchestrationPeer,
-        validateMetadataClusterOrchestrationPeers(peers, 1),
-    );
-    try validateMetadataClusterOrchestrationPeers(peers[0..1], 1);
+    try std.testing.expectEqualStrings("http://127.0.0.1:12377", protocol_peers[0].orchestration_url.?);
+    try std.testing.expectEqual(@as(u64, 2), protocol_peers[1].node_id);
+    try std.testing.expect(protocol_peers[1].orchestration_url == null);
 
     var cfg = try antfly.common.config.Config.parseFromSlice(alloc,
         \\{
@@ -1684,7 +1666,6 @@ test "metadata runtime cluster json carries raft and orchestration endpoints" {
     const legacy_cluster_json = "{\"1\":\"http://127.0.0.1:9017\",\"2\":\"http://127.0.0.1:9018\"}";
     const merged_peers = try resolveMetadataClusterPeers(alloc, legacy_cluster_json, &cfg);
     defer freeMetadataClusterPeers(alloc, merged_peers);
-    try validateMetadataClusterOrchestrationPeers(merged_peers, 1);
     for (merged_peers) |peer| {
         try std.testing.expectEqualStrings(
             if (peer.node_id == 1) "http://127.0.0.1:12377" else "http://127.0.0.1:12378",
@@ -1802,6 +1783,35 @@ test "metadata runtime server uses wal replica state backend by default" {
 
     try std.testing.expect(server.server.svc.raft.host.owned_wal_replica_provider != null);
     try std.testing.expect(server.server.svc.raft.host.owned_file_replica_provider == null);
+}
+
+test "metadata runtime legacy multi-node cluster config does not require orchestration endpoints at startup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-legacy-cluster/replicas", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-legacy-cluster/catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-legacy-cluster/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+    const peers = [_]MetadataClusterPeer{
+        .{ .node_id = 1, .raft_url = "http://127.0.0.1:19017" },
+        .{ .node_id = 2, .raft_url = "http://127.0.0.1:19018" },
+    };
+
+    var server = try Server.init(std.testing.allocator, .{
+        .local_node_id = 1,
+        .metadata_cluster_peers = &peers,
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .snapshot_root_dir = snapshot_root,
+    });
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), server.reallocation_protocol_peers.len);
+    try std.testing.expect(server.reallocation_protocol_peers[0].orchestration_url == null);
+    try std.testing.expect(server.reallocation_protocol_peers[1].orchestration_url == null);
 }
 
 test "metadata runtime enables bounded raft storage compaction for multi-node groups" {
