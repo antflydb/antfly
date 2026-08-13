@@ -245,42 +245,23 @@ pub const TableApi = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
             req: db_mod.types.BatchRequest,
-        ) ExecuteBatchError!void,
-        execute_table_batch_with_cancellation: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            req: db_mod.types.BatchRequest,
             cancellation: ?db_mod.types.CancellationToken,
-        ) ExecuteBatchError!void = null,
+        ) ExecuteBatchError!void,
         execute_table_query_request: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
             body: []const u8,
             row_filter_json: ?[]const u8,
-        ) ExecuteQueryError![]u8,
-        execute_table_query_request_with_cancellation: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            body: []const u8,
-            row_filter_json: ?[]const u8,
             cancellation: ?db_mod.types.CancellationToken,
-        ) ExecuteQueryError![]u8 = null,
+        ) ExecuteQueryError![]u8,
         execute_table_query_view: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
             view: TableQueryView,
-        ) ExecuteQueryViewError![]u8,
-        execute_table_query_view_with_cancellation: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            view: TableQueryView,
             cancellation: ?db_mod.types.CancellationToken,
-        ) ExecuteQueryViewError![]u8 = null,
+        ) ExecuteQueryViewError![]u8,
         execute_table_backup: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -377,10 +358,7 @@ pub const TableApi = struct {
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
     ) ExecuteBatchError!void {
-        if (self.vtable.execute_table_batch_with_cancellation) |execute| {
-            return try execute(self.ptr, alloc, table_name, req, self.cancellation);
-        }
-        return try self.vtable.execute_table_batch(self.ptr, alloc, table_name, req);
+        return try self.vtable.execute_table_batch(self.ptr, alloc, table_name, req, self.cancellation);
     }
 
     pub fn executeTableQueryRequest(
@@ -390,10 +368,7 @@ pub const TableApi = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
     ) ExecuteQueryError![]u8 {
-        if (self.vtable.execute_table_query_request_with_cancellation) |execute| {
-            return try execute(self.ptr, alloc, table_name, body, row_filter_json, self.cancellation);
-        }
-        return try self.vtable.execute_table_query_request(self.ptr, alloc, table_name, body, row_filter_json);
+        return try self.vtable.execute_table_query_request(self.ptr, alloc, table_name, body, row_filter_json, self.cancellation);
     }
 
     pub fn executeTableQueryView(
@@ -402,10 +377,7 @@ pub const TableApi = struct {
         table_name: []const u8,
         view: TableQueryView,
     ) ExecuteQueryViewError![]u8 {
-        if (self.vtable.execute_table_query_view_with_cancellation) |execute| {
-            return try execute(self.ptr, alloc, table_name, view, self.cancellation);
-        }
-        return try self.vtable.execute_table_query_view(self.ptr, alloc, table_name, view);
+        return try self.vtable.execute_table_query_view(self.ptr, alloc, table_name, view, self.cancellation);
     }
 
     pub fn executeTableBackup(
@@ -1569,6 +1541,7 @@ fn unsupportedBatch(
     _: std.mem.Allocator,
     _: []const u8,
     _: db_mod.types.BatchRequest,
+    _: ?db_mod.types.CancellationToken,
 ) TableApi.ExecuteBatchError!void {
     return error.InternalFailure;
 }
@@ -1579,6 +1552,7 @@ fn unsupportedQueryRequest(
     _: []const u8,
     _: []const u8,
     _: ?[]const u8,
+    _: ?db_mod.types.CancellationToken,
 ) TableApi.ExecuteQueryError![]u8 {
     return error.InternalFailure;
 }
@@ -1588,6 +1562,7 @@ fn unsupportedQueryView(
     _: std.mem.Allocator,
     _: []const u8,
     _: TableApi.TableQueryView,
+    _: ?db_mod.types.CancellationToken,
 ) TableApi.ExecuteQueryViewError![]u8 {
     return error.InternalFailure;
 }
@@ -1681,6 +1656,7 @@ test "public table batch handler returns created batch response" {
             _: std.mem.Allocator,
             table_name: []const u8,
             req: db_mod.types.BatchRequest,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteBatchError!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.called = true;
@@ -1751,12 +1727,9 @@ test "public table api carries borrowed cancellation into batch execution" {
         .ptr = &state,
         .cancellation = db_mod.types.CancellationToken.fromAtomic(&signal),
         .vtable = &.{
-            .execute_table_batch = unsupportedBatch,
-            .execute_table_batch_with_cancellation = Backend.executeTableBatch,
-            .execute_table_query_request = unsupportedQueryRequest,
-            .execute_table_query_request_with_cancellation = Backend.executeTableQueryRequest,
-            .execute_table_query_view = unsupportedQueryView,
-            .execute_table_query_view_with_cancellation = Backend.executeTableQueryView,
+            .execute_table_batch = Backend.executeTableBatch,
+            .execute_table_query_request = Backend.executeTableQueryRequest,
+            .execute_table_query_view = Backend.executeTableQueryView,
             .execute_table_backup = unsupportedBackup,
             .execute_table_restore = unsupportedRestore,
             .execute_table_list_indexes = unsupportedListIndexes,
@@ -1795,6 +1768,7 @@ test "public create index exposes retryable storage descriptor exhaustion" {
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.BatchRequest,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteBatchError!void {}
 
         fn executeCreateIndex(
@@ -1843,6 +1817,7 @@ test "public table batch handler rejects unsupported missing-document transform 
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.BatchRequest,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteBatchError!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.called = true;
@@ -1885,6 +1860,7 @@ test "public table batch handler maps backend errors" {
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.BatchRequest,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteBatchError!void {
             return error.Backpressured;
         }
@@ -1923,6 +1899,7 @@ test "public table batch handler returns concise dense repair backpressure" {
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.BatchRequest,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteBatchError!void {
             return error.DenseRepairBackpressure;
         }
@@ -1972,6 +1949,7 @@ test "public table batch handler maps unavailable errors" {
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.BatchRequest,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteBatchError!void {
             return error.Unavailable;
         }
@@ -2012,6 +1990,7 @@ test "public table batch handler maps write unavailable errors" {
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.BatchRequest,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteBatchError!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.err;
@@ -2058,7 +2037,7 @@ test "public table batch handler returns accepted for durable pending commits" {
             } };
         }
 
-        fn executeTableBatch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) TableApi.ExecuteBatchError!void {
+        fn executeTableBatch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest, _: ?db_mod.types.CancellationToken) TableApi.ExecuteBatchError!void {
             return error.CommittedPending;
         }
     };
@@ -2095,6 +2074,7 @@ test "public table batch handler preserves ambiguous write outcomes" {
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.BatchRequest,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteBatchError!void {
             return error.WriteOutcomeUnknown;
         }
@@ -2133,6 +2113,7 @@ test "public table batch handler exposes pending HA durability without claiming 
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.BatchRequest,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteBatchError!void {
             return error.HAWriteDurabilityPending;
         }
@@ -2174,6 +2155,7 @@ test "public table batch handler maps doc identity unavailable errors" {
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.BatchRequest,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteBatchError!void {
             return error.DocIdentityUnavailable;
         }
@@ -2214,6 +2196,7 @@ test "public table batch handler maps HA write gate errors" {
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.BatchRequest,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteBatchError!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.err;
@@ -2267,6 +2250,7 @@ test "public table query handler maps doc identity unavailable errors" {
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryError![]u8 {
             return error.DocIdentityUnavailable;
         }
@@ -2308,6 +2292,7 @@ test "public table query handler preserves structured filter diagnostics" {
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryError![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.err;
@@ -2388,6 +2373,7 @@ test "public table query handler preserves retryable failure status" {
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryError![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.err;
@@ -2454,6 +2440,7 @@ test "public table query handler maps HA read gate errors" {
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryError![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.err;
@@ -2504,6 +2491,7 @@ test "public table query handler returns json response" {
             table_name: []const u8,
             body: []const u8,
             row_filter_json: ?[]const u8,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryError![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.called = true;
@@ -2554,6 +2542,7 @@ test "public table query handler rejects only top-level internal fields" {
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryError![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.called = true;
@@ -2620,6 +2609,7 @@ test "public table query handler maps backend errors" {
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryError![]u8 {
             return error.InvalidQueryRequest;
         }
@@ -2659,6 +2649,7 @@ test "public table query handler maps invalid exact sort diagnostics" {
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryError![]u8 {
             db_mod.testing.recordSortRejectionDiagnostic(
                 "_score",
@@ -2720,6 +2711,7 @@ test "public table query handler rejects unknown sort tuple properties before di
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryError![]u8 {
             return error.InternalFailure;
         }
@@ -2773,6 +2765,7 @@ test "public table query handler maps candidate budget exhaustion" {
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryError![]u8 {
             db_mod.testing.recordSortRejectionDiagnostic(
                 "full_text_index_v0",
@@ -2836,6 +2829,7 @@ test "public table query handler maps unsupported exact sort" {
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryError![]u8 {
             return error.UnsupportedExactSort;
         }
@@ -2891,6 +2885,7 @@ test "public table query handler exposes stable count-only sort rejection reason
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryError![]u8 {
             db_mod.testing.recordSortRejectionDiagnostic(
                 "*",
@@ -2949,6 +2944,7 @@ test "public table query handler surfaces exact sort rejection diagnostics" {
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryError![]u8 {
             db_mod.testing.recordSortRejectionDiagnostic(
                 "created_at",
@@ -3008,6 +3004,7 @@ test "public table query view handler maps doc identity unavailable errors" {
             _: std.mem.Allocator,
             _: []const u8,
             _: TableApi.TableQueryView,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryViewError![]u8 {
             return error.DocIdentityUnavailable;
         }
@@ -3044,6 +3041,7 @@ test "public table query view handler maps HA read gate errors" {
             _: std.mem.Allocator,
             _: []const u8,
             _: TableApi.TableQueryView,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryViewError![]u8 {
             return error.ReadRequiresPrimary;
         }
@@ -3080,6 +3078,7 @@ test "public table query view handler returns json response" {
             alloc: std.mem.Allocator,
             table_name: []const u8,
             view: TableApi.TableQueryView,
+            _: ?db_mod.types.CancellationToken,
         ) TableApi.ExecuteQueryViewError![]u8 {
             if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
             if (view != .latest) return error.InternalFailure;

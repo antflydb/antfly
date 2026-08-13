@@ -27,6 +27,20 @@ const vec = @import("vector.zig");
 const proto = @import("proto.zig");
 const go_rand = @import("go_rand.zig");
 
+/// Borrowed request-lifecycle signal for long quantizer scans. Keeping the
+/// callback transport-neutral lets storage and serverless runtimes share the
+/// kernel without exposing either runtime's token representation.
+pub const CancellationToken = struct {
+    ptr: *const anyopaque,
+    is_cancelled_fn: *const fn (*const anyopaque) bool,
+
+    pub fn check(self: CancellationToken) !void {
+        if (self.is_cancelled_fn(self.ptr)) return error.Canceled;
+    }
+};
+
+const estimate_cancellation_stride = 64;
+
 /// RaBitQuantizer quantizes vectors into 1 bit per dimension.
 ///
 /// Thread-safe: can be cached and reused across threads.
@@ -309,9 +323,20 @@ pub const RaBitQuantizer = struct {
         distances: []f32,
         error_bounds: []f32,
     ) !void {
+        return self.estimateDistancesCancellable(qs, query_vector, distances, error_bounds, null);
+    }
+
+    pub fn estimateDistancesCancellable(
+        self: *const RaBitQuantizer,
+        qs: *const proto.RaBitQuantizedVectorSet,
+        query_vector: []const f32,
+        distances: []f32,
+        error_bounds: []f32,
+        cancellation: ?CancellationToken,
+    ) !void {
         var scratch = try EstimateScratch.init(self.alloc, self.dims);
         defer scratch.deinit(self.alloc);
-        try self.estimateDistancesWithScratch(qs, query_vector, distances, error_bounds, &scratch);
+        try self.estimateDistancesWithScratchCancellable(qs, query_vector, distances, error_bounds, &scratch, cancellation);
     }
 
     pub fn estimateDistancesWithScratch(
@@ -322,6 +347,19 @@ pub const RaBitQuantizer = struct {
         error_bounds: []f32,
         scratch: *EstimateScratch,
     ) !void {
+        return self.estimateDistancesWithScratchCancellable(qs, query_vector, distances, error_bounds, scratch, null);
+    }
+
+    pub fn estimateDistancesWithScratchCancellable(
+        self: *const RaBitQuantizer,
+        qs: *const proto.RaBitQuantizedVectorSet,
+        query_vector: []const f32,
+        distances: []f32,
+        error_bounds: []f32,
+        scratch: *EstimateScratch,
+        cancellation: ?CancellationToken,
+    ) !void {
+        if (cancellation) |token| try token.check();
         const count = qs.getCount();
         const width: usize = @intCast(qs.codes.width);
         const temp_query_diff = scratch.query_diff[0..self.dims];
@@ -335,7 +373,7 @@ pub const RaBitQuantizer = struct {
         const query_centroid_distance = vec.norm(temp_query_diff);
 
         if (query_centroid_distance == 0) {
-            self.calcCentroidDistances(qs, distances);
+            try self.calcCentroidDistances(qs, distances, cancellation);
             @memset(error_bounds[0..count], 0);
             return;
         }
@@ -371,6 +409,7 @@ pub const RaBitQuantizer = struct {
         var quantized4: u64 = 0;
 
         for (0..self.dims) |d| {
+            if (d % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
             if (delta != 0) {
                 var q_val: u64 = @intFromFloat(@floor((temp_query_diff[d] - min_val) / delta + self.unbias[d]));
                 q_val = @min(q_val, @as(u64, @intFromFloat(quantized_range)));
@@ -414,6 +453,7 @@ pub const RaBitQuantizer = struct {
             .l2_squared => {
                 const query_centroid_distance_sq = query_centroid_distance * query_centroid_distance;
                 for (0..count) |i| {
+                    if (i % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
                     const code = qs.codes.atConst(i);
                     const bit_product: f32 = @floatFromInt(rabitq.bitProduct(
                         code,
@@ -443,6 +483,7 @@ pub const RaBitQuantizer = struct {
             },
             .inner_product => {
                 for (0..count) |i| {
+                    if (i % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
                     const code = qs.codes.atConst(i);
                     const bit_product: f32 = @floatFromInt(rabitq.bitProduct(
                         code,
@@ -464,6 +505,7 @@ pub const RaBitQuantizer = struct {
             },
             .cosine => {
                 for (0..count) |i| {
+                    if (i % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
                     const code = qs.codes.atConst(i);
                     const bit_product: f32 = @floatFromInt(rabitq.bitProduct(
                         code,
@@ -499,21 +541,25 @@ pub const RaBitQuantizer = struct {
         self: *const RaBitQuantizer,
         qs: *const proto.RaBitQuantizedVectorSet,
         distances: []f32,
-    ) void {
+        cancellation: ?CancellationToken,
+    ) !void {
         switch (self.distance_metric) {
             .l2_squared => {
                 for (qs.centroid_distances, 0..) |cd, i| {
+                    if (i % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
                     distances[i] = cd * cd;
                 }
             },
             .inner_product => {
                 for (qs.centroid_dot_products, 0..) |cdp, i| {
+                    if (i % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
                     distances[i] = -cdp;
                 }
             },
             .cosine => {
                 const inv_centroid_norm: f32 = if (qs.centroid_norm != 0) 1.0 / qs.centroid_norm else 0.0;
                 for (qs.centroid_dot_products, 0..) |cdp, i| {
+                    if (i % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
                     distances[i] = 1.0 - cdp * inv_centroid_norm;
                 }
             },
@@ -527,6 +573,37 @@ fn resizeSlice(comptime T: type, alloc: Allocator, slice: []T, new_len: usize) !
 }
 
 // --- Tests ---
+
+test "RaBitQuantizer checks cancellation inside distance scans" {
+    var quantizer = try RaBitQuantizer.init(std.testing.allocator, 2, 42, .l2_squared);
+    defer quantizer.deinit();
+
+    const State = struct {
+        checks: usize = 0,
+
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            return self.checks >= 3;
+        }
+    };
+    var state = State{};
+    var quantized = try quantizer.quantize(&.{ 0, 0 }, &.{ 1, 1 }, 1);
+    defer quantized.deinit(std.testing.allocator);
+    var distances: [1]f32 = undefined;
+    var error_bounds: [1]f32 = undefined;
+    try std.testing.expectError(
+        error.Canceled,
+        quantizer.estimateDistancesCancellable(
+            &quantized,
+            &.{ 0, 0 },
+            &distances,
+            &error_bounds,
+            .{ .ptr = &state, .is_cancelled_fn = State.cancelled },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 3), state.checks);
+}
 
 test "RaBitQuantizer basic L2Squared" {
     const alloc = std.testing.allocator;

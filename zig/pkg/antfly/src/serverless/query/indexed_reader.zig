@@ -22,6 +22,7 @@ const vector_segment_mod = @import("../vector_segment/mod.zig");
 const query_request = @import("request.zig");
 const query_plan = @import("plan.zig");
 const runtime_mod = @import("runtime.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const materializer_mod = @import("materializer.zig");
 const vector_proto = @import("antfly_vector").proto;
 const vector_quantizer = @import("antfly_vector").quantizer;
@@ -354,7 +355,8 @@ fn searchTextSegmentSpecAlloc(
     min_score: u32,
     session: ?*runtime_mod.QuerySession,
 ) ![]ScoredDoc {
-    if (session) |value| try value.checkCancellation();
+    const cancellation = if (session) |value| value.cancellation else CancellationToken.none;
+    try cancellation.check();
     const normalized_query = try normalizeAlloc(alloc, text);
     defer alloc.free(normalized_query);
     if (normalized_query.len == 0) return try alloc.alloc(ScoredDoc, 0);
@@ -372,16 +374,16 @@ fn searchTextSegmentSpecAlloc(
     @memset(matched_terms, 0);
 
     switch (operator) {
-        .any_terms => accumulateAnyTerms(text_segment, query_terms, scores),
-        .all_terms => accumulateAllTerms(text_segment, query_terms, scores, matched_terms),
-        .phrase => accumulatePhrase(text_segment, normalized_query, query_terms[0], scores),
-        .prefix_any_term => accumulatePrefixAnyTerms(text_segment, query_terms, scores),
+        .any_terms => try accumulateAnyTerms(text_segment, query_terms, scores, cancellation),
+        .all_terms => try accumulateAllTerms(text_segment, query_terms, scores, matched_terms, cancellation),
+        .phrase => try accumulatePhrase(text_segment, normalized_query, query_terms[0], scores, cancellation),
+        .prefix_any_term => try accumulatePrefixAnyTerms(text_segment, query_terms, scores, cancellation),
     }
 
     var scored = std.ArrayListUnmanaged(ScoredDoc).empty;
     defer scored.deinit(alloc);
     for (scores, 0..) |score, doc_index| {
-        if (doc_index % 64 == 0) if (session) |value| try value.checkCancellation();
+        if (doc_index % 64 == 0) try cancellation.check();
         if (score == 0) continue;
         if (operator == .all_terms and matched_terms[doc_index] != @as(u16, @intCast(query_terms.len))) continue;
         try scored.append(alloc, .{
@@ -589,7 +591,8 @@ fn searchSparseArtifactAlloc(
         defer alloc.free(postings_bytes);
         const postings = try sparse_segment_mod.decodePostingBlockAlloc(alloc, match.record.doc_freq, postings_bytes);
         defer alloc.free(postings);
-        for (postings) |posting| {
+        for (postings, 0..) |posting, posting_index| {
+            if (posting_index % 64 == 0) try session.checkCancellation();
             scores[posting.doc_index] += posting.weight * feature.weight;
         }
     }
@@ -767,6 +770,7 @@ fn searchVectorArtifactAlloc(
     var ranked_clusters = try alloc.alloc(ScoredCluster, clusters.len);
     defer alloc.free(ranked_clusters);
     for (clusters, 0..) |cluster, idx| {
+        if (idx % 64 == 0) try session.checkCancellation();
         ranked_clusters[idx] = .{
             .cluster_index = idx,
             .score = routingScoreForQuery(effective_query, query_measure, cluster.centroid, header.metric),
@@ -801,10 +805,17 @@ fn searchVectorArtifactAlloc(
             defer alloc.free(distances);
             const error_bounds = try alloc.alloc(f32, count);
             defer alloc.free(error_bounds);
-            try quantizer.estimateDistances(&quantized, effective_query, distances, error_bounds);
+            try quantizer.estimateDistancesCancellable(
+                &quantized,
+                effective_query,
+                distances,
+                error_bounds,
+                quantizerCancellation(session),
+            );
             var local_candidates = std.ArrayListUnmanaged(ApproxCandidate).empty;
             defer local_candidates.deinit(alloc);
             for (distances, error_bounds, 0..) |distance, error_bound, idx| {
+                if (idx % 64 == 0) try session.checkCancellation();
                 try local_candidates.append(alloc, .{
                     .cluster_index = cluster_hit.cluster_index,
                     .local_index = idx,
@@ -1434,10 +1445,19 @@ test "indexed reader merges duplicate vector doc hits by best score" {
     try std.testing.expectEqual(@as(u32, 900), merged_owned[0].score);
 }
 
-fn accumulateAnyTerms(text_segment: text_segment_mod.Segment, query_terms: []const []const u8, scores: []u32) void {
-    for (query_terms) |term| {
+fn accumulateAnyTerms(
+    text_segment: text_segment_mod.Segment,
+    query_terms: []const []const u8,
+    scores: []u32,
+    cancellation: CancellationToken,
+) !void {
+    for (query_terms, 0..) |term, term_index| {
+        if (term_index % 16 == 0) try cancellation.check();
         const term_entry = findTerm(text_segment.terms, term) orelse continue;
-        for (term_entry.postings) |posting| scores[posting.doc_index] += posting.term_freq;
+        for (term_entry.postings, 0..) |posting, posting_index| {
+            if (posting_index % 64 == 0) try cancellation.check();
+            scores[posting.doc_index] += posting.term_freq;
+        }
     }
 }
 
@@ -1446,15 +1466,19 @@ fn accumulateAllTerms(
     query_terms: []const []const u8,
     scores: []u32,
     matched_terms: []u16,
-) void {
-    for (query_terms) |term| {
+    cancellation: CancellationToken,
+) !void {
+    for (query_terms, 0..) |term, term_index| {
+        if (term_index % 16 == 0) try cancellation.check();
         const term_entry = findTerm(text_segment.terms, term) orelse return;
-        for (term_entry.postings) |posting| {
+        for (term_entry.postings, 0..) |posting, posting_index| {
+            if (posting_index % 64 == 0) try cancellation.check();
             scores[posting.doc_index] += posting.term_freq;
             matched_terms[posting.doc_index] += 1;
         }
     }
     for (scores, 0..) |score, doc_index| {
+        if (doc_index % 64 == 0) try cancellation.check();
         if (score == 0) continue;
         if (matched_terms[doc_index] == @as(u16, @intCast(query_terms.len))) {
             scores[doc_index] = score + @as(u32, @intCast(query_terms.len * 10));
@@ -1469,17 +1493,25 @@ fn accumulatePhrase(
     normalized_query: []const u8,
     seed_term: []const u8,
     scores: []u32,
-) void {
+    cancellation: CancellationToken,
+) !void {
     const seed = findTerm(text_segment.terms, seed_term) orelse return;
-    for (seed.postings) |posting| {
+    for (seed.postings, 0..) |posting, posting_index| {
+        if (posting_index % 64 == 0) try cancellation.check();
         const doc = text_segment.docs[posting.doc_index];
         if (std.mem.indexOf(u8, doc.normalized_text, normalized_query) == null) continue;
         scores[posting.doc_index] = 100 + posting.term_freq;
     }
 }
 
-fn accumulatePrefixAnyTerms(text_segment: text_segment_mod.Segment, query_terms: []const []const u8, scores: []u32) void {
-    for (text_segment.terms) |term_entry| {
+fn accumulatePrefixAnyTerms(
+    text_segment: text_segment_mod.Segment,
+    query_terms: []const []const u8,
+    scores: []u32,
+    cancellation: CancellationToken,
+) !void {
+    for (text_segment.terms, 0..) |term_entry, term_index| {
+        if (term_index % 64 == 0) try cancellation.check();
         var matched = false;
         for (query_terms) |prefix| {
             if (std.mem.startsWith(u8, term_entry.term, prefix)) {
@@ -1488,8 +1520,17 @@ fn accumulatePrefixAnyTerms(text_segment: text_segment_mod.Segment, query_terms:
             }
         }
         if (!matched) continue;
-        for (term_entry.postings) |posting| scores[posting.doc_index] += posting.term_freq;
+        for (term_entry.postings, 0..) |posting, posting_index| {
+            if (posting_index % 64 == 0) try cancellation.check();
+            scores[posting.doc_index] += posting.term_freq;
+        }
     }
+}
+
+fn quantizerCancellation(session: *const runtime_mod.QuerySession) ?vector_quantizer.CancellationToken {
+    const ptr = session.cancellation.ptr orelse return null;
+    const is_cancelled_fn = session.cancellation.is_cancelled_fn orelse return null;
+    return .{ .ptr = ptr, .is_cancelled_fn = is_cancelled_fn };
 }
 
 fn findTerm(terms: []const text_segment_mod.TermEntry, needle: []const u8) ?text_segment_mod.TermEntry {
@@ -1581,6 +1622,37 @@ test "normalizeAlloc lowercases and compresses whitespace" {
     const normalized = try normalizeAlloc(alloc, " Alpha\tBravo \n  Charlie ");
     defer alloc.free(normalized);
     try std.testing.expectEqualStrings("alpha bravo charlie", normalized);
+}
+
+test "serverless text postings scan stops at an inner-loop cancellation checkpoint" {
+    const State = struct {
+        checks: usize = 0,
+
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            return self.checks >= 3;
+        }
+    };
+
+    var state = State{};
+    const cancellation = CancellationToken{ .ptr = &state, .is_cancelled_fn = State.cancelled };
+    var postings: [65]text_segment_mod.Posting = undefined;
+    for (&postings) |*posting| posting.* = .{ .doc_index = 0, .term_freq = 1 };
+    var docs: [0]text_segment_mod.DocumentEntry = .{};
+    var terms = [_]text_segment_mod.TermEntry{.{
+        .term = @constCast("term"),
+        .postings = &postings,
+    }};
+    const segment = text_segment_mod.Segment{ .docs = &docs, .terms = &terms };
+    var scores = [_]u32{0};
+
+    try std.testing.expectError(
+        error.Canceled,
+        accumulateAnyTerms(segment, &.{"term"}, &scores, cancellation),
+    );
+    try std.testing.expectEqual(@as(usize, 3), state.checks);
+    try std.testing.expectEqual(@as(u32, 64), scores[0]);
 }
 
 test "indexed reader uses text postings for all-term and prefix search" {

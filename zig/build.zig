@@ -2821,6 +2821,14 @@ pub fn build(b: *std.Build) void {
     const lib_vectorindex_test_step = b.step("lib-vectorindex-test", "Run standalone lib/vectorindex tests");
     lib_vectorindex_test_step.dependOn(&run_lib_vectorindex_tests.step);
 
+    const vector_cancellation_tests = b.addTest(.{
+        .root_module = vector_mod,
+        .filters = &.{"RaBitQuantizer checks cancellation inside distance scans"},
+    });
+    const run_vector_cancellation_tests = b.addRunArtifact(vector_cancellation_tests);
+    const vector_cancellation_test_step = b.step("lib-vector-cancellation-test", "Run bounded vector-kernel cancellation tests");
+    vector_cancellation_test_step.dependOn(&run_vector_cancellation_tests.step);
+
     const lib_chunking_tests = b.addTest(.{
         .root_module = chunking_mod,
     });
@@ -6408,6 +6416,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_generating_tests.step);
     unit_test_step.dependOn(&run_lib_embeddings_tests.step);
     unit_test_step.dependOn(&run_lib_vectorindex_tests.step);
+    unit_test_step.dependOn(&run_vector_cancellation_tests.step);
     unit_test_step.dependOn(&run_lib_chunking_tests.step);
     unit_test_step.dependOn(&run_lib_generating_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_tests.step);

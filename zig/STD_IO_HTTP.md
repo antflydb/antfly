@@ -40,8 +40,12 @@ that end state:
   it before and after dispatch; semantic embedding, artifact fetches, indexed
   result materialization, graph traversal, join scans, foreign queries, and
   synchronous write-publication waits have bounded cancellation checkpoints.
-  Contextual public-table callbacks keep that lifetime outside serializable
-  query and write command types. The native adapter also preserves typed retry
+  Provider pacing sleeps poll the same token, and text/sparse postings plus
+  RaBitQ distance scans check it inside their potentially large inner loops.
+  Public-table callbacks have one required contextual signature rather than
+  legacy plus optional cancellation variants, keeping the request lifetime
+  outside serializable query and write command types without a fallback path
+  that can silently drop it. The native adapter also preserves typed retry
   metadata, and both adapters route on the parsed path rather than the
   query-bearing raw target.
 - Cancellable outbound requests own the complete resolve/connect/request

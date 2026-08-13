@@ -3933,7 +3933,14 @@ pub const AntflyApiHandler = struct {
         };
         if (try self.acquirePublicOperation(ctx, "batchWrite")) |response| return response;
         defer self.releasePublicOperation("batchWrite");
-        return try handleTableBatchOffEventLoop(ctx, self.api_server.cfg.backend_runtime, decoded_table_name, body_data, self.api_server.tableApi());
+        var cancellation = requestCancellation(ctx);
+        return try handleTableBatchOffEventLoop(
+            ctx,
+            self.api_server.cfg.backend_runtime,
+            decoded_table_name,
+            body_data,
+            self.api_server.tableApiWithCancellation(cancellation.token()),
+        );
     }
 
     pub fn linearMerge(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {

@@ -4245,11 +4245,8 @@ pub const HttpHandler = struct {
             .cancellation = cancellation,
             .vtable = &.{
                 .execute_table_batch = executePublicTableBatch,
-                .execute_table_batch_with_cancellation = executePublicTableBatchWithCancellation,
                 .execute_table_query_request = executePublicTableQueryRequest,
-                .execute_table_query_request_with_cancellation = executePublicTableQueryRequestWithCancellation,
                 .execute_table_query_view = executePublicTableQueryView,
-                .execute_table_query_view_with_cancellation = executePublicTableQueryViewWithCancellation,
                 .execute_table_backup = executePublicTableBackup,
                 .execute_table_restore = executePublicTableRestore,
                 .execute_table_list_indexes = executePublicTableListIndexes,
@@ -4261,15 +4258,6 @@ pub const HttpHandler = struct {
     }
 
     fn executePublicTableBatch(
-        ptr: *anyopaque,
-        alloc: Allocator,
-        table_name: []const u8,
-        req: db_types.BatchRequest,
-    ) public_table_http.TableApi.ExecuteBatchError!void {
-        return executePublicTableBatchWithCancellation(ptr, alloc, table_name, req, null);
-    }
-
-    fn executePublicTableBatchWithCancellation(
         ptr: *anyopaque,
         alloc: Allocator,
         table_name: []const u8,
@@ -4473,16 +4461,6 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         body: []const u8,
         row_filter_json: ?[]const u8,
-    ) public_table_http.TableApi.ExecuteQueryError![]u8 {
-        return executePublicTableQueryRequestWithCancellation(ptr, alloc, table_name, body, row_filter_json, null);
-    }
-
-    fn executePublicTableQueryRequestWithCancellation(
-        ptr: *anyopaque,
-        alloc: Allocator,
-        table_name: []const u8,
-        body: []const u8,
-        row_filter_json: ?[]const u8,
         cancellation: ?CancellationToken,
     ) public_table_http.TableApi.ExecuteQueryError![]u8 {
         _ = alloc;
@@ -4507,15 +4485,6 @@ pub const HttpHandler = struct {
     }
 
     fn executePublicTableQueryView(
-        ptr: *anyopaque,
-        alloc: Allocator,
-        table_name: []const u8,
-        view: public_table_http.TableApi.TableQueryView,
-    ) public_table_http.TableApi.ExecuteQueryViewError![]u8 {
-        return executePublicTableQueryViewWithCancellation(ptr, alloc, table_name, view, null);
-    }
-
-    fn executePublicTableQueryViewWithCancellation(
         ptr: *anyopaque,
         alloc: Allocator,
         table_name: []const u8,

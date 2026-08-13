@@ -7169,8 +7169,16 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn tableApi(self: *ApiHttpServer) public_table_http.TableApi {
+        return self.tableApiWithCancellation(null);
+    }
+
+    pub fn tableApiWithCancellation(
+        self: *ApiHttpServer,
+        cancellation: ?CancellationToken,
+    ) public_table_http.TableApi {
         return .{
             .ptr = self,
+            .cancellation = cancellation,
             .vtable = &.{
                 .execute_table_batch = executePublicTableBatch,
                 .execute_table_query_request = executePublicTableQueryRequest,
@@ -7208,8 +7216,10 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
+        cancellation: ?CancellationToken,
     ) public_table_http.TableApi.ExecuteBatchError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        ensureRequestActive(cancellation) catch return error.Canceled;
         const source = self.table_writes orelse return error.NotFound;
         self.validateTableWritesAgainstSchema(table_name, req.writes) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidBatchRequest,
@@ -7231,6 +7241,10 @@ pub const ApiHttpServer = struct {
             .transforms = req.transforms,
             .predicates = req.predicates,
         }};
+        // Cancellation is safe before commit begins. Once commitBatch enters
+        // the transaction protocol, preserve its typed outcome instead of
+        // reporting cancellation for a write that may already be durable.
+        ensureRequestActive(cancellation) catch return error.Canceled;
         const outcome = (source.commitBatch(alloc, &tables, req.sync_level) catch |err| switch (err) {
             error.InvalidBatchRequest,
             error.InvalidArgument,
@@ -7292,10 +7306,11 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
         row_filter_json: ?[]const u8,
+        cancellation: ?CancellationToken,
     ) public_table_http.TableApi.ExecuteQueryError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_reads orelse return error.NotFound;
-        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, null) catch |err| switch (err) {
+        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -7321,6 +7336,7 @@ pub const ApiHttpServer = struct {
             error.EmbedRateLimited => return error.EmbedRateLimited,
             error.EmbedTransientFailure => return error.EmbedTransientFailure,
             error.EmbedUpstreamFailure => return error.EmbedUpstreamFailure,
+            error.Cancelled => return error.Canceled,
             error.InvalidManifest => return error.InvalidManifest,
             error.InvalidTableFile => return error.InvalidTableFile,
             error.TableBlockChecksumMismatch => return error.TableBlockChecksumMismatch,
@@ -8342,6 +8358,7 @@ pub const ApiHttpServer = struct {
         _: std.mem.Allocator,
         _: []const u8,
         _: public_table_http.TableApi.TableQueryView,
+        _: ?CancellationToken,
     ) public_table_http.TableApi.ExecuteQueryViewError![]u8 {
         return error.NotFound;
     }

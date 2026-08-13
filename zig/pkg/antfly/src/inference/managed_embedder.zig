@@ -193,6 +193,7 @@ pub const QueryTemplateError = error{
 
 const default_pacing_burst: u32 = 1;
 const pacing_safety_margin_ns: u64 = 50 * std.time.ns_per_ms;
+const pacing_cancellation_poll_ns: u64 = 5 * std.time.ns_per_ms;
 const max_embedding_request_timeout_ms: u64 = 30_000;
 const query_cache_secret_refresh_interval_ns: u64 = std.time.ns_per_s;
 const dimension_probe_text = "antfly embedding dimension probe";
@@ -235,9 +236,15 @@ const RequestPacer = struct {
         };
     }
 
-    fn acquire(self: *RequestPacer, io: std.Io, deadline_ns: ?u64) !void {
+    fn acquire(
+        self: *RequestPacer,
+        io: std.Io,
+        deadline_ns: ?u64,
+        cancellation: ?CancellationToken,
+    ) !void {
         if (self.capacity <= 1.0) {
             while (true) {
+                if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
                 lockAtomic(&self.mutex);
                 const now_ns = monotonicNowNs();
                 if (now_ns >= self.next_send_ns) {
@@ -253,11 +260,12 @@ const RequestPacer = struct {
                     }
                 }
                 self.mutex.unlock();
-                try io.sleep(.fromNanoseconds(@intCast(wait_ns)), .awake);
+                try io.sleep(.fromNanoseconds(@intCast(@min(wait_ns, pacing_cancellation_poll_ns))), .awake);
             }
         }
 
         while (true) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             lockAtomic(&self.mutex);
             const now_ns = monotonicNowNs();
             const elapsed_ns = now_ns - self.last_refill_ns;
@@ -277,7 +285,7 @@ const RequestPacer = struct {
             if (deadline_ns) |deadline| {
                 if (now_ns >= deadline or wait_ns >= deadline - now_ns) return error.Timeout;
             }
-            try io.sleep(.fromNanoseconds(@intCast(wait_ns)), .awake);
+            try io.sleep(.fromNanoseconds(@intCast(@min(wait_ns, pacing_cancellation_poll_ns))), .awake);
         }
     }
 };
@@ -941,7 +949,7 @@ fn hashQueryCacheSecretIdentity(hasher: *std.crypto.hash.sha2.Sha256, maybe_secr
 fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) !void {
     try ensureEntryDeadline(entry);
     const pacer = entry.pacer orelse return;
-    try pacer.acquire(embeddingIo(entry), entry.deadline_ns);
+    try pacer.acquire(embeddingIo(entry), entry.deadline_ns, entry.cancellation);
     try ensureEntryDeadline(entry);
 }
 
@@ -980,10 +988,26 @@ fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientC
 pub fn testEmbeddingProviderDeadlines() !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     var pacer = RequestPacer.init(60, 1);
-    try pacer.acquire(io, null);
+    try pacer.acquire(io, null, null);
     try std.testing.expect(pacer.mutex.tryLock());
     pacer.mutex.unlock();
-    try std.testing.expectError(error.Timeout, pacer.acquire(io, monotonicNowNs() + std.time.ns_per_ms));
+    try std.testing.expectError(error.Timeout, pacer.acquire(io, monotonicNowNs() + std.time.ns_per_ms, null));
+
+    const CancelAfterFirstPacingSlice = struct {
+        checks: usize = 0,
+
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            return self.checks >= 2;
+        }
+    };
+    var cancelled = CancelAfterFirstPacingSlice{};
+    try std.testing.expectError(
+        error.Cancelled,
+        pacer.acquire(io, null, .{ .ptr = &cancelled, .is_cancelled_fn = CancelAfterFirstPacingSlice.cancelled }),
+    );
+    try std.testing.expectEqual(@as(usize, 2), cancelled.checks);
 
     const indexes_json =
         \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small"}}}
