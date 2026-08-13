@@ -22,6 +22,7 @@ const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const api_operation = @import("operation.zig");
 const search_pattern_filter = @import("../search/pattern_filter.zig");
 const backups_api = @import("backups.zig");
 const restore_jobs = @import("restore_jobs.zig");
@@ -7168,17 +7169,13 @@ pub const ApiHttpServer = struct {
         return enriched;
     }
 
-    pub fn tableApi(self: *ApiHttpServer) public_table_http.TableApi {
-        return self.tableApiWithCancellation(null);
-    }
-
-    pub fn tableApiWithCancellation(
+    pub fn tableApi(
         self: *ApiHttpServer,
-        cancellation: ?CancellationToken,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi {
         return .{
             .ptr = self,
-            .cancellation = cancellation,
+            .request = request,
             .vtable = &.{
                 .execute_table_batch = executePublicTableBatch,
                 .execute_table_query_request = executePublicTableQueryRequest,
@@ -7216,10 +7213,10 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
-        cancellation: ?CancellationToken,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBatchError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        ensureRequestActive(cancellation) catch return error.Canceled;
+        try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
         self.validateTableWritesAgainstSchema(table_name, req.writes) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidBatchRequest,
@@ -7244,7 +7241,7 @@ pub const ApiHttpServer = struct {
         // Cancellation is safe before commit begins. Once commitBatch enters
         // the transaction protocol, preserve its typed outcome instead of
         // reporting cancellation for a write that may already be durable.
-        ensureRequestActive(cancellation) catch return error.Canceled;
+        try ensureTableOperationActive(request);
         const outcome = (source.commitBatch(alloc, &tables, req.sync_level) catch |err| switch (err) {
             error.InvalidBatchRequest,
             error.InvalidArgument,
@@ -7306,11 +7303,12 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
         row_filter_json: ?[]const u8,
-        cancellation: ?CancellationToken,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteQueryError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_reads orelse return error.NotFound;
-        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, cancellation) catch |err| switch (err) {
+        try ensureTableOperationActive(request);
+        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -7336,7 +7334,7 @@ pub const ApiHttpServer = struct {
             error.EmbedRateLimited => return error.EmbedRateLimited,
             error.EmbedTransientFailure => return error.EmbedTransientFailure,
             error.EmbedUpstreamFailure => return error.EmbedUpstreamFailure,
-            error.Cancelled => return error.Canceled,
+            error.Cancelled, error.Canceled => return error.Canceled,
             error.InvalidManifest => return error.InvalidManifest,
             error.InvalidTableFile => return error.InvalidTableFile,
             error.TableBlockChecksumMismatch => return error.TableBlockChecksumMismatch,
@@ -8358,7 +8356,7 @@ pub const ApiHttpServer = struct {
         _: std.mem.Allocator,
         _: []const u8,
         _: public_table_http.TableApi.TableQueryView,
-        _: ?CancellationToken,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteQueryViewError![]u8 {
         return error.NotFound;
     }
@@ -8372,8 +8370,10 @@ pub const ApiHttpServer = struct {
         location_uri: []const u8,
         connection: []const u8,
         location: *backups_api.BackupLocation,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         self.source.ensureLinearizableRead() catch |err| {
             std.log.warn("table backup metadata read barrier failed phase=admission class={s}", .{@errorName(err)});
             return metadataAccessFailure(err);
@@ -8413,8 +8413,10 @@ pub const ApiHttpServer = struct {
         location_uri: []const u8,
         connection: []const u8,
         location: *backups_api.BackupLocation,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteRestoreError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         if (!self.cfg.deployment_mode.isStandalone()) {
             var manifest = backups_api.readManifestFromLocation(self.alloc, location, backup_id) catch |err| switch (err) {
                 error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
@@ -8496,8 +8498,10 @@ pub const ApiHttpServer = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteListIndexesError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         if (tables_api.findTableByName(&snapshot, table_name) == null) return error.NotFound;
@@ -8516,8 +8520,10 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         index_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
@@ -8537,8 +8543,10 @@ pub const ApiHttpServer = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteListArtifactEnrichmentsError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
@@ -8551,8 +8559,10 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         index_name: []const u8,
         body: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteCreateIndexError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
         const index_json = table_contract.parseCreateIndexRequest(alloc, index_name, body) catch {
@@ -8612,6 +8622,10 @@ pub const ApiHttpServer = struct {
         const stored_index_json = (indexes_api.storedIndexConfigJsonAlloc(alloc, expected_indexes_json, index_name) catch return error.InternalFailure) orelse return error.InternalFailure;
         defer alloc.free(stored_index_json);
 
+        // Catalog mutation is the irreversible boundary. Observe cancellation
+        // after all potentially expensive validation, but never claim a
+        // canceled result once consensus may have committed the mutation.
+        try ensureTableOperationActive(request);
         self.source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
@@ -8670,10 +8684,13 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         index_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteDeleteIndexError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
+        try ensureTableOperationActive(request);
         self.source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
@@ -8714,8 +8731,10 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         artifact_name: []const u8,
         body: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecutePutArtifactEnrichmentError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
         const enrichment_json = table_contract.parseArtifactEnrichmentRequest(alloc, artifact_name, body) catch {
@@ -8733,6 +8752,7 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
 
+        try ensureTableOperationActive(request);
         self.source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
@@ -8768,8 +8788,10 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         artifact_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteDeleteArtifactEnrichmentError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
         const expected_indexes_json = (indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table_before.indexes_json, artifact_name) catch return error.InternalFailure) orelse {
@@ -8781,6 +8803,7 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
 
+        try ensureTableOperationActive(request);
         self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
@@ -8814,8 +8837,10 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const source = self.table_reads orelse return error.NotFound;
         return (source.documentArtifactManifest(alloc, table_name, doc_key, artifact_name, .read_index) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
@@ -8838,8 +8863,10 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         doc_key: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteDocumentArtifactManifestsError!db_mod.types.DocumentArtifactManifestList {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const source = self.table_reads orelse return error.NotFound;
         return (source.documentArtifactManifests(alloc, table_name, doc_key, .read_index) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
@@ -8863,9 +8890,12 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteReprocessDocumentArtifactError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
+        try ensureTableOperationActive(request);
         const handled = source.reprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.InvalidArgument, error.NotFound => return error.NotFound,
@@ -8884,8 +8914,10 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         artifact_name: []const u8,
         req: db_mod.types.DocumentArtifactTableReprocessRequest,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteReprocessDocumentArtifactRangeError!db_mod.types.DocumentArtifactTableReprocessResult {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
         return (source.reprocessDocumentArtifactRange(alloc, table_name, artifact_name, req) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
@@ -9709,7 +9741,7 @@ pub const ApiHttpServer = struct {
         comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.batch) == .write);
         if (!self.tryAcquireWrite()) return error.RequestAdmissionExhausted;
         defer self.releaseWrite();
-        var response = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi());
+        var response = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi(.{}));
         defer response.deinit(self.alloc);
         if (response.status < 200 or response.status >= 300) return error.ExtensionHostApiFailed;
         return try result_alloc.dupe(u8, response.body);
@@ -9790,17 +9822,17 @@ pub const ApiHttpServer = struct {
                 return contextual_operations.json(body, false);
             },
             .list_indexes => |request| {
-                var response = try public_table_http.handleTableListIndexes(self.alloc, request.table_name, self.tableApi());
+                var response = try public_table_http.handleTableListIndexes(self.alloc, request.table_name, self.tableApi(.{}));
                 defer response.deinit(self.alloc);
                 return try contextualResponseFromPublicTable(self.alloc, response);
             },
             .create_index => |request| {
-                var response = try public_table_http.handleTableCreateIndex(self.alloc, request.table_name, request.index_name, request.body, self.tableApi());
+                var response = try public_table_http.handleTableCreateIndex(self.alloc, request.table_name, request.index_name, request.body, self.tableApi(.{}));
                 defer response.deinit(self.alloc);
                 return try contextualResponseFromPublicTable(self.alloc, response);
             },
             .drop_index => |request| {
-                var response = try public_table_http.handleTableDeleteIndex(self.alloc, request.table_name, request.index_name, self.tableApi());
+                var response = try public_table_http.handleTableDeleteIndex(self.alloc, request.table_name, request.index_name, self.tableApi(.{}));
                 defer response.deinit(self.alloc);
                 return try contextualResponseFromPublicTable(self.alloc, response);
             },
@@ -9822,7 +9854,7 @@ pub const ApiHttpServer = struct {
                     self.alloc,
                     request.table_name,
                     request.body,
-                    self.tableApi(),
+                    self.tableApi(.{}),
                     self.cfg.secret_store,
                     self.cfg.node_config,
                     self.sharedApiIo(),
@@ -9841,7 +9873,7 @@ pub const ApiHttpServer = struct {
                 return try cloneContextualResponse(self.alloc, response);
             },
             .batch => |request| {
-                var response = try public_table_http.handleTableBatch(self.alloc, request.table_name, request.body, self.tableApi());
+                var response = try public_table_http.handleTableBatch(self.alloc, request.table_name, request.body, self.tableApi(.{}));
                 defer response.deinit(self.alloc);
                 return try contextualResponseFromPublicTable(self.alloc, response);
             },
@@ -11168,6 +11200,7 @@ pub const ApiHttpServer = struct {
                         state.location,
                         state.connection,
                         &location,
+                        .{},
                     ) catch |err| switch (err) {
                         // The local owned-table path reports durable completion as
                         // a sentinel because the public callback otherwise has no
@@ -11809,6 +11842,14 @@ fn ensureRequestActive(cancellation: ?CancellationToken) !void {
     if (cancellation) |value| {
         if (value.isCancelled()) return error.Cancelled;
     }
+}
+
+fn ensureTableOperationActive(request: api_operation.RequestContext) error{ Canceled, DeadlineExceeded }!void {
+    request.ensureActive() catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.DeadlineExceeded => return error.DeadlineExceeded,
+        else => unreachable,
+    };
 }
 
 fn sleepNsCancellable(duration_ns: u64, cancellation: ?CancellationToken) !void {

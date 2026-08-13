@@ -3933,13 +3933,12 @@ pub const AntflyApiHandler = struct {
         };
         if (try self.acquirePublicOperation(ctx, "batchWrite")) |response| return response;
         defer self.releasePublicOperation("batchWrite");
-        var cancellation = requestCancellation(ctx);
         return try handleTableBatchOffEventLoop(
             ctx,
             self.api_server.cfg.backend_runtime,
             decoded_table_name,
             body_data,
-            self.api_server.tableApiWithCancellation(cancellation.token()),
+            self.api_server.tableApi(operationContext(ctx, authenticated_identity)),
         );
     }
 
@@ -3993,7 +3992,9 @@ pub const AntflyApiHandler = struct {
             writes,
             decoded_table_name,
             merge_req,
+            operationContext(ctx, authenticated_identity),
         ) catch |err| switch (err) {
+            error.Canceled, error.DeadlineExceeded => return err,
             error.InvalidLinearMergeRequest, error.InvalidBatchRequest => {
                 _ = ctx.status(400);
                 return ctx.text("invalid linear merge request");
@@ -4014,7 +4015,7 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
-        var resp = try public_table_http.handleTableBackup(ctx.allocator, decoded_table_name, body_data, self.api_server.tableApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo());
+        var resp = try public_table_http.handleTableBackup(ctx.allocator, decoded_table_name, body_data, self.api_server.tableApi(operationContext(ctx, authenticated_identity)), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo());
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4306,7 +4307,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        var resp = try public_table_http.handleDocumentArtifactManifest(alloc, decoded_table_name, decoded_key, decoded_artifact_name, opts, self.api_server.tableApi());
+        var resp = try public_table_http.handleDocumentArtifactManifest(alloc, decoded_table_name, decoded_key, decoded_artifact_name, opts, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4334,7 +4335,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        var resp = try public_table_http.handleDocumentArtifactManifests(alloc, decoded_table_name, decoded_key, opts, self.api_server.tableApi());
+        var resp = try public_table_http.handleDocumentArtifactManifests(alloc, decoded_table_name, decoded_key, opts, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4344,7 +4345,7 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
-        var resp = try public_table_http.handleListArtifactEnrichments(ctx.allocator, decoded_table_name, self.api_server.tableApi());
+        var resp = try public_table_http.handleListArtifactEnrichments(ctx.allocator, decoded_table_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4439,7 +4440,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        var resp = try public_table_http.handleReprocessDocumentArtifact(alloc, decoded_table_name, decoded_key, decoded_artifact_name, self.api_server.tableApi());
+        var resp = try public_table_http.handleReprocessDocumentArtifact(alloc, decoded_table_name, decoded_key, decoded_artifact_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4453,7 +4454,7 @@ pub const AntflyApiHandler = struct {
         const decoded_artifact_name = (try decodePathParamOrBadRequest(ctx, artifact_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_artifact_name);
         const body_data = (try ctx.body()) orelse "";
-        var resp = try public_table_http.handleReprocessDocumentArtifactRange(alloc, decoded_table_name, decoded_artifact_name, body_data, self.api_server.tableApi());
+        var resp = try public_table_http.handleReprocessDocumentArtifactRange(alloc, decoded_table_name, decoded_artifact_name, body_data, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4504,7 +4505,7 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
-        var resp = try public_table_http.handleTableListIndexes(ctx.allocator, decoded_table_name, self.api_server.tableApi());
+        var resp = try public_table_http.handleTableListIndexes(ctx.allocator, decoded_table_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4523,7 +4524,7 @@ pub const AntflyApiHandler = struct {
             defer ctx.allocator.free(debug_body);
             return jsonResponse(ctx, 200, debug_body);
         }
-        var resp = try public_table_http.handleTableGetIndex(ctx.allocator, decoded_table_name, decoded_index_name, self.api_server.tableApi());
+        var resp = try public_table_http.handleTableGetIndex(ctx.allocator, decoded_table_name, decoded_index_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4536,7 +4537,7 @@ pub const AntflyApiHandler = struct {
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
         const body_data = (try ctx.body()) orelse "";
-        var resp = try public_table_http.handleTableCreateIndex(ctx.allocator, decoded_table_name, decoded_index_name, body_data, self.api_server.tableApi());
+        var resp = try public_table_http.handleTableCreateIndex(ctx.allocator, decoded_table_name, decoded_index_name, body_data, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4548,7 +4549,7 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
-        var resp = try public_table_http.handleTableDeleteIndex(ctx.allocator, decoded_table_name, decoded_index_name, self.api_server.tableApi());
+        var resp = try public_table_http.handleTableDeleteIndex(ctx.allocator, decoded_table_name, decoded_index_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4562,7 +4563,7 @@ pub const AntflyApiHandler = struct {
         const decoded_artifact_name = (try decodePathParamOrBadRequest(ctx, artifact_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_artifact_name);
         const body_data = (try ctx.body()) orelse "";
-        var resp = try public_table_http.handlePutArtifactEnrichment(alloc, decoded_table_name, decoded_artifact_name, body_data, self.api_server.tableApi());
+        var resp = try public_table_http.handlePutArtifactEnrichment(alloc, decoded_table_name, decoded_artifact_name, body_data, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4575,7 +4576,7 @@ pub const AntflyApiHandler = struct {
         defer alloc.free(decoded_table_name);
         const decoded_artifact_name = (try decodePathParamOrBadRequest(ctx, artifact_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_artifact_name);
-        var resp = try public_table_http.handleDeleteArtifactEnrichment(alloc, decoded_table_name, decoded_artifact_name, self.api_server.tableApi());
+        var resp = try public_table_http.handleDeleteArtifactEnrichment(alloc, decoded_table_name, decoded_artifact_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 

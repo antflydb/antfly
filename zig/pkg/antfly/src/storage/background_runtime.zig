@@ -396,11 +396,17 @@ pub const BackendRuntime = struct {
     pub const ApiLaneLease = struct {
         runtime: *BackendRuntime,
         borrowed_io: Io,
+        concurrent_capacity: u32,
         released: bool = false,
 
         pub fn io(self: *const ApiLaneLease) Io {
             std.debug.assert(!self.released);
             return self.borrowed_io;
+        }
+
+        pub fn concurrentCapacity(self: *const ApiLaneLease) u32 {
+            std.debug.assert(!self.released);
+            return self.concurrent_capacity;
         }
 
         pub fn release(self: *ApiLaneLease) void {
@@ -427,7 +433,11 @@ pub const BackendRuntime = struct {
         }
         updateAtomicMax(&self.api_lane_peak_leases, leases);
         _ = self.api_lane_acquisitions_total.fetchAdd(1, .monotonic);
-        return .{ .runtime = self, .borrowed_io = borrowed_io };
+        return .{
+            .runtime = self,
+            .borrowed_io = borrowed_io,
+            .concurrent_capacity = threaded_io_limits.service,
+        };
     }
 
     pub fn outstandingApiLeases(self: *const BackendRuntime) usize {

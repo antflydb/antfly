@@ -98,6 +98,15 @@ pub const H1DisconnectCancellation = enum {
     disabled,
 };
 
+pub const ConnectionExecution = enum {
+    /// Every accepted connection must be submitted to the injected Io
+    /// executor. Saturation rejects the connection without blocking accept.
+    concurrent,
+    /// Deliberately serve one connection at a time on the calling thread.
+    /// This is an explicit embedding mode, never a saturation fallback.
+    serial,
+};
+
 /// Server configuration.
 pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
@@ -115,6 +124,10 @@ pub const ServerConfig = struct {
     response_write_timeout_ms: u64 = 30_000,
     keep_alive_timeout_ms: u64 = 60_000,
     max_connections: u32 = 1000,
+    /// Known concurrent-task capacity of the injected connection executor.
+    /// When provided, bind fails if max_connections exceeds it.
+    connection_executor_capacity: ?u32 = null,
+    connection_execution: ConnectionExecution = .concurrent,
     /// Optional transport runtime shared by multiple listeners. When absent,
     /// the Server owns a private runtime sized to its connection limit.
     http_runtime: ?*HttpRuntime = null,
@@ -160,9 +173,13 @@ pub const ServerConfig = struct {
     tls_key_path: ?[]const u8 = null,
 };
 
-fn routeErrorStatus(err: anyerror) u16 {
+/// Maps an application error to an HTTP response. Cancellation has no status:
+/// its transport or shutdown source already made response delivery invalid.
+fn routeErrorStatus(err: anyerror) ?u16 {
     return switch (err) {
+        error.Canceled => null,
         error.Timeout => 408,
+        error.DeadlineExceeded => 504,
         error.BodyTooLarge, error.StreamTooLong, error.ValueTooLong => 413,
         error.BodyCapacityExceeded => 429,
         error.EndOfStream,
@@ -1028,6 +1045,8 @@ pub const Server = struct {
         peak_active_requests: usize,
         accept_errors_total: u64,
         connection_timeouts_total: u64,
+        connection_dispatch_rejections_total: u64,
+        request_cancellations_total: u64,
         body_buffer_capacity_bytes: usize,
         body_buffer_in_use_bytes: usize,
         body_buffer_peak_bytes: usize,
@@ -1060,6 +1079,8 @@ pub const Server = struct {
     peak_active_requests: std.atomic.Value(usize) = .init(0),
     accept_errors_total: std.atomic.Value(u64) = .init(0),
     connection_timeouts_total: std.atomic.Value(u64) = .init(0),
+    connection_dispatch_rejections_total: std.atomic.Value(u64) = .init(0),
+    request_cancellations_total: std.atomic.Value(u64) = .init(0),
     connection_controls_mutex: std.atomic.Mutex = .unlocked,
     connection_controls: std.ArrayListUnmanaged(*ConnectionControl) = .empty,
     connections: Io.Group = Io.Group.init,
@@ -1118,6 +1139,7 @@ pub const Server = struct {
         pub fn start(self: *ListenerTask) !void {
             if (self.state != .initialized) return error.ListenerTaskAlreadyStarted;
             try self.server.bind();
+            self.io = self.server.http_runtime_lease.listenerIo();
             const run_state = try self.server.allocator.create(RunState);
             run_state.* = .{ .server = self.server };
             self.run_state = run_state;
@@ -1259,6 +1281,8 @@ pub const Server = struct {
             .peak_active_requests = self.peak_active_requests.load(.acquire),
             .accept_errors_total = self.accept_errors_total.load(.acquire),
             .connection_timeouts_total = self.connection_timeouts_total.load(.acquire),
+            .connection_dispatch_rejections_total = self.connection_dispatch_rejections_total.load(.acquire),
+            .request_cancellations_total = self.request_cancellations_total.load(.acquire),
             .body_buffer_capacity_bytes = body.capacity,
             .body_buffer_in_use_bytes = body.in_use,
             .body_buffer_peak_bytes = body.peak_in_use,
@@ -1364,6 +1388,12 @@ pub const Server = struct {
     /// (useful when port 0 is used for OS-assigned ports).
     pub fn bind(self: *Self) !void {
         if (self.listener != null) return;
+        if (self.config.connection_execution == .concurrent) {
+            if (self.config.connection_executor_capacity) |capacity| {
+                if (self.config.max_connections > capacity)
+                    return error.ConnectionExecutorCapacityExceeded;
+            }
+        }
         const observer_capacity = if (self.config.h1_disconnect_cancellation == .required)
             self.config.max_connections
         else
@@ -1396,9 +1426,9 @@ pub const Server = struct {
     }
 
     /// Starts the server and begins accepting connections.
-    /// Uses Io.Group.concurrent to spawn a fiber per connection when
-    /// the Io backend supports it (Kqueue on macOS, io_uring on Linux).
-    /// Falls back to synchronous handling if concurrency is unavailable.
+    /// Uses Io.Group.concurrent to spawn a fiber per connection. Executor
+    /// saturation rejects that connection and leaves the accept loop live.
+    /// Callers that require serial serving must select `.serial` explicitly.
     pub fn listen(self: *Self) !void {
         // A server is single-use once stopped. In particular, do not let a
         // startup/shutdown race re-bind a listener after its owner has begun
@@ -1463,7 +1493,6 @@ pub const Server = struct {
             }
 
             // Spawn a lightweight fiber to handle this connection concurrently.
-            // If the Io backend doesn't support concurrency, fall back to sync.
             const connection = self.allocator.create(ConnectionContext) catch {
                 var rejected_socket = conn.socket;
                 rejected_socket.close();
@@ -1485,12 +1514,20 @@ pub const Server = struct {
             };
             const active = self.active_connections.fetchAdd(1, .acq_rel) + 1;
             updateAtomicMax(&self.peak_active_connections, active);
-            self.connections.concurrent(self.io, handleConnectionFiber, .{ self, connection }) catch {
-                self.handleConnection(connection) catch |err| {
+            switch (self.config.connection_execution) {
+                .serial => self.handleConnection(connection) catch |err| {
                     self.recordConnectionError(err);
                     logConnectionError(err);
-                };
-            };
+                },
+                .concurrent => self.connections.concurrent(self.io, handleConnectionFiber, .{ self, connection }) catch {
+                    _ = self.connection_dispatch_rejections_total.fetchAdd(1, .monotonic);
+                    _ = self.active_connections.fetchSub(1, .acq_rel);
+                    self.unregisterConnection(&connection.control);
+                    connection.socket.close();
+                    self.allocator.destroy(connection);
+                    self.conn_semaphore.post(self.io);
+                },
+            }
         }
 
         self.running = false;
@@ -1581,6 +1618,21 @@ pub const Server = struct {
 
     fn recordConnectionError(self: *Self, err: anyerror) void {
         if (err == error.Timeout) _ = self.connection_timeouts_total.fetchAdd(1, .monotonic);
+    }
+
+    fn routeErrorResponseStatus(self: *Self, err: anyerror) ?u16 {
+        const status = routeErrorStatus(err);
+        if (status == null) _ = self.request_cancellations_total.fetchAdd(1, .monotonic);
+        return status;
+    }
+
+    fn cancelH2Stream(h2: *H2Connection, sock: *Socket, stream_id: u31) void {
+        h2.write_mutex.lockUncancelable(h2.io);
+        defer h2.write_mutex.unlock(h2.io);
+        const stream = h2.stream_manager.getStream(stream_id) orelse return;
+        if (stream.state == .idle or stream.state == .closed) return;
+        h2.sendRstStream(sock, stream_id, .cancel) catch {};
+        stream.reset();
     }
 
     fn logConnectionError(err: anyerror) void {
@@ -1852,9 +1904,10 @@ pub const Server = struct {
 
             for (self.pre_route_hooks.items) |hook| {
                 hook(&ctx) catch |err| {
+                    const status = self.routeErrorResponseStatus(err) orelse return;
                     std.debug.print("Pre-route hook error: {}\n", .{err});
                     if (ctx.h1_stream_sent) return;
-                    return self.sendError(&sock, 500);
+                    return self.sendError(&sock, status);
                 };
             }
 
@@ -1877,12 +1930,13 @@ pub const Server = struct {
             var response: Response = undefined;
             if (route_result) |r| {
                 response = self.executeMiddleware(&ctx, r.handler) catch |err| {
+                    const status = self.routeErrorResponseStatus(err) orelse return;
                     std.debug.print("Route handler error: {}\n", .{err});
                     // Once streaming headers are committed, another HTTP
                     // response would corrupt the connection. Closing the
                     // connection is the only valid HTTP/1 terminal action.
                     if (ctx.h1_stream_sent) return;
-                    return self.sendError(&sock, routeErrorStatus(err));
+                    return self.sendError(&sock, status);
                 };
             } else {
                 var allow_methods: [16]types.Method = undefined;
@@ -1898,9 +1952,10 @@ pub const Server = struct {
                     try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
                 } else if (self.global_handler) |global_handler| {
                     response = self.executeMiddleware(&ctx, global_handler) catch |err| {
+                        const status = self.routeErrorResponseStatus(err) orelse return;
                         std.debug.print("Global handler error: {}\n", .{err});
                         if (ctx.h1_stream_sent) return;
-                        return self.sendError(&sock, 500);
+                        return self.sendError(&sock, status);
                     };
                 } else {
                     return self.sendError(&sock, 404);
@@ -2535,8 +2590,12 @@ pub const Server = struct {
         defer ctx.deinit();
 
         for (self.pre_route_hooks.items) |hook| {
-            hook(&ctx) catch {
-                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, 500);
+            hook(&ctx) catch |err| {
+                const status = self.routeErrorResponseStatus(err) orelse {
+                    cancelH2Stream(h2, sock, stream_id);
+                    return;
+                };
+                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
                 return;
             };
         }
@@ -2558,7 +2617,11 @@ pub const Server = struct {
         var response: Response = undefined;
         if (route_result) |r| {
             response = self.executeMiddleware(&ctx, r.handler) catch |err| {
-                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, routeErrorStatus(err));
+                const status = self.routeErrorResponseStatus(err) orelse {
+                    cancelH2Stream(h2, sock, stream_id);
+                    return;
+                };
+                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
                 return;
             };
         } else {
@@ -2575,8 +2638,12 @@ pub const Server = struct {
                 errdefer response.deinit();
                 try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
             } else if (self.global_handler) |global_handler| {
-                response = self.executeMiddleware(&ctx, global_handler) catch {
-                    if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, 500);
+                response = self.executeMiddleware(&ctx, global_handler) catch |err| {
+                    const status = self.routeErrorResponseStatus(err) orelse {
+                        cancelH2Stream(h2, sock, stream_id);
+                        return;
+                    };
+                    if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
                     return;
                 };
             } else {
@@ -3157,14 +3224,16 @@ test "ServerConfig defaults" {
 }
 
 test "routeErrorStatus maps oversized route errors to payload too large" {
-    try std.testing.expectEqual(@as(u16, 400), routeErrorStatus(error.SyntaxError));
-    try std.testing.expectEqual(@as(u16, 400), routeErrorStatus(error.MissingField));
-    try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.ValueTooLong));
-    try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.StreamTooLong));
-    try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.BodyTooLarge));
-    try std.testing.expectEqual(@as(u16, 429), routeErrorStatus(error.BodyCapacityExceeded));
-    try std.testing.expectEqual(@as(u16, 408), routeErrorStatus(error.Timeout));
-    try std.testing.expectEqual(@as(u16, 500), routeErrorStatus(error.UnexpectedRouteFailure));
+    try std.testing.expectEqual(@as(?u16, 400), routeErrorStatus(error.SyntaxError));
+    try std.testing.expectEqual(@as(?u16, 400), routeErrorStatus(error.MissingField));
+    try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.ValueTooLong));
+    try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.StreamTooLong));
+    try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.BodyTooLarge));
+    try std.testing.expectEqual(@as(?u16, 429), routeErrorStatus(error.BodyCapacityExceeded));
+    try std.testing.expectEqual(@as(?u16, 408), routeErrorStatus(error.Timeout));
+    try std.testing.expectEqual(@as(?u16, 504), routeErrorStatus(error.DeadlineExceeded));
+    try std.testing.expectEqual(@as(?u16, 500), routeErrorStatus(error.UnexpectedRouteFailure));
+    try std.testing.expectEqual(@as(?u16, null), routeErrorStatus(error.Canceled));
     try std.testing.expectEqualStrings(
         "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid request\"}",
         routeErrorBody(400),
@@ -3929,6 +3998,8 @@ test "accept backoff is normalized and bounded" {
     server.peak_active_requests.store(4, .release);
     server.accept_errors_total.store(7, .release);
     server.connection_timeouts_total.store(11, .release);
+    server.connection_dispatch_rejections_total.store(13, .release);
+    server.request_cancellations_total.store(17, .release);
     const stats = server.runtimeStats();
     try std.testing.expectEqual(@as(u32, 1000), stats.max_connections);
     try std.testing.expectEqual(@as(usize, 3), stats.active_connections);
@@ -3937,6 +4008,8 @@ test "accept backoff is normalized and bounded" {
     try std.testing.expectEqual(@as(usize, 4), stats.peak_active_requests);
     try std.testing.expectEqual(@as(u64, 7), stats.accept_errors_total);
     try std.testing.expectEqual(@as(u64, 11), stats.connection_timeouts_total);
+    try std.testing.expectEqual(@as(u64, 13), stats.connection_dispatch_rejections_total);
+    try std.testing.expectEqual(@as(u64, 17), stats.request_cancellations_total);
 }
 
 test "cross-thread stop wakes an ephemeral listener" {
@@ -4030,6 +4103,21 @@ test "bind establishes HTTP runtime ownership before publishing an address" {
     try std.testing.expectEqual(@as(usize, 0), http_runtime.stats().reserved_h1_request_capacity);
 }
 
+test "bind rejects a connection limit larger than the declared executor capacity" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{ .concurrent_limit = .limited(1) });
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 2,
+        .connection_executor_capacity = 1,
+    });
+    defer server.deinit();
+    try std.testing.expectError(error.ConnectionExecutorCapacityExceeded, server.bind());
+    try std.testing.expectEqual(@as(usize, 0), server.httpRuntimeStats().active_listener_leases);
+}
+
 test "bounded control listener serves without H1 observer capacity" {
     if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
@@ -4095,6 +4183,82 @@ test "listener task binds synchronously and joins before executor teardown" {
     try std.testing.expect(!server.running);
     // Joining is idempotent for cleanup paths.
     try task.join();
+}
+
+test "listener task does not consume the bounded connection executor" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{ .concurrent_limit = .limited(1) });
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 1,
+        .connection_executor_capacity = 1,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    try server.get("/ok", struct {
+        fn handle(ctx: *Context) anyerror!Response {
+            return ctx.text("ok");
+        }
+    }.handle);
+
+    var task = Server.ListenerTask.init(&server);
+    try task.start();
+    defer {
+        task.requestStop();
+        task.join() catch {};
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll("GET /ok HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    var response: [1024]u8 = undefined;
+    const response_len = try client.recv(&response);
+    try std.testing.expect(mem.indexOf(u8, response[0..response_len], "200") != null);
+    try std.testing.expectEqual(@as(u64, 0), server.runtimeStats().connection_dispatch_rejections_total);
+}
+
+test "canceled route is a response-free terminal transport outcome" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 1,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    try server.get("/cancel", struct {
+        fn handle(_: *Context) anyerror!Response {
+            return error.Canceled;
+        }
+    }.handle);
+
+    var task = Server.ListenerTask.init(&server);
+    try task.start();
+    defer {
+        task.requestStop();
+        task.join() catch {};
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll("GET /cancel HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    var response: [128]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try client.recv(&response));
+    try std.testing.expectEqual(@as(u64, 1), server.runtimeStats().request_cancellations_total);
 }
 
 test "listener task remains valid after its owning handle moves" {

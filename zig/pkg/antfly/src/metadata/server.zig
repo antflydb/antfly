@@ -517,6 +517,7 @@ const MetadataAdminHttpRuntime = struct {
                 .request_body_buffer_budget_bytes = cfg.max_request_bytes * @as(usize, max_active_requests),
                 .max_h1_inflight_bodies = max_active_requests,
                 .max_connections = max_connections,
+                .connection_executor_capacity = api_lane_lease.concurrentCapacity(),
                 .accept_error_backoff_initial_ms = cfg.accept_error_backoff_initial_ms,
                 .accept_error_backoff_max_ms = cfg.accept_error_backoff_max_ms,
                 .reuse_address = cfg.reuse_address,

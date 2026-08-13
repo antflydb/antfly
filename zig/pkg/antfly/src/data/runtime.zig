@@ -698,6 +698,7 @@ fn publicApiListenerConfig(bind_host: []const u8, bind_port: u16) antfly.raft.tr
 fn publicApiHttpxConfig(
     cfg: antfly.raft.transport.StdHttpListenerConfig,
     http_runtime: *httpx.HttpRuntime,
+    connection_executor_capacity: u32,
 ) httpx.ServerConfig {
     return .{
         .host = cfg.bind_host,
@@ -709,6 +710,7 @@ fn publicApiHttpxConfig(
         .request_body_buffer_budget_bytes = cfg.max_request_bytes * public_api_max_active_requests,
         .max_h1_inflight_bodies = public_api_max_active_requests,
         .max_connections = public_api_max_connection_threads,
+        .connection_executor_capacity = connection_executor_capacity,
         .accept_error_backoff_initial_ms = cfg.accept_error_backoff_initial_ms,
         .accept_error_backoff_max_ms = cfg.accept_error_backoff_max_ms,
         .reuse_address = cfg.reuse_address,
@@ -741,6 +743,10 @@ const DataPublicHttpRuntime = struct {
         peak_active_writes: usize,
         rejected_writes_total: u64,
         accept_errors_total: u64,
+        connection_dispatch_rejections_total: u64,
+        request_cancellations_total: u64,
+        listener_capacity: usize,
+        active_listener_leases: usize,
         cancellation_watcher_start_failures_total: u64,
         peer_observer_failures_total: u64,
         deadline_observer_failures_total: u64,
@@ -768,7 +774,7 @@ const DataPublicHttpRuntime = struct {
             .server = httpx.Server.initWithConfig(
                 alloc,
                 api_lane_lease.io(),
-                publicApiHttpxConfig(cfg, http_runtime),
+                publicApiHttpxConfig(cfg, http_runtime, api_lane_lease.concurrentCapacity()),
             ),
             .listener_task = undefined,
             .api_lane_lease = api_lane_lease,
@@ -827,6 +833,10 @@ const DataPublicHttpRuntime = struct {
             .peak_active_writes = application.write_peak_in_flight,
             .rejected_writes_total = application.write_rejected_total,
             .accept_errors_total = transport.accept_errors_total,
+            .connection_dispatch_rejections_total = transport.connection_dispatch_rejections_total,
+            .request_cancellations_total = transport.request_cancellations_total,
+            .listener_capacity = http_runtime.listener_capacity,
+            .active_listener_leases = http_runtime.active_listener_leases,
             .cancellation_watcher_start_failures_total = http_runtime.h1_cancellation_registration_failures_total,
             .peer_observer_failures_total = http_runtime.h1_cancellation_observer_failures_total,
             .deadline_observer_failures_total = 0,
@@ -1296,6 +1306,10 @@ pub const HealthSource = struct {
                 try antfly.common.request_admission.appendPrometheusMetrics(writer, .inference, inference);
             }
             try health_metrics.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_connection_dispatch_rejections_total", "counter", "Accepted public HTTP connections closed because concurrent execution was unavailable", http.connection_dispatch_rejections_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_request_cancellations_total", "counter", "Public HTTP requests terminated by application cancellation", http.request_cancellations_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_listener_capacity", "gauge", "Maximum concurrent long-lived HTTP listeners", http.listener_capacity);
+            try health_metrics.appendPromMetric(writer, "antfly_http_active_listener_leases", "gauge", "Long-lived HTTP listeners currently owned by the shared runtime", http.active_listener_leases);
             try health_metrics.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests cancelled because peer observation could not be scheduled", http.cancellation_watcher_start_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public requests cancelled after transport cancellation observation failed", http.peer_observer_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_deadline_observer_failures_total", "counter", "Public requests closed because deadline observation could not be scheduled", http.deadline_observer_failures_total);

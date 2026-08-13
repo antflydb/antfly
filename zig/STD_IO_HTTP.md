@@ -29,12 +29,18 @@ that end state:
   control lanes from `BackendRuntime`.
 - `HttpRuntime` is the role-owned transport service shared by `httpx`
   listeners. It owns one bounded HTTP/1 cancellation multiplexer, listener
-  leases, reserved observer capacity, health state, and transport metrics; it
-  does not own an executor lane.
+  leases, a bounded executor reserved for long-lived accept loops, reserved
+  observer capacity, health state, and transport metrics. Connection and
+  request work still runs on the executor injected into each server.
 - Every `httpx.Context` has transport-provided cancellation. HTTP/2 uses the
   stream reset signal, while HTTP/1 registrations share the role's
   `HttpRuntime`. The linked API and inference ABIs carry the same semantic
   cancellation callback without route-specific OpenAPI policy.
+- `error.Canceled` is a response-free transport terminal outcome. `httpx`
+  closes or resets the affected request/connection and increments a dedicated
+  cancellation counter; it never converts cancellation into a synthetic 500.
+  Deadlines remain distinguishable and map to 504 when a response is still
+  legal.
 - The serverless HTTP boundary now borrows that same semantic callback in both
   its native `httpx` and compatibility-executor adapters. Admission rechecks
   it before and after dispatch; semantic embedding, artifact fetches, indexed
@@ -385,6 +391,7 @@ Process Runtime Supervisor
 │   └── inference CPU lane
 ├── HTTP Runtime
 │   ├── listener leases
+│   ├── bounded listener executor
 │   ├── bounded HTTP/1 cancellation registry
 │   └── one multiplexed observer thread
 ├── Data/Metadata/Standalone Server
@@ -523,8 +530,10 @@ the joined task.
 Use `std.Io.concurrent` for a listener that must progress concurrently with its
 caller. `std.Io.async` is appropriate for operations that can use its weaker
 scheduling guarantee. Under `Io.Threaded`, a long-lived concurrent listener
-still consumes a worker thread; the benefit is structured ownership rather than
-elimination of threads.
+still consumes a worker thread. That worker comes from `HttpRuntime`'s bounded
+listener executor rather than from the server's connection executor, so an
+accept loop cannot consume capacity promised to connections. The benefit is
+structured and isolated ownership rather than elimination of threads.
 
 ## Listener bind ownership
 
@@ -580,9 +589,10 @@ Each lane needs:
 - Queue-depth, active-worker, rejection, and saturation metrics
 - A documented policy for blocking and CPU-bound operations
 
-Long-lived HTTP listeners should use the API lane rather than the general
-storage lane. CPU-heavy model execution should not occupy the workers required
-to serve readiness probes, wake shutdown, or complete storage commits.
+HTTP connection and request work should use the API lane rather than the
+general storage lane. Long-lived accept loops use `HttpRuntime`'s dedicated
+listener executor. CPU-heavy model execution should not occupy the workers
+required to serve readiness probes, wake shutdown, or complete storage commits.
 
 The first implementation should keep these lanes on `Io.Threaded`. Moving a
 lane to an evented backend requires auditing every task for synchronous file
@@ -624,6 +634,22 @@ stopping and awaiting its tasks before releasing the lease.
 state for one process role. Data, metadata, and standalone construct one
 `HttpRuntime` and inject it into each `httpx.Server` they compose. A standalone
 library `Server` creates a private fallback runtime for convenience.
+
+`HttpRuntime` also owns a small bounded `Io.Threaded` executor exclusively for
+accept loops. `max_listeners` is a hard capacity, and listener-lease acquisition
+fails before bind when it is exhausted. Once a `ListenerTask` has bound and
+acquired its lease, it schedules the accept loop on `listenerIo()`; the
+server's injected executor is reserved for connection and request work. The
+listener executor is stopped only after every listener task has been joined.
+
+Concurrent connection execution is a declared contract, not a best-effort
+optimization. A server configured for concurrent connections must declare its
+injected executor's concurrent capacity, and bind fails if `max_connections`
+exceeds that capacity. A post-accept scheduling rejection closes that socket,
+releases all admission/accounting state, and increments
+`connection_dispatch_rejections_total`; the accept loop never falls back to
+serving the connection inline. Explicit serial execution remains available for
+small test or embedding configurations and is selected deliberately.
 
 Each listening server acquires a lease before bind/accept and releases it only
 after its connection group has drained. The first lease starts the HTTP/1
@@ -820,6 +846,23 @@ All blocking loops require cancellation points. `error.Canceled` must be
 propagated or deliberately translated at a documented boundary rather than
 silently swallowed. Client disconnect and server shutdown should cancel actual
 backend work, not only stop response delivery.
+
+Every public-table operation receives a required `RequestContext`; there is no
+nullable cancellation field or alternate non-contextual callback signature.
+Adapters that have no external cancellation still pass `.none` explicitly via
+an empty context. Multi-stage operations check the context at bounded intervals
+and immediately before irreversible publication. They do not report
+cancellation after a commit has begun, because the durable outcome may already
+exist. Linear merge follows this rule before its single HA-mirrored batch
+boundary, and its scan and comparison loops contain bounded checkpoints.
+
+At HTTP ingress, application `error.Canceled` is not an application error
+response. If no response has committed, `httpx` terminates the stream or
+connection without emitting a status and records `request_cancellations_total`.
+This preserves the peer-disconnect/server-stop meaning and avoids misleading
+500 logs. `error.DeadlineExceeded` remains a 504 before commitment. After a
+response is committed, either outcome closes/resets the transport because a
+second status line is impossible.
 
 The universal representation is a borrowed `(context, is_cancelled)` callback.
 Atomic values are adapters used by concrete listener, lifecycle, or test
@@ -1218,9 +1261,14 @@ Lifecycle tests should cover:
 - Failure after every startup phase
 - Bind failure and partial route registration
 - Executor and queue exhaustion
+- Listener-executor capacity exhaustion and connection-executor capacity
+  mismatch at bind
+- Connection scheduling rejection without inline accept-loop fallback
 - Shutdown during active HTTP/1 and HTTP/2 requests
 - Shutdown during storage commits and model generation
 - Client disconnect during distributed and inference work
+- Cancellation observed during a multi-stage operation before its irreversible
+  publication boundary, with proof that no write was issued
 - A task that ignores cancellation
 - Provider destruction while work is pending
 - Backend runtime destruction with an outstanding lease
@@ -1289,6 +1337,9 @@ The branch completed the migration in this order:
 10. Replaced embedded inference listener threads with owned Futures.
 11. Added API/control lane leases, bounded HTTP capacity, and lifecycle and
     listener metrics.
+    Long-lived accept loops use `HttpRuntime`'s dedicated bounded executor,
+    while connection capacity is declared and validated against the injected
+    API executor.
 12. Audited long-lived background work and retained explicit OS threads only
     where they remain owned, stopped, and joined.
 13. Hardened the API-kernel and linked-inference boundaries with versioned

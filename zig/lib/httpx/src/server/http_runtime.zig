@@ -10,6 +10,10 @@ const CancellationObserver = @import("cancellation_observer.zig").Observer;
 pub const HttpRuntime = struct {
     pub const Config = struct {
         max_active_h1_requests: usize = 4096,
+        /// Maximum number of long-lived listener tasks owned by this runtime.
+        /// Listener tasks use a dedicated executor so accepting connections
+        /// never consumes capacity from an application or backend lane.
+        max_listeners: usize = 16,
         /// Null follows Zig's platform thread-stack contract. Although the
         /// observer itself is shallow, linked runtimes may impose target- and
         /// libc-specific TLS/stack requirements that httpx cannot safely infer.
@@ -22,6 +26,7 @@ pub const HttpRuntime = struct {
         h1_request_capacity: usize,
         reserved_h1_request_capacity: usize,
         active_listener_leases: usize,
+        listener_capacity: usize,
         active_h1_cancellation_observers: usize,
         h1_hard_disconnect_cancellations_total: u64,
         h1_cancellation_observer_failures_total: u64,
@@ -47,18 +52,30 @@ pub const HttpRuntime = struct {
             const runtime = self.runtime orelse return error.HttpRuntimeUnavailable;
             return runtime.registerH1Request(fd, cancellation);
         }
+
+        pub fn listenerIo(self: *const ListenerLease) std.Io {
+            const runtime = self.runtime orelse @panic("released HTTP listener lease");
+            return runtime.listener_io_impl.io();
+        }
     };
 
     observer: CancellationObserver,
+    listener_io_impl: std.Io.Threaded,
     h1_request_capacity: usize,
+    listener_capacity: usize,
     lifecycle_mutex: std.atomic.Mutex = .unlocked,
     listener_leases: std.atomic.Value(usize) = .init(0),
     reserved_h1_request_capacity: std.atomic.Value(usize) = .init(0),
     registration_failures_total: std.atomic.Value(u64) = .init(0),
 
     pub fn init(alloc: std.mem.Allocator, config: Config) HttpRuntime {
+        const listener_capacity = @max(config.max_listeners, 1);
         return .{
             .h1_request_capacity = config.max_active_h1_requests,
+            .listener_capacity = listener_capacity,
+            .listener_io_impl = std.Io.Threaded.init(alloc, .{
+                .concurrent_limit = .limited(listener_capacity),
+            }),
             .observer = CancellationObserver.init(
                 alloc,
                 config.max_active_h1_requests,
@@ -70,6 +87,7 @@ pub const HttpRuntime = struct {
     pub fn deinit(self: *HttpRuntime) void {
         std.debug.assert(self.listener_leases.load(.acquire) == 0);
         self.observer.deinit();
+        self.listener_io_impl.deinit();
         self.* = undefined;
     }
 
@@ -81,6 +99,7 @@ pub const HttpRuntime = struct {
         defer self.lifecycle_mutex.unlock();
         const leases = self.listener_leases.load(.acquire);
         const reserved = self.reserved_h1_request_capacity.load(.acquire);
+        if (leases >= self.listener_capacity) return error.HttpRuntimeListenerCapacityExceeded;
         if (max_h1_requests > self.h1_request_capacity -| reserved)
             return error.HttpRuntimeCapacityExceeded;
         if (reserved == 0 and max_h1_requests > 0) try self.observer.start();
@@ -94,6 +113,7 @@ pub const HttpRuntime = struct {
             .h1_request_capacity = self.h1_request_capacity,
             .reserved_h1_request_capacity = self.reserved_h1_request_capacity.load(.acquire),
             .active_listener_leases = self.listener_leases.load(.acquire),
+            .listener_capacity = self.listener_capacity,
             .active_h1_cancellation_observers = self.observer.activeCount(),
             .h1_hard_disconnect_cancellations_total = self.observer.cancellations(),
             .h1_cancellation_observer_failures_total = self.observer.failures(),
@@ -154,4 +174,20 @@ test "HTTP runtime listener leases share one cancellation observer lifecycle" {
     restarted.release();
     control.release();
     try std.testing.expectEqual(@as(usize, 0), runtime.stats().active_listener_leases);
+}
+
+test "HTTP runtime reserves bounded dedicated listener workers" {
+    if (@import("builtin").os.tag == .freestanding) return;
+    var runtime = HttpRuntime.init(std.testing.allocator, .{
+        .max_active_h1_requests = 0,
+        .max_listeners = 1,
+    });
+    defer runtime.deinit();
+
+    var listener = try runtime.acquireListener(0);
+    try std.testing.expectEqual(@as(usize, 1), runtime.stats().listener_capacity);
+    try std.testing.expectError(error.HttpRuntimeListenerCapacityExceeded, runtime.acquireListener(0));
+    listener.release();
+    var replacement = try runtime.acquireListener(0);
+    replacement.release();
 }

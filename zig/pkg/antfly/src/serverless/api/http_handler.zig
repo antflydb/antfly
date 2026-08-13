@@ -72,6 +72,7 @@ const parseJsonPathValueAlloc = json_helpers.parseJsonPathValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
 const common_config = @import("../../common/config.zig");
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const api_operation = @import("../../api/operation.zig");
 const request_admission = @import("../../common/request_admission.zig");
 const RequestAdmission = request_admission.RequestAdmission;
 
@@ -4242,7 +4243,7 @@ pub const HttpHandler = struct {
     fn tableApi(self: *HttpHandler, cancellation: CancellationToken) public_table_http.TableApi {
         return .{
             .ptr = self,
-            .cancellation = cancellation,
+            .request = .{ .cancellation = cancellation },
             .vtable = &.{
                 .execute_table_batch = executePublicTableBatch,
                 .execute_table_query_request = executePublicTableQueryRequest,
@@ -4262,7 +4263,7 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         req: db_types.BatchRequest,
-        cancellation: ?CancellationToken,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBatchError!void {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
@@ -4306,7 +4307,7 @@ pub const HttpHandler = struct {
         };
         defer result.deinit(self.alloc);
 
-        self.enforcePublicTableBatchSyncLevel(table_name, req.sync_level, result.end_lsn, status, cancellation) catch |err| {
+        self.enforcePublicTableBatchSyncLevel(table_name, req.sync_level, result.end_lsn, status, request.cancellation) catch |err| {
             if (err == error.InternalFailure) {
                 std.log.err("serverless public table batch sync wait failed table={s} sync_level={} end_lsn={} err={}", .{
                     table_name,
@@ -4325,7 +4326,7 @@ pub const HttpHandler = struct {
         sync_level: db_types.SyncLevel,
         end_lsn: u64,
         status_before_write: catalog_types.BuildStatus,
-        cancellation: ?CancellationToken,
+        cancellation: CancellationToken,
     ) public_table_http.TableApi.ExecuteBatchError!void {
         const requires_background_materialization =
             status_before_write.enrichment_enabled or
@@ -4344,7 +4345,7 @@ pub const HttpHandler = struct {
         const timeout_ns = 30 * std.time.ns_per_s;
         const start_ns = platform_time.monotonicNs();
         while (true) {
-            if (cancellation) |token| token.check() catch return error.Canceled;
+            cancellation.check() catch return error.Canceled;
             const build_result = self.catalog.buildTable(table_name) catch |err| switch (err) {
                 error.NamespaceNotFound => return error.NotFound,
                 error.HeadChanged => null,
@@ -4461,12 +4462,12 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         body: []const u8,
         row_filter_json: ?[]const u8,
-        cancellation: ?CancellationToken,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteQueryError![]u8 {
         _ = alloc;
         _ = row_filter_json;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        return self.executePublicTableQueryJsonAlloc(table_name, body, cancellation orelse .none) catch |err| switch (err) {
+        return self.executePublicTableQueryJsonAlloc(table_name, body, request.cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -4489,11 +4490,11 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         view: public_table_http.TableApi.TableQueryView,
-        cancellation: ?CancellationToken,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteQueryViewError![]u8 {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        return self.executePublicTableQueryViewJsonAlloc(table_name, view, cancellation orelse .none) catch |err| switch (err) {
+        return self.executePublicTableQueryViewJsonAlloc(table_name, view, request.cancellation) catch |err| switch (err) {
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.Canceled => return error.Canceled,
@@ -4510,6 +4511,7 @@ pub const HttpHandler = struct {
         _: []const u8,
         _: []const u8,
         _: *backups_api.BackupLocation,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         return error.MethodNotAllowed;
     }
@@ -4522,6 +4524,7 @@ pub const HttpHandler = struct {
         _: []const u8,
         _: []const u8,
         _: *backups_api.BackupLocation,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteRestoreError!void {
         return error.MethodNotAllowed;
     }
@@ -4530,6 +4533,7 @@ pub const HttpHandler = struct {
         ptr: *anyopaque,
         alloc: Allocator,
         table_name: []const u8,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteListIndexesError![]u8 {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
@@ -4545,6 +4549,7 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         index_name: []const u8,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
@@ -4561,6 +4566,7 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         index_name: []const u8,
         body: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteCreateIndexError!void {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.MethodNotAllowed;
@@ -4592,6 +4598,11 @@ pub const HttpHandler = struct {
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
+        request.ensureActive() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => unreachable,
+        };
         const updated = self.catalog.setTableDefinition(
             table_name,
             table.schema_json,
@@ -4606,6 +4617,7 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         index_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteDeleteIndexError!void {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.MethodNotAllowed;
@@ -4617,6 +4629,11 @@ pub const HttpHandler = struct {
         };
         defer alloc.free(next_indexes_json);
         validateServerlessIndexCatalog(alloc, next_indexes_json) catch return error.InternalFailure;
+        request.ensureActive() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => unreachable,
+        };
         const updated = self.catalog.setTableDefinition(
             table_name,
             table.schema_json,

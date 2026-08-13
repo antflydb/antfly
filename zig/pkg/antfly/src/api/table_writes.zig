@@ -34576,7 +34576,7 @@ test "provisioned table read source survives many external write-sync batches be
             alloc,
             "docs",
             "semantic_idx",
-            server.tableApi(),
+            server.tableApi(.{}),
         );
         defer detail.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 200), detail.status);
