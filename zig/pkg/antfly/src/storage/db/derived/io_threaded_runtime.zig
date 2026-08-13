@@ -577,10 +577,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 self.mutex.lockUncancelable(io);
                 var all_persisted = true;
                 var snapshots = std.ArrayListUnmanaged(PersistSnapshot).empty;
+                defer snapshots.deinit(self.alloc);
                 errdefer {
                     for (snapshots.items) |snapshot| self.alloc.free(snapshot.name);
                 }
-                defer snapshots.deinit(self.alloc);
                 for (self.workers.items) |worker| {
                     if (worker.applied_sequence == 0) continue;
                     try appendPersistSnapshot(self.alloc, &snapshots, worker);
@@ -673,10 +673,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 self.mutex.lockUncancelable(io);
                 var all_persisted = true;
                 var snapshots = std.ArrayListUnmanaged(PersistSnapshot).empty;
+                defer snapshots.deinit(self.alloc);
                 errdefer {
                     for (snapshots.items) |snapshot| self.alloc.free(snapshot.name);
                 }
-                defer snapshots.deinit(self.alloc);
                 for (self.workers.items) |worker| {
                     if (!indexNameInList(worker.name, index_names)) continue;
                     if (worker.applied_sequence == 0) continue;
@@ -1250,6 +1250,7 @@ const TestThreadedRuntimeCapture = struct {
     truncated_sequence: std.atomic.Value(u64) = .init(0),
     advanced_sequence: std.atomic.Value(u64) = .init(0),
     callback_observed_applied_sequence: std.atomic.Value(u64) = .init(0),
+    fail_next_forced_persist: std.atomic.Value(bool) = .init(false),
     fail_next_dense_apply_not_found: std.atomic.Value(bool) = .init(false),
     fail_next_apply_resource_budget: std.atomic.Value(bool) = .init(false),
     fail_next_publish: std.atomic.Value(bool) = .init(false),
@@ -1280,8 +1281,8 @@ fn testThreadedRuntimeApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, 
 
 fn testThreadedRuntimePersist(ctx: *anyopaque, index_name: []const u8, sequence: u64, force: bool) !bool {
     _ = index_name;
-    _ = force;
     const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
+    if (force and capture.fail_next_forced_persist.swap(false, .monotonic)) return error.Canceled;
     capture.persisted_sequence.store(sequence, .monotonic);
     return true;
 }
@@ -1325,6 +1326,44 @@ fn appendTestThreadedRuntimeRecord(log: *change_journal_mod.Journal, alloc: Allo
     const payload = try change_journal_mod.encodeRecord(alloc, record);
     defer alloc.free(payload);
     _ = try log.appendOpaque(payload);
+}
+
+test "io threaded forced persist errors unwind snapshot ownership safely" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-forced-persist-error-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+
+    var capture = TestThreadedRuntimeCapture{};
+    var runtime = try DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testThreadedRuntimeApply,
+        testThreadedRuntimePersist,
+        testThreadedRuntimeTruncate,
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("text_idx", .{ .name = "text_idx", .kind = .full_text }, 1);
+
+    capture.fail_next_forced_persist.store(true, .monotonic);
+    try std.testing.expectError(error.Canceled, runtime.waitForAll(1));
+
+    capture.fail_next_forced_persist.store(true, .monotonic);
+    try std.testing.expectError(error.Canceled, runtime.waitForIndexes(1, &.{"text_idx"}));
 }
 
 test "io threaded applied callback observes published watermark outside runtime lock" {
