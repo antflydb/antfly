@@ -34,7 +34,8 @@ pub const InvokeResponse = extern struct {
     content_type: OptionalOwnedBytes = .{},
 
     pub fn valid(self: InvokeResponse) bool {
-        return std.mem.allEqual(u8, &self._reserved, 0) and
+        return self.status >= 100 and self.status <= 599 and
+            std.mem.allEqual(u8, &self._reserved, 0) and
             validOwnedBytes(self.body) and
             validOptionalOwnedBytes(self.retry_after) and
             validOptionalOwnedBytes(self.content_type);
@@ -55,13 +56,17 @@ fn validOwnedBytes(bytes: OwnedBytes) bool {
 }
 
 fn validOptionalOwnedBytes(bytes: OptionalOwnedBytes) bool {
-    if (bytes.present > 1) return false;
+    if (!std.mem.allEqual(u8, &bytes._reserved, 0) or bytes.present > 1) return false;
     if (bytes.present == 0) return bytes.bytes.ptr == null and bytes.bytes.len == 0;
     return validOwnedBytes(bytes.bytes);
 }
 
 fn releaseOwnedBytes(allocator: *const Allocator, bytes: OwnedBytes) void {
-    if (bytes.len != 0) allocator.release(allocator.context, bytes.ptr, bytes.len, @alignOf(u8));
+    // Destruction is also used on malformed and partially populated boundary
+    // responses. Never force-unwrap an invalid foreign pointer while trying
+    // to contain the original ABI violation.
+    if (bytes.len != 0 and bytes.ptr != null)
+        allocator.release(allocator.context, bytes.ptr, bytes.len, @alignOf(u8));
 }
 
 pub const InvokeContext = extern struct {
@@ -124,4 +129,25 @@ test "local inference connection ABI retains C layout and validates capabilities
     };
     try std.testing.expect(target.valid(Capability.streaming_response));
     try std.testing.expect(!target.valid(1 << 63));
+}
+
+test "local inference response validation contains malformed ownership" {
+    var alloc = std.testing.allocator;
+    var abi_alloc = Allocator.fromStd(&alloc);
+
+    var invalid_pointer: InvokeResponse = .{
+        .status = 200,
+        .body = .{ .ptr = null, .len = 8 },
+    };
+    try std.testing.expect(!invalid_pointer.valid());
+    invalid_pointer.deinit(&abi_alloc);
+
+    var invalid_status: InvokeResponse = .{ .status = 0 };
+    try std.testing.expect(!invalid_status.valid());
+    invalid_status.deinit(&abi_alloc);
+
+    var invalid_reserved: InvokeResponse = .{ .status = 200 };
+    invalid_reserved.content_type._reserved[0] = 1;
+    try std.testing.expect(!invalid_reserved.valid());
+    invalid_reserved.deinit(&abi_alloc);
 }

@@ -1835,6 +1835,38 @@ test "inference connection ABI reclaims partial responses on target failure" {
     ));
 }
 
+test "inference connection ABI rejects malformed responses without dereferencing invalid ownership" {
+    const LocalTarget = struct {
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            context.out_response.* = .{
+                .status = 200,
+                .body = .{ .ptr = null, .len = 8 },
+            };
+            return .ok;
+        }
+    };
+
+    var target_context: u8 = 0;
+    const target: LocalInferenceConnectionTarget = .{
+        .capabilities = inference_connection_abi.Capability.streaming_response,
+        .context = &target_context,
+        .invoke = LocalTarget.invoke,
+    };
+    try std.testing.expectError(error.RuntimeBoundaryFailure, invokeInferenceConnection(
+        std.testing.allocator,
+        null,
+        null,
+        target,
+        null,
+        common_config.local_inference_connection_id,
+        "embed",
+        "{}",
+        null,
+        inferenceInvocationDeadlineNs(),
+        .{},
+    ));
+}
+
 test "inference connection URLs require an HTTP origin" {
     try std.testing.expect(validInferenceURL("https://platform.antfly.io/ai/v1"));
     try std.testing.expect(validInferenceURL("http://antfly-inference.default.svc:8080"));
