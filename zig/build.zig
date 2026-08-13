@@ -2670,9 +2670,13 @@ pub fn build(b: *std.Build) void {
     common_http_test_mod.addImport("httpx", httpx_mod);
     const common_http_tests = b.addTest(.{
         .root_module = common_http_test_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     common_http_tests.root_module.link_libc = true;
-    const run_common_http_tests = b.addRunArtifact(common_http_tests);
+    const run_common_http_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, common_http_tests, &.{});
     const common_http_test_step = b.step("common-http-test", "Run common HTTP listener and client tests");
     common_http_test_step.dependOn(&run_common_http_tests.step);
 
