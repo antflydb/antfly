@@ -53,6 +53,7 @@ pub const DurableJobLane = struct {
         drain_owner: *const fn (ptr: *anyopaque, owner_id: u64) void,
         close_owner: *const fn (ptr: *anyopaque, owner_id: u64) void,
         poll: *const fn (ptr: *anyopaque, max_jobs: usize) anyerror!usize,
+        executes_inline: bool = false,
     };
 
     /// On success, the lane owns `job` and will call `job.deinit`.
@@ -71,6 +72,13 @@ pub const DurableJobLane = struct {
 
     pub fn poll(self: DurableJobLane, max_jobs: usize) !usize {
         return try self.vtable.poll(self.ptr, max_jobs);
+    }
+
+    /// Manual runtimes execute submissions on the caller's stack. Workers
+    /// that page durable work must leave the marker pending for a later
+    /// explicit poll/reopen instead of recursively submitting their successor.
+    pub fn executesInline(self: DurableJobLane) bool {
+        return self.vtable.executes_inline;
     }
 };
 
@@ -562,6 +570,7 @@ const inline_vtable = DurableJobLane.VTable{
     .drain_owner = InlineDurableJobLane.drainOwner,
     .close_owner = InlineDurableJobLane.closeOwner,
     .poll = InlineDurableJobLane.poll,
+    .executes_inline = true,
 };
 
 const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
@@ -840,6 +849,7 @@ test "backend runtime durable lane runs inline jobs" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
     defer handle.deinit();
 
+    try std.testing.expect(handle.ptr().durable_jobs.executesInline());
     const owner_id = try handle.ptr().allocOwnerId();
     var ctx = Ctx{};
     try handle.ptr().durable_jobs.submit(.{
