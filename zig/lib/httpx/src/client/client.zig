@@ -2494,17 +2494,56 @@ pub const Client = struct {
     }
 
     /// RFC 9110 defines `deflate` as a zlib-wrapped stream. Some deployed HTTP
-    /// servers instead send a raw RFC 1951 stream, so recognize a valid RFC 1950
-    /// header and otherwise use the compatibility form.
-    fn deflateContainer(prefix: []const u8) flate.Container {
-        if (prefix.len < 2) return .raw;
+    /// servers instead send a raw RFC 1951 stream. A valid raw stream can begin
+    /// with bytes that also form an RFC 1950 header, so this is only a hint:
+    /// callers must fall back to raw decoding if zlib validation fails.
+    fn hasZlibHeader(prefix: []const u8) bool {
+        if (prefix.len < 2) return false;
         const cmf = prefix[0];
         const flg = prefix[1];
         const header = (@as(u16, cmf) << 8) | flg;
-        const is_deflate = cmf & 0x0f == 8;
-        const valid_window = cmf >> 4 <= 7;
-        const valid_check = header % 31 == 0;
-        return if (is_deflate and valid_window and valid_check) .zlib else .raw;
+        return cmf & 0x0f == 8 and cmf >> 4 <= 7 and header % 31 == 0;
+    }
+
+    fn appendDecompressed(
+        allocator: Allocator,
+        encoded: []const u8,
+        container: flate.Container,
+        output: *std.ArrayListUnmanaged(u8),
+        max_size: usize,
+    ) !void {
+        var encoded_reader: Io.Reader = .fixed(encoded);
+        var decompress_window: [flate.max_window_len]u8 = undefined;
+        var decompressor = flate.Decompress.init(&encoded_reader, container, &decompress_window);
+        var read_buf: [16 * 1024]u8 = undefined;
+
+        while (true) {
+            const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
+                if (err == error.EndOfStream) break;
+                return error.DecompressionFailed;
+            };
+            if (n == 0) break;
+            _ = try checkedResponseSize(output.items.len, n, max_size);
+            try output.appendSlice(allocator, read_buf[0..n]);
+        }
+    }
+
+    fn appendDeflateDecompressed(
+        allocator: Allocator,
+        encoded: []const u8,
+        output: *std.ArrayListUnmanaged(u8),
+        max_size: usize,
+    ) !void {
+        const original_len = output.items.len;
+        if (hasZlibHeader(encoded)) {
+            appendDecompressed(allocator, encoded, .zlib, output, max_size) catch |err| {
+                output.items.len = original_len;
+                if (err != error.DecompressionFailed) return err;
+                try appendDecompressed(allocator, encoded, .raw, output, max_size);
+            };
+            return;
+        }
+        try appendDecompressed(allocator, encoded, .raw, output, max_size);
     }
 
     /// Builds a Response by streaming the body through an Io.Reader chain.
@@ -2601,22 +2640,20 @@ pub const Client = struct {
                 try compressed.appendSlice(self.allocator, read_buf[0..n]);
             }
 
-            const container: flate.Container = switch (coding) {
-                .gzip => .gzip,
-                .deflate => deflateContainer(compressed.items),
-            };
-            var compressed_reader: Io.Reader = .fixed(compressed.items);
-            var decompress_window: [flate.max_window_len]u8 = undefined;
-            var decompressor = flate.Decompress.init(&compressed_reader, container, &decompress_window);
-
-            while (true) {
-                const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
-                    if (err == error.EndOfStream) break;
-                    return error.DecompressionFailed;
-                };
-                if (n == 0) break;
-                _ = try checkedResponseSize(result.items.len, n, max_size);
-                try result.appendSlice(self.allocator, read_buf[0..n]);
+            switch (coding) {
+                .gzip => try appendDecompressed(
+                    self.allocator,
+                    compressed.items,
+                    .gzip,
+                    &result,
+                    max_size,
+                ),
+                .deflate => try appendDeflateDecompressed(
+                    self.allocator,
+                    compressed.items,
+                    &result,
+                    max_size,
+                ),
             }
         } else {
             while (true) {
@@ -2739,31 +2776,66 @@ pub const Client = struct {
                 framed_reader,
                 &encoded_prefix_buffer,
             );
-            const container: flate.Container = switch (coding) {
-                .gzip => .gzip,
-                .deflate => deflateContainer(encoded_prefix[0..encoded_prefix_len]),
-            };
-            var decompress_window: [flate.max_window_len]u8 = undefined;
-            var decompressor = flate.Decompress.init(&encoded_reader.reader_iface, container, &decompress_window);
 
-            while (true) {
-                const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
-                    if (err == error.EndOfStream) break;
-                    if (err == error.ReadFailed and close_delimited_body) break;
-                    return error.DecompressionFailed;
-                };
-                if (n == 0) break;
-                const next_total = try checkedResponseSize(
-                    written_total,
-                    n,
+            if (coding == .deflate and hasZlibHeader(encoded_prefix[0..encoded_prefix_len])) {
+                var encoded = std.ArrayListUnmanaged(u8).empty;
+                defer encoded.deinit(parser.allocator);
+                while (true) {
+                    const n = readSomeOnce(&encoded_reader.reader_iface, &read_buf) catch |err| {
+                        if (err == error.EndOfStream) break;
+                        if (err == error.ReadFailed and close_delimited_body) break;
+                        return error.InvalidResponse;
+                    };
+                    if (n == 0) break;
+                    _ = try checkedResponseSize(encoded.items.len, n, max_response_size);
+                    try encoded.appendSlice(parser.allocator, read_buf[0..n]);
+                }
+
+                var decoded = std.ArrayListUnmanaged(u8).empty;
+                defer decoded.deinit(parser.allocator);
+                try appendDeflateDecompressed(
+                    parser.allocator,
+                    encoded.items,
+                    &decoded,
                     max_response_size,
                 );
-                try writer.writeAll(read_buf[0..n]);
-                written_total = next_total;
+                try writer.writeAll(decoded.items);
+                written_total = decoded.items.len;
                 if (progress_cb) |cb| cb(.{
                     .bytes_written = @intCast(written_total),
                     .total_bytes = null,
                 }, progress_ctx);
+            } else {
+                const container: flate.Container = switch (coding) {
+                    .gzip => .gzip,
+                    .deflate => .raw,
+                };
+                var decompress_window: [flate.max_window_len]u8 = undefined;
+                var decompressor = flate.Decompress.init(
+                    &encoded_reader.reader_iface,
+                    container,
+                    &decompress_window,
+                );
+
+                while (true) {
+                    const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
+                        if (err == error.EndOfStream) break;
+                        if (err == error.ReadFailed and close_delimited_body) break;
+                        return error.DecompressionFailed;
+                    };
+                    if (n == 0) break;
+                    const next_total = try checkedResponseSize(
+                        written_total,
+                        n,
+                        max_response_size,
+                    );
+                    try writer.writeAll(read_buf[0..n]);
+                    written_total = next_total;
+                    if (progress_cb) |cb| cb(.{
+                        .bytes_written = @intCast(written_total),
+                        .total_bytes = null,
+                    }, progress_ctx);
+                }
             }
         } else {
             while (true) {
@@ -3578,6 +3650,22 @@ test "H2 stream cleanup detaches receiver before resetting a published stream" {
     h2.stream_manager.removeStream(idle.id);
     h2.write_mutex.unlock(std.testing.io);
     allocator.destroy(idle_event);
+}
+
+test "raw deflate fallback handles a valid zlib-looking prefix" {
+    const allocator = std.testing.allocator;
+    var expected: [156]u8 = undefined;
+    for (&expected, 0..) |*byte, i| byte.* = @intCast(i);
+
+    var encoded: [166]u8 = undefined;
+    @memcpy(encoded[0..5], &[_]u8{ 0x78, 0x9c, 0x00, 0x63, 0xff });
+    @memcpy(encoded[5..161], &expected);
+    @memcpy(encoded[161..], &[_]u8{ 0x01, 0x00, 0x00, 0xff, 0xff });
+
+    var decoded = std.ArrayListUnmanaged(u8).empty;
+    defer decoded.deinit(allocator);
+    try Client.appendDeflateDecompressed(allocator, &encoded, &decoded, 1024);
+    try std.testing.expectEqualSlices(u8, &expected, decoded.items);
 }
 
 const test_tls_cert_pem =

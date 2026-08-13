@@ -1916,7 +1916,8 @@ fn downloadTestHttpResponseAlloc(
 
     const listen_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try listen_addr.listen(io, .{});
-    defer server.deinit(io);
+    var server_open = true;
+    defer if (server_open) server.deinit(io);
 
     var fixture = TestHttpResponseServer{
         .io = io,
@@ -1933,8 +1934,9 @@ fn downloadTestHttpResponseAlloc(
         .max_download_size_bytes = max_download_size_bytes,
     };
     var downloaded = downloadContentAlloc(alloc, uri, &security, null) catch |err| {
+        server.deinit(io);
+        server_open = false;
         thread.join();
-        if (fixture.failure) |server_err| return server_err;
         return err;
     };
     thread.join();
