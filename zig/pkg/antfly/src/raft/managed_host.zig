@@ -21,6 +21,7 @@ const data_storage = @import("../data/storage/mod.zig");
 const host_mod = @import("host.zig");
 const leader_runtime = @import("leader_runtime.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
+const metadata_reallocation_request = @import("../metadata/reallocation_request.zig");
 const metadata_storage = @import("../metadata/storage/mod.zig");
 const metadata_view = @import("metadata_view.zig");
 const reconciler = @import("reconciler.zig");
@@ -65,6 +66,53 @@ pub const ManagedSyncResult = struct {
     reconcile: reconciler.ReconcileResult,
     runtime: raft_engine.runtime.multi_raft.HostRound,
 };
+
+fn metadataMembershipChangePermit(store: *metadata_storage.RaftApplyStore) reconciler.MembershipChangePermit {
+    return .{
+        .ptr = store,
+        .vtable = &.{ .allows = metadataMembershipChangeAllowed },
+    };
+}
+
+fn metadataMembershipChangeAllowed(
+    ptr: *anyopaque,
+    group_id: u64,
+    voter_node_ids: []const u64,
+    learner_node_ids: []const u64,
+) bool {
+    _ = voter_node_ids;
+    _ = learner_node_ids;
+    const store: *metadata_storage.RaftApplyStore = @ptrCast(@alignCast(ptr));
+    const request = store.getReallocationRequest(group_id) catch return false;
+    return reallocationRequestAllowsMembershipChange(request);
+}
+
+fn reallocationRequestAllowsMembershipChange(
+    request: ?metadata_reallocation_request.ReallocationRequestRecord,
+) bool {
+    // A member can restart into an older binary after admission, so even an
+    // otherwise idempotent membership proposal is unsafe while the replicated
+    // request is active. Clearing that request is the only release signal.
+    return request == null;
+}
+
+test "metadata membership changes remain fenced for the lifetime of a reallocation request" {
+    const protected = [_]u64{ 1, 2, 3 };
+    const request: metadata_reallocation_request.ReallocationRequestRecord = .{
+        .request_id = 7,
+        .requested_at_ms = 11,
+        .barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .protected_metadata_member_count = protected.len,
+        .protected_metadata_membership_fingerprint = metadata_reallocation_request.membershipFingerprint(&protected),
+    };
+    try std.testing.expect(!reallocationRequestAllowsMembershipChange(request));
+    try std.testing.expect(!reallocationRequestAllowsMembershipChange(.{
+        .request_id = 7,
+        .requested_at_ms = 11,
+    }));
+    try std.testing.expect(reallocationRequestAllowsMembershipChange(null));
+}
 
 pub const ManagedHost = struct {
     alloc: std.mem.Allocator,
@@ -135,6 +183,10 @@ pub const ManagedHost = struct {
                 .alloc = alloc,
                 .host = host,
                 .provider = view.placementProvider(),
+                .membership_change_permit = if (prepared_deps.owned_metadata_store) |store|
+                    metadataMembershipChangePermit(store)
+                else
+                    null,
             },
         };
     }
@@ -359,6 +411,10 @@ pub const ManagedHttpHost = struct {
                 .alloc = alloc,
                 .host = http_host.host,
                 .provider = view.placementProvider(),
+                .membership_change_permit = if (prepared_deps.owned_metadata_store) |store|
+                    metadataMembershipChangePermit(store)
+                else
+                    null,
             },
         };
     }

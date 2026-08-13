@@ -12299,6 +12299,39 @@ func TestGenerateCompleteConfig(t *testing.T) {
 	g.Expect(config["max_shards_per_table"]).To(Equal(float64(0)))
 }
 
+func TestBuildMetadataClusterConfigIncludesRaftAndOrchestrationEndpoints(t *testing.T) {
+	g := NewWithT(t)
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "antfly-system",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				MetadataAPI:  antflyv1.APISpec{Port: 12377},
+				MetadataRaft: antflyv1.APISpec{Port: 9017},
+			},
+		},
+	}
+
+	type metadataPeerEndpoints struct {
+		RaftURL          string `json:"raft_url"`
+		OrchestrationURL string `json:"orchestration_url"`
+	}
+	var peers map[string]metadataPeerEndpoints
+	g.Expect(json.Unmarshal([]byte(reconciler.buildMetadataClusterConfig(cluster, 3)), &peers)).To(Succeed())
+	g.Expect(peers).To(HaveLen(3))
+	g.Expect(peers["1"]).To(Equal(metadataPeerEndpoints{
+		RaftURL:          "http://test-cluster-metadata-0.test-cluster-metadata.antfly-system.svc.cluster.local:9017",
+		OrchestrationURL: "http://test-cluster-metadata-0.test-cluster-metadata.antfly-system.svc.cluster.local:12377",
+	}))
+	g.Expect(peers["3"]).To(Equal(metadataPeerEndpoints{
+		RaftURL:          "http://test-cluster-metadata-2.test-cluster-metadata.antfly-system.svc.cluster.local:9017",
+		OrchestrationURL: "http://test-cluster-metadata-2.test-cluster-metadata.antfly-system.svc.cluster.local:12377",
+	}))
+}
+
 func TestGenerateCompleteConfig_Standalone(t *testing.T) {
 	g := NewWithT(t)
 
