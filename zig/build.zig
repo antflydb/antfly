@@ -2804,13 +2804,6 @@ pub fn build(b: *std.Build) void {
     const lib_embeddings_test_step = b.step("lib-embeddings-test", "Run standalone lib/embeddings tests");
     lib_embeddings_test_step.dependOn(&run_lib_embeddings_tests.step);
 
-    const lib_scraping_tests = b.addTest(.{
-        .root_module = scraping_mod,
-    });
-    const run_lib_scraping_tests = b.addRunArtifact(lib_scraping_tests);
-    const lib_scraping_test_step = b.step("lib-scraping-test", "Run standalone lib/scraping tests");
-    lib_scraping_test_step.dependOn(&run_lib_scraping_tests.step);
-
     const lib_vectorindex_tests = b.addTest(.{
         .root_module = vectorindex_mod,
     });
