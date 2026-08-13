@@ -386,6 +386,50 @@ fn sessionTaskForModelType(model_type: manifest_mod.ModelType, override: ?TaskOv
     };
 }
 
+const deberta_reranker_weight_mirror_min_rows: usize = 128;
+
+fn debertaRerankerPrefersWeightMirrors(enabled: bool, batch: usize, seq_len: usize) bool {
+    if (!enabled) return false;
+    const rows = std.math.mul(usize, batch, seq_len) catch return false;
+    return rows >= deberta_reranker_weight_mirror_min_rows;
+}
+
+fn sessionEnablesDebertaRerankerWeightMirrors(
+    model_type: manifest_mod.ModelType,
+    arch_type: ArchType,
+    task: SessionTask,
+) bool {
+    return model_type == .reranker and arch_type == .deberta and task == .classifier;
+}
+
+/// Metal mirror/cache and graph-plan scratch amounts that ModelManager must
+/// reserve for native DeBERTa and GLiNER sessions. An absent reranker
+/// architecture hint is treated conservatively because GGUF metadata can still
+/// identify DeBERTa at load.
+pub fn metalDebertaFastPathAdmissionAmounts(mf: manifest_mod.ModelManifest) runtime.tier.memory.AdmissionAmounts {
+    const gliner_bundle = mf.gliner_head_gguf_path != null or
+        mf.gliner_head_safetensors_path != null or
+        mf.gliner_model_type.len != 0 or
+        std.mem.startsWith(u8, mf.inference_bundle_family, "gliner2");
+    const direct_deberta = mf.config_model_arch.len > 0 and deberta_mod.isDebertaModel(mf.config_model_arch);
+    const unknown_reranker = mf.model_type == .reranker and mf.config_model_arch.len == 0;
+    if (!gliner_bundle and !direct_deberta and !unknown_reranker) return .{};
+
+    const reservation = deberta_arch.metalFastPathReservationBytes(.{
+        .hidden_size = mf.hidden_size,
+        .num_hidden_layers = mf.num_hidden_layers,
+        .num_attention_heads = mf.num_attention_heads,
+        .intermediate_size = mf.intermediate_size,
+        .vocab_size = mf.bert_vocab_size,
+        .max_position_embeddings = mf.max_position_embeddings,
+        .num_labels = mf.num_labels,
+    }, gliner_bundle or mf.model_type == .reranker);
+    return .{
+        .backend_weight_bytes = reservation.persistent_bytes,
+        .backend_scratch_bytes = reservation.scratch_bytes,
+    };
+}
+
 pub const UnsupportedTensorTypeCount = struct {
     tensor_type: gguf_mod.tensor_types.TensorType,
     count: usize,
@@ -680,11 +724,17 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
         }
     }
 
+    const task = sessionTaskForModelType(mf.model_type, override);
     const impl = try allocator.create(ArchSession);
     impl.* = .{
         .allocator = allocator,
         .arch_config = arch_config,
-        .task = sessionTaskForModelType(mf.model_type, override),
+        .task = task,
+        .deberta_reranker_weight_mirrors = sessionEnablesDebertaRerankerWeightMirrors(
+            mf.model_type,
+            std.meta.activeTag(arch_config),
+            task,
+        ),
         .backend_type = .native,
         .backend_data = .{ .native = .{
             .allocator = allocator,
@@ -949,11 +999,17 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
         break :blk client;
     };
 
+    const task = sessionTaskForModelType(mf.model_type, override);
     const impl = try allocator.create(ArchSession);
     impl.* = .{
         .allocator = allocator,
         .arch_config = arch_config,
-        .task = sessionTaskForModelType(mf.model_type, override),
+        .task = task,
+        .deberta_reranker_weight_mirrors = sessionEnablesDebertaRerankerWeightMirrors(
+            mf.model_type,
+            std.meta.activeTag(arch_config),
+            task,
+        ),
         .backend_type = .pjrt,
         .backend_data = .{ .pjrt = .{
             .native = .{
@@ -1536,11 +1592,17 @@ fn createGpuHostedSessionWithTaskOverride(
         }
     }
 
+    const task = sessionTaskForModelType(mf.model_type, override);
     const impl = try allocator.create(ArchSession);
     impl.* = .{
         .allocator = allocator,
         .arch_config = arch_config,
-        .task = sessionTaskForModelType(mf.model_type, override),
+        .task = task,
+        .deberta_reranker_weight_mirrors = sessionEnablesDebertaRerankerWeightMirrors(
+            mf.model_type,
+            std.meta.activeTag(arch_config),
+            task,
+        ),
         .backend_type = backend_type,
         .kernel_jit_config = kernel_jit_config,
         // Startup authority is a constructor-local capability. Never retain
@@ -4426,6 +4488,51 @@ test "sessionTaskForModelType maps classifier and recognizer tasks" {
     try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.reranker, .generic));
 }
 
+test "DeBERTa fast-path admission covers direct classifiers and reranker mirrors" {
+    try std.testing.expect(!debertaRerankerPrefersWeightMirrors(false, 1, 512));
+    try std.testing.expect(!debertaRerankerPrefersWeightMirrors(true, 1, 127));
+    try std.testing.expect(debertaRerankerPrefersWeightMirrors(true, 1, 128));
+    try std.testing.expect(debertaRerankerPrefersWeightMirrors(true, 8, 16));
+    try std.testing.expect(!debertaRerankerPrefersWeightMirrors(true, std.math.maxInt(usize), 2));
+
+    try std.testing.expect(sessionEnablesDebertaRerankerWeightMirrors(.reranker, .deberta, .classifier));
+    try std.testing.expect(!sessionEnablesDebertaRerankerWeightMirrors(.classifier, .deberta, .classifier));
+    try std.testing.expect(!sessionEnablesDebertaRerankerWeightMirrors(.reranker, .bert, .classifier));
+    try std.testing.expect(!sessionEnablesDebertaRerankerWeightMirrors(.reranker, .deberta, .generic));
+
+    const classifier_manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .classifier,
+        .config_model_arch = "deberta-v2",
+    };
+    const classifier_admission = metalDebertaFastPathAdmissionAmounts(classifier_manifest);
+    try std.testing.expect(classifier_admission.backend_weight_bytes > 0);
+    try std.testing.expectEqual(
+        deberta_arch.metalDebertaMpsAttentionScratchMaxBytes(),
+        classifier_admission.backend_scratch_bytes,
+    );
+    const bert_reranker_manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .reranker,
+        .config_model_arch = "bert",
+    };
+    try std.testing.expectEqual(
+        runtime.tier.memory.AdmissionAmounts{},
+        metalDebertaFastPathAdmissionAmounts(bert_reranker_manifest),
+    );
+    const gliner_manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .recognizer,
+        .inference_bundle_family = "gliner2_split_bundle/v1",
+    };
+    const gliner_admission = metalDebertaFastPathAdmissionAmounts(gliner_manifest);
+    try std.testing.expect(gliner_admission.backend_weight_bytes > 0);
+    try std.testing.expectEqual(
+        deberta_arch.metalDebertaMpsAttentionScratchMaxBytes(),
+        gliner_admission.backend_scratch_bytes,
+    );
+}
+
 test "detectArchitecture recognizes generic deberta classifier configs" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4949,6 +5056,9 @@ const ArchSession = struct {
     allocator: std.mem.Allocator,
     arch_config: ArchConfig,
     task: SessionTask = .generic,
+    /// Only real DeBERTa reranker sessions may trade persistent mirror memory
+    /// for the resident fused-layer path. Generic classifiers stay unchanged.
+    deberta_reranker_weight_mirrors: bool = false,
     backend_type: BackendType,
     kernel_jit_config: kernel_jit.Config = .{},
     kernel_jit_load_context: kernel_jit.LoadContext = .dynamic,
@@ -5801,7 +5911,16 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const attention_mask = inputs[1].asInt64();
 
             if (self.task == .classifier) {
-                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, false);
+                // Long-sequence DeBERTa rerankers need the same bounded F16
+                // mirrors as GLiNER to stay on the resident fused-layer path.
+                // Non-Metal backends ignore this preference, and the existing
+                // TERMITE_METAL_DISABLE_DEBERTA_WEIGHT_MIRRORS switch opts out.
+                const prefer_weight_mirrors = debertaRerankerPrefersWeightMirrors(
+                    self.deberta_reranker_weight_mirrors,
+                    batch,
+                    seq_len,
+                );
+                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, prefer_weight_mirrors);
                 defer cb.free(hidden_ct);
 
                 const logits = try runDebertaSequenceClassifierCt(&cb, allocator, cfg, hidden_ct, batch, seq_len);
