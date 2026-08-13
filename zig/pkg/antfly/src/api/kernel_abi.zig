@@ -27,7 +27,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 15;
+pub const abi_version: u32 = 16;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -198,9 +198,29 @@ pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
 }
 
 pub fn validFunctionTable(table: *const FunctionTable, required_capabilities: u64) bool {
+    const required_size = requiredFunctionTableSize(required_capabilities) orelse return false;
     return table.abi_version == abi_version and
-        table.struct_size >= @sizeOf(FunctionTable) and
+        table.struct_size >= required_size and
         table.capabilities & required_capabilities == required_capabilities;
+}
+
+fn functionTableFieldEnd(comptime field_name: []const u8) u32 {
+    return @intCast(@offsetOf(FunctionTable, field_name) + @sizeOf(@FieldType(FunctionTable, field_name)));
+}
+
+pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
+    const known = Capability.core |
+        Capability.route_manifest |
+        Capability.inference_admission_stats;
+    if (required_capabilities & ~known != 0) return null;
+    var required = functionTableFieldEnd("capabilities");
+    if (required_capabilities & Capability.core != 0)
+        required = @max(required, functionTableFieldEnd("handler_destroy"));
+    if (required_capabilities & Capability.route_manifest != 0)
+        required = @max(required, functionTableFieldEnd("handler_route_manifest"));
+    if (required_capabilities & Capability.inference_admission_stats != 0)
+        required = @max(required, functionTableFieldEnd("inference_admission_stats"));
+    return required;
 }
 
 test "API kernel control contexts retain C layout" {
@@ -230,6 +250,9 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     try std.testing.expect(validFunctionTable(&table, Capability.core));
     try std.testing.expect(!validFunctionTable(&table, Capability.route_manifest));
     try std.testing.expect(!validFunctionTable(&table, Capability.inference_admission_stats));
-    table.struct_size -= 1;
+    table.struct_size = requiredFunctionTableSize(Capability.core).? - 1;
     try std.testing.expect(!validFunctionTable(&table, Capability.core));
+    table.struct_size = requiredFunctionTableSize(Capability.core).?;
+    try std.testing.expect(validFunctionTable(&table, Capability.core));
+    try std.testing.expect(!validFunctionTable(&table, 1 << 63));
 }

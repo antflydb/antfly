@@ -82,7 +82,13 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Invoke an Antfly-compatible inference connection */
+        /**
+         * Invoke an Antfly-compatible inference connection
+         * @description Invokes an inference operation through the selected connection.
+         *     Requires `inference/*` write permission. Generation requests with
+         *     `stream: true` return the provider's Server-Sent Events stream; all
+         *     other responses are returned as buffered JSON.
+         */
         post: operations["invokeInferenceConnection"];
         delete?: never;
         options?: never;
@@ -13267,6 +13273,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
+                    "text/event-stream": string;
                     "application/json": {
                         [key: string]: unknown;
                     };
@@ -13286,7 +13293,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description The connection does not declare the capability required by this operation */
+            /** @description Inference write permission is missing, or the connection does not declare the required capability */
             403: {
                 headers: {
                     [name: string]: unknown;

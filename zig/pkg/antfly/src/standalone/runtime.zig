@@ -24,6 +24,7 @@ const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const inference_bridge = @import("inference_bridge.zig");
+const inference_connection_abi = @import("../inference_connection_abi.zig");
 const runtime_http_abi = @import("../runtime_http_abi.zig");
 const inline_inference_codegen = builtin.is_test;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
@@ -2035,8 +2036,9 @@ pub fn runFromIterator(
                 .stats_fn = embeddedInferenceRequestStats,
             },
             .local_inference_connection_target = .{
-                .ptr = &local_inference_connection_context,
-                .invoke_fn = invokeLocalInferenceConnection,
+                .capabilities = inference_connection_abi.Capability.streaming_response,
+                .context = &local_inference_connection_context,
+                .invoke = invokeLocalInferenceConnection,
             },
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
@@ -4394,14 +4396,87 @@ fn linkedInferenceApiInfallible() *const inference_bridge.FunctionTable {
 /// embedded route handler used by the public inference API. This preserves the
 /// destination's validation and admission semantics without opening a second
 /// connection to our own listener.
-fn invokeLocalInferenceConnection(
-    opaque_context: *anyopaque,
+fn invokeLocalInferenceConnection(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+    invokeLocalInferenceConnectionFallible(context) catch |err| {
+        std.log.err("local inference connection failed err={}", .{err});
+        return inference_connection_abi.statusFromError(err);
+    };
+    return .ok;
+}
+
+const LocalInferenceInvocationLifetime = struct {
+    upstream: runtime_http_abi.CancellationView,
+    deadline_ns: u64,
+
+    fn expired(self: *const LocalInferenceInvocationLifetime) bool {
+        return self.deadline_ns != 0 and platform_time.monotonicNs() >= self.deadline_ns;
+    }
+
+    fn check(self: *const LocalInferenceInvocationLifetime) !void {
+        if (self.upstream.requested()) return error.Canceled;
+        if (self.expired()) return error.Timeout;
+    }
+
+    fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
+        const self: *const LocalInferenceInvocationLifetime = @ptrCast(@alignCast(raw orelse return 1));
+        return @intFromBool(self.upstream.requested() or self.expired());
+    }
+
+    fn cancellation(self: *const LocalInferenceInvocationLifetime) runtime_http_abi.CancellationView {
+        return .{ .context = self, .is_cancelled = isCancelled };
+    }
+};
+
+test "standalone local inference lifetime distinguishes deadline from upstream cancellation" {
+    const expired = LocalInferenceInvocationLifetime{
+        .upstream = .{},
+        .deadline_ns = platform_time.monotonicNs(),
+    };
+    try std.testing.expectError(error.Timeout, expired.check());
+    try std.testing.expect(expired.cancellation().requested());
+
+    const Cancelled = struct {
+        fn requested(_: ?*const anyopaque) callconv(.c) u8 {
+            return 1;
+        }
+    };
+    const canceled = LocalInferenceInvocationLifetime{
+        .upstream = .{ .context = &expired, .is_cancelled = Cancelled.requested },
+        .deadline_ns = std.math.maxInt(u64),
+    };
+    try std.testing.expectError(error.Canceled, canceled.check());
+}
+
+fn ownedInferenceConnectionBytes(alloc: std.mem.Allocator, value: []const u8) !inference_connection_abi.OwnedBytes {
+    const owned = try alloc.dupe(u8, value);
+    return .{
+        .ptr = if (owned.len == 0) null else owned.ptr,
+        .len = owned.len,
+    };
+}
+
+fn optionalOwnedInferenceConnectionBytes(
     alloc: std.mem.Allocator,
-    operation: []const u8,
-    body: []const u8,
-    cancellation: ?httpx.CancellationToken,
-) !antfly.public_api.connections.InvokeResult {
-    const context: *LocalInferenceConnectionContext = @ptrCast(@alignCast(opaque_context));
+    value: ?[]const u8,
+) !inference_connection_abi.OptionalOwnedBytes {
+    const present = value orelse return .{};
+    return .{
+        .bytes = try ownedInferenceConnectionBytes(alloc, present),
+        .present = 1,
+    };
+}
+
+fn invokeLocalInferenceConnectionFallible(context: *const inference_connection_abi.InvokeContext) !void {
+    if (!inference_connection_abi.validInvokeContext(context)) return error.UnsupportedVersion;
+    const local_context: *LocalInferenceConnectionContext = @ptrCast(@alignCast(context.target_context));
+    const alloc = context.allocator.asStd();
+    const operation = context.operation.slice();
+    const body = context.body.slice();
+    var lifetime = LocalInferenceInvocationLifetime{
+        .upstream = context.cancellation,
+        .deadline_ns = context.deadline_ns,
+    };
+    try lifetime.check();
     const functions: ?*const inference_bridge.FunctionTable = if (comptime inline_inference_codegen)
         null
     else
@@ -4411,7 +4486,7 @@ fn invokeLocalInferenceConnection(
     var entries_len: usize = 0;
     const manifest_context = inference_bridge.RouteManifestContext{
         .abi_version = inference_bridge.abi_version,
-        .handle = context.handle,
+        .handle = local_context.handle,
         .out_entries = &entries_ptr,
         .out_len = &entries_len,
     };
@@ -4451,51 +4526,51 @@ fn invokeLocalInferenceConnection(
     };
     var response_handle: ?*anyopaque = null;
     var response_view: runtime_http_abi.HttpResponseView = undefined;
-    var cancellation_token = cancellation;
-    const cancellation_view: runtime_http_abi.CancellationView = if (cancellation_token) |*token| .{
-        .context = token,
-        .is_cancelled = struct {
-            fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
-                const cancellation_source: *const httpx.CancellationToken = @ptrCast(@alignCast(raw orelse return 0));
-                return @intFromBool(cancellation_source.isCancelled());
-            }
-        }.isCancelled,
-    } else .{};
     const handle_context = inference_bridge.HttpHandleContext{
         .abi_version = inference_bridge.abi_version,
         .route_handle = route_handle,
         .request = &request,
-        .cancellation = cancellation_view,
+        .cancellation = lifetime.cancellation(),
+        .stream = context.stream,
         .out_response_handle = &response_handle,
         .out_response = &response_view,
     };
     if (comptime inline_inference_codegen) {
-        try inference_host.linkedInferenceHandleHttp(&handle_context);
+        inference_host.linkedInferenceHandleHttp(&handle_context) catch |err| {
+            try lifetime.check();
+            return err;
+        };
     } else {
         const status = functions.?.handle_http(&handle_context);
-        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+        if (!status.isOk()) {
+            try lifetime.check();
+            return inference_bridge.errorFromStatus(status);
+        }
     }
+    try lifetime.check();
     const owned_response = response_handle orelse return error.InferenceRuntimeResponseMissing;
     defer if (comptime inline_inference_codegen)
         inference_host.linkedInferenceDestroyHttpResponse(owned_response)
     else
         functions.?.destroy_http_response(owned_response);
 
-    const response_body = try alloc.dupe(u8, response_view.body.slice());
-    errdefer alloc.free(response_body);
-    var retry_after: ?[]u8 = null;
+    var response: inference_connection_abi.InvokeResponse = .{
+        .status = response_view.status,
+        .body = try ownedInferenceConnectionBytes(alloc, response_view.body.slice()),
+    };
+    errdefer alloc.free(response.body.slice());
+    var retry_after: ?[]const u8 = null;
     const response_headers = if (response_view.headers_ptr) |ptr| ptr[0..response_view.headers_len] else &.{};
     for (response_headers) |header| {
         if (std.ascii.eqlIgnoreCase(header.name.slice(), "Retry-After")) {
-            retry_after = try alloc.dupe(u8, header.value.slice());
+            retry_after = header.value.slice();
             break;
         }
     }
-    return .{
-        .status = response_view.status,
-        .body = response_body,
-        .retry_after = retry_after,
-    };
+    response.retry_after = try optionalOwnedInferenceConnectionBytes(alloc, retry_after);
+    errdefer if (response.retry_after.present != 0) alloc.free(response.retry_after.bytes.slice());
+    response.content_type = try optionalOwnedInferenceConnectionBytes(alloc, response_view.content_type.slice());
+    context.out_response.* = response;
 }
 
 fn tryAcquireEmbeddedInferenceRequest(handle: *anyopaque) bool {

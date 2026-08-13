@@ -2213,6 +2213,14 @@ paths:
   /db/v1/connections/{connection_id}/inference/{operation}:
     post:
       summary: Invoke an Antfly-compatible inference connection
+      description: >
+        Invokes an inference operation through the selected connection.
+
+        Requires `inference/*` write permission. Generation requests with
+
+        `stream: true` return the provider's Server-Sent Events stream; all
+
+        other responses are returned as buffered JSON.
       tags:
         - cluster_management
       operationId: invokeInferenceConnection
@@ -2248,6 +2256,10 @@ paths:
         '200':
           description: Inference provider response
           content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Streaming inference events when requested by the operation payload.
             application/json:
               schema:
                 type: object
@@ -2257,7 +2269,8 @@ paths:
         '401':
           description: Unauthorized - authentication required
         '403':
-          description: The connection does not declare the capability required by this operation
+          description: Inference write permission is missing, or the connection does not declare the required
+            capability
         '502':
           description: Inference provider request failed
         '503':

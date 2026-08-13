@@ -84,8 +84,10 @@ test "standalone linked inference ABI validates the supported function-table pre
     table.capabilities = inference_bridge.Capability.provider;
     try std.testing.expect(inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
     try std.testing.expect(!inference_bridge.validFunctionTable(&table, inference_bridge.Capability.route_manifest));
-    table.struct_size -= 1;
+    table.struct_size = inference_bridge.requiredFunctionTableSize(inference_bridge.Capability.provider).? - 1;
     try std.testing.expect(!inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
+    table.struct_size = inference_bridge.requiredFunctionTableSize(inference_bridge.Capability.provider).?;
+    try std.testing.expect(inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
 }
 
 const ModelTextsRequest = struct {

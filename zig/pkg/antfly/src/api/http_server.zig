@@ -2412,6 +2412,8 @@ pub const ApiHttpServer = struct {
         operation: []const u8,
         body: []const u8,
         cancellation: ?httpx.CancellationToken,
+        deadline_ns: u64,
+        stream: kernel_abi.StreamSink,
     ) !connections_api.InvokeResult {
         if (std.mem.eql(u8, connection_id, common_config.local_inference_connection_id)) {
             return connections_api.invokeInferenceConnection(
@@ -2424,6 +2426,8 @@ pub const ApiHttpServer = struct {
                 operation,
                 body,
                 cancellation,
+                deadline_ns,
+                stream,
             );
         }
         var client = httpx.Client.initWithConfig(alloc, self.inferenceIo(), .{ .keep_alive = false });
@@ -2438,6 +2442,8 @@ pub const ApiHttpServer = struct {
             operation,
             body,
             cancellation,
+            deadline_ns,
+            stream,
         );
     }
 
@@ -13274,6 +13280,11 @@ fn parseArtifactReprocessJobId(encoded_job_id: []const u8) !u64 {
 }
 
 pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_common.Method, path: []const u8) !?RequiredPermission {
+    if (method == .POST and routes.Routes.matchInferenceConnectionInvocation(path) != null) return .{
+        .resource_type = .inference,
+        .resource = "*",
+        .permission_type = .write,
+    };
     if (std.mem.eql(u8, path, routes.Routes.tables)) return switch (method) {
         .GET => .{
             .resource_type = .table,
@@ -13373,6 +13384,29 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (routes.Routes.matchTableRestore(path)) |table_restore| return try tablePermission(alloc, table_restore.table_name, .admin);
     if (tableNameForGraphPath(path)) |table_name| return try tablePermission(alloc, table_name, .read);
     return null;
+}
+
+test "inference connection invocation requires inference write permission" {
+    const required = (try requiredPermissionForRequest(
+        std.testing.allocator,
+        .POST,
+        "/connections/local-inference/inference/generate",
+    )).?;
+    defer required.deinit(std.testing.allocator);
+    try std.testing.expectEqual(usermgr.ResourceType.inference, required.resource_type);
+    try std.testing.expectEqualStrings("*", required.resource);
+    try std.testing.expectEqual(usermgr.PermissionType.write, required.permission_type);
+
+    try std.testing.expect((try requiredPermissionForRequest(
+        std.testing.allocator,
+        .GET,
+        "/connections/local-inference/inference/generate",
+    )) == null);
+    try std.testing.expect((try requiredPermissionForRequest(
+        std.testing.allocator,
+        .POST,
+        "/connections/local-inference/inference/generate/extra",
+    )) == null);
 }
 
 fn tablePermission(alloc: std.mem.Allocator, encoded_table_name: []const u8, permission_type: usermgr.PermissionType) !RequiredPermission {

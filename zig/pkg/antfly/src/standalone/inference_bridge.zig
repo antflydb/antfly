@@ -213,9 +213,34 @@ pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
 }
 
 pub fn validFunctionTable(table: *const FunctionTable, required_capabilities: u64) bool {
+    const required_size = requiredFunctionTableSize(required_capabilities) orelse return false;
     return table.abi_version == abi_version and
-        table.struct_size >= @sizeOf(FunctionTable) and
+        table.struct_size >= required_size and
         table.capabilities & required_capabilities == required_capabilities;
+}
+
+fn functionTableFieldEnd(comptime field_name: []const u8) u32 {
+    return @intCast(@offsetOf(FunctionTable, field_name) + @sizeOf(@FieldType(FunctionTable, field_name)));
+}
+
+pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
+    const known = Capability.provider |
+        Capability.route_manifest |
+        Capability.resource_budget |
+        Capability.request_admission;
+    if (required_capabilities & ~known != 0) return null;
+    var required = functionTableFieldEnd("capabilities");
+    // Provider lifetime includes destruction even though the invoke operations
+    // precede route support in the append-only table.
+    if (required_capabilities & Capability.provider != 0)
+        required = @max(required, functionTableFieldEnd("destroy"));
+    if (required_capabilities & Capability.route_manifest != 0)
+        required = @max(required, functionTableFieldEnd("destroy_http_response"));
+    if (required_capabilities & Capability.resource_budget != 0)
+        required = @max(required, functionTableFieldEnd("configure"));
+    if (required_capabilities & Capability.request_admission != 0)
+        required = @max(required, functionTableFieldEnd("request_admission_stats"));
+    return required;
 }
 
 pub extern fn antfly_standalone_inference_get_function_table() callconv(.c) *const FunctionTable;
@@ -232,6 +257,9 @@ test "linked inference ABI rejects mismatched context and function-table prefixe
     table.capabilities = Capability.provider;
     try std.testing.expect(validFunctionTable(&table, Capability.provider));
     try std.testing.expect(!validFunctionTable(&table, Capability.route_manifest));
-    table.struct_size -= 1;
+    table.struct_size = requiredFunctionTableSize(Capability.provider).? - 1;
     try std.testing.expect(!validFunctionTable(&table, Capability.provider));
+    table.struct_size = requiredFunctionTableSize(Capability.provider).?;
+    try std.testing.expect(validFunctionTable(&table, Capability.provider));
+    try std.testing.expect(!validFunctionTable(&table, 1 << 63));
 }

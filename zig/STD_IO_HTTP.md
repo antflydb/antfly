@@ -717,14 +717,29 @@ Inference forwarding admission uses explicit runtime identity, not URL
 comparison. The reserved `local-inference` virtual connection is created by the
 runtime and dispatches directly through the linked inference route boundary; it
 does not open a loopback connection or infer locality from a public URL. The
-destination route receives the original cancellation signal and is the sole
-owner of the shared embedded-inference permit. Every configured connection is
-instead admitted by the forwarding operation for the full upstream request,
+destination route receives the original cancellation signal, the same absolute
+invocation deadline used for a remote provider, and the original response
+stream sink. SSE therefore retains listener backpressure and HTTP/1 or HTTP/2
+close semantics instead of being buffered or failing for lack of a socket. The
+destination is the sole owner of the shared embedded-inference permit. Every
+configured connection is instead admitted by the forwarding operation for the
+full upstream request,
 even when its URL text matches or aliases the local listener. Operators that
 intend in-process inference must use the reserved connection; configured URLs
 remain ordinary network boundaries and cannot silently change resource
 ownership because of DNS, proxy, case, path, or listener configuration. Tests
 must preserve this distinction at capacity one.
+
+The local target itself is a versioned C-layout interface. It carries only ABI
+byte views, fixed status values, a callback allocator, cancellation, deadline,
+and stream views. It never transports a Zig allocator, slice, error union,
+tagged union, `httpx.Context`, or default-calling-convention function pointer
+through `ApiHttpServerConfig`. Buffered response bytes are allocated through
+the caller's ABI allocator and become caller-owned; streamed bytes remain
+borrowed for each sink callback. The forwarding operation computes one
+absolute process-monotonic deadline and remote HTTP derives its remaining
+timeout from that value, so changing transport cannot reset or remove the
+request ceiling.
 
 ### Health
 
@@ -1122,6 +1137,13 @@ owned and exported by `HttpRuntime`; kernel handler statistics retain only
 application admission state, avoiding duplicated or partially observed
 transport counters.
 
+Function-table validation is capability-prefix-aware. Each capability defines
+the byte extent through its last callable field; validation rejects unknown
+capability bits and tables shorter than the largest requested extent, but does
+not require unrelated fields appended later. This makes append-only tables
+useful in both directions without allowing a caller to read beyond the
+provider's published `struct_size`.
+
 Passing an opaque server pointer may remain as a same-toolchain migration step,
 but it is not the final ABI contract. Kernel-created objects must still be
 destroyed by the archive and allocator that created them.
@@ -1140,6 +1162,8 @@ A hardened bridge should provide:
 - Explicit object, allocator, and slice ownership
 - Creation and destruction of an object in the same archive
 - Capability negotiation for optional operations
+- Capability-specific minimum function-table extents rather than the size of
+  the newest complete table
 - No unstable Zig errors, slices, or layouts passed by value
 - Tests that intentionally detect layout and version mismatches
 

@@ -760,7 +760,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/connections", .operation_id = "listConnections", .request_body = .none, .streaming_response = false },
-    .{ .method = "POST", .path = "/connections/{connection_id}/inference/{operation}", .operation_id = "invokeInferenceConnection", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/connections/{connection_id}/inference/{operation}", .operation_id = "invokeInferenceConnection", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore", .request_body = .buffered, .streaming_response = false },

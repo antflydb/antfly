@@ -20,6 +20,8 @@
 /// a typed operation, and adapts its owned result to an httpx.Response.
 const std = @import("std");
 const httpx = @import("httpx");
+const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const inference_connection_abi = @import("../inference_connection_abi.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const http_server_mod = @import("http_server.zig");
@@ -2052,7 +2054,10 @@ pub const AntflyApiHandler = struct {
 
     fn inferenceInvokeResponse(ctx: *httpx.Context, result: *const connections_api.InvokeResult) !httpx.Response {
         if (result.retry_after) |value| try ctx.setHeader("Retry-After", value);
-        return jsonResponse(ctx, result.status, result.body);
+        _ = ctx.status(result.status);
+        try ctx.setHeader("content-type", result.content_type orelse "application/json");
+        _ = ctx.response.body(result.body);
+        return ctx.response.build();
     }
 
     fn acquirePublicOperation(
@@ -2190,13 +2195,31 @@ pub const AntflyApiHandler = struct {
                 return request_context.isCancellationRequested();
             }
         }.isCancelled);
-        var result = self.api_server.invokeInferenceConnection(ctx.allocator, connection_id, operation, body, cancellation) catch |err| switch (err) {
-            error.ConnectionCapabilityMissing => return textResponse(ctx, 403, @errorName(err)),
-            error.ConnectionNotFound, error.ConnectionNotInference, error.InvalidConfig, error.ConnectionURLMissing, error.InvalidConnectionURL, error.ProviderNotAntflyCompatible, error.UnsupportedInferenceOperation => return textResponse(ctx, 400, @errorName(err)),
-            error.Canceled, error.Cancelled => return error.Canceled,
-            else => return textResponse(ctx, 502, @errorName(err)),
+        const deadline_ns = connections_api.inferenceInvocationDeadlineNs();
+        var transport = runtime_http_bridge.Outbound{ .context = ctx };
+        var result = self.api_server.invokeInferenceConnection(
+            ctx.allocator,
+            connection_id,
+            operation,
+            body,
+            cancellation,
+            deadline_ns,
+            transport.stream(),
+        ) catch |err| {
+            // Once a stream has committed its headers, the listener must close
+            // that stream on failure; attempting to synthesize a second HTTP
+            // response would corrupt the transport.
+            if (transport.started) return err;
+            return switch (err) {
+                error.ConnectionCapabilityMissing => textResponse(ctx, 403, @errorName(err)),
+                error.ConnectionNotFound, error.ConnectionNotInference, error.InvalidConfig, error.ConnectionURLMissing, error.InvalidConnectionURL, error.ProviderNotAntflyCompatible, error.UnsupportedInferenceOperation => textResponse(ctx, 400, @errorName(err)),
+                error.Canceled, error.Cancelled => error.Canceled,
+                error.Timeout => textResponse(ctx, 504, "inference invocation deadline exceeded"),
+                else => textResponse(ctx, 502, @errorName(err)),
+            };
         };
         defer result.deinit(ctx.allocator);
+        if (transport.started) return ctx.response.build();
         return inferenceInvokeResponse(ctx, &result);
     }
 
@@ -6556,23 +6579,32 @@ test "local inference connection admission is owned exactly once by its target" 
             return self.gate.stats();
         }
 
-        fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, operation: []const u8, body: []const u8, cancellation: ?httpx.CancellationToken) !connections_api.InvokeResult {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expect(cancellation != null);
-            try std.testing.expect(!cancellation.?.isCancelled());
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            const alloc = context.allocator.asStd();
+            if (context.cancellation.requested() or
+                !std.mem.eql(u8, context.operation.slice(), "embed") or
+                !std.mem.eql(u8, context.body.slice(), "{}"))
+            {
+                return inference_connection_abi.statusFromError(error.InvalidArgument);
+            }
             if (!self.gate.tryAcquire()) {
-                return .{
+                const body = alloc.dupe(u8, "capacity exhausted") catch
+                    return inference_connection_abi.statusFromError(error.OutOfMemory);
+                context.out_response.* = .{
                     .status = 503,
-                    .body = try alloc.dupe(u8, "capacity exhausted"),
+                    .body = .{ .ptr = body.ptr, .len = body.len },
                 };
+                return .ok;
             }
             defer self.gate.release();
-            try std.testing.expectEqualStrings("embed", operation);
-            try std.testing.expectEqualStrings("{}", body);
-            return .{
+            const body = alloc.dupe(u8, "{\"ok\":true}") catch
+                return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{
                 .status = 200,
-                .body = try alloc.dupe(u8, "{\"ok\":true}"),
+                .body = .{ .ptr = body.ptr, .len = body.len },
             };
+            return .ok;
         }
     };
 
@@ -6587,8 +6619,9 @@ test "local inference connection admission is owned exactly once by its target" 
             .stats_fn = SharedTarget.stats,
         },
         .local_inference_connection_target = .{
-            .ptr = &shared,
-            .invoke_fn = SharedTarget.invoke,
+            .capabilities = inference_connection_abi.Capability.streaming_response,
+            .context = &shared,
+            .invoke = SharedTarget.invoke,
         },
     }, source.iface(), null, null);
     defer api_server.deinit();
@@ -6610,6 +6643,144 @@ test "local inference connection admission is owned exactly once by its target" 
     try std.testing.expectEqual(@as(u64, 0), stats.rejected_total);
 }
 
+test "httpx inference connection requires inference write permission" {
+    const Target = struct {
+        invoked: bool = false,
+
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            self.invoked = true;
+            const body = context.allocator.asStd().dupe(u8, "{\"ok\":true}") catch
+                return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{
+                .status = 200,
+                .body = .{ .ptr = body.ptr, .len = body.len },
+            };
+            return .ok;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var table_read = try usermgr.Permission.initOwned(alloc, .table, "*", .read);
+    defer table_read.deinit(alloc);
+    var reader = try auth.manager.createUser("reader", "reader", &.{table_read});
+    defer reader.deinit(alloc);
+    const authorization = try encodeBasicAuthorization(alloc, "reader", "reader");
+    defer alloc.free(authorization);
+
+    var source = AuthStatusSource{};
+    var target = Target{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+        .local_inference_connection_target = .{
+            .capabilities = inference_connection_abi.Capability.streaming_response,
+            .context = &target,
+            .invoke = Target.invoke,
+        },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+
+    var denied_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/connections/local-inference/inference/embed");
+    defer denied_request.deinit();
+    try denied_request.headers.append("authorization", authorization);
+    denied_request.body = "{}";
+    var denied_ctx = httpx.Context.init(alloc, std.testing.io, &denied_request);
+    defer denied_ctx.deinit();
+    var denied = try handler.invokeInferenceConnection(&denied_ctx, common_config.local_inference_connection_id, "embed");
+    defer denied.deinit();
+    try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    try std.testing.expect(!target.invoked);
+
+    var inference_write = try usermgr.Permission.initOwned(alloc, .inference, "*", .write);
+    defer inference_write.deinit(alloc);
+    try auth.manager.addPermissionToUser("reader", inference_write);
+
+    var allowed_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/connections/local-inference/inference/embed");
+    defer allowed_request.deinit();
+    try allowed_request.headers.append("authorization", authorization);
+    allowed_request.body = "{}";
+    var allowed_ctx = httpx.Context.init(alloc, std.testing.io, &allowed_request);
+    defer allowed_ctx.deinit();
+    var allowed = try handler.invokeInferenceConnection(&allowed_ctx, common_config.local_inference_connection_id, "embed");
+    defer allowed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), allowed.status.code);
+    try std.testing.expect(target.invoked);
+}
+
+test "httpx inference connection propagates failures after stream commit" {
+    const Target = struct {
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const stream = context.stream;
+            if (stream.start.?(stream.context, 200) != .ok or
+                stream.write.?(stream.context, inference_connection_abi.Bytes.init("data: partial\n\n")) != .ok)
+            {
+                return inference_connection_abi.statusFromError(error.Unavailable);
+            }
+            return inference_connection_abi.statusFromError(error.Timeout);
+        }
+    };
+    const Stream = struct {
+        started: bool = false,
+        bytes: [32]u8 = undefined,
+        len: usize = 0,
+
+        fn start(raw: ?*anyopaque, status: u16) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+            self.started = status == 200;
+        }
+
+        fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+            if (bytes.len > self.bytes.len - self.len) return error.NoSpaceLeft;
+            @memcpy(self.bytes[self.len..][0..bytes.len], bytes);
+            self.len += bytes.len;
+        }
+
+        fn close(_: ?*anyopaque) !void {}
+    };
+
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var target_context: u8 = 0;
+    var api_server = ApiHttpServer.init(alloc, .{
+        .local_inference_connection_target = .{
+            .capabilities = inference_connection_abi.Capability.streaming_response,
+            .context = &target_context,
+            .invoke = Target.invoke,
+        },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/connections/local-inference/inference/generate");
+    defer request.deinit();
+    request.body = "{\"stream\":true}";
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var stream = Stream{};
+    ctx.stream_delegate = .{
+        .ptr = &stream,
+        .start = Stream.start,
+        .write = Stream.write,
+        .close = Stream.close,
+    };
+
+    try std.testing.expectError(
+        error.Timeout,
+        handler.invokeInferenceConnection(&ctx, common_config.local_inference_connection_id, "generate"),
+    );
+    try std.testing.expect(stream.started);
+    try std.testing.expectEqualStrings("data: partial\n\n", stream.bytes[0..stream.len]);
+}
+
 test "httpx inference connection preserves upstream retry guidance" {
     const alloc = std.testing.allocator;
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/connections/remote/inference/embed");
@@ -6620,6 +6791,7 @@ test "httpx inference connection preserves upstream retry guidance" {
         .status = 503,
         .body = try alloc.dupe(u8, "{\"error\":\"busy\"}"),
         .retry_after = try alloc.dupe(u8, "4"),
+        .content_type = try alloc.dupe(u8, "application/problem+json"),
     };
     defer result.deinit(alloc);
 
@@ -6627,6 +6799,7 @@ test "httpx inference connection preserves upstream retry guidance" {
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 503), response.status.code);
     try std.testing.expectEqualStrings("4", response.headers.get("Retry-After").?);
+    try std.testing.expectEqualStrings("application/problem+json", response.headers.get("Content-Type").?);
     try std.testing.expectEqualStrings("{\"error\":\"busy\"}", response.body.?);
 }
 
