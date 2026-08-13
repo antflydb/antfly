@@ -713,6 +713,17 @@ or own a heap-stable executor implementation. Its returned handle must retain
 an owned Future and stop/await it during deinitialization. It must not detach a
 thread and intentionally leak the node for the remainder of the process.
 
+Inference forwarding admission uses explicit runtime identity, not URL
+comparison. The reserved `local-inference` virtual connection is created by the
+runtime and is the only connection that delegates admission to the destination
+route, where the shared embedded-inference coordinator acquires one permit.
+Every configured connection is admitted by the forwarding operation for the
+full upstream request, even when its URL text matches or aliases the local
+listener. Operators that intend in-process inference must use the reserved
+connection; configured URLs remain ordinary network boundaries and cannot
+silently change resource ownership because of DNS, proxy, case, path, or
+listener configuration. Tests must preserve this distinction at capacity one.
+
 ### Health
 
 Health listeners should use `httpx.Server` on a supervisor-provided control or

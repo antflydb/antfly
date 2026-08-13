@@ -4951,6 +4951,7 @@ pub fn build(b: *std.Build) void {
             "connection cache remains valid across every allocation failure",
             "build response exposes embedded inference as a local connection",
             "inference connection operations are allowlisted",
+            "inference admission ownership uses explicit connection identity",
             "inference connection URLs require an HTTP origin",
             "build response reports mock connected and types filter",
             "build response reports configured external io connections",

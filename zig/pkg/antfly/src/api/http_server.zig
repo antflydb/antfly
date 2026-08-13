@@ -657,10 +657,10 @@ pub const ApiHttpServerConfig = struct {
     /// Shared owner used when inference runs in this process. When present it
     /// supersedes the local fallback so every inference endpoint shares one cap.
     inference_request_admission_source: ?InferenceRequestAdmissionSource = null,
-    /// Public base URL of the inference service embedded in this process.
-    /// Connection forwarding to this target lets the destination route own
-    /// admission so one logical request never consumes the shared permit twice.
-    local_inference_api_url: ?[]const u8 = null,
+    /// Explicit in-process transport for the reserved local-inference virtual
+    /// connection. The destination route owns admission and no public listener
+    /// connection is consumed. Configured connections are always remote.
+    local_inference_connection_target: ?connections_api.LocalInferenceConnectionTarget = null,
     ard_base_url: ?[]const u8 = null,
     ard_publisher_domain: []const u8 = "antfly.local",
     ard_display_name: []const u8 = "Antfly",
@@ -2418,8 +2418,7 @@ pub const ApiHttpServer = struct {
             alloc,
             &client,
             self.cfg.node_config,
-            self.cfg.local_inference_api_url,
-            self.cfg.inference_api_key,
+            self.cfg.local_inference_connection_target,
             self.cfg.secret_store,
             connection_id,
             operation,
@@ -2434,7 +2433,7 @@ pub const ApiHttpServer = struct {
     ) !connections_api.InferenceAdmissionOwner {
         return connections_api.inferenceConnectionAdmissionOwner(
             self.cfg.node_config,
-            self.cfg.local_inference_api_url,
+            self.cfg.local_inference_connection_target,
             connection_id,
             operation,
         );

@@ -176,47 +176,77 @@ pub const InferenceAdmissionOwner = enum {
     target,
 };
 
-const ResolvedInferenceConnection = struct {
-    url: []const u8,
-    admission_owner: InferenceAdmissionOwner,
+/// Explicit in-process transport for the runtime-reserved local-inference
+/// connection. The callback enters the destination route directly, so the
+/// destination remains the sole owner of request admission without consuming
+/// another public HTTP connection.
+pub const LocalInferenceConnectionTarget = struct {
+    ptr: *anyopaque,
+    invoke_fn: *const fn (
+        ptr: *anyopaque,
+        alloc: Allocator,
+        operation: []const u8,
+        body: []const u8,
+    ) anyerror!InvokeResult,
+
+    pub fn invoke(
+        self: LocalInferenceConnectionTarget,
+        alloc: Allocator,
+        operation: []const u8,
+        body: []const u8,
+    ) !InvokeResult {
+        return self.invoke_fn(self.ptr, alloc, operation, body);
+    }
 };
 
-/// Resolve the forwarding target before reading the request body. A target in
-/// this process owns its route admission; remote targets are admitted by the
-/// forwarding API for the full upstream request.
+const RemoteInferenceConnection = struct {
+    url: []const u8,
+    api_key: ?[]const u8,
+};
+
+const ResolvedInferenceConnection = union(enum) {
+    local: LocalInferenceConnectionTarget,
+    remote: RemoteInferenceConnection,
+};
+
+/// Resolve the forwarding target before reading the request body. Only the
+/// reserved local-inference connection delegates admission to its destination
+/// route. Configured connections are caller-admitted; a URL is transport data,
+/// not a trustworthy process-identity signal.
 pub fn inferenceConnectionAdmissionOwner(
     node_config: ?*const common_config.Config,
-    local_inference_api_url: ?[]const u8,
+    local_target: ?LocalInferenceConnectionTarget,
     connection_id: []const u8,
     operation: []const u8,
 ) !InferenceAdmissionOwner {
-    return (try resolveInferenceConnection(node_config, local_inference_api_url, connection_id, operation)).admission_owner;
+    return switch (try resolveInferenceConnection(node_config, local_target, connection_id, operation)) {
+        .local => .target,
+        .remote => .caller,
+    };
 }
 
 pub fn invokeInferenceConnection(
     alloc: Allocator,
-    http: *httpx.Client,
+    http: ?*httpx.Client,
     node_config: ?*const common_config.Config,
-    local_inference_api_url: ?[]const u8,
-    local_inference_api_key: ?[]const u8,
+    local_target: ?LocalInferenceConnectionTarget,
     secret_store: ?*common_secrets.FileStore,
     connection_id: []const u8,
     operation: []const u8,
     body: []const u8,
 ) !InvokeResult {
-    const resolved = try resolveInferenceConnection(node_config, local_inference_api_url, connection_id, operation);
-    const raw_url = resolved.url;
+    const resolved = try resolveInferenceConnection(node_config, local_target, connection_id, operation);
+    if (resolved == .local) return resolved.local.invoke(alloc, operation, body);
+
+    const remote = resolved.remote;
+    const raw_url = remote.url;
     const base = std.mem.trimEnd(u8, raw_url, "/");
     const prefix = if (std.mem.endsWith(u8, base, "/ai/v1")) base else try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{base});
     defer if (prefix.ptr != base.ptr) alloc.free(prefix);
     const url = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
     defer alloc.free(url);
 
-    const configured_api_key = if (std.mem.eql(u8, connection_id, common_config.local_inference_connection_id))
-        local_inference_api_key
-    else
-        node_config.?.connections.get(connection_id).?.inference.?.api_key;
-    const resolved_key = try resolveInferenceApiKey(alloc, secret_store, configured_api_key);
+    const resolved_key = try resolveInferenceApiKey(alloc, secret_store, remote.api_key);
     defer if (resolved_key) |key| alloc.free(key);
     const auth = if (resolved_key) |key| try std.fmt.allocPrint(alloc, "Bearer {s}", .{key}) else null;
     defer if (auth) |value| alloc.free(value);
@@ -225,7 +255,7 @@ pub fn invokeInferenceConnection(
         .{ "Content-Type", "application/json" },
     } else &[_][2][]const u8{.{ "Content-Type", "application/json" }};
 
-    var response = try http.request(.POST, url, .{ .headers = headers, .body = body, .timeout_ms = 120_000 });
+    var response = try (http orelse return error.InferenceTransportUnavailable).request(.POST, url, .{ .headers = headers, .body = body, .timeout_ms = 120_000 });
     defer response.deinit();
     const response_body = try alloc.dupe(u8, response.body orelse "");
     errdefer alloc.free(response_body);
@@ -242,18 +272,13 @@ pub fn invokeInferenceConnection(
 
 fn resolveInferenceConnection(
     node_config: ?*const common_config.Config,
-    local_inference_api_url: ?[]const u8,
+    local_target: ?LocalInferenceConnectionTarget,
     connection_id: []const u8,
     operation: []const u8,
 ) !ResolvedInferenceConnection {
     const required_capability = inferenceCapability(operation) orelse return error.UnsupportedInferenceOperation;
     if (std.mem.eql(u8, connection_id, common_config.local_inference_connection_id)) {
-        const local_url = local_inference_api_url orelse return error.ConnectionNotFound;
-        if (!validInferenceURL(local_url)) return error.InvalidConnectionURL;
-        return .{
-            .url = local_url,
-            .admission_owner = .target,
-        };
+        return .{ .local = local_target orelse return error.ConnectionNotFound };
     }
 
     const config = node_config orelse return error.ConnectionNotFound;
@@ -264,23 +289,14 @@ fn resolveInferenceConnection(
     if (!std.mem.eql(u8, cfg.provider, "antfly")) return error.ProviderNotAntflyCompatible;
     const raw_url = cfg.url orelse return error.ConnectionURLMissing;
     if (!validInferenceURL(raw_url)) return error.InvalidConnectionURL;
-    return .{
+    return .{ .remote = .{
         .url = raw_url,
-        .admission_owner = if (local_inference_api_url) |local_url|
-            if (sameInferenceBaseURL(raw_url, local_url)) .target else .caller
-        else
-            .caller,
-    };
-}
-
-fn sameInferenceBaseURL(first: []const u8, second: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(trimInferenceBaseURL(first), trimInferenceBaseURL(second));
-}
-
-fn trimInferenceBaseURL(raw: []const u8) []const u8 {
-    var value = std.mem.trimEnd(u8, raw, "/");
-    if (std.mem.endsWith(u8, value, "/ai/v1")) value = value[0 .. value.len - "/ai/v1".len];
-    return std.mem.trimEnd(u8, value, "/");
+        .api_key = cfg.api_key,
+        // The reserved connection ID above is the only process-local identity.
+        // A configured URL may resolve through aliases, proxies, or a future
+        // listener at the same origin, so URL equality must never transfer
+        // admission ownership to the target.
+    } };
 }
 
 fn inferenceCapability(operation: []const u8) ?[]const u8 {
@@ -1561,15 +1577,6 @@ test "inference connection operations are allowlisted" {
     );
     defer cfg.deinit();
     try std.testing.expectError(error.ConnectionCapabilityMissing, invokeInferenceConnection(alloc, undefined, &cfg, null, null, null, "embed-only", "generate", "{}"));
-    try std.testing.expectEqual(
-        InferenceAdmissionOwner.caller,
-        try inferenceConnectionAdmissionOwner(&cfg, "http://127.0.0.1:8080", "embed-only", "embed"),
-    );
-    try std.testing.expectEqual(
-        InferenceAdmissionOwner.target,
-        try inferenceConnectionAdmissionOwner(null, "http://127.0.0.1:8080", common_config.local_inference_connection_id, "generate"),
-    );
-    try std.testing.expect(sameInferenceBaseURL("http://127.0.0.1:8080/ai/v1/", "HTTP://127.0.0.1:8080"));
 
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-connection-secrets-{d}.json", .{platform_time.monotonicNs()});
     defer alloc.free(store_path);
@@ -1585,6 +1592,34 @@ test "inference connection operations are allowlisted" {
     const resolved = (try resolveInferenceApiKey(alloc, &secret_store, "${secret:openai.api_key}")).?;
     defer alloc.free(resolved);
     try std.testing.expectEqualStrings("resolved-key", resolved);
+}
+
+test "inference admission ownership uses explicit connection identity" {
+    const alloc = std.testing.allocator;
+    const local_url = "http://127.0.0.1:8080/ai/v1";
+    var cfg = try common_config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "configured-loopback": {
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.embed"],
+        \\      "inference": { "provider": "antfly", "url": "http://127.0.0.1:8080/ai/v1" }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+
+    // Even an exact URL match is an ordinary configured network boundary.
+    try std.testing.expectEqual(
+        InferenceAdmissionOwner.caller,
+        try inferenceConnectionAdmissionOwner(&cfg, local_url, "configured-loopback", "embed"),
+    );
+    // Only the runtime-reserved identity transfers ownership to the local route.
+    try std.testing.expectEqual(
+        InferenceAdmissionOwner.target,
+        try inferenceConnectionAdmissionOwner(null, local_url, common_config.local_inference_connection_id, "generate"),
+    );
 }
 
 test "inference connection URLs require an HTTP origin" {
