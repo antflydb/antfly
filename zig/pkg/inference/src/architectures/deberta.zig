@@ -177,17 +177,23 @@ pub fn densePackReservationBytes(config: Config, bytes_per_element: usize) ?usiz
     return std.math.mul(usize, bytes_per_layer, layers) catch null;
 }
 
-/// Persistent f32 device buffers retained by the compact relative-position
-/// path: normalized unique embeddings, projected Qr/Kr for every layer, and
-/// the full-to-unique index map at the model's maximum sequence length.
-pub fn relativeCacheReservationBytes(config: Config) ?usize {
+/// Persistent f32 device buffers retained by the relative-position path:
+/// normalized embeddings, projected Qr/Kr for every layer, and (for the
+/// compact path) the full-to-unique index map at the model's maximum sequence
+/// length.
+pub fn relativeCacheReservationBytes(config: Config, compact_relative_positions: bool) ?usize {
     const layers: usize = @intCast(config.num_hidden_layers);
     const hidden: usize = @intCast(config.hidden_size);
     const max_positions: usize = @intCast(config.max_position_embeddings);
     const row_bytes = std.math.mul(usize, hidden, @sizeOf(f32)) catch return null;
+    const full_relative_rows = if (max_positions == 0)
+        0
+    else
+        std.math.sub(usize, std.math.mul(usize, max_positions, 2) catch return null, 1) catch return null;
     // Buckets are offset and clamped into the full relative embedding table;
-    // at max sequence length every table row may be unique.
-    const relative_rows = max_positions;
+    // the compact path retains at most one row per bucket, while its fallback
+    // retains every relative-position row, including duplicates.
+    const relative_rows = if (compact_relative_positions) max_positions else full_relative_rows;
     const embedding_bytes = std.math.mul(usize, relative_rows, row_bytes) catch return null;
     const projected_tables = std.math.mul(usize, layers, 2) catch return null;
     const projection_bytes = std.math.mul(
@@ -195,10 +201,7 @@ pub fn relativeCacheReservationBytes(config: Config) ?usize {
         std.math.mul(usize, projected_tables, relative_rows) catch return null,
         row_bytes,
     ) catch return null;
-    const index_count = if (max_positions == 0)
-        0
-    else
-        std.math.sub(usize, std.math.mul(usize, max_positions, 2) catch return null, 1) catch return null;
+    const index_count = if (compact_relative_positions) full_relative_rows else 0;
     const index_bytes = std.math.mul(usize, index_count, @sizeOf(f32)) catch return null;
     return std.math.add(
         usize,
@@ -218,7 +221,10 @@ pub const MetalFastPathReservationBytes = struct {
 /// allocation cannot silently disagree about a kill switch or byte cap.
 pub fn metalFastPathReservationBytes(config: Config, prefer_weight_mirrors: bool) MetalFastPathReservationBytes {
     const mirrors = debertaMirrorPreference(config, prefer_weight_mirrors);
-    const relative_cache_bytes = relativeCacheReservationBytes(config) orelse std.math.maxInt(usize);
+    const relative_cache_bytes = relativeCacheReservationBytes(
+        config,
+        uniqueRelativePositionProjectionEnabled(),
+    ) orelse std.math.maxInt(usize);
     var persistent_bytes = relative_cache_bytes;
     if (mirrors.enabled) {
         const pack_bytes = if (mirrors.prefer_f16_mps)
@@ -248,15 +254,24 @@ test "DeBERTa dense pack reservation covers QKV and relative QK caches" {
     );
 }
 
-test "DeBERTa relative cache reservation covers embeddings projections and index map" {
+test "DeBERTa relative cache reservation covers compact and expanded layouts" {
     const config = Config{
         .hidden_size = 64,
         .num_hidden_layers = 2,
         .position_buckets = 16,
         .max_position_embeddings = 32,
     };
-    const expected = (32 * 64 + 2 * 2 * 32 * 64 + 63) * @sizeOf(f32);
-    try std.testing.expectEqual(@as(?usize, expected), relativeCacheReservationBytes(config));
+    const compact_expected = (32 * 64 + 2 * 2 * 32 * 64 + 63) * @sizeOf(f32);
+    try std.testing.expectEqual(
+        @as(?usize, compact_expected),
+        relativeCacheReservationBytes(config, true),
+    );
+    const expanded_rows = 2 * 32 - 1;
+    const expanded_expected = (expanded_rows * 64 + 2 * 2 * expanded_rows * 64) * @sizeOf(f32);
+    try std.testing.expectEqual(
+        @as(?usize, expanded_expected),
+        relativeCacheReservationBytes(config, false),
+    );
 }
 
 const DebertaLinearSlotKind = enum(usize) {
