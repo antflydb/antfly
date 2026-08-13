@@ -3919,6 +3919,8 @@ pub fn build(b: *std.Build) void {
             "unsupported transforms fail atomically instead of reporting success",
             "supported transform on a missing document remains a no-op without upsert",
             "io threaded applied callback observes published watermark outside runtime lock",
+            "io threaded wait observes worker-owned catch-up close",
+            "io threaded wait requests prompt worker catch-up close",
         }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
