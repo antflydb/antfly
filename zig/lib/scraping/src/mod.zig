@@ -1928,7 +1928,10 @@ fn downloadTestHttpResponseAlloc(
 
     const uri = try std.fmt.allocPrint(alloc, "http://{f}/blob", .{server.socket.address});
     defer alloc.free(uri);
-    var security = ContentSecurityConfig{ .max_download_size_bytes = max_download_size_bytes };
+    var security = ContentSecurityConfig{
+        .block_private_ips = false,
+        .max_download_size_bytes = max_download_size_bytes,
+    };
     var downloaded = downloadContentAlloc(alloc, uri, &security, null) catch |err| {
         thread.join();
         if (fixture.failure) |server_err| return server_err;
