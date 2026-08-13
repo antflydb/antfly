@@ -35,6 +35,10 @@ const public_api_max_requests_per_connection: u32 = 64;
 const public_api_max_body_size: usize = antfly.common.http.default_max_request_bytes;
 const local_schema_migration_finalize_interval_ms: u64 = std.time.ms_per_s;
 
+const LocalInferenceConnectionContext = struct {
+    handle: *anyopaque,
+};
+
 const LocalSchemaProgressProvider = struct {
     ptr: *anyopaque,
     collect: *const fn (
@@ -1805,6 +1809,9 @@ pub fn runFromIterator(
         if (!status.isOk()) return inference_bridge.errorFromStatus(status);
         break :blk handle orelse return error.InferenceRuntimeStartupFailed;
     };
+    var local_inference_connection_context = LocalInferenceConnectionContext{
+        .handle = antfly_node,
+    };
     // Until DataServer exists, error cleanup is owned here. Once its
     // ResourceManager is attached below, the regular defer is registered
     // after DataServer's so tokenizer budget callbacks are torn down first.
@@ -2027,7 +2034,10 @@ pub fn runFromIterator(
                 .release_fn = releaseEmbeddedInferenceRequest,
                 .stats_fn = embeddedInferenceRequestStats,
             },
-            .local_inference_api_url = public_api_url,
+            .local_inference_connection_target = .{
+                .ptr = &local_inference_connection_context,
+                .invoke_fn = invokeLocalInferenceConnection,
+            },
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
@@ -4378,6 +4388,114 @@ fn linkedInferenceApi(required_capabilities: u64) !*const inference_bridge.Funct
 
 fn linkedInferenceApiInfallible() *const inference_bridge.FunctionTable {
     return linkedInferenceApi(0) catch @panic("linked inference ABI changed after startup");
+}
+
+/// Dispatch the runtime-reserved local-inference connection through the same
+/// embedded route handler used by the public inference API. This preserves the
+/// destination's validation and admission semantics without opening a second
+/// connection to our own listener.
+fn invokeLocalInferenceConnection(
+    opaque_context: *anyopaque,
+    alloc: std.mem.Allocator,
+    operation: []const u8,
+    body: []const u8,
+    cancellation: ?httpx.CancellationToken,
+) !antfly.public_api.connections.InvokeResult {
+    const context: *LocalInferenceConnectionContext = @ptrCast(@alignCast(opaque_context));
+    const functions: ?*const inference_bridge.FunctionTable = if (comptime inline_inference_codegen)
+        null
+    else
+        try linkedInferenceApi(inference_bridge.Capability.route_manifest);
+
+    var entries_ptr: ?[*]const inference_bridge.RouteManifestEntry = null;
+    var entries_len: usize = 0;
+    const manifest_context = inference_bridge.RouteManifestContext{
+        .abi_version = inference_bridge.abi_version,
+        .handle = context.handle,
+        .out_entries = &entries_ptr,
+        .out_len = &entries_len,
+    };
+    if (comptime inline_inference_codegen) {
+        try inference_host.linkedInferenceRouteManifest(&manifest_context);
+    } else {
+        const status = functions.?.route_manifest(&manifest_context);
+        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+    }
+
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ inference_bridge.ai_api_prefix, operation });
+    defer alloc.free(path);
+    const interactive_generate = isInteractiveGeneratePath(path);
+    if (interactive_generate)
+        _ = antfly.db.enrichment_types.interactive_generate_inflight.fetchAdd(1, .monotonic);
+    defer {
+        if (interactive_generate)
+            _ = antfly.db.enrichment_types.interactive_generate_inflight.fetchSub(1, .monotonic);
+    }
+    const entries = if (entries_ptr) |ptr| ptr[0..entries_len] else &.{};
+    const route_handle = for (entries) |entry| {
+        if (entry.method == .post and std.mem.eql(u8, entry.path.slice(), path))
+            break entry.route_handle;
+    } else return error.UnsupportedInferenceOperation;
+
+    const headers = [_]runtime_http_abi.HeaderView{.{
+        .name = runtime_http_abi.Bytes.init("Content-Type"),
+        .value = runtime_http_abi.Bytes.init("application/json"),
+    }};
+    const request = runtime_http_abi.HttpRequestView{
+        .method = .post,
+        .path = runtime_http_abi.Bytes.init(path),
+        .headers_ptr = &headers,
+        .headers_len = headers.len,
+        .body = runtime_http_abi.OptionalBytes.init(body),
+        .content_type = runtime_http_abi.OptionalBytes.init("application/json"),
+    };
+    var response_handle: ?*anyopaque = null;
+    var response_view: runtime_http_abi.HttpResponseView = undefined;
+    var cancellation_token = cancellation;
+    const cancellation_view: runtime_http_abi.CancellationView = if (cancellation_token) |*token| .{
+        .context = token,
+        .is_cancelled = struct {
+            fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
+                const cancellation_source: *const httpx.CancellationToken = @ptrCast(@alignCast(raw orelse return 0));
+                return @intFromBool(cancellation_source.isCancelled());
+            }
+        }.isCancelled,
+    } else .{};
+    const handle_context = inference_bridge.HttpHandleContext{
+        .abi_version = inference_bridge.abi_version,
+        .route_handle = route_handle,
+        .request = &request,
+        .cancellation = cancellation_view,
+        .out_response_handle = &response_handle,
+        .out_response = &response_view,
+    };
+    if (comptime inline_inference_codegen) {
+        try inference_host.linkedInferenceHandleHttp(&handle_context);
+    } else {
+        const status = functions.?.handle_http(&handle_context);
+        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+    }
+    const owned_response = response_handle orelse return error.InferenceRuntimeResponseMissing;
+    defer if (comptime inline_inference_codegen)
+        inference_host.linkedInferenceDestroyHttpResponse(owned_response)
+    else
+        functions.?.destroy_http_response(owned_response);
+
+    const response_body = try alloc.dupe(u8, response_view.body.slice());
+    errdefer alloc.free(response_body);
+    var retry_after: ?[]u8 = null;
+    const response_headers = if (response_view.headers_ptr) |ptr| ptr[0..response_view.headers_len] else &.{};
+    for (response_headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name.slice(), "Retry-After")) {
+            retry_after = try alloc.dupe(u8, header.value.slice());
+            break;
+        }
+    }
+    return .{
+        .status = response_view.status,
+        .body = response_body,
+        .retry_after = retry_after,
+    };
 }
 
 fn tryAcquireEmbeddedInferenceRequest(handle: *anyopaque) bool {

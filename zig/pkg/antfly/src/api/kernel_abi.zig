@@ -27,7 +27,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 14;
+pub const abi_version: u32 = 15;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -156,6 +156,7 @@ pub const HandlerStats = extern struct {
 pub const Capability = struct {
     pub const core: u64 = 1 << 0;
     pub const route_manifest: u64 = 1 << 3;
+    pub const inference_admission_stats: u64 = 1 << 4;
 };
 
 /// The sole discovery point for the API-kernel ABI. Keeping the table itself
@@ -171,7 +172,6 @@ pub const FunctionTable = extern struct {
     request_stats: *const fn (*const CallContext) callconv(.c) Status,
     query_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
     write_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
-    inference_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
     set_provider: *const fn (*const CallContext) callconv(.c) Status,
     set_ha_executor: *const fn (*const CallContext) callconv(.c) Status,
     attach_runtime_restore_store: *const fn (*const CallContext) callconv(.c) Status,
@@ -190,6 +190,7 @@ pub const FunctionTable = extern struct {
     handler_handle_http: *const fn (*const HttpHandleContext) callconv(.c) Status,
     handler_destroy_http_response: *const fn (*anyopaque) callconv(.c) void,
     handler_destroy: *const fn (*anyopaque) callconv(.c) void,
+    inference_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
@@ -212,6 +213,7 @@ test "API kernel control contexts retain C layout" {
     try std.testing.expectEqual(.@"extern", @typeInfo(native_abi.TypeContract).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(memory_abi.Allocator).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(FunctionTable).@"struct".layout);
+    try std.testing.expect(@offsetOf(FunctionTable, "inference_admission_stats") > @offsetOf(FunctionTable, "handler_destroy"));
     try std.testing.expectEqual(@as(u32, @sizeOf(CreateContext)), (CreateContext{ .abi_version = abi_version, .owner_alloc = undefined, .cfg = undefined, .cfg_contract = .of(void), .source = undefined, .source_contract = .of(void), .table_reads = undefined, .table_reads_contract = .of(void), .table_writes = undefined, .table_writes_contract = .of(void), .out_handle = undefined, .out_request_alloc = undefined }).struct_size);
 }
 
@@ -227,6 +229,7 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     table.capabilities = Capability.core;
     try std.testing.expect(validFunctionTable(&table, Capability.core));
     try std.testing.expect(!validFunctionTable(&table, Capability.route_manifest));
+    try std.testing.expect(!validFunctionTable(&table, Capability.inference_admission_stats));
     table.struct_size -= 1;
     try std.testing.expect(!validFunctionTable(&table, Capability.core));
 }

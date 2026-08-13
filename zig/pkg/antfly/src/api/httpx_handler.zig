@@ -2184,9 +2184,16 @@ pub const AntflyApiHandler = struct {
         if (caller_owns_admission and !self.api_server.tryAcquireInference()) return inferenceOverloadedResponse(ctx);
         defer if (caller_owns_admission) self.api_server.releaseInference();
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "request body required");
-        var result = self.api_server.invokeInferenceConnection(ctx.allocator, connection_id, operation, body) catch |err| switch (err) {
+        const cancellation = httpx.CancellationToken.fromCallback(ctx, struct {
+            fn isCancelled(raw: *const anyopaque) bool {
+                const request_context: *const httpx.Context = @ptrCast(@alignCast(raw));
+                return request_context.isCancellationRequested();
+            }
+        }.isCancelled);
+        var result = self.api_server.invokeInferenceConnection(ctx.allocator, connection_id, operation, body, cancellation) catch |err| switch (err) {
             error.ConnectionCapabilityMissing => return textResponse(ctx, 403, @errorName(err)),
             error.ConnectionNotFound, error.ConnectionNotInference, error.InvalidConfig, error.ConnectionURLMissing, error.InvalidConnectionURL, error.ProviderNotAntflyCompatible, error.UnsupportedInferenceOperation => return textResponse(ctx, 400, @errorName(err)),
+            error.Canceled, error.Cancelled => return error.Canceled,
             else => return textResponse(ctx, 502, @errorName(err)),
         };
         defer result.deinit(ctx.allocator);
@@ -6528,6 +6535,79 @@ test "httpx inference connection uses the configured shared admission owner" {
     try std.testing.expect(payload.value.retryable);
     try std.testing.expectEqual(@as(u32, 1000), payload.value.retry_after_ms);
     try std.testing.expectEqual(@as(u64, 1), shared.gate.stats().rejected_total);
+}
+
+test "local inference connection admission is owned exactly once by its target" {
+    const SharedTarget = struct {
+        gate: RequestAdmission = RequestAdmission.init(1),
+
+        fn tryAcquire(ptr: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.gate.tryAcquire();
+        }
+
+        fn release(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.gate.release();
+        }
+
+        fn stats(ptr: *anyopaque) RequestAdmission.Stats {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.gate.stats();
+        }
+
+        fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, operation: []const u8, body: []const u8, cancellation: ?httpx.CancellationToken) !connections_api.InvokeResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(cancellation != null);
+            try std.testing.expect(!cancellation.?.isCancelled());
+            if (!self.gate.tryAcquire()) {
+                return .{
+                    .status = 503,
+                    .body = try alloc.dupe(u8, "capacity exhausted"),
+                };
+            }
+            defer self.gate.release();
+            try std.testing.expectEqualStrings("embed", operation);
+            try std.testing.expectEqualStrings("{}", body);
+            return .{
+                .status = 200,
+                .body = try alloc.dupe(u8, "{\"ok\":true}"),
+            };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var shared: SharedTarget = .{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .inference_request_admission_source = .{
+            .ptr = &shared,
+            .try_acquire_fn = SharedTarget.tryAcquire,
+            .release_fn = SharedTarget.release,
+            .stats_fn = SharedTarget.stats,
+        },
+        .local_inference_connection_target = .{
+            .ptr = &shared,
+            .invoke_fn = SharedTarget.invoke,
+        },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/connections/local-inference/inference/embed");
+    defer request.deinit();
+    request.body = "{}";
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try handler.invokeInferenceConnection(&ctx, common_config.local_inference_connection_id, "embed");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqualStrings("{\"ok\":true}", response.body.?);
+    const stats = shared.gate.stats();
+    try std.testing.expectEqual(@as(usize, 0), stats.in_flight);
+    try std.testing.expectEqual(@as(usize, 1), stats.peak_in_flight);
+    try std.testing.expectEqual(@as(u64, 0), stats.rejected_total);
 }
 
 test "httpx inference connection preserves upstream retry guidance" {

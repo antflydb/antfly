@@ -435,13 +435,14 @@ pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
 const function_table: abi.FunctionTable = .{
     .abi_version = abi.abi_version,
     .struct_size = @sizeOf(abi.FunctionTable),
-    .capabilities = abi.Capability.core | abi.Capability.route_manifest,
+    .capabilities = abi.Capability.core |
+        abi.Capability.route_manifest |
+        abi.Capability.inference_admission_stats,
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
     .query_admission_stats = &queryAdmissionStats,
     .write_admission_stats = &writeAdmissionStats,
-    .inference_admission_stats = &inferenceAdmissionStats,
     .set_provider = &setProvider,
     .set_ha_executor = &setHAExecutor,
     .attach_runtime_restore_store = &attachRuntimeRestoreStore,
@@ -460,6 +461,7 @@ const function_table: abi.FunctionTable = .{
     .handler_handle_http = &handlerHandleHttp,
     .handler_destroy_http_response = &handlerDestroyHttpResponse,
     .handler_destroy = &handlerDestroy,
+    .inference_admission_stats = &inferenceAdmissionStats,
 };
 
 pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {

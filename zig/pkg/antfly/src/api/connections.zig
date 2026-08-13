@@ -187,6 +187,7 @@ pub const LocalInferenceConnectionTarget = struct {
         alloc: Allocator,
         operation: []const u8,
         body: []const u8,
+        cancellation: ?httpx.CancellationToken,
     ) anyerror!InvokeResult,
 
     pub fn invoke(
@@ -194,8 +195,9 @@ pub const LocalInferenceConnectionTarget = struct {
         alloc: Allocator,
         operation: []const u8,
         body: []const u8,
+        cancellation: ?httpx.CancellationToken,
     ) !InvokeResult {
-        return self.invoke_fn(self.ptr, alloc, operation, body);
+        return self.invoke_fn(self.ptr, alloc, operation, body, cancellation);
     }
 };
 
@@ -234,9 +236,10 @@ pub fn invokeInferenceConnection(
     connection_id: []const u8,
     operation: []const u8,
     body: []const u8,
+    cancellation: ?httpx.CancellationToken,
 ) !InvokeResult {
     const resolved = try resolveInferenceConnection(node_config, local_target, connection_id, operation);
-    if (resolved == .local) return resolved.local.invoke(alloc, operation, body);
+    if (resolved == .local) return resolved.local.invoke(alloc, operation, body, cancellation);
 
     const remote = resolved.remote;
     const raw_url = remote.url;
@@ -255,7 +258,12 @@ pub fn invokeInferenceConnection(
         .{ "Content-Type", "application/json" },
     } else &[_][2][]const u8{.{ "Content-Type", "application/json" }};
 
-    var response = try (http orelse return error.InferenceTransportUnavailable).request(.POST, url, .{ .headers = headers, .body = body, .timeout_ms = 120_000 });
+    var response = try (http orelse return error.InferenceTransportUnavailable).request(.POST, url, .{
+        .headers = headers,
+        .body = body,
+        .timeout_ms = 120_000,
+        .cancellation = cancellation,
+    });
     defer response.deinit();
     const response_body = try alloc.dupe(u8, response.body orelse "");
     errdefer alloc.free(response_body);
@@ -289,14 +297,16 @@ fn resolveInferenceConnection(
     if (!std.mem.eql(u8, cfg.provider, "antfly")) return error.ProviderNotAntflyCompatible;
     const raw_url = cfg.url orelse return error.ConnectionURLMissing;
     if (!validInferenceURL(raw_url)) return error.InvalidConnectionURL;
-    return .{ .remote = .{
-        .url = raw_url,
-        .api_key = cfg.api_key,
-        // The reserved connection ID above is the only process-local identity.
-        // A configured URL may resolve through aliases, proxies, or a future
-        // listener at the same origin, so URL equality must never transfer
-        // admission ownership to the target.
-    } };
+    return .{
+        .remote = .{
+            .url = raw_url,
+            .api_key = cfg.api_key,
+            // The reserved connection ID above is the only process-local identity.
+            // A configured URL may resolve through aliases, proxies, or a future
+            // listener at the same origin, so URL equality must never transfer
+            // admission ownership to the target.
+        },
+    };
 }
 
 fn inferenceCapability(operation: []const u8) ?[]const u8 {
@@ -1576,7 +1586,7 @@ test "inference connection operations are allowlisted" {
         \\}
     );
     defer cfg.deinit();
-    try std.testing.expectError(error.ConnectionCapabilityMissing, invokeInferenceConnection(alloc, undefined, &cfg, null, null, null, "embed-only", "generate", "{}"));
+    try std.testing.expectError(error.ConnectionCapabilityMissing, invokeInferenceConnection(alloc, null, &cfg, null, null, "embed-only", "generate", "{}", null));
 
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-connection-secrets-{d}.json", .{platform_time.monotonicNs()});
     defer alloc.free(store_path);
@@ -1595,8 +1605,22 @@ test "inference connection operations are allowlisted" {
 }
 
 test "inference admission ownership uses explicit connection identity" {
+    const LocalTarget = struct {
+        fn invoke(_: *anyopaque, alloc: Allocator, operation: []const u8, body: []const u8, cancellation: ?httpx.CancellationToken) !InvokeResult {
+            try std.testing.expect(cancellation == null);
+            return .{
+                .status = 200,
+                .body = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ operation, body }),
+            };
+        }
+    };
+
     const alloc = std.testing.allocator;
-    const local_url = "http://127.0.0.1:8080/ai/v1";
+    var local_context: u8 = 0;
+    const local_target: LocalInferenceConnectionTarget = .{
+        .ptr = &local_context,
+        .invoke_fn = LocalTarget.invoke,
+    };
     var cfg = try common_config.Config.parseFromSlice(alloc,
         \\{
         \\  "connections": {
@@ -1613,13 +1637,28 @@ test "inference admission ownership uses explicit connection identity" {
     // Even an exact URL match is an ordinary configured network boundary.
     try std.testing.expectEqual(
         InferenceAdmissionOwner.caller,
-        try inferenceConnectionAdmissionOwner(&cfg, local_url, "configured-loopback", "embed"),
+        try inferenceConnectionAdmissionOwner(&cfg, local_target, "configured-loopback", "embed"),
     );
     // Only the runtime-reserved identity transfers ownership to the local route.
     try std.testing.expectEqual(
         InferenceAdmissionOwner.target,
-        try inferenceConnectionAdmissionOwner(null, local_url, common_config.local_inference_connection_id, "generate"),
+        try inferenceConnectionAdmissionOwner(null, local_target, common_config.local_inference_connection_id, "generate"),
     );
+
+    var result = try invokeInferenceConnection(
+        alloc,
+        null,
+        null,
+        local_target,
+        null,
+        common_config.local_inference_connection_id,
+        "generate",
+        "{}",
+        null,
+    );
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), result.status);
+    try std.testing.expectEqualStrings("generate:{}", result.body);
 }
 
 test "inference connection URLs require an HTTP origin" {

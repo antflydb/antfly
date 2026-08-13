@@ -2411,7 +2411,21 @@ pub const ApiHttpServer = struct {
         connection_id: []const u8,
         operation: []const u8,
         body: []const u8,
+        cancellation: ?httpx.CancellationToken,
     ) !connections_api.InvokeResult {
+        if (std.mem.eql(u8, connection_id, common_config.local_inference_connection_id)) {
+            return connections_api.invokeInferenceConnection(
+                alloc,
+                null,
+                self.cfg.node_config,
+                self.cfg.local_inference_connection_target,
+                self.cfg.secret_store,
+                connection_id,
+                operation,
+                body,
+                cancellation,
+            );
+        }
         var client = httpx.Client.initWithConfig(alloc, self.inferenceIo(), .{ .keep_alive = false });
         defer client.deinit();
         return connections_api.invokeInferenceConnection(
@@ -2423,6 +2437,7 @@ pub const ApiHttpServer = struct {
             connection_id,
             operation,
             body,
+            cancellation,
         );
     }
 

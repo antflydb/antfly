@@ -49,7 +49,10 @@ fn callError(status: abi.Status) !void {
 
 fn validateFunctionTable() !*const abi.FunctionTable {
     const table = antfly_api_kernel_get_function_table();
-    if (!abi.validFunctionTable(table, abi.Capability.core))
+    if (!abi.validFunctionTable(
+        table,
+        abi.Capability.core | abi.Capability.inference_admission_stats,
+    ))
         return error.UnsupportedVersion;
     return table;
 }

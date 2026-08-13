@@ -715,14 +715,16 @@ thread and intentionally leak the node for the remainder of the process.
 
 Inference forwarding admission uses explicit runtime identity, not URL
 comparison. The reserved `local-inference` virtual connection is created by the
-runtime and is the only connection that delegates admission to the destination
-route, where the shared embedded-inference coordinator acquires one permit.
-Every configured connection is admitted by the forwarding operation for the
-full upstream request, even when its URL text matches or aliases the local
-listener. Operators that intend in-process inference must use the reserved
-connection; configured URLs remain ordinary network boundaries and cannot
-silently change resource ownership because of DNS, proxy, case, path, or
-listener configuration. Tests must preserve this distinction at capacity one.
+runtime and dispatches directly through the linked inference route boundary; it
+does not open a loopback connection or infer locality from a public URL. The
+destination route receives the original cancellation signal and is the sole
+owner of the shared embedded-inference permit. Every configured connection is
+instead admitted by the forwarding operation for the full upstream request,
+even when its URL text matches or aliases the local listener. Operators that
+intend in-process inference must use the reserved connection; configured URLs
+remain ordinary network boundaries and cannot silently change resource
+ownership because of DNS, proxy, case, path, or listener configuration. Tests
+must preserve this distinction at capacity one.
 
 ### Health
 
