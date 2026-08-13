@@ -27,6 +27,9 @@ pub const Routes = struct {
     pub const group_placement_prefix = "/metadata/v1/groups/";
     pub const group_placement_suffix = "/placement";
     pub const internal_reallocate = "/internal/v1/reallocate";
+    /// Versioned separately so upgraded clients cannot accidentally submit a
+    /// causal-barrier request to an older metadata leader.
+    pub const internal_reallocate_v2 = "/internal/v2/reallocate";
     pub const internal_nodes = "/internal/v1/nodes";
     pub const internal_nodes_prefix = "/internal/v1/nodes/";
     pub const internal_node_shutdown_suffix = "/shutdown";

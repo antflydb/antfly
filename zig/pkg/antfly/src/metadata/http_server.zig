@@ -36,6 +36,7 @@ const backups_api = @import("../api/backups.zig");
 const http_route_helpers = @import("../api/http_route_helpers.zig");
 const indexes_api = @import("../api/indexes.zig");
 const tables_api = @import("../api/tables.zig");
+const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const routes = @import("http_routes.zig");
 const service = @import("service.zig");
@@ -603,7 +604,7 @@ pub const AdminSource = struct {
 
     fn metadataServiceTriggerReallocate(ptr: *anyopaque) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        try svc.requestReallocation(@intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)));
+        try svc.requestReallocation(platform_clock.Clock.real().nowRealtimeMs());
         try flushMetadataServiceMutation(svc);
     }
 
@@ -932,7 +933,7 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceTriggerReallocate(ptr: *anyopaque) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try svc.requestReallocation(@intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)));
+        try svc.requestReallocation(platform_clock.Clock.real().nowRealtimeMs());
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -1100,6 +1101,7 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_reallocate, httpx.Handler.bind(self, metadataTriggerReallocate));
+        try server.post(routes.Routes.internal_reallocate_v2, httpx.Handler.bind(self, metadataTriggerReallocate));
         try server.post(routes.Routes.internal_schema_progress, httpx.Handler.bind(self, metadataUpsertSchemaProgress));
         try server.post(routes.Routes.internal_extension_restore, httpx.Handler.bind(self, metadataRestoreExtensions));
         const extension_path = routes.Routes.internal_extensions_prefix ++ ":extension_name";
@@ -1316,6 +1318,8 @@ pub const MetadataHttpServer = struct {
 
     fn metadataMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         if (err == error.UnsupportedOperation) return ctx.status(405).text("unsupported operation");
+        if (err == error.ReallocationProtocolUpgradeRequired)
+            return ctx.status(503).text("metadata voter upgrade required");
         return metadataReadError(ctx, err);
     }
 
@@ -2109,6 +2113,7 @@ const ParsedGroupStatus = struct {
     empty: ?bool = null,
     created_at_millis: ?u64 = null,
     updated_at_millis: ?u64 = null,
+    observed_reallocation_request_id: ?u128 = null,
     local_leader: ?bool = null,
     local_voter: ?bool = null,
     voter_count: ?u16 = null,
@@ -2353,6 +2358,7 @@ fn cloneParsedGroupStatuses(
             .empty = parsed.empty orelse true,
             .created_at_millis = parsed.created_at_millis orelse 0,
             .updated_at_millis = parsed.updated_at_millis orelse 0,
+            .observed_reallocation_request_id = parsed.observed_reallocation_request_id orelse 0,
             .local_leader = parsed.local_leader orelse false,
             .local_voter = parsed.local_voter orelse false,
             .voter_count = parsed.voter_count orelse 0,
@@ -2907,6 +2913,43 @@ fn jsonBodyOrEmptyObject(body: []const u8) []const u8 {
 
 fn freeStoreStatusReport(alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) void {
     node_operations.freeStoreStatusReport(alloc, report);
+}
+
+test "metadata http server reports reallocation protocol upgrade gating" {
+    const UpgradeGatedSource = struct {
+        fn iface(_: *@This()) AdminSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .trigger_reallocate = triggerReallocate,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn triggerReallocate(_: *anyopaque) !void {
+            return error.ReallocationProtocolUpgradeRequired;
+        }
+    };
+
+    var source = UpgradeGatedSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var response = try server.executeTypedHandlerForTest(.POST, routes.Routes.internal_reallocate_v2, &.{}, MetadataHttpServer.metadataTriggerReallocate);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("metadata voter upgrade required", response.body.?);
 }
 
 test "metadata http server serves status and filtered admin routes" {
@@ -4070,6 +4113,12 @@ test "metadata http server accepts internal reallocate and split merge routes" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(u64, 7), report.store_id);
             try std.testing.expectEqualStrings("healthy", report.health_class);
+            try std.testing.expectEqual(@as(usize, 1), report.group_statuses.len);
+            try std.testing.expectEqual(@as(u64, 9), report.group_statuses[0].group_id);
+            try std.testing.expectEqual(
+                @as(u128, 0x1234_5678_9abc_def0_1234_5678_9abc_def0),
+                report.group_statuses[0].observed_reallocation_request_id,
+            );
             self.store_status_count += 1;
         }
 
@@ -4146,7 +4195,7 @@ test "metadata http server accepts internal reallocate and split merge routes" {
     try std.testing.expectEqual(@as(u16, 202), store.status.code);
 
     const node_7_params = [_]httpx.RouteParam{.{ .name = "node_id", .value = "7" }};
-    var store_status = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/nodes/7/status", &node_7_params, "{\"store_id\":7,\"health_class\":\"healthy\"}", MetadataHttpServer.metadataReportNodeStatus);
+    var store_status = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/nodes/7/status", &node_7_params, "{\"store_id\":7,\"health_class\":\"healthy\",\"group_statuses\":[{\"group_id\":9,\"observed_reallocation_request_id\":24197857203266734864793317670504947440}]}", MetadataHttpServer.metadataReportNodeStatus);
     defer store_status.deinit();
     try std.testing.expectEqual(@as(u16, 202), store_status.status.code);
 
