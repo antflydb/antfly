@@ -66,11 +66,10 @@ pub const LocalTableRuntimeStatus = struct {
     // deliberately separate from metadata.status_generation, which identifies
     // externally published store snapshots.
     cache_observation_generation: u64 = 0,
-    // Identifies the live local observation that produced these facts. Unlike
-    // cache_observation_generation, this value survives cache-to-cache
-    // refreshes so callers can establish a causal fence without allowing a
-    // recycled snapshot to masquerade as a new DB observation.
-    causal_observation_generation: u64 = 0,
+    // Identifies the filesystem observation that produced disk_bytes. Disk
+    // usage has a separate causal lifetime from DB/runtime facts: a cached or
+    // startup status can still carry a freshly scanned, authoritative size.
+    disk_observation_generation: u64 = 0,
     metadata: RuntimeStatusMetadata = .{},
     disk_bytes: u64 = 0,
     disk_bytes_known: bool = false,
@@ -87,7 +86,7 @@ pub const LocalTableRuntimeStatus = struct {
         return .{
             .group_id = self.group_id,
             .cache_observation_generation = self.cache_observation_generation,
-            .causal_observation_generation = self.causal_observation_generation,
+            .disk_observation_generation = self.disk_observation_generation,
             .metadata = self.metadata,
             .disk_bytes = self.disk_bytes,
             .disk_bytes_known = self.disk_bytes_known,
@@ -288,15 +287,6 @@ pub const TableRuntimeSnapshotCache = struct {
         };
     }
 
-    /// Establishes an ordering point in the same generation domain used by
-    /// live status publications. A status can prove it observed work after
-    /// this call only when its causal generation is greater than the result.
-    pub fn captureCausalObservationFence(self: *@This()) u64 {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        return self.takeObservationGenerationLocked();
-    }
-
     /// Captures all catalog tables in one lock acquisition before refresh DB
     /// inspection begins. `table_names` need only live for this call.
     pub fn captureCatalogToken(
@@ -351,7 +341,6 @@ pub const TableRuntimeSnapshotCache = struct {
         errdefer owned.deinit(self.alloc);
         owned.cache_observation_generation = token.observation_generation;
         owned.withMetadataDefaults(.live_writer_publish, platform_time.monotonicNs());
-        markNewCausalObservation(&owned, token.observation_generation);
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -425,7 +414,6 @@ pub const TableRuntimeSnapshotCache = struct {
         for (owned, statuses) |*next, status| {
             next.cache_observation_generation = token.observation_generation;
             next.withMetadataDefaults(.live_writer_publish, now_ns);
-            markNewCausalObservation(next, token.observation_generation);
             if (state.groups.getPtr(status.group_id)) |previous| {
                 if (previous.cache_observation_generation > token.observation_generation) {
                     next.deinit(self.alloc);
@@ -487,7 +475,6 @@ pub const TableRuntimeSnapshotCache = struct {
         while (replacement_it.next()) |status| {
             status.cache_observation_generation = observation_generation;
             status.withMetadataDefaults(.live_writer_publish, now_ns);
-            markNewCausalObservation(status, observation_generation);
         }
 
         self.advanceInvalidationEpochLocked();
@@ -700,7 +687,6 @@ pub const TableRuntimeSnapshotCache = struct {
             moved += 1;
             owned.cache_observation_generation = observation_generation;
             owned.withMetadataDefaults(.background_refresh, now_ns);
-            markNewCausalObservation(&owned, observation_generation);
             owned = try self.prepareRefreshStatusLocked(state.groups.getPtr(owned.group_id), owned, now_ns);
             if (replacement.getPtr(owned.group_id)) |duplicate| {
                 duplicate.deinit(self.alloc);
@@ -777,14 +763,6 @@ pub const TableRuntimeSnapshotCache = struct {
 
 fn lessThanGroupId(_: void, lhs: LocalTableRuntimeStatus, rhs: LocalTableRuntimeStatus) bool {
     return lhs.group_id < rhs.group_id;
-}
-
-fn markNewCausalObservation(status: *LocalTableRuntimeStatus, generation: u64) void {
-    if (status.causal_observation_generation != 0 or !statusRuntimeFresh(status.*)) return;
-    switch (status.metadata.source) {
-        .live_writer_publish, .background_refresh, .startup_catch_up => status.causal_observation_generation = generation,
-        .unknown, .synthetic_config, .cached_snapshot, .remote_store, .rebuild_state_quarantine => {},
-    }
 }
 
 fn preserveArtifactVisibilityOnReplayRegression(previous: LocalTableRuntimeStatus, incoming: *LocalTableRuntimeStatus) void {
