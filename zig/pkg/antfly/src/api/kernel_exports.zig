@@ -42,7 +42,6 @@ const ServerState = struct {
 const HandlerState = struct {
     alloc: std.mem.Allocator,
     handler: handler_mod.AntflyApiHandler,
-    io_impl: ?std.Io.Threaded = null,
     routes: std.ArrayListUnmanaged(*RouteState) = .empty,
     route_manifest: std.ArrayListUnmanaged(abi.RouteManifestEntry) = .empty,
     route_validator: httpx.Router,
@@ -283,7 +282,6 @@ pub fn handlerInit(context: *const CallContext) callconv(.c) abi.Status {
     const state = handlerState(context);
     state.handler.initRuntime(state.alloc) catch |err|
         return fail(err);
-    state.io_impl = std.Io.Threaded.init(state.alloc, .{});
     return .ok;
 }
 
@@ -338,6 +336,7 @@ pub fn handlerRouteManifest(context: *const abi.RouteManifestContext) callconv(.
 
 pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi.Status {
     if (validateContext(abi.HttpHandleContext, context.abi_version, context.struct_size)) |failure| return failure;
+    const io = context.executor.get() catch |err| return fail(err);
     const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
     const state = route.owner;
     const request = context.request;
@@ -369,8 +368,7 @@ pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi
         params[i] = .{ .name = param.name.slice(), .value = param.value.slice() };
     }
 
-    const io_impl = &(state.io_impl orelse return fail(error.ApiKernelNotInitialized));
-    var http_context = httpx.Context.init(alloc, io_impl.io(), &http_request);
+    var http_context = httpx.Context.init(alloc, io, &http_request);
     defer http_context.deinit();
     http_context.params = params;
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
@@ -420,7 +418,6 @@ pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
     state.route_manifest.deinit(alloc);
     state.route_validator.deinit();
     state.handler.deinitRuntime();
-    if (state.io_impl) |*io_impl| io_impl.deinit();
     alloc.destroy(state);
 }
 
@@ -617,11 +614,10 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     var state = HandlerState{
         .alloc = alloc,
         .handler = .{ .api_server = api_server },
-        .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{}),
         .route_validator = httpx.Router.init(alloc),
     };
-    defer state.io_impl.?.deinit();
     defer state.route_validator.deinit();
+    const test_io = std.testing.io;
 
     KernelIngressTestRoutes.mutation_calls = 0;
     var mutation_route = RouteState{
@@ -639,6 +635,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
         .abi_version = abi.abi_version,
         .route_handle = &mutation_route,
         .request = &mutation_request,
+        .executor = .init(&test_io),
         .out_response_handle = &mutation_response_handle,
         .out_response = &mutation_response,
     });
@@ -663,6 +660,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
         .abi_version = abi.abi_version,
         .route_handle = &retry_route,
         .request = &retry_request,
+        .executor = .init(&test_io),
         .out_response_handle = &retry_response_handle,
         .out_response = &retry_response,
     });

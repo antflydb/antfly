@@ -886,17 +886,10 @@ pub const Client = struct {
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
         const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
         var interrupt: RequestInterrupt = .{ .external_cancellation = cancellation };
-        // HTTP/1 owns its socket exclusively. Propagate cancellation directly
-        // through the transport's bounded read/write polling instead of
-        // nesting another task race inside an inbound server task. This keeps
-        // successful requests synchronous and makes cancellation release the
-        // same socket/request resources before returning.
-        if (!shouldUseHttp2(self.config)) {
-            return self.executeRequestWithRetries(req, timeout_override_ms, deadline_ms, &interrupt) catch |err| {
-                if (interrupt.isCancellationRequested()) return error.Cancelled;
-                return err;
-            };
-        }
+        // Own the complete request attempt in a cancellable std.Io task for
+        // every protocol. The socket interrupt handles established HTTP/1 and
+        // HTTP/2 connections; cancelling the task also reaches operations that
+        // precede socket publication, including hostname lookup and connect.
         const RequestResult = anyerror!Response;
         const SelectResult = union(enum) {
             request: RequestResult,
@@ -1082,20 +1075,6 @@ pub const Client = struct {
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
         const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
         var interrupt: RequestInterrupt = .{ .external_cancellation = cancellation };
-        if (!shouldUseHttp2(self.config)) {
-            return self.executeRequestToWriterWithRetries(
-                req,
-                timeout_override_ms,
-                deadline_ms,
-                writer,
-                progress_cb,
-                progress_ctx,
-                &interrupt,
-            ) catch |err| {
-                if (interrupt.isCancellationRequested()) return error.Cancelled;
-                return err;
-            };
-        }
         const Writer = @TypeOf(writer);
         const RequestResult = anyerror!Response;
         const SelectResult = union(enum) {

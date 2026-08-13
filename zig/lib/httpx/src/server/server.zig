@@ -909,10 +909,30 @@ pub const Context = struct {
 pub const Handler = union(enum) {
     function: *const fn (*Context) anyerror!Response,
     bound: Bound,
+    wrapped_function: WrappedFunction,
+    wrapped_bound: WrappedBound,
 
     pub const Bound = struct {
         ptr: *anyopaque,
         call: *const fn (ptr: *anyopaque, ctx: *Context) anyerror!Response,
+    };
+
+    const WrapperCall = *const fn (
+        ptr: *anyopaque,
+        inner: Handler,
+        ctx: *Context,
+    ) anyerror!Response;
+
+    pub const WrappedFunction = struct {
+        ptr: *anyopaque,
+        inner: *const fn (*Context) anyerror!Response,
+        call: WrapperCall,
+    };
+
+    pub const WrappedBound = struct {
+        ptr: *anyopaque,
+        inner: Bound,
+        call: WrapperCall,
     };
 
     /// Converts either an existing Handler or a plain handler function into
@@ -948,10 +968,56 @@ pub const Handler = union(enum) {
         } };
     }
 
+    /// Wraps an existing handler without replacing or re-deriving its target.
+    /// The wrapper instance must outlive every router that stores the result.
+    pub fn wrap(instance: anytype, inner: Handler, comptime method: anytype) Handler {
+        const Instance = @TypeOf(instance);
+        comptime {
+            switch (@typeInfo(Instance)) {
+                .pointer => |pointer| {
+                    if (pointer.size != .one) @compileError("httpx.Handler.wrap requires a single-item pointer");
+                    if (pointer.is_const) @compileError("httpx.Handler.wrap currently requires a mutable instance pointer");
+                },
+                else => @compileError("httpx.Handler.wrap requires an instance pointer"),
+            }
+        }
+
+        const Adapter = struct {
+            fn call(raw: *anyopaque, wrapped: Handler, ctx: *Context) anyerror!Response {
+                const typed: Instance = @ptrCast(@alignCast(raw));
+                return @call(.auto, method, .{ typed, wrapped, ctx });
+            }
+        };
+
+        return switch (inner) {
+            .function => |function| .{ .wrapped_function = .{
+                .ptr = @ptrCast(instance),
+                .inner = function,
+                .call = Adapter.call,
+            } },
+            .bound => |bound| .{ .wrapped_bound = .{
+                .ptr = @ptrCast(instance),
+                .inner = bound,
+                .call = Adapter.call,
+            } },
+            .wrapped_function, .wrapped_bound => @panic("httpx.Handler.wrap does not support nested wrappers"),
+        };
+    }
+
     pub fn invoke(self: Handler, ctx: *Context) anyerror!Response {
         return switch (self) {
             .function => |function| function(ctx),
             .bound => |bound| bound.call(bound.ptr, ctx),
+            .wrapped_function => |wrapped| wrapped.call(
+                wrapped.ptr,
+                .{ .function = wrapped.inner },
+                ctx,
+            ),
+            .wrapped_bound => |wrapped| wrapped.call(
+                wrapped.ptr,
+                .{ .bound = wrapped.inner },
+                ctx,
+            ),
         };
     }
 };
@@ -1791,6 +1857,7 @@ pub const Server = struct {
             for (self.pre_route_hooks.items) |hook| {
                 hook(&ctx) catch |err| {
                     std.debug.print("Pre-route hook error: {}\n", .{err});
+                    if (ctx.h1_stream_sent) return;
                     return self.sendError(&sock, 500);
                 };
             }
@@ -1815,6 +1882,10 @@ pub const Server = struct {
             if (route_result) |r| {
                 response = self.executeMiddleware(&ctx, r.handler) catch |err| {
                     std.debug.print("Route handler error: {}\n", .{err});
+                    // Once streaming headers are committed, another HTTP
+                    // response would corrupt the connection. Closing the
+                    // connection is the only valid HTTP/1 terminal action.
+                    if (ctx.h1_stream_sent) return;
                     return self.sendError(&sock, routeErrorStatus(err));
                 };
             } else {
@@ -1832,6 +1903,7 @@ pub const Server = struct {
                 } else if (self.global_handler) |global_handler| {
                     response = self.executeMiddleware(&ctx, global_handler) catch |err| {
                         std.debug.print("Global handler error: {}\n", .{err});
+                        if (ctx.h1_stream_sent) return;
                         return self.sendError(&sock, 500);
                     };
                 } else {
@@ -2468,7 +2540,7 @@ pub const Server = struct {
 
         for (self.pre_route_hooks.items) |hook| {
             hook(&ctx) catch {
-                try self.sendH2ErrorLocked(h2, sock, stream_id, 500);
+                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, 500);
                 return;
             };
         }
@@ -2916,6 +2988,41 @@ test "bound handlers keep independent instance context" {
     try std.testing.expectEqual(@as(usize, 1), second_state.calls);
 }
 
+test "wrapped handlers preserve the supplied handler target" {
+    const StatefulHandler = struct {
+        calls: usize = 0,
+
+        fn handle(self: *@This(), ctx: *Context) anyerror!Response {
+            self.calls += 1;
+            return Response.init(ctx.allocator, 207);
+        }
+    };
+    const Wrapper = struct {
+        calls: usize = 0,
+
+        fn handle(self: *@This(), inner: Handler, ctx: *Context) anyerror!Response {
+            self.calls += 1;
+            return inner.invoke(ctx);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var state: StatefulHandler = .{};
+    var wrapper: Wrapper = .{};
+    const handler = Handler.wrap(&wrapper, Handler.bind(&state, StatefulHandler.handle), Wrapper.handle);
+
+    var request = try Request.init(allocator, .GET, "/wrapped");
+    defer request.deinit();
+    var ctx = Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try handler.invoke(&ctx);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 207), response.status.code);
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    try std.testing.expectEqual(@as(usize, 1), wrapper.calls);
+}
+
 test "Context response helpers" {
     const allocator = std.testing.allocator;
     var req = try Request.init(allocator, .GET, "/test");
@@ -3337,6 +3444,58 @@ test "H1 body deadline starts after headers and rejects a stalled upload" {
     const n = try client.recv(&response);
     try std.testing.expect(mem.indexOf(u8, response[0..n], " 408 ") != null);
     try std.testing.expect(!State.handled.load(.acquire));
+}
+
+test "H1 handler failure after stream commit closes without a second response" {
+    const State = struct {
+        fn handler(ctx: *Context) anyerror!Response {
+            var writer = try ctx.streamResponse(200);
+            try writer.write("partial");
+            return error.TestStreamFailure;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    try server.get("/stream", State.handler);
+    try server.bind();
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("stream failure listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll("GET /stream HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+
+    var response: [1024]u8 = undefined;
+    var response_len: usize = 0;
+    while (true) {
+        const n = try client.recv(response[response_len..]);
+        if (n == 0) break;
+        response_len += n;
+        if (response_len == response.len) return error.TestUnexpectedResult;
+    }
+    const bytes = response[0..response_len];
+    try std.testing.expectEqual(@as(usize, 1), mem.count(u8, bytes, "HTTP/1.1"));
+    try std.testing.expect(mem.indexOf(u8, bytes, "7\r\npartial\r\n") != null);
+    try std.testing.expect(mem.indexOf(u8, bytes, " 500 ") == null);
 }
 
 test "H2StreamReader reports terminal stream errors instead of truncated EOF" {

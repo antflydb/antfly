@@ -374,6 +374,14 @@ fn standaloneInferenceDestroyHttpResponse(handle: *anyopaque) callconv(.c) void 
     standalone_inference_host.linkedInferenceDestroyHttpResponse(handle);
 }
 
+fn standaloneInferenceTryAcquireRequest(handle: *anyopaque) callconv(.c) u8 {
+    return @intFromBool(standalone_inference_host.linkedInferenceTryAcquireRequest(handle));
+}
+
+fn standaloneInferenceReleaseRequest(handle: *anyopaque) callconv(.c) void {
+    standalone_inference_host.linkedInferenceReleaseRequest(handle);
+}
+
 fn standaloneInferenceDestroy(handle: *anyopaque) callconv(.c) void {
     standalone_inference_host.linkedInferenceDestroy(handle);
 }
@@ -383,7 +391,8 @@ const standalone_inference_function_table: standalone_inference_bridge.FunctionT
     .struct_size = @sizeOf(standalone_inference_bridge.FunctionTable),
     .capabilities = standalone_inference_bridge.Capability.provider |
         standalone_inference_bridge.Capability.route_manifest |
-        standalone_inference_bridge.Capability.resource_budget,
+        standalone_inference_bridge.Capability.resource_budget |
+        standalone_inference_bridge.Capability.request_admission,
     .create = &standaloneInferenceCreate,
     .configure = &standaloneInferenceConfigure,
     .invoke_provider = &standaloneInferenceInvokeProvider,
@@ -391,6 +400,8 @@ const standalone_inference_function_table: standalone_inference_bridge.FunctionT
     .route_manifest = &standaloneInferenceRouteManifest,
     .handle_http = &standaloneInferenceHandleHttp,
     .destroy_http_response = &standaloneInferenceDestroyHttpResponse,
+    .try_acquire_request = &standaloneInferenceTryAcquireRequest,
+    .release_request = &standaloneInferenceReleaseRequest,
     .destroy = &standaloneInferenceDestroy,
 };
 

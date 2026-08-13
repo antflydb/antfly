@@ -654,6 +654,7 @@ test "generated route policy inventory is unique and describes wire modes" {
     try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("globalQuery").?);
     try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("queryTable").?);
     try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("scanKeys").?);
+    try std.testing.expectEqual(.inference, request_admission_policy.publicOperationClass("invokeInferenceConnection").?);
     try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("multiBatchWrite").?);
     try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("batchWrite").?);
     try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("linearMerge").?);

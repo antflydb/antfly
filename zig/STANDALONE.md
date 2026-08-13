@@ -76,7 +76,9 @@ Serving admission and backend execution are separate concerns:
   control-plane routes remain available when either foreground class saturates.
 - `admission.inference.max_concurrent_requests` independently bounds requests
   across every embedded inference execution surface, including direct providers
-  and the public inference and traditional-ML prediction routes. The same value
+  and the public inference and traditional-ML prediction routes, as well as
+  public connection inference forwarding. Standalone shares one coordinator
+  across those surfaces rather than stacking independent limits. The same value
   sizes a weighted work budget, so expensive requests can exhaust inference
   capacity before the request-count ceiling is reached.
 - Listener connection limits remain transport safeguards. They do not express

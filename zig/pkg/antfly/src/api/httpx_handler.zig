@@ -43,6 +43,7 @@ const common_secrets = @import("../common/secrets.zig");
 const ha_mutation_inventory = @import("../storage/ha/mutation_inventory.zig");
 const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
+const connections_api = @import("connections.zig");
 const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
 const restore_jobs = @import("restore_jobs.zig");
@@ -2042,6 +2043,17 @@ pub const AntflyApiHandler = struct {
         return textResponse(ctx, 429, "write capacity exhausted");
     }
 
+    fn inferenceOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
+        return textResponse(ctx, 503, "inference capacity exhausted");
+    }
+
+    fn inferenceInvokeResponse(ctx: *httpx.Context, result: *const connections_api.InvokeResult) !httpx.Response {
+        if (result.retry_after) |value| try ctx.setHeader("Retry-After", value);
+        return jsonResponse(ctx, result.status, result.body);
+    }
+
     fn acquirePublicOperation(
         self: *AntflyApiHandler,
         ctx: *httpx.Context,
@@ -2053,6 +2065,7 @@ pub const AntflyApiHandler = struct {
             .none => @compileError("operation does not use foreground admission: " ++ operation_id),
             .query => if (self.api_server.tryAcquireQuery()) null else try queryOverloadedResponse(ctx),
             .write => if (self.api_server.tryAcquireWrite()) null else try writeOverloadedResponse(ctx),
+            .inference => if (self.api_server.tryAcquireInference()) null else try inferenceOverloadedResponse(ctx),
         };
     }
 
@@ -2063,6 +2076,7 @@ pub const AntflyApiHandler = struct {
             .none => @compileError("operation does not use foreground admission: " ++ operation_id),
             .query => self.api_server.releaseQuery(),
             .write => self.api_server.releaseWrite(),
+            .inference => self.api_server.releaseInference(),
         }
     }
 
@@ -2160,13 +2174,16 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (try self.acquirePublicOperation(ctx, "invokeInferenceConnection")) |response| return response;
+        defer self.releasePublicOperation("invokeInferenceConnection");
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "request body required");
-        const result = self.api_server.invokeInferenceConnection(ctx.allocator, connection_id, operation, body) catch |err| switch (err) {
+        var result = self.api_server.invokeInferenceConnection(ctx.allocator, connection_id, operation, body) catch |err| switch (err) {
             error.ConnectionCapabilityMissing => return textResponse(ctx, 403, @errorName(err)),
             error.ConnectionNotFound, error.ConnectionNotInference, error.InvalidConfig, error.ConnectionURLMissing, error.InvalidConnectionURL, error.ProviderNotAntflyCompatible, error.UnsupportedInferenceOperation => return textResponse(ctx, 400, @errorName(err)),
             else => return textResponse(ctx, 502, @errorName(err)),
         };
-        return jsonResponse(ctx, result.status, result.body);
+        defer result.deinit(ctx.allocator);
+        return inferenceInvokeResponse(ctx, &result);
     }
 
     pub fn listSecrets(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -6430,6 +6447,72 @@ test "httpx query admission rejects saturated queries without blocking control r
     var control = try handler.getStatus(&control_ctx);
     defer control.deinit();
     try std.testing.expectEqual(@as(u16, 200), control.status.code);
+}
+
+test "httpx inference connection uses the configured shared admission owner" {
+    const SharedAdmission = struct {
+        gate: RequestAdmission = RequestAdmission.init(1),
+
+        fn tryAcquire(ptr: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.gate.tryAcquire();
+        }
+
+        fn release(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.gate.release();
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var shared: SharedAdmission = .{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .inference_max_concurrent_requests = 99,
+        .inference_request_admission_source = .{
+            .ptr = &shared,
+            .try_acquire_fn = SharedAdmission.tryAcquire,
+            .release_fn = SharedAdmission.release,
+        },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+
+    try std.testing.expect(shared.gate.tryAcquire());
+    defer shared.gate.release();
+
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/connections/remote/inference/embed");
+    defer request.deinit();
+    request.body = "{}";
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var rejected = try handler.invokeInferenceConnection(&ctx, "remote", "embed");
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 503), rejected.status.code);
+    try std.testing.expectEqualStrings("1", rejected.headers.get("Retry-After").?);
+    try std.testing.expectEqualStrings("inference capacity exhausted", rejected.body orelse "");
+    try std.testing.expectEqual(@as(u64, 1), shared.gate.stats().rejected_total);
+}
+
+test "httpx inference connection preserves upstream retry guidance" {
+    const alloc = std.testing.allocator;
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/connections/remote/inference/embed");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var result = connections_api.InvokeResult{
+        .status = 503,
+        .body = try alloc.dupe(u8, "{\"error\":\"busy\"}"),
+        .retry_after = try alloc.dupe(u8, "4"),
+    };
+    defer result.deinit(alloc);
+
+    var response = try AntflyApiHandler.inferenceInvokeResponse(&ctx, &result);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("4", response.headers.get("Retry-After").?);
+    try std.testing.expectEqualStrings("{\"error\":\"busy\"}", response.body.?);
 }
 
 test "httpx query admission releases a cancelled query slot" {

@@ -7,7 +7,7 @@
 const std = @import("std");
 const prometheus = @import("prometheus.zig");
 
-pub const Class = enum { none, query, write };
+pub const Class = enum { none, query, write, inference };
 
 pub const PrometheusClass = enum {
     query,

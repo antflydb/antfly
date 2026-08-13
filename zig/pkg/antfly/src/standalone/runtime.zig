@@ -1654,6 +1654,11 @@ pub fn runFromIterator(
 
     var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer node_backend_runtime.deinit();
+    // The linked inference archive retains std.Io for its full node lifetime.
+    // Keep the corresponding host lane lease until after node destruction.
+    var inference_lane_lease = try node_backend_runtime.ptr().acquireInferenceLane();
+    defer inference_lane_lease.release();
+    const inference_io = inference_lane_lease.io();
     var lite_backend: ?antfly.lite.backend.Handle = if (lite_path) |path|
         try antfly.lite.backend.Handle.openOrCreate(alloc, path, .{ .no_sync = !lite_fsync })
     else
@@ -1778,6 +1783,7 @@ pub fn runFromIterator(
         .content_security_json = inference_bridge.OptionalString.init(content_security_json),
         .s3_credentials_json = inference_bridge.OptionalString.init(s3_credentials_json),
         .runtime_config_json = inference_bridge.String.init(inference_runtime_config_json),
+        .executor = .init(&inference_io),
         .out_handle = &handle,
     };
     const antfly_node = if (comptime inline_inference_codegen) blk: {
@@ -1786,7 +1792,8 @@ pub fn runFromIterator(
         const inference_api = try linkedInferenceApi(
             inference_bridge.Capability.provider |
                 inference_bridge.Capability.route_manifest |
-                inference_bridge.Capability.resource_budget,
+                inference_bridge.Capability.resource_budget |
+                inference_bridge.Capability.request_admission,
         );
         const status = inference_api.create(&inference_create_context);
         if (!status.isOk()) return inference_bridge.errorFromStatus(status);
@@ -2007,6 +2014,12 @@ pub fn runFromIterator(
             .experimental = cli.experimental,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
+            .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
+            .inference_request_admission_source = .{
+                .ptr = antfly_node,
+                .try_acquire_fn = tryAcquireEmbeddedInferenceRequest,
+                .release_fn = releaseEmbeddedInferenceRequest,
+            },
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
@@ -4357,6 +4370,21 @@ fn linkedInferenceApi(required_capabilities: u64) !*const inference_bridge.Funct
 
 fn linkedInferenceApiInfallible() *const inference_bridge.FunctionTable {
     return linkedInferenceApi(0) catch @panic("linked inference ABI changed after startup");
+}
+
+fn tryAcquireEmbeddedInferenceRequest(handle: *anyopaque) bool {
+    if (comptime inline_inference_codegen) {
+        return inference_host.linkedInferenceTryAcquireRequest(handle);
+    }
+    return linkedInferenceApiInfallible().try_acquire_request(handle) != 0;
+}
+
+fn releaseEmbeddedInferenceRequest(handle: *anyopaque) void {
+    if (comptime inline_inference_codegen) {
+        inference_host.linkedInferenceReleaseRequest(handle);
+        return;
+    }
+    linkedInferenceApiInfallible().release_request(handle);
 }
 
 fn inferenceProviderEmbedDenseTexts(

@@ -146,6 +146,13 @@ pub const ConnectionsResponse = struct {
 pub const InvokeResult = struct {
     status: u16,
     body: []u8,
+    retry_after: ?[]u8 = null,
+
+    pub fn deinit(self: *InvokeResult, alloc: Allocator) void {
+        alloc.free(self.body);
+        if (self.retry_after) |value| alloc.free(value);
+        self.* = undefined;
+    }
 };
 
 pub fn invokeInferenceConnection(
@@ -182,9 +189,16 @@ pub fn invokeInferenceConnection(
 
     var response = try http.request(.POST, url, .{ .headers = headers, .body = body, .timeout_ms = 120_000 });
     defer response.deinit();
+    const response_body = try alloc.dupe(u8, response.body orelse "");
+    errdefer alloc.free(response_body);
+    const retry_after = if (response.header("Retry-After")) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
     return .{
         .status = response.status.code,
-        .body = try alloc.dupe(u8, response.body orelse ""),
+        .body = response_body,
+        .retry_after = retry_after,
     };
 }
 

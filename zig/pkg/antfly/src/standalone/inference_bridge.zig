@@ -18,8 +18,9 @@
 
 const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
+const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version: u32 = 8;
+pub const abi_version: u32 = 10;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -82,6 +83,8 @@ pub const CreateContext = extern struct {
     content_security_json: OptionalString,
     s3_credentials_json: OptionalString,
     runtime_config_json: String,
+    /// Host-owned inference executor retained until destroy returns.
+    executor: native_abi.IoBorrow,
     out_handle: *?*anyopaque,
 };
 
@@ -175,6 +178,7 @@ pub const Capability = struct {
     pub const provider: u64 = 1 << 0;
     pub const route_manifest: u64 = 1 << 1;
     pub const resource_budget: u64 = 1 << 2;
+    pub const request_admission: u64 = 1 << 3;
 };
 
 /// Append-only function table returned by the linked inference archive. A
@@ -192,6 +196,8 @@ pub const FunctionTable = extern struct {
     handle_http: *const fn (*const HttpHandleContext) callconv(.c) Status,
     destroy_http_response: *const fn (*anyopaque) callconv(.c) void,
     destroy: *const fn (*anyopaque) callconv(.c) void,
+    try_acquire_request: *const fn (*anyopaque) callconv(.c) u8,
+    release_request: *const fn (*anyopaque) callconv(.c) void,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {

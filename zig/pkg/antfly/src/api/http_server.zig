@@ -624,6 +624,22 @@ pub const HAMutationPolicySource = struct {
     }
 };
 
+/// Optional request-count admission owner for an embedded inference runtime.
+/// API-only processes omit this and use their local fallback admission gate.
+pub const InferenceRequestAdmissionSource = struct {
+    ptr: *anyopaque,
+    try_acquire_fn: *const fn (ptr: *anyopaque) bool,
+    release_fn: *const fn (ptr: *anyopaque) void,
+
+    pub fn tryAcquire(self: InferenceRequestAdmissionSource) bool {
+        return self.try_acquire_fn(self.ptr);
+    }
+
+    pub fn release(self: InferenceRequestAdmissionSource) void {
+        self.release_fn(self.ptr);
+    }
+};
+
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     experimental: bool = false,
@@ -631,6 +647,11 @@ pub const ApiHttpServerConfig = struct {
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
     /// Node-local foreground data-mutation admission capacity. Zero is unlimited.
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
+    /// Node-local inference request admission capacity. Zero is unlimited.
+    inference_max_concurrent_requests: u32 = common_config.default_inference_max_concurrent_requests,
+    /// Shared owner used when inference runs in this process. When present it
+    /// supersedes the local fallback so every inference endpoint shares one cap.
+    inference_request_admission_source: ?InferenceRequestAdmissionSource = null,
     ard_base_url: ?[]const u8 = null,
     ard_publisher_domain: []const u8 = "antfly.local",
     ard_display_name: []const u8 = "Antfly",
@@ -1728,6 +1749,7 @@ pub const ApiHttpServer = struct {
     cfg: ApiHttpServerConfig,
     query_admission: RequestAdmission,
     write_admission: RequestAdmission,
+    inference_admission: RequestAdmission,
     source: StatusSource,
     metadata_mutation_retry_policy: MetadataMutationRetryPolicy = .{},
     table_reads: ?table_reads.TableReadSource = null,
@@ -1899,6 +1921,7 @@ pub const ApiHttpServer = struct {
             .cfg = cfg,
             .query_admission = RequestAdmission.init(cfg.query_max_concurrent_requests),
             .write_admission = RequestAdmission.init(cfg.write_max_concurrent_requests),
+            .inference_admission = RequestAdmission.init(cfg.inference_max_concurrent_requests),
             .source = source,
             .table_reads = table_read_source,
             .table_writes = table_write_source,
@@ -2024,6 +2047,23 @@ pub const ApiHttpServer = struct {
 
     pub fn writeOverloadedResponse(self: *ApiHttpServer) !contextual_operations.OwnedResponse {
         return try contextualRetryableTextResponse(self.alloc, 429, "write capacity exhausted");
+    }
+
+    pub fn tryAcquireInference(self: *ApiHttpServer) bool {
+        if (self.cfg.inference_request_admission_source) |source| return source.tryAcquire();
+        return self.inference_admission.tryAcquire();
+    }
+
+    pub fn releaseInference(self: *ApiHttpServer) void {
+        if (self.cfg.inference_request_admission_source) |source| {
+            source.release();
+            return;
+        }
+        self.inference_admission.release();
+    }
+
+    pub fn inferenceOverloadedResponse(self: *ApiHttpServer) !contextual_operations.OwnedResponse {
+        return try contextualRetryableTextResponse(self.alloc, 503, "inference capacity exhausted");
     }
 
     pub fn setHAInternalExecutor(self: *ApiHttpServer, executor_value: ?ha_http_operation.Executor) void {
@@ -9647,16 +9687,19 @@ pub const ApiHttpServer = struct {
             .none => true,
             .query => self.tryAcquireQuery(),
             .write => self.tryAcquireWrite(),
+            .inference => self.tryAcquireInference(),
         };
         if (!admitted) return switch (admission_class) {
             .none => unreachable,
             .query => try self.queryOverloadedResponse(),
             .write => try self.writeOverloadedResponse(),
+            .inference => try self.inferenceOverloadedResponse(),
         };
         defer switch (admission_class) {
             .none => {},
             .query => self.releaseQuery(),
             .write => self.releaseWrite(),
+            .inference => self.releaseInference(),
         };
 
         switch (operation) {

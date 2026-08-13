@@ -8,6 +8,17 @@
 const httpx = @import("httpx");
 const abi = @import("runtime_http_abi.zig");
 
+fn callbackStatusFromError(err: anyerror) abi.CallbackStatus {
+    return switch (err) {
+        error.Canceled, error.Cancelled => .canceled,
+        error.Timeout => .timeout,
+        error.BodyTooLarge => .body_too_large,
+        error.BodyCapacityExceeded => .body_capacity_exceeded,
+        error.EndOfStream => .end_of_stream,
+        else => .failed,
+    };
+}
+
 pub const Outbound = struct {
     context: *httpx.Context,
     writer: ?httpx.Context.StreamWriter = null,
@@ -59,8 +70,9 @@ pub const Outbound = struct {
 
     fn start(raw: ?*anyopaque, status: u16) callconv(.c) abi.CallbackStatus {
         const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
+        if (self.context.isCancellationRequested()) return .canceled;
         if (self.started) return .failed;
-        self.writer = self.context.streamResponse(status) catch return .failed;
+        self.writer = self.context.streamResponse(status) catch |err| return callbackStatusFromError(err);
         self.started = true;
         return .ok;
     }
@@ -69,14 +81,15 @@ pub const Outbound = struct {
         const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
         if (self.context.isCancellationRequested()) return .canceled;
         const writer = &(self.writer orelse return .failed);
-        writer.write(bytes.slice()) catch return .failed;
+        writer.write(bytes.slice()) catch |err| return callbackStatusFromError(err);
         return .ok;
     }
 
     fn close(raw: ?*anyopaque) callconv(.c) abi.CallbackStatus {
         const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
+        if (self.context.isCancellationRequested()) return .canceled;
         const writer = &(self.writer orelse return .failed);
-        writer.close() catch return .failed;
+        writer.close() catch |err| return callbackStatusFromError(err);
         return .ok;
     }
 };
@@ -277,4 +290,53 @@ test "linked callbacks preserve streaming and cancellation semantics" {
     try std.testing.expectEqual(@as(u16, 202), state.status);
     try std.testing.expectEqualStrings("linked", state.bytes[0..state.bytes_len]);
     try std.testing.expect(state.closed);
+}
+
+test "outbound stream callbacks preserve terminal status classes" {
+    const std = @import("std");
+    const Delegate = struct {
+        fn startCanceled(_: ?*anyopaque, _: u16) anyerror!void {
+            return error.Canceled;
+        }
+
+        fn startOk(_: ?*anyopaque, _: u16) anyerror!void {}
+
+        fn writeTimeout(_: ?*anyopaque, _: []const u8) anyerror!void {
+            return error.Timeout;
+        }
+
+        fn closeEndOfStream(_: ?*anyopaque) anyerror!void {
+            return error.EndOfStream;
+        }
+    };
+
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "/");
+    defer request.deinit();
+    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    var cancellation = std.atomic.Value(bool).init(false);
+    context.cancellation = &cancellation;
+
+    context.stream_delegate = .{
+        .ptr = null,
+        .start = Delegate.startCanceled,
+        .write = Delegate.writeTimeout,
+        .close = Delegate.closeEndOfStream,
+    };
+    var canceled = Outbound{ .context = &context };
+    const canceled_sink = canceled.stream();
+    try std.testing.expectEqual(.canceled, canceled_sink.start.?(canceled_sink.context, 200));
+
+    context.stream_delegate.?.start = Delegate.startOk;
+    var terminal = Outbound{ .context = &context };
+    const terminal_sink = terminal.stream();
+    try std.testing.expectEqual(.ok, terminal_sink.start.?(terminal_sink.context, 200));
+    try std.testing.expectEqual(.timeout, terminal_sink.write.?(terminal_sink.context, abi.Bytes.init("x")));
+    try std.testing.expectEqual(.end_of_stream, terminal_sink.close.?(terminal_sink.context));
+
+    cancellation.store(true, .release);
+    var pre_canceled = Outbound{ .context = &context };
+    const pre_canceled_sink = pre_canceled.stream();
+    try std.testing.expectEqual(.canceled, pre_canceled_sink.start.?(pre_canceled_sink.context, 200));
+    try std.testing.expectEqual(.canceled, terminal_sink.close.?(terminal_sink.context));
 }

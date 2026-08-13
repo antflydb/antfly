@@ -4444,23 +4444,20 @@ pub const Node = struct {
         self.updateAdmissionMetrics();
     }
 
-    fn acquireHttpRequestSlot(self: *Node, ctx: *httpx.Context) !?httpx.Response {
+    /// Acquire the node-wide request-count permit shared by HTTP routes and
+    /// embedding runtimes that forward inference work through the public API.
+    pub fn tryAcquireRequestSlot(self: *Node) bool {
         self.inference_admission.acquireRequestSlot() catch {
             self.metrics.incError();
             self.metrics.recordAdmissionRejection(1);
             self.updateAdmissionMetrics();
-            return try transientCapacityFailureResponse(
-                ctx,
-                "SERVICE_UNAVAILABLE",
-                "server at concurrent request capacity, try again later",
-                "inference_admission",
-            );
+            return false;
         };
         self.updateAdmissionMetrics();
-        return null;
+        return true;
     }
 
-    fn releaseHttpRequestSlot(self: *Node) void {
+    pub fn releaseRequestSlot(self: *Node) void {
         self.inference_admission.releaseRequestSlot();
         self.updateAdmissionMetrics();
     }
@@ -11630,31 +11627,17 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
     @compileError(std.fmt.comptimePrint("unclassified inference HTTP route: {s} {s}", .{ method, path }));
 }
 
-fn inferenceEndpointForPath(comptime path: []const u8) *const fn (*Node, *httpx.Context) anyerror!httpx.Response {
-    if (comptime std.mem.eql(u8, path, "/chat/completions")) return Node.chatCompletions;
-    if (comptime std.mem.eql(u8, path, "/chunk")) return Node.chunkText;
-    if (comptime std.mem.eql(u8, path, "/embed")) return Node.generateEmbeddings;
-    if (comptime std.mem.eql(u8, path, "/embeddings")) return Node.createEmbedding;
-    if (comptime std.mem.eql(u8, path, "/extract")) return Node.extract;
-    if (comptime std.mem.eql(u8, path, "/generate")) return Node.generateContent;
-    if (comptime std.mem.eql(u8, path, "/generate/batch")) return Node.generateBatchContent;
-    if (comptime std.mem.eql(u8, path, "/predict")) return Node.predict;
-    if (comptime std.mem.eql(u8, path, "/read")) return Node.readImages;
-    if (comptime std.mem.eql(u8, path, "/rerank")) return Node.rerankPrompts;
-    if (comptime std.mem.eql(u8, path, "/rerank_multimodal")) return Node.rerankMultimodalPrompts;
-    if (comptime std.mem.eql(u8, path, "/rewrite")) return Node.rewriteText;
-    if (comptime std.mem.eql(u8, path, "/transcribe")) return Node.transcribeAudio;
-    @compileError(std.fmt.comptimePrint("missing admitted inference handler: POST {s}", .{path}));
-}
-
-fn admittedInferenceHandler(comptime endpoint: *const fn (*Node, *httpx.Context) anyerror!httpx.Response) *const fn (*Node, *httpx.Context) anyerror!httpx.Response {
-    return struct {
-        fn handle(node: *Node, ctx: *httpx.Context) anyerror!httpx.Response {
-            if (try node.acquireHttpRequestSlot(ctx)) |response| return response;
-            defer node.releaseHttpRequestSlot();
-            return endpoint(node, ctx);
-        }
-    }.handle;
+fn admittedInferenceHandler(node: *Node, handler: httpx.Handler, ctx: *httpx.Context) anyerror!httpx.Response {
+    if (!node.tryAcquireRequestSlot()) {
+        return try transientCapacityFailureResponse(
+            ctx,
+            "SERVICE_UNAVAILABLE",
+            "server at concurrent request capacity, try again later",
+            "inference_admission",
+        );
+    }
+    defer node.releaseRequestSlot();
+    return handler.invoke(ctx);
 }
 
 /// Wrapper that prepends a path prefix and applies the route-owned request
@@ -11666,11 +11649,11 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         models_handler: ?httpx.Handler = null,
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            _ = handler;
             comptime std.debug.assert(inferenceHttpRouteAdmission("POST", path) == .inference);
-            try self.inner.post(prefix ++ path, httpx.Handler.bind(
+            try self.inner.post(prefix ++ path, httpx.Handler.wrap(
                 self.node,
-                admittedInferenceHandler(inferenceEndpointForPath(path)),
+                handler,
+                admittedInferenceHandler,
             ));
         }
 
@@ -11706,11 +11689,11 @@ fn AiPrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             if (comptime isMlOnlyRoute(path)) return;
-            _ = handler;
             comptime std.debug.assert(inferenceHttpRouteAdmission("POST", path) == .inference);
-            try self.inner.post(prefix ++ path, httpx.Handler.bind(
+            try self.inner.post(prefix ++ path, httpx.Handler.wrap(
                 self.node,
-                admittedInferenceHandler(inferenceEndpointForPath(path)),
+                handler,
+                admittedInferenceHandler,
             ));
         }
 
@@ -17806,7 +17789,11 @@ test "route-owned request admission rejects before endpoint work" {
             return ctx.status(204).text("");
         }
     };
-    const handler = httpx.Handler.bind(&node, admittedInferenceHandler(Endpoint.run));
+    const handler = httpx.Handler.wrap(
+        &node,
+        httpx.Handler.bind(&node, Endpoint.run),
+        admittedInferenceHandler,
+    );
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/test");
     defer request.deinit();
     var ctx = httpx.Context.init(allocator, std.testing.io, &request);

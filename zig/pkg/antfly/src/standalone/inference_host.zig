@@ -27,7 +27,8 @@ const inference_api = @import("inference_api");
 
 pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
-    io_impl: std.Io.Threaded,
+    /// Host-owned interface protected by standalone's inference-lane lease.
+    io: std.Io,
     node: inference.server.Node,
     warm_models: ResolvedWarmModels,
     content_security: ?std.json.Parsed(antfly.common.config.Config.ContentSecurityConfig),
@@ -219,6 +220,7 @@ test "standalone inference keep alive parses compound durations and zero" {
 pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*anyopaque {
     const data_dir = context.data_dir_ptr[0..context.data_dir_len];
     const alloc = std.heap.c_allocator;
+    const io = try context.executor.get();
 
     var content_security = if (context.content_security_json.slice()) |json|
         try std.json.parseFromSlice(antfly.common.config.Config.ContentSecurityConfig, alloc, json, .{ .ignore_unknown_fields = true })
@@ -280,7 +282,7 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
 
     state.* = .{
         .alloc = alloc,
-        .io_impl = std.Io.Threaded.init(alloc, .{}),
+        .io = io,
         .node = undefined,
         .warm_models = warm_models,
         .content_security = content_security,
@@ -291,9 +293,8 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
         .route_validator = httpx.Router.init(alloc),
     };
     errdefer state.route_validator.deinit();
-    errdefer state.io_impl.deinit();
     state.node = try inference.server.Node.init(alloc, node_config);
-    state.node.attachIo(state.io_impl.io());
+    state.node.attachIo(state.io);
     return state;
 }
 
@@ -331,7 +332,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             var parsed = try std.json.parseFromSlice(ModelTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
             const result = if (operation == .embed_dense_texts_with_context)
-                try state.node.embedDenseTextsDirectWithContext(state.alloc, state.io_impl.io(), deadline_ns, parsed.value.model, parsed.value.texts)
+                try state.node.embedDenseTextsDirectWithContext(state.alloc, state.io, deadline_ns, parsed.value.model, parsed.value.texts)
             else
                 try state.node.embedDenseTextsDirect(state.alloc, parsed.value.model, parsed.value.texts);
             defer {
@@ -358,7 +359,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 alloc,
                 parsed.value.model,
                 parsed.value.parts,
-                state.io_impl.io(),
+                state.io,
                 if (operation == .embed_dense_parts_with_context) deadline_ns else null,
             );
             defer {
@@ -418,7 +419,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             break :blk try std.json.Stringify.valueAlloc(alloc, result.json, .{});
         },
         .list_models_json => blk: {
-            const result = try state.node.listModelsJsonAlloc(alloc, state.io_impl.io());
+            const result = try state.node.listModelsJsonAlloc(alloc, state.io);
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
@@ -628,7 +629,7 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
         params[i] = .{ .name = param.name.slice(), .value = param.value.slice() };
     }
 
-    var http_context = httpx.Context.init(alloc, state.io_impl.io(), &http_request);
+    var http_context = httpx.Context.init(alloc, state.io, &http_request);
     defer http_context.deinit();
     http_context.params = params;
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
@@ -665,6 +666,16 @@ pub fn linkedInferenceDestroyHttpResponse(handle: *anyopaque) void {
     alloc.destroy(state);
 }
 
+pub fn linkedInferenceTryAcquireRequest(handle: *anyopaque) bool {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    return state.node.tryAcquireRequestSlot();
+}
+
+pub fn linkedInferenceReleaseRequest(handle: *anyopaque) void {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    state.node.releaseRequestSlot();
+}
+
 pub fn linkedInferenceDestroy(handle: *anyopaque) void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
     const alloc = state.alloc;
@@ -680,26 +691,7 @@ pub fn linkedInferenceDestroy(handle: *anyopaque) void {
     state.runtime_config.deinit();
     if (state.owned_models_dir) |path| alloc.free(path);
     if (state.owned_ml_dir) |path| alloc.free(path);
-    state.io_impl.deinit();
     alloc.destroy(state);
-}
-
-fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_embedder.AntflyProvider {
-    return .{
-        .ptr = node,
-        .embed_dense_texts = localAntflyEmbedDenseTexts,
-        .embed_dense_texts_with_context = localAntflyEmbedDenseTextsWithContext,
-        .embed_sparse_texts = localAntflyEmbedSparseTexts,
-        .embed_dense_parts = localAntflyEmbedDenseParts,
-        .embed_dense_parts_with_context = localAntflyEmbedDensePartsWithContext,
-        .rerank_texts = localAntflyRerankTexts,
-        .generate_text = localAntflyGenerateText,
-        .generate_messages = localAntflyGenerateMessages,
-        .read_images = localAntflyReadImages,
-        .transcribe_audio = localAntflyTranscribeAudio,
-        .extract = localAntflyExtract,
-        .list_models_json = localAntflyListModelsJson,
-    };
 }
 
 fn promptCacheResourceUsageObserver(state: *LinkedInferenceState) inference.runtime.kv.prompt_cache.ResourceUsageObserver {
@@ -827,13 +819,6 @@ fn releaseTokenizerCacheBytes(context: *anyopaque, bytes: usize) void {
     budget.release_tokenizer_cache(budget.context, bytes);
 }
 
-fn localAntflyListModelsJson(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    return try node.listModelsJsonAlloc(alloc, io_impl.io());
-}
-
 fn localAntflyEmbedDenseTexts(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
@@ -853,17 +838,6 @@ fn localAntflyEmbedDenseTextsWithContext(
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     return try node.embedDenseTextsDirectWithContext(alloc, context.io, context.deadline_ns, model, texts);
-}
-
-fn localAntflyEmbedDenseParts(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    parts: []const antfly.template.ContentPart,
-) anyerror![][]f32 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    return try localAntflyEmbedDensePartsWithExecutionContext(ptr, alloc, model, parts, io_impl.io(), null);
 }
 
 fn localAntflyEmbedDensePartsWithExecutionContext(

@@ -208,6 +208,10 @@ pub const HealthSource = struct {
             try append(writer, "antfly_executor_api_peak_leases", "gauge", "Peak API executor lifetime leases", lanes.api_peak_leases);
             try append(writer, "antfly_executor_api_acquisitions_total", "counter", "Successful API executor lease acquisitions", lanes.api_acquisitions_total);
             try append(writer, "antfly_executor_api_rejections_total", "counter", "API executor lease acquisitions rejected during shutdown", lanes.api_rejections_total);
+            try append(writer, "antfly_executor_inference_active_leases", "gauge", "Active inference executor lifetime leases", lanes.inference_active_leases);
+            try append(writer, "antfly_executor_inference_peak_leases", "gauge", "Peak inference executor lifetime leases", lanes.inference_peak_leases);
+            try append(writer, "antfly_executor_inference_acquisitions_total", "counter", "Successful inference executor lease acquisitions", lanes.inference_acquisitions_total);
+            try append(writer, "antfly_executor_inference_rejections_total", "counter", "Inference executor lease acquisitions rejected during shutdown", lanes.inference_rejections_total);
             try append(writer, "antfly_executor_control_active_leases", "gauge", "Active control executor lifetime leases", lanes.control_active_leases);
             try append(writer, "antfly_executor_control_peak_leases", "gauge", "Peak control executor lifetime leases", lanes.control_peak_leases);
             try append(writer, "antfly_executor_control_acquisitions_total", "counter", "Successful control executor lease acquisitions", lanes.control_acquisitions_total);
@@ -948,6 +952,7 @@ pub fn runFromIterator(
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
+            .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
     });

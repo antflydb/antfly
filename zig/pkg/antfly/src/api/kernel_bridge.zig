@@ -389,6 +389,7 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .content_type = abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
     };
     var transport = runtime_http_bridge.Outbound{ .context = context };
+    const borrowed_io = context.io;
     const body_source = if (route.request_body == .buffered) transport.bodySource() else abi.RequestBodySource{};
     try callError(route.functions.handler_handle_http(&.{
         .abi_version = abi.abi_version,
@@ -397,6 +398,7 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .cancellation = transport.cancellation(),
         .body_source = body_source,
         .stream = if (route.streaming_response) transport.stream() else .{},
+        .executor = .init(&borrowed_io),
         .out_response_handle = &response_handle,
         .out_response = &response_view,
     }));

@@ -35,6 +35,14 @@ that end state:
   stream reset signal, while HTTP/1 registrations share the role's
   `HttpRuntime`. The linked API and inference ABIs carry the same semantic
   cancellation callback without route-specific OpenAPI policy.
+- Cancellable outbound requests own the complete resolve/connect/request
+  attempt in a `std.Io` task. The semantic watchdog interrupts established
+  sockets and cancels the owning task, so DNS and initial connection work no
+  longer sit outside the cancellation and request-deadline boundary.
+- Once an HTTP/1 streaming response is committed, handler failure closes the
+  connection instead of serializing a second status line. Linked stream
+  callbacks preserve cancellation, timeout, capacity, and end-of-stream
+  status classes rather than collapsing them into a generic failure.
 - Linked request bodies use a transport-owned lazy body source. The API kernel
   can identify a still-streaming upload, acquire application body admission,
   and only then ask the listener to buffer it; direct and independently linked
@@ -72,6 +80,10 @@ that end state:
 - The API-kernel and inference archives expose versioned function tables and
   immutable route manifests; the runtime owns router mutation and wire
   adaptation on both boundaries.
+- Linked archives do not construct private `std.Io.Threaded` pools. API
+  dispatch receives a request-scoped, layout-validated executor borrow;
+  standalone retains a dedicated bounded `BackendRuntime` inference-lane lease
+  until the linked inference handle is destroyed.
 - Generated route inventories include operation ID, request-body mode, and
   streaming-response metadata, with uniqueness/contract tests.
 - The transport-neutral operation layer now defines request identity,
@@ -526,8 +538,8 @@ by platform-specific integration tests.
 
 ## Executor topology
 
-`BackendRuntime` already separates general, API, Raft-inbound, and
-Raft-outbound `Io.Threaded` implementations. That should evolve into an explicit
+`BackendRuntime` separates general, API, inference, control, Raft-inbound, and
+Raft-outbound `Io.Threaded` implementations. This should evolve into an explicit
 executor set usable by process roles without making all of them depend on the
 storage runtime:
 
@@ -574,7 +586,7 @@ Returning the interface value keeps consumers independent of the executor
 implementation. The backing implementation must remain at a stable address for
 the entire borrow.
 
-Long term, borrowing should be represented by an executor-lane lease:
+Long-lived borrowing is represented by an executor-lane lease:
 
 ```zig
 var lease = try backend_runtime.acquireApiLane();
@@ -656,7 +668,8 @@ drop readiness
 → release the listener's HttpRuntime lease
 → destroy servers and handlers
 → deinitialize HttpRuntime
-→ release BackendRuntime API-lane leases
+→ destroy linked inference handles
+→ release BackendRuntime API/inference/control-lane leases
 → deinitialize BackendRuntime
 ```
 
@@ -771,21 +784,16 @@ and outbound HTTP. This avoids the semantic hole where linked runtimes could
 observe cancellation at ingress but deep work continued unless a same-process
 atomic fast path happened to be available.
 
-Outbound HTTP must translate that semantic token at the transport boundary,
-not wrap an inbound executor task in another long-lived task race. An HTTP/1
-request owns its socket, so `httpx.Client` installs the borrowed cancellation
-callback on that socket and checks it before retries and during bounded
-read/write operations; cancellation therefore closes out the same synchronous
-request before control returns. The token is rechecked before retries and after
-connection establishment, and the absolute request deadline is installed on
-the socket before any bytes are sent. DNS lookup and the initial TCP connect do
-not yet accept the semantic token directly; completing that transport work
-requires a cancellation-aware resolver plus a deadline-aware nonblocking
-connect operation rather than wrapping cancellable HTTP/1 response I/O in
-another task race. Until connect itself is deadline-aware, ordinary HTTP/1
-requests and HTTP/2 streams retain one whole-operation race against a single
-short-interval watchdog. HTTP/2 resets only the affected stream. The watchdog
-combines cancellation and the absolute request deadline in one task: separate
+Outbound HTTP translates that semantic token at the transport boundary. Every
+cancellable request owns its complete attempt—including address resolution,
+initial connect, retries, and response I/O—in a cancellable `std.Io` task. A
+single short-interval watchdog combines the semantic token and absolute request
+deadline. When it wins, it first shuts down a published HTTP/1 socket or resets
+the affected HTTP/2 stream and then cancels and drains the owning task. Task
+cancellation is what reaches resolver/connect operations before a socket is
+available; the socket/stream interrupt makes established-transport teardown
+immediate. Individual `std.Io` backends remain responsible for the platform
+details and latency of canceling an in-progress resolver syscall. Separate
 losing timeout and cancellation sleepers can otherwise retain
 `std.Io.Threaded` workers until a long deadline after a successful request.
 Every request race also owns an explicit atomic watchdog-stop signal. The
@@ -1072,12 +1080,17 @@ preserving the compiler-memory benefit of independent code generation.
 The linked API and inference manifests carry buffered-body and streaming-
 response policy. Cancellation is deliberately absent from route manifests and
 OpenAPI extensions because it is a universal request-lifetime property, not an
-operation opt-in. Each dispatch receives request-scoped cancellation, lazy
-body-source, and streaming callback views. A deferred HTTP/2 body remains owned
+operation opt-in. Each API dispatch receives request-scoped cancellation, a
+request-scoped validated host-executor borrow, lazy body-source, and streaming
+callback views. The API interface may be copied for nested work but cannot
+escape the synchronous dispatch call; inference dispatch uses its separately
+leased lifetime borrow described below. A deferred HTTP/2 body remains owned
 by the listener until the archive requests it; the archive's reconstructed
 `httpx.Context` exposes that source as streaming so application admission runs
 before buffering. Callback outcomes preserve cancellation, timeout, size,
-capacity, and end-of-stream errors across the ABI. The same transport-neutral
+capacity, and end-of-stream errors across the ABI. If a streaming handler fails
+after HTTP/1 headers are committed, the host closes that connection and never
+attempts a second response. The same transport-neutral
 delegate model lets an inference SSE handler start, write, and close the
 original listener's HTTP/1 chunked stream or HTTP/2 DATA stream without sharing
 socket or connection layouts across the ABI. The cancellation callback is used
@@ -1117,9 +1130,13 @@ A hardened bridge should provide:
 - No unstable Zig errors, slices, or layouts passed by value
 - Tests that intentionally detect layout and version mismatches
 
-The bridge borrows `std.Io`; it never owns or deinitializes the executor.
-Standalone must await listener and provider work, destroy the inference handle
-through the archive that created it, and only then destroy `BackendRuntime`.
+The bridge borrows `std.Io`; it never owns or deinitializes the executor. The
+borrow carries the native type contract because this is a same-toolchain static
+archive boundary. Standalone acquires the bounded inference lane before create,
+the archive copies the interface into its state, and the host retains the lease
+until every listener/provider call has completed and archive destruction has
+returned. Only then may standalone release the lease and destroy
+`BackendRuntime`.
 
 ## Observability
 

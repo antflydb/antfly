@@ -27,7 +27,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 12;
+pub const abi_version: u32 = 13;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -109,6 +109,8 @@ pub const HttpHandleContext = extern struct {
     cancellation: CancellationView = .{},
     body_source: RequestBodySource = .{},
     stream: StreamSink = .{},
+    /// Request-scoped host executor. It must not be retained after the call.
+    executor: native_abi.IoBorrow,
     out_response_handle: *?*anyopaque,
     out_response: *HttpResponseView,
 };

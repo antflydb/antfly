@@ -50,7 +50,7 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "multiBatchWrite", .class = .write },
     .{ .operation_id = "getCluster", .class = .none },
     .{ .operation_id = "listConnections", .class = .none },
-    .{ .operation_id = "invokeInferenceConnection", .class = .none },
+    .{ .operation_id = "invokeInferenceConnection", .class = .inference },
     .{ .operation_id = "evaluate", .class = .none },
     .{ .operation_id = "globalQuery", .class = .query },
     .{ .operation_id = "restore", .class = .none },
