@@ -47,6 +47,9 @@ const Worker = struct {
     stop: bool = false,
     future: ?Io.Future(void) = null,
     catch_up_open: bool = false,
+    catch_up_close_requested: bool = false,
+    catch_up_close_active: bool = false,
+    catch_up_close_failed: bool = false,
     replay_cursor: ?replay_source_mod.MatchingCursor = null,
     replay_cursor_open_sequence: u64 = 0,
     catch_up_active: bool = false,
@@ -395,7 +398,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
         self.mutex.lockUncancelable(io);
         worker.target_sequence = @max(worker.target_sequence, self.last_notified_sequence);
-        try self.workers.append(self.alloc, worker);
+        self.workers.append(self.alloc, worker) catch |err| {
+            self.mutex.unlock(io);
+            return err;
+        };
         self.mutex.unlock(io);
         errdefer {
             self.mutex.lockUncancelable(io);
@@ -564,23 +570,20 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
             var all_applied = true;
             for (self.workers.items) |worker| {
-                if (worker.applied_sequence < sequence or worker.catch_up_active) {
+                if (worker.catch_up_open) {
+                    worker.catch_up_close_requested = true;
+                }
+                if (worker.applied_sequence < sequence or worker.catch_up_active or worker.catch_up_open or worker.catch_up_close_active or worker.catch_up_close_failed) {
                     all_applied = false;
-                    break;
                 }
             }
             if (all_applied and self.truncates_in_flight == 0) {
-                self.mutex.unlock(io);
-                for (self.workers.items) |worker| {
-                    try closeWorkerCatchUpState(self, worker, true);
-                }
-                self.mutex.lockUncancelable(io);
                 var all_persisted = true;
                 var snapshots = std.ArrayListUnmanaged(PersistSnapshot).empty;
+                defer snapshots.deinit(self.alloc);
                 errdefer {
                     for (snapshots.items) |snapshot| self.alloc.free(snapshot.name);
                 }
-                defer snapshots.deinit(self.alloc);
                 for (self.workers.items) |worker| {
                     if (worker.applied_sequence == 0) continue;
                     try appendPersistSnapshot(self.alloc, &snapshots, worker);
@@ -659,24 +662,20 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             var all_applied = true;
             for (self.workers.items) |worker| {
                 if (!indexNameInList(worker.name, index_names)) continue;
-                if (worker.applied_sequence < sequence or worker.catch_up_active) {
+                if (worker.catch_up_open) {
+                    worker.catch_up_close_requested = true;
+                }
+                if (worker.applied_sequence < sequence or worker.catch_up_active or worker.catch_up_open or worker.catch_up_close_active or worker.catch_up_close_failed) {
                     all_applied = false;
-                    break;
                 }
             }
             if (all_applied and self.truncates_in_flight == 0) {
-                self.mutex.unlock(io);
-                for (self.workers.items) |worker| {
-                    if (!indexNameInList(worker.name, index_names)) continue;
-                    try closeWorkerCatchUpState(self, worker, true);
-                }
-                self.mutex.lockUncancelable(io);
                 var all_persisted = true;
                 var snapshots = std.ArrayListUnmanaged(PersistSnapshot).empty;
+                defer snapshots.deinit(self.alloc);
                 errdefer {
                     for (snapshots.items) |snapshot| self.alloc.free(snapshot.name);
                 }
-                defer snapshots.deinit(self.alloc);
                 for (self.workers.items) |worker| {
                     if (!indexNameInList(worker.name, index_names)) continue;
                     if (worker.applied_sequence == 0) continue;
@@ -1069,8 +1068,14 @@ fn truncateWithRecoverableRetry(runtime: *DerivedRuntime, worker: *Worker, seque
 
 fn ensureWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64) !void {
     if (!worker.catch_up_open) {
+        const io = runtime.ioContext();
+        runtime.mutex.lockUncancelable(io);
+        worker.catch_up_close_failed = false;
+        runtime.mutex.unlock(io);
         if (runtime.begin_catch_up_fn) |begin_catch_up| try begin_catch_up(runtime.ctx, worker.kind);
+        runtime.mutex.lockUncancelable(io);
         worker.catch_up_open = true;
+        runtime.mutex.unlock(io);
     }
     if (worker.replay_cursor == null) {
         worker.replay_cursor = try runtime.replay_source.openMatchingCursor(
@@ -1101,12 +1106,34 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
     worker.replay_cursor = null;
     worker.replay_cursor_open_sequence = 0;
     worker.catch_up_open = false;
+    worker.catch_up_close_requested = false;
+    if (catch_up_open) {
+        worker.catch_up_close_active = true;
+        worker.catch_up_close_failed = false;
+    }
     worker.last_replay_tail_records = 0;
     runtime.mutex.unlock(io);
 
     if (replay_cursor) |*cursor| cursor.deinit(runtime.alloc);
     if (!catch_up_open) return;
-    if (runtime.finish_catch_up_fn) |finish_catch_up| try finish_catch_up(runtime.ctx, worker.kind, success);
+
+    if (runtime.finish_catch_up_fn) |finish_catch_up| {
+        finish_catch_up(runtime.ctx, worker.kind, success) catch |err| {
+            runtime.mutex.lockUncancelable(io);
+            worker.catch_up_close_active = false;
+            worker.catch_up_close_failed = true;
+            runtime.cond.broadcast(io);
+            runtime.mutex.unlock(io);
+            return err;
+        };
+    }
+    {
+        runtime.mutex.lockUncancelable(io);
+        worker.catch_up_close_active = false;
+        worker.catch_up_close_failed = false;
+        runtime.cond.broadcast(io);
+        runtime.mutex.unlock(io);
+    }
 }
 
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
@@ -1157,8 +1184,10 @@ fn waitForCatchUpSessionReuse(runtime: *DerivedRuntime, worker: *Worker, io: Io)
         const shutdown = runtime.shutdown or worker.stop or runtime.last_error_name != null;
         const target = worker.target_sequence;
         const force_sequence = runtime.force_catch_up_sequence;
+        const close_requested = worker.catch_up_close_requested;
         runtime.mutex.unlock(io);
         if (shutdown) return false;
+        if (close_requested) return false;
         if (target > from_sequence or force_sequence > from_sequence) return true;
         const sleep_ns = @min(delay_ns, idle_wait_ns - waited_ns);
         io.sleep(Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
@@ -1250,10 +1279,14 @@ const TestThreadedRuntimeCapture = struct {
     truncated_sequence: std.atomic.Value(u64) = .init(0),
     advanced_sequence: std.atomic.Value(u64) = .init(0),
     callback_observed_applied_sequence: std.atomic.Value(u64) = .init(0),
+    fail_next_forced_persist: std.atomic.Value(bool) = .init(false),
     fail_next_dense_apply_not_found: std.atomic.Value(bool) = .init(false),
     fail_next_apply_resource_budget: std.atomic.Value(bool) = .init(false),
     fail_next_publish: std.atomic.Value(bool) = .init(false),
     fail_next_truncate_writer_locked: std.atomic.Value(bool) = .init(false),
+    block_finish: std.atomic.Value(bool) = .init(false),
+    finish_entered: std.atomic.Value(bool) = .init(false),
+    release_finish: std.atomic.Value(bool) = .init(false),
 };
 
 fn testThreadedRuntimeAppliedSequenceAdvanced(ctx: *anyopaque, index_name: []const u8, sequence: u64) void {
@@ -1280,8 +1313,8 @@ fn testThreadedRuntimeApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, 
 
 fn testThreadedRuntimePersist(ctx: *anyopaque, index_name: []const u8, sequence: u64, force: bool) !bool {
     _ = index_name;
-    _ = force;
     const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
+    if (force and capture.fail_next_forced_persist.swap(false, .monotonic)) return error.Canceled;
     capture.persisted_sequence.store(sequence, .monotonic);
     return true;
 }
@@ -1303,6 +1336,10 @@ fn testThreadedRuntimeFinishCatchUp(ctx: *anyopaque, index_ref: index_manager_mo
     _ = index_ref;
     const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
     _ = capture.finish_calls.fetchAdd(1, .monotonic);
+    if (capture.block_finish.load(.acquire)) {
+        capture.finish_entered.store(true, .release);
+        while (!capture.release_finish.load(.acquire)) std.atomic.spinLoopHint();
+    }
     if (success and capture.fail_next_publish.swap(false, .monotonic)) {
         _ = capture.publish_failures.fetchAdd(1, .monotonic);
         return error.NotFound;
@@ -1325,6 +1362,44 @@ fn appendTestThreadedRuntimeRecord(log: *change_journal_mod.Journal, alloc: Allo
     const payload = try change_journal_mod.encodeRecord(alloc, record);
     defer alloc.free(payload);
     _ = try log.appendOpaque(payload);
+}
+
+test "io threaded forced persist errors unwind snapshot ownership safely" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-forced-persist-error-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+
+    var capture = TestThreadedRuntimeCapture{};
+    var runtime = try DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testThreadedRuntimeApply,
+        testThreadedRuntimePersist,
+        testThreadedRuntimeTruncate,
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("text_idx", .{ .name = "text_idx", .kind = .full_text }, 1);
+
+    capture.fail_next_forced_persist.store(true, .monotonic);
+    try std.testing.expectError(error.Canceled, runtime.waitForAll(1));
+
+    capture.fail_next_forced_persist.store(true, .monotonic);
+    try std.testing.expectError(error.Canceled, runtime.waitForIndexes(1, &.{"text_idx"}));
 }
 
 test "io threaded applied callback observes published watermark outside runtime lock" {
@@ -1374,6 +1449,258 @@ test "io threaded applied callback observes published watermark outside runtime 
 
     try std.testing.expectEqual(@as(u64, 1), capture.advanced_sequence.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), capture.callback_observed_applied_sequence.load(.acquire));
+}
+
+test "io threaded wait observes worker-owned catch-up close" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-worker-lifetime-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.dense_vector},
+    });
+
+    var capture = TestThreadedRuntimeCapture{};
+    capture.block_finish.store(true, .release);
+    var runtime = try DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testThreadedRuntimeApply,
+        testThreadedRuntimePersist,
+        testThreadedRuntimeTruncate,
+        testThreadedRuntimeBeginCatchUp,
+        testThreadedRuntimeFinishCatchUp,
+        null,
+        null,
+        null,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("dense_idx", .{ .name = "dense_idx", .kind = .dense_vector }, 0);
+    const io = runtime.ioContext();
+
+    const Race = struct {
+        runtime: *DerivedRuntime,
+        wait_started: std.atomic.Value(bool) = .init(false),
+        wait_failed: std.atomic.Value(bool) = .init(false),
+        wait_done: std.atomic.Value(bool) = .init(false),
+
+        fn wait(self: *@This()) void {
+            self.wait_started.store(true, .release);
+            self.runtime.waitForAll(1) catch {
+                self.wait_failed.store(true, .release);
+            };
+            self.wait_done.store(true, .release);
+        }
+    };
+    var race = Race{ .runtime = &runtime };
+    const wait_thread = try std.Thread.spawn(.{}, Race.wait, .{&race});
+    var wait_joined = false;
+    defer if (!wait_joined) {
+        capture.release_finish.store(true, .release);
+        wait_thread.join();
+    };
+
+    for (0..5_000) |_| {
+        if (capture.finish_entered.load(.acquire)) break;
+        io.sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    } else return error.TestTimeout;
+    for (0..5_000) |_| {
+        if (race.wait_started.load(.acquire)) break;
+        io.sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    } else return error.TestTimeout;
+
+    // A waiter may observe the applied watermark while its worker still owns
+    // the corresponding publish callback. It must not steal that session or
+    // report completion until the worker finishes closing it. It also must not
+    // leave a close request behind for the next session while this one closes.
+    io.sleep(Io.Duration.fromMilliseconds(25), .awake) catch {};
+    try std.testing.expect(!race.wait_done.load(.acquire));
+    {
+        runtime.mutex.lockUncancelable(io);
+        defer runtime.mutex.unlock(io);
+        try std.testing.expect(runtime.workers.items[0].catch_up_close_active);
+        try std.testing.expect(!runtime.workers.items[0].catch_up_close_requested);
+    }
+
+    capture.release_finish.store(true, .release);
+    wait_thread.join();
+    wait_joined = true;
+
+    try std.testing.expect(!race.wait_failed.load(.acquire));
+    try std.testing.expect(race.wait_done.load(.acquire));
+    {
+        runtime.mutex.lockUncancelable(io);
+        defer runtime.mutex.unlock(io);
+        try std.testing.expect(!runtime.workers.items[0].catch_up_close_failed);
+        try std.testing.expect(!runtime.workers.items[0].catch_up_close_requested);
+    }
+}
+
+test "io threaded wait requests prompt worker catch-up close" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-worker-close-request-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+
+    var capture = TestThreadedRuntimeCapture{};
+    capture.block_finish.store(true, .release);
+    var runtime = try DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testThreadedRuntimeApply,
+        testThreadedRuntimePersist,
+        testThreadedRuntimeTruncate,
+        testThreadedRuntimeBeginCatchUp,
+        testThreadedRuntimeFinishCatchUp,
+        null,
+        null,
+        null,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("dense_idx", .{ .name = "dense_idx", .kind = .dense_vector }, 1);
+    const io = runtime.ioContext();
+    runtime.mutex.lockUncancelable(io);
+    runtime.workers.items[0].catch_up_open = true;
+    runtime.cond.broadcast(io);
+    runtime.mutex.unlock(io);
+
+    const Wait = struct {
+        runtime: *DerivedRuntime,
+        failed: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.runtime.waitForAll(1) catch {
+                self.failed.store(true, .release);
+            };
+            self.done.store(true, .release);
+        }
+    };
+    var wait = Wait{ .runtime = &runtime };
+    const wait_thread = try std.Thread.spawn(.{}, Wait.run, .{&wait});
+    var wait_joined = false;
+    defer if (!wait_joined) {
+        capture.release_finish.store(true, .release);
+        wait_thread.join();
+    };
+
+    // Dense workers normally retain an idle session for reuse. A synchronous
+    // wait must ask the owner to publish promptly instead of inheriting that
+    // multi-second idle window.
+    for (0..1_000) |_| {
+        if (capture.finish_entered.load(.acquire)) break;
+        io.sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    } else return error.TestTimeout;
+    try std.testing.expect(!wait.done.load(.acquire));
+
+    capture.release_finish.store(true, .release);
+    wait_thread.join();
+    wait_joined = true;
+    try std.testing.expect(!wait.failed.load(.acquire));
+    try std.testing.expect(wait.done.load(.acquire));
+}
+
+test "io threaded wait observes failed worker-owned catch-up close" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-worker-close-failure-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+
+    var capture = TestThreadedRuntimeCapture{};
+    var runtime = try DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testThreadedRuntimeApply,
+        testThreadedRuntimePersist,
+        testThreadedRuntimeTruncate,
+        testThreadedRuntimeBeginCatchUp,
+        testThreadedRuntimeFinishCatchUp,
+        null,
+        null,
+        null,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("dense_idx", .{ .name = "dense_idx", .kind = .dense_vector }, 1);
+    const io = runtime.ioContext();
+    runtime.mutex.lockUncancelable(io);
+    const worker = runtime.workers.items[0];
+    worker.catch_up_open = true;
+    runtime.mutex.unlock(io);
+    capture.fail_next_publish.store(true, .release);
+
+    try std.testing.expectError(error.NotFound, closeWorkerCatchUpState(&runtime, worker, true));
+    {
+        runtime.mutex.lockUncancelable(io);
+        defer runtime.mutex.unlock(io);
+        try std.testing.expect(!worker.catch_up_close_active);
+        try std.testing.expect(worker.catch_up_close_failed);
+    }
+
+    const Wait = struct {
+        runtime: *DerivedRuntime,
+        saw_expected_error: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.runtime.waitForAll(1) catch |err| {
+                self.saw_expected_error.store(err == RuntimeError.AsyncWorkerFailed, .release);
+            };
+            self.done.store(true, .release);
+        }
+
+        fn failRuntime(self: *@This()) void {
+            const runtime_io = self.runtime.ioContext();
+            self.runtime.mutex.lockUncancelable(runtime_io);
+            if (self.runtime.last_error_name == null) self.runtime.last_error_name = @errorName(error.NotFound);
+            self.runtime.cond.broadcast(runtime_io);
+            self.runtime.mutex.unlock(runtime_io);
+        }
+    };
+    var wait = Wait{ .runtime = &runtime };
+    const wait_thread = try std.Thread.spawn(.{}, Wait.run, .{&wait});
+    var wait_joined = false;
+    defer if (!wait_joined) {
+        wait.failRuntime();
+        wait_thread.join();
+    };
+
+    io.sleep(Io.Duration.fromMilliseconds(25), .awake) catch {};
+    try std.testing.expect(!wait.done.load(.acquire));
+
+    wait.failRuntime();
+    wait_thread.join();
+    wait_joined = true;
+    try std.testing.expect(wait.done.load(.acquire));
+    try std.testing.expect(wait.saw_expected_error.load(.acquire));
 }
 
 test "io threaded worker backoffs and retries replay truncation writer lock" {
