@@ -83,7 +83,8 @@ fn uniqueRelativePositionProjectionEnabled() bool {
     // wasm-freestanding has no libc/getenv. The toggle is a server-side
     // debug knob, so the browser path simply takes the default.
     if (@import("builtin").target.cpu.arch.isWasm()) return false;
-    return platform.env.getenvBool("TERMITE_DEBERTA_UNIQUE_REL_POS");
+    if (platform.env.getenvBool("TERMITE_METAL_DISABLE_DEBERTA_COMPACT_REL_POS")) return false;
+    return true;
 }
 
 fn metalEncoderFrameEnabled() bool {
@@ -108,6 +109,16 @@ fn metalDebertaWeightMirrorMaxBytes() usize {
     return std.math.mul(usize, mb, 1024 * 1024) catch std.math.maxInt(usize);
 }
 
+/// Maximum retained graph-plan capacity available to the batched MPS
+/// disentangled-attention route. The Objective-C runtime applies the same cap
+/// to the allocator's doubled first-use capacities before selecting the path.
+pub fn metalDebertaMpsAttentionScratchMaxBytes() usize {
+    if (@import("builtin").target.cpu.arch.isWasm()) return 0;
+    if (platform.env.getenvBool("TERMITE_METAL_DISABLE_DEBERTA_MPS_ATTENTION")) return 0;
+    const mb = platform.env.getenvUsize("TERMITE_METAL_DEBERTA_MPS_ATTENTION_MAX_MB") orelse 64;
+    return std.math.mul(usize, mb, 1024 * 1024) catch std.math.maxInt(usize);
+}
+
 fn debertaDenseMirrorBytes(config: Config, bytes_per_element: usize) ?usize {
     const layers: usize = @intCast(config.num_hidden_layers);
     const hidden: usize = @intCast(config.hidden_size);
@@ -123,6 +134,7 @@ fn debertaDenseMirrorBytes(config: Config, bytes_per_element: usize) ?usize {
 
 const DebertaMirrorPreference = struct {
     enabled: bool,
+    reservation_bytes: usize,
     prefer_q8: bool,
     prefer_bf16: bool,
     prefer_f32_mps: bool,
@@ -141,11 +153,125 @@ fn debertaMirrorPreference(config: Config, prefer_weight_mirrors: bool) DebertaM
     const enabled = requested and mirror_bytes <= metalDebertaWeightMirrorMaxBytes();
     return .{
         .enabled = enabled,
+        .reservation_bytes = if (enabled) mirror_bytes else 0,
         .prefer_q8 = enabled and prefer_q8,
         .prefer_bf16 = enabled and !prefer_q8 and prefer_bf16_requested,
         .prefer_f32_mps = enabled and !prefer_q8 and !prefer_bf16_requested and prefer_f32_requested,
         .prefer_f16_mps = enabled and !prefer_q8 and !prefer_bf16_requested and !prefer_f32_requested,
     };
+}
+
+pub fn densePackReservationBytes(config: Config, bytes_per_element: usize) ?usize {
+    const layers: usize = @intCast(config.num_hidden_layers);
+    const hidden: usize = @intCast(config.hidden_size);
+    const hidden_squared = std.math.mul(usize, hidden, hidden) catch return null;
+    const qkv_weights = std.math.mul(usize, hidden_squared, 3) catch return null;
+    const pair_weights = std.math.mul(usize, hidden_squared, 2) catch return null;
+    const packed_weights = std.math.mul(
+        usize,
+        std.math.add(usize, qkv_weights, pair_weights) catch return null,
+        bytes_per_element,
+    ) catch return null;
+    const packed_biases = std.math.mul(usize, hidden, 5 * @sizeOf(f32)) catch return null;
+    const bytes_per_layer = std.math.add(usize, packed_weights, packed_biases) catch return null;
+    return std.math.mul(usize, bytes_per_layer, layers) catch null;
+}
+
+/// Persistent f32 device buffers retained by the relative-position path:
+/// normalized embeddings, projected Qr/Kr for every layer, and (for the
+/// compact path) the full-to-unique index map at the model's maximum sequence
+/// length.
+pub fn relativeCacheReservationBytes(config: Config, compact_relative_positions: bool) ?usize {
+    const layers: usize = @intCast(config.num_hidden_layers);
+    const hidden: usize = @intCast(config.hidden_size);
+    const max_positions: usize = @intCast(config.max_position_embeddings);
+    const row_bytes = std.math.mul(usize, hidden, @sizeOf(f32)) catch return null;
+    const full_relative_rows = if (max_positions == 0)
+        0
+    else
+        std.math.sub(usize, std.math.mul(usize, max_positions, 2) catch return null, 1) catch return null;
+    // Buckets are offset and clamped into the full relative embedding table;
+    // the compact path retains at most one row per bucket, while its fallback
+    // retains every relative-position row, including duplicates.
+    const relative_rows = if (compact_relative_positions) max_positions else full_relative_rows;
+    const embedding_bytes = std.math.mul(usize, relative_rows, row_bytes) catch return null;
+    const projected_tables = std.math.mul(usize, layers, 2) catch return null;
+    const projection_bytes = std.math.mul(
+        usize,
+        std.math.mul(usize, projected_tables, relative_rows) catch return null,
+        row_bytes,
+    ) catch return null;
+    const index_count = if (compact_relative_positions) full_relative_rows else 0;
+    const index_bytes = std.math.mul(usize, index_count, @sizeOf(f32)) catch return null;
+    return std.math.add(
+        usize,
+        std.math.add(usize, embedding_bytes, projection_bytes) catch return null,
+        index_bytes,
+    ) catch null;
+}
+
+pub const MetalFastPathReservationBytes = struct {
+    persistent_bytes: usize,
+    scratch_bytes: usize,
+};
+
+/// Return the persistent Metal allocations and bounded MPS attention scratch
+/// used by DeBERTa's compact relative cache and mirrored linear path. Keep this
+/// derived from the same policy as runtime preparation so admission and
+/// allocation cannot silently disagree about a kill switch or byte cap.
+pub fn metalFastPathReservationBytes(config: Config, prefer_weight_mirrors: bool) MetalFastPathReservationBytes {
+    const mirrors = debertaMirrorPreference(config, prefer_weight_mirrors);
+    const relative_cache_bytes = relativeCacheReservationBytes(
+        config,
+        uniqueRelativePositionProjectionEnabled(),
+    ) orelse std.math.maxInt(usize);
+    var persistent_bytes = relative_cache_bytes;
+    if (mirrors.enabled) {
+        const pack_bytes = if (mirrors.prefer_f16_mps)
+            densePackReservationBytes(config, @sizeOf(u16)) orelse std.math.maxInt(usize)
+        else if (mirrors.prefer_f32_mps)
+            densePackReservationBytes(config, @sizeOf(f32)) orelse std.math.maxInt(usize)
+        else
+            0;
+        persistent_bytes = std.math.add(
+            usize,
+            persistent_bytes,
+            std.math.add(usize, mirrors.reservation_bytes, pack_bytes) catch std.math.maxInt(usize),
+        ) catch std.math.maxInt(usize);
+    }
+    return .{
+        .persistent_bytes = persistent_bytes,
+        .scratch_bytes = metalDebertaMpsAttentionScratchMaxBytes(),
+    };
+}
+
+test "DeBERTa dense pack reservation covers QKV and relative QK caches" {
+    const config = Config{ .hidden_size = 64, .num_hidden_layers = 2 };
+    const expected_per_layer = 5 * 64 * 64 * @sizeOf(u16) + 5 * 64 * @sizeOf(f32);
+    try std.testing.expectEqual(
+        @as(?usize, 2 * expected_per_layer),
+        densePackReservationBytes(config, @sizeOf(u16)),
+    );
+}
+
+test "DeBERTa relative cache reservation covers compact and expanded layouts" {
+    const config = Config{
+        .hidden_size = 64,
+        .num_hidden_layers = 2,
+        .position_buckets = 16,
+        .max_position_embeddings = 32,
+    };
+    const compact_expected = (32 * 64 + 2 * 2 * 32 * 64 + 63) * @sizeOf(f32);
+    try std.testing.expectEqual(
+        @as(?usize, compact_expected),
+        relativeCacheReservationBytes(config, true),
+    );
+    const expanded_rows = 2 * 32 - 1;
+    const expanded_expected = (expanded_rows * 64 + 2 * 2 * expanded_rows * 64) * @sizeOf(f32);
+    try std.testing.expectEqual(
+        @as(?usize, expanded_expected),
+        relativeCacheReservationBytes(config, false),
+    );
 }
 
 const DebertaLinearSlotKind = enum(usize) {
@@ -595,36 +721,25 @@ fn buildRelativePositionEmbInfo(
     const rel_weight = try cb.getWeight("encoder.rel_embeddings.weight");
     defer cb.free(rel_weight);
 
-    // DeBERTa-v3 norm_rel_ebd: apply LayerNorm to raw rel_embeddings before lookup
+    // DeBERTa-v3 norm_rel_ebd parameters. Metal may cache the immutable
+    // normalize+gather result across requests; other backends use the eager
+    // helper below.
     const ln_w = try cb.getWeight("encoder.LayerNorm.weight");
     defer cb.free(ln_w);
     const ln_b = try cb.getWeight("encoder.LayerNorm.bias");
     defer cb.free(ln_b);
-    const normed_rel = cb.layerNorm(rel_weight, ln_w, ln_b, H, config.layer_norm_eps) catch |err| switch (err) {
-        error.UnsupportedTensorType => blk: {
-            const rel_data = try cb.toFloat32(rel_weight, allocator);
-            defer allocator.free(rel_data);
-            if (rel_data.len % H != 0) return error.InvalidShape;
-            const rel_shape = [_]i32{ @intCast(rel_data.len / H), @intCast(H) };
-            const rel_f32 = try cb.fromFloat32Shape(rel_data, &rel_shape);
-            defer cb.free(rel_f32);
-            break :blk try cb.layerNorm(rel_f32, ln_w, ln_b, H, config.layer_norm_eps);
-        },
-        else => return err,
-    };
-    defer cb.free(normed_rel);
 
     // Build bucket IDs for all relative positions: we need unique positions from -(seq_len-1) to +(seq_len-1)
     const num_rel = 2 * seq_len - 1;
     const bucket_ids = try allocator.alloc(i64, num_rel);
     defer allocator.free(bucket_ids);
-    if (!uniqueRelativePositionProjectionEnabled()) {
+    if (cb.kind() != .metal or !uniqueRelativePositionProjectionEnabled()) {
         for (0..num_rel) |i| {
             const rel_pos: i64 = @as(i64, @intCast(i)) - @as(i64, @intCast(seq_len - 1));
             bucket_ids[i] = @intCast(deberta_config.relativePositionBucket(rel_pos, num_buckets, max_pos));
         }
         return .{
-            .embeddings = try cb.embeddingLookup(normed_rel, bucket_ids, num_rel, H),
+            .embeddings = try normalizedRelativeEmbeddingLookup(cb, allocator, rel_weight, ln_w, ln_b, bucket_ids, H, config.layer_norm_eps),
             .full_to_unique = null,
             .unique_count = num_rel,
             .full_count = num_rel,
@@ -655,7 +770,7 @@ fn buildRelativePositionEmbInfo(
     if (unique_count == num_rel) {
         allocator.free(full_to_unique);
         return .{
-            .embeddings = try cb.embeddingLookup(normed_rel, bucket_ids, num_rel, H),
+            .embeddings = try normalizedRelativeEmbeddingLookup(cb, allocator, rel_weight, ln_w, ln_b, bucket_ids, H, config.layer_norm_eps),
             .full_to_unique = null,
             .unique_count = num_rel,
             .full_count = num_rel,
@@ -663,11 +778,46 @@ fn buildRelativePositionEmbInfo(
     }
 
     return .{
-        .embeddings = try cb.embeddingLookup(normed_rel, unique_bucket_ids[0..unique_count], unique_count, H),
+        .embeddings = try normalizedRelativeEmbeddingLookup(cb, allocator, rel_weight, ln_w, ln_b, unique_bucket_ids[0..unique_count], H, config.layer_norm_eps),
         .full_to_unique = full_to_unique,
         .unique_count = unique_count,
         .full_count = num_rel,
     };
+}
+
+fn normalizedRelativeEmbeddingLookup(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    rel_weight: CT,
+    ln_w: CT,
+    ln_b: CT,
+    bucket_ids: []const i64,
+    hidden_size: usize,
+    norm_eps: f32,
+) !CT {
+    if (try cb.debertaRelativeEmbeddings(&.{
+        .weight = rel_weight,
+        .layer_norm_weight = ln_w,
+        .layer_norm_bias = ln_b,
+        .bucket_ids = bucket_ids,
+        .hidden_size = hidden_size,
+        .norm_eps = norm_eps,
+    })) |cached| return cached;
+
+    const normed_rel = cb.layerNorm(rel_weight, ln_w, ln_b, hidden_size, norm_eps) catch |err| switch (err) {
+        error.UnsupportedTensorType => blk: {
+            const rel_data = try cb.toFloat32(rel_weight, allocator);
+            defer allocator.free(rel_data);
+            if (rel_data.len % hidden_size != 0) return error.InvalidShape;
+            const rel_shape = [_]i32{ @intCast(rel_data.len / hidden_size), @intCast(hidden_size) };
+            const rel_f32 = try cb.fromFloat32Shape(rel_data, &rel_shape);
+            defer cb.free(rel_f32);
+            break :blk try cb.layerNorm(rel_f32, ln_w, ln_b, hidden_size, norm_eps);
+        },
+        else => return err,
+    };
+    defer cb.free(normed_rel);
+    return cb.embeddingLookup(normed_rel, bucket_ids, bucket_ids.len, hidden_size);
 }
 
 fn encoderLayer(
