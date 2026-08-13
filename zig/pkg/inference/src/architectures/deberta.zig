@@ -207,14 +207,19 @@ pub fn relativeCacheReservationBytes(config: Config) ?usize {
     ) catch null;
 }
 
-/// Return all persistent Metal allocations used by DeBERTa's compact relative
-/// cache, mirrored linear path, and bounded MPS attention scratch. Keep this
+pub const MetalFastPathReservationBytes = struct {
+    persistent_bytes: usize,
+    scratch_bytes: usize,
+};
+
+/// Return the persistent Metal allocations and bounded MPS attention scratch
+/// used by DeBERTa's compact relative cache and mirrored linear path. Keep this
 /// derived from the same policy as runtime preparation so admission and
 /// allocation cannot silently disagree about a kill switch or byte cap.
-pub fn metalRerankerFastPathReservationBytes(config: Config, prefer_weight_mirrors: bool) usize {
+pub fn metalFastPathReservationBytes(config: Config, prefer_weight_mirrors: bool) MetalFastPathReservationBytes {
     const mirrors = debertaMirrorPreference(config, prefer_weight_mirrors);
     const relative_cache_bytes = relativeCacheReservationBytes(config) orelse std.math.maxInt(usize);
-    var reservation_bytes = relative_cache_bytes;
+    var persistent_bytes = relative_cache_bytes;
     if (mirrors.enabled) {
         const pack_bytes = if (mirrors.prefer_f16_mps)
             densePackReservationBytes(config, @sizeOf(u16)) orelse std.math.maxInt(usize)
@@ -222,17 +227,16 @@ pub fn metalRerankerFastPathReservationBytes(config: Config, prefer_weight_mirro
             densePackReservationBytes(config, @sizeOf(f32)) orelse std.math.maxInt(usize)
         else
             0;
-        reservation_bytes = std.math.add(
+        persistent_bytes = std.math.add(
             usize,
-            reservation_bytes,
-            std.math.add(usize, mirrors.reservation_bytes, pack_bytes) catch return std.math.maxInt(usize),
-        ) catch return std.math.maxInt(usize);
+            persistent_bytes,
+            std.math.add(usize, mirrors.reservation_bytes, pack_bytes) catch std.math.maxInt(usize),
+        ) catch std.math.maxInt(usize);
     }
-    return std.math.add(
-        usize,
-        reservation_bytes,
-        metalDebertaMpsAttentionScratchMaxBytes(),
-    ) catch std.math.maxInt(usize);
+    return .{
+        .persistent_bytes = persistent_bytes,
+        .scratch_bytes = metalDebertaMpsAttentionScratchMaxBytes(),
+    };
 }
 
 test "DeBERTa dense pack reservation covers QKV and relative QK caches" {

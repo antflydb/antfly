@@ -402,19 +402,20 @@ fn sessionEnablesDebertaRerankerWeightMirrors(
     return model_type == .reranker and arch_type == .deberta and task == .classifier;
 }
 
-/// Persistent Metal mirror, packed-weight, and relative-position cache bytes
-/// that ModelManager must reserve for native DeBERTa reranker and GLiNER
-/// sessions. An absent reranker architecture hint is treated conservatively
-/// because GGUF metadata can still identify DeBERTa at load.
-pub fn metalDebertaFastPathReservationBytes(mf: manifest_mod.ModelManifest) usize {
+/// Metal mirror/cache and graph-plan scratch amounts that ModelManager must
+/// reserve for native DeBERTa and GLiNER sessions. An absent reranker
+/// architecture hint is treated conservatively because GGUF metadata can still
+/// identify DeBERTa at load.
+pub fn metalDebertaFastPathAdmissionAmounts(mf: manifest_mod.ModelManifest) runtime.tier.memory.AdmissionAmounts {
     const gliner_bundle = mf.gliner_head_gguf_path != null or
         mf.gliner_head_safetensors_path != null or
         mf.gliner_model_type.len != 0 or
         std.mem.startsWith(u8, mf.inference_bundle_family, "gliner2");
-    if (mf.model_type != .reranker and !gliner_bundle) return 0;
-    if (!gliner_bundle and mf.config_model_arch.len > 0 and !deberta_mod.isDebertaModel(mf.config_model_arch)) return 0;
+    const direct_deberta = mf.config_model_arch.len > 0 and deberta_mod.isDebertaModel(mf.config_model_arch);
+    const unknown_reranker = mf.model_type == .reranker and mf.config_model_arch.len == 0;
+    if (!gliner_bundle and !direct_deberta and !unknown_reranker) return .{};
 
-    return deberta_arch.metalRerankerFastPathReservationBytes(.{
+    const reservation = deberta_arch.metalFastPathReservationBytes(.{
         .hidden_size = mf.hidden_size,
         .num_hidden_layers = mf.num_hidden_layers,
         .num_attention_heads = mf.num_attention_heads,
@@ -422,7 +423,11 @@ pub fn metalDebertaFastPathReservationBytes(mf: manifest_mod.ModelManifest) usiz
         .vocab_size = mf.bert_vocab_size,
         .max_position_embeddings = mf.max_position_embeddings,
         .num_labels = mf.num_labels,
-    }, true);
+    }, gliner_bundle or mf.model_type == .reranker);
+    return .{
+        .backend_weight_bytes = reservation.persistent_bytes,
+        .backend_scratch_bytes = reservation.scratch_bytes,
+    };
 }
 
 pub const UnsupportedTensorTypeCount = struct {
@@ -4483,7 +4488,7 @@ test "sessionTaskForModelType maps classifier and recognizer tasks" {
     try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.reranker, .generic));
 }
 
-test "DeBERTa reranker mirrors are reserved for material encoder workloads" {
+test "DeBERTa fast-path admission covers direct classifiers and reranker mirrors" {
     try std.testing.expect(!debertaRerankerPrefersWeightMirrors(false, 1, 512));
     try std.testing.expect(!debertaRerankerPrefersWeightMirrors(true, 1, 127));
     try std.testing.expect(debertaRerankerPrefersWeightMirrors(true, 1, 128));
@@ -4500,19 +4505,32 @@ test "DeBERTa reranker mirrors are reserved for material encoder workloads" {
         .model_type = .classifier,
         .config_model_arch = "deberta-v2",
     };
-    try std.testing.expectEqual(@as(usize, 0), metalDebertaFastPathReservationBytes(classifier_manifest));
+    const classifier_admission = metalDebertaFastPathAdmissionAmounts(classifier_manifest);
+    try std.testing.expect(classifier_admission.backend_weight_bytes > 0);
+    try std.testing.expectEqual(
+        deberta_arch.metalDebertaMpsAttentionScratchMaxBytes(),
+        classifier_admission.backend_scratch_bytes,
+    );
     const bert_reranker_manifest = manifest_mod.ModelManifest{
         .allocator = std.testing.allocator,
         .model_type = .reranker,
         .config_model_arch = "bert",
     };
-    try std.testing.expectEqual(@as(usize, 0), metalDebertaFastPathReservationBytes(bert_reranker_manifest));
+    try std.testing.expectEqual(
+        runtime.tier.memory.AdmissionAmounts{},
+        metalDebertaFastPathAdmissionAmounts(bert_reranker_manifest),
+    );
     const gliner_manifest = manifest_mod.ModelManifest{
         .allocator = std.testing.allocator,
         .model_type = .recognizer,
         .inference_bundle_family = "gliner2_split_bundle/v1",
     };
-    try std.testing.expect(metalDebertaFastPathReservationBytes(gliner_manifest) > 0);
+    const gliner_admission = metalDebertaFastPathAdmissionAmounts(gliner_manifest);
+    try std.testing.expect(gliner_admission.backend_weight_bytes > 0);
+    try std.testing.expectEqual(
+        deberta_arch.metalDebertaMpsAttentionScratchMaxBytes(),
+        gliner_admission.backend_scratch_bytes,
+    );
 }
 
 test "detectArchitecture recognizes generic deberta classifier configs" {
