@@ -2787,7 +2787,7 @@ pub const Client = struct {
             }
         }
 
-        if (container != null) {
+        if (content_coding != null) {
             _ = res.headers.remove(HeaderName.CONTENT_ENCODING);
             _ = res.headers.remove(HeaderName.CONTENT_LENGTH);
         }
