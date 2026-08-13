@@ -35,6 +35,15 @@ that end state:
   stream reset signal, while HTTP/1 registrations share the role's
   `HttpRuntime`. The linked API and inference ABIs carry the same semantic
   cancellation callback without route-specific OpenAPI policy.
+- The serverless HTTP boundary now borrows that same semantic callback in both
+  its native `httpx` and compatibility-executor adapters. Admission rechecks
+  it before and after dispatch; semantic embedding, artifact fetches, indexed
+  result materialization, graph traversal, join scans, foreign queries, and
+  synchronous write-publication waits have bounded cancellation checkpoints.
+  Contextual public-table callbacks keep that lifetime outside serializable
+  query and write command types. The native adapter also preserves typed retry
+  metadata, and both adapters route on the parsed path rather than the
+  query-bearing raw target.
 - Cancellable outbound requests own the complete resolve/connect/request
   attempt in a `std.Io` task. The semantic watchdog interrupts established
   sockets and cancels the owning task, so DNS and initial connection work no
@@ -70,6 +79,11 @@ that end state:
   machine. Readiness is gated on the supervisor reaching `ready`; the first
   fatal component/task error cancels the role and is preserved while teardown
   shares the original deadline.
+- Listener lifecycle transitions are monotonic and serialized with listener
+  attachment. Once stop wins, a late listener is stopped and rejected, ready
+  cannot be republished, and a shutdown-induced listener exit cannot replace
+  the terminal state with a failure. The first genuine listener failure is
+  retained across later stop notifications.
 - Supervisor phase and cancellation state are exported with data, metadata,
   standalone, and serverless health metrics. The dedicated inference command
   uses the same lifecycle while retaining model-specific readiness. The

@@ -723,6 +723,23 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntry(alloc, entry, text, entry.dimensions);
     }
 
+    pub fn embedQueryWithCancellation(
+        self: *const ManagedEmbedder,
+        alloc: std.mem.Allocator,
+        index_name: []const u8,
+        text: []const u8,
+        cancellation: CancellationToken,
+    ) ![]f32 {
+        const configured_entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        var request_entry = configured_entry.*;
+        request_entry.bedrock_credentials = .{};
+        defer request_entry.bedrock_credentials.deinit(alloc);
+        request_entry.auth_header_cache = .{};
+        defer request_entry.auth_header_cache.deinit(alloc);
+        request_entry.cancellation = cancellation;
+        return try embedWithEntry(alloc, &request_entry, text, request_entry.dimensions);
+    }
+
     /// Digest the effective dense-text embedding operation. Table and index
     /// names are intentionally excluded so equivalent configurations share
     /// results; the server-derived scope prevents cross-principal reuse.
@@ -773,6 +790,30 @@ pub const ManagedEmbedder = struct {
         const parts = try template_mod.textToParts(alloc, rendered);
         defer template_mod.freeContentParts(alloc, parts);
         return embedWithEntryParts(alloc, entry, parts, entry.dimensions) catch |err| return err;
+    }
+
+    pub fn embedQueryWithTemplateAndCancellation(
+        self: *const ManagedEmbedder,
+        alloc: std.mem.Allocator,
+        index_name: []const u8,
+        text: []const u8,
+        embedding_template: []const u8,
+        cancellation: CancellationToken,
+    ) ![]f32 {
+        const configured_entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        var request_entry = configured_entry.*;
+        request_entry.bedrock_credentials = .{};
+        defer request_entry.bedrock_credentials.deinit(alloc);
+        request_entry.auth_header_cache = .{};
+        defer request_entry.auth_header_cache.deinit(alloc);
+        request_entry.cancellation = cancellation;
+        const rendered = try renderQueryTemplateWithEntry(alloc, embedding_template, text, &request_entry);
+        defer alloc.free(rendered);
+        try ensureEntryDeadline(&request_entry);
+        try validateRenderedTemplate(alloc, rendered);
+        const parts = try template_mod.textToParts(alloc, rendered);
+        defer template_mod.freeContentParts(alloc, parts);
+        return embedWithEntryParts(alloc, &request_entry, parts, request_entry.dimensions) catch |err| return err;
     }
 
     fn findEntry(self: *const ManagedEmbedder, index_name: []const u8) ?*const ManagedEmbeddingEntry {

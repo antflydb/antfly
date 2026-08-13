@@ -54,6 +54,7 @@ pub fn parseDocumentArtifactManifestOptions(alloc: std.mem.Allocator, query: []c
 pub const TableApi = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    cancellation: ?db_mod.types.CancellationToken = null,
 
     pub const ExecuteBatchError = error{
         InvalidBatchRequest,
@@ -73,6 +74,7 @@ pub const TableApi = struct {
         HAReadOnlyStandby,
         HAPromotedStandbyRequiresPrimaryOpen,
         HAFencedPrimary,
+        Canceled,
         InternalFailure,
     };
 
@@ -96,6 +98,7 @@ pub const TableApi = struct {
         EmbedRateLimited,
         EmbedTransientFailure,
         EmbedUpstreamFailure,
+        Canceled,
         InvalidManifest,
         InvalidTableFile,
         TableBlockChecksumMismatch,
@@ -112,6 +115,7 @@ pub const TableApi = struct {
         ReadUnavailable,
         StorageReadTemporarilyUnavailable,
         ModelNotFound,
+        Canceled,
         InternalFailure,
     };
 
@@ -242,6 +246,13 @@ pub const TableApi = struct {
             table_name: []const u8,
             req: db_mod.types.BatchRequest,
         ) ExecuteBatchError!void,
+        execute_table_batch_with_cancellation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+            cancellation: ?db_mod.types.CancellationToken,
+        ) ExecuteBatchError!void = null,
         execute_table_query_request: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -249,12 +260,27 @@ pub const TableApi = struct {
             body: []const u8,
             row_filter_json: ?[]const u8,
         ) ExecuteQueryError![]u8,
+        execute_table_query_request_with_cancellation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            body: []const u8,
+            row_filter_json: ?[]const u8,
+            cancellation: ?db_mod.types.CancellationToken,
+        ) ExecuteQueryError![]u8 = null,
         execute_table_query_view: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
             view: TableQueryView,
         ) ExecuteQueryViewError![]u8,
+        execute_table_query_view_with_cancellation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            view: TableQueryView,
+            cancellation: ?db_mod.types.CancellationToken,
+        ) ExecuteQueryViewError![]u8 = null,
         execute_table_backup: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -351,6 +377,9 @@ pub const TableApi = struct {
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
     ) ExecuteBatchError!void {
+        if (self.vtable.execute_table_batch_with_cancellation) |execute| {
+            return try execute(self.ptr, alloc, table_name, req, self.cancellation);
+        }
         return try self.vtable.execute_table_batch(self.ptr, alloc, table_name, req);
     }
 
@@ -361,6 +390,9 @@ pub const TableApi = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
     ) ExecuteQueryError![]u8 {
+        if (self.vtable.execute_table_query_request_with_cancellation) |execute| {
+            return try execute(self.ptr, alloc, table_name, body, row_filter_json, self.cancellation);
+        }
         return try self.vtable.execute_table_query_request(self.ptr, alloc, table_name, body, row_filter_json);
     }
 
@@ -370,6 +402,9 @@ pub const TableApi = struct {
         table_name: []const u8,
         view: TableQueryView,
     ) ExecuteQueryViewError![]u8 {
+        if (self.vtable.execute_table_query_view_with_cancellation) |execute| {
+            return try execute(self.ptr, alloc, table_name, view, self.cancellation);
+        }
         return try self.vtable.execute_table_query_view(self.ptr, alloc, table_name, view);
     }
 
@@ -654,6 +689,7 @@ pub fn handleTableBatch(
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
         error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
         error.HAFencedPrimary => return .{ .status = 409, .body = try alloc.dupe(u8, "fenced primary rejects writes") },
+        error.Canceled => return error.Canceled,
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "batch failed") },
     };
 
@@ -788,6 +824,7 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table query unsupported exact sort table={s} err={}", .{ table_name, err });
                 return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
             },
+            error.Canceled => return error.Canceled,
             error.InternalFailure => {
                 std.log.err("public table query failed table={s} err={}", .{ table_name, err });
                 return .{ .status = 500, .body = try alloc.dupe(u8, "query failed") };
@@ -857,6 +894,7 @@ pub fn handleTableQueryView(
         error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
         error.StorageReadTemporarilyUnavailable => return try storageReadTemporarilyUnavailableOwnedResponse(alloc),
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") },
+        error.Canceled => return error.Canceled,
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "query failed") },
     };
     return .{
@@ -1662,6 +1700,75 @@ test "public table batch handler returns created batch response" {
     try std.testing.expectEqual(@as(u16, 201), resp.status);
     try std.testing.expect(backend.called);
     try std.testing.expectEqual(@as(u32, 1), parsed.value.inserted);
+}
+
+test "public table api carries borrowed cancellation into batch execution" {
+    const Backend = struct {
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            req: db_mod.types.BatchRequest,
+            cancellation: ?db_mod.types.CancellationToken,
+        ) TableApi.ExecuteBatchError!void {
+            _ = req;
+            const token = cancellation orelse return error.InternalFailure;
+            if (!token.isCancelled()) return error.InternalFailure;
+            return error.Canceled;
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            cancellation: ?db_mod.types.CancellationToken,
+        ) TableApi.ExecuteQueryError![]u8 {
+            _ = alloc;
+            const token = cancellation orelse return error.InternalFailure;
+            if (!token.isCancelled()) return error.InternalFailure;
+            return error.Canceled;
+        }
+
+        fn executeTableQueryView(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            _: TableApi.TableQueryView,
+            cancellation: ?db_mod.types.CancellationToken,
+        ) TableApi.ExecuteQueryViewError![]u8 {
+            _ = alloc;
+            const token = cancellation orelse return error.InternalFailure;
+            if (!token.isCancelled()) return error.InternalFailure;
+            return error.Canceled;
+        }
+    };
+
+    var signal = std.atomic.Value(bool).init(true);
+    var state: u8 = 0;
+    const api = TableApi{
+        .ptr = &state,
+        .cancellation = db_mod.types.CancellationToken.fromAtomic(&signal),
+        .vtable = &.{
+            .execute_table_batch = unsupportedBatch,
+            .execute_table_batch_with_cancellation = Backend.executeTableBatch,
+            .execute_table_query_request = unsupportedQueryRequest,
+            .execute_table_query_request_with_cancellation = Backend.executeTableQueryRequest,
+            .execute_table_query_view = unsupportedQueryView,
+            .execute_table_query_view_with_cancellation = Backend.executeTableQueryView,
+            .execute_table_backup = unsupportedBackup,
+            .execute_table_restore = unsupportedRestore,
+            .execute_table_list_indexes = unsupportedListIndexes,
+            .execute_table_get_index = unsupportedGetIndex,
+            .execute_table_create_index = unsupportedCreateIndex,
+            .execute_table_delete_index = unsupportedDeleteIndex,
+        },
+    };
+
+    try std.testing.expectError(error.Canceled, api.executeTableBatch(std.testing.allocator, "docs", .{}));
+    try std.testing.expectError(error.Canceled, api.executeTableQueryRequest(std.testing.allocator, "docs", "{}", null));
+    try std.testing.expectError(error.Canceled, api.executeTableQueryView(std.testing.allocator, "docs", .published));
 }
 
 test "public create index exposes retryable storage descriptor exhaustion" {

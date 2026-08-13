@@ -225,9 +225,16 @@ pub const HttpServerLifecycle = struct {
     failure: anyerror = error.Unexpected,
     cancellation: CancellationSource = .{},
 
-    pub fn attach(self: *HttpServerLifecycle, server: *httpx.Server) void {
+    /// Attaches the concrete listener only while startup still owns the
+    /// lifecycle. A stop that wins this race is terminal, so a late listener
+    /// is rejected instead of being allowed to enter `listen` unnoticed.
+    pub fn attach(self: *HttpServerLifecycle, server: *httpx.Server) !void {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        if (self.state.load(.monotonic) != .starting) {
+            server.requestStop();
+            return error.ServerStopped;
+        }
         self.server = server;
     }
 
@@ -241,22 +248,34 @@ pub const HttpServerLifecycle = struct {
         return self.cancellation.token();
     }
 
-    pub fn publishReady(self: *HttpServerLifecycle) void {
+    pub fn publishReady(self: *HttpServerLifecycle) !void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.state.load(.monotonic) != .starting) return error.ServerStopped;
         self.state.store(.ready, .release);
     }
 
     pub fn publishFailure(self: *HttpServerLifecycle, err: anyerror) void {
-        if (self.state.load(.acquire) == .stopping) {
-            self.state.store(.stopped, .release);
-            return;
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        switch (self.state.load(.monotonic)) {
+            .starting, .ready => {
+                self.failure = err;
+                self.cancellation.cancel();
+                self.state.store(.failed, .release);
+            },
+            .stopping => self.state.store(.stopped, .release),
+            .failed, .stopped => {},
         }
-        self.failure = err;
-        self.cancellation.cancel();
-        self.state.store(.failed, .release);
     }
 
     pub fn publishStopped(self: *HttpServerLifecycle) void {
-        self.state.store(.stopped, .release);
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        switch (self.state.load(.monotonic)) {
+            .starting, .ready, .stopping => self.state.store(.stopped, .release),
+            .failed, .stopped => {},
+        }
     }
 
     pub fn waitForStartup(self: *HttpServerLifecycle) !void {
@@ -270,6 +289,10 @@ pub const HttpServerLifecycle = struct {
 
     pub fn runtimeFailure(self: *HttpServerLifecycle) ?anyerror {
         return if (self.state.load(.acquire) == .failed) self.failure else null;
+    }
+
+    pub fn currentState(self: *const HttpServerLifecycle) State {
+        return self.state.load(.acquire);
     }
 
     pub fn runtimeStats(self: *HttpServerLifecycle) ?httpx.Server.RuntimeStats {
@@ -288,19 +311,25 @@ pub const HttpServerLifecycle = struct {
 
     pub fn stop(self: *HttpServerLifecycle) void {
         self.cancellation.cancel();
-        const prior = self.state.swap(.stopping, .acq_rel);
-        if (prior == .failed or prior == .stopped) return;
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        switch (self.state.load(.monotonic)) {
+            .starting, .ready => self.state.store(.stopping, .release),
+            .failed, .stopped => return,
+            .stopping => {},
+        }
         if (self.server) |server| server.requestStop();
     }
 
     pub fn shutdown(self: *HttpServerLifecycle, deadline: ShutdownDeadline) void {
         self.cancellation.cancel();
-        const prior = self.state.swap(.stopping, .acq_rel);
-        if (prior == .failed or prior == .stopped) return;
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        switch (self.state.load(.monotonic)) {
+            .starting, .ready => self.state.store(.stopping, .release),
+            .failed, .stopped => return,
+            .stopping => {},
+        }
         if (self.server) |server| server.shutdown(deadline.remainingMilliseconds());
     }
 };
@@ -321,6 +350,35 @@ test "runtime lifecycle cancellation and shutdown deadline share state" {
     const first = ShutdownDeadline.shared(&shared_deadline, 100);
     const second = ShutdownDeadline.shared(&shared_deadline, 10_000);
     try std.testing.expectEqual(first.deadline_ns, second.deadline_ns);
+}
+
+test "http lifecycle stop cannot be overwritten by ready or failure" {
+    var lifecycle = HttpServerLifecycle{};
+    lifecycle.stop();
+    try std.testing.expectEqual(HttpServerLifecycle.State.stopping, lifecycle.currentState());
+    try std.testing.expectError(error.ServerStopped, lifecycle.publishReady());
+    lifecycle.publishFailure(error.AddressInUse);
+    try std.testing.expectEqual(HttpServerLifecycle.State.stopped, lifecycle.currentState());
+    try std.testing.expectEqual(@as(?anyerror, null), lifecycle.runtimeFailure());
+}
+
+test "http lifecycle rejects a listener that attaches after stop" {
+    var lifecycle = HttpServerLifecycle{};
+    lifecycle.stop();
+    var server = httpx.Server.init(std.testing.allocator, std.testing.io);
+    defer server.deinit();
+
+    try std.testing.expectError(error.ServerStopped, lifecycle.attach(&server));
+    try std.testing.expectEqual(HttpServerLifecycle.State.stopping, lifecycle.currentState());
+}
+
+test "http lifecycle retains its first terminal failure" {
+    var lifecycle = HttpServerLifecycle{};
+    lifecycle.publishFailure(error.AddressInUse);
+    lifecycle.publishFailure(error.ConnectionRefused);
+    lifecycle.publishStopped();
+    try std.testing.expectEqual(HttpServerLifecycle.State.failed, lifecycle.currentState());
+    try std.testing.expectEqual(error.AddressInUse, lifecycle.runtimeFailure().?);
 }
 
 test "runtime lifecycle supervisor retains first failure and one shutdown deadline" {

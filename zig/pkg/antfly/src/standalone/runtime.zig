@@ -2450,7 +2450,7 @@ fn serveUnifiedInner(
         .api_server = api_server,
         .cors_config = cors_config,
     };
-    lifecycle.attach(&server);
+    try lifecycle.attach(&server);
     defer lifecycle.detach(&server);
 
     if (corsEnabled(cors_config)) try server.use(corsMiddleware(&route_context));
@@ -2491,7 +2491,7 @@ fn serveUnifiedInner(
 
     try server.bind();
     unified_api_ready.store(true, .release);
-    lifecycle.publishReady();
+    try lifecycle.publishReady();
 
     if (server.boundAddress()) |addr| {
         std.debug.print("standalone public api listening on http://{f}\n", .{addr});

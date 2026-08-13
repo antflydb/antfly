@@ -116,6 +116,7 @@ fn searchResolvedAllocWithStats(
     req: query_request.QueryRequest,
     stats: *SearchExecutionStats,
 ) ![]query_request.SearchHit {
+    try session.checkCancellation();
     const docs = try loadPublishedDocumentsAlloc(alloc, session);
     defer materializer_mod.freeDocuments(alloc, docs);
 
@@ -126,6 +127,7 @@ fn searchResolvedAllocWithStats(
         .sparse => try searchSparseAlloc(alloc, session, req),
     };
     defer freeScoredDocs(alloc, scored_docs);
+    try session.checkCancellation();
 
     const final_scored_docs = if (req.filter_text != null or req.exclusion_text != null)
         try applyTextFilterSetsAlloc(alloc, session, scored_docs, req)
@@ -137,6 +139,7 @@ fn searchResolvedAllocWithStats(
     var initialized_hits: usize = 0;
     errdefer query_request.freeHits(alloc, hits[0..initialized_hits]);
     for (final_scored_docs, 0..) |scored, idx| {
+        if (idx % 64 == 0) try session.checkCancellation();
         const body = findBody(docs, scored.doc_id) orelse return error.DocumentBodyNotFound;
         hits[idx] = .{
             .doc_id = try alloc.dupe(u8, scored.doc_id),
@@ -285,7 +288,7 @@ fn searchTextAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, req: qu
     defer alloc.free(text_payload);
     var text_segment = try text_segment_mod.decodeAlloc(alloc, text_payload);
     defer text_segment_mod.freeSegment(alloc, &text_segment);
-    return try searchTextSegmentAlloc(alloc, text_segment, req);
+    return try searchTextSegmentAlloc(alloc, text_segment, req, session);
 }
 
 fn searchVectorAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, req: query_request.QueryRequest, stats: *SearchExecutionStats) ![]ScoredDoc {
@@ -337,8 +340,8 @@ fn searchHybridAllocResolved(
     return try ownedScoredDocsFromFloatMap(alloc, merged, req.offset, req.limit);
 }
 
-fn searchTextSegmentAlloc(alloc: Allocator, text_segment: text_segment_mod.Segment, req: query_request.QueryRequest) ![]ScoredDoc {
-    return try searchTextSegmentSpecAlloc(alloc, text_segment, req.text, req.operator, req.offset, req.limit, req.min_score);
+fn searchTextSegmentAlloc(alloc: Allocator, text_segment: text_segment_mod.Segment, req: query_request.QueryRequest, session: ?*runtime_mod.QuerySession) ![]ScoredDoc {
+    return try searchTextSegmentSpecAlloc(alloc, text_segment, req.text, req.operator, req.offset, req.limit, req.min_score, session);
 }
 
 fn searchTextSegmentSpecAlloc(
@@ -349,7 +352,9 @@ fn searchTextSegmentSpecAlloc(
     offset: usize,
     limit: usize,
     min_score: u32,
+    session: ?*runtime_mod.QuerySession,
 ) ![]ScoredDoc {
+    if (session) |value| try value.checkCancellation();
     const normalized_query = try normalizeAlloc(alloc, text);
     defer alloc.free(normalized_query);
     if (normalized_query.len == 0) return try alloc.alloc(ScoredDoc, 0);
@@ -376,6 +381,7 @@ fn searchTextSegmentSpecAlloc(
     var scored = std.ArrayListUnmanaged(ScoredDoc).empty;
     defer scored.deinit(alloc);
     for (scores, 0..) |score, doc_index| {
+        if (doc_index % 64 == 0) if (session) |value| try value.checkCancellation();
         if (score == 0) continue;
         if (operator == .all_terms and matched_terms[doc_index] != @as(u16, @intCast(query_terms.len))) continue;
         try scored.append(alloc, .{
@@ -401,13 +407,13 @@ fn applyTextFilterSetsAlloc(
     defer text_segment_mod.freeSegment(alloc, &text_segment);
 
     const filter_hits = if (req.filter_text) |text|
-        try searchTextSegmentSpecAlloc(alloc, text_segment, text, req.filter_operator, 0, text_segment.docs.len, 0)
+        try searchTextSegmentSpecAlloc(alloc, text_segment, text, req.filter_operator, 0, text_segment.docs.len, 0, session)
     else
         try alloc.alloc(ScoredDoc, 0);
     defer freeScoredDocs(alloc, filter_hits);
 
     const exclusion_hits = if (req.exclusion_text) |text|
-        try searchTextSegmentSpecAlloc(alloc, text_segment, text, req.exclusion_operator, 0, text_segment.docs.len, 0)
+        try searchTextSegmentSpecAlloc(alloc, text_segment, text, req.exclusion_operator, 0, text_segment.docs.len, 0, session)
     else
         try alloc.alloc(ScoredDoc, 0);
     defer freeScoredDocs(alloc, exclusion_hits);
@@ -565,7 +571,8 @@ fn searchSparseArtifactAlloc(
     defer alloc.free(scores);
     @memset(scores, 0);
 
-    for (sparse_query) |feature| {
+    for (sparse_query, 0..) |feature, feature_index| {
+        if (feature_index % 16 == 0) try session.checkCancellation();
         const normalized_term = try normalizeAlloc(alloc, feature.term);
         defer alloc.free(normalized_term);
         if (normalized_term.len == 0) continue;
@@ -590,6 +597,7 @@ fn searchSparseArtifactAlloc(
     var scored = std.ArrayListUnmanaged(ScoredDoc).empty;
     defer scored.deinit(alloc);
     for (scores, 0..) |score, doc_index| {
+        if (doc_index % 64 == 0) try session.checkCancellation();
         if (score <= 0) continue;
         try scored.append(alloc, .{
             .doc_id = try alloc.dupe(u8, docs[doc_index].doc_id),
@@ -772,6 +780,7 @@ fn searchVectorArtifactAlloc(
     defer candidates.deinit(alloc);
     const needed = req.offset + req.limit;
     for (ranked_clusters[0..probes], 0..) |cluster_hit, probe_rank| {
+        try session.checkCancellation();
         const cluster = clusters[cluster_hit.cluster_index];
         if (cluster.entry_count == 0) continue;
 
@@ -833,6 +842,7 @@ fn searchVectorArtifactAlloc(
             alloc.free(exact_entries);
         }
         for (exact_entries, 0..) |entry, idx| {
+            if (idx % 64 == 0) try session.checkCancellation();
             try candidates.append(alloc, .{
                 .cluster_index = cluster_hit.cluster_index,
                 .local_index = idx,
@@ -865,7 +875,8 @@ fn searchVectorArtifactAlloc(
     }
     @memset(exact_blocks, null);
 
-    for (candidates.items[0..shortlist_count]) |candidate| {
+    for (candidates.items[0..shortlist_count], 0..) |candidate, candidate_index| {
+        if (candidate_index % 64 == 0) try session.checkCancellation();
         if (optimisticScoreCannotBeatFloor(candidate, header.metric, scored.items, needed)) break;
         if (exact_blocks[candidate.cluster_index] == null) {
             const cluster = clusters[candidate.cluster_index];
@@ -1593,7 +1604,7 @@ test "indexed reader uses text postings for all-term and prefix search" {
         .operator = .all_terms,
     };
     defer req.deinit(alloc);
-    const all_hits = try searchTextSegmentAlloc(alloc, text_segment, req);
+    const all_hits = try searchTextSegmentAlloc(alloc, text_segment, req, null);
     defer freeScoredDocs(alloc, all_hits);
     try std.testing.expectEqual(@as(usize, 1), all_hits.len);
     try std.testing.expectEqualStrings("doc-a", all_hits[0].doc_id);

@@ -32,6 +32,10 @@ pub const CancellationToken = struct {
         const callback = self.is_cancelled_fn orelse return false;
         return callback(ptr);
     }
+
+    pub fn check(self: CancellationToken) !void {
+        if (self.isCancelled()) return error.Canceled;
+    }
 };
 
 test "semantic cancellation token adapts an atomic source" {
@@ -40,6 +44,7 @@ test "semantic cancellation token adapts an atomic source" {
     try std.testing.expect(!token.isCancelled());
     signal.store(true, .release);
     try std.testing.expect(token.isCancelled());
+    try std.testing.expectError(error.Canceled, token.check());
 }
 
 test "incomplete semantic cancellation token is safely inactive" {

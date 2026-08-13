@@ -5498,6 +5498,7 @@ pub fn build(b: *std.Build) void {
             "public table batch handler preserves ambiguous write outcomes",
             "public table batch handler maps HA write gate errors",
             "public table batch handler returns concise dense repair backpressure",
+            "public table api carries borrowed cancellation into batch execution",
             "public create index exposes retryable storage descriptor exhaustion",
             "public table query handler maps doc identity unavailable errors",
             "public table query handler preserves retryable failure status",
