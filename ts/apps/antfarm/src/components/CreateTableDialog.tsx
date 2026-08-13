@@ -8,7 +8,7 @@ import {
 } from "@antfly/design-system";
 import type { IndexConfig } from "@antfly/sdk";
 import type React from "react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { TableSchema } from "../api";
 import { useApi } from "../hooks/use-api-config";
 import { useTable } from "../hooks/use-table";
@@ -31,6 +31,12 @@ const CreateTableDialog: React.FC<CreateTableDialogProps> = ({
   const api = useApi();
   const { refreshTables, setSelectedTable } = useTable();
   const [createError, setCreateError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setCreateError(null);
+    }
+  }, [open]);
 
   const handleCreateTable = async (data: {
     name: string;

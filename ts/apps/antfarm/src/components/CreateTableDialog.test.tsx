@@ -65,4 +65,27 @@ describe("CreateTableDialog", () => {
     ).toBeTruthy();
     expect(onClose).not.toHaveBeenCalled();
   });
+
+  it("clears a previous failure when reopened", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mocks.create.mockRejectedValue(
+      new Error("Failed to create table: invalid create table request")
+    );
+
+    const props = {
+      onClose: vi.fn(),
+      onTableCreated: vi.fn(),
+      theme: "light",
+    };
+    const { rerender } = render(<CreateTableDialog open {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Submit table" }));
+    expect(
+      await screen.findByText("Failed to create table: invalid create table request")
+    ).toBeTruthy();
+
+    rerender(<CreateTableDialog open={false} {...props} />);
+    rerender(<CreateTableDialog open {...props} />);
+
+    expect(screen.queryByText("Failed to create table: invalid create table request")).toBeNull();
+  });
 });
