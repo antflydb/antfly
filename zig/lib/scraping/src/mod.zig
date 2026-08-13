@@ -1859,3 +1859,123 @@ test "HTTP response body ownership transfers without a copy" {
     try std.testing.expectEqual(original, taken.ptr);
     try std.testing.expect(response.body == null);
 }
+
+const TestHttpResponseServer = struct {
+    io: std.Io,
+    server: *std.Io.net.Server,
+    body: []const u8,
+    content_encoding: ?[]const u8,
+    failure: ?anyerror = null,
+
+    fn serve(self: *@This()) void {
+        var stream = self.server.accept(self.io) catch |err| {
+            self.failure = err;
+            return;
+        };
+        defer stream.close(self.io);
+
+        var write_buffer: [1024]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+        writer.interface.writeAll(
+            "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: text/plain; charset=utf-8\r\n" ++
+                "Connection: close\r\n",
+        ) catch |err| {
+            self.failure = err;
+            return;
+        };
+        if (self.content_encoding) |encoding| {
+            writer.interface.print("Content-Encoding: {s}\r\n", .{encoding}) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+        writer.interface.print("Content-Length: {d}\r\n\r\n", .{self.body.len}) catch |err| {
+            self.failure = err;
+            return;
+        };
+        writer.interface.writeAll(self.body) catch |err| {
+            self.failure = err;
+            return;
+        };
+        writer.interface.flush() catch |err| {
+            self.failure = err;
+        };
+    }
+};
+
+fn downloadTestHttpResponseAlloc(
+    alloc: Allocator,
+    body: []const u8,
+    content_encoding: ?[]const u8,
+    max_download_size_bytes: u64,
+) !DownloadedContent {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const listen_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try listen_addr.listen(io, .{});
+    var server_open = true;
+    defer if (server_open) server.deinit(io);
+
+    var fixture = TestHttpResponseServer{
+        .io = io,
+        .server = &server,
+        .body = body,
+        .content_encoding = content_encoding,
+    };
+    const thread = try std.Thread.spawn(.{}, TestHttpResponseServer.serve, .{&fixture});
+
+    const uri = try std.fmt.allocPrint(alloc, "http://{f}/blob", .{server.socket.address});
+    defer alloc.free(uri);
+    var security = ContentSecurityConfig{
+        .block_private_ips = false,
+        .max_download_size_bytes = max_download_size_bytes,
+    };
+    var downloaded = downloadContentAlloc(alloc, uri, &security, null) catch |err| {
+        server.deinit(io);
+        server_open = false;
+        thread.join();
+        return err;
+    };
+    thread.join();
+    if (fixture.failure) |server_err| {
+        downloaded.deinit(alloc);
+        return server_err;
+    }
+    return downloaded;
+}
+
+test "HTTP download returns identical decoded bytes for supported content encodings" {
+    const alloc = std.testing.allocator;
+    const expected = "GitHub compressed content stays readable.\n";
+    const gzip = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 115, 207, 44, 241, 40, 77, 82, 72, 206, 207, 45, 40, 74, 45, 46, 78, 77, 1, 50, 243, 74, 82, 243, 74, 20, 138, 75, 18, 43, 139, 21, 138, 82, 19, 83, 18, 147, 114, 82, 245, 184, 0, 187, 214, 11, 13, 42, 0, 0, 0 };
+    const deflate = [_]u8{ 120, 156, 115, 207, 44, 241, 40, 77, 82, 72, 206, 207, 45, 40, 74, 45, 46, 78, 77, 1, 50, 243, 74, 82, 243, 74, 20, 138, 75, 18, 43, 139, 21, 138, 82, 19, 83, 18, 147, 114, 82, 245, 184, 0, 87, 78, 15, 144 };
+    const deflate_raw = deflate[2 .. deflate.len - 4];
+    const cases = [_]struct {
+        encoding: ?[]const u8,
+        body: []const u8,
+    }{
+        .{ .encoding = null, .body = expected },
+        .{ .encoding = "gzip", .body = &gzip },
+        .{ .encoding = "deflate", .body = &deflate },
+        .{ .encoding = "deflate", .body = deflate_raw },
+    };
+
+    for (cases) |case| {
+        var downloaded = try downloadTestHttpResponseAlloc(alloc, case.body, case.encoding, 1024);
+        defer downloaded.deinit(alloc);
+        try std.testing.expectEqualStrings("text/plain", downloaded.content_type);
+        try std.testing.expectEqualStrings(expected, downloaded.data);
+    }
+}
+
+test "HTTP download enforces its size limit on decoded bytes" {
+    const alloc = std.testing.allocator;
+    const gzip = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 115, 207, 44, 241, 40, 77, 82, 72, 206, 207, 45, 40, 74, 45, 46, 78, 77, 1, 50, 243, 74, 82, 243, 74, 20, 138, 75, 18, 43, 139, 21, 138, 82, 19, 83, 18, 147, 114, 82, 245, 184, 0, 187, 214, 11, 13, 42, 0, 0, 0 };
+    try std.testing.expectError(
+        error.StreamTooLong,
+        downloadTestHttpResponseAlloc(alloc, &gzip, "gzip", 41),
+    );
+}

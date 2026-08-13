@@ -692,20 +692,24 @@ pub const PrefixedReader = struct {
 
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
         const p = parent(r);
-        const entry = firstNonEmptyBuffer(bufs) orelse return 0;
-        const buf = entry.buf;
+        var iovecs_buffer: [8][]u8 = undefined;
+        const dest_n, const data_size = try r.writableVector(&iovecs_buffer, bufs);
+        const dest = iovecs_buffer[0..dest_n];
+        const entry = firstNonEmptyBuffer(dest) orelse return 0;
 
-        // Drain prefix first.
         const remaining = p.prefix[p.prefix_pos..];
-        if (remaining.len > 0) {
-            const n = @min(buf.len, remaining.len);
-            @memcpy(buf[0..n], remaining[0..n]);
-            p.prefix_pos += n;
-            return n;
-        }
+        const n = if (remaining.len > 0) blk: {
+            const prefix_n = @min(entry.buf.len, remaining.len);
+            @memcpy(entry.buf[0..prefix_n], remaining[0..prefix_n]);
+            p.prefix_pos += prefix_n;
+            break :blk prefix_n;
+        } else try readVecOnce(p.inner, entry.buf);
 
-        // Prefix exhausted — delegate to inner reader.
-        return readVecOnce(p.inner, buf);
+        if (n > data_size) {
+            r.end += n - data_size;
+            return data_size;
+        }
+        return n;
     }
 
     const vtable = IoReaderHelpers.makeVTable(readVec);
