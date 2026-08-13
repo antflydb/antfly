@@ -7,6 +7,8 @@
 const std = @import("std");
 const prometheus = @import("prometheus.zig");
 
+pub const Class = enum { none, query, write };
+
 pub const PrometheusClass = enum {
     query,
     write,
@@ -76,7 +78,7 @@ pub fn appendPrometheusMetrics(
             .in_flight = "antfly_admission_query_in_flight_requests",
             .peak_in_flight = "antfly_admission_query_peak_in_flight_requests",
             .rejected_total = "antfly_admission_query_rejected_requests_total",
-            .capacity_help = "Maximum concurrent expensive public queries",
+            .capacity_help = "Maximum concurrent expensive public queries; zero means unlimited",
             .in_flight_help = "Currently executing expensive public queries",
             .peak_help = "Peak concurrent expensive public queries since process start",
             .rejected_help = "Public queries rejected by admission control",
@@ -86,7 +88,7 @@ pub fn appendPrometheusMetrics(
             .in_flight = "antfly_admission_write_in_flight_requests",
             .peak_in_flight = "antfly_admission_write_peak_in_flight_requests",
             .rejected_total = "antfly_admission_write_rejected_requests_total",
-            .capacity_help = "Maximum concurrent foreground data mutations",
+            .capacity_help = "Maximum concurrent foreground data mutations; zero means unlimited",
             .in_flight_help = "Currently executing foreground data mutations",
             .peak_help = "Peak concurrent foreground data mutations since process start",
             .rejected_help = "Foreground data mutations rejected by admission control",

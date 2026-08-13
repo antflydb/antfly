@@ -14,17 +14,21 @@ T = TypeVar("T", bound="InferenceRequestAdmissionConfig")
 class InferenceRequestAdmissionConfig:
     """
     Attributes:
-        max_concurrent_requests (int | Unset): Maximum concurrent weighted inference admission units in this
-            process. The budget is shared by every executing inference endpoint.
-            Request body size, generation workload, and image byte/count
-            reservations can consume more than one unit. Read and image-extraction
-            admission reserves the effective downloaded-byte ceiling at 16 MiB
+        max_concurrent_requests (int | Unset): Maximum concurrent inference requests in this process. The same
+            value also sizes the weighted work budget shared by every executing
+            inference endpoint: each request consumes one request slot and at
+            least one unit, while request body size, generation workload, and
+            image byte/count reservations can consume more than one unit. The
+            request count can therefore never exceed this value, while expensive
+            requests may exhaust weighted capacity sooner. Read and
+            image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB
             per unit and at least one unit per two images. A positive capacity also
             clamps each such request's downloaded-image ceiling to 16 MiB times
-            this value. When exhausted, new HTTP requests are rejected immediately
-            with 503 Service Unavailable and Retry-After: 1; they are not retained
-            in an in-process queue. Set to 0 to disable both admission accounting
-            and the capacity-derived clamp. The default is 32.
+            this value. When either ceiling is exhausted, new HTTP requests are
+            rejected immediately with 503 Service Unavailable and Retry-After: 1;
+            they are not retained
+            in an in-process queue. Set to 0 to disable both ceilings, admission
+            unit accounting, and the capacity-derived clamp. The default is 32.
              Default: 32. Example: 32.
     """
 

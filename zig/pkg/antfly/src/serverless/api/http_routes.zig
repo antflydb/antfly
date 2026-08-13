@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const AdmissionClass = @import("../../common/request_admission.zig").Class;
 
 pub const HttpMethod = enum {
     get,
@@ -119,6 +120,56 @@ pub fn isInternal(route: Route) bool {
         .query_version_artifact,
         => true,
         else => false,
+    };
+}
+
+/// Classify every serverless route explicitly. This switch intentionally has
+/// no catch-all: adding a route requires an admission decision at compile time.
+pub fn admissionClass(route: Route) AdmissionClass {
+    return switch (route) {
+        .query,
+        .table_query,
+        .table_query_request,
+        .table_query_published,
+        .table_query_latest,
+        .query_search,
+        .table_query_search,
+        .table_query_graph_neighbors,
+        .table_query_graph_traverse,
+        .table_query_graph_shortest_path,
+        .query_graph_neighbors,
+        .query_graph_traverse,
+        .query_graph_shortest_path,
+        .query_head,
+        .query_latest,
+        .query_version,
+        .query_version_graph_neighbors,
+        .query_version_graph_traverse,
+        .query_version_graph_shortest_path,
+        .query_head_artifact,
+        .query_version_artifact,
+        => .query,
+        .ingest_batch, .ingest_table_batch, .table_batch => .write,
+        .health,
+        .healthz,
+        .readyz,
+        .metrics,
+        .status,
+        .list_namespaces,
+        .list_tables,
+        .ensure_namespace,
+        .ensure_table,
+        .table_indexes,
+        .table_index,
+        .build_namespace,
+        .build_status,
+        .policy,
+        .internal_table_build,
+        .internal_table_build_status,
+        .internal_table_policy,
+        .head,
+        .publish_head,
+        => .none,
     };
 }
 

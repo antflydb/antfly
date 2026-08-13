@@ -71,7 +71,8 @@ const parseJsonObjectAlloc = json_helpers.parseJsonObjectAlloc;
 const parseJsonPathValueAlloc = json_helpers.parseJsonPathValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
 const common_config = @import("../../common/config.zig");
-const RequestAdmission = @import("../../common/request_admission.zig").RequestAdmission;
+const request_admission = @import("../../common/request_admission.zig");
+const RequestAdmission = request_admission.RequestAdmission;
 
 pub const HttpRequest = http_types.HttpRequest;
 pub const HttpResponse = http_types.HttpResponse;
@@ -209,31 +210,10 @@ pub const HttpHandler = struct {
 
     pub fn handle(self: *HttpHandler, req: HttpRequest) !HttpResponse {
         const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
-        const admission: ?*RequestAdmission = switch (route) {
-            .query,
-            .table_query,
-            .table_query_request,
-            .table_query_published,
-            .table_query_latest,
-            .query_search,
-            .table_query_search,
-            .table_query_graph_neighbors,
-            .table_query_graph_traverse,
-            .table_query_graph_shortest_path,
-            .query_graph_neighbors,
-            .query_graph_traverse,
-            .query_graph_shortest_path,
-            .query_head,
-            .query_latest,
-            .query_version,
-            .query_version_graph_neighbors,
-            .query_version_graph_traverse,
-            .query_version_graph_shortest_path,
-            .query_head_artifact,
-            .query_version_artifact,
-            => &self.query_admission,
-            .ingest_batch, .ingest_table_batch, .table_batch => &self.write_admission,
-            else => null,
+        const admission: ?*RequestAdmission = switch (http_routes.admissionClass(route)) {
+            .none => null,
+            .query => &self.query_admission,
+            .write => &self.write_admission,
         };
         if (admission) |gate| {
             if (!gate.tryAcquire()) {

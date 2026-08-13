@@ -83,6 +83,7 @@ const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
 const public_limits = @import("public_limits.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
+const request_admission_policy = @import("request_admission_policy.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const distributed_join = @import("distributed_join.zig");
@@ -4219,6 +4220,9 @@ pub const ApiHttpServer = struct {
         defer parsed.deinit();
         if (parsed.value.intent.len == 0)
             return try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request");
+        comptime std.debug.assert(request_admission_policy.publicOperationClass("queryBuilderAgent").? == .query);
+        if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
+        defer self.releaseQuery();
 
         var table_context: ?query_builder_agent.QueryBuilderTableContext = null;
         defer if (table_context) |context| freeQueryBuilderTableContext(self.alloc, context);
@@ -4347,6 +4351,7 @@ pub const ApiHttpServer = struct {
             try queue.status(alloc, task_id, context_id, "failed", "not found");
             return;
         };
+        comptime std.debug.assert(request_admission_policy.publicOperationClass("retrievalAgent").? == .query);
         if (!self.tryAcquireQuery()) {
             try queue.status(alloc, task_id, context_id, "failed", "query capacity exhausted");
             return;
@@ -9568,6 +9573,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
     ) ![]u8 {
+        comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.batch) == .write);
         if (!self.tryAcquireWrite()) return error.RequestAdmissionExhausted;
         defer self.releaseWrite();
         var response = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi());
@@ -9583,6 +9589,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) ![]u8 {
+        comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.query) == .query);
         if (!self.tryAcquireQuery()) return error.RequestAdmissionExhausted;
         defer self.releaseQuery();
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
@@ -9607,6 +9614,23 @@ pub const ApiHttpServer = struct {
         operation: contextual_operations.McpApplicationOperation,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
+        const admission_class = request_admission_policy.mcpOperationClass(operation);
+        const admitted = switch (admission_class) {
+            .none => true,
+            .query => self.tryAcquireQuery(),
+            .write => self.tryAcquireWrite(),
+        };
+        if (!admitted) return switch (admission_class) {
+            .none => unreachable,
+            .query => try self.queryOverloadedResponse(),
+            .write => try self.writeOverloadedResponse(),
+        };
+        defer switch (admission_class) {
+            .none => {},
+            .query => self.releaseQuery(),
+            .write => self.releaseWrite(),
+        };
+
         switch (operation) {
             .list_tables => {
                 var snapshot = (try self.source.adminSnapshot()) orelse
@@ -9647,7 +9671,13 @@ pub const ApiHttpServer = struct {
             .get_document => |request| return try self.executeMcpGetDocument(request, authenticated_identity),
             .sample_documents => |request| return try self.executeMcpSampleDocuments(request, authenticated_identity),
             .query => |request| {
-                var response = try self.handlePublicTableQuery(request.table_name, request.body, authenticated_identity);
+                var response = try self.handleAdmittedPublicTableQueryWithContentTypeCancellation(
+                    request.table_name,
+                    request.body,
+                    null,
+                    authenticated_identity,
+                    null,
+                );
                 defer response.deinit(self.alloc);
                 return try cloneContextualResponse(self.alloc, response);
             },
@@ -9675,8 +9705,6 @@ pub const ApiHttpServer = struct {
                 return try cloneContextualResponse(self.alloc, response);
             },
             .batch => |request| {
-                if (!self.tryAcquireWrite()) return try self.writeOverloadedResponse();
-                defer self.releaseWrite();
                 var response = try public_table_http.handleTableBatch(self.alloc, request.table_name, request.body, self.tableApi());
                 defer response.deinit(self.alloc);
                 return try contextualResponseFromPublicTable(self.alloc, response);
@@ -25990,6 +26018,21 @@ test "shared application admission covers MCP query and write operations" {
     try std.testing.expectEqualStrings("query capacity exhausted", query.body);
     try std.testing.expectEqualStrings("1", query.headers[0].value);
 
+    var sample = try server.executeMcpApplicationOperation(.{ .sample_documents = .{
+        .table_name = "docs",
+        .body = "{\"limit\":1}",
+    } }, null);
+    defer sample.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), sample.status);
+    try std.testing.expectEqualStrings("query capacity exhausted", sample.body);
+    try std.testing.expectEqualStrings("1", sample.headers[0].value);
+
+    var query_builder = try server.executeQueryBuilderAgent("{\"intent\":\"find relevant documents\"}", null);
+    defer query_builder.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), query_builder.status);
+    try std.testing.expectEqualStrings("query capacity exhausted", query_builder.body);
+    try std.testing.expectEqualStrings("1", query_builder.headers[0].value);
+
     var write = try server.executeMcpApplicationOperation(.{ .batch = .{
         .table_name = "docs",
         .body = "{\"inserts\":{}}",
@@ -25997,7 +26040,7 @@ test "shared application admission covers MCP query and write operations" {
     defer write.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 429), write.status);
     try std.testing.expectEqualStrings("write capacity exhausted", write.body);
-    try std.testing.expectEqual(@as(u64, 1), server.queryAdmissionStats().rejected_total);
+    try std.testing.expectEqual(@as(u64, 3), server.queryAdmissionStats().rejected_total);
     try std.testing.expectEqual(@as(u64, 1), server.writeAdmissionStats().rejected_total);
 }
 

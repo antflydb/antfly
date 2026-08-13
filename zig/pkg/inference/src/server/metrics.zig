@@ -64,6 +64,7 @@ pub const Metrics = struct {
     cache_hits: prometheus.Counter(u64),
     cache_misses: prometheus.Counter(u64),
     admission_in_flight_units: prometheus.Gauge(i64),
+    admission_capacity_requests: prometheus.Gauge(i64),
     admission_capacity_units: prometheus.Gauge(i64),
     admission_available_units: prometheus.Gauge(i64),
     admission_in_flight_requests: prometheus.Gauge(i64),
@@ -106,7 +107,8 @@ pub const Metrics = struct {
             .cache_hits = prometheus.Counter(u64).init("antfly_inference_cache_hits_total", .{ .help = "Cache hits" }, .{}),
             .cache_misses = prometheus.Counter(u64).init("antfly_inference_cache_misses_total", .{ .help = "Cache misses" }, .{}),
             .admission_in_flight_units = prometheus.Gauge(i64).init("antfly_admission_inference_in_flight_units", .{ .help = "Weighted inference admission units currently in flight" }, .{}),
-            .admission_capacity_units = prometheus.Gauge(i64).init("antfly_admission_inference_capacity_units", .{ .help = "Configured weighted inference admission capacity" }, .{}),
+            .admission_capacity_requests = prometheus.Gauge(i64).init("antfly_admission_inference_capacity_requests", .{ .help = "Maximum concurrent inference requests; zero means unlimited" }, .{}),
+            .admission_capacity_units = prometheus.Gauge(i64).init("antfly_admission_inference_capacity_units", .{ .help = "Configured weighted inference admission capacity; zero means unlimited" }, .{}),
             .admission_available_units = prometheus.Gauge(i64).init("antfly_admission_inference_available_units", .{ .help = "Weighted inference admission units currently available" }, .{}),
             .admission_in_flight_requests = prometheus.Gauge(i64).init("antfly_admission_inference_in_flight_requests", .{ .help = "Inference requests currently admitted" }, .{}),
             .admission_rejected_requests_total = prometheus.Counter(u64).init("antfly_admission_inference_rejected_requests_total", .{ .help = "Inference requests rejected because admission capacity was exhausted" }, .{}),
@@ -199,11 +201,13 @@ pub const Metrics = struct {
 
     pub fn setAdmissionState(
         self: *Metrics,
+        capacity_requests: usize,
         capacity_units: usize,
         in_flight_units: usize,
         available_units: usize,
         in_flight_requests: usize,
     ) void {
+        self.admission_capacity_requests.set(@intCast(capacity_requests));
         self.admission_capacity_units.set(@intCast(capacity_units));
         self.admission_in_flight_units.set(@intCast(in_flight_units));
         self.admission_available_units.set(@intCast(available_units));
@@ -242,13 +246,14 @@ test "metrics render" {
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_speculation_active_total 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_speculation_disabled_total 1\n") != null);
 
-    m.setAdmissionState(6, 3, 3, 2);
+    m.setAdmissionState(6, 6, 3, 3, 2);
     m.recordAdmissionRejection(4);
     var admission_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer admission_writer.deinit();
     try m.render(&admission_writer.writer);
     const admission_output = admission_writer.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, admission_output, "antfly_admission_inference_in_flight_units 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admission_output, "antfly_admission_inference_capacity_requests 6\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, admission_output, "antfly_admission_inference_capacity_units 6\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, admission_output, "antfly_admission_inference_available_units 3\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, admission_output, "antfly_admission_inference_in_flight_requests 2\n") != null);

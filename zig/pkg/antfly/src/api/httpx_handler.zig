@@ -77,6 +77,7 @@ const db_mod = @import("../storage/db/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 const routes = @import("http_routes.zig").Routes;
+const request_admission_policy = @import("request_admission_policy.zig");
 const admin_routes = @import("../admin/routes.zig");
 const internal_routes = @import("../internal/routes.zig");
 
@@ -2040,6 +2041,30 @@ pub const AntflyApiHandler = struct {
         return textResponse(ctx, 429, "write capacity exhausted");
     }
 
+    fn acquirePublicOperation(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        comptime operation_id: []const u8,
+    ) !?httpx.Response {
+        const class = comptime request_admission_policy.publicOperationClass(operation_id) orelse
+            @compileError("public operation is missing an admission policy: " ++ operation_id);
+        return switch (class) {
+            .none => @compileError("operation does not use foreground admission: " ++ operation_id),
+            .query => if (self.api_server.tryAcquireQuery()) null else try queryOverloadedResponse(ctx),
+            .write => if (self.api_server.tryAcquireWrite()) null else try writeOverloadedResponse(ctx),
+        };
+    }
+
+    fn releasePublicOperation(self: *AntflyApiHandler, comptime operation_id: []const u8) void {
+        const class = comptime request_admission_policy.publicOperationClass(operation_id) orelse
+            @compileError("public operation is missing an admission policy: " ++ operation_id);
+        switch (class) {
+            .none => @compileError("operation does not use foreground admission: " ++ operation_id),
+            .query => self.api_server.releaseQuery(),
+            .write => self.api_server.releaseWrite(),
+        }
+    }
+
     fn queryBodyOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
         try ctx.setHeader("Retry-After", "1");
         return textResponse(ctx, 429, "query body capacity exhausted");
@@ -2225,6 +2250,8 @@ pub const AntflyApiHandler = struct {
             },
         };
         defer commit_req.deinit(alloc);
+        if (try self.acquirePublicOperation(ctx, "multiBatchWrite")) |response| return response;
+        defer self.releasePublicOperation("multiBatchWrite");
         return try self.executeCommitRequest(ctx, authenticated_identity, &commit_req, .multi_batch);
     }
 
@@ -2245,6 +2272,8 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         defer commit_req.deinit(alloc);
+        if (try self.acquirePublicOperation(ctx, "commitTransaction")) |response| return response;
+        defer self.releasePublicOperation("commitTransaction");
         return try self.executeCommitRequest(ctx, authenticated_identity, &commit_req, .transaction);
     }
 
@@ -2256,8 +2285,6 @@ pub const AntflyApiHandler = struct {
         response_mode: CommitResponseMode,
     ) !httpx.Response {
         const alloc = ctx.allocator;
-        if (!self.api_server.tryAcquireWrite()) return writeOverloadedResponse(ctx);
-        defer self.api_server.releaseWrite();
         const source = self.api_server.table_writes orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -2906,8 +2933,8 @@ pub const AntflyApiHandler = struct {
             // same transaction ID through session maintenance.
             if (status == .committed and !terminal.coordinator_acknowledged) {
                 if (terminal.coordinator_group_id) |coordinator_group_id| {
-                    if (!self.api_server.tryAcquireWrite()) return writeOverloadedResponse(ctx);
-                    defer self.api_server.releaseWrite();
+                    if (try self.acquirePublicOperation(ctx, "commitTransactionSession")) |response| return response;
+                    defer self.releasePublicOperation("commitTransactionSession");
                     const coordinator_table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
                     const acknowledged = source.acknowledgeTransactionCommit(
                         alloc,
@@ -2969,8 +2996,8 @@ pub const AntflyApiHandler = struct {
             return ctx.json(response);
         }
 
-        if (!self.api_server.tryAcquireWrite()) return writeOverloadedResponse(ctx);
-        defer self.api_server.releaseWrite();
+        if (try self.acquirePublicOperation(ctx, "commitTransactionSession")) |response| return response;
+        defer self.releasePublicOperation("commitTransactionSession");
 
         // Persist the exact sealed request as recoverable work before 2PC can
         // choose a durable decision. This closes the response/crash window:
@@ -3292,8 +3319,8 @@ pub const AntflyApiHandler = struct {
         };
         // Body admission is released before expensive execution starts so
         // slow ingress and query compute cannot starve one another.
-        if (!self.api_server.tryAcquireQuery()) return queryOverloadedResponse(ctx);
-        defer self.api_server.releaseQuery();
+        if (try self.acquirePublicOperation(ctx, "globalQuery")) |response| return response;
+        defer self.releasePublicOperation("globalQuery");
         var cancellation = requestCancellation(ctx);
         if (isNdjsonContentType(ctx.header("content-type"))) {
             var resp = try self.api_server.handleAdmittedPublicGlobalMultiQueryWithCancellation(
@@ -3370,8 +3397,8 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid retrieval agent request");
         };
-        if (!self.api_server.tryAcquireQuery()) return queryOverloadedResponse(ctx);
-        defer self.api_server.releaseQuery();
+        if (try self.acquirePublicOperation(ctx, "retrievalAgent")) |response| return response;
+        defer self.releasePublicOperation("retrievalAgent");
 
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
@@ -3826,8 +3853,8 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("missing body");
             };
         };
-        if (!self.api_server.tryAcquireQuery()) return queryOverloadedResponse(ctx);
-        defer self.api_server.releaseQuery();
+        if (try self.acquirePublicOperation(ctx, "queryTable")) |response| return response;
+        defer self.releasePublicOperation("queryTable");
         var cancellation = requestCancellation(ctx);
         var resp = try self.api_server.handleAdmittedPublicTableQueryWithContentTypeCancellation(
             decoded_table_name,
@@ -3849,8 +3876,8 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        if (!self.api_server.tryAcquireWrite()) return writeOverloadedResponse(ctx);
-        defer self.api_server.releaseWrite();
+        if (try self.acquirePublicOperation(ctx, "batchWrite")) |response| return response;
+        defer self.releasePublicOperation("batchWrite");
         return try handleTableBatchOffEventLoop(ctx, self.api_server.cfg.backend_runtime, decoded_table_name, body_data, self.api_server.tableApi());
     }
 
@@ -3877,8 +3904,8 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid linear merge request");
         };
-        if (!self.api_server.tryAcquireWrite()) return writeOverloadedResponse(ctx);
-        defer self.api_server.releaseWrite();
+        if (try self.acquirePublicOperation(ctx, "linearMerge")) |response| return response;
+        defer self.releasePublicOperation("linearMerge");
         var merge_req = linear_merge_api.parseRequest(alloc, body_data) catch |err| switch (err) {
             error.InvalidLinearMergeRequest => {
                 _ = ctx.status(400);
@@ -4061,10 +4088,6 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_table_name);
-        const source = self.api_server.table_reads orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        };
         // The OpenAPI request body is optional; an absent body is the default
         // unbounded-range scan, just like an explicitly empty legacy request.
         const body_data = (try ctx.body()) orelse "";
@@ -4076,6 +4099,13 @@ pub const AntflyApiHandler = struct {
             return err;
         };
         defer scan_req.deinit(alloc);
+
+        if (try self.acquirePublicOperation(ctx, "scanKeys")) |response| return response;
+        defer self.releasePublicOperation("scanKeys");
+        const source = self.api_server.table_reads orelse {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        };
 
         var result = (source.scan(
             alloc,
@@ -6342,6 +6372,17 @@ test "httpx query admission rejects saturated queries without blocking control r
     try std.testing.expectEqual(@as(usize, 1), admission_stats.in_flight);
     try std.testing.expectEqual(@as(usize, 1), admission_stats.peak_in_flight);
     try std.testing.expectEqual(@as(u64, 1), admission_stats.rejected_total);
+
+    var scan_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/documents");
+    defer scan_request.deinit();
+    scan_request.body = "{}";
+    var scan_ctx = httpx.Context.init(alloc, undefined, &scan_request);
+    defer scan_ctx.deinit();
+    var scan_rejected = try handler.scanKeys(&scan_ctx, "docs");
+    defer scan_rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 429), scan_rejected.status.code);
+    try std.testing.expectEqualStrings("query capacity exhausted", scan_rejected.body orelse "");
+    try std.testing.expectEqual(@as(u64, 2), api_server.queryAdmissionStats().rejected_total);
 
     var h1_query_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
     defer h1_query_request.deinit();

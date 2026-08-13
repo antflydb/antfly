@@ -25,6 +25,7 @@ fn spinLock(mutex: *std.atomic.Mutex) void {
 
 pub const InferenceAdmission = struct {
     pub const Stats = struct {
+        capacity_requests: usize,
         capacity_units: usize,
         in_flight_units: usize,
         available_units: usize,
@@ -37,10 +38,14 @@ pub const InferenceAdmission = struct {
     mutex: std.atomic.Mutex = .unlocked,
     active_requests: usize = 0,
     active_units: usize = 0,
+    max_concurrent_requests: usize,
     capacity: usize,
 
     pub fn init(capacity: usize) InferenceAdmission {
-        return .{ .capacity = capacity };
+        return .{
+            .max_concurrent_requests = capacity,
+            .capacity = capacity,
+        };
     }
 
     /// Acquire a slot. Returns error.QueueFull if admission is at capacity.
@@ -48,11 +53,53 @@ pub const InferenceAdmission = struct {
         try self.acquireUnits(1);
     }
 
+    /// Acquire only the request-count permit. HTTP routing owns this permit so
+    /// every executing endpoint is covered before endpoint-specific work-unit
+    /// estimation begins.
+    pub fn acquireRequestSlot(self: *InferenceAdmission) !void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.max_concurrent_requests != 0 and self.active_requests >= self.max_concurrent_requests) {
+            return error.QueueFull;
+        }
+        self.active_requests += 1;
+    }
+
+    pub fn releaseRequestSlot(self: *InferenceAdmission) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.active_requests > 0) self.active_requests -= 1;
+    }
+
+    /// Reserve weighted work for a request whose request-count permit is
+    /// already owned by the HTTP router.
+    pub fn reserveUnits(self: *InferenceAdmission, units: usize) !void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        const requested = self.capacityUnits(units);
+        if (requested > self.capacity - self.active_units) return error.QueueFull;
+        self.active_units += requested;
+    }
+
+    pub fn releaseReservedUnits(self: *InferenceAdmission, units: usize) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        const requested = self.capacityUnits(units);
+        if (self.active_units > requested) {
+            self.active_units -= requested;
+        } else {
+            self.active_units = 0;
+        }
+    }
+
     /// Acquire weighted capacity units. Single-slot callers should continue using acquire().
     pub fn acquireUnits(self: *InferenceAdmission, units: usize) !void {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         const requested = self.capacityUnits(units);
+        if (self.max_concurrent_requests != 0 and self.active_requests >= self.max_concurrent_requests) {
+            return error.QueueFull;
+        }
         if (requested > self.capacity - self.active_units) {
             return error.QueueFull;
         }
@@ -96,6 +143,13 @@ pub const InferenceAdmission = struct {
         return @min(@max(units, 1), self.capacity);
     }
 
+    /// Units requested by the caller before the configured capacity clamps
+    /// accounting. Rejection telemetry uses this value so oversized requests
+    /// do not appear smaller than they were.
+    pub fn requestedUnits(_: *const InferenceAdmission, units: usize) usize {
+        return @max(units, 1);
+    }
+
     pub fn inFlightUnits(self: *InferenceAdmission) usize {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
@@ -119,6 +173,7 @@ pub const InferenceAdmission = struct {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         return .{
+            .capacity_requests = self.max_concurrent_requests,
             .capacity_units = self.capacity,
             .in_flight_units = self.active_units,
             .available_units = self.capacity - self.active_units,
@@ -167,6 +222,7 @@ test "inference admission weighted capacity" {
     try std.testing.expectEqual(@as(usize, 4), q.capacityUnits(100));
     try std.testing.expectEqual(@as(usize, 1), q.capacityUnits(0));
     try std.testing.expectEqual(InferenceAdmission.Stats{
+        .capacity_requests = 4,
         .capacity_units = 4,
         .in_flight_units = 1,
         .available_units = 3,
@@ -201,6 +257,21 @@ test "inference admission zero limit is unlimited" {
     q.releaseUnits(std.math.maxInt(usize));
     q.release();
     try std.testing.expectEqual(@as(usize, 0), q.inFlightRequests());
+}
+
+test "inference admission separates routed request and weighted work permits" {
+    var q = InferenceAdmission.init(2);
+
+    try q.acquireRequestSlot();
+    try q.reserveUnits(2);
+    try std.testing.expectEqual(@as(usize, 1), q.inFlightRequests());
+    try std.testing.expectEqual(@as(usize, 2), q.inFlightUnits());
+    try std.testing.expectError(error.QueueFull, q.reserveUnits(1));
+
+    q.releaseReservedUnits(2);
+    q.releaseRequestSlot();
+    try std.testing.expectEqual(@as(usize, 0), q.inFlightRequests());
+    try std.testing.expectEqual(@as(usize, 0), q.inFlightUnits());
 }
 
 test "inference admission synchronizes embedded and HTTP callers" {

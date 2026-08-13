@@ -2496,6 +2496,7 @@ pub const Node = struct {
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
     inference_admission: inference_admission_mod.InferenceAdmission,
+    admission_metrics_mutex: std.atomic.Mutex = .unlocked,
     compatibility_cache: std.StringHashMapUnmanaged(*CachedCompatibility) = .empty,
     compatibility_cache_lock: std.atomic.Mutex = .unlocked,
     /// Runtime JIT qualification is limited to the single-threaded startup phase.
@@ -2574,9 +2575,8 @@ pub const Node = struct {
                 }
 
                 const required_units = @max(self.reserved_units, decoded_budget.requiredUnits());
-                try node.inference_admission.growUnits(self.reserved_units, required_units);
+                try node.growAdmissionUnits(self.reserved_units, required_units);
                 self.reserved_units = required_units;
-                node.updateAdmissionMetrics();
             }
             self.prepared = true;
         }
@@ -2584,7 +2584,7 @@ pub const Node = struct {
         pub fn deinit(self: *DirectGenerateAdmission) void {
             const node = self.node orelse return;
             self.node = null;
-            node.releaseSlotUnits(self.reserved_units);
+            node.releaseAdmissionUnits(self.reserved_units);
             node.metrics.decActive();
         }
     };
@@ -2870,9 +2870,8 @@ pub const Node = struct {
     ) ![][]f32 {
         if (texts.len == 0) return try allocator.alloc([]f32, 0);
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        try self.inference_admission.acquire();
-        self.updateAdmissionMetrics();
-        defer self.releaseSlot();
+        try self.acquireAdmissionUnits(1);
+        defer self.releaseAdmission();
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
@@ -2934,9 +2933,8 @@ pub const Node = struct {
         texts: []const []const u8,
     ) ![]DirectSparseEmbedding {
         if (texts.len == 0) return try allocator.alloc(DirectSparseEmbedding, 0);
-        try self.inference_admission.acquire();
-        self.updateAdmissionMetrics();
-        defer self.releaseSlot();
+        try self.acquireAdmissionUnits(1);
+        defer self.releaseAdmission();
         self.metrics.incRequest("embed_sparse.local");
         defer self.metrics.decActive();
 
@@ -2976,9 +2974,8 @@ pub const Node = struct {
         documents: []const []const u8,
     ) ![]f32 {
         if (documents.len == 0) return try allocator.alloc(f32, 0);
-        try self.inference_admission.acquire();
-        self.updateAdmissionMetrics();
-        defer self.releaseSlot();
+        try self.acquireAdmissionUnits(1);
+        defer self.releaseAdmission();
         self.metrics.incRequest("rerank.local");
         defer self.metrics.decActive();
 
@@ -3070,8 +3067,7 @@ pub const Node = struct {
         );
         const reserved_units = @max(generation_units, byte_units);
 
-        try self.inference_admission.acquireUnits(reserved_units);
-        self.updateAdmissionMetrics();
+        try self.acquireAdmissionUnits(reserved_units);
         self.metrics.incRequest("generate.local");
         return .{
             .node = self,
@@ -3647,10 +3643,9 @@ pub const Node = struct {
     ) ![][]f32 {
         try ensureDirectEmbeddingDeadline(deadline_ns);
         const media_admission = requestMediaAdmission(self, denseEmbedRequestMediaShape(input));
-        try self.inference_admission.acquireUnits(media_admission.units);
-        self.updateAdmissionMetrics();
+        try self.acquireAdmissionUnits(media_admission.units);
         var reserved_units = media_admission.units;
-        defer self.releaseSlotUnits(reserved_units);
+        defer self.releaseAdmissionUnits(reserved_units);
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
@@ -3723,10 +3718,9 @@ pub const Node = struct {
         // Only bounded arithmetic and borrowed-slice inspection precede this
         // lease. Fetch, decode, model resolution/loading, and output allocation
         // all happen while the weighted request remains admitted.
-        try self.inference_admission.acquireUnits(initial_units);
-        self.updateAdmissionMetrics();
+        try self.acquireAdmissionUnits(initial_units);
         var reserved_units = initial_units;
-        defer self.releaseSlotUnits(reserved_units);
+        defer self.releaseAdmissionUnits(reserved_units);
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
@@ -3775,18 +3769,16 @@ pub const Node = struct {
             var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
             for (parsed.images.items) |image| try decoded_budget.addImage(image.bytes);
             const required_units = @max(reserved_units.*, decoded_budget.requiredUnits());
-            try self.inference_admission.growUnits(reserved_units.*, required_units);
+            try self.growAdmissionUnits(reserved_units.*, required_units);
             reserved_units.* = required_units;
-            self.updateAdmissionMetrics();
         }
 
         if (parsed.audio.items.len > 0) {
             const audio_admission = audioDecodeAdmission(self, media_admission.resident_byte_cap);
             const required_units = @max(reserved_units.*, audio_admission.units);
-            try self.inference_admission.growUnits(reserved_units.*, required_units);
+            try self.growAdmissionUnits(reserved_units.*, required_units);
             reserved_units.* = required_units;
             audio_decode_working_bytes = audio_admission.max_decode_working_bytes;
-            self.updateAdmissionMetrics();
         }
 
         const Attempt = struct {
@@ -3848,10 +3840,9 @@ pub const Node = struct {
             inline_source_bytes = try addReadInlineSourceBytes(inline_source_bytes, url, inline_source_cap);
         }
         const admission = readRequestAdmission(self, request.images.len, inline_source_bytes, max_tokens);
-        try self.inference_admission.acquireUnits(admission.units);
-        self.updateAdmissionMetrics();
+        try self.acquireAdmissionUnits(admission.units);
         var reserved_units = admission.units;
-        defer self.releaseSlotUnits(reserved_units);
+        defer self.releaseAdmissionUnits(reserved_units);
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
 
@@ -3888,9 +3879,8 @@ pub const Node = struct {
         }
 
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
-        try self.inference_admission.growUnits(reserved_units, required_units);
+        try self.growAdmissionUnits(reserved_units, required_units);
         reserved_units = required_units;
-        self.updateAdmissionMetrics();
 
         var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager);
         defer reader.deinit();
@@ -3941,10 +3931,9 @@ pub const Node = struct {
         else
             media_shape.has_remote = true;
         const media_admission = requestMediaAdmission(self, media_shape);
-        try self.inference_admission.acquireUnits(media_admission.units);
-        self.updateAdmissionMetrics();
+        try self.acquireAdmissionUnits(media_admission.units);
         var reserved_units = media_admission.units;
-        defer self.releaseSlotUnits(reserved_units);
+        defer self.releaseAdmissionUnits(reserved_units);
         self.metrics.incRequest("transcribe.local");
         defer self.metrics.decActive();
 
@@ -3967,11 +3956,10 @@ pub const Node = struct {
         // *potential* max download, which is typically larger than the actual
         // clip's decode reservation. growUnits() is grow-only, so overwriting
         // reserved_units downward here would under-release on the deferred
-        // releaseSlotUnits() and permanently leak shared admission capacity.
+        // releaseAdmissionUnits() and permanently leak shared admission capacity.
         const required_units = @max(reserved_units, audio_admission.units);
-        try self.inference_admission.growUnits(reserved_units, required_units);
+        try self.growAdmissionUnits(reserved_units, required_units);
         reserved_units = required_units;
-        self.updateAdmissionMetrics();
 
         var decoded = audio_mod.decodeBounded(
             allocator,
@@ -4027,18 +4015,34 @@ pub const Node = struct {
         model_name: []const u8,
         request: extracting_api.Request,
     ) !extracting_api.Response {
-        try self.inference_admission.acquire();
-        self.updateAdmissionMetrics();
+        return self.extractWithAdmission(allocator, model_name, request, .direct);
+    }
+
+    const ExtractionAdmissionOwner = enum { direct, http_route };
+
+    fn extractWithAdmission(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: extracting_api.Request,
+        admission_owner: ExtractionAdmissionOwner,
+    ) !extracting_api.Response {
+        switch (admission_owner) {
+            .direct => try self.acquireAdmissionUnits(1),
+            .http_route => try self.reserveAdmissionUnits(1),
+        }
         var reserved_units: usize = 1;
-        defer self.releaseSlotUnits(reserved_units);
-        self.metrics.incRequest("extract.local");
+        defer switch (admission_owner) {
+            .direct => self.releaseAdmissionUnits(reserved_units),
+            .http_route => self.releaseSlotUnits(reserved_units),
+        };
+        self.metrics.incRequest(if (admission_owner == .direct) "extract.local" else "extract");
         defer self.metrics.decActive();
 
         const media_shape = try directExtractionMediaShape(allocator, request.inputs);
         const media_admission = requestMediaAdmission(self, media_shape);
-        try self.inference_admission.growUnits(reserved_units, media_admission.units);
+        try self.growAdmissionUnits(reserved_units, media_admission.units);
         reserved_units = media_admission.units;
-        self.updateAdmissionMetrics();
 
         var schema_parsed = try std.json.parseFromSlice(extraction_api.ExtractionSchema, allocator, request.schema_json, .{
             .allocate = .alloc_always,
@@ -4099,9 +4103,8 @@ pub const Node = struct {
                 @max(reserved_units, decoded_budget.requiredUnits()),
                 estimateReadAdmissionUnits(parsed_inputs.images.items.len, parsed_inputs.max_tokens),
             );
-            try self.inference_admission.growUnits(reserved_units, required_units);
+            try self.growAdmissionUnits(reserved_units, required_units);
             reserved_units = required_units;
-            self.updateAdmissionMetrics();
         }
 
         const results = if (parsed_inputs.images.items.len > 0)
@@ -4363,12 +4366,43 @@ pub const Node = struct {
         return self.acquireSlotUnits(ctx, 1);
     }
 
-    fn acquireSlotUnits(self: *Node, ctx: *httpx.Context, units: usize) !?httpx.Response {
-        const requested_units = self.inference_admission.capacityUnits(units);
-        self.inference_admission.acquireUnits(units) catch {
+    /// Mutate the shared admission state and account every rejection,
+    /// including embedded/direct calls that do not have an HTTP response.
+    fn acquireAdmissionUnits(self: *Node, units: usize) !void {
+        const requested_units = self.inference_admission.requestedUnits(units);
+        self.inference_admission.acquireUnits(units) catch |err| {
             self.metrics.incError();
             self.metrics.recordAdmissionRejection(requested_units);
             self.updateAdmissionMetrics();
+            return err;
+        };
+        self.updateAdmissionMetrics();
+    }
+
+    fn reserveAdmissionUnits(self: *Node, units: usize) !void {
+        const requested_units = self.inference_admission.requestedUnits(units);
+        self.inference_admission.reserveUnits(units) catch |err| {
+            self.metrics.incError();
+            self.metrics.recordAdmissionRejection(requested_units);
+            self.updateAdmissionMetrics();
+            return err;
+        };
+        self.updateAdmissionMetrics();
+    }
+
+    fn growAdmissionUnits(self: *Node, current_units: usize, target_units: usize) !void {
+        const requested_units = self.inference_admission.requestedUnits(target_units);
+        self.inference_admission.growUnits(current_units, target_units) catch |err| {
+            self.metrics.incError();
+            self.metrics.recordAdmissionRejection(requested_units);
+            self.updateAdmissionMetrics();
+            return err;
+        };
+        self.updateAdmissionMetrics();
+    }
+
+    fn acquireSlotUnits(self: *Node, ctx: *httpx.Context, units: usize) !?httpx.Response {
+        self.reserveAdmissionUnits(units) catch {
             const resp = try transientCapacityFailureResponse(
                 ctx,
                 "SERVICE_UNAVAILABLE",
@@ -4377,16 +4411,11 @@ pub const Node = struct {
             );
             return resp;
         };
-        self.updateAdmissionMetrics();
         return null;
     }
 
     fn growSlotUnits(self: *Node, ctx: *httpx.Context, current_units: usize, target_units: usize) !?httpx.Response {
-        const requested_units = self.inference_admission.capacityUnits(target_units);
-        self.inference_admission.growUnits(current_units, target_units) catch {
-            self.metrics.incError();
-            self.metrics.recordAdmissionRejection(requested_units);
-            self.updateAdmissionMetrics();
+        self.growAdmissionUnits(current_units, target_units) catch {
             return try transientCapacityFailureResponse(
                 ctx,
                 "SERVICE_UNAVAILABLE",
@@ -4394,7 +4423,6 @@ pub const Node = struct {
                 "inference_admission",
             );
         };
-        self.updateAdmissionMetrics();
         return null;
     }
 
@@ -4403,13 +4431,50 @@ pub const Node = struct {
     }
 
     fn releaseSlotUnits(self: *Node, units: usize) void {
+        self.inference_admission.releaseReservedUnits(units);
+        self.updateAdmissionMetrics();
+    }
+
+    fn releaseAdmission(self: *Node) void {
+        self.releaseAdmissionUnits(1);
+    }
+
+    fn releaseAdmissionUnits(self: *Node, units: usize) void {
         self.inference_admission.releaseUnits(units);
         self.updateAdmissionMetrics();
     }
 
+    fn acquireHttpRequestSlot(self: *Node, ctx: *httpx.Context) !?httpx.Response {
+        self.inference_admission.acquireRequestSlot() catch {
+            self.metrics.incError();
+            self.metrics.recordAdmissionRejection(1);
+            self.updateAdmissionMetrics();
+            return try transientCapacityFailureResponse(
+                ctx,
+                "SERVICE_UNAVAILABLE",
+                "server at concurrent request capacity, try again later",
+                "inference_admission",
+            );
+        };
+        self.updateAdmissionMetrics();
+        return null;
+    }
+
+    fn releaseHttpRequestSlot(self: *Node) void {
+        self.inference_admission.releaseRequestSlot();
+        self.updateAdmissionMetrics();
+    }
+
     fn updateAdmissionMetrics(self: *Node) void {
+        // Admission mutations complete before they publish. Serialize the
+        // publication and read the state only after taking this lock so an
+        // older caller cannot overwrite a newer snapshot after being
+        // descheduled between the mutation and metric update.
+        spinLock(&self.admission_metrics_mutex);
+        defer self.admission_metrics_mutex.unlock();
         const admission = self.inference_admission.stats();
         self.metrics.setAdmissionState(
+            admission.capacity_requests,
             admission.capacity_units,
             admission.in_flight_units,
             admission.available_units,
@@ -9659,11 +9724,11 @@ pub const Node = struct {
             else
                 try ctx.allocator.dupe(u8, "{}");
             defer ctx.allocator.free(options_json);
-            var response = self.extractDirect(ctx.allocator, body.model, .{
+            var response = self.extractWithAdmission(ctx.allocator, body.model, .{
                 .inputs = inputs,
                 .schema_json = schema_json,
                 .options_json = options_json,
-            }) catch |err| return extractionDirectFailureResponse(ctx, err);
+            }, .http_route) catch |err| return extractionDirectFailureResponse(ctx, err);
             defer response.deinit();
             try ctx.setHeader("content-type", "application/json");
             _ = ctx.response.body(response.json);
@@ -10207,6 +10272,7 @@ pub const Node = struct {
         const router = api.ServerRouter(Node).init(self);
         var prefixed = PrefixedServer(prefix, @TypeOf(server.*)){
             .inner = server,
+            .node = self,
             .models_handler = if (comptime std.mem.eql(u8, prefix, public_api_prefix))
                 httpx.Handler.bind(self, mlModelsHandler)
             else
@@ -10225,7 +10291,7 @@ pub const Node = struct {
         );
         self.request_surfaces_published = true;
         const router = api.ServerRouter(Node).init(self);
-        var prefixed = AiPrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
+        var prefixed = AiPrefixedServer(prefix, @TypeOf(server.*)){ .inner = server, .node = self };
         try router.register(&prefixed);
         // Keep the retired endpoint deterministic when inference routes share
         // the standalone public server. Without an explicit tombstone, httpx
@@ -10711,6 +10777,12 @@ fn freeStringSlice(allocator: std.mem.Allocator, values: []const []const u8) voi
 
 fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     return switch (err) {
+        error.QueueFull => transientCapacityFailureResponse(
+            ctx,
+            "SERVICE_UNAVAILABLE",
+            "server at capacity, try again later",
+            "inference_admission",
+        ),
         error.InvalidExtractionConfig,
         error.InvalidStructureField,
         error.MissingStructureFields,
@@ -11532,19 +11604,78 @@ fn appendModelInfo(
     try buf.append(allocator, '}');
 }
 
-/// Wrapper that prepends a path prefix to route registrations.
-/// This bridges the generated router (which emits paths like "/embed")
-/// to the actual server (which serves under a configured prefix such as "/ml/v1/embed").
+const InferenceHttpRouteAdmission = enum { none, inference };
+
+/// Every generated inference route must make an explicit admission decision.
+/// Because the generated router supplies comptime paths, an unclassified new
+/// route is a build error rather than a silent admission bypass.
+fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []const u8) InferenceHttpRouteAdmission {
+    if (comptime std.mem.eql(u8, method, "GET")) {
+        if (comptime std.mem.eql(u8, path, "/models") or std.mem.eql(u8, path, "/predictors")) return .none;
+    } else if (comptime std.mem.eql(u8, method, "POST")) {
+        if (comptime std.mem.eql(u8, path, "/chat/completions") or
+            std.mem.eql(u8, path, "/chunk") or
+            std.mem.eql(u8, path, "/embed") or
+            std.mem.eql(u8, path, "/embeddings") or
+            std.mem.eql(u8, path, "/extract") or
+            std.mem.eql(u8, path, "/generate") or
+            std.mem.eql(u8, path, "/generate/batch") or
+            std.mem.eql(u8, path, "/predict") or
+            std.mem.eql(u8, path, "/read") or
+            std.mem.eql(u8, path, "/rerank") or
+            std.mem.eql(u8, path, "/rerank_multimodal") or
+            std.mem.eql(u8, path, "/rewrite") or
+            std.mem.eql(u8, path, "/transcribe")) return .inference;
+    }
+    @compileError(std.fmt.comptimePrint("unclassified inference HTTP route: {s} {s}", .{ method, path }));
+}
+
+fn inferenceEndpointForPath(comptime path: []const u8) *const fn (*Node, *httpx.Context) anyerror!httpx.Response {
+    if (comptime std.mem.eql(u8, path, "/chat/completions")) return Node.chatCompletions;
+    if (comptime std.mem.eql(u8, path, "/chunk")) return Node.chunkText;
+    if (comptime std.mem.eql(u8, path, "/embed")) return Node.generateEmbeddings;
+    if (comptime std.mem.eql(u8, path, "/embeddings")) return Node.createEmbedding;
+    if (comptime std.mem.eql(u8, path, "/extract")) return Node.extract;
+    if (comptime std.mem.eql(u8, path, "/generate")) return Node.generateContent;
+    if (comptime std.mem.eql(u8, path, "/generate/batch")) return Node.generateBatchContent;
+    if (comptime std.mem.eql(u8, path, "/predict")) return Node.predict;
+    if (comptime std.mem.eql(u8, path, "/read")) return Node.readImages;
+    if (comptime std.mem.eql(u8, path, "/rerank")) return Node.rerankPrompts;
+    if (comptime std.mem.eql(u8, path, "/rerank_multimodal")) return Node.rerankMultimodalPrompts;
+    if (comptime std.mem.eql(u8, path, "/rewrite")) return Node.rewriteText;
+    if (comptime std.mem.eql(u8, path, "/transcribe")) return Node.transcribeAudio;
+    @compileError(std.fmt.comptimePrint("missing admitted inference handler: POST {s}", .{path}));
+}
+
+fn admittedInferenceHandler(comptime endpoint: *const fn (*Node, *httpx.Context) anyerror!httpx.Response) *const fn (*Node, *httpx.Context) anyerror!httpx.Response {
+    return struct {
+        fn handle(node: *Node, ctx: *httpx.Context) anyerror!httpx.Response {
+            if (try node.acquireHttpRequestSlot(ctx)) |response| return response;
+            defer node.releaseHttpRequestSlot();
+            return endpoint(node, ctx);
+        }
+    }.handle;
+}
+
+/// Wrapper that prepends a path prefix and applies the route-owned request
+/// permit. Endpoint handlers retain responsibility for weighted work units.
 fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
     return struct {
         inner: *Inner,
+        node: *Node,
         models_handler: ?httpx.Handler = null,
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            try self.inner.post(prefix ++ path, handler);
+            _ = handler;
+            comptime std.debug.assert(inferenceHttpRouteAdmission("POST", path) == .inference);
+            try self.inner.post(prefix ++ path, httpx.Handler.bind(
+                self.node,
+                admittedInferenceHandler(inferenceEndpointForPath(path)),
+            ));
         }
 
         pub fn get(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
+            comptime std.debug.assert(inferenceHttpRouteAdmission("GET", path) == .none);
             const route_handler = if (comptime std.mem.eql(u8, path, "/models"))
                 self.models_handler orelse handler
             else
@@ -11553,10 +11684,12 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         }
 
         pub fn put(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
+            _ = inferenceHttpRouteAdmission("PUT", path);
             try self.inner.put(prefix ++ path, handler);
         }
 
         pub fn delete(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
+            _ = inferenceHttpRouteAdmission("DELETE", path);
             try self.inner.delete(prefix ++ path, handler);
         }
     };
@@ -11569,24 +11702,33 @@ fn isMlOnlyRoute(comptime path: []const u8) bool {
 fn AiPrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
     return struct {
         inner: *Inner,
+        node: *Node,
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             if (comptime isMlOnlyRoute(path)) return;
-            try self.inner.post(prefix ++ path, handler);
+            _ = handler;
+            comptime std.debug.assert(inferenceHttpRouteAdmission("POST", path) == .inference);
+            try self.inner.post(prefix ++ path, httpx.Handler.bind(
+                self.node,
+                admittedInferenceHandler(inferenceEndpointForPath(path)),
+            ));
         }
 
         pub fn get(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             if (comptime isMlOnlyRoute(path)) return;
+            comptime std.debug.assert(inferenceHttpRouteAdmission("GET", path) == .none);
             try self.inner.get(prefix ++ path, handler);
         }
 
         pub fn put(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             if (comptime isMlOnlyRoute(path)) return;
+            _ = inferenceHttpRouteAdmission("PUT", path);
             try self.inner.put(prefix ++ path, handler);
         }
 
         pub fn delete(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             if (comptime isMlOnlyRoute(path)) return;
+            _ = inferenceHttpRouteAdmission("DELETE", path);
             try self.inner.delete(prefix ++ path, handler);
         }
     };
@@ -12777,7 +12919,7 @@ test "direct dense embed rejects media and reserves audio before model work" {
         .max_concurrent_requests = 8,
     });
     defer reserve_node.deinit();
-    try reserve_node.inference_admission.acquire();
+    try reserve_node.acquireAdmissionUnits(1);
     const small_audio = [_]Node.DirectDenseEmbedPart{.{ .media = .{
         .mime_type = "audio/wav",
         .data = "x",
@@ -12788,7 +12930,15 @@ test "direct dense embed rejects media and reserves audio before model work" {
     );
     try std.testing.expectEqual(@as(usize, 1), reserve_node.inference_admission.inFlightUnits());
     try std.testing.expectEqual(@as(usize, 1), reserve_node.inference_admission.inFlightRequests());
-    reserve_node.inference_admission.release();
+    var metrics_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer metrics_writer.deinit();
+    try reserve_node.metrics.render(&metrics_writer.writer);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        metrics_writer.writer.buffered(),
+        "antfly_admission_inference_rejected_requests_total 1\n",
+    ) != null);
+    reserve_node.releaseAdmission();
     try std.testing.expectEqual(@as(usize, 0), reserve_node.inference_admission.inFlightUnits());
     try std.testing.expectEqual(@as(usize, 0), reserve_node.inference_admission.inFlightRequests());
 }
@@ -17641,6 +17791,75 @@ test "admission rejection includes Retry-After" {
     );
     defer payload.deinit();
     try std.testing.expect(payload.value.retryable);
+}
+
+test "route-owned request admission rejects before endpoint work" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    try node.inference_admission.acquireRequestSlot();
+    defer node.inference_admission.releaseRequestSlot();
+
+    const Endpoint = struct {
+        fn run(_: *Node, ctx: *httpx.Context) anyerror!httpx.Response {
+            return ctx.status(204).text("");
+        }
+    };
+    const handler = httpx.Handler.bind(&node, admittedInferenceHandler(Endpoint.run));
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/test");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try handler.invoke(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+    try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightRequests());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "admission rejection metrics retain unclamped requested units" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 2 });
+    defer node.deinit();
+
+    try node.acquireAdmissionUnits(2);
+    defer node.releaseAdmissionUnits(2);
+    try std.testing.expectError(error.QueueFull, node.acquireAdmissionUnits(9));
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    try node.metrics.render(&writer.writer);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        writer.writer.buffered(),
+        "antfly_admission_inference_rejected_units_total 9\n",
+    ) != null);
+}
+
+test "structured extract maps weighted admission exhaustion to retryable capacity" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    try node.inference_admission.reserveUnits(1);
+    defer node.inference_admission.releaseReservedUnits(1);
+
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body =
+        \\{"model":"demo","inputs":[{"content":"hello"}],"schema":{"structures":{"answer":{"fields":{"value":"string"}}}}}
+    ;
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try node.extract(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"reason\":\"inference_admission\"") != null);
 }
 
 test "predict endpoint shares inference request admission" {
