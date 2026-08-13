@@ -318,6 +318,7 @@ pub const ServerConfig = struct {
     local_node_id: u64 = 1,
     metadata_group_id: u64 = group_ids.main_metadata_group_id,
     metadata_cluster_peers: []const MetadataClusterPeer = &.{},
+    reallocation_protocol_peers: []const antfly.metadata_service.ReallocationProtocolPeer = &.{},
     replica_root_dir: []const u8,
     replica_catalog_path: []const u8,
     snapshot_root_dir: []const u8,
@@ -430,6 +431,7 @@ pub const Server = struct {
             .observe_local_replica_root = cfg.observe_local_replica_root,
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
+            .reallocation_protocol_peers = cfg.reallocation_protocol_peers,
         };
         result.server = try antfly.metadata_server.MetadataServer.init(alloc, .{
             .http = .{
@@ -872,6 +874,8 @@ pub fn runFromIterator(
     const metadata_group_id = group_ids.main_metadata_group_id;
     const cluster_peers = try resolveMetadataClusterPeers(alloc, cli.cluster_json, if (loaded_config) |*cfg| cfg else null);
     defer freeMetadataClusterPeers(alloc, cluster_peers);
+    const reallocation_protocol_peers = try reallocationProtocolPeersFromConfig(alloc, if (loaded_config) |*cfg| cfg else null);
+    defer if (reallocation_protocol_peers.len > 0) alloc.free(reallocation_protocol_peers);
     const listener = resolveRaftListener(cli, if (loaded_config) |*cfg| cfg else null);
     const admin_listener = resolveAdminListener(cli, if (loaded_config) |*cfg| cfg else null, local_node_id, listener.bind_host);
 
@@ -879,6 +883,7 @@ pub fn runFromIterator(
         .local_node_id = local_node_id,
         .metadata_group_id = metadata_group_id,
         .metadata_cluster_peers = cluster_peers,
+        .reallocation_protocol_peers = reallocation_protocol_peers,
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
@@ -1280,6 +1285,25 @@ fn resolveMetadataClusterPeers(
     if (cluster_json) |raw| return try parseMetadataClusterJson(alloc, raw);
     if (cfg) |loaded| return try metadataClusterPeersFromConfig(alloc, loaded);
     return &.{};
+}
+
+fn reallocationProtocolPeersFromConfig(
+    alloc: std.mem.Allocator,
+    cfg: ?*const antfly.common.config.Config,
+) ![]antfly.metadata_service.ReallocationProtocolPeer {
+    const loaded = cfg orelse return &.{};
+    if (loaded.metadata.orchestration_urls.len == 0) return &.{};
+    const peers = try alloc.alloc(
+        antfly.metadata_service.ReallocationProtocolPeer,
+        loaded.metadata.orchestration_urls.len,
+    );
+    for (loaded.metadata.orchestration_urls, 0..) |entry, index| {
+        peers[index] = .{
+            .node_id = entry.node_id,
+            .orchestration_url = entry.url,
+        };
+    }
+    return peers;
 }
 
 pub fn metadataClusterPeersFromConfig(

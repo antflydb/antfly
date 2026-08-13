@@ -19,6 +19,7 @@ const common_secrets = @import("../common/secrets.zig");
 const metadata_mod = @import("domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
+const metadata_http_client = @import("http_client.zig");
 const raft_engine = @import("raft_engine");
 const metadata_control_loop = @import("control_loop.zig");
 const metadata_reconcile_lease = @import("reconcile_lease.zig");
@@ -59,6 +60,7 @@ const metadata_run_round_trace_max_phases: usize = 32;
 const linearizable_metadata_read_prefix = "metadata:linearizable-read:";
 const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const linearizable_metadata_read_retry_ns: u64 = 50 * std.time.ns_per_ms;
+const reallocation_protocol_probe_timeout_ns: u64 = 5 * std.time.ns_per_s;
 
 fn logMetadataRunRoundPhase(name: []const u8, elapsed_ns: u64) void {
     if (elapsed_ns > metadata_run_round_slow_phase_threshold_ns) {
@@ -431,7 +433,26 @@ pub const MetadataServiceConfig = struct {
     observe_local_replica_root: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*common_secrets.FileStore = null,
+    reallocation_protocol_peers: []const ReallocationProtocolPeer = &.{},
 };
+
+pub const ReallocationProtocolPeer = struct {
+    node_id: u64,
+    orchestration_url: []const u8,
+};
+
+fn findReallocationProtocolPeer(peers: []const ReallocationProtocolPeer, node_id: u64) ?ReallocationProtocolPeer {
+    for (peers) |peer| {
+        if (peer.node_id == node_id) return peer;
+    }
+    return null;
+}
+
+fn reallocationBarrierStatusCompatible(peer_status: MetadataStatus, metadata_group_id: u64, node_id: u64) bool {
+    return peer_status.metadata_group_id == metadata_group_id and
+        peer_status.metadata_raft_local_node_id == node_id and
+        peer_status.reallocation_barrier_protocol_version >= metadata_reallocation_request.barrier_protocol_version;
+}
 
 pub const MetadataServiceDeps = struct {
     host: raft_managed_host.ManagedHostDeps = .{},
@@ -3112,6 +3133,7 @@ pub const MetadataHttpService = struct {
     metadata_group_id: u64,
     replica_root_dir: ?[]const u8,
     observe_local_replica_root: bool,
+    reallocation_protocol_peers: []const ReallocationProtocolPeer,
     store_status_ticks: usize,
     projection_epoch: std.atomic.Value(u64) = .init(1),
     catalog_epoch: std.atomic.Value(u64) = .init(1),
@@ -3216,6 +3238,7 @@ pub const MetadataHttpService = struct {
             .metadata_group_id = metadata_group_id,
             .replica_root_dir = host_cfg.http.host.replica_root_dir,
             .observe_local_replica_root = cfg.observe_local_replica_root,
+            .reallocation_protocol_peers = cfg.reallocation_protocol_peers,
             .store_status_ticks = 0,
             .local_placement_epoch = null,
             .last_local_placement_refresh_at_ms = 0,
@@ -3833,12 +3856,65 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn requestReallocation(self: *MetadataHttpService, requested_at_ms: u64) !void {
+        try self.ensureReallocationBarrierProtocolReady();
         const runtime = try self.ensureBackendRuntime();
         const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse std.Options.debug_io);
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
             .request_id = request_id,
             .requested_at_ms = requested_at_ms,
         } });
+    }
+
+    fn ensureReallocationBarrierProtocolReady(self: *MetadataHttpService) !void {
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
+            return error.ReallocationProtocolUpgradeRequired;
+        const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
+        var client = metadata_http_client.MetadataHttpClient.init(
+            self.alloc,
+            self.raft.host.http_host.request_executor,
+        );
+        const probe_budget = metadata_http_client.RequestBudget{
+            .deadline_ns = platform_time.monotonicNs() +| reallocation_protocol_probe_timeout_ns,
+        };
+
+        var local_voter = false;
+        for (raft_status.conf_state.voters) |node_id| {
+            local_voter = local_voter or node_id == local_node_id;
+            try self.requireReallocationBarrierPeer(&client, probe_budget, local_node_id, node_id);
+        }
+        // During joint consensus an outgoing voter can still become leader, so
+        // it participates in the compatibility barrier until it is removed.
+        for (raft_status.conf_state.voters_outgoing) |node_id| {
+            local_voter = local_voter or node_id == local_node_id;
+            if (std.mem.indexOfScalar(u64, raft_status.conf_state.voters, node_id) != null) continue;
+            try self.requireReallocationBarrierPeer(&client, probe_budget, local_node_id, node_id);
+        }
+        if (!local_voter) return error.ReallocationProtocolUpgradeRequired;
+    }
+
+    fn requireReallocationBarrierPeer(
+        self: *MetadataHttpService,
+        client: *metadata_http_client.MetadataHttpClient,
+        probe_budget: metadata_http_client.RequestBudget,
+        local_node_id: u64,
+        node_id: u64,
+    ) !void {
+        if (node_id == local_node_id) return;
+        const peer = findReallocationProtocolPeer(self.reallocation_protocol_peers, node_id) orelse {
+            std.log.warn("reallocation barrier blocked: metadata voter {d} has no orchestration URL", .{node_id});
+            return error.ReallocationProtocolUpgradeRequired;
+        };
+        const peer_status = client.fetchStatusWithBudget(peer.orchestration_url, probe_budget) catch |err| {
+            std.log.warn("reallocation barrier blocked: metadata voter {d} capability probe failed: {s}", .{ node_id, @errorName(err) });
+            return error.ReallocationProtocolUpgradeRequired;
+        };
+        if (!reallocationBarrierStatusCompatible(peer_status, self.metadata_group_id, node_id)) {
+            std.log.warn(
+                "reallocation barrier blocked: metadata voter {d} reports node={d} group={d} protocol={d}",
+                .{ node_id, peer_status.metadata_raft_local_node_id, peer_status.metadata_group_id, peer_status.reallocation_barrier_protocol_version },
+            );
+            return error.ReallocationProtocolUpgradeRequired;
+        }
     }
 
     pub fn clearReallocationRequest(self: *MetadataHttpService, expected_request_id: u128) !void {
@@ -4189,6 +4265,7 @@ pub const MetadataHttpService = struct {
     fn fallbackStatus(self: *MetadataHttpService) MetadataStatus {
         return .{
             .metadata_group_id = self.metadata_group_id,
+            .reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
             .metadata_epoch = self.lifecycle_signal.currentEpoch(),
             .metrics = self.metrics(),
         };
@@ -5518,6 +5595,21 @@ fn cdcLocalMetadataLeader(service: anytype) bool {
     service.lockRuntime();
     defer service.unlockRuntime();
     return service.raft.host.http_host.host.isLocalLeader(service.metadata_group_id);
+}
+
+test "metadata service reallocation barrier requires a current protocol from the exact metadata voter" {
+    const legacy_status = MetadataStatus{
+        .metadata_group_id = 42,
+        .metadata_raft_local_node_id = 7,
+        .metrics = .{},
+    };
+    try std.testing.expect(!reallocationBarrierStatusCompatible(legacy_status, 42, 7));
+
+    var current_status = legacy_status;
+    current_status.reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version;
+    try std.testing.expect(reallocationBarrierStatusCompatible(current_status, 42, 7));
+    try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 43, 7));
+    try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 42, 8));
 }
 
 fn shutdownCdcRuntimeJobs(service: anytype) void {
@@ -8424,6 +8516,7 @@ pub fn snapshotStatusWithOptions(
 
     return .{
         .metadata_group_id = metadata_group_id,
+        .reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
         .metadata_incarnation = metadata_incarnation,
         .metadata_raft_local_node_id = metadata_raft.local_node_id,
         .metadata_raft_role = metadata_raft.role,

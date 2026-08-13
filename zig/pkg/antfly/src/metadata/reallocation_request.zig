@@ -14,6 +14,11 @@
 
 const std = @import("std");
 
+/// Every metadata voter must advertise at least this version before a forced
+/// reallocation request can be admitted. Older reconcilers do not understand
+/// the causal acknowledgement barrier and may clear the request prematurely.
+pub const barrier_protocol_version: u16 = 1;
+
 pub const ReallocationRequestRecord = struct {
     request_id: u128,
     requested_at_ms: u64,

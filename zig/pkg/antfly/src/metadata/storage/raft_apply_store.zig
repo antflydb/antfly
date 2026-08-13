@@ -4540,9 +4540,13 @@ fn appendStoreRecordExtensions(
     try out.appendSlice(alloc, store_record_extension_magic);
     try appendInt(alloc, out, u16, store_record_extension_version);
     try appendInt(alloc, out, u32, observation_count);
-    for (record.group_statuses) |status| {
+    for (record.group_statuses, 0..) |status, status_index| {
         if (status.observed_reallocation_request_id == 0) continue;
-        try appendInt(alloc, out, u64, status.group_id);
+        // Group reports are intentionally permitted to contain duplicate group
+        // IDs so reconciliation can treat the report as ambiguous and fail
+        // closed. Address the extension by position so that ambiguity remains
+        // representable in the committed command instead of making apply fail.
+        try appendInt(alloc, out, u32, @intCast(status_index));
         try appendInt(alloc, out, u128, status.observed_reallocation_request_id);
     }
 }
@@ -4655,20 +4659,12 @@ fn readStoreRecordExtensions(
     const observation_count = try readInt(encoded, pos, u32);
     var observation_index: u32 = 0;
     while (observation_index < observation_count) : (observation_index += 1) {
-        const group_id = try readInt(encoded, pos, u64);
+        const status_index = try readInt(encoded, pos, u32);
         const request_id = try readInt(encoded, pos, u128);
-        if (request_id == 0) return error.InvalidMetadataTransitionEncoding;
-
-        var matched = false;
-        for (group_statuses) |*status| {
-            if (status.group_id != group_id) continue;
-            if (matched or status.observed_reallocation_request_id != 0) {
-                return error.InvalidMetadataTransitionEncoding;
-            }
-            status.observed_reallocation_request_id = request_id;
-            matched = true;
-        }
-        if (!matched) return error.InvalidMetadataTransitionEncoding;
+        if (request_id == 0 or status_index >= group_statuses.len) return error.InvalidMetadataTransitionEncoding;
+        const status = &group_statuses[status_index];
+        if (status.observed_reallocation_request_id != 0) return error.InvalidMetadataTransitionEncoding;
+        status.observed_reallocation_request_id = request_id;
     }
     if (pos.* != encoded.len) return error.InvalidMetadataTransitionEncoding;
 }
@@ -9714,6 +9710,38 @@ test "metadata raft apply store transition codec preserves exact raft voter iden
     );
     try std.testing.expectEqual(@as(u16, 3), statuses[0].voter_count);
     try std.testing.expectEqualSlices(u8, &fingerprint, &statuses[0].voter_set_fingerprint);
+}
+
+test "metadata raft apply store transition codec preserves duplicate group observations by position" {
+    var group_statuses = [_]metadata.GroupStatusReport{
+        .{
+            .group_id = 5101,
+            .observed_reallocation_request_id = 0x1111,
+        },
+        .{
+            .group_id = 5101,
+            .observed_reallocation_request_id = 0x2222,
+        },
+    };
+    const encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_store = .{
+            .store_id = 101,
+            .node_id = 101,
+            .role = "data",
+            .group_statuses = group_statuses[0..],
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)) orelse
+        return error.InvalidMetadataTransitionEncoding;
+    defer decoded.deinit(std.testing.allocator);
+    const statuses = decoded.upsert_store.group_statuses;
+    try std.testing.expectEqual(@as(usize, 2), statuses.len);
+    try std.testing.expectEqual(@as(u64, 5101), statuses[0].group_id);
+    try std.testing.expectEqual(@as(u64, 5101), statuses[1].group_id);
+    try std.testing.expectEqual(@as(u128, 0x1111), statuses[0].observed_reallocation_request_id);
+    try std.testing.expectEqual(@as(u128, 0x2222), statuses[1].observed_reallocation_request_id);
 }
 
 test "metadata raft apply store projects placement intents from committed entries" {

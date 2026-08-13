@@ -1216,9 +1216,12 @@ pub const MetadataHttpServer = struct {
                     };
                     return try textResponse(alloc, if (valid) 204 else 409, "");
                 }
-                if (std.mem.eql(u8, req.uri, routes.Routes.internal_reallocate)) {
+                if (std.mem.eql(u8, req.uri, routes.Routes.internal_reallocate) or
+                    std.mem.eql(u8, req.uri, routes.Routes.internal_reallocate_v2))
+                {
                     self.source.triggerReallocate() catch |err| switch (err) {
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
+                        error.ReallocationProtocolUpgradeRequired => return try textResponse(alloc, 503, "metadata voter upgrade required"),
                         else => return err,
                     };
                     return try textResponse(alloc, 202, "accepted");
@@ -1644,7 +1647,7 @@ pub const MetadataHttpServer = struct {
         if (self.source.vtable.request_node_shutdown) |_| {
             try self.source.requestNodeShutdown(node_id);
             self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
+                error.UnsupportedOperation, error.ReallocationProtocolUpgradeRequired => {},
                 else => return err,
             };
             return;
@@ -1702,7 +1705,7 @@ pub const MetadataHttpServer = struct {
 
         if (changed) {
             self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
+                error.UnsupportedOperation, error.ReallocationProtocolUpgradeRequired => {},
                 else => return err,
             };
         }
@@ -1712,7 +1715,7 @@ pub const MetadataHttpServer = struct {
         if (self.source.vtable.cancel_node_shutdown) |_| {
             try self.source.cancelNodeShutdown(node_id);
             self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
+                error.UnsupportedOperation, error.ReallocationProtocolUpgradeRequired => {},
                 else => return err,
             };
             return;
@@ -1754,7 +1757,7 @@ pub const MetadataHttpServer = struct {
 
         if (changed) {
             self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
+                error.UnsupportedOperation, error.ReallocationProtocolUpgradeRequired => {},
                 else => return err,
             };
         }
@@ -1768,7 +1771,7 @@ pub const MetadataHttpServer = struct {
             if (finalizeWouldDeleteActiveNodeOrStore(&snapshot, node_id)) return error.ActiveNodeFinalizeRejected;
             try self.source.finalizeNodeShutdown(node_id);
             self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
+                error.UnsupportedOperation, error.ReallocationProtocolUpgradeRequired => {},
                 else => return err,
             };
             return;
@@ -3019,6 +3022,47 @@ fn freeStoreStatusReport(alloc: std.mem.Allocator, report: metadata_table_manage
     alloc.free(report.health_class);
     metadata_table_manager.freeGroupStatuses(alloc, report.group_statuses);
     metadata_table_manager.freeRuntimeGroupStatusReports(alloc, report.runtime_statuses);
+}
+
+test "metadata http server reports reallocation protocol upgrade gating" {
+    const UpgradeGatedSource = struct {
+        fn iface(_: *@This()) AdminSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .trigger_reallocate = triggerReallocate,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn triggerReallocate(_: *anyopaque) !void {
+            return error.ReallocationProtocolUpgradeRequired;
+        }
+    };
+
+    var source = UpgradeGatedSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.internal_reallocate_v2,
+        .body = "",
+    });
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), response.status);
+    try std.testing.expectEqualStrings("metadata voter upgrade required", response.body);
 }
 
 test "metadata http server serves status and filtered admin routes" {
