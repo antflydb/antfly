@@ -10,10 +10,12 @@ const CancellationObserver = @import("cancellation_observer.zig").Observer;
 pub const HttpRuntime = struct {
     pub const Config = struct {
         max_active_h1_requests: usize = 4096,
-        /// The observer is a shallow polling loop, not an application worker.
-        /// Keep its stack independent from (and much smaller than) executor
-        /// worker stacks while allowing embedders to raise it for a platform.
-        observer_thread_stack_size: usize = 1024 * 1024,
+        /// Null follows Zig's platform thread-stack contract. Although the
+        /// observer itself is shallow, linked runtimes may impose target- and
+        /// libc-specific TLS/stack requirements that httpx cannot safely infer.
+        /// The reservation is virtual on supported hosts; embedders may set an
+        /// explicit smaller value only after validating every deployment target.
+        observer_thread_stack_size: ?usize = null,
     };
 
     pub const Stats = struct {

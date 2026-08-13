@@ -1006,6 +1006,9 @@ pub const Server = struct {
     waiting_for_connection_permit: std.atomic.Value(bool) = .init(false),
     body_budget: SharedBodyBudget,
     owned_http_runtime: HttpRuntime,
+    /// Acquired before publishing a bound socket so transport cancellation is
+    /// startable whenever callers advertise the listener as ready.
+    http_runtime_lease: HttpRuntime.ListenerLease = .{},
 
     const Self = @This();
 
@@ -1210,12 +1213,14 @@ pub const Server = struct {
 
     /// Releases all server resources.
     pub fn deinit(self: *Self) void {
+        if (self.listener) |*l| l.deinit();
+        self.listener = null;
+        self.http_runtime_lease.release();
         self.owned_http_runtime.deinit();
         self.router.deinit();
         self.middleware.deinit(self.allocator);
         self.pre_route_hooks.deinit(self.allocator);
         self.connection_controls.deinit(self.allocator);
-        if (self.listener) |*l| l.deinit();
     }
 
     /// Adds middleware to the server.
@@ -1297,20 +1302,29 @@ pub const Server = struct {
     /// (useful when port 0 is used for OS-assigned ports).
     pub fn bind(self: *Self) !void {
         if (self.listener != null) return;
+        const observer_capacity = if (self.config.h1_disconnect_cancellation == .required)
+            self.config.max_connections
+        else
+            0;
+        var http_runtime_lease = try (self.config.http_runtime orelse &self.owned_http_runtime).acquireListener(observer_capacity);
+        errdefer http_runtime_lease.release();
         const addr = try Address.parse(self.config.host, self.config.port);
         const backlog_u32: u32 = @max(self.config.max_connections, 1);
         const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
-        self.listener = try TcpListener.initWithOptions(addr, self.io, .{
+        var listener = try TcpListener.initWithOptions(addr, self.io, .{
             .kernel_backlog = backlog,
             .reuse_address = self.config.reuse_address,
             .reuse_port = self.config.reuse_port,
         });
-        const bound = self.listener.?.getLocalAddress();
+        errdefer listener.deinit();
+        const bound = listener.getLocalAddress();
         const port = switch (bound) {
             .ip4 => |ip4| ip4.port,
             .ip6 => |ip6| ip6.port,
         };
         self.wake_port.store(port, .release);
+        self.http_runtime_lease = http_runtime_lease;
+        self.listener = listener;
     }
 
     /// Returns the bound listener address, or null if not yet bound.
@@ -1328,13 +1342,10 @@ pub const Server = struct {
         // startup/shutdown race re-bind a listener after its owner has begun
         // tearing down the handler state referenced by this server.
         if (self.shutdown_mode.load(.acquire) != 0) return;
-        const observer_capacity = if (self.config.h1_disconnect_cancellation == .required)
-            self.config.max_connections
-        else
-            0;
-        var http_runtime_lease = try (self.config.http_runtime orelse &self.owned_http_runtime).acquireListener(observer_capacity);
-        defer http_runtime_lease.release();
+        if (self.listener != null and self.http_runtime_lease.runtime == null)
+            return error.ServerAlreadyListened;
         if (self.listener == null) try self.bind();
+        defer self.http_runtime_lease.release();
         if (self.shutdown_mode.load(.acquire) != 0) return;
         self.running = true;
         self.listen_started.store(true, .release);
@@ -3836,6 +3847,32 @@ test "multiple listeners share one HTTP runtime lifecycle" {
     first_thread.join();
     second_thread.join();
     try std.testing.expectEqual(@as(usize, 0), http_runtime.stats().active_listener_leases);
+}
+
+test "bind establishes HTTP runtime ownership before publishing an address" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var http_runtime = HttpRuntime.init(allocator, .{ .max_active_h1_requests = 1 });
+    defer http_runtime.deinit();
+
+    {
+        var server = Server.initWithConfig(allocator, io_impl.io(), .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .max_connections = 1,
+            .http_runtime = &http_runtime,
+        });
+        defer server.deinit();
+        try server.bind();
+        try std.testing.expect(server.boundAddress() != null);
+        try std.testing.expectEqual(@as(usize, 1), http_runtime.stats().active_listener_leases);
+        try std.testing.expectEqual(@as(usize, 1), http_runtime.stats().reserved_h1_request_capacity);
+    }
+    try std.testing.expectEqual(@as(usize, 0), http_runtime.stats().active_listener_leases);
+    try std.testing.expectEqual(@as(usize, 0), http_runtime.stats().reserved_h1_request_capacity);
 }
 
 test "bounded control listener serves without H1 observer capacity" {

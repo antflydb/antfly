@@ -76,7 +76,7 @@ pub const Observer = struct {
 
     alloc: std.mem.Allocator,
     capacity: usize,
-    thread_stack_size: usize,
+    thread_stack_size: ?usize,
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     next_id: u64 = 1,
@@ -88,7 +88,7 @@ pub const Observer = struct {
     failures_total: std.atomic.Value(u64) = .init(0),
     healthy: std.atomic.Value(bool) = .init(true),
 
-    pub fn init(alloc: std.mem.Allocator, capacity: usize, thread_stack_size: usize) Observer {
+    pub fn init(alloc: std.mem.Allocator, capacity: usize, thread_stack_size: ?usize) Observer {
         return .{
             .alloc = alloc,
             .capacity = capacity,
@@ -111,7 +111,17 @@ pub const Observer = struct {
         };
         self.stopping.store(false, .release);
         self.healthy.store(true, .release);
-        self.thread = try std.Thread.spawn(.{ .stack_size = self.thread_stack_size }, run, .{self});
+        const spawn_config: std.Thread.SpawnConfig = if (self.thread_stack_size) |stack_size|
+            .{ .stack_size = stack_size }
+        else
+            .{};
+        self.thread = std.Thread.spawn(spawn_config, run, .{self}) catch |err| switch (err) {
+            // `Unexpected` carries no subsystem context at the role boundary.
+            // Preserve the standard resource errors, but make this otherwise
+            // opaque startup failure identify the transport component.
+            error.Unexpected => return error.CancellationObserverThreadSpawnFailed,
+            else => |spawn_err| return spawn_err,
+        };
     }
 
     pub fn stop(self: *Observer) void {

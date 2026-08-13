@@ -614,12 +614,16 @@ The current `std.Io.Threaded` backend grows a worker pool as concurrency demands
 and retains those workers until executor deinitialization. Consequently, one
 long-lived watcher submitted per connection or request would turn peak socket
 concurrency into retained thread stacks. The current H1 implementation instead
-uses one explicitly owned OS thread with a small configurable stack and
-multiplexes all registered sockets with `poll`, `kqueue`, or `WSAPoll` on
-Windows. It only peeks; the HTTP parser remains the sole consumer of socket
-bytes. Unsupported freestanding targets fail listener startup when observation
-is required; no supported platform can silently turn `.required` into a no-op.
-An HTTP/1 peer may
+uses one explicitly owned OS thread and multiplexes all registered sockets with
+`poll`, `kqueue`, or `WSAPoll` on Windows. Its default stack reservation follows
+Zig's platform thread contract because a fully linked runtime may add target-
+and libc-specific requirements that a transport library cannot safely size.
+Supported hosts reserve that address space virtually, so committed memory still
+tracks actual use; embedders may configure a smaller stack only after validating
+every deployment target. The observer only peeks; the HTTP parser remains the
+sole consumer of socket bytes. Unsupported freestanding targets fail listener
+startup when observation is required; no supported platform can silently turn
+`.required` into a no-op. An HTTP/1 peer may
 half-close its request side with FIN while legitimately awaiting the response,
 so orderly EOF is never treated as request cancellation. Only a hard socket
 failure/reset cancels an active H1 request; explicit protocol cancellation and
