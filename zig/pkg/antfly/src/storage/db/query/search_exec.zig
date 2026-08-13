@@ -13516,13 +13516,13 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
     var cancellation = std.atomic.Value(bool).init(false);
     counter = .{
         .cancel_after = exact_native_filter_cancellation_stride,
-        .cancellation = types.CancellationToken.fromAtomic(&cancellation),
+        .cancellation = &cancellation,
     };
     try std.testing.expectError(error.Cancelled, exactScoreNativeDenseFilter(alloc, &entry, .{
         .query = &query,
         .k = result_count,
         .filter_ids = filter_ids,
-        .cancellation = types.CancellationToken.fromAtomic(&cancellation),
+        .cancellation = vectorindex_mod.CancellationToken.fromAtomic(&cancellation),
     }));
     try std.testing.expectEqual(exact_native_filter_cancellation_stride, counter.count);
 }

@@ -4005,7 +4005,7 @@ test "postgres libpq async reader observes cancellation after bounded wait befor
     var driver = Driver{ .cancellation = &cancellation };
     try std.testing.expectError(
         error.Cancelled,
-        readSingleAsyncResultWithDeadline(&driver, null, &cancellation),
+        readSingleAsyncResultWithDeadline(&driver, null, CancellationToken.fromAtomic(&cancellation)),
     );
     try std.testing.expectEqual(@as(usize, 1), driver.wait_calls);
     try std.testing.expectEqual(@as(usize, 0), driver.consume_calls);
@@ -4047,21 +4047,21 @@ test "postgres libpq async reader returns cancelled before waiting or consuming 
     var driver = Driver{};
     try std.testing.expectError(
         error.Cancelled,
-        readSingleAsyncResultWithDeadline(&driver, null, &cancellation),
+        readSingleAsyncResultWithDeadline(&driver, null, CancellationToken.fromAtomic(&cancellation)),
     );
 }
 
 test "postgres libpq result decoding observes cancellation at periodic checkpoints" {
     var cells_until_check: u8 = 1;
     var cancellation = std.atomic.Value(bool).init(false);
-    try checkResultDecodeProgress(null, &cancellation, &cells_until_check);
+    try checkResultDecodeProgress(null, CancellationToken.fromAtomic(&cancellation), &cells_until_check);
     try std.testing.expectEqual(@as(u8, 64), cells_until_check);
 
     cells_until_check = 1;
     cancellation.store(true, .release);
     try std.testing.expectError(
         error.Cancelled,
-        checkResultDecodeProgress(null, &cancellation, &cells_until_check),
+        checkResultDecodeProgress(null, CancellationToken.fromAtomic(&cancellation), &cells_until_check),
     );
 }
 
@@ -4078,7 +4078,7 @@ test "postgres libpq global permit wait observes cancellation without a deadline
             cancelled: *std.atomic.Value(bool),
             failed: *std.atomic.Value(bool),
         ) void {
-            inner.acquireGlobalConnectionPermits(1, null, cancellation) catch |err| {
+            inner.acquireGlobalConnectionPermits(1, null, CancellationToken.fromAtomic(cancellation)) catch |err| {
                 if (err == error.Cancelled) {
                     cancelled.store(true, .release);
                 } else {
@@ -4129,7 +4129,7 @@ test "postgres libpq pool wait observes cancellation without a deadline" {
             cancelled: *std.atomic.Value(bool),
             failed: *std.atomic.Value(bool),
         ) void {
-            var lease = inner.acquireConnection(inner_dsn, null, cancellation) catch |err| {
+            var lease = inner.acquireConnection(inner_dsn, null, CancellationToken.fromAtomic(cancellation)) catch |err| {
                 if (err == error.Cancelled) {
                     cancelled.store(true, .release);
                 } else {
@@ -4199,7 +4199,7 @@ test "postgres libpq cancellation during connect polling closes the fresh connec
     Fake.finish_count = 0;
     try std.testing.expectError(
         error.Cancelled,
-        executor.connectFreshWithDeadline("postgres://connect-cancel", null, &cancellation),
+        executor.connectFreshWithDeadline("postgres://connect-cancel", null, CancellationToken.fromAtomic(&cancellation)),
     );
     try std.testing.expectEqual(@as(usize, 1), Fake.finish_count);
 }

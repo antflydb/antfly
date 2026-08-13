@@ -27285,7 +27285,7 @@ test "api http server create index waits for exact target config projection" {
     // The response preserves backpressure, while convergence is still handed
     // off for any shards admitted before the failure.
     writes.create_error = error.ResourceBudgetExceeded;
-    var backpressured_resp = try server.handle(.{
+    var backpressured_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/embed_idx",
         .content_type = "application/json",
@@ -27299,7 +27299,7 @@ test "api http server create index waits for exact target config projection" {
     // failure: durable state and foreground write admission have both won.
     writes.create_error = null;
     writes.enqueue_error = error.ResourceBudgetExceeded;
-    var enqueue_deferred_resp = try server.handle(.{
+    var enqueue_deferred_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/embed_idx",
         .content_type = "application/json",

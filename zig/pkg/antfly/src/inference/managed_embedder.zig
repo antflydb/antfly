@@ -3015,7 +3015,7 @@ pub fn testRemoteEmbeddingCancellation() !void {
     var cancellation = std.atomic.Value(bool).init(false);
     var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, .{
         .io = io_impl.io(),
-        .cancellation = &cancellation,
+        .cancellation = CancellationToken.fromAtomic(&cancellation),
     });
     defer managed.deinit();
 

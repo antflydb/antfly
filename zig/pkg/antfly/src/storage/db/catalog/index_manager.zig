@@ -20899,7 +20899,7 @@ test "production exact dense scorer cancels during bounded vector work" {
         .query = &.{ 0, 0 },
         .k = 10,
         .filter_ids = filter_ids,
-        .cancellation = &cancellation,
+        .cancellation = hbc_mod.CancellationToken.fromAtomic(&cancellation),
     }));
     try std.testing.expectEqual(exact_dense_cancellation_stride, counter.count);
 }
