@@ -2655,6 +2655,25 @@ export interface components {
             /** @example An error message */
             error: string;
         };
+        /** @description Actionable retry contract for temporary inference-capacity failures. */
+        InferenceCapacityError: {
+            /** @description Stable machine-readable error code. */
+            error: string;
+            /** @description Human-readable error description. */
+            message: string;
+            /**
+             * @description Machine-readable capacity source.
+             * @enum {string}
+             */
+            reason: "inference_capacity" | "inference_admission";
+            /**
+             * @description Always true for a transient-capacity response.
+             * @enum {boolean}
+             */
+            retryable: true;
+            /** @description Minimum retry delay in milliseconds. */
+            retry_after_ms: number;
+        };
         /** @description A non-retryable table-storage integrity or format failure. */
         TableStorageUnreadableError: {
             /**
@@ -13012,6 +13031,17 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Inference capacity is temporarily unavailable */
+        InferenceTransientCapacity: {
+            headers: {
+                /** @description Minimum number of seconds clients should wait before retrying. */
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["InferenceCapacityError"];
+            };
+        };
         /**
          * @description Internal transaction failure. If the response says that the outcome is
          *     unknown, the request may already have committed and the stateless
@@ -13270,6 +13300,7 @@ export interface operations {
                 };
                 content?: never;
             };
+            503: components["responses"]["InferenceTransientCapacity"];
         };
     };
     listSecrets: {

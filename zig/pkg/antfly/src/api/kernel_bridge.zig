@@ -114,6 +114,12 @@ const OpaqueApiHttpServer = struct {
         return out;
     }
 
+    pub fn inferenceAdmissionStats(self: *const OpaqueApiHttpServer) AdmissionStats {
+        var out: AdmissionStats = undefined;
+        callInfallible(void, AdmissionStats, self.functions.inference_admission_stats, self.opaque_handle, null, &out);
+        return out;
+    }
+
     pub fn setAntflyProvider(self: *OpaqueApiHttpServer, provider: ?managed_embedder.AntflyProvider) void {
         var input = provider;
         callInfallible(?managed_embedder.AntflyProvider, void, self.functions.set_provider, self.opaque_handle, &input, null);
@@ -440,6 +446,7 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
     if (comptime direct_codegen) {
         const query = handler.api_server.queryAdmissionStats();
         const write = handler.api_server.writeAdmissionStats();
+        const inference = handler.api_server.inferenceAdmissionStats();
         const query_body = handler.query_body_admission.stats();
         return .{
             .query_capacity = query.capacity,
@@ -450,6 +457,10 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
             .write_in_flight = write.in_flight,
             .write_peak_in_flight = write.peak_in_flight,
             .write_rejected_total = write.rejected_total,
+            .inference_capacity = inference.capacity,
+            .inference_in_flight = inference.in_flight,
+            .inference_peak_in_flight = inference.peak_in_flight,
+            .inference_rejected_total = inference.rejected_total,
             .query_body_capacity = query_body.capacity,
             .query_body_in_flight = query_body.in_flight,
             .query_body_peak_in_flight = query_body.peak_in_flight,

@@ -382,6 +382,13 @@ fn standaloneInferenceReleaseRequest(handle: *anyopaque) callconv(.c) void {
     standalone_inference_host.linkedInferenceReleaseRequest(handle);
 }
 
+fn standaloneInferenceRequestAdmissionStats(
+    handle: *anyopaque,
+    out: *standalone_inference_bridge.RequestAdmissionStats,
+) callconv(.c) void {
+    out.* = standalone_inference_host.linkedInferenceRequestAdmissionStats(handle);
+}
+
 fn standaloneInferenceDestroy(handle: *anyopaque) callconv(.c) void {
     standalone_inference_host.linkedInferenceDestroy(handle);
 }
@@ -402,6 +409,7 @@ const standalone_inference_function_table: standalone_inference_bridge.FunctionT
     .destroy_http_response = &standaloneInferenceDestroyHttpResponse,
     .try_acquire_request = &standaloneInferenceTryAcquireRequest,
     .release_request = &standaloneInferenceReleaseRequest,
+    .request_admission_stats = &standaloneInferenceRequestAdmissionStats,
     .destroy = &standaloneInferenceDestroy,
 };
 

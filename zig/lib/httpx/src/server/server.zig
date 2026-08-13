@@ -909,30 +909,32 @@ pub const Context = struct {
 pub const Handler = union(enum) {
     function: *const fn (*Context) anyerror!Response,
     bound: Bound,
-    wrapped_function: WrappedFunction,
-    wrapped_bound: WrappedBound,
+    wrapped: Wrapped,
 
     pub const Bound = struct {
         ptr: *anyopaque,
         call: *const fn (ptr: *anyopaque, ctx: *Context) anyerror!Response,
     };
 
-    const WrapperCall = *const fn (
-        ptr: *anyopaque,
-        inner: Handler,
-        ctx: *Context,
-    ) anyerror!Response;
+    /// Non-recursive representation of the two base handler forms. Keeping
+    /// Handler out of the stored wrapper and callback signature prevents each
+    /// generated router from recursively expanding the handler type graph.
+    const Inner = union(enum) {
+        function: *const fn (*Context) anyerror!Response,
+        bound: Bound,
 
-    pub const WrappedFunction = struct {
-        ptr: *anyopaque,
-        inner: *const fn (*Context) anyerror!Response,
-        call: WrapperCall,
+        fn handler(self: Inner) Handler {
+            return switch (self) {
+                .function => |function| .{ .function = function },
+                .bound => |bound| .{ .bound = bound },
+            };
+        }
     };
 
-    pub const WrappedBound = struct {
+    pub const Wrapped = struct {
         ptr: *anyopaque,
-        inner: Bound,
-        call: WrapperCall,
+        inner: Inner,
+        call: *const fn (ptr: *anyopaque, inner: Inner, ctx: *Context) anyerror!Response,
     };
 
     /// Converts either an existing Handler or a plain handler function into
@@ -958,7 +960,7 @@ pub const Handler = union(enum) {
         const Adapter = struct {
             fn call(raw: *anyopaque, ctx: *Context) anyerror!Response {
                 const typed: Instance = @ptrCast(@alignCast(raw));
-                return @call(.auto, method, .{ typed, ctx });
+                return @call(.never_inline, method, .{ typed, ctx });
             }
         };
 
@@ -983,41 +985,35 @@ pub const Handler = union(enum) {
         }
 
         const Adapter = struct {
-            fn call(raw: *anyopaque, wrapped: Handler, ctx: *Context) anyerror!Response {
+            fn call(raw: *anyopaque, wrapped: Inner, ctx: *Context) anyerror!Response {
                 const typed: Instance = @ptrCast(@alignCast(raw));
-                return @call(.auto, method, .{ typed, wrapped, ctx });
+                return @call(.never_inline, method, .{ typed, wrapped.handler(), ctx });
             }
         };
 
         return switch (inner) {
-            .function => |function| .{ .wrapped_function = .{
+            .function => |function| .{ .wrapped = .{
                 .ptr = @ptrCast(instance),
-                .inner = function,
+                .inner = .{ .function = function },
                 .call = Adapter.call,
             } },
-            .bound => |bound| .{ .wrapped_bound = .{
+            .bound => |bound| .{ .wrapped = .{
                 .ptr = @ptrCast(instance),
-                .inner = bound,
+                .inner = .{ .bound = bound },
                 .call = Adapter.call,
             } },
-            .wrapped_function, .wrapped_bound => @panic("httpx.Handler.wrap does not support nested wrappers"),
+            .wrapped => @panic("httpx.Handler.wrap does not support nested wrappers"),
         };
     }
 
     pub fn invoke(self: Handler, ctx: *Context) anyerror!Response {
         return switch (self) {
-            .function => |function| function(ctx),
-            .bound => |bound| bound.call(bound.ptr, ctx),
-            .wrapped_function => |wrapped| wrapped.call(
-                wrapped.ptr,
-                .{ .function = wrapped.inner },
-                ctx,
-            ),
-            .wrapped_bound => |wrapped| wrapped.call(
-                wrapped.ptr,
-                .{ .bound = wrapped.inner },
-                ctx,
-            ),
+            // Handler is the intentional type-erasure/code-generation
+            // boundary for routers. Inlining through it duplicates large
+            // generated and inference handlers for every wrapper and prefix.
+            .function => |function| @call(.never_inline, function, .{ctx}),
+            .bound => |bound| @call(.never_inline, bound.call, .{ bound.ptr, ctx }),
+            .wrapped => |wrapped| @call(.never_inline, wrapped.call, .{ wrapped.ptr, wrapped.inner, ctx }),
         };
     }
 };

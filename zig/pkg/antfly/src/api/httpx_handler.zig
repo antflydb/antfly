@@ -40,6 +40,7 @@ const ApiHttpServer = http_server_mod.ApiHttpServer;
 const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
 
 const common_secrets = @import("../common/secrets.zig");
+const common_config = @import("../common/config.zig");
 const ha_mutation_inventory = @import("../storage/ha/mutation_inventory.zig");
 const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
@@ -2044,9 +2045,9 @@ pub const AntflyApiHandler = struct {
     }
 
     fn inferenceOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
-        try ctx.setHeader("Retry-After", "1");
+        try ctx.setHeader("Retry-After", connections_api.inference_retry_after_seconds);
         if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
-        return textResponse(ctx, 503, "inference capacity exhausted");
+        return ctx.status(503).json(connections_api.inferenceAdmissionFailure());
     }
 
     fn inferenceInvokeResponse(ctx: *httpx.Context, result: *const connections_api.InvokeResult) !httpx.Response {
@@ -2174,8 +2175,14 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        if (try self.acquirePublicOperation(ctx, "invokeInferenceConnection")) |response| return response;
-        defer self.releasePublicOperation("invokeInferenceConnection");
+        comptime std.debug.assert(request_admission_policy.publicOperationClass("invokeInferenceConnection").? == .inference);
+        const admission_owner = self.api_server.inferenceConnectionAdmissionOwner(connection_id, operation) catch |err| switch (err) {
+            error.ConnectionCapabilityMissing => return textResponse(ctx, 403, @errorName(err)),
+            error.ConnectionNotFound, error.ConnectionNotInference, error.InvalidConfig, error.ConnectionURLMissing, error.InvalidConnectionURL, error.ProviderNotAntflyCompatible, error.UnsupportedInferenceOperation => return textResponse(ctx, 400, @errorName(err)),
+        };
+        const caller_owns_admission = admission_owner == .caller;
+        if (caller_owns_admission and !self.api_server.tryAcquireInference()) return inferenceOverloadedResponse(ctx);
+        defer if (caller_owns_admission) self.api_server.releaseInference();
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "request body required");
         var result = self.api_server.invokeInferenceConnection(ctx.allocator, connection_id, operation, body) catch |err| switch (err) {
             error.ConnectionCapabilityMissing => return textResponse(ctx, 403, @errorName(err)),
@@ -6462,18 +6469,37 @@ test "httpx inference connection uses the configured shared admission owner" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.gate.release();
         }
+
+        fn stats(ptr: *anyopaque) RequestAdmission.Stats {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.gate.stats();
+        }
     };
 
     const alloc = std.testing.allocator;
     var source = AuthStatusSource{};
     var shared: SharedAdmission = .{};
+    var node_config = try common_config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "remote": {
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.embed"],
+        \\      "inference": { "provider": "antfly", "url": "https://inference.example.com" }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer node_config.deinit();
     var api_server = ApiHttpServer.init(alloc, .{
         .inference_max_concurrent_requests = 99,
         .inference_request_admission_source = .{
             .ptr = &shared,
             .try_acquire_fn = SharedAdmission.tryAcquire,
             .release_fn = SharedAdmission.release,
+            .stats_fn = SharedAdmission.stats,
         },
+        .node_config = &node_config,
     }, source.iface(), null, null);
     defer api_server.deinit();
     var handler = AntflyApiHandler{ .api_server = &api_server };
@@ -6491,7 +6517,16 @@ test "httpx inference connection uses the configured shared admission owner" {
     defer rejected.deinit();
     try std.testing.expectEqual(@as(u16, 503), rejected.status.code);
     try std.testing.expectEqualStrings("1", rejected.headers.get("Retry-After").?);
-    try std.testing.expectEqualStrings("inference capacity exhausted", rejected.body orelse "");
+    var payload = try std.json.parseFromSlice(
+        struct { reason: []const u8, retryable: bool, retry_after_ms: u32 },
+        alloc,
+        rejected.body.?,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer payload.deinit();
+    try std.testing.expectEqualStrings("inference_admission", payload.value.reason);
+    try std.testing.expect(payload.value.retryable);
+    try std.testing.expectEqual(@as(u32, 1000), payload.value.retry_after_ms);
     try std.testing.expectEqual(@as(u64, 1), shared.gate.stats().rejected_total);
 }
 

@@ -1237,6 +1237,10 @@ pub const HealthSource = struct {
             http_server.requestStats()
         else
             antfly.public_api.ApiHttpServer.RequestStats{};
+        const inference_admission_stats = if (self.data_server.http_server) |*http_server|
+            http_server.inferenceAdmissionStats()
+        else
+            null;
         const listener_stats = if (self.data_server.listener) |listener|
             listener.runtimeStats()
         else
@@ -1288,6 +1292,9 @@ pub const HealthSource = struct {
                 .peak_in_flight = http.peak_active_writes,
                 .rejected_total = http.rejected_writes_total,
             });
+            if (inference_admission_stats) |inference| {
+                try antfly.common.request_admission.appendPrometheusMetrics(writer, .inference, inference);
+            }
             try health_metrics.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests cancelled because peer observation could not be scheduled", http.cancellation_watcher_start_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public requests cancelled after transport cancellation observation failed", http.peer_observer_failures_total);

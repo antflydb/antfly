@@ -27,7 +27,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 13;
+pub const abi_version: u32 = 14;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -140,6 +140,10 @@ pub const HandlerStats = extern struct {
     write_in_flight: usize,
     write_peak_in_flight: usize,
     write_rejected_total: u64,
+    inference_capacity: usize,
+    inference_in_flight: usize,
+    inference_peak_in_flight: usize,
+    inference_rejected_total: u64,
     query_body_capacity: usize,
     query_body_in_flight: usize,
     query_body_peak_in_flight: usize,
@@ -167,6 +171,7 @@ pub const FunctionTable = extern struct {
     request_stats: *const fn (*const CallContext) callconv(.c) Status,
     query_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
     write_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
+    inference_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
     set_provider: *const fn (*const CallContext) callconv(.c) Status,
     set_ha_executor: *const fn (*const CallContext) callconv(.c) Status,
     attach_runtime_restore_store: *const fn (*const CallContext) callconv(.c) Status,

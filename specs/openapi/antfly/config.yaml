@@ -853,7 +853,9 @@ components:
           description: |
             Maximum concurrent inference requests admitted by this process.
             The budget covers embedded inference routes, direct providers, and
-            public connection inference forwarding for the full upstream request.
+            public connection inference forwarding. Remote forwarding holds a
+            slot for the full upstream request; forwarding back to this process
+            is admitted once by the destination inference route.
             Embedded standalone uses one shared coordinator for all of those
             surfaces; API-only runtimes use the same setting as a local forwarding
             gate. For embedded inference, this value also sizes the weighted work

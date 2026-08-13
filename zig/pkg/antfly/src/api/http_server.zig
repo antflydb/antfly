@@ -630,6 +630,7 @@ pub const InferenceRequestAdmissionSource = struct {
     ptr: *anyopaque,
     try_acquire_fn: *const fn (ptr: *anyopaque) bool,
     release_fn: *const fn (ptr: *anyopaque) void,
+    stats_fn: *const fn (ptr: *anyopaque) RequestAdmission.Stats,
 
     pub fn tryAcquire(self: InferenceRequestAdmissionSource) bool {
         return self.try_acquire_fn(self.ptr);
@@ -637,6 +638,10 @@ pub const InferenceRequestAdmissionSource = struct {
 
     pub fn release(self: InferenceRequestAdmissionSource) void {
         self.release_fn(self.ptr);
+    }
+
+    pub fn stats(self: InferenceRequestAdmissionSource) RequestAdmission.Stats {
+        return self.stats_fn(self.ptr);
     }
 };
 
@@ -652,6 +657,10 @@ pub const ApiHttpServerConfig = struct {
     /// Shared owner used when inference runs in this process. When present it
     /// supersedes the local fallback so every inference endpoint shares one cap.
     inference_request_admission_source: ?InferenceRequestAdmissionSource = null,
+    /// Public base URL of the inference service embedded in this process.
+    /// Connection forwarding to this target lets the destination route own
+    /// admission so one logical request never consumes the shared permit twice.
+    local_inference_api_url: ?[]const u8 = null,
     ard_base_url: ?[]const u8 = null,
     ard_publisher_domain: []const u8 = "antfly.local",
     ard_display_name: []const u8 = "Antfly",
@@ -2054,6 +2063,11 @@ pub const ApiHttpServer = struct {
         return self.inference_admission.tryAcquire();
     }
 
+    pub fn inferenceAdmissionStats(self: *const ApiHttpServer) RequestAdmission.Stats {
+        if (self.cfg.inference_request_admission_source) |source| return source.stats();
+        return self.inference_admission.stats();
+    }
+
     pub fn releaseInference(self: *ApiHttpServer) void {
         if (self.cfg.inference_request_admission_source) |source| {
             source.release();
@@ -2063,7 +2077,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn inferenceOverloadedResponse(self: *ApiHttpServer) !contextual_operations.OwnedResponse {
-        return try contextualRetryableTextResponse(self.alloc, 503, "inference capacity exhausted");
+        return try contextualInferenceCapacityResponse(self.alloc);
     }
 
     pub fn setHAInternalExecutor(self: *ApiHttpServer, executor_value: ?ha_http_operation.Executor) void {
@@ -2398,17 +2412,31 @@ pub const ApiHttpServer = struct {
         operation: []const u8,
         body: []const u8,
     ) !connections_api.InvokeResult {
-        const node_config = self.cfg.node_config orelse return error.ConnectionNotFound;
         var client = httpx.Client.initWithConfig(alloc, self.inferenceIo(), .{ .keep_alive = false });
         defer client.deinit();
         return connections_api.invokeInferenceConnection(
             alloc,
             &client,
-            node_config,
+            self.cfg.node_config,
+            self.cfg.local_inference_api_url,
+            self.cfg.inference_api_key,
             self.cfg.secret_store,
             connection_id,
             operation,
             body,
+        );
+    }
+
+    pub fn inferenceConnectionAdmissionOwner(
+        self: *const ApiHttpServer,
+        connection_id: []const u8,
+        operation: []const u8,
+    ) !connections_api.InferenceAdmissionOwner {
+        return connections_api.inferenceConnectionAdmissionOwner(
+            self.cfg.node_config,
+            self.cfg.local_inference_api_url,
+            connection_id,
+            operation,
         );
     }
 
@@ -12607,6 +12635,22 @@ fn contextualRetryableTextResponse(alloc: std.mem.Allocator, status: u16, body: 
         .body = try alloc.dupe(u8, body),
         .headers = headers,
     };
+}
+
+fn contextualInferenceCapacityResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    var response = try contextualJsonResponse(alloc, 503, connections_api.inferenceAdmissionFailure());
+    errdefer response.deinit(alloc);
+    const headers = try alloc.alloc(contextual_operations.Header, 1);
+    errdefer alloc.free(headers);
+    headers[0] = .{
+        .name = try alloc.dupe(u8, "Retry-After"),
+        .value = alloc.dupe(u8, connections_api.inference_retry_after_seconds) catch |err| {
+            alloc.free(headers[0].name);
+            return err;
+        },
+    };
+    response.headers = headers;
+    return response;
 }
 
 fn extensionLifecycleContextualResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {

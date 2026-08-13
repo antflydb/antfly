@@ -302,6 +302,8 @@ from .inference_admission_config import InferenceAdmissionConfig
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
 from .inference_backend_runtimes import InferenceBackendRuntimes
 from .inference_binary_content import InferenceBinaryContent
+from .inference_capacity_error import InferenceCapacityError
+from .inference_capacity_error_reason import InferenceCapacityErrorReason
 from .inference_chat_message import InferenceChatMessage
 from .inference_chunk import InferenceChunk
 from .inference_chunk_config import InferenceChunkConfig
@@ -1028,6 +1030,8 @@ __all__ = (
     "InferenceAudioChunkConfig",
     "InferenceBackendRuntimes",
     "InferenceBinaryContent",
+    "InferenceCapacityError",
+    "InferenceCapacityErrorReason",
     "InferenceChatMessage",
     "InferenceChunk",
     "InferenceChunkConfig",

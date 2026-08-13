@@ -30,6 +30,8 @@ pub const InferenceAdmission = struct {
         in_flight_units: usize,
         available_units: usize,
         in_flight_requests: usize,
+        peak_in_flight_requests: usize,
+        rejected_requests_total: u64,
     };
 
     // Zig 0.16's Io.Mutex requires an Io at each call site. This critical
@@ -38,6 +40,8 @@ pub const InferenceAdmission = struct {
     mutex: std.atomic.Mutex = .unlocked,
     active_requests: usize = 0,
     active_units: usize = 0,
+    peak_active_requests: usize = 0,
+    rejected_requests_total: u64 = 0,
     max_concurrent_requests: usize,
     capacity: usize,
 
@@ -60,9 +64,11 @@ pub const InferenceAdmission = struct {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         if (self.max_concurrent_requests != 0 and self.active_requests >= self.max_concurrent_requests) {
+            self.rejected_requests_total +|= 1;
             return error.QueueFull;
         }
         self.active_requests += 1;
+        self.peak_active_requests = @max(self.peak_active_requests, self.active_requests);
     }
 
     pub fn releaseRequestSlot(self: *InferenceAdmission) void {
@@ -77,7 +83,10 @@ pub const InferenceAdmission = struct {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         const requested = self.capacityUnits(units);
-        if (requested > self.capacity - self.active_units) return error.QueueFull;
+        if (requested > self.capacity - self.active_units) {
+            self.rejected_requests_total +|= 1;
+            return error.QueueFull;
+        }
         self.active_units += requested;
     }
 
@@ -98,12 +107,15 @@ pub const InferenceAdmission = struct {
         defer self.mutex.unlock();
         const requested = self.capacityUnits(units);
         if (self.max_concurrent_requests != 0 and self.active_requests >= self.max_concurrent_requests) {
+            self.rejected_requests_total +|= 1;
             return error.QueueFull;
         }
         if (requested > self.capacity - self.active_units) {
+            self.rejected_requests_total +|= 1;
             return error.QueueFull;
         }
         self.active_requests += 1;
+        self.peak_active_requests = @max(self.peak_active_requests, self.active_requests);
         self.active_units += requested;
     }
 
@@ -116,7 +128,10 @@ pub const InferenceAdmission = struct {
         const target = self.capacityUnits(target_units);
         if (target <= current) return;
         const additional = target - current;
-        if (additional > self.capacity - self.active_units) return error.QueueFull;
+        if (additional > self.capacity - self.active_units) {
+            self.rejected_requests_total +|= 1;
+            return error.QueueFull;
+        }
         self.active_units += additional;
     }
 
@@ -178,6 +193,8 @@ pub const InferenceAdmission = struct {
             .in_flight_units = self.active_units,
             .available_units = self.capacity - self.active_units,
             .in_flight_requests = self.active_requests,
+            .peak_in_flight_requests = self.peak_active_requests,
+            .rejected_requests_total = self.rejected_requests_total,
         };
     }
 };
@@ -227,6 +244,8 @@ test "inference admission weighted capacity" {
         .in_flight_units = 1,
         .available_units = 3,
         .in_flight_requests = 1,
+        .peak_in_flight_requests = 2,
+        .rejected_requests_total = 1,
     }, q.stats());
 }
 

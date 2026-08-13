@@ -4290,6 +4290,20 @@ pub const InferenceBinaryContent = struct {
     frame_delay_ms: ?i64 = null,
 };
 
+/// Actionable retry contract for temporary inference-capacity failures.
+pub const InferenceCapacityError = struct {
+    /// Stable machine-readable error code.
+    @"error": []const u8,
+    /// Human-readable error description.
+    message: []const u8,
+    /// Machine-readable capacity source.
+    reason: []const u8,
+    /// Always true for a transient-capacity response.
+    retryable: bool,
+    /// Minimum retry delay in milliseconds.
+    retry_after_ms: i64,
+};
+
 pub const InferenceChatMessage = struct {
     role: InferenceRole,
     content: ?ChatMessageContent = null,

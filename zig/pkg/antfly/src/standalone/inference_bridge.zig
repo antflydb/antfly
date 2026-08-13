@@ -20,7 +20,7 @@ const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version: u32 = 10;
+pub const abi_version: u32 = 11;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -181,6 +181,13 @@ pub const Capability = struct {
     pub const request_admission: u64 = 1 << 3;
 };
 
+pub const RequestAdmissionStats = extern struct {
+    capacity: usize,
+    in_flight: usize,
+    peak_in_flight: usize,
+    rejected_total: u64,
+};
+
 /// Append-only function table returned by the linked inference archive. A
 /// caller validates this fixed prefix before creating any cross-archive object.
 pub const FunctionTable = extern struct {
@@ -198,6 +205,7 @@ pub const FunctionTable = extern struct {
     destroy: *const fn (*anyopaque) callconv(.c) void,
     try_acquire_request: *const fn (*anyopaque) callconv(.c) u8,
     release_request: *const fn (*anyopaque) callconv(.c) void,
+    request_admission_stats: *const fn (*anyopaque, *RequestAdmissionStats) callconv(.c) void,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {

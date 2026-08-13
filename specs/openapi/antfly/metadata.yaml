@@ -1433,6 +1433,29 @@ components:
   schemas:
     Error:
       $ref: "../auth/api.yaml#/components/schemas/Error"
+    InferenceCapacityError:
+      type: object
+      description: Actionable retry contract for temporary inference-capacity failures.
+      required: [error, message, reason, retryable, retry_after_ms]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable error description.
+        reason:
+          type: string
+          enum: [inference_capacity, inference_admission]
+          description: Machine-readable capacity source.
+        retryable:
+          type: boolean
+          enum: [true]
+          description: Always true for a transient-capacity response.
+        retry_after_ms:
+          type: integer
+          minimum: 1
+          description: Minimum retry delay in milliseconds.
     TableStorageUnreadableError:
       type: object
       additionalProperties: false
@@ -7795,6 +7818,19 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    InferenceTransientCapacity:
+      description: Inference capacity is temporarily unavailable
+      headers:
+        Retry-After:
+          required: true
+          description: Minimum number of seconds clients should wait before retrying.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/InferenceCapacityError"
     StatelessTransactionFailure:
       description: |
         Internal transaction failure. If the response says that the outcome is
@@ -7996,6 +8032,8 @@ paths:
           description: The connection does not declare the capability required by this operation
         "502":
           description: Inference provider request failed
+        "503":
+          $ref: "#/components/responses/InferenceTransientCapacity"
   /secrets:
     get:
       summary: List secrets status

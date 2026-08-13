@@ -13,7 +13,10 @@
 // limitations.
 
 const std = @import("std");
-const AdmissionClass = @import("../../common/request_admission.zig").Class;
+/// Serverless currently exposes only database query and write execution.
+/// Keeping this inventory local means inference cannot be classified as an
+/// unsupported no-op if that surface is added later.
+const AdmissionClass = enum { none, query, write };
 
 pub const HttpMethod = enum {
     get,

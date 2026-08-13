@@ -155,30 +155,68 @@ pub const InvokeResult = struct {
     }
 };
 
+pub const inference_retry_after_seconds = "1";
+
+/// Stable public payload for caller-side inference admission failures. Keep
+/// this synchronized with TransientCapacityError in the inference API spec.
+pub const InferenceAdmissionFailure = struct {
+    @"error": []const u8 = "SERVICE_UNAVAILABLE",
+    message: []const u8 = "inference capacity exhausted",
+    reason: []const u8 = "inference_admission",
+    retryable: bool = true,
+    retry_after_ms: u32 = 1000,
+};
+
+pub fn inferenceAdmissionFailure() InferenceAdmissionFailure {
+    return .{};
+}
+
+pub const InferenceAdmissionOwner = enum {
+    caller,
+    target,
+};
+
+const ResolvedInferenceConnection = struct {
+    url: []const u8,
+    admission_owner: InferenceAdmissionOwner,
+};
+
+/// Resolve the forwarding target before reading the request body. A target in
+/// this process owns its route admission; remote targets are admitted by the
+/// forwarding API for the full upstream request.
+pub fn inferenceConnectionAdmissionOwner(
+    node_config: ?*const common_config.Config,
+    local_inference_api_url: ?[]const u8,
+    connection_id: []const u8,
+    operation: []const u8,
+) !InferenceAdmissionOwner {
+    return (try resolveInferenceConnection(node_config, local_inference_api_url, connection_id, operation)).admission_owner;
+}
+
 pub fn invokeInferenceConnection(
     alloc: Allocator,
     http: *httpx.Client,
-    node_config: *const common_config.Config,
+    node_config: ?*const common_config.Config,
+    local_inference_api_url: ?[]const u8,
+    local_inference_api_key: ?[]const u8,
     secret_store: ?*common_secrets.FileStore,
     connection_id: []const u8,
     operation: []const u8,
     body: []const u8,
 ) !InvokeResult {
-    const required_capability = inferenceCapability(operation) orelse return error.UnsupportedInferenceOperation;
-    const connection = node_config.connections.get(connection_id) orelse return error.ConnectionNotFound;
-    if (connection.kind != .inference) return error.ConnectionNotInference;
-    try requireInferenceCapability(connection.capabilities, required_capability);
-    const cfg = connection.inference orelse return error.InvalidConfig;
-    if (!std.mem.eql(u8, cfg.provider, "antfly")) return error.ProviderNotAntflyCompatible;
-    const raw_url = cfg.url orelse return error.ConnectionURLMissing;
-    if (!validInferenceURL(raw_url)) return error.InvalidConnectionURL;
+    const resolved = try resolveInferenceConnection(node_config, local_inference_api_url, connection_id, operation);
+    const raw_url = resolved.url;
     const base = std.mem.trimEnd(u8, raw_url, "/");
     const prefix = if (std.mem.endsWith(u8, base, "/ai/v1")) base else try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{base});
     defer if (prefix.ptr != base.ptr) alloc.free(prefix);
     const url = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
     defer alloc.free(url);
 
-    const resolved_key = try resolveInferenceApiKey(alloc, secret_store, cfg.api_key);
+    const configured_api_key = if (std.mem.eql(u8, connection_id, common_config.local_inference_connection_id))
+        local_inference_api_key
+    else
+        node_config.?.connections.get(connection_id).?.inference.?.api_key;
+    const resolved_key = try resolveInferenceApiKey(alloc, secret_store, configured_api_key);
     defer if (resolved_key) |key| alloc.free(key);
     const auth = if (resolved_key) |key| try std.fmt.allocPrint(alloc, "Bearer {s}", .{key}) else null;
     defer if (auth) |value| alloc.free(value);
@@ -200,6 +238,49 @@ pub fn invokeInferenceConnection(
         .body = response_body,
         .retry_after = retry_after,
     };
+}
+
+fn resolveInferenceConnection(
+    node_config: ?*const common_config.Config,
+    local_inference_api_url: ?[]const u8,
+    connection_id: []const u8,
+    operation: []const u8,
+) !ResolvedInferenceConnection {
+    const required_capability = inferenceCapability(operation) orelse return error.UnsupportedInferenceOperation;
+    if (std.mem.eql(u8, connection_id, common_config.local_inference_connection_id)) {
+        const local_url = local_inference_api_url orelse return error.ConnectionNotFound;
+        if (!validInferenceURL(local_url)) return error.InvalidConnectionURL;
+        return .{
+            .url = local_url,
+            .admission_owner = .target,
+        };
+    }
+
+    const config = node_config orelse return error.ConnectionNotFound;
+    const connection = config.connections.get(connection_id) orelse return error.ConnectionNotFound;
+    if (connection.kind != .inference) return error.ConnectionNotInference;
+    try requireInferenceCapability(connection.capabilities, required_capability);
+    const cfg = connection.inference orelse return error.InvalidConfig;
+    if (!std.mem.eql(u8, cfg.provider, "antfly")) return error.ProviderNotAntflyCompatible;
+    const raw_url = cfg.url orelse return error.ConnectionURLMissing;
+    if (!validInferenceURL(raw_url)) return error.InvalidConnectionURL;
+    return .{
+        .url = raw_url,
+        .admission_owner = if (local_inference_api_url) |local_url|
+            if (sameInferenceBaseURL(raw_url, local_url)) .target else .caller
+        else
+            .caller,
+    };
+}
+
+fn sameInferenceBaseURL(first: []const u8, second: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(trimInferenceBaseURL(first), trimInferenceBaseURL(second));
+}
+
+fn trimInferenceBaseURL(raw: []const u8) []const u8 {
+    var value = std.mem.trimEnd(u8, raw, "/");
+    if (std.mem.endsWith(u8, value, "/ai/v1")) value = value[0 .. value.len - "/ai/v1".len];
+    return std.mem.trimEnd(u8, value, "/");
 }
 
 fn inferenceCapability(operation: []const u8) ?[]const u8 {
@@ -1479,7 +1560,16 @@ test "inference connection operations are allowlisted" {
         \\}
     );
     defer cfg.deinit();
-    try std.testing.expectError(error.ConnectionCapabilityMissing, invokeInferenceConnection(alloc, undefined, &cfg, null, "embed-only", "generate", "{}"));
+    try std.testing.expectError(error.ConnectionCapabilityMissing, invokeInferenceConnection(alloc, undefined, &cfg, null, null, null, "embed-only", "generate", "{}"));
+    try std.testing.expectEqual(
+        InferenceAdmissionOwner.caller,
+        try inferenceConnectionAdmissionOwner(&cfg, "http://127.0.0.1:8080", "embed-only", "embed"),
+    );
+    try std.testing.expectEqual(
+        InferenceAdmissionOwner.target,
+        try inferenceConnectionAdmissionOwner(null, "http://127.0.0.1:8080", common_config.local_inference_connection_id, "generate"),
+    );
+    try std.testing.expect(sameInferenceBaseURL("http://127.0.0.1:8080/ai/v1/", "HTTP://127.0.0.1:8080"));
 
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-connection-secrets-{d}.json", .{platform_time.monotonicNs()});
     defer alloc.free(store_path);

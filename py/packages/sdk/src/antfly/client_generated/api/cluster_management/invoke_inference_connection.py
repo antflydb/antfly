@@ -6,6 +6,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.inference_capacity_error import InferenceCapacityError
 from ...models.invoke_inference_connection_body import InvokeInferenceConnectionBody
 from ...models.invoke_inference_connection_operation import InvokeInferenceConnectionOperation
 from ...models.invoke_inference_connection_response_200 import InvokeInferenceConnectionResponse200
@@ -38,7 +39,7 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | InvokeInferenceConnectionResponse200 | None:
+) -> Any | InferenceCapacityError | InvokeInferenceConnectionResponse200 | None:
     if response.status_code == 200:
         response_200 = InvokeInferenceConnectionResponse200.from_dict(response.json())
 
@@ -60,6 +61,11 @@ def _parse_response(
         response_502 = cast(Any, None)
         return response_502
 
+    if response.status_code == 503:
+        response_503 = InferenceCapacityError.from_dict(response.json())
+
+        return response_503
+
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -68,7 +74,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | InvokeInferenceConnectionResponse200]:
+) -> Response[Any | InferenceCapacityError | InvokeInferenceConnectionResponse200]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -83,7 +89,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: InvokeInferenceConnectionBody,
-) -> Response[Any | InvokeInferenceConnectionResponse200]:
+) -> Response[Any | InferenceCapacityError | InvokeInferenceConnectionResponse200]:
     """Invoke an Antfly-compatible inference connection
 
     Args:
@@ -96,7 +102,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | InvokeInferenceConnectionResponse200]
+        Response[Any | InferenceCapacityError | InvokeInferenceConnectionResponse200]
     """
 
     kwargs = _get_kwargs(
@@ -118,7 +124,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: InvokeInferenceConnectionBody,
-) -> Any | InvokeInferenceConnectionResponse200 | None:
+) -> Any | InferenceCapacityError | InvokeInferenceConnectionResponse200 | None:
     """Invoke an Antfly-compatible inference connection
 
     Args:
@@ -131,7 +137,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | InvokeInferenceConnectionResponse200
+        Any | InferenceCapacityError | InvokeInferenceConnectionResponse200
     """
 
     return sync_detailed(
@@ -148,7 +154,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: InvokeInferenceConnectionBody,
-) -> Response[Any | InvokeInferenceConnectionResponse200]:
+) -> Response[Any | InferenceCapacityError | InvokeInferenceConnectionResponse200]:
     """Invoke an Antfly-compatible inference connection
 
     Args:
@@ -161,7 +167,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | InvokeInferenceConnectionResponse200]
+        Response[Any | InferenceCapacityError | InvokeInferenceConnectionResponse200]
     """
 
     kwargs = _get_kwargs(
@@ -181,7 +187,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: InvokeInferenceConnectionBody,
-) -> Any | InvokeInferenceConnectionResponse200 | None:
+) -> Any | InferenceCapacityError | InvokeInferenceConnectionResponse200 | None:
     """Invoke an Antfly-compatible inference connection
 
     Args:
@@ -194,7 +200,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | InvokeInferenceConnectionResponse200
+        Any | InferenceCapacityError | InvokeInferenceConnectionResponse200
     """
 
     return (

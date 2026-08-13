@@ -12,6 +12,7 @@ pub const Class = enum { none, query, write, inference };
 pub const PrometheusClass = enum {
     query,
     write,
+    inference,
 };
 
 /// Process-local, fail-fast admission for one foreground request class.
@@ -93,6 +94,16 @@ pub fn appendPrometheusMetrics(
             .peak_help = "Peak concurrent foreground data mutations since process start",
             .rejected_help = "Foreground data mutations rejected by admission control",
         },
+        .inference => .{
+            .capacity = "antfly_admission_inference_capacity_requests",
+            .in_flight = "antfly_admission_inference_in_flight_requests",
+            .peak_in_flight = "antfly_admission_inference_peak_in_flight_requests",
+            .rejected_total = "antfly_admission_inference_rejected_requests_total",
+            .capacity_help = "Maximum concurrent inference requests; zero means unlimited",
+            .in_flight_help = "Inference requests currently admitted",
+            .peak_help = "Peak concurrent inference requests since process start",
+            .rejected_help = "Inference requests rejected by admission control",
+        },
     };
     try prometheus.appendPromMetric(writer, names.capacity, "gauge", names.capacity_help, stats.capacity);
     try prometheus.appendPromMetric(writer, names.in_flight, "gauge", names.in_flight_help, stats.in_flight);
@@ -116,23 +127,31 @@ test "request admission bounds positive capacity and preserves unlimited mode" {
 }
 
 test "request admission metrics use the shared admission namespace" {
-    var output: [2048]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&output);
-    try appendPrometheusMetrics(&writer, .query, .{
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try appendPrometheusMetrics(&output.writer, .query, .{
         .capacity = 32,
         .in_flight = 2,
         .peak_in_flight = 4,
         .rejected_total = 1,
     });
-    try appendPrometheusMetrics(&writer, .write, .{
+    try appendPrometheusMetrics(&output.writer, .write, .{
         .capacity = 16,
         .in_flight = 3,
         .peak_in_flight = 5,
         .rejected_total = 2,
     });
-    const rendered = writer.buffered();
+    try appendPrometheusMetrics(&output.writer, .inference, .{
+        .capacity = 8,
+        .in_flight = 1,
+        .peak_in_flight = 3,
+        .rejected_total = 4,
+    });
+    const rendered = output.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_capacity_requests 32\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_rejected_requests_total 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_write_capacity_requests 16\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_write_rejected_requests_total 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_inference_capacity_requests 8\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_inference_rejected_requests_total 4\n") != null);
 }

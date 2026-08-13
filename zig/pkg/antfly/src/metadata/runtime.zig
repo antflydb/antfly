@@ -221,8 +221,10 @@ pub const HealthSource = struct {
         if (self.server.server.owned_public_http_server) |public_api| {
             const query = public_api.queryAdmissionStats();
             const write = public_api.writeAdmissionStats();
+            const inference = public_api.inferenceAdmissionStats();
             try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, query);
             try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, write);
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .inference, inference);
         }
 
         try append(writer, "antfly_raft_hosted_groups", "gauge", "Number of raft groups hosted on this node", @intCast(host_metrics.hosted_groups));
@@ -1849,6 +1851,10 @@ test "metadata runtime metrics expose memory ownership buckets" {
     try expectMetricPresent(output, "antfly_admission_write_capacity_requests");
     try expectMetricPresent(output, "antfly_admission_write_in_flight_requests");
     try expectMetricPresent(output, "antfly_admission_write_rejected_requests_total");
+    try expectMetricPresent(output, "antfly_admission_inference_capacity_requests");
+    try expectMetricPresent(output, "antfly_admission_inference_in_flight_requests");
+    try expectMetricPresent(output, "antfly_admission_inference_peak_in_flight_requests");
+    try expectMetricPresent(output, "antfly_admission_inference_rejected_requests_total");
 }
 
 test "metadata runtime memory soak diagnostic" {

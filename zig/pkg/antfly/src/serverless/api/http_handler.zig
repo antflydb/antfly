@@ -214,7 +214,6 @@ pub const HttpHandler = struct {
             .none => null,
             .query => &self.query_admission,
             .write => &self.write_admission,
-            .inference => null,
         };
         if (admission) |gate| {
             if (!gate.tryAcquire()) {

@@ -599,6 +599,12 @@ const StandaloneHealthSource = struct {
             .peak_in_flight = handler.write_peak_in_flight,
             .rejected_total = handler.write_rejected_total,
         });
+        try antfly.common.request_admission.appendPrometheusMetrics(writer, .inference, .{
+            .capacity = handler.inference_capacity,
+            .in_flight = handler.inference_in_flight,
+            .peak_in_flight = handler.inference_peak_in_flight,
+            .rejected_total = handler.inference_rejected_total,
+        });
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", handler.query_body_capacity);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", handler.query_body_in_flight);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", handler.query_body_peak_in_flight);
@@ -2019,7 +2025,9 @@ pub fn runFromIterator(
                 .ptr = antfly_node,
                 .try_acquire_fn = tryAcquireEmbeddedInferenceRequest,
                 .release_fn = releaseEmbeddedInferenceRequest,
+                .stats_fn = embeddedInferenceRequestStats,
             },
+            .local_inference_api_url = public_api_url,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
@@ -4385,6 +4393,22 @@ fn releaseEmbeddedInferenceRequest(handle: *anyopaque) void {
         return;
     }
     linkedInferenceApiInfallible().release_request(handle);
+}
+
+fn embeddedInferenceRequestStats(handle: *anyopaque) antfly.common.request_admission.RequestAdmission.Stats {
+    const stats = if (comptime inline_inference_codegen)
+        inference_host.linkedInferenceRequestAdmissionStats(handle)
+    else blk: {
+        var result: inference_bridge.RequestAdmissionStats = undefined;
+        linkedInferenceApiInfallible().request_admission_stats(handle, &result);
+        break :blk result;
+    };
+    return .{
+        .capacity = stats.capacity,
+        .in_flight = stats.in_flight,
+        .peak_in_flight = stats.peak_in_flight,
+        .rejected_total = stats.rejected_total,
+    };
 }
 
 fn inferenceProviderEmbedDenseTexts(

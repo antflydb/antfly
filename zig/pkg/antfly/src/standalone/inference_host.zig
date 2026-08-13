@@ -676,6 +676,17 @@ pub fn linkedInferenceReleaseRequest(handle: *anyopaque) void {
     state.node.releaseRequestSlot();
 }
 
+pub fn linkedInferenceRequestAdmissionStats(handle: *anyopaque) inference_bridge.RequestAdmissionStats {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    const stats = state.node.inference_admission.stats();
+    return .{
+        .capacity = stats.capacity_requests,
+        .in_flight = stats.in_flight_requests,
+        .peak_in_flight = stats.peak_in_flight_requests,
+        .rejected_total = stats.rejected_requests_total,
+    };
+}
+
 pub fn linkedInferenceDestroy(handle: *anyopaque) void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
     const alloc = state.alloc;
