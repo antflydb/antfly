@@ -3950,6 +3950,7 @@ pub fn build(b: *std.Build) void {
         "data runtime repair queue links and removes debt in constant time",
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
         "data runtime raft status changes force immediate store status publication",
+        "data runtime reallocation request refreshes group status once per request",
         "data runtime replicated split policy is identity and phase aware",
         "data runtime structural changes preserve physical root generations",
         "data raft draining leader remains stable through membership expansion",

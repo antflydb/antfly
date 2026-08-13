@@ -1380,7 +1380,6 @@ const StoreEvidenceIndex = struct {
         status: ?*const table_manager.GroupStatusReport = null,
         status_ambiguous: bool = false,
         runtime_reported: bool = false,
-        latest_runtime_updated_at_millis: u64 = 0,
     };
 
     const PlacementTopology = struct {
@@ -1433,10 +1432,6 @@ const StoreEvidenceIndex = struct {
                 const entry = try self.reports_by_store_group.getOrPut(alloc, placementStoreKey(status.group_id, store.store_id));
                 if (!entry.found_existing) entry.value_ptr.* = .{};
                 entry.value_ptr.runtime_reported = true;
-                entry.value_ptr.latest_runtime_updated_at_millis = @max(
-                    entry.value_ptr.latest_runtime_updated_at_millis,
-                    @divTrunc(status.updated_at_ns, std.time.ns_per_ms),
-                );
             }
         }
         for (current.placement_intents) |*intent| {

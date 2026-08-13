@@ -9854,6 +9854,10 @@ pub const ProvisionedTableWriteSource = struct {
         _: *ProvisionedTableWriteSource,
         status: *runtime_status.LocalTableRuntimeStatus,
     ) void {
+        // The caller just sampled the live writer. Discard any causal identity
+        // inherited from a cached seed so the next cache publication assigns
+        // this observation its own generation.
+        status.causal_observation_generation = 0;
         status.metadata = .{
             .updated_at_ns = platform_time.monotonicNs(),
             .source = .live_writer_publish,
@@ -19810,6 +19814,11 @@ fn publishStructuralRuntimeObservations(
     std.debug.assert(observations.len <= ProvisionedTableWriteSource.structural_reconcile_groups_per_quantum);
     var statuses: [ProvisionedTableWriteSource.structural_reconcile_groups_per_quantum]runtime_status.LocalTableRuntimeStatus = undefined;
     for (observations, 0..) |observation, index| statuses[index] = observation.status;
+    for (statuses[0..observations.len]) |*status| {
+        if (runtime_status.statusRuntimeFresh(status.*)) {
+            status.causal_observation_generation = token.observation_generation;
+        }
+    }
     const result = if (lifecycle_transition)
         try snapshot_cache.publishLifecycleTransition(completed, table_name, statuses[0..observations.len])
     else
@@ -20107,6 +20116,12 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         else
             markRuntimeStatusFromDb(&status, phase);
         status.metadata.lsm_root_generation = lsm_root_generation;
+        if (runtime_status.statusRuntimeFresh(status)) {
+            // publishRuntimeStatusGroupAfterObservation uses a second token
+            // for cache ordering. Retain the token captured before DB
+            // inspection as the observation's causal identity.
+            status.causal_observation_generation = publication_token.observation_generation;
+        }
         try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, status);
     }
 }
@@ -20166,6 +20181,7 @@ fn markRuntimeStatusFromDb(
     status: *runtime_status.LocalTableRuntimeStatus,
     phase: db_mod.types.StartupCatchUpPhase,
 ) void {
+    status.causal_observation_generation = 0;
     status.metadata = .{
         .updated_at_ns = platform_time.monotonicNs(),
         .source = if (phase != .idle)

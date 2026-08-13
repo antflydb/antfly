@@ -312,13 +312,13 @@ pub const ListenerConfig = struct {
 pub const MetadataClusterPeer = struct {
     node_id: u64,
     raft_url: []const u8,
+    orchestration_url: ?[]const u8 = null,
 };
 
 pub const ServerConfig = struct {
     local_node_id: u64 = 1,
     metadata_group_id: u64 = group_ids.main_metadata_group_id,
     metadata_cluster_peers: []const MetadataClusterPeer = &.{},
-    reallocation_protocol_peers: []const antfly.metadata_service.ReallocationProtocolPeer = &.{},
     replica_root_dir: []const u8,
     replica_catalog_path: []const u8,
     snapshot_root_dir: []const u8,
@@ -398,9 +398,11 @@ pub const Server = struct {
     snapshot_root_dir: []u8,
     bind_host: []u8,
     admin_bind_host: []u8,
+    reallocation_protocol_peers: []antfly.metadata_service.ReallocationProtocolPeer,
     raft_storage_diagnostics: MetadataRaftStorageDiagnosticsCache = .{},
 
     pub fn init(alloc: std.mem.Allocator, cfg: ServerConfig) !Server {
+        try validateMetadataClusterOrchestrationPeers(cfg.metadata_cluster_peers, cfg.local_node_id);
         var result: Server = undefined;
         result.alloc = alloc;
         result.raft_storage_diagnostics = .{};
@@ -427,11 +429,13 @@ pub const Server = struct {
         errdefer alloc.free(result.bind_host);
         result.admin_bind_host = try alloc.dupe(u8, cfg.admin_bind_host);
         errdefer alloc.free(result.admin_bind_host);
+        result.reallocation_protocol_peers = try reallocationProtocolPeersFromClusterPeers(alloc, cfg.metadata_cluster_peers);
+        errdefer freeReallocationProtocolPeers(alloc, result.reallocation_protocol_peers);
         const service_cfg = antfly.metadata_service.MetadataServiceConfig{
             .observe_local_replica_root = cfg.observe_local_replica_root,
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
-            .reallocation_protocol_peers = cfg.reallocation_protocol_peers,
+            .reallocation_protocol_peers = result.reallocation_protocol_peers,
         };
         result.server = try antfly.metadata_server.MetadataServer.init(alloc, .{
             .http = .{
@@ -480,6 +484,7 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.server.deinit();
+        freeReallocationProtocolPeers(self.alloc, self.reallocation_protocol_peers);
         self.alloc.free(self.admin_bind_host);
         self.alloc.free(self.bind_host);
         self.alloc.free(self.snapshot_root_dir);
@@ -874,8 +879,6 @@ pub fn runFromIterator(
     const metadata_group_id = group_ids.main_metadata_group_id;
     const cluster_peers = try resolveMetadataClusterPeers(alloc, cli.cluster_json, if (loaded_config) |*cfg| cfg else null);
     defer freeMetadataClusterPeers(alloc, cluster_peers);
-    const reallocation_protocol_peers = try reallocationProtocolPeersFromConfig(alloc, if (loaded_config) |*cfg| cfg else null);
-    defer if (reallocation_protocol_peers.len > 0) alloc.free(reallocation_protocol_peers);
     const listener = resolveRaftListener(cli, if (loaded_config) |*cfg| cfg else null);
     const admin_listener = resolveAdminListener(cli, if (loaded_config) |*cfg| cfg else null, local_node_id, listener.bind_host);
 
@@ -883,7 +886,6 @@ pub fn runFromIterator(
         .local_node_id = local_node_id,
         .metadata_group_id = metadata_group_id,
         .metadata_cluster_peers = cluster_peers,
-        .reallocation_protocol_peers = reallocation_protocol_peers,
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
@@ -1282,28 +1284,66 @@ fn resolveMetadataClusterPeers(
     cluster_json: ?[]const u8,
     cfg: ?*const antfly.common.config.Config,
 ) ![]MetadataClusterPeer {
-    if (cluster_json) |raw| return try parseMetadataClusterJson(alloc, raw);
+    if (cluster_json) |raw| {
+        const peers = try parseMetadataClusterJson(alloc, raw);
+        errdefer freeMetadataClusterPeers(alloc, peers);
+        if (cfg) |loaded| {
+            for (peers) |*peer| {
+                if (peer.orchestration_url != null) continue;
+                const orchestration_url = metadataOrchestrationPeerUrl(loaded, peer.node_id) orelse continue;
+                peer.orchestration_url = try alloc.dupe(u8, orchestration_url);
+            }
+        }
+        return peers;
+    }
     if (cfg) |loaded| return try metadataClusterPeersFromConfig(alloc, loaded);
     return &.{};
 }
 
-fn reallocationProtocolPeersFromConfig(
+fn reallocationProtocolPeersFromClusterPeers(
     alloc: std.mem.Allocator,
-    cfg: ?*const antfly.common.config.Config,
+    cluster_peers: []const MetadataClusterPeer,
 ) ![]antfly.metadata_service.ReallocationProtocolPeer {
-    const loaded = cfg orelse return &.{};
-    if (loaded.metadata.orchestration_urls.len == 0) return &.{};
-    const peers = try alloc.alloc(
-        antfly.metadata_service.ReallocationProtocolPeer,
-        loaded.metadata.orchestration_urls.len,
-    );
-    for (loaded.metadata.orchestration_urls, 0..) |entry, index| {
+    var count: usize = 0;
+    for (cluster_peers) |peer| count += @intFromBool(peer.orchestration_url != null);
+    if (count == 0) return &.{};
+    const peers = try alloc.alloc(antfly.metadata_service.ReallocationProtocolPeer, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (peers[0..initialized]) |peer| alloc.free(peer.orchestration_url);
+        alloc.free(peers);
+    }
+    var index: usize = 0;
+    for (cluster_peers) |peer| {
+        const orchestration_url = peer.orchestration_url orelse continue;
         peers[index] = .{
-            .node_id = entry.node_id,
-            .orchestration_url = entry.url,
+            .node_id = peer.node_id,
+            .orchestration_url = try alloc.dupe(u8, orchestration_url),
         };
+        initialized += 1;
+        index += 1;
     }
     return peers;
+}
+
+fn freeReallocationProtocolPeers(
+    alloc: std.mem.Allocator,
+    peers: []antfly.metadata_service.ReallocationProtocolPeer,
+) void {
+    for (peers) |peer| alloc.free(peer.orchestration_url);
+    if (peers.len > 0) alloc.free(peers);
+}
+
+fn validateMetadataClusterOrchestrationPeers(
+    cluster_peers: []const MetadataClusterPeer,
+    local_node_id: u64,
+) !void {
+    if (cluster_peers.len <= 1) return;
+    for (cluster_peers) |peer| {
+        if (peer.node_id == local_node_id) continue;
+        const orchestration_url = peer.orchestration_url orelse return error.MissingMetadataOrchestrationPeer;
+        if (orchestration_url.len == 0) return error.MissingMetadataOrchestrationPeer;
+    }
 }
 
 pub fn metadataClusterPeersFromConfig(
@@ -1314,13 +1354,24 @@ pub fn metadataClusterPeersFromConfig(
     var out = try alloc.alloc(MetadataClusterPeer, cfg.metadata.raft_urls.len);
     var initialized: usize = 0;
     errdefer {
-        for (out[0..initialized]) |peer| alloc.free(peer.raft_url);
+        for (out[0..initialized]) |peer| {
+            alloc.free(peer.raft_url);
+            if (peer.orchestration_url) |url| alloc.free(url);
+        }
         alloc.free(out);
     }
     for (cfg.metadata.raft_urls, 0..) |entry, index| {
-        out[index] = .{
-            .node_id = entry.node_id,
-            .raft_url = try alloc.dupe(u8, entry.url),
+        const orchestration_url = metadataOrchestrationPeerUrl(cfg, entry.node_id);
+        out[index] = owned: {
+            const raft_url = try alloc.dupe(u8, entry.url);
+            errdefer alloc.free(raft_url);
+            const owned_orchestration_url = if (orchestration_url) |url| try alloc.dupe(u8, url) else null;
+            errdefer if (owned_orchestration_url) |url| alloc.free(url);
+            break :owned .{
+                .node_id = entry.node_id,
+                .raft_url = raft_url,
+                .orchestration_url = owned_orchestration_url,
+            };
         };
         initialized += 1;
     }
@@ -1348,6 +1399,10 @@ pub fn metadataOrchestrationPeerUrl(
 }
 
 pub fn parseMetadataClusterJson(alloc: std.mem.Allocator, raw: []const u8) ![]MetadataClusterPeer {
+    const ParsedPeerUrls = struct {
+        raft: []const u8,
+        orchestration: ?[]const u8,
+    };
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     const object = switch (parsed.value) {
@@ -1359,19 +1414,41 @@ pub fn parseMetadataClusterJson(alloc: std.mem.Allocator, raw: []const u8) ![]Me
     var out = try alloc.alloc(MetadataClusterPeer, object.count());
     var initialized: usize = 0;
     errdefer {
-        for (out[0..initialized]) |peer| alloc.free(peer.raft_url);
+        for (out[0..initialized]) |peer| {
+            alloc.free(peer.raft_url);
+            if (peer.orchestration_url) |url| alloc.free(url);
+        }
         alloc.free(out);
     }
 
     var it = object.iterator();
     while (it.next()) |entry| {
-        const url = switch (entry.value_ptr.*) {
-            .string => |value| value,
+        const urls: ParsedPeerUrls = switch (entry.value_ptr.*) {
+            .string => |value| .{ .raft = value, .orchestration = @as(?[]const u8, null) },
+            .object => |value| blk: {
+                const raft_value = value.get("raft_url") orelse return error.InvalidArguments;
+                const raft_url = switch (raft_value) {
+                    .string => |url| url,
+                    else => return error.InvalidArguments,
+                };
+                const orchestration_url = if (value.get("orchestration_url")) |orchestration_value| switch (orchestration_value) {
+                    .string => |url| url,
+                    else => return error.InvalidArguments,
+                } else null;
+                break :blk .{ .raft = raft_url, .orchestration = orchestration_url };
+            },
             else => return error.InvalidArguments,
         };
-        out[initialized] = .{
-            .node_id = try parseMetadataNodeId(entry.key_ptr.*),
-            .raft_url = try alloc.dupe(u8, url),
+        out[initialized] = owned: {
+            const raft_url = try alloc.dupe(u8, urls.raft);
+            errdefer alloc.free(raft_url);
+            const orchestration_url = if (urls.orchestration) |url| try alloc.dupe(u8, url) else null;
+            errdefer if (orchestration_url) |url| alloc.free(url);
+            break :owned .{
+                .node_id = try parseMetadataNodeId(entry.key_ptr.*),
+                .raft_url = raft_url,
+                .orchestration_url = orchestration_url,
+            };
         };
         initialized += 1;
     }
@@ -1385,7 +1462,10 @@ fn parseMetadataNodeId(raw: []const u8) !u64 {
 }
 
 pub fn freeMetadataClusterPeers(alloc: std.mem.Allocator, peers: []MetadataClusterPeer) void {
-    for (peers) |peer| alloc.free(peer.raft_url);
+    for (peers) |peer| {
+        alloc.free(peer.raft_url);
+        if (peer.orchestration_url) |url| alloc.free(url);
+    }
     if (peers.len > 0) alloc.free(peers);
 }
 
@@ -1417,7 +1497,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --raft-port <port>             Metadata raft bind port (default: 0)
         \\  --api-host <host>              Metadata admin API bind host (default: raft host)
         \\  --api-port <port>              Metadata admin API bind port (default: 0)
-        \\  --cluster <json>               Metadata raft peer URLs, e.g. {{"1":"http://127.0.0.1:9017"}}
+        \\  --cluster <json>               Metadata peer endpoints, e.g. {{"1":{{"raft_url":"http://127.0.0.1:9017","orchestration_url":"http://127.0.0.1:12377"}}}}
         \\  --health <true|false>          Enable health/metrics server (default: true)
         \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
         \\  --experimental                 Enable experimental A2A protocol surfaces
@@ -1551,6 +1631,66 @@ test "metadata runtime cli accepts experimental flag" {
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expect(cfg.experimental);
+}
+
+test "metadata runtime cluster json carries raft and orchestration endpoints" {
+    const alloc = std.testing.allocator;
+    const peers = try parseMetadataClusterJson(alloc,
+        \\{
+        \\  "1": {
+        \\    "raft_url": "http://127.0.0.1:9017",
+        \\    "orchestration_url": "http://127.0.0.1:12377"
+        \\  },
+        \\  "2": "http://127.0.0.1:9018"
+        \\}
+    );
+    defer freeMetadataClusterPeers(alloc, peers);
+
+    try std.testing.expectEqual(@as(usize, 2), peers.len);
+    var structured: ?MetadataClusterPeer = null;
+    var legacy: ?MetadataClusterPeer = null;
+    for (peers) |peer| {
+        if (peer.node_id == 1) structured = peer;
+        if (peer.node_id == 2) legacy = peer;
+    }
+    try std.testing.expectEqualStrings("http://127.0.0.1:9017", structured.?.raft_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:12377", structured.?.orchestration_url.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9018", legacy.?.raft_url);
+    try std.testing.expect(legacy.?.orchestration_url == null);
+
+    const protocol_peers = try reallocationProtocolPeersFromClusterPeers(alloc, peers);
+    defer freeReallocationProtocolPeers(alloc, protocol_peers);
+    try std.testing.expectEqual(@as(usize, 1), protocol_peers.len);
+    try std.testing.expectEqual(@as(u64, 1), protocol_peers[0].node_id);
+    try std.testing.expectEqualStrings("http://127.0.0.1:12377", protocol_peers[0].orchestration_url);
+
+    try std.testing.expectError(
+        error.MissingMetadataOrchestrationPeer,
+        validateMetadataClusterOrchestrationPeers(peers, 1),
+    );
+    try validateMetadataClusterOrchestrationPeers(peers[0..1], 1);
+
+    var cfg = try antfly.common.config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "metadata": {
+        \\    "orchestration_urls": {
+        \\      "1": "http://127.0.0.1:12377",
+        \\      "2": "http://127.0.0.1:12378"
+        \\    }
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+    const legacy_cluster_json = "{\"1\":\"http://127.0.0.1:9017\",\"2\":\"http://127.0.0.1:9018\"}";
+    const merged_peers = try resolveMetadataClusterPeers(alloc, legacy_cluster_json, &cfg);
+    defer freeMetadataClusterPeers(alloc, merged_peers);
+    try validateMetadataClusterOrchestrationPeers(merged_peers, 1);
+    for (merged_peers) |peer| {
+        try std.testing.expectEqualStrings(
+            if (peer.node_id == 1) "http://127.0.0.1:12377" else "http://127.0.0.1:12378",
+            peer.orchestration_url.?,
+        );
+    }
 }
 
 test "metadata runtime preserves trusted principal auth material bytes" {
