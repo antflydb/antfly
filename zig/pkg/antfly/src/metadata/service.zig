@@ -4491,6 +4491,7 @@ pub const MetadataHttpService = struct {
             const catalog = try self.catalogValidationSnapshotLocked();
             const core = try self.projectedCoreSnapshotLocked();
             const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            snapshot.reallocation_request = try store.getReallocationRequest(self.metadata_group_id);
             snapshot.tables = try cloneProjectedTablesOwned(self.alloc, catalog.tables);
             snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, catalog.ranges);
             snapshot.nodes = try store.listNodes(self.alloc, self.metadata_group_id);
@@ -9978,6 +9979,9 @@ test "metadata service persists and clears reallocation requests" {
     try std.testing.expect(requested != null);
     try std.testing.expect(requested.?.request_id != 0);
     try std.testing.expectEqual(@as(u64, 77_000), requested.?.requested_at_ms);
+    var requested_snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&requested_snapshot);
+    try std.testing.expectEqual(requested, requested_snapshot.reallocation_request);
 
     var stale_plan = metadata_reconciler.ReconciliationPlan.empty();
     stale_plan.clear_reallocation_request = requested.?.request_id;
@@ -12070,6 +12074,13 @@ test "metadata http service catalog cache is independent from volatile projectio
     defer svc.freeProjectedTables(std.testing.allocator, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
     try std.testing.expectEqual(catalog_epoch_after, svc.catalog_validation_cache.catalog_epoch);
+
+    try svc.requestReallocation(77_000);
+    try svc.runRound();
+    var admin_snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&admin_snapshot);
+    try std.testing.expect(admin_snapshot.reallocation_request != null);
+    try std.testing.expectEqual(@as(u64, 77_000), admin_snapshot.reallocation_request.?.requested_at_ms);
 }
 
 test "metadata http service linearizable read waits for leader discovery" {

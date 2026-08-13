@@ -3869,6 +3869,8 @@ pub const DataServer = struct {
     last_data_raft_reconciled_metadata_epoch: ?u64 = null,
     last_data_raft_storage_ownership_fingerprint: ?u64 = null,
     last_data_raft_status_fingerprint: ?u64 = null,
+    reallocation_request_observation_mutex: std.atomic.Mutex = .unlocked,
+    last_observed_reallocation_request_id: ?u128 = null,
     provision_ticks: usize = 0,
     last_provision_fingerprint: ?u64 = null,
     last_provision_metadata_epoch: ?u64 = null,
@@ -7324,6 +7326,34 @@ pub const DataServer = struct {
         self.markStoreStatusDirtyImmediate();
     }
 
+    fn observeReallocationRequest(
+        self: *DataServer,
+        request: ?antfly.metadata.ReallocationRequestRecord,
+    ) void {
+        const request_id = if (request) |record| record.request_id else null;
+        const changed = changed: {
+            lockAtomic(&self.reallocation_request_observation_mutex);
+            defer self.reallocation_request_observation_mutex.unlock();
+            if (request_id == null) {
+                self.last_observed_reallocation_request_id = null;
+                break :changed false;
+            }
+            if (self.last_observed_reallocation_request_id != null and
+                self.last_observed_reallocation_request_id.? == request_id.?)
+            {
+                break :changed false;
+            }
+            self.last_observed_reallocation_request_id = request_id;
+            break :changed true;
+        };
+        if (!changed) return;
+        // A forced split/merge scan must be based on observations produced
+        // after its durable request. Refresh exactly once per request instead
+        // of coupling operator latency to the normal 60-second cache TTL.
+        self.invalidateLocalGroupStatusCache();
+        self.markStoreStatusDirtyImmediate();
+    }
+
     fn markRuntimeStatusDirty(
         self: *DataServer,
         table_name: []const u8,
@@ -9733,6 +9763,7 @@ pub const DataServer = struct {
             registration.node_id,
             registration.store_id,
         );
+        annotateReallocationRequestObservation(group_statuses, snapshot.reallocation_request);
         const runtime_statuses = try self.collectStoreRuntimeStatusReports(
             self.alloc,
             local_group_ids,
@@ -9825,6 +9856,7 @@ pub const DataServer = struct {
     }
 
     fn syncDataRaftFromSnapshot(self: *DataServer, snapshot: *const antfly.metadata_api.AdminSnapshot) !void {
+        self.observeReallocationRequest(snapshot.reallocation_request);
         const raft = self.data_raft orelse return;
         const factory = self.data_raft_factory orelse return;
         const registration = self.store_registration orelse return;
@@ -14161,6 +14193,7 @@ fn remoteGroupReadyForTableLifecycle(
 fn cloneAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: antfly.metadata_api.AdminSnapshot) !antfly.metadata_api.AdminSnapshot {
     return .{
         .status = snapshot.status,
+        .reallocation_request = snapshot.reallocation_request,
         .tables = try cloneTablesOwned(alloc, snapshot.tables),
         .ranges = try cloneRangesOwned(alloc, snapshot.ranges),
         .stores = try cloneStoresOwned(alloc, snapshot.stores),
@@ -14180,6 +14213,21 @@ fn cloneAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: antfly.metadata_a
         .merge_observations = try cloneMergeObservationsOwned(alloc, snapshot.merge_observations),
         .merged_group_statuses = try cloneMergedGroupStatusesOwned(alloc, snapshot.merged_group_statuses),
     };
+}
+
+fn annotateReallocationRequestObservation(
+    statuses: []antfly.metadata.table_manager.GroupStatusReport,
+    request: ?antfly.metadata.ReallocationRequestRecord,
+) void {
+    const record = request orelse return;
+    for (statuses) |*status| {
+        // Unknown-size Raft fallbacks are deliberately not allowed to
+        // acknowledge the scan; the background refresh will publish
+        // authoritative size evidence with this request ID.
+        if (status.disk_bytes_known) {
+            status.observed_reallocation_request_id = record.request_id;
+        }
+    }
 }
 
 fn localGroupStatusFingerprint(
@@ -17524,6 +17572,67 @@ test "data runtime raft status changes force immediate store status publication"
     server.observeDataRaftStatusFingerprint(12);
     try std.testing.expect(server.store_status_dirty.load(.acquire));
     try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks.load(.acquire));
+}
+
+test "data runtime reallocation request refreshes group status once per request" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-reallocation-status-refresh", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root_dir);
+
+    var server: DataServer = .{
+        .alloc = std.testing.allocator,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(std.testing.allocator),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    const initial_generation = server.local_group_status_generation.load(.acquire);
+    try server.storeCachedLocalGroupStatuses(initial_generation, 99, &.{});
+    server.store_status_dirty.store(false, .release);
+    server.store_status_ticks.store(0, .release);
+
+    const request: antfly.metadata.ReallocationRequestRecord = .{
+        .request_id = 123,
+        .requested_at_ms = 456,
+    };
+    server.observeReallocationRequest(request);
+    const request_generation = server.local_group_status_generation.load(.acquire);
+    try std.testing.expectEqual(initial_generation + 1, request_generation);
+    try std.testing.expect(server.localGroupStatusCacheStale(@intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms))));
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
+    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks.load(.acquire));
+
+    server.store_status_dirty.store(false, .release);
+    server.store_status_ticks.store(0, .release);
+    server.observeReallocationRequest(request);
+    try std.testing.expectEqual(request_generation, server.local_group_status_generation.load(.acquire));
+    try std.testing.expect(!server.store_status_dirty.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.store_status_ticks.load(.acquire));
+
+    server.observeReallocationRequest(null);
+    try std.testing.expectEqual(request_generation, server.local_group_status_generation.load(.acquire));
+
+    var statuses = [_]antfly.metadata.table_manager.GroupStatusReport{
+        .{ .group_id = 1, .disk_bytes_known = true },
+        .{ .group_id = 2, .disk_bytes_known = false },
+    };
+    annotateReallocationRequestObservation(&statuses, request);
+    try std.testing.expectEqual(@as(u128, 123), statuses[0].observed_reallocation_request_id);
+    try std.testing.expectEqual(@as(u128, 0), statuses[1].observed_reallocation_request_id);
 }
 
 test "data runtime local split fallback preserves source identity namespace" {

@@ -29,6 +29,7 @@ const backups_api = @import("../api/backups.zig");
 const http_route_helpers = @import("../api/http_route_helpers.zig");
 const indexes_api = @import("../api/indexes.zig");
 const tables_api = @import("../api/tables.zig");
+const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const routes = @import("http_routes.zig");
 const service = @import("service.zig");
@@ -634,7 +635,7 @@ pub const AdminSource = struct {
 
     fn metadataServiceTriggerReallocate(ptr: *anyopaque) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        try svc.requestReallocation(@intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)));
+        try svc.requestReallocation(platform_clock.Clock.real().nowRealtimeMs());
         try flushMetadataServiceMutation(svc);
     }
 
@@ -963,7 +964,7 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceTriggerReallocate(ptr: *anyopaque) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try svc.requestReallocation(@intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)));
+        try svc.requestReallocation(platform_clock.Clock.real().nowRealtimeMs());
         try flushMetadataHttpServiceMutation(svc);
     }
 
