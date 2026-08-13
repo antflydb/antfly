@@ -4188,7 +4188,11 @@ pub const ModelManager = struct {
                 const plan = if (artifact_estimate == .onnx)
                     onnxModelLoadAdmission(artifact_bytes, backend_runtime)
                 else
-                    nativeModelLoadAdmission(artifact_bytes, backend_runtime.backend);
+                    nativeModelLoadAdmission(
+                        artifact_bytes,
+                        backend_runtime.backend,
+                        artifact_estimate.extraBackendResidentBytes(backend_runtime.backend),
+                    );
                 const admission_plan = plan catch |err| {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
@@ -5964,6 +5968,17 @@ const ComponentArtifactEstimate = union(enum) {
             .native => |man| estimateModelArtifactBytes(man, backend),
         };
     }
+
+    fn extraBackendResidentBytes(
+        self: *const ComponentArtifactEstimate,
+        backend: backends.BackendType,
+    ) usize {
+        if (backend != .metal) return 0;
+        return switch (self.*) {
+            .native => |man| session_factory.metalDebertaRerankerFastPathReservationBytes(man),
+            .disabled, .onnx => 0,
+        };
+    }
 };
 
 test "tokenizer admission reserves parse peak and retains live structures" {
@@ -6052,7 +6067,11 @@ fn estimateModelLoadAdmission(
     const weights = try estimateModelArtifactBytes(man, backend_runtime.backend);
     const uses_onnx_artifact = backend_runtime.backend == .onnx or !manifestHasNativeAssets(man);
     if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend_runtime);
-    return nativeModelLoadAdmission(weights, backend_runtime.backend);
+    const extra_backend_resident_bytes = if (backend_runtime.backend == .metal)
+        session_factory.metalDebertaRerankerFastPathReservationBytes(man)
+    else
+        0;
+    return nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident_bytes);
 }
 
 fn onnxModelLoadAdmission(
@@ -6108,17 +6127,25 @@ fn onnxModelLoadAdmission(
 fn nativeModelLoadAdmission(
     weights: usize,
     backend: backends.BackendType,
+    extra_backend_resident_bytes: usize,
 ) !ModelLoadAdmissionPlan {
     return switch (backend) {
-        .metal => .{
-            .peak = .{
-                // Device weights plus conservative host-side import/repacking staging.
-                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.metal, weights),
-                .host_weight_bytes = weights / 4,
-            },
-            .resident = .{
-                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.metal, weights),
-            },
+        .metal => blk: {
+            const encoded_resident = try session_factory.estimateBackendWeightResidencyBytes(.metal, weights);
+            const backend_resident = std.math.add(
+                usize,
+                encoded_resident,
+                extra_backend_resident_bytes,
+            ) catch return error.ResourceLimitExceeded;
+            break :blk .{
+                .peak = .{
+                    // Device weights plus persistent architecture fast-path
+                    // allocations and conservative host import/repacking staging.
+                    .backend_weight_bytes = backend_resident,
+                    .host_weight_bytes = weights / 4,
+                },
+                .resident = .{ .backend_weight_bytes = backend_resident },
+            };
         },
         .cuda => .{
             .peak = .{
@@ -7429,7 +7456,7 @@ test "component loader rejects paths outside its validated plan" {
 
 test "cuda model admission includes full native staging peak" {
     const weights: usize = 1024 * 1024;
-    const cuda = try nativeModelLoadAdmission(weights, .cuda);
+    const cuda = try nativeModelLoadAdmission(weights, .cuda, 0);
     try std.testing.expectEqual(weights, cuda.peak.host_weight_bytes);
     try std.testing.expect(cuda.peak.backend_weight_bytes >= weights);
     try std.testing.expectEqual(@as(usize, 0), cuda.resident.host_weight_bytes);
@@ -7438,11 +7465,12 @@ test "cuda model admission includes full native staging peak" {
         cuda.resident.backend_weight_bytes,
     );
 
-    const metal = try nativeModelLoadAdmission(weights, .metal);
+    const extra_backend_resident_bytes: usize = 384 * 1024;
+    const metal = try nativeModelLoadAdmission(weights, .metal, extra_backend_resident_bytes);
     try std.testing.expectEqual(weights / 4, metal.peak.host_weight_bytes);
-    try std.testing.expectEqual(weights, metal.peak.backend_weight_bytes);
+    try std.testing.expectEqual(weights + extra_backend_resident_bytes, metal.peak.backend_weight_bytes);
     try std.testing.expectEqual(@as(usize, 0), metal.resident.host_weight_bytes);
-    try std.testing.expectEqual(weights, metal.resident.backend_weight_bytes);
+    try std.testing.expectEqual(weights + extra_backend_resident_bytes, metal.resident.backend_weight_bytes);
 }
 
 test "onnx admission separates encoded staging from completed residency" {
@@ -7500,6 +7528,7 @@ test "directory-backed component admission charges native model artifacts" {
     const plan = try nativeModelLoadAdmission(
         try estimate.bytesForBackend(.native),
         .native,
+        0,
     );
     try std.testing.expectEqual(@as(usize, weight_bytes), plan.resident.host_weight_bytes);
 }

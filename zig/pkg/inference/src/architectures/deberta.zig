@@ -123,6 +123,7 @@ fn debertaDenseMirrorBytes(config: Config, bytes_per_element: usize) ?usize {
 
 const DebertaMirrorPreference = struct {
     enabled: bool,
+    reservation_bytes: usize,
     prefer_q8: bool,
     prefer_bf16: bool,
     prefer_f32_mps: bool,
@@ -141,11 +142,55 @@ fn debertaMirrorPreference(config: Config, prefer_weight_mirrors: bool) DebertaM
     const enabled = requested and mirror_bytes <= metalDebertaWeightMirrorMaxBytes();
     return .{
         .enabled = enabled,
+        .reservation_bytes = if (enabled) mirror_bytes else 0,
         .prefer_q8 = enabled and prefer_q8,
         .prefer_bf16 = enabled and !prefer_q8 and prefer_bf16_requested,
         .prefer_f32_mps = enabled and !prefer_q8 and !prefer_bf16_requested and prefer_f32_requested,
         .prefer_f16_mps = enabled and !prefer_q8 and !prefer_bf16_requested and !prefer_f32_requested,
     };
+}
+
+pub fn densePackReservationBytes(config: Config, bytes_per_element: usize) ?usize {
+    const layers: usize = @intCast(config.num_hidden_layers);
+    const hidden: usize = @intCast(config.hidden_size);
+    const hidden_squared = std.math.mul(usize, hidden, hidden) catch return null;
+    const qkv_weights = std.math.mul(usize, hidden_squared, 3) catch return null;
+    const pair_weights = std.math.mul(usize, hidden_squared, 2) catch return null;
+    const packed_weights = std.math.mul(
+        usize,
+        std.math.add(usize, qkv_weights, pair_weights) catch return null,
+        bytes_per_element,
+    ) catch return null;
+    const packed_biases = std.math.mul(usize, hidden, 5 * @sizeOf(f32)) catch return null;
+    const bytes_per_layer = std.math.add(usize, packed_weights, packed_biases) catch return null;
+    return std.math.mul(usize, bytes_per_layer, layers) catch null;
+}
+
+/// Return all persistent Metal allocations that must be admitted before a
+/// session can opt into DeBERTa's mirrored MPS path: dense mirrors plus the
+/// QKV and relative Q/K packed caches those mirrors enable. Keep this derived
+/// from the same policy as runtime preparation so admission and allocation
+/// cannot silently disagree about the kill switch, precision, or byte cap.
+pub fn metalRerankerFastPathReservationBytes(config: Config, prefer_weight_mirrors: bool) usize {
+    const mirrors = debertaMirrorPreference(config, prefer_weight_mirrors);
+    if (!mirrors.enabled) return 0;
+
+    const pack_bytes = if (mirrors.prefer_f16_mps)
+        densePackReservationBytes(config, @sizeOf(u16)) orelse std.math.maxInt(usize)
+    else if (mirrors.prefer_f32_mps)
+        densePackReservationBytes(config, @sizeOf(f32)) orelse std.math.maxInt(usize)
+    else
+        0;
+    return std.math.add(usize, mirrors.reservation_bytes, pack_bytes) catch std.math.maxInt(usize);
+}
+
+test "DeBERTa dense pack reservation covers QKV and relative QK caches" {
+    const config = Config{ .hidden_size = 64, .num_hidden_layers = 2 };
+    const expected_per_layer = 5 * 64 * 64 * @sizeOf(u16) + 5 * 64 * @sizeOf(f32);
+    try std.testing.expectEqual(
+        @as(?usize, 2 * expected_per_layer),
+        densePackReservationBytes(config, @sizeOf(u16)),
+    );
 }
 
 const DebertaLinearSlotKind = enum(usize) {
