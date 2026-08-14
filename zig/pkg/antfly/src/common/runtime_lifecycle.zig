@@ -15,6 +15,86 @@ const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 
+const shutdown_watchdog_poll_ns: u64 = 10 * std.time.ns_per_ms;
+
+const WindowsSleep = if (@import("builtin").os.tag == .windows) struct {
+    extern "kernel32" fn Sleep(timeout_ms: u32) callconv(.winapi) void;
+} else struct {};
+
+fn sleepWatchdog(ns: u64) void {
+    if (comptime @import("builtin").os.tag == .windows) {
+        const ms = @max(@as(u64, 1), @divFloor(ns +| std.time.ns_per_ms - 1, std.time.ns_per_ms));
+        WindowsSleep.Sleep(@intCast(@min(ms, @as(u64, std.math.maxInt(u32)))));
+        return;
+    }
+    var req = std.posix.timespec{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => return,
+    };
+}
+
+/// Last-resort process termination is deliberately independent of every
+/// `std.Io` executor being drained. A stuck task can consume or deadlock those
+/// executors, so scheduling the deadline on one of them would make the
+/// deadline advisory precisely when it is needed.
+const ShutdownWatchdog = struct {
+    const State = enum(u8) { idle, armed, disarmed, expired };
+    const Expiration = struct {
+        context: ?*anyopaque = null,
+        run: *const fn (?*anyopaque) void = terminateProcess,
+
+        fn terminateProcess(_: ?*anyopaque) void {
+            // Do not run destructors after the graceful deadline: they may
+            // free memory still referenced by the task that failed to drain.
+            std.process.exit(1);
+        }
+    };
+
+    state: std.atomic.Value(State) = .init(.idle),
+    deadline_ns: u64 = 0,
+    expiration: Expiration = .{},
+    thread: ?std.Thread = null,
+
+    fn arm(self: *ShutdownWatchdog, deadline: ShutdownDeadline) void {
+        std.debug.assert(self.thread == null);
+        std.debug.assert(self.state.load(.acquire) == .idle);
+        self.deadline_ns = deadline.deadline_ns;
+        self.state.store(.armed, .release);
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch {
+            // Without an executor-independent watchdog the promised hard
+            // deadline cannot be upheld. Failing immediately is safer than
+            // entering teardown with an unbounded or use-after-free outcome.
+            self.expiration.run(self.expiration.context);
+            unreachable;
+        };
+    }
+
+    fn disarm(self: *ShutdownWatchdog) void {
+        const previous = self.state.swap(.disarmed, .acq_rel);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        if (previous == .idle) self.state.store(.disarmed, .release);
+    }
+
+    fn run(self: *ShutdownWatchdog) void {
+        while (self.state.load(.acquire) == .armed) {
+            const now: u64 = @intCast(@max(platform_time.monotonicNs(), 0));
+            if (now >= self.deadline_ns) {
+                if (self.state.cmpxchgStrong(.armed, .expired, .acq_rel, .acquire) == null) {
+                    self.expiration.run(self.expiration.context);
+                }
+                return;
+            }
+            sleepWatchdog(@min(self.deadline_ns - now, shutdown_watchdog_poll_ns));
+        }
+    }
+};
+
 var process_signal_requested: std.atomic.Value(bool) = .init(false);
 
 fn processSignalHandler(_: std.posix.SIG) callconv(.c) void {
@@ -46,6 +126,10 @@ pub const ProcessSignalScope = struct {
 
     pub fn cancellationRequested(_: *const ProcessSignalScope) bool {
         return process_signal_requested.load(.acquire);
+    }
+
+    pub fn token(_: *const ProcessSignalScope) CancellationToken {
+        return .{ .cancelled = &process_signal_requested };
     }
 
     pub fn deinit(self: *ProcessSignalScope) void {
@@ -135,6 +219,7 @@ pub const RuntimeSupervisor = struct {
     first_failure: ?Failure = null,
     shutdown_timeout_ms: u64,
     shutdown_deadline: ?ShutdownDeadline = null,
+    shutdown_watchdog: ShutdownWatchdog = .{},
 
     pub fn init(shutdown_timeout_ms: u64) RuntimeSupervisor {
         return .{ .shutdown_timeout_ms = shutdown_timeout_ms };
@@ -205,10 +290,21 @@ pub const RuntimeSupervisor = struct {
     /// The process owner is the sole caller during ordered teardown, so the
     /// lazy deadline slot requires no additional synchronization.
     pub fn deadline(self: *RuntimeSupervisor) ShutdownDeadline {
-        return ShutdownDeadline.shared(&self.shutdown_deadline, self.shutdown_timeout_ms);
+        const deadline_value = ShutdownDeadline.shared(&self.shutdown_deadline, self.shutdown_timeout_ms);
+        if (self.shutdown_watchdog.state.load(.acquire) == .idle)
+            self.shutdown_watchdog.arm(deadline_value);
+        return deadline_value;
+    }
+
+    /// Startup uses the same configured budget without arming the hard
+    /// teardown watchdog. A healthy process must not be terminated merely
+    /// because its listener became ready near the end of startup.
+    pub fn startupDeadline(self: *const RuntimeSupervisor) ShutdownDeadline {
+        return ShutdownDeadline.afterMilliseconds(self.shutdown_timeout_ms);
     }
 
     pub fn markStopped(self: *RuntimeSupervisor) void {
+        self.shutdown_watchdog.disarm();
         self.cancellation.cancel();
         self.state.store(.stopped, .release);
     }
@@ -224,6 +320,16 @@ pub const HttpServerLifecycle = struct {
     server: ?*httpx.Server = null,
     failure: anyerror = error.Unexpected,
     cancellation: CancellationSource = .{},
+    startup_io: std.Io,
+    startup_event: std.Io.Event = .unset,
+
+    pub fn init(startup_io: std.Io) HttpServerLifecycle {
+        return .{ .startup_io = startup_io };
+    }
+
+    fn publishStartupTerminal(self: *HttpServerLifecycle) void {
+        self.startup_event.set(self.startup_io);
+    }
 
     /// Attaches the concrete listener only while startup still owns the
     /// lifecycle. A stop that wins this race is terminal, so a late listener
@@ -253,6 +359,7 @@ pub const HttpServerLifecycle = struct {
         defer self.mutex.unlock();
         if (self.state.load(.monotonic) != .starting) return error.ServerStopped;
         self.state.store(.ready, .release);
+        self.publishStartupTerminal();
     }
 
     pub fn publishFailure(self: *HttpServerLifecycle, err: anyerror) void {
@@ -263,8 +370,12 @@ pub const HttpServerLifecycle = struct {
                 self.failure = err;
                 self.cancellation.cancel();
                 self.state.store(.failed, .release);
+                self.publishStartupTerminal();
             },
-            .stopping => self.state.store(.stopped, .release),
+            .stopping => {
+                self.state.store(.stopped, .release);
+                self.publishStartupTerminal();
+            },
             .failed, .stopped => {},
         }
     }
@@ -273,18 +384,43 @@ pub const HttpServerLifecycle = struct {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         switch (self.state.load(.monotonic)) {
-            .starting, .ready, .stopping => self.state.store(.stopped, .release),
+            .starting, .ready, .stopping => {
+                self.state.store(.stopped, .release);
+                self.publishStartupTerminal();
+            },
             .failed, .stopped => {},
         }
     }
 
-    pub fn waitForStartup(self: *HttpServerLifecycle) !void {
-        while (true) switch (self.state.load(.acquire)) {
-            .starting => std.Thread.yield() catch {},
-            .ready => return,
-            .failed => return self.failure,
-            .stopping, .stopped => return error.ServerStopped,
-        };
+    pub fn waitForStartup(
+        self: *HttpServerLifecycle,
+        deadline: ShutdownDeadline,
+        external_cancellation: CancellationToken,
+    ) !void {
+        while (true) {
+            switch (self.state.load(.acquire)) {
+                .starting => {},
+                .ready => return,
+                .failed => return self.failure,
+                .stopping, .stopped => return error.ServerStopped,
+            }
+            if (external_cancellation.isCancelled()) {
+                self.stop();
+                return error.Cancelled;
+            }
+            const remaining_ms = deadline.remainingMilliseconds();
+            if (remaining_ms == 0) {
+                self.stop();
+                return error.StartupTimeout;
+            }
+            self.startup_event.waitTimeout(self.startup_io, .{ .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(@intCast(@min(remaining_ms, 25))),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return error.Canceled,
+            };
+        }
     }
 
     pub fn runtimeFailure(self: *HttpServerLifecycle) ?anyerror {
@@ -314,7 +450,10 @@ pub const HttpServerLifecycle = struct {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         switch (self.state.load(.monotonic)) {
-            .starting, .ready => self.state.store(.stopping, .release),
+            .starting, .ready => {
+                self.state.store(.stopping, .release);
+                self.publishStartupTerminal();
+            },
             .failed, .stopped => return,
             .stopping => {},
         }
@@ -326,7 +465,10 @@ pub const HttpServerLifecycle = struct {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         switch (self.state.load(.monotonic)) {
-            .starting, .ready => self.state.store(.stopping, .release),
+            .starting, .ready => {
+                self.state.store(.stopping, .release);
+                self.publishStartupTerminal();
+            },
             .failed, .stopped => return,
             .stopping => {},
         }
@@ -335,7 +477,7 @@ pub const HttpServerLifecycle = struct {
 };
 
 test "runtime lifecycle cancellation and shutdown deadline share state" {
-    var lifecycle = HttpServerLifecycle{};
+    var lifecycle = HttpServerLifecycle.init(std.testing.io);
     const token = lifecycle.token();
     try std.testing.expect(!token.isCancelled());
     lifecycle.stop();
@@ -352,8 +494,49 @@ test "runtime lifecycle cancellation and shutdown deadline share state" {
     try std.testing.expectEqual(first.deadline_ns, second.deadline_ns);
 }
 
+test "http lifecycle startup wait observes event cancellation and timeout" {
+    var ready = HttpServerLifecycle.init(std.testing.io);
+    try ready.publishReady();
+    var inactive = CancellationSource{};
+    try ready.waitForStartup(ShutdownDeadline.afterMilliseconds(100), inactive.token());
+
+    var canceled = HttpServerLifecycle.init(std.testing.io);
+    var cancellation = CancellationSource{};
+    cancellation.cancel();
+    try std.testing.expectError(
+        error.Cancelled,
+        canceled.waitForStartup(ShutdownDeadline.afterMilliseconds(100), cancellation.token()),
+    );
+    try std.testing.expectEqual(HttpServerLifecycle.State.stopping, canceled.currentState());
+
+    var timed_out = HttpServerLifecycle.init(std.testing.io);
+    try std.testing.expectError(
+        error.StartupTimeout,
+        timed_out.waitForStartup(ShutdownDeadline.afterMilliseconds(0), inactive.token()),
+    );
+    try std.testing.expectEqual(HttpServerLifecycle.State.stopping, timed_out.currentState());
+}
+
+test "http lifecycle startup wait parks until publication" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var lifecycle = HttpServerLifecycle.init(io);
+    const Publisher = struct {
+        fn run(publisher_io: std.Io, target: *HttpServerLifecycle) !void {
+            try publisher_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            try target.publishReady();
+        }
+    };
+    var publisher = try io.concurrent(Publisher.run, .{ io, &lifecycle });
+    defer _ = publisher.await(io) catch {};
+    var inactive = CancellationSource{};
+    try lifecycle.waitForStartup(ShutdownDeadline.afterMilliseconds(1_000), inactive.token());
+    try std.testing.expectEqual(HttpServerLifecycle.State.ready, lifecycle.currentState());
+}
+
 test "http lifecycle stop cannot be overwritten by ready or failure" {
-    var lifecycle = HttpServerLifecycle{};
+    var lifecycle = HttpServerLifecycle.init(std.testing.io);
     lifecycle.stop();
     try std.testing.expectEqual(HttpServerLifecycle.State.stopping, lifecycle.currentState());
     try std.testing.expectError(error.ServerStopped, lifecycle.publishReady());
@@ -363,7 +546,7 @@ test "http lifecycle stop cannot be overwritten by ready or failure" {
 }
 
 test "http lifecycle rejects a listener that attaches after stop" {
-    var lifecycle = HttpServerLifecycle{};
+    var lifecycle = HttpServerLifecycle.init(std.testing.io);
     lifecycle.stop();
     var server = httpx.Server.init(std.testing.allocator, std.testing.io);
     defer server.deinit();
@@ -373,7 +556,7 @@ test "http lifecycle rejects a listener that attaches after stop" {
 }
 
 test "http lifecycle retains its first terminal failure" {
-    var lifecycle = HttpServerLifecycle{};
+    var lifecycle = HttpServerLifecycle.init(std.testing.io);
     lifecycle.publishFailure(error.AddressInUse);
     lifecycle.publishFailure(error.ConnectionRefused);
     lifecycle.publishStopped();
@@ -382,7 +565,7 @@ test "http lifecycle retains its first terminal failure" {
 }
 
 test "runtime lifecycle supervisor retains first failure and one shutdown deadline" {
-    var supervisor = RuntimeSupervisor.init(100);
+    var supervisor = RuntimeSupervisor.init(10_000);
     try supervisor.publishReady();
     try std.testing.expectEqual(RuntimeSupervisor.State.ready, supervisor.currentState());
     try std.testing.expect(!supervisor.shouldStop(false));
@@ -403,4 +586,26 @@ test "runtime lifecycle supervisor retains first failure and one shutdown deadli
     try std.testing.expectEqual(first_deadline.deadline_ns, second_deadline.deadline_ns);
     supervisor.markStopped();
     try std.testing.expectEqual(RuntimeSupervisor.State.stopped, supervisor.currentState());
+}
+
+test "runtime supervisor hard deadline expires outside std Io" {
+    const ExpirationState = struct {
+        fired: std.atomic.Value(bool) = .init(false),
+
+        fn expire(raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+            self.fired.store(true, .release);
+        }
+    };
+
+    var expiration = ExpirationState{};
+    var supervisor = RuntimeSupervisor.init(1);
+    supervisor.shutdown_watchdog.expiration = .{
+        .context = &expiration,
+        .run = ExpirationState.expire,
+    };
+    _ = supervisor.deadline();
+    while (!expiration.fired.load(.acquire)) sleepWatchdog(std.time.ns_per_ms);
+    try std.testing.expectEqual(ShutdownWatchdog.State.expired, supervisor.shutdown_watchdog.state.load(.acquire));
+    supervisor.markStopped();
 }

@@ -3551,6 +3551,7 @@ pub fn build(b: *std.Build) void {
         "linked transport admits a streaming body before the kernel pulls it",
         "linked callbacks preserve streaming and cancellation semantics",
         "outbound stream callbacks preserve terminal status classes",
+        "outbound callbacks prefer cancellation that arrives during transport IO",
         "linked request bodies remain lazy and transport neutral",
         "native executor borrows validate before reconstructing std.Io",
         "httpx production path sheds 128 abandoned queries and preserves control recovery",

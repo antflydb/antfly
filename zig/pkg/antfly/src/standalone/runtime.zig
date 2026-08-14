@@ -2202,7 +2202,7 @@ pub fn runFromIterator(
 
     var unified_api_ready = std.atomic.Value(bool).init(false);
 
-    var unified_lifecycle = UnifiedServerLifecycle{};
+    var unified_lifecycle = UnifiedServerLifecycle.init(control_io);
     const public_http_config = publicHttpServerConfig(bind_host, bind_port);
     var http_runtime = httpx.HttpRuntime.init(alloc, .{
         .max_active_h1_requests = public_http_config.max_connections,
@@ -2275,7 +2275,7 @@ pub fn runFromIterator(
         unified_lifecycle.stop();
         _ = unified_future.await(control_io);
     };
-    unified_lifecycle.waitForStartup() catch |err| {
+    unified_lifecycle.waitForStartup(supervisor.startupDeadline(), termination_signals.token()) catch |err| {
         std.log.err("standalone startup failed step=bind_unified_http err={}", .{err});
         return err;
     };
@@ -7002,9 +7002,16 @@ test "standalone metadata finalizes schema migration from resident runtime evide
 }
 
 test "standalone unified server lifecycle propagates startup failure" {
-    var lifecycle = UnifiedServerLifecycle{};
+    var lifecycle = UnifiedServerLifecycle.init(std.testing.io);
     lifecycle.publishFailure(error.AddressInUse);
-    try std.testing.expectError(error.AddressInUse, lifecycle.waitForStartup());
+    var cancellation = antfly.common.runtime_lifecycle.CancellationSource{};
+    try std.testing.expectError(
+        error.AddressInUse,
+        lifecycle.waitForStartup(
+            antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(100),
+            cancellation.token(),
+        ),
+    );
     try std.testing.expectEqual(error.AddressInUse, lifecycle.runtimeFailure().?);
 }
 

@@ -471,6 +471,15 @@ and inference should share the same SIGINT/SIGTERM-to-cancellation mechanism
 rather than maintaining role-specific globals or infinite loops that bypass
 deferred cleanup.
 
+Listener startup is also a supervised operation. The task that owns the
+listener publishes its first terminal startup transition through a
+`std.Io.Event`; the process owner waits on that event with both the startup
+deadline and the process-signal cancellation token. Readiness, bind failure,
+explicit stop, cancellation, and timeout are therefore observable without a
+`std.Thread.yield` polling loop. The event is only the notification mechanism;
+the lifecycle state remains the source of truth, so publication and stop races
+have one monotonic outcome.
+
 ## Structured task ownership
 
 Every long-lived task must be represented by an owned `std.Io.Future`,
@@ -891,9 +900,19 @@ A production shutdown sequence is:
 11. Release executor leases and destroy executors last.
 
 Every phase receives the remaining time until the shared deadline. If graceful
-shutdown expires, the supervisor escalates to cancellation and then controlled
-process termination. It must not deinitialize memory still referenced by a
-stuck task.
+shutdown expires, the supervisor escalates to cancellation and then process
+termination. It must not deinitialize memory still referenced by a stuck task.
+
+The first request for the shared shutdown deadline arms one hard watchdog for
+that absolute timestamp. Clean completion disarms and joins it before the
+supervisor becomes stopped. The watchdog deliberately uses one owned OS thread,
+not a task on `std.Io`: it must remain schedulable when the executors it is
+policing are saturated, deadlocked, or occupied by non-cooperative work. It is
+created only during teardown, sleeps against the platform monotonic clock, and
+is not a general runtime lane. If the deadline wins, it exits immediately
+without running destructors, because a task that failed to drain may still hold
+those objects. This makes the process deadline a hard lifetime bound rather
+than an advisory timeout followed by an unbounded join.
 
 ## End-to-end cancellation
 
@@ -931,6 +950,14 @@ the stream or connection without emitting a status and records
 meaning and avoids misleading 500 logs. `error.DeadlineExceeded` remains a 504
 before commitment. After a response is committed, either outcome closes/resets
 the transport because a second status line is impossible.
+
+Linked-runtime body and response callbacks check the same semantic token both
+before blocking transport I/O and after a failed read, stream start, write, or
+close. Cancellation can arrive while the callback is blocked and commonly
+wakes it as `StreamReset` or `ConnectionClosed`; when both facts are present,
+cancellation takes precedence. This preserves response-free cancellation
+instead of translating a cancellation-induced transport error into a generic
+handler failure or 500.
 
 The universal representation is a borrowed `(context, is_cancelled)` callback.
 Atomic values are adapters used by concrete listener, lifecycle, or test
