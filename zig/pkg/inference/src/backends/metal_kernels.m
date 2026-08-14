@@ -14375,10 +14375,11 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
             generated_pipeline = runtime->antfly_q8_k_small_batch_pipeline;
         } else if (use_antfly_q4_k_small_batch) {
             runtime->antfly_q4_k_small_batch_dispatches += 1;
-            if (use_florence_q4_k_mm_matrix) runtime->florence_q4_k_mm_matrix_dispatches += 1;
-            if (use_florence_q4_k_mm_nr4) runtime->florence_q4_k_mm_nr4_dispatches += 1;
             if (exact_q4_k != NULL) {
                 termite_metal_jit_exact_dispatch_record(runtime, TERMITE_METAL_JIT_SLOT_Q4_K);
+            } else {
+                if (use_florence_q4_k_mm_matrix) runtime->florence_q4_k_mm_matrix_dispatches += 1;
+                if (use_florence_q4_k_mm_nr4) runtime->florence_q4_k_mm_nr4_dispatches += 1;
             }
             generated_pipeline = exact_q4_k != NULL
                 ? exact_q4_k->pipeline
