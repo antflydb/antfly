@@ -3935,6 +3935,7 @@ pub fn build(b: *std.Build) void {
             "io threaded applied callback observes published watermark outside runtime lock",
             "io threaded wait observes worker-owned catch-up close",
             "io threaded wait requests prompt worker catch-up close",
+            "io threaded wait observes failed worker-owned catch-up close",
         }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
