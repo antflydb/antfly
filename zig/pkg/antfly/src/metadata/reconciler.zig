@@ -876,6 +876,13 @@ pub const Reconciler = struct {
                         if (require_conclusive_scan) planning_conclusive = false;
                         continue;
                     }
+                    if (require_conclusive_scan and
+                        (!evidence.hasFullHealthyPlacementObservedFor(current, left.group_id, current.reallocation_request.?) or
+                            !evidence.hasFullHealthyPlacementObservedFor(current, right.group_id, current.reallocation_request.?)))
+                    {
+                        planning_conclusive = false;
+                        continue;
+                    }
                     if (!groupStatusReadyForAutomaticPlanning(left_status) or !groupStatusReadyForAutomaticPlanning(right_status)) {
                         if (require_conclusive_scan) planning_conclusive = false;
                         continue;
@@ -943,6 +950,12 @@ pub const Reconciler = struct {
                 }
                 if (!groupStatusFresh(self.config, status, now_realtime_ms)) {
                     if (require_conclusive_scan) planning_conclusive = false;
+                    continue;
+                }
+                if (require_conclusive_scan and
+                    !evidence.hasFullHealthyPlacementObservedFor(current, range.group_id, current.reallocation_request.?))
+                {
+                    planning_conclusive = false;
                     continue;
                 }
                 if (!groupStatusReadyForAutomaticPlanning(status)) {
@@ -1548,6 +1561,38 @@ const StoreEvidenceIndex = struct {
                 &status.voter_set_fingerprint,
                 &topology.voter_set_fingerprint,
             );
+    }
+
+    /// A forced scan may only consume its level-trigger after every placed
+    /// voter has published observations at or after the request. Without this
+    /// barrier, a reconcile snapshot can acknowledge an under-threshold view
+    /// while a newer oversized report is still being projected, permanently
+    /// losing the operator's one-shot request when shard allocation is disabled.
+    fn hasFullHealthyPlacementObservedFor(
+        self: *const StoreEvidenceIndex,
+        current: CurrentMetadataState,
+        group_id: u64,
+        request: reallocation_request.ReallocationRequestRecord,
+    ) bool {
+        var saw_placement = false;
+        for (current.placement_intents) |intent| {
+            if (intent.record.group_id != group_id) continue;
+            saw_placement = true;
+            const store = self.storeForIntent(intent) orelse return false;
+            if (!healthyStore(store.*)) return false;
+            const evidence = self.reports_by_store_group.get(
+                placementStoreKey(group_id, store.store_id),
+            ) orelse return false;
+            if (evidence.status_ambiguous) return false;
+            const status = evidence.status orelse return false;
+            // Legacy reporters fail closed. Their timestamps may use a
+            // different clock domain from the request, and wall clocks across
+            // hosts are not a causal ordering. The durable request remains
+            // pending through a rolling upgrade until every placed voter can
+            // echo the exact request ID.
+            if (status.observed_reallocation_request_id != request.request_id) return false;
+        }
+        return saw_placement;
     }
 
     fn relocationSource(self: *const StoreEvidenceIndex, group_id: u64) ?raft_reconciler.PlacementIntent {
@@ -6369,6 +6414,7 @@ test "metadata reconciler plans an automatic split from fresh group status" {
                     .disk_bytes_known = true,
                     .empty = false,
                     .updated_at_millis = now_ms,
+                    .observed_reallocation_request_id = 1,
                     .local_leader = true,
                     .local_voter = true,
                     .voter_count = 1,
@@ -6500,6 +6546,7 @@ test "metadata reconciler waits for placement convergence before automatic split
         .disk_bytes = 200,
         .empty = false,
         .updated_at_millis = now_ms,
+        .observed_reallocation_request_id = 1,
         .local_leader = true,
     }})[0..]);
     const stores = [_]table_manager.StoreRecord{.{
@@ -8529,6 +8576,7 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
         .disk_bytes_known = true,
         .empty = false,
         .updated_at_millis = now_ms,
+        .observed_reallocation_request_id = 2,
         .local_leader = true,
         .local_voter = true,
         .voter_count = 1,
@@ -8548,11 +8596,82 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
     try std.testing.expectEqual(@as(usize, 0), inconclusive_plan.split_admissions.len);
     try std.testing.expect(inconclusive_plan.clear_reallocation_request == null);
 
-    var forced_plan = try reconciler.computePlan(&manager, &.{1}, &candidates, .{
+    // A request can become visible to the reconcile loop before a store
+    // report that another metadata replica already exposed. Do not consume
+    // that request (or act on its stale size view) until every placed voter
+    // has published a post-request observation.
+    var stale_observation_plan = try reconciler.computePlan(&manager, &.{1}, &candidates, .{
         .tables = tables,
         .ranges = ranges,
         .placement_intents = &placements,
         .stores = &stores,
+        .reallocation_request = .{ .request_id = 2, .requested_at_ms = now_ms + 1 },
+    });
+    defer stale_observation_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), stale_observation_plan.split_admissions.len);
+    try std.testing.expect(stale_observation_plan.clear_reallocation_request == null);
+
+    const under_threshold_reports = [_]table_manager.GroupStatusReport{.{
+        .group_id = 4201,
+        .doc_count = 50,
+        .disk_bytes = 50,
+        .disk_bytes_known = true,
+        .empty = false,
+        .updated_at_millis = now_ms,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 1,
+        .voter_set_known = true,
+        .voter_set_fingerprint = voter_set_fingerprint,
+    }};
+    var under_threshold_stores = stores;
+    under_threshold_stores[0].group_statuses = @constCast(under_threshold_reports[0..]);
+    var stale_under_threshold_plan = try reconciler.computePlan(&manager, &.{1}, &candidates, .{
+        .tables = tables,
+        .ranges = ranges,
+        .placement_intents = &placements,
+        .stores = &under_threshold_stores,
+        .reallocation_request = .{ .request_id = 3, .requested_at_ms = now_ms + 1 },
+    });
+    defer stale_under_threshold_plan.deinit(std.testing.allocator);
+    try std.testing.expect(stale_under_threshold_plan.clear_reallocation_request == null);
+
+    var fresh_under_threshold_reports = under_threshold_reports;
+    fresh_under_threshold_reports[0].observed_reallocation_request_id = 3;
+    under_threshold_stores[0].group_statuses = @constCast(fresh_under_threshold_reports[0..]);
+    var fresh_under_threshold_plan = try reconciler.computePlan(&manager, &.{1}, &candidates, .{
+        .tables = tables,
+        .ranges = ranges,
+        .placement_intents = &placements,
+        .stores = &under_threshold_stores,
+        .reallocation_request = .{ .request_id = 3, .requested_at_ms = now_ms + 1 },
+    });
+    defer fresh_under_threshold_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u128, 3), fresh_under_threshold_plan.clear_reallocation_request);
+
+    // Legacy reports used wall-clock status timestamps while origin/main
+    // stamped requests with monotonic uptime. Even an apparently much newer
+    // timestamp cannot prove that the reporter observed this request.
+    var legacy_timestamp_plan = try reconciler.computePlan(&manager, &.{1}, &candidates, .{
+        .tables = tables,
+        .ranges = ranges,
+        .placement_intents = &placements,
+        .stores = &stores,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
+    });
+    defer legacy_timestamp_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), legacy_timestamp_plan.split_admissions.len);
+    try std.testing.expect(legacy_timestamp_plan.clear_reallocation_request == null);
+
+    var acknowledged_reports = [_]table_manager.GroupStatusReport{stores[0].group_statuses[0]};
+    acknowledged_reports[0].observed_reallocation_request_id = 1;
+    var acknowledged_stores = stores;
+    acknowledged_stores[0].group_statuses = @constCast(acknowledged_reports[0..]);
+    var forced_plan = try reconciler.computePlan(&manager, &.{1}, &candidates, .{
+        .tables = tables,
+        .ranges = ranges,
+        .placement_intents = &placements,
+        .stores = &acknowledged_stores,
         .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer forced_plan.deinit(std.testing.allocator);

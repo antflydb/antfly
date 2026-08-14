@@ -29,6 +29,7 @@ const backups_api = @import("../api/backups.zig");
 const http_route_helpers = @import("../api/http_route_helpers.zig");
 const indexes_api = @import("../api/indexes.zig");
 const tables_api = @import("../api/tables.zig");
+const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const routes = @import("http_routes.zig");
 const service = @import("service.zig");
@@ -634,7 +635,7 @@ pub const AdminSource = struct {
 
     fn metadataServiceTriggerReallocate(ptr: *anyopaque) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        try svc.requestReallocation(@intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)));
+        try svc.requestReallocation(platform_clock.Clock.real().nowRealtimeMs());
         try flushMetadataServiceMutation(svc);
     }
 
@@ -963,7 +964,7 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceTriggerReallocate(ptr: *anyopaque) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try svc.requestReallocation(@intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)));
+        try svc.requestReallocation(platform_clock.Clock.real().nowRealtimeMs());
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -1215,9 +1216,12 @@ pub const MetadataHttpServer = struct {
                     };
                     return try textResponse(alloc, if (valid) 204 else 409, "");
                 }
-                if (std.mem.eql(u8, req.uri, routes.Routes.internal_reallocate)) {
+                if (std.mem.eql(u8, req.uri, routes.Routes.internal_reallocate) or
+                    std.mem.eql(u8, req.uri, routes.Routes.internal_reallocate_v2))
+                {
                     self.source.triggerReallocate() catch |err| switch (err) {
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
+                        error.ReallocationProtocolUpgradeRequired => return try textResponse(alloc, 503, "metadata voter upgrade required"),
                         else => return err,
                     };
                     return try textResponse(alloc, 202, "accepted");
@@ -1643,7 +1647,7 @@ pub const MetadataHttpServer = struct {
         if (self.source.vtable.request_node_shutdown) |_| {
             try self.source.requestNodeShutdown(node_id);
             self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
+                error.UnsupportedOperation, error.ReallocationProtocolUpgradeRequired => {},
                 else => return err,
             };
             return;
@@ -1701,7 +1705,7 @@ pub const MetadataHttpServer = struct {
 
         if (changed) {
             self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
+                error.UnsupportedOperation, error.ReallocationProtocolUpgradeRequired => {},
                 else => return err,
             };
         }
@@ -1711,7 +1715,7 @@ pub const MetadataHttpServer = struct {
         if (self.source.vtable.cancel_node_shutdown) |_| {
             try self.source.cancelNodeShutdown(node_id);
             self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
+                error.UnsupportedOperation, error.ReallocationProtocolUpgradeRequired => {},
                 else => return err,
             };
             return;
@@ -1753,7 +1757,7 @@ pub const MetadataHttpServer = struct {
 
         if (changed) {
             self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
+                error.UnsupportedOperation, error.ReallocationProtocolUpgradeRequired => {},
                 else => return err,
             };
         }
@@ -1767,7 +1771,7 @@ pub const MetadataHttpServer = struct {
             if (finalizeWouldDeleteActiveNodeOrStore(&snapshot, node_id)) return error.ActiveNodeFinalizeRejected;
             try self.source.finalizeNodeShutdown(node_id);
             self.source.triggerReallocate() catch |err| switch (err) {
-                error.UnsupportedOperation => {},
+                error.UnsupportedOperation, error.ReallocationProtocolUpgradeRequired => {},
                 else => return err,
             };
             return;
@@ -2122,6 +2126,7 @@ const ParsedGroupStatus = struct {
     empty: ?bool = null,
     created_at_millis: ?u64 = null,
     updated_at_millis: ?u64 = null,
+    observed_reallocation_request_id: ?u128 = null,
     local_leader: ?bool = null,
     local_voter: ?bool = null,
     voter_count: ?u16 = null,
@@ -2366,6 +2371,7 @@ fn cloneParsedGroupStatuses(
             .empty = parsed.empty orelse true,
             .created_at_millis = parsed.created_at_millis orelse 0,
             .updated_at_millis = parsed.updated_at_millis orelse 0,
+            .observed_reallocation_request_id = parsed.observed_reallocation_request_id orelse 0,
             .local_leader = parsed.local_leader orelse false,
             .local_voter = parsed.local_voter orelse false,
             .voter_count = parsed.voter_count orelse 0,
@@ -3016,6 +3022,47 @@ fn freeStoreStatusReport(alloc: std.mem.Allocator, report: metadata_table_manage
     alloc.free(report.health_class);
     metadata_table_manager.freeGroupStatuses(alloc, report.group_statuses);
     metadata_table_manager.freeRuntimeGroupStatusReports(alloc, report.runtime_statuses);
+}
+
+test "metadata http server reports reallocation protocol upgrade gating" {
+    const UpgradeGatedSource = struct {
+        fn iface(_: *@This()) AdminSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .trigger_reallocate = triggerReallocate,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn triggerReallocate(_: *anyopaque) !void {
+            return error.ReallocationProtocolUpgradeRequired;
+        }
+    };
+
+    var source = UpgradeGatedSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.internal_reallocate_v2,
+        .body = "",
+    });
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), response.status);
+    try std.testing.expectEqualStrings("metadata voter upgrade required", response.body);
 }
 
 test "metadata http server serves status and filtered admin routes" {
@@ -4214,6 +4261,12 @@ test "metadata http server accepts internal reallocate and split merge routes" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(u64, 7), report.store_id);
             try std.testing.expectEqualStrings("healthy", report.health_class);
+            try std.testing.expectEqual(@as(usize, 1), report.group_statuses.len);
+            try std.testing.expectEqual(@as(u64, 9), report.group_statuses[0].group_id);
+            try std.testing.expectEqual(
+                @as(u128, 0x1234_5678_9abc_def0_1234_5678_9abc_def0),
+                report.group_statuses[0].observed_reallocation_request_id,
+            );
             self.store_status_count += 1;
         }
 
@@ -4316,7 +4369,7 @@ test "metadata http server accepts internal reallocate and split merge routes" {
     var store_status = try server.handle(.{
         .method = .POST,
         .uri = "/internal/v1/nodes/7/status",
-        .body = "{\"store_id\":7,\"health_class\":\"healthy\"}",
+        .body = "{\"store_id\":7,\"health_class\":\"healthy\",\"group_statuses\":[{\"group_id\":9,\"observed_reallocation_request_id\":24197857203266734864793317670504947440}]}",
         .content_type = "application/json",
     });
     defer store_status.deinit(std.testing.allocator);
