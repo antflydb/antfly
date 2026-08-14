@@ -20,7 +20,7 @@ usage() {
   cat <<'USAGE'
 usage: benchmark_florence2_metal_kernels.sh
 
-Runs an exact-output A/B benchmark of the promoted Florence-2 Metal frame,
+Runs a decoded-output A/B benchmark of the promoted Florence-2 Metal frame,
 stage-frame, high-row Q4_K, decode-1x cross-attention, and window-attention
 paths. The baseline disables all five paths; the candidate uses the production
 defaults. Writes raw JSON, stderr logs, hardware.json, and a stable summary.json to
@@ -176,7 +176,6 @@ run_case() {
       -u TERMITE_FLORENCE2_METAL_FRAMES \
       -u TERMITE_FLORENCE2_METAL_Q4_K_MM \
       -u TERMITE_FLORENCE2_METAL_STAGE_FRAMES \
-      -u TERMITE_FLORENCE2_METAL_FUSED_LM_HEAD \
       TERMITE_FLORENCE2_METAL_DISABLE_FRAMES=1 \
       TERMITE_FLORENCE2_METAL_DISABLE_STAGE_FRAMES=1 \
       TERMITE_FLORENCE2_METAL_DISABLE_Q4_K_MM=1 \
@@ -192,7 +191,6 @@ run_case() {
       -u TERMITE_FLORENCE2_METAL_FRAMES \
       -u TERMITE_FLORENCE2_METAL_Q4_K_MM \
       -u TERMITE_FLORENCE2_METAL_STAGE_FRAMES \
-      -u TERMITE_FLORENCE2_METAL_FUSED_LM_HEAD \
       -u TERMITE_FLORENCE2_METAL_DISABLE_FRAMES \
       -u TERMITE_FLORENCE2_METAL_DISABLE_STAGE_FRAMES \
       -u TERMITE_FLORENCE2_METAL_DISABLE_Q4_K_MM \
@@ -300,7 +298,7 @@ parity_keys = ("last_text", "generated_tokens")
 for key in parity_keys:
     if baseline.get(key) != candidate.get(key):
         raise SystemExit(
-            f"exact-output parity failed for {key}: "
+            f"decoded-output parity failed for {key}: "
             f"baseline={baseline.get(key)!r} candidate={candidate.get(key)!r}"
         )
 if not baseline.get("last_text"):
@@ -339,7 +337,7 @@ summary = {
     "schema": "florence2-metal-kernel-ab/v1",
     "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "result": "pass",
-    "exact_output_parity": True,
+    "decoded_output_parity": True,
     "speedup": {"avg": avg_speedup, "p50": p50_speedup, "minimum_p50": minimum},
     "workload": {
         "prompt": prompt,
@@ -353,8 +351,8 @@ summary = {
             "frames": False,
             "stage_frames": False,
             "florence_high_row_q4_k": False,
-            "florence_q4_k_matrix": False,
-            "florence_q4_k_nr4": False,
+            "florence_q4_k_matrix_enabled": False,
+            "florence_q4_k_nr4_fallback_enabled": False,
             "decode_cross_attention_1x": False,
             "window_sdpa_1sg": False,
         },
@@ -362,12 +360,15 @@ summary = {
             "frames": True,
             "stage_frames": True,
             "florence_high_row_q4_k": True,
-            "florence_q4_k_matrix": True,
-            "florence_q4_k_nr4": False,
+            "florence_q4_k_matrix_enabled": True,
+            "florence_q4_k_nr4_fallback_enabled": True,
             "decode_cross_attention_1x": True,
             "window_sdpa_1sg": True,
         },
-        "fused_lm_head": False,
+    },
+    "observed_dispatches": {
+        "baseline_generated_q4_k": baseline_generated,
+        "candidate_generated_q4_k": candidate_generated,
     },
     "provenance": {
         "git_head": git("rev-parse", "HEAD"),

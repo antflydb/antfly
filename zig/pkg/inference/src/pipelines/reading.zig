@@ -1095,24 +1095,6 @@ pub const ReadingPipeline = struct {
         const allocator = self.allocator;
 
         if (fused_lm_head_allowed) {
-            if (cb.kind() == .metal) {
-                const metal_fused_start = nowNs();
-                if (try florence_arch.decoderFusedTokenIdFromFinalHiddenTensor(
-                    cb,
-                    allocator,
-                    florence_cfg,
-                    hidden.*,
-                    suppress_tokens,
-                )) |token_id| {
-                    logReadProfile("florence_decoder_lm_head_fused_argmax_frame", metal_fused_start);
-                    cb.free(hidden.*);
-                    hidden_live.* = false;
-                    if (last_read_telemetry.lm_head_path == null) last_read_telemetry.lm_head_path = "fused_argmax_frame";
-                    return token_id;
-                }
-                logReadProfile("florence_decoder_lm_head_fused_argmax_frame_unavailable", metal_fused_start);
-            }
-
             var capture_graph = false;
             errdefer if (capture_graph) cb.debugCudaGraphCaptureEnd(false) catch {};
             if (florenceCudaGraphEnabled()) {

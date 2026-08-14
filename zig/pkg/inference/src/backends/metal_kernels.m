@@ -1549,6 +1549,10 @@ typedef struct termite_metal_decode_runtime {
     uint64_t q4_k_pair_activation_reduce;
     uint64_t q4_k_pair_activation_reduce_f16_output;
     uint64_t q4_k_activation_rhs_reduce;
+    uint64_t florence_q4_k_mm_matrix_dispatches;
+    uint64_t florence_q4_k_mm_nr4_dispatches;
+    uint64_t florence_attention_1x_dispatches;
+    uint64_t florence_window_sdpa_dispatches;
     uint64_t q6_k_linear_reduce;
     uint64_t q6_k_linear_reduce_rows_1;
     uint64_t q6_k_linear_reduce_rows_2_8;
@@ -2172,6 +2176,10 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t q4_k_pair_activation_reduce;
     uint64_t q4_k_pair_activation_reduce_f16_output;
     uint64_t q4_k_activation_rhs_reduce;
+    uint64_t florence_q4_k_mm_matrix_dispatches;
+    uint64_t florence_q4_k_mm_nr4_dispatches;
+    uint64_t florence_attention_1x_dispatches;
+    uint64_t florence_window_sdpa_dispatches;
     uint64_t q6_k_linear_reduce;
     uint64_t q6_k_linear_reduce_rows_1;
     uint64_t q6_k_linear_reduce_rows_2_8;
@@ -14367,6 +14375,8 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
             generated_pipeline = runtime->antfly_q8_k_small_batch_pipeline;
         } else if (use_antfly_q4_k_small_batch) {
             runtime->antfly_q4_k_small_batch_dispatches += 1;
+            if (use_florence_q4_k_mm_matrix) runtime->florence_q4_k_mm_matrix_dispatches += 1;
+            if (use_florence_q4_k_mm_nr4) runtime->florence_q4_k_mm_nr4_dispatches += 1;
             if (exact_q4_k != NULL) {
                 termite_metal_jit_exact_dispatch_record(runtime, TERMITE_METAL_JIT_SLOT_Q4_K);
             }
@@ -23180,6 +23190,7 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
         id<MTLComputePipelineState> pipeline = use_decode_1x_hd64
             ? runtime->attention_f32_decode_1x_hd64_pipeline
             : runtime->attention_f32_pipeline;
+        if (use_decode_1x_hd64) runtime->florence_attention_1x_dispatches += 1;
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:q_buffer offset:q_offset atIndex:0];
         [encoder setBuffer:k_buffer offset:k_offset atIndex:1];
@@ -24580,7 +24591,8 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
         }
 
         const bool encode_on_active_frame =
-            consume_active_frame != 0 && runtime->active_frame_cb != nil;
+            consume_active_frame != 0 &&
+            runtime->active_frame_cb != nil && runtime->active_planned_compute_encoder != nil;
         const bool restore_active_frame = runtime->active_frame_cb != nil && !encode_on_active_frame;
         if (restore_active_frame) {
             if (!termite_metal_decode_runtime_active_frame_empty(runtime)) {
@@ -24597,14 +24609,6 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = nil;
         id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
-        bool active_encoder_owned = false;
-        if (encode_on_active_frame && encoder == nil) {
-            encoder = termite_metal_tracked_compute_command_encoder_for(
-                runtime->active_frame_cb,
-                TERMITE_METAL_COMPUTE_SOURCE_TAIL);
-            active_encoder_owned = encoder != nil;
-            if (encoder == nil) return -12;
-        }
         if (!encode_on_active_frame) {
             command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
             if (command_buffer == nil) return -11;
@@ -24627,7 +24631,6 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
             if (encode_rc != 0) break;
         }
         if (encode_on_active_frame) {
-            if (active_encoder_owned) [encoder endEncoding];
             // The logits producer, row argmaxes, and token writeback now share
             // the verify frame. Submit+wait closes the planned encoder without
             // reopening an empty frame, so this is the only synchronization.
@@ -34177,6 +34180,7 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             : (use_bert_prefill_q8
             ? runtime->sdpa_f32_bert_prefill_s256_hd64_q8_pipeline
             : (use_tg ? runtime->sdpa_f32_tg_pipeline : runtime->sdpa_f32_pipeline));
+        if (use_florence_window_hd32) runtime->florence_window_sdpa_dispatches += 1;
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -14;
@@ -49317,6 +49321,10 @@ int termite_metal_decode_runtime_memory_snapshot(
     snapshot->q4_k_pair_activation_reduce = runtime->q4_k_pair_activation_reduce;
     snapshot->q4_k_pair_activation_reduce_f16_output = runtime->q4_k_pair_activation_reduce_f16_output;
     snapshot->q4_k_activation_rhs_reduce = runtime->q4_k_activation_rhs_reduce;
+    snapshot->florence_q4_k_mm_matrix_dispatches = runtime->florence_q4_k_mm_matrix_dispatches;
+    snapshot->florence_q4_k_mm_nr4_dispatches = runtime->florence_q4_k_mm_nr4_dispatches;
+    snapshot->florence_attention_1x_dispatches = runtime->florence_attention_1x_dispatches;
+    snapshot->florence_window_sdpa_dispatches = runtime->florence_window_sdpa_dispatches;
     snapshot->q6_k_linear_reduce = runtime->q6_k_linear_reduce;
     snapshot->q6_k_linear_reduce_rows_1 = runtime->q6_k_linear_reduce_rows_1;
     snapshot->q6_k_linear_reduce_rows_2_8 = runtime->q6_k_linear_reduce_rows_2_8;

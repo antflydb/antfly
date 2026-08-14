@@ -594,49 +594,6 @@ pub fn decoderFusedTokenFromFinalHiddenTensor(
     return try cb.linearNoBiasArgmaxLastRowSuppressTensor(hidden, try lmHeadWeight(cb), 1, config.d_model, config.vocab_size, suppress_tokens);
 }
 
-/// Keeps the Florence LM head and suppressed argmax in one Metal frame, then
-/// returns only the selected token to the host. This avoids materializing and
-/// synchronizing the full vocabulary logits between two command buffers.
-pub fn decoderFusedTokenIdFromFinalHiddenTensor(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    config: Config,
-    hidden: CT,
-    suppress_tokens: []const i32,
-) !?u32 {
-    if (!platform.env.getenvBool("TERMITE_FLORENCE2_METAL_FUSED_LM_HEAD")) return null;
-    var frame_active = try beginFlorenceMetalFrame(cb, .decode);
-    if (!frame_active) return null;
-    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
-
-    const token_ids = (try cb.linearNoBiasArgmaxRowsSuppress(
-        hidden,
-        try lmHeadWeight(cb),
-        1,
-        config.d_model,
-        config.vocab_size,
-        suppress_tokens,
-        allocator,
-    )) orelse {
-        try cb.decoderRuntimeCancelFrame();
-        frame_active = false;
-        return null;
-    };
-    defer allocator.free(token_ids);
-
-    // The Metal argmax consume path submits and closes the producer frame.
-    // Treat a still-active frame as an unsupported fused path instead of
-    // reading a token before the queued LM head has completed.
-    if (cb.decoderRuntimeHasActiveFrame()) {
-        try cb.decoderRuntimeCancelFrame();
-        frame_active = false;
-        return null;
-    }
-    frame_active = false;
-    if (token_ids.len != 1) return error.InvalidTensorShape;
-    return token_ids[0];
-}
-
 pub fn decoderFinalLogitsBiasIsZero(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
