@@ -29,7 +29,12 @@ class QueryHierarchy:
     supported for compatibility. Prefer `children` and `ancestors` for new clients.
 
         Attributes:
-            return_level (QueryHierarchyReturnLevel | Unset): Hierarchy level represented by each top-level hit.
+            return_level (QueryHierarchyReturnLevel | Unset): Top-level result shape. `source` rolls matches up to source
+                documents;
+                `chunk` returns directly matched derived records. The targeted index
+                determines the actual derived level, which is reported in each hit's
+                `hierarchy.level`. Legacy JSON requests using `unit` or `mention` remain
+                accepted as direct-match aliases but are not exposed to new clients.
             children (HierarchyChildren | Unset):
             ancestors (HierarchyAncestors | Unset):
             rollup (QueryHierarchyRollup | Unset):

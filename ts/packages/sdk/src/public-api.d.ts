@@ -6015,10 +6015,14 @@ export interface components {
          */
         QueryHierarchy: {
             /**
-             * @description Hierarchy level represented by each top-level hit.
+             * @description Top-level result shape. `source` rolls matches up to source documents;
+             *     `chunk` returns directly matched derived records. The targeted index
+             *     determines the actual derived level, which is reported in each hit's
+             *     `hierarchy.level`. Legacy JSON requests using `unit` or `mention` remain
+             *     accepted as direct-match aliases but are not exposed to new clients.
              * @enum {string}
              */
-            return_level?: "source" | "unit" | "chunk" | "mention";
+            return_level?: "source" | "chunk";
             children?: components["schemas"]["HierarchyChildren"];
             ancestors?: components["schemas"]["HierarchyAncestors"];
             /**

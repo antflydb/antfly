@@ -176,7 +176,6 @@ validation, and error behavior aligned with the product API.
 - `zig build raft-transport-test`
 - `zig build lib-api-auth-test`
 - `zig build root-test -- --test-filter "api http server serves fielded full-text search through mcp tools"`
-- `go test ./src/mcp`
 
 The API auth test bucket includes HTTP-level coverage for MCP initialize. It also covers MCP session response headers
 and MCP GET event-stream endpoint framing.
@@ -195,7 +194,7 @@ The standalone protocol tests also cover parse errors, invalid params, unknown M
   the surface grows.
 - Protocol structs are intentionally minimal. Dynamic `std.json.Value` remains the extension path for evolving MCP
   fields and tool payloads.
-- MCP schemas are generated from Antfly MCP tool descriptors and cover the current Go-parity tool arguments. They are
+- MCP schemas are generated from Antfly MCP tool descriptors. They are
   not yet derived from generated OpenAPI or Zig request structs. The raw `queryRequest` field deliberately uses a
   permissive schema plus the `describe_query_request` helper to avoid inlining the full recursive OpenAPI query schema
   into every MCP `tools/list` response.
@@ -209,10 +208,6 @@ The next durability improvements should be:
 
 1. Add MCP historical event replay if clients need more than cursor-aware stream continuation.
 2. Expose the `go/pkg/antfly/lib/mcp` stdio dispatcher through a product CLI/server mode if local agent hosts need it.
-3. Broaden adapter failure mapping, tool schema stability tests, and cross-language MCP parity tests.
+3. Broaden adapter failure mapping and tool schema stability tests.
 4. Consider deriving MCP tool schemas from generated OpenAPI or Zig request structs if the tool surface continues to
    expand.
-
-For Go product parity, the only remaining behavior difference worth tracking is MCP historical replay after
-`Last-Event-ID`. The other items above are product extensions or maintainability improvements, not missing behavior in
-the current Antfly Go MCP mount.

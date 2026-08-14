@@ -6703,7 +6703,7 @@ pub const QueryBuilderResult = struct {
 
 /// Controls the hierarchy level returned by a query, optional bounded child hits, and projected ancestor context. `children` is analogous to a bounded nested inner-hit request: it defaults to three children per parent while the top-level `limit` continues to control the number of returned hits. The legacy `rollup`, `include`, and `max_children_per_parent` fields remain supported for compatibility. Prefer `children` and `ancestors` for new clients.
 pub const QueryHierarchy = struct {
-    /// Hierarchy level represented by each top-level hit.
+    /// Top-level result shape. `source` rolls matches up to source documents; `chunk` returns directly matched derived records. The targeted index determines the actual derived level, which is reported in each hit's `hierarchy.level`. Legacy JSON requests using `unit` or `mention` remain accepted as direct-match aliases but are not exposed to new clients.
     return_level: ?[]const u8 = null,
     children: ?HierarchyChildren = null,
     ancestors: ?HierarchyAncestors = null,

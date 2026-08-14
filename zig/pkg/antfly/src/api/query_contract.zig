@@ -9121,6 +9121,16 @@ fn applyPublicHierarchyControls(
     const wants_source_rollup = if (rollup) |value| std.mem.eql(u8, value, "source") else false;
     const wants_no_rollup = if (rollup) |value| std.mem.eql(u8, value, "none") else false;
 
+    // `children` is a source-hit projection. Treating it as an override for a
+    // direct-hit request silently changes the top-level result shape and can
+    // multiply the response size, so reject contradictory new-style controls.
+    if (children_set) {
+        if (return_level) |level| {
+            if (!std.mem.eql(u8, level, "source")) return error.InvalidQueryRequest;
+        }
+        if (wants_no_rollup) return error.InvalidQueryRequest;
+    }
+
     if (return_level) |level| {
         if (std.mem.eql(u8, level, "chunk") or std.mem.eql(u8, level, "unit") or std.mem.eql(u8, level, "mention")) {
             req.return_mode = if (wants_source_rollup or include_chunk or has_child_limit)
@@ -10535,6 +10545,33 @@ test "api query contract rejects unsupported hierarchy levels" {
         \\}
     ;
     try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", unsupported_children));
+
+    const contradictory_children =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"return_level":"chunk","children":{"level":"chunk"}}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", contradictory_children));
+
+    const contradictory_rollup =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"rollup":"none","children":{"level":"chunk"}}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", contradictory_rollup));
+
+    const implicit_source_children =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"children":{"level":"chunk","limit":2}}
+        \\}
+    ;
+    var implicit_source = try parseQueryRequest(alloc, null, "docs", implicit_source_children);
+    defer implicit_source.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, implicit_source.req.return_mode);
+    try std.testing.expectEqual(@as(u32, 2), implicit_source.req.max_chunks_per_parent);
 }
 
 test "api query contract keeps generated schema strict when with is present" {
