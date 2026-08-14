@@ -36,6 +36,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const raft_shard_ops = @import("../raft/shard_ops.zig");
 const raft_transport = @import("../raft/transport/mod.zig");
 const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
+const health_server = @import("../common/health_server.zig");
 
 pub const MetadataServerConfig = struct {
     http: raft_managed_host.ManagedHttpHostConfig,
@@ -216,6 +217,8 @@ pub const MetadataServer = struct {
             const http_runtime = try alloc.create(httpx.HttpRuntime);
             http_runtime.* = httpx.HttpRuntime.init(alloc, .{
                 .max_active_h1_requests = max_connections,
+                .max_active_connections = max_connections +| health_server.max_connections,
+                .max_active_h2_streams = max_connections +| health_server.max_connections,
             });
             owned_http_runtime = http_runtime;
 
@@ -517,7 +520,6 @@ const MetadataAdminHttpRuntime = struct {
                 .request_body_buffer_budget_bytes = cfg.max_request_bytes * @as(usize, max_active_requests),
                 .max_h1_inflight_bodies = max_active_requests,
                 .max_connections = max_connections,
-                .connection_executor_capacity = api_lane_lease.concurrentCapacity(),
                 .accept_error_backoff_initial_ms = cfg.accept_error_backoff_initial_ms,
                 .accept_error_backoff_max_ms = cfg.accept_error_backoff_max_ms,
                 .reuse_address = cfg.reuse_address,

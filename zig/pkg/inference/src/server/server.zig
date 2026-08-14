@@ -642,6 +642,14 @@ pub const NodeConfig = struct {
     keep_alive_ms: u64 = 300_000,
     max_loaded_models: usize = 10,
     max_concurrent_requests: usize = 32,
+    /// Transport concurrency is bounded independently from inference work.
+    /// Keep enough connection headroom for health, discovery, and idle
+    /// keep-alive clients without allowing retained Threaded workers to grow
+    /// with an unbounded connection population.
+    http_max_connections: u32 = 64,
+    /// HTTP/2 handlers cannot share the connection frame-pump task: streaming
+    /// request bodies require that pump to keep receiving DATA frames.
+    http_max_h2_stream_tasks: u32 = 64,
     pool_size: usize = 2,
     generation_budget_overrides: BudgetOverrides = .{},
     generation_batching: GenerationBatchingConfig = .{},
@@ -2590,6 +2598,8 @@ pub const Node = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
+        if (config.http_max_connections == 0 or config.http_max_h2_stream_tasks == 0)
+            return error.InvalidHttpTransportCapacity;
         if (config.kernel_jit.profile_capture_only) {
             return error.KernelJitProfileCaptureUnsupportedInServer;
         }
@@ -10320,6 +10330,24 @@ pub const Node = struct {
         try validateStandaloneBind(host, self.config.allow_insecure_public_bind);
     }
 
+    /// Returns the single transport policy used by standalone and embedded
+    /// inference listeners. Keeping this next to NodeConfig prevents the two
+    /// launch paths from silently acquiring different executor bounds.
+    pub fn httpServerConfig(self: *const Node, host: []const u8, port: u16) httpx.ServerConfig {
+        return .{
+            .host = host,
+            .port = port,
+            .max_connections = self.config.http_max_connections,
+            .max_h2_stream_tasks = self.config.http_max_h2_stream_tasks,
+            // Generation can legitimately take longer than the generic 30s HTTP
+            // default during cold model startup or first-token GPU execution.
+            .header_read_timeout_ms = 300_000,
+            .body_read_timeout_ms = 300_000,
+            .response_write_timeout_ms = 300_000,
+            .keep_alive_timeout_ms = 300_000,
+        };
+    }
+
     pub fn serve(self: *Node, allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !void {
         validateStandaloneBind(host, self.config.allow_insecure_public_bind) catch |err| {
             std.log.err(
@@ -10329,16 +10357,7 @@ pub const Node = struct {
             return err;
         };
         self.attachIo(io);
-        var server = httpx.Server.initWithConfig(allocator, io, .{
-            .host = host,
-            .port = port,
-            // Generation can legitimately take longer than the generic 30s HTTP
-            // default during cold model startup or first-token GPU execution.
-            .header_read_timeout_ms = 300_000,
-            .body_read_timeout_ms = 300_000,
-            .response_write_timeout_ms = 300_000,
-            .keep_alive_timeout_ms = 300_000,
-        });
+        var server = httpx.Server.initWithConfig(allocator, io, self.httpServerConfig(host, port));
         defer server.deinit();
 
         try self.registerHttpRoutes(&server);

@@ -620,6 +620,7 @@ const StandaloneHealthSource = struct {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_requests", "gauge", "Currently active public HTTP requests", http.active_requests);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_connection_dispatch_rejections_total", "counter", "Accepted public HTTP connections closed because concurrent execution was unavailable", http.connection_dispatch_rejections_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_h2_stream_dispatch_rejections_total", "counter", "HTTP/2 streams reset before application execution because bounded handler execution was unavailable", http.h2_stream_dispatch_rejections_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_request_cancellations_total", "counter", "Public HTTP requests terminated by application cancellation", http.request_cancellations_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_capacity_bytes", "gauge", "Aggregate HTTP request-body buffer capacity", http.body_buffer_capacity_bytes);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_in_use_bytes", "gauge", "HTTP request-body bytes admitted across HTTP/1 and HTTP/2", http.body_buffer_in_use_bytes);
@@ -629,6 +630,10 @@ const StandaloneHealthSource = struct {
         if (self.unified_lifecycle.httpRuntimeStats()) |http_runtime| {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_listener_capacity", "gauge", "Maximum concurrent long-lived HTTP listeners", http_runtime.listener_capacity);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_listener_leases", "gauge", "Long-lived HTTP listeners currently owned by the shared runtime", http_runtime.active_listener_leases);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_transport_connection_capacity", "gauge", "Shared HTTP transport connection-task capacity", http_runtime.connection_capacity);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_transport_reserved_connections", "gauge", "HTTP transport connection-task capacity reserved by live listeners", http_runtime.reserved_connection_capacity);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_h2_stream_task_capacity", "gauge", "Shared HTTP/2 handler-task capacity", http_runtime.h2_stream_capacity);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_h2_stream_task_reserved", "gauge", "HTTP/2 handler-task capacity reserved by live listeners", http_runtime.reserved_h2_stream_capacity);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests rejected because transport cancellation observation could not be registered", http_runtime.h1_cancellation_registration_failures_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_hard_disconnect_cancellations_total", "counter", "Public requests cancelled after a hard transport failure", http_runtime.h1_hard_disconnect_cancellations_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public requests cancelled after transport cancellation observation failed", http_runtime.h1_cancellation_observer_failures_total);
@@ -2200,6 +2205,8 @@ pub fn runFromIterator(
     const public_http_config = publicHttpServerConfig(bind_host, bind_port);
     var http_runtime = httpx.HttpRuntime.init(alloc, .{
         .max_active_h1_requests = public_http_config.max_connections,
+        .max_active_connections = @as(usize, public_http_config.max_connections) +| antfly.common.health_server.max_connections,
+        .max_active_h2_streams = @as(usize, public_http_config.max_h2_stream_tasks) +| antfly.common.health_server.max_connections,
     });
     defer http_runtime.deinit();
     var standalone_health = StandaloneHealthSource{
@@ -2233,12 +2240,10 @@ pub fn runFromIterator(
     var api_lane_lease = try node_backend_runtime.ptr().acquireApiLane();
     defer api_lane_lease.release();
     const public_io = api_lane_lease.io();
-    const public_io_capacity = api_lane_lease.concurrentCapacity();
     var unified_future = (if (comptime inline_inference_codegen)
         control_io.concurrent(serveUnifiedWithInference, .{
             alloc,
             public_io,
-            public_io_capacity,
             bind_host,
             bind_port,
             cors_config,
@@ -2253,7 +2258,6 @@ pub fn runFromIterator(
         control_io.concurrent(serveUnifiedWithLinkedInference, .{
             alloc,
             public_io,
-            public_io_capacity,
             bind_host,
             bind_port,
             cors_config,
@@ -2392,7 +2396,6 @@ pub fn runLite(
 fn serveUnifiedWithInference(
     alloc: std.mem.Allocator,
     io: std.Io,
-    connection_executor_capacity: u32,
     bind_host: []const u8,
     bind_port: u16,
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
@@ -2403,7 +2406,7 @@ fn serveUnifiedWithInference(
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(true, alloc, io, connection_executor_capacity, bind_host, bind_port, cors_config, handler, antfly_node, api_server, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(true, alloc, io, bind_host, bind_port, cors_config, handler, antfly_node, api_server, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2416,7 +2419,6 @@ fn serveUnifiedWithInference(
 fn serveUnifiedWithLinkedInference(
     alloc: std.mem.Allocator,
     io: std.Io,
-    connection_executor_capacity: u32,
     bind_host: []const u8,
     bind_port: u16,
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
@@ -2427,7 +2429,7 @@ fn serveUnifiedWithLinkedInference(
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(false, alloc, io, connection_executor_capacity, bind_host, bind_port, cors_config, handler, inference_handle, api_server, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(false, alloc, io, bind_host, bind_port, cors_config, handler, inference_handle, api_server, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2441,7 +2443,6 @@ fn serveUnifiedInner(
     comptime inline_inference: bool,
     alloc: std.mem.Allocator,
     io: std.Io,
-    connection_executor_capacity: u32,
     bind_host: []const u8,
     bind_port: u16,
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
@@ -2454,7 +2455,6 @@ fn serveUnifiedInner(
 ) !void {
     var server_config = publicHttpServerConfig(bind_host, bind_port);
     server_config.http_runtime = http_runtime;
-    server_config.connection_executor_capacity = connection_executor_capacity;
     var server = httpx.Server.initWithConfig(alloc, io, server_config);
     defer server.deinit();
     var route_context = StandaloneHttpContext{

@@ -421,14 +421,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         );
         return err;
     };
-    var server = httpx.Server.initWithConfig(alloc, io, .{
-        .host = host,
-        .port = port,
-        .header_read_timeout_ms = 300_000,
-        .body_read_timeout_ms = 300_000,
-        .response_write_timeout_ms = 300_000,
-        .keep_alive_timeout_ms = 300_000,
-    });
+    var server = httpx.Server.initWithConfig(alloc, io, node.httpServerConfig(host, port));
     defer server.deinit();
     try node.registerHttpRoutes(&server);
 
@@ -494,14 +487,7 @@ pub fn spawnServerProcess(
 
     const server = try alloc.create(httpx.Server);
     errdefer alloc.destroy(server);
-    server.* = httpx.Server.initWithConfig(alloc, io, .{
-        .host = host_dup,
-        .port = parsed.port,
-        .header_read_timeout_ms = 300_000,
-        .body_read_timeout_ms = 300_000,
-        .response_write_timeout_ms = 300_000,
-        .keep_alive_timeout_ms = 300_000,
-    });
+    server.* = httpx.Server.initWithConfig(alloc, io, node.httpServerConfig(host_dup, parsed.port));
     errdefer server.deinit();
     try node.registerHttpRoutes(server);
     const base_uri_owned = try alloc.dupe(u8, base_uri);
