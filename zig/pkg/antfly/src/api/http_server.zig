@@ -20218,7 +20218,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     });
     defer mcp_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), mcp_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, mcp_resp.body, "\"protocolVersion\":\"2025-06-18\"") != null);
+    try mcp.testing.expectResultSubset(std.testing.allocator, mcp_resp.body, "{\"protocolVersion\":\"2025-06-18\"}");
     try std.testing.expectEqual(@as(usize, 2), mcp_resp.headers.len);
     try std.testing.expectEqualStrings("Mcp-Session-Id", mcp_resp.headers[0].name);
     try std.testing.expectEqualStrings("Mcp-Protocol-Version", mcp_resp.headers[1].name);
@@ -20269,8 +20269,11 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     var card_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.agent_card });
     defer card_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), card_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"id\":\"query-builder\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"id\":\"retrieval\"") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"skills\":[{\"id\":\"query-builder\"},{\"id\":\"retrieval\"}]}",
+        card_resp.body,
+    );
 
     var prefixed_card_resp = try server.handle(.{ .method = .GET, .uri = "/db/v1/.well-known/agent-card.json" });
     defer prefixed_card_resp.deinit(std.testing.allocator);
@@ -20284,7 +20287,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     });
     defer a2a_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), a2a_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, a2a_resp.body, "\"preferredTransport\":\"JSONRPC\"") != null);
+    try a2a.testing.expectResultSubset(std.testing.allocator, a2a_resp.body, "{\"preferredTransport\":\"JSONRPC\"}");
 
     var prefixed_a2a_resp = try server.handle(.{
         .method = .POST,
@@ -20315,7 +20318,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     });
     defer task_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), task_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, task_resp.body, "\"id\":\"t1\"") != null);
+    try a2a.testing.expectResultSubset(std.testing.allocator, task_resp.body, "{\"id\":\"t1\"}");
 
     var cancel_resp = try server.handle(.{
         .method = .POST,
@@ -20325,7 +20328,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     });
     defer cancel_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), cancel_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, cancel_resp.body, "\"state\":\"canceled\"") != null);
+    try a2a.testing.expectResultSubset(std.testing.allocator, cancel_resp.body, "{\"status\":{\"state\":\"canceled\"}}");
 }
 
 test "api http server serves ARD catalogs with public bootstrap and authenticated tenant entries" {
@@ -21028,9 +21031,11 @@ test "api http server lists extension-owned mcp tools" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_memories\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"description\":\"Search long-term memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"required\":[\"query\"]") != null);
+    var parsed_tools = try mcp.testing.parseToolsListResponse(std.testing.allocator, tools_resp.body);
+    defer parsed_tools.deinit();
+    const search_memories = mcp.testing.findTool(parsed_tools.value.result.tools, "search_memories") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("Search long-term memory", search_memories.description);
+    try ant_json.testing.expectSubsetJsonValue(std.testing.allocator, "{\"required\":[\"query\"]}", search_memories.inputSchema);
 }
 
 test "api http server scopes mcp endpoint to one extension" {
@@ -21126,9 +21131,12 @@ test "api http server scopes mcp endpoint to one extension" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"recall\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"other_tool\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"create_table\"") == null);
+    var parsed_tools = try mcp.testing.parseToolsListResponse(std.testing.allocator, tools_resp.body);
+    defer parsed_tools.deinit();
+    const listed_tools = parsed_tools.value.result.tools;
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "recall") != null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "other_tool") == null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "create_table") == null);
 }
 
 test "api http server filters extension mcp tools by trusted principal table permissions" {
@@ -21314,9 +21322,12 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_docs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"store_doc\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_memories\"") == null);
+    var parsed_tools = try mcp.testing.parseToolsListResponse(std.testing.allocator, tools_resp.body);
+    defer parsed_tools.deinit();
+    const listed_tools = parsed_tools.value.result.tools;
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "search_docs") != null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "store_doc") == null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "search_memories") == null);
 
     // Discovery is not the authorization boundary: a read-only client may
     // retain an older write-tool schema and hand-craft tools/call. The current
@@ -21330,7 +21341,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer denied_builtin_write.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), denied_builtin_write.status);
-    try std.testing.expect(std.mem.indexOf(u8, denied_builtin_write.body, "\"message\":\"unknown tool\"") != null);
+    try mcp.testing.expectError(std.testing.allocator, denied_builtin_write.body, -32602, "unknown tool");
 
     var denied_extension_write = try server.handle(.{
         .method = .POST,
@@ -21341,7 +21352,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer denied_extension_write.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), denied_extension_write.status);
-    try std.testing.expect(std.mem.indexOf(u8, denied_extension_write.body, "\"message\":\"unknown tool\"") != null);
+    try mcp.testing.expectError(std.testing.allocator, denied_extension_write.body, -32602, "unknown tool");
 
     const write_payload = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -21376,8 +21387,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer denied_cross_table_write.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), denied_cross_table_write.status);
-    try std.testing.expect(std.mem.indexOf(u8, denied_cross_table_write.body, "\"text\":\"permission denied\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, denied_cross_table_write.body, "\"isError\":true") != null);
+    try mcp.testing.expectToolResultTextContains(std.testing.allocator, denied_cross_table_write.body, true, "permission denied");
 
     var denied_unscoped_write = try server.handle(.{
         .method = .POST,
@@ -21388,8 +21398,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer denied_unscoped_write.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), denied_unscoped_write.status);
-    try std.testing.expect(std.mem.indexOf(u8, denied_unscoped_write.body, "\"text\":\"permission denied\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, denied_unscoped_write.body, "\"isError\":true") != null);
+    try mcp.testing.expectToolResultTextContains(std.testing.allocator, denied_unscoped_write.body, true, "permission denied");
 
     var ard_catalog_resp = try server.handle(.{
         .method = .GET,
@@ -23820,8 +23829,11 @@ test "api http server serves document lookup through mcp tool" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"get_document\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"lookup\"") == null);
+    var parsed_tools = try mcp.testing.parseToolsListResponse(alloc, tools_resp.body);
+    defer parsed_tools.deinit();
+    const listed_tools = parsed_tools.value.result.tools;
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "get_document") != null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "lookup") == null);
 
     var call_resp = try server.handle(.{
         .method = .POST,
@@ -23832,7 +23844,7 @@ test "api http server serves document lookup through mcp tool" {
     });
     defer call_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), call_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, call_resp.body, "\"structuredContent\":{\"title\":\"alpha\"}") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, call_resp.body, "{\"title\":\"alpha\"}");
 }
 
 test "api http server serves fielded full-text search through mcp tools" {
@@ -23964,7 +23976,9 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), batch_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, batch_resp.body, "\"isError\":false") != null);
+    var parsed_batch = try mcp.testing.parseToolCallResponse(alloc, batch_resp.body);
+    defer parsed_batch.deinit();
+    try std.testing.expect(!parsed_batch.value.result.isError);
     var inserted = (try db.lookup(alloc, "doc:b", .{})) orelse return error.TestExpectedEqual;
     defer inserted.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, inserted.json, "world") != null);
@@ -23980,7 +23994,7 @@ test "api http server serves fielded full-text search through mcp tools" {
         .body = "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"tableName\":\"docs\",\"inserts\":{},\"writes\":{}}}}",
     });
     defer ambiguous_batch_resp.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, ambiguous_batch_resp.body, "inserts and writes cannot be combined") != null);
+    try mcp.testing.expectToolResultTextContains(alloc, ambiguous_batch_resp.body, true, "inserts and writes cannot be combined");
 
     var missing_backup_connection_resp = try server.handle(.{
         .method = .POST,
@@ -23990,7 +24004,7 @@ test "api http server serves fielded full-text search through mcp tools" {
         .body = "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"backup\",\"arguments\":{\"tableName\":\"docs\",\"backupId\":\"backup-1\",\"location\":\"s3://bucket/path\"}}}",
     });
     defer missing_backup_connection_resp.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, missing_backup_connection_resp.body, "missing connection") != null);
+    try mcp.testing.expectToolResultTextContains(alloc, missing_backup_connection_resp.body, true, "missing connection");
 
     var forwarded_backup_format_resp = try server.handle(.{
         .method = .POST,
@@ -24000,7 +24014,7 @@ test "api http server serves fielded full-text search through mcp tools" {
         .body = "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/call\",\"params\":{\"name\":\"backup\",\"arguments\":{\"tableName\":\"docs\",\"backupId\":\"backup-1\",\"location\":\"s3://bucket/path\",\"connection\":\"archive\",\"format\":\"invalid\"}}}",
     });
     defer forwarded_backup_format_resp.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, forwarded_backup_format_resp.body, "unsupported backup format") != null);
+    try mcp.testing.expectToolResultTextContains(alloc, forwarded_backup_format_resp.body, true, "unsupported backup format");
 
     var forwarded_restore_connection_resp = try server.handle(.{
         .method = .POST,
@@ -24010,8 +24024,12 @@ test "api http server serves fielded full-text search through mcp tools" {
         .body = "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"tools/call\",\"params\":{\"name\":\"restore\",\"arguments\":{\"tableName\":\"docs\",\"backupId\":\"backup-1\",\"location\":\"s3://bucket/path\",\"connection\":\"archive\"}}}",
     });
     defer forwarded_restore_connection_resp.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, forwarded_restore_connection_resp.body, "asynchronous restore worker unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, forwarded_restore_connection_resp.body, "invalid restore request") == null);
+    var parsed_restore = try mcp.testing.parseToolCallResponse(alloc, forwarded_restore_connection_resp.body);
+    defer parsed_restore.deinit();
+    try std.testing.expect(parsed_restore.value.result.isError);
+    const restore_error = mcp.testing.findTextContent(parsed_restore.value.result.content) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, restore_error, "asynchronous restore worker unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restore_error, "invalid restore request") == null);
 
     var describe_table_resp = try server.handle(.{
         .method = .POST,
@@ -24022,8 +24040,11 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer describe_table_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), describe_table_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, describe_table_resp.body, "\"name\":\"docs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_table_resp.body, "\"full_text_index_v0\"") != null);
+    try mcp.testing.expectToolStructuredSubset(
+        alloc,
+        describe_table_resp.body,
+        "{\"name\":\"docs\",\"indexes\":{\"full_text_index_v0\":{}}}",
+    );
 
     var describe_indexes_resp = try server.handle(.{
         .method = .POST,
@@ -24034,8 +24055,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer describe_indexes_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), describe_indexes_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, describe_indexes_resp.body, "\"full_text_index_v0\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_indexes_resp.body, "\"structuredContent\":{\"indexes\":[") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, describe_indexes_resp.body, "{\"indexes\":[{\"config\":{\"name\":\"full_text_index_v0\"}}]}");
 
     var list_indexes_resp = try server.handle(.{
         .method = .POST,
@@ -24046,8 +24066,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer list_indexes_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), list_indexes_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, list_indexes_resp.body, "\"full_text_index_v0\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, list_indexes_resp.body, "\"structuredContent\":{\"indexes\":[") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, list_indexes_resp.body, "{\"indexes\":[{\"config\":{\"name\":\"full_text_index_v0\"}}]}");
 
     var sample_documents_resp = try server.handle(.{
         .method = .POST,
@@ -24058,8 +24077,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer sample_documents_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), sample_documents_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"doc:a\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"hello\"") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, sample_documents_resp.body, "{\"_id\":\"doc:a\",\"body\":\"hello\"}");
 
     var sample_documents_zero_limit_resp = try server.handle(.{
         .method = .POST,
@@ -24070,8 +24088,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer sample_documents_zero_limit_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), sample_documents_zero_limit_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, sample_documents_zero_limit_resp.body, "\"isError\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sample_documents_zero_limit_resp.body, "limit must be greater than 0") != null);
+    try mcp.testing.expectToolResultTextContains(alloc, sample_documents_zero_limit_resp.body, true, "limit must be greater than 0");
 
     var sample_documents_large_limit_resp = try server.handle(.{
         .method = .POST,
@@ -24082,8 +24099,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer sample_documents_large_limit_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), sample_documents_large_limit_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, sample_documents_large_limit_resp.body, "\"isError\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sample_documents_large_limit_resp.body, "limit exceeds maximum sample size") != null);
+    try mcp.testing.expectToolResultTextContains(alloc, sample_documents_large_limit_resp.body, true, "limit exceeds maximum sample size");
 
     var describe_capabilities_resp = try server.handle(.{
         .method = .POST,
@@ -24094,9 +24110,11 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer describe_capabilities_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), describe_capabilities_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "\"structuredContent\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "query-builder") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "\"raw_query_request\":true") != null);
+    try mcp.testing.expectToolStructuredSubset(
+        alloc,
+        describe_capabilities_resp.body,
+        "{\"query_builder\":\"Use the A2A query-builder skill for agentic natural-language query planning. MCP stays focused on deterministic database tools and raw QueryRequest execution.\",\"query\":{\"raw_query_request\":true}}",
+    );
 
     var wrong_field_resp = try server.handle(.{
         .method = .POST,
@@ -24107,7 +24125,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer wrong_field_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), wrong_field_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, wrong_field_resp.body, "\"doc:a\"") == null);
+    try mcp.testing.expectToolStructuredSubset(alloc, wrong_field_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[]}}]}");
 
     var query_resp = try server.handle(.{
         .method = .POST,
@@ -24118,7 +24136,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer query_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), query_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, query_resp.body, "\"doc:a\"") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, query_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
 
     var query_object_resp = try server.handle(.{
         .method = .POST,
@@ -24129,7 +24147,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer query_object_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), query_object_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, query_object_resp.body, "\"doc:a\"") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, query_object_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
 
     var query_rest_alias_resp = try server.handle(.{
         .method = .POST,
@@ -24140,7 +24158,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer query_rest_alias_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), query_rest_alias_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, query_rest_alias_resp.body, "\"doc:a\"") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, query_rest_alias_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
 
     var raw_query_request_resp = try server.handle(.{
         .method = .POST,
@@ -24151,16 +24169,13 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer raw_query_request_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), raw_query_request_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, raw_query_request_resp.body, "\"doc:a\"") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, raw_query_request_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
 
     // Some MCP clients ignore structuredContent. Verify the compatibility
     // TextContent block independently carries the complete query response.
-    var parsed_mcp = try std.json.parseFromSlice(std.json.Value, alloc, raw_query_request_resp.body, .{});
+    var parsed_mcp = try mcp.testing.parseToolCallResponse(alloc, raw_query_request_resp.body);
     defer parsed_mcp.deinit();
-    const text_content = parsed_mcp.value.object
-        .get("result").?.object
-        .get("content").?.array.items[0].object
-        .get("text").?.string;
+    const text_content = mcp.testing.findTextContent(parsed_mcp.value.result.content) orelse return error.TestExpectedEqual;
     var parsed_text_content = try std.json.parseFromSlice(std.json.Value, alloc, text_content, .{});
     defer parsed_text_content.deinit();
     const text_hit = parsed_text_content.value.object
@@ -24179,8 +24194,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer mixed_query_request_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), mixed_query_request_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, mixed_query_request_resp.body, "\"isError\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mixed_query_request_resp.body, "queryRequest cannot be combined") != null);
+    try mcp.testing.expectToolResultTextContains(alloc, mixed_query_request_resp.body, true, "queryRequest cannot be combined");
 
     var raw_query_request_table_resp = try server.handle(.{
         .method = .POST,
@@ -24191,8 +24205,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer raw_query_request_table_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), raw_query_request_table_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, raw_query_request_table_resp.body, "\"isError\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, raw_query_request_table_resp.body, "queryRequest.table is not allowed") != null);
+    try mcp.testing.expectToolResultTextContains(alloc, raw_query_request_table_resp.body, true, "queryRequest.table is not allowed");
 
     var describe_query_request_resp = try server.handle(.{
         .method = .POST,
@@ -24203,14 +24216,23 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer describe_query_request_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), describe_query_request_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"structuredContent\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "metadata.yaml#/components/schemas/QueryRequest") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"queryRequest\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"match_retrieval\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "result_mode=matches") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "Never request _chunks.*") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fielded_full_text\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fields\":[\"title\",\"body\"]") != null);
+    var parsed_description = try mcp.testing.parseToolCallResponse(alloc, describe_query_request_resp.body);
+    defer parsed_description.deinit();
+    const query_description = parsed_description.value.result.structuredContent orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectSubsetJsonValue(
+        alloc,
+        "{\"openapi_schema\":\"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest\",\"mcp_usage\":{\"raw_body_argument\":\"queryRequest\"},\"examples\":{\"fielded_full_text\":{\"fields\":[\"title\",\"body\"]},\"match_retrieval\":{\"hierarchy\":{\"result_mode\":\"matches\"}}}}",
+        query_description,
+    );
+    const rules = query_description.object.get("mcp_usage").?.object.get("rules").?.array.items;
+    var found_chunks_guidance = false;
+    for (rules) |rule| {
+        if (rule == .string and std.mem.eql(u8, rule.string, "Never request _chunks.* through MCP because it can expand every child stored on a matched source.")) {
+            found_chunks_guidance = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_chunks_guidance);
 
     server.cfg.mcp_max_tool_result_bytes = 80;
     var oversized_query_resp = try server.handle(.{
@@ -24221,9 +24243,12 @@ test "api http server serves fielded full-text search through mcp tools" {
         .body = "{\"jsonrpc\":\"2.0\",\"id\":18,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"fullTextSearch\":\"hello\",\"fullTextSearchField\":\"body\"}}}",
     });
     defer oversized_query_resp.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, oversized_query_resp.body, "\"isError\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, oversized_query_resp.body, "avoid _chunks.*") != null);
-    try std.testing.expect(std.mem.indexOf(u8, oversized_query_resp.body, "structuredContent") == null);
+    var parsed_oversized = try mcp.testing.parseToolCallResponse(alloc, oversized_query_resp.body);
+    defer parsed_oversized.deinit();
+    try std.testing.expect(parsed_oversized.value.result.isError);
+    try std.testing.expect(parsed_oversized.value.result.structuredContent == null);
+    const oversized_text = mcp.testing.findTextContent(parsed_oversized.value.result.content) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, oversized_text, "avoid _chunks.*") != null);
 }
 
 test "api http server serves table scan as ndjson" {
@@ -24825,9 +24850,29 @@ test "api http server serves retrieval agent event stream" {
     defer a2a_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), a2a_resp.status);
     try std.testing.expectEqualStrings("text/event-stream", a2a_resp.content_type.?);
-    try std.testing.expect(std.mem.indexOf(u8, a2a_resp.body, "\"event\":\"hit\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a2a_resp.body, "\"name\":\"result\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a2a_resp.body, "\"state\":\"completed\"") != null);
+    const a2a_events = try parseSseEventsAlloc(alloc, a2a_resp.body);
+    defer alloc.free(a2a_events);
+    var expected_a2a_hit = try std.json.parseFromSlice(std.json.Value, alloc, "{\"artifact\":{\"name\":\"hit\",\"parts\":[{\"data\":{\"event\":\"hit\"}}]}}", .{});
+    defer expected_a2a_hit.deinit();
+    var expected_a2a_result = try std.json.parseFromSlice(std.json.Value, alloc, "{\"artifact\":{\"name\":\"result\"}}", .{});
+    defer expected_a2a_result.deinit();
+    var expected_a2a_completed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":{\"state\":\"completed\"}}", .{});
+    defer expected_a2a_completed.deinit();
+    var saw_a2a_hit = false;
+    var saw_a2a_result = false;
+    var saw_a2a_completed = false;
+    for (a2a_events) |event| {
+        if (!std.mem.eql(u8, event.event, "message")) continue;
+        var parsed_event = try std.json.parseFromSlice(std.json.Value, alloc, event.data, .{});
+        defer parsed_event.deinit();
+        const value = parsed_event.value;
+        if (ant_json.testing.valueIsSubset(expected_a2a_hit.value, value)) saw_a2a_hit = true;
+        if (ant_json.testing.valueIsSubset(expected_a2a_result.value, value)) saw_a2a_result = true;
+        if (ant_json.testing.valueIsSubset(expected_a2a_completed.value, value)) saw_a2a_completed = true;
+    }
+    try std.testing.expect(saw_a2a_hit);
+    try std.testing.expect(saw_a2a_result);
+    try std.testing.expect(saw_a2a_completed);
 }
 
 test "api http server serves eval response envelope" {

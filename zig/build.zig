@@ -1556,11 +1556,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    mcp_mod.addImport("antfly-json", json_mod);
     const a2a_mod = b.addModule("antfly_a2a", .{
         .root_source_file = b.path("lib/a2a/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    a2a_mod.addImport("antfly-json", json_mod);
     const matcher_mod = b.addModule("antfly_matcher", .{
         .root_source_file = b.path("lib/matcher/src/mod.zig"),
         .target = target,

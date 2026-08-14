@@ -64,6 +64,12 @@ pub fn expectSubsetJsonText(alloc: std.mem.Allocator, expected_json: []const u8,
     try expectSubset(expected.value, actual.value);
 }
 
+pub fn expectSubsetJsonValue(alloc: std.mem.Allocator, expected_json: []const u8, actual: Value) !void {
+    var expected = try std.json.parseFromSlice(Value, alloc, expected_json, .{});
+    defer expected.deinit();
+    try expectSubset(expected.value, actual);
+}
+
 fn expectMatch(expected: Value, actual: Value, mode: MatchMode) !void {
     if (matches(expected, actual, mode)) return;
 

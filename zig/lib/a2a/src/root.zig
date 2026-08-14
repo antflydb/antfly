@@ -14,6 +14,12 @@
 
 const std = @import("std");
 
+pub const testing = @import("testing.zig");
+
+test {
+    _ = testing;
+}
+
 pub const protocol_version = "0.3.0";
 
 pub const Skill = struct {
@@ -1111,8 +1117,11 @@ test "a2a dispatches message by metadata skill" {
     ;
     const resp = try dispatcher.handleJsonRpc(alloc, body);
     defer alloc.free(resp);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\"kind\":\"artifact-update\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\"state\":\"completed\"") != null);
+    try testing.expectResultArrayContainsSubsets(
+        alloc,
+        resp,
+        &.{ "{\"kind\":\"artifact-update\"}", "{\"kind\":\"status-update\",\"status\":{\"state\":\"completed\"}}" },
+    );
 }
 
 test "a2a message stream emits queue events through sink" {
@@ -1166,14 +1175,17 @@ test "a2a message stream emits queue events through sink" {
     try dispatcher.handleJsonRpcStream(alloc,
         \\{"jsonrpc":"2.0","id":1,"method":"message/stream","params":{"taskId":"t1","contextId":"c1","message":{"kind":"message","role":"user","parts":[{"kind":"text","text":"hi"}]}}}
     , sink.iface());
-    try std.testing.expect(std.mem.indexOf(u8, sink.out.items, "\"kind\":\"artifact-update\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sink.out.items, "\"kind\":\"status-update\"") != null);
+    try testing.expectJsonLinesContainSubsets(
+        alloc,
+        sink.out.items,
+        &.{ "{\"kind\":\"artifact-update\"}", "{\"kind\":\"status-update\"}" },
+    );
 
     const get_resp = try dispatcher.handleJsonRpc(alloc,
         \\{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"id":"t1"}}
     );
     defer alloc.free(get_resp);
-    try std.testing.expect(std.mem.indexOf(u8, get_resp, "\"state\":\"completed\"") != null);
+    try testing.expectResultSubset(alloc, get_resp, "{\"status\":{\"state\":\"completed\"}}");
 }
 
 test "a2a agent card lists skills" {
@@ -1204,8 +1216,11 @@ test "a2a agent card lists skills" {
         \\{"jsonrpc":"2.0","id":"card","method":"agent/getAuthenticatedExtendedCard","params":{}}
     );
     defer alloc.free(resp);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\"protocolVersion\":\"0.3.0\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\"id\":\"s\"") != null);
+    try testing.expectResultSubset(
+        alloc,
+        resp,
+        "{\"protocolVersion\":\"0.3.0\",\"skills\":[{\"id\":\"s\"}]}",
+    );
 }
 
 test "a2a maps malformed requests, unknown skills, and missing tasks to JSON-RPC errors" {
@@ -1253,28 +1268,25 @@ test "a2a maps malformed requests, unknown skills, and missing tasks to JSON-RPC
 
     const parse_resp = try dispatcher.handleJsonRpc(alloc, "{");
     defer alloc.free(parse_resp);
-    try std.testing.expect(std.mem.indexOf(u8, parse_resp, "\"code\":-32700") != null);
+    try testing.expectError(alloc, parse_resp, -32700, "parse error");
 
     const invalid_params = try dispatcher.handleJsonRpc(alloc,
         \\{"jsonrpc":"2.0","id":1,"method":"message/send","params":[]}
     );
     defer alloc.free(invalid_params);
-    try std.testing.expect(std.mem.indexOf(u8, invalid_params, "\"code\":-32602") != null);
-    try std.testing.expect(std.mem.indexOf(u8, invalid_params, "\"message\":\"invalid params\"") != null);
+    try testing.expectError(alloc, invalid_params, -32602, "invalid params");
 
     const unknown_skill = try dispatcher.handleJsonRpc(alloc,
         \\{"jsonrpc":"2.0","id":2,"method":"message/send","params":{"taskId":"t1","message":{"kind":"message","role":"user","metadata":{"skill":"missing"},"parts":[{"kind":"text","text":"hi"}]}}}
     );
     defer alloc.free(unknown_skill);
-    try std.testing.expect(std.mem.indexOf(u8, unknown_skill, "\"code\":-32602") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unknown_skill, "\"message\":\"unknown skill\"") != null);
+    try testing.expectError(alloc, unknown_skill, -32602, "unknown skill");
 
     const missing_task = try dispatcher.handleJsonRpc(alloc,
         \\{"jsonrpc":"2.0","id":3,"method":"tasks/get","params":{"id":"missing"}}
     );
     defer alloc.free(missing_task);
-    try std.testing.expect(std.mem.indexOf(u8, missing_task, "\"code\":-32004") != null);
-    try std.testing.expect(std.mem.indexOf(u8, missing_task, "\"message\":\"task not found\"") != null);
+    try testing.expectError(alloc, missing_task, -32004, "task not found");
 }
 
 test "a2a task store supports get and cancel" {
@@ -1313,20 +1325,23 @@ test "a2a task store supports get and cancel" {
         \\{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"taskId":"t1","contextId":"c1","message":{"kind":"message","role":"user","parts":[{"kind":"text","text":"hi"}]}}}
     );
     defer alloc.free(send_resp);
-    try std.testing.expect(std.mem.indexOf(u8, send_resp, "\"id\":\"t1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, send_resp, "\"state\":\"completed\"") != null);
+    try testing.expectResultSubset(
+        alloc,
+        send_resp,
+        "{\"id\":\"t1\",\"status\":{\"state\":\"completed\"}}",
+    );
 
     const get_resp = try dispatcher.handleJsonRpc(alloc,
         \\{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"id":"t1"}}
     );
     defer alloc.free(get_resp);
-    try std.testing.expect(std.mem.indexOf(u8, get_resp, "\"name\":\"echo\"") != null);
+    try testing.expectResultSubset(alloc, get_resp, "{\"artifacts\":[{\"name\":\"echo\"}]}");
 
     const cancel_resp = try dispatcher.handleJsonRpc(alloc,
         \\{"jsonrpc":"2.0","id":3,"method":"tasks/cancel","params":{"id":"t1"}}
     );
     defer alloc.free(cancel_resp);
-    try std.testing.expect(std.mem.indexOf(u8, cancel_resp, "\"state\":\"canceled\"") != null);
+    try testing.expectResultSubset(alloc, cancel_resp, "{\"status\":{\"state\":\"canceled\"}}");
 }
 
 test "a2a generates unique task and context identities when omitted" {

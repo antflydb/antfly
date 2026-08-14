@@ -612,7 +612,7 @@ test "mcp handles initialize and tool call" {
     ;
     const init_resp = (try server.handleJsonRpc(alloc, init_body)).?;
     defer alloc.free(init_resp);
-    try std.testing.expect(std.mem.indexOf(u8, init_resp, "\"protocolVersion\":\"2025-06-18\"") != null);
+    try testing.expectResultSubset(alloc, init_resp, "{\"protocolVersion\":\"2025-06-18\"}");
 
     const list_body =
         \\{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
@@ -630,8 +630,11 @@ test "mcp handles initialize and tool call" {
     ;
     const call_resp = (try server.handleJsonRpc(alloc, call_body)).?;
     defer alloc.free(call_resp);
-    try std.testing.expect(std.mem.indexOf(u8, call_resp, "\"text\":\"hello\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, call_resp, "\"structuredContent\":{\"ok\":true}") != null);
+    var parsed_call = try testing.parseToolCallResponse(alloc, call_resp);
+    defer parsed_call.deinit();
+    try std.testing.expectEqualStrings("hello", testing.findTextContent(parsed_call.value.result.content).?);
+    try std.testing.expect(parsed_call.value.result.structuredContent.? == .object);
+    try std.testing.expectEqual(true, parsed_call.value.result.structuredContent.?.object.get("ok").?.bool);
 }
 
 test "mcp replaces oversized tool results with a text error" {
@@ -667,10 +670,11 @@ test "mcp replaces oversized tool results with a text error" {
         \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"large","arguments":{}}}
     )).?;
     defer alloc.free(response);
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"isError\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "narrow the query") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "structuredContent") == null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "duplicated for compatibility") == null);
+    var parsed = try testing.parseToolCallResponse(alloc, response);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.result.isError);
+    try std.testing.expectEqualStrings("narrow the query", testing.findTextContent(parsed.value.result.content).?);
+    try std.testing.expect(parsed.value.result.structuredContent == null);
 }
 
 test "mcp initialized notification has no response" {
@@ -686,22 +690,19 @@ test "mcp maps malformed and unknown tool requests to JSON-RPC errors" {
 
     const parse_resp = (try server.handleJsonRpc(alloc, "{")).?;
     defer alloc.free(parse_resp);
-    try std.testing.expect(std.mem.indexOf(u8, parse_resp, "\"code\":-32700") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parse_resp, "\"message\":\"parse error\"") != null);
+    try testing.expectError(alloc, parse_resp, -32700, "parse error");
 
     const invalid_params = (try server.handleJsonRpc(alloc,
         \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":[]}
     )).?;
     defer alloc.free(invalid_params);
-    try std.testing.expect(std.mem.indexOf(u8, invalid_params, "\"code\":-32602") != null);
-    try std.testing.expect(std.mem.indexOf(u8, invalid_params, "\"message\":\"invalid params\"") != null);
+    try testing.expectError(alloc, invalid_params, -32602, "invalid params");
 
     const unknown_tool = (try server.handleJsonRpc(alloc,
         \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"missing","arguments":{}}}
     )).?;
     defer alloc.free(unknown_tool);
-    try std.testing.expect(std.mem.indexOf(u8, unknown_tool, "\"code\":-32602") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unknown_tool, "\"message\":\"unknown tool\"") != null);
+    try testing.expectError(alloc, unknown_tool, -32602, "unknown tool");
 }
 
 test "mcp streamable http helpers map responses" {
@@ -784,7 +785,7 @@ test "mcp streamable http enforces sessions inside the transport" {
     var malformed = try server.handleStreamableHttpPostWithSession(alloc, "{", null);
     defer malformed.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), malformed.status);
-    try std.testing.expect(std.mem.indexOf(u8, malformed.body, "\"code\":-32700") != null);
+    try testing.expectError(alloc, malformed.body, -32700, "parse error");
 
     var missing_get = try server.handleStreamableHttpGetWithSession(alloc, "/mcp/v1", null, null);
     defer missing_get.deinit(alloc);
@@ -893,7 +894,7 @@ test "mcp stdio line dispatch frames responses" {
     )).?;
     defer alloc.free(response);
     try std.testing.expect(std.mem.endsWith(u8, response, "\n"));
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"protocolVersion\":\"2025-06-18\"") != null);
+    try testing.expectResultSubset(alloc, response, "{\"protocolVersion\":\"2025-06-18\"}");
 
     try std.testing.expectEqual(@as(?[]u8, null), try server.handleStdioLine(alloc,
         \\{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
