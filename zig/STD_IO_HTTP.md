@@ -278,15 +278,17 @@ that end state:
   operations after capability and scope resolution. They preserve the caller's
   authenticated row-policy context without constructing a `/tables/...`
   request or routing back through the public HTTP dispatcher.
-- Canonical and legacy-location A2A agent-card reads now use a direct `httpx`
-  handler over an owned JSON builder. Card generation no longer constructs a
-  request or response compatibility object, and both locations share the same
-  implementation.
+- The canonical A2A agent-card read now uses a direct `httpx` handler over an
+  owned JSON builder. Card generation no longer constructs a request or
+  response compatibility object. The former `/db/v1/.well-known/agent-card.json`
+  compatibility location is intentionally not registered and receives the
+  router's native 404 response.
 - Buffered A2A JSON-RPC and event-stream responses now use a direct `httpx`
   adapter over typed authorization/body inputs and the shared owned contextual
   result. The old buffered `HttpRequest`/`HttpResponse` adapter has been
-  deleted. The live streaming executor is retained only until the public
-  listener streaming cutover is complete.
+  deleted, along with the legacy live-streaming executor entry point. A future
+  incremental public-streaming implementation must use the typed operation and
+  `httpx` transport contracts rather than restore that compatibility executor.
 - MCP GET, POST, DELETE, extension-scoped, and profile routes now use a direct
   `httpx` registrar with typed method/body/session inputs. The owned contextual
   result carries cloned MCP session/protocol headers, so ingress no longer

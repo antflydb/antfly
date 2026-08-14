@@ -725,10 +725,9 @@ fn publicApiHttpxConfig(
     }).normalized();
 }
 
-/// Structured owner for the data role's public HTTP transport. Generated
-/// `httpx` routes take precedence; the global handler is a deliberately
-/// isolated migration boundary for internal routes not yet represented by a
-/// contextual registrar. Delete it once those route families are extracted.
+/// Structured owner for the data role's public HTTP transport. The handler
+/// registers the generated and contextual `httpx` route families explicitly;
+/// unknown paths use the router's native 404 behavior with no global fallback.
 const DataPublicHttpRuntime = struct {
     alloc: std.mem.Allocator,
     api_server: *antfly.public_api.kernel_bridge.ApiHttpServer,
