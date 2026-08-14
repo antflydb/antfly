@@ -3775,7 +3775,10 @@ pub fn build(b: *std.Build) void {
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
 
-    const http_low_fd_ratchet_filter = "std http listener process threads and descriptors recover after cancellation storms";
+    // Keep this as the stable behavioral suffix of the declaration rather
+    // than duplicating its descriptive worker-model prefix. The exact-filter
+    // runner still fails when the regression is no longer declared.
+    const http_low_fd_ratchet_filter = "recovers descriptors after cancellation storms";
     const http_low_fd_ratchet_tests = b.addTest(.{
         .root_module = lib_test_mod,
         // Compile the shared HTTP module for declaration reachability, but
