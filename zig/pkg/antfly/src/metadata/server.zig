@@ -210,15 +210,12 @@ pub const MetadataServer = struct {
             };
             owned_admin_mux = mux;
 
-            const max_connections: usize = @intCast(if (listener_cfg.max_connection_threads == 0)
-                256
-            else
-                listener_cfg.max_connection_threads);
+            const listener_server_config = metadataAdminHttpxConfig(listener_cfg, null);
             const http_runtime = try alloc.create(httpx.HttpRuntime);
             http_runtime.* = httpx.HttpRuntime.init(alloc, .{
-                .max_active_h1_requests = max_connections,
-                .max_active_connections = max_connections +| health_server.max_connections,
-                .max_active_requests = max_connections +| health_server.max_connections,
+                .max_active_h1_requests = listener_server_config.max_connections,
+                .max_active_connections = @as(usize, listener_server_config.max_connections) +| health_server.max_connections,
+                .max_active_requests = @as(usize, listener_server_config.max_request_tasks) +| health_server.max_connections,
             });
             owned_http_runtime = http_runtime;
 
@@ -482,6 +479,40 @@ pub const MetadataServer = struct {
     }
 };
 
+fn metadataAdminHttpxConfig(
+    cfg: raft_transport.StdHttpListenerConfig,
+    http_runtime: ?*httpx.HttpRuntime,
+) httpx.ServerConfig {
+    const max_connections: u32 = if (cfg.max_connection_threads == 0) 256 else cfg.max_connection_threads;
+    const max_request_tasks: u32 = if (cfg.max_active_requests == 0) @min(max_connections, 32) else cfg.max_active_requests;
+    return (httpx.ServerConfig{
+        .host = cfg.bind_host,
+        .port = cfg.bind_port,
+        .max_body_size = cfg.max_request_bytes,
+        .header_read_timeout_ms = cfg.header_read_timeout_ms,
+        .body_read_timeout_ms = cfg.body_read_timeout_ms,
+        .response_write_timeout_ms = cfg.header_read_timeout_ms,
+        .request_body_buffer_budget_bytes = cfg.max_request_bytes * @as(usize, max_request_tasks),
+        .max_h1_inflight_bodies = max_request_tasks,
+        .max_connections = max_connections,
+        .max_request_tasks = max_request_tasks,
+        .accept_error_backoff_initial_ms = cfg.accept_error_backoff_initial_ms,
+        .accept_error_backoff_max_ms = cfg.accept_error_backoff_max_ms,
+        .reuse_address = cfg.reuse_address,
+        .http_runtime = http_runtime,
+    }).normalized();
+}
+
+test "metadata listener resolves connection and request capacities once" {
+    const config = metadataAdminHttpxConfig(.{
+        .max_connection_threads = 0,
+        .max_active_requests = 0,
+    }, null);
+    try std.testing.expectEqual(@as(u32, 256), config.max_connections);
+    try std.testing.expectEqual(@as(u32, 32), config.max_request_tasks);
+    try std.testing.expectEqual(@as(u32, 32), config.max_h1_inflight_bodies);
+}
+
 const MetadataAdminHttpRuntime = struct {
     alloc: std.mem.Allocator,
     cfg: raft_transport.StdHttpListenerConfig,
@@ -503,28 +534,12 @@ const MetadataAdminHttpRuntime = struct {
         errdefer api_lane_lease.release();
         const runtime = try alloc.create(MetadataAdminHttpRuntime);
         errdefer alloc.destroy(runtime);
-        const max_connections: u32 = if (cfg.max_connection_threads == 0) 256 else cfg.max_connection_threads;
-        const max_active_requests: u32 = if (cfg.max_active_requests == 0) @min(max_connections, 32) else cfg.max_active_requests;
         runtime.* = .{
             .alloc = alloc,
             .cfg = cfg,
             .mux = mux,
             .handler = try public_api_kernel.createHandler(public_api),
-            .server = httpx.Server.initWithConfig(alloc, api_lane_lease.io(), .{
-                .host = cfg.bind_host,
-                .port = cfg.bind_port,
-                .max_body_size = cfg.max_request_bytes,
-                .header_read_timeout_ms = cfg.header_read_timeout_ms,
-                .body_read_timeout_ms = cfg.body_read_timeout_ms,
-                .response_write_timeout_ms = cfg.header_read_timeout_ms,
-                .request_body_buffer_budget_bytes = cfg.max_request_bytes * @as(usize, max_active_requests),
-                .max_h1_inflight_bodies = max_active_requests,
-                .max_connections = max_connections,
-                .accept_error_backoff_initial_ms = cfg.accept_error_backoff_initial_ms,
-                .accept_error_backoff_max_ms = cfg.accept_error_backoff_max_ms,
-                .reuse_address = cfg.reuse_address,
-                .http_runtime = http_runtime,
-            }),
+            .server = httpx.Server.initWithConfig(alloc, api_lane_lease.io(), metadataAdminHttpxConfig(cfg, http_runtime)),
             .listener_task = undefined,
             .api_lane_lease = api_lane_lease,
         };

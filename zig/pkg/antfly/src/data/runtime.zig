@@ -697,23 +697,32 @@ fn publicApiListenerConfig(bind_host: []const u8, bind_port: u16) antfly.raft.tr
 
 fn publicApiHttpxConfig(
     cfg: antfly.raft.transport.StdHttpListenerConfig,
-    http_runtime: *httpx.HttpRuntime,
+    http_runtime: ?*httpx.HttpRuntime,
 ) httpx.ServerConfig {
-    return .{
+    const max_connections: u32 = if (cfg.max_connection_threads == 0)
+        public_api_max_connection_threads
+    else
+        cfg.max_connection_threads;
+    const max_request_tasks: u32 = if (cfg.max_active_requests == 0)
+        @min(max_connections, public_api_max_active_requests)
+    else
+        cfg.max_active_requests;
+    return (httpx.ServerConfig{
         .host = cfg.bind_host,
         .port = cfg.bind_port,
         .max_body_size = cfg.max_request_bytes,
         .header_read_timeout_ms = cfg.header_read_timeout_ms,
         .body_read_timeout_ms = cfg.body_read_timeout_ms,
         .response_write_timeout_ms = cfg.header_read_timeout_ms,
-        .request_body_buffer_budget_bytes = cfg.max_request_bytes * public_api_max_active_requests,
-        .max_h1_inflight_bodies = public_api_max_active_requests,
-        .max_connections = public_api_max_connection_threads,
+        .request_body_buffer_budget_bytes = cfg.max_request_bytes * @as(usize, max_request_tasks),
+        .max_h1_inflight_bodies = max_request_tasks,
+        .max_connections = max_connections,
+        .max_request_tasks = max_request_tasks,
         .accept_error_backoff_initial_ms = cfg.accept_error_backoff_initial_ms,
         .accept_error_backoff_max_ms = cfg.accept_error_backoff_max_ms,
         .reuse_address = cfg.reuse_address,
         .http_runtime = http_runtime,
-    };
+    }).normalized();
 }
 
 /// Structured owner for the data role's public HTTP transport. Generated
@@ -872,6 +881,11 @@ test "data public API listener uses public API request body limit" {
     try std.testing.expect(cfg.serve_in_connection_threads);
     try std.testing.expectEqual(public_api_max_connection_threads, cfg.max_connection_threads);
     try std.testing.expectEqual(public_api_max_active_requests, cfg.max_active_requests);
+
+    const server_config = publicApiHttpxConfig(cfg, null);
+    try std.testing.expectEqual(public_api_max_connection_threads, server_config.max_connections);
+    try std.testing.expectEqual(public_api_max_active_requests, server_config.max_request_tasks);
+    try std.testing.expectEqual(public_api_max_active_requests, server_config.max_h1_inflight_bodies);
 }
 
 const DataDescriptorFactory = struct {
@@ -6237,14 +6251,11 @@ pub const DataServer = struct {
         if (self.owned_http_runtime) |runtime| return runtime;
         const runtime = try self.alloc.create(httpx.HttpRuntime);
         errdefer self.alloc.destroy(runtime);
-        const capacity: usize = @intCast(if (self.listener_cfg.max_connection_threads == 0)
-            public_api_max_connection_threads
-        else
-            self.listener_cfg.max_connection_threads);
+        const listener_config = publicApiHttpxConfig(self.listener_cfg, null);
         runtime.* = httpx.HttpRuntime.init(self.alloc, .{
-            .max_active_h1_requests = capacity,
-            .max_active_connections = capacity +| health_metrics.max_connections,
-            .max_active_requests = capacity +| health_metrics.max_connections,
+            .max_active_h1_requests = listener_config.max_connections,
+            .max_active_connections = @as(usize, listener_config.max_connections) +| health_metrics.max_connections,
+            .max_active_requests = @as(usize, listener_config.max_request_tasks) +| health_metrics.max_connections,
         });
         self.owned_http_runtime = runtime;
         return runtime;

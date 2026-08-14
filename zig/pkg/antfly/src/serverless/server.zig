@@ -34,6 +34,17 @@ pub const ListenerConfig = struct {
     max_connections: u32 = 64,
 };
 
+fn listenerHttpxConfig(cfg: ListenerConfig, http_runtime: ?*httpx.HttpRuntime) httpx.ServerConfig {
+    return (httpx.ServerConfig{
+        .host = cfg.bind_host,
+        .port = cfg.bind_port,
+        .max_body_size = cfg.max_request_bytes,
+        .request_body_buffer_budget_bytes = cfg.max_request_bytes,
+        .max_connections = cfg.max_connections,
+        .http_runtime = http_runtime,
+    }).normalized();
+}
+
 pub const ServerlessServer = struct {
     alloc: std.mem.Allocator,
     stack: *runtime_mod.OwnedStack,
@@ -54,11 +65,14 @@ pub const ServerlessServer = struct {
 
         const http_runtime = try alloc.create(httpx.HttpRuntime);
         errdefer alloc.destroy(http_runtime);
-        const public_capacity: usize = if (cfg.listener) |listener_cfg| listener_cfg.max_connections else 0;
+        const public_server_config: ?httpx.ServerConfig = if (cfg.listener) |listener_cfg|
+            listenerHttpxConfig(listener_cfg, null)
+        else
+            null;
         http_runtime.* = httpx.HttpRuntime.init(alloc, .{
-            .max_active_h1_requests = public_capacity,
-            .max_active_connections = public_capacity +| health_server.max_connections,
-            .max_active_requests = public_capacity +| health_server.max_connections,
+            .max_active_h1_requests = if (public_server_config) |listener_config| listener_config.max_connections else 0,
+            .max_active_connections = (if (public_server_config) |listener_config| @as(usize, listener_config.max_connections) else 0) +| health_server.max_connections,
+            .max_active_requests = (if (public_server_config) |listener_config| @as(usize, listener_config.max_request_tasks) else 0) +| health_server.max_connections,
         });
         errdefer http_runtime.deinit();
 
@@ -68,16 +82,11 @@ pub const ServerlessServer = struct {
             alloc.destroy(listener);
         };
 
-        if (cfg.listener) |listener_cfg| {
+        if (public_server_config) |resolved_config| {
             const listener = try alloc.create(httpx.Server);
-            listener.* = httpx.Server.initWithConfig(alloc, io, .{
-                .host = listener_cfg.bind_host,
-                .port = listener_cfg.bind_port,
-                .max_body_size = listener_cfg.max_request_bytes,
-                .request_body_buffer_budget_bytes = listener_cfg.max_request_bytes,
-                .max_connections = listener_cfg.max_connections,
-                .http_runtime = http_runtime,
-            });
+            var listener_config = resolved_config;
+            listener_config.http_runtime = http_runtime;
+            listener.* = httpx.Server.initWithConfig(alloc, io, listener_config);
             listener.global(httpx.Handler.bind(http_server, serverless_http_server.ServerlessHttpServer.handleHttpx));
             owned_listener = listener;
         }
@@ -168,6 +177,10 @@ pub const ServerlessServer = struct {
 test "serverless server module compiles" {
     _ = ServerlessServerConfig;
     _ = ServerlessServer;
+
+    const normalized = listenerHttpxConfig(.{ .max_connections = 0 }, null);
+    try std.testing.expectEqual(@as(u32, 1000), normalized.max_connections);
+    try std.testing.expectEqual(normalized.max_connections, normalized.max_request_tasks);
 }
 
 test "serverless server starts managed runtime and serves listener requests" {

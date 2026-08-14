@@ -2245,8 +2245,7 @@ pub fn runFromIterator(
         control_io.concurrent(serveUnifiedWithInference, .{
             alloc,
             public_io,
-            bind_host,
-            bind_port,
+            public_http_config,
             cors_config,
             &handler,
             antfly_node,
@@ -2259,8 +2258,7 @@ pub fn runFromIterator(
         control_io.concurrent(serveUnifiedWithLinkedInference, .{
             alloc,
             public_io,
-            bind_host,
-            bind_port,
+            public_http_config,
             cors_config,
             &handler,
             antfly_node,
@@ -2397,8 +2395,7 @@ pub fn runLite(
 fn serveUnifiedWithInference(
     alloc: std.mem.Allocator,
     io: std.Io,
-    bind_host: []const u8,
-    bind_port: u16,
+    public_http_config: httpx.ServerConfig,
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
     handler: *ApiKernelHandler,
     antfly_node: *anyopaque,
@@ -2407,7 +2404,7 @@ fn serveUnifiedWithInference(
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(true, alloc, io, bind_host, bind_port, cors_config, handler, antfly_node, api_server, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, api_server, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2420,8 +2417,7 @@ fn serveUnifiedWithInference(
 fn serveUnifiedWithLinkedInference(
     alloc: std.mem.Allocator,
     io: std.Io,
-    bind_host: []const u8,
-    bind_port: u16,
+    public_http_config: httpx.ServerConfig,
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
     handler: *ApiKernelHandler,
     inference_handle: *anyopaque,
@@ -2430,7 +2426,7 @@ fn serveUnifiedWithLinkedInference(
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(false, alloc, io, bind_host, bind_port, cors_config, handler, inference_handle, api_server, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, api_server, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2444,8 +2440,7 @@ fn serveUnifiedInner(
     comptime inline_inference: bool,
     alloc: std.mem.Allocator,
     io: std.Io,
-    bind_host: []const u8,
-    bind_port: u16,
+    public_http_config: httpx.ServerConfig,
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
     handler: *ApiKernelHandler,
     antfly_node: *anyopaque,
@@ -2454,7 +2449,7 @@ fn serveUnifiedInner(
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
 ) !void {
-    var server_config = publicHttpServerConfig(bind_host, bind_port);
+    var server_config = public_http_config;
     server_config.http_runtime = http_runtime;
     var server = httpx.Server.initWithConfig(alloc, io, server_config);
     defer server.deinit();
@@ -2502,7 +2497,22 @@ fn serveUnifiedInner(
     try registerAntfarmRoutes(&server);
 
     var listener_task = httpx.ListenerTask.init(&server);
-    try listener_task.start();
+    listener_task.start() catch |err| {
+        const stats = http_runtime.stats();
+        std.log.err(
+            "standalone public listener admission failed err={s} requested_connections={d} requested_requests={d} runtime_connections={d} reserved_connections={d} runtime_requests={d} reserved_requests={d}",
+            .{
+                @errorName(err),
+                public_http_config.max_connections,
+                public_http_config.max_request_tasks,
+                stats.connection_capacity,
+                stats.reserved_connection_capacity,
+                stats.request_capacity,
+                stats.reserved_request_capacity,
+            },
+        );
+        return err;
+    };
     var listener_joined = false;
     defer if (!listener_joined) {
         listener_task.requestStop();
@@ -2653,7 +2663,7 @@ fn configuredPublicHttpConnectionLimit() u32 {
 }
 
 fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerConfig {
-    return .{
+    return (httpx.ServerConfig{
         .host = bind_host,
         .port = bind_port,
         .max_body_size = antfly.public_api.http_server.public_api_max_request_body_bytes,
@@ -2679,7 +2689,7 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         // the public bind tuple.
         .reuse_address = true,
         .reuse_port = false,
-    };
+    }).normalized();
 }
 
 fn healthzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -6508,6 +6518,7 @@ test "standalone public HTTP server is restart-safe and uses public API request 
     try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), cfg.request_body_buffer_budget_bytes);
     try std.testing.expect(cfg.max_connections >= 1);
     try std.testing.expect(cfg.max_connections <= public_http_connection_ceiling);
+    try std.testing.expectEqual(cfg.max_connections, cfg.max_request_tasks);
     try std.testing.expectEqual(public_http_max_h1_inflight_bodies, cfg.max_h1_inflight_bodies);
     try std.testing.expectEqual(@as(u32, 5), cfg.accept_error_backoff_initial_ms);
     try std.testing.expectEqual(@as(u32, 1_000), cfg.accept_error_backoff_max_ms);

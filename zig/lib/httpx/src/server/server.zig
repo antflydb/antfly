@@ -173,6 +173,23 @@ pub const ServerConfig = struct {
     /// Use a TLS-terminating reverse proxy in the meantime.
     tls_cert_path: ?[]const u8 = null,
     tls_key_path: ?[]const u8 = null,
+
+    /// Resolves every sentinel/default and enforces dependent bounds. Shared
+    /// HttpRuntime owners must size their lanes from this value so the runtime
+    /// and Server cannot interpret the same listener configuration differently.
+    pub fn normalized(config: @This()) @This() {
+        var resolved = config;
+        if (resolved.max_connections == 0) resolved.max_connections = 1000;
+        if (resolved.max_request_tasks == 0) resolved.max_request_tasks = resolved.max_connections;
+        if (resolved.h2_max_concurrent_streams == 0) resolved.h2_max_concurrent_streams = 100;
+        // Do not advertise more simultaneous streams on one connection than
+        // this listener can ever publish to its bounded handler lane.
+        resolved.h2_max_concurrent_streams = @min(resolved.h2_max_concurrent_streams, resolved.max_request_tasks);
+        resolved.request_body_buffer_budget_bytes = @max(resolved.request_body_buffer_budget_bytes, resolved.max_body_size);
+        resolved.accept_error_backoff_initial_ms = @max(resolved.accept_error_backoff_initial_ms, 1);
+        resolved.accept_error_backoff_max_ms = @max(resolved.accept_error_backoff_max_ms, resolved.accept_error_backoff_initial_ms);
+        return resolved;
+    }
 };
 
 /// Maps an application error to an HTTP response. Cancellation has no status:
@@ -1256,16 +1273,7 @@ pub const Server = struct {
 
     /// Creates a server with custom configuration.
     pub fn initWithConfig(allocator: Allocator, io: Io, config: ServerConfig) Self {
-        var cfg = config;
-        if (cfg.max_connections == 0) cfg.max_connections = 1000;
-        if (cfg.max_request_tasks == 0) cfg.max_request_tasks = cfg.max_connections;
-        if (cfg.h2_max_concurrent_streams == 0) cfg.h2_max_concurrent_streams = 100;
-        // Do not advertise more simultaneous streams on one connection than
-        // this listener can ever publish to its bounded handler lane.
-        cfg.h2_max_concurrent_streams = @min(cfg.h2_max_concurrent_streams, cfg.max_request_tasks);
-        cfg.request_body_buffer_budget_bytes = @max(cfg.request_body_buffer_budget_bytes, cfg.max_body_size);
-        cfg.accept_error_backoff_initial_ms = @max(cfg.accept_error_backoff_initial_ms, 1);
-        cfg.accept_error_backoff_max_ms = @max(cfg.accept_error_backoff_max_ms, cfg.accept_error_backoff_initial_ms);
+        const cfg = config.normalized();
 
         return .{
             .allocator = allocator,
@@ -3325,6 +3333,21 @@ test "ServerConfig defaults" {
     try std.testing.expectEqual(@as(u64, 120_000), config.body_read_timeout_ms);
     try std.testing.expectEqual(@as(u64, 30_000), config.response_write_timeout_ms);
 
+    const normalized = (ServerConfig{
+        .max_connections = 64,
+        .max_request_tasks = 0,
+        .h2_max_concurrent_streams = 0,
+        .max_body_size = 4096,
+        .request_body_buffer_budget_bytes = 0,
+        .accept_error_backoff_initial_ms = 0,
+        .accept_error_backoff_max_ms = 0,
+    }).normalized();
+    try std.testing.expectEqual(@as(u32, 64), normalized.max_request_tasks);
+    try std.testing.expectEqual(@as(u32, 64), normalized.h2_max_concurrent_streams);
+    try std.testing.expectEqual(@as(usize, 4096), normalized.request_body_buffer_budget_bytes);
+    try std.testing.expectEqual(@as(u32, 1), normalized.accept_error_backoff_initial_ms);
+    try std.testing.expectEqual(@as(u32, 1), normalized.accept_error_backoff_max_ms);
+
     var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
         .header_read_timeout_ms = 0,
         .body_read_timeout_ms = 0,
@@ -4457,7 +4480,7 @@ test "HTTP runtime tasks do not consume the nested-operation executor" {
     try std.testing.expectEqual(@as(u64, 0), server.runtimeStats().connection_dispatch_rejections_total);
 }
 
-test "HTTP/1 request saturation rejects before handler execution" {
+test "HTTP/1 and h2c request saturation reject before application work" {
     if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
     const State = struct {
@@ -4482,7 +4505,7 @@ test "HTTP/1 request saturation rejects before handler execution" {
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
         .port = 0,
-        .max_connections = 2,
+        .max_connections = 3,
         .max_request_tasks = 1,
         .h1_disconnect_cancellation = .disabled,
     });
@@ -4513,8 +4536,27 @@ test "HTTP/1 request saturation rejects before handler execution" {
     const rejected_len = try second_client.recv(&rejected_response);
 
     try std.testing.expect(mem.indexOf(u8, rejected_response[0..rejected_len], " 503 ") != null);
+
+    // An h2c upgrade is still an admitted request. Saturation must reject it
+    // before switching protocols, otherwise h2c could bypass the universal
+    // request lane through the upgrade path.
+    var h2c_client = try Socket.connect(server.boundAddress().?, client_io);
+    defer h2c_client.close();
+    try h2c_client.setRecvTimeout(5_000);
+    try h2c_client.sendAll(
+        "GET /work HTTP/1.1\r\n" ++
+            "Host: test\r\n" ++
+            "Connection: Upgrade, HTTP2-Settings\r\n" ++
+            "Upgrade: h2c\r\n" ++
+            "HTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n",
+    );
+    var h2c_rejected_response: [1024]u8 = undefined;
+    const h2c_rejected_len = try h2c_client.recv(&h2c_rejected_response);
+    try std.testing.expect(mem.indexOf(u8, h2c_rejected_response[0..h2c_rejected_len], " 503 ") != null);
+    try std.testing.expect(mem.indexOf(u8, h2c_rejected_response[0..h2c_rejected_len], " 101 ") == null);
+
     try std.testing.expectEqual(@as(u32, 1), State.handler_calls.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), server.runtimeStats().request_dispatch_rejections_total);
+    try std.testing.expectEqual(@as(u64, 2), server.runtimeStats().request_dispatch_rejections_total);
     try std.testing.expectEqual(@as(u64, 0), server.runtimeStats().h2_stream_dispatch_rejections_total);
 
     State.release_first.store(true, .release);

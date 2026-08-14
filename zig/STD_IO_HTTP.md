@@ -656,6 +656,15 @@ sockets and their connection groups run on `connectionIo()`, and every HTTP/1,
 HTTP/2, and h2c handler runs on `requestIo()`. These lanes stop only after every
 listener, connection, and request task has been joined.
 
+`ServerConfig.normalized()` is the single configuration boundary for listener
+defaults, sentinels, and dependent bounds. A role that owns a shared
+`HttpRuntime` first builds and normalizes each listener configuration, sizes the
+runtime from those resolved `max_connections` and `max_request_tasks` values,
+and passes that same resolved configuration to `Server`. Runtime owners must
+never size a lane from raw zero-sentinel fields or independently reproduce the
+server's default arithmetic; otherwise a valid configuration can fail at bind
+or silently reserve a different request bound than operators configured.
+
 Aggregate reservation alone is insufficient: a shared executor does not know
 which listener a task belongs to. Each `httpx.Server` therefore owns a local
 atomic request-permit pool equal to its leased request capacity. It must claim a
@@ -1299,6 +1308,7 @@ Lifecycle tests should cover:
 - Listener, connection, and request-lane reservation exhaustion at bind
 - Connection scheduling rejection without inline accept-loop fallback
 - HTTP/1 request saturation with 503 and no handler execution
+- h2c upgrade saturation with 503 before the protocol switch
 - H2 request scheduling rejection with `REFUSED_STREAM` and no inline
   frame-pump execution
 - Per-listener request-quota isolation on a shared `HttpRuntime`
