@@ -23,7 +23,7 @@ const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
 
 const max_mcp_sample_documents_limit: i64 = 100;
-const mcp_tool_result_too_large_text = "Antfly produced more data than this MCP client can safely consume. Reduce limit and fields, avoid _chunks.*, or return direct matches with an explicit queryRequest.hierarchy.ancestors projection.";
+const mcp_tool_result_too_large_text = "Antfly produced more data than this MCP client can safely consume. Reduce limit and fields, avoid _chunks.*, or return direct matches with an explicit queryRequest.hierarchy object and bounded ancestor projections.";
 
 const McpToolKind = enum {
     create_table,
@@ -108,8 +108,9 @@ const query_request_description_json =
     \\      "queryRequest is mutually exclusive with shorthand query arguments such as fullTextSearch, semanticSearch, fields, limit, orderBy, indexes, and filterPrefix.",
     \\      "queryRequest.table is rejected because tableName selects the table-scoped route.",
     \\      "Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema.",
-    \\      "For hierarchical documents, prefer direct matches with explicit top-level fields and hierarchy.ancestors projections.",
-    \\      "Use hierarchy.group_by.level=source with bounded group_by.matches for grouped source results; top-level limit does not bound nested matches.",
+    \\      "For hierarchical documents, the presence of hierarchy selects direct matches unless group_by is present; ancestors only controls projected context.",
+    \\      "Use hierarchy.group_by.level=source with bounded group_by.matches for grouped source results; nested matches default to three, cannot exceed 100, and top-level limit does not bound them.",
+    \\      "For source groups, project source fields with top-level fields; hierarchy.ancestors.source is rejected because it would duplicate the grouping-level document.",
     \\      "Never request _chunks.* through MCP because it can expand every child stored on a matched source.",
     \\      "Structured filter_query.geo_bbox accepts field, min_lat, min_lon, max_lat, and max_lon; min_lon greater than max_lon represents an antimeridian-wrapped box."
     \\    ]

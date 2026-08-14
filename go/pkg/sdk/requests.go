@@ -171,7 +171,8 @@ type QueryRequest struct {
 	GraphSearches map[string]GraphQuery `json:"graph_searches,omitempty"`
 
 	// Hierarchy controls top-level result shape, bounded child hits, and projected ancestors.
-	Hierarchy QueryHierarchy `json:"hierarchy,omitzero"`
+	// A non-nil empty object selects direct index matches without ancestor hydration.
+	Hierarchy *QueryHierarchy `json:"hierarchy,omitempty"`
 
 	// Join configuration for joining data from another table.
 	// Supports inner, left, and right joins with automatic strategy selection.

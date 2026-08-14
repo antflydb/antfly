@@ -6,11 +6,11 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="QueryHitHierarchyChunksItem")
+T = TypeVar("T", bound="HierarchyEvidenceMention")
 
 
 @_attrs_define
-class QueryHitHierarchyChunksItem:
+class HierarchyEvidenceMention:
     """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -25,10 +25,10 @@ class QueryHitHierarchyChunksItem:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        query_hit_hierarchy_chunks_item = cls()
+        hierarchy_evidence_mention = cls()
 
-        query_hit_hierarchy_chunks_item.additional_properties = d
-        return query_hit_hierarchy_chunks_item
+        hierarchy_evidence_mention.additional_properties = d
+        return hierarchy_evidence_mention
 
     @property
     def additional_keys(self) -> list[str]:

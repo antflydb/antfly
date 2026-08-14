@@ -6017,7 +6017,10 @@ export interface components {
         HierarchyMatches: {
             /**
              * Format: uint32
-             * @description Maximum matching descendant hits attached to each group, independent of the top-level query limit.
+             * @description Maximum matching descendant hits attached to each group, independent of
+             *     the top-level query limit. Matches follow the effective query order, and
+             *     the group score is the score of its best matching descendant. The maximum
+             *     is enforced before query execution to bound work and response growth.
              * @default 3
              */
             limit?: number;
@@ -6047,12 +6050,10 @@ export interface components {
          *     `limit` continues to control the number of groups.
          *
          *     Ancestor and nested-match field projections are always explicit to keep response
-         *     size predictable. Direct matches are selected whenever `ancestors` is used without
-         *     `group_by`.
-         *
-         *     The legacy `return_level`, `rollup`, `include`, and
-         *     `max_children_per_parent` fields remain supported in legacy-only requests.
-         *     Do not mix legacy and new controls in one request.
+         *     size predictable. The presence of this object selects the canonical contract:
+         *     without `group_by`, including when the object is empty, direct index matches are
+         *     returned. `ancestors` only controls projected context and never changes result
+         *     cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
          */
         QueryHierarchy: {
             group_by?: components["schemas"]["HierarchyGroupBy"];
@@ -6076,7 +6077,7 @@ export interface components {
              * @description Legacy child limit. Prefer group_by.matches.limit.
              */
             max_children_per_parent?: number;
-        } & unknown;
+        } & (unknown & unknown);
         QueryRequest: {
             /**
              * @description Name of the table to query. Optional for global queries.
@@ -7014,6 +7015,93 @@ export interface components {
             pca?: number[];
             tsne?: number[];
         };
+        HierarchyArtifactSource: {
+            name: string;
+            /** @enum {string} */
+            kind: "chunk" | "asset" | "embedding";
+            /** Format: uint32 */
+            chunk_id?: number;
+            unit_id?: string;
+        };
+        HierarchyArtifact: {
+            name: string;
+            /** @enum {string} */
+            kind: "chunk" | "asset" | "embedding";
+            /** Format: uint32 */
+            chunk_id?: number;
+            unit_id?: string;
+            source?: components["schemas"]["HierarchyArtifactSource"];
+        };
+        HierarchyAncestor: {
+            id?: string;
+            document?: {
+                [key: string]: unknown;
+            };
+            key?: string;
+            artifact_name?: string;
+            source_field?: string;
+            provenance?: unknown;
+        } & {
+            [key: string]: unknown;
+        };
+        QueryHitHierarchyAncestors: {
+            source: components["schemas"]["HierarchyAncestor"];
+            unit?: components["schemas"]["HierarchyAncestor"];
+        };
+        /** @enum {string} */
+        QueryHitHierarchyLevel: "source" | "unit" | "chunk" | "mention" | "artifact" | "embedding";
+        HierarchyMatchContext: {
+            level?: components["schemas"]["QueryHitHierarchyLevel"];
+            parent_doc_key?: string;
+            parent_unit_id?: string;
+            artifact?: components["schemas"]["HierarchyArtifact"];
+            ancestors?: components["schemas"]["QueryHitHierarchyAncestors"];
+        };
+        HierarchyEvidence: {
+            local_id?: string;
+            decision?: string;
+            /** Format: float */
+            confidence?: number;
+            source_artifact?: string;
+            source_artifact_key?: string;
+            resolution_artifact?: string;
+            resolution_artifact_key?: string;
+            resolver?: string;
+            resolver_table?: string;
+            mention?: {
+                [key: string]: unknown;
+            };
+            canonical?: {
+                [key: string]: unknown;
+            };
+        };
+        HierarchyMatchHit: {
+            _id: string;
+            /** Format: float */
+            _score: number;
+            _source?: {
+                [key: string]: unknown;
+            };
+            hierarchy?: components["schemas"]["HierarchyMatchContext"];
+        };
+        QueryHitHierarchy: {
+            /** @description Hierarchy level represented by this hit. */
+            level?: components["schemas"]["QueryHitHierarchyLevel"];
+            /** @description Source document key that owns this derived hit. */
+            parent_doc_key?: string;
+            /** @description Unit identifier when the hit is attached to a document unit. */
+            parent_unit_id?: string;
+            artifact?: components["schemas"]["HierarchyArtifact"];
+            ancestors?: components["schemas"]["QueryHitHierarchyAncestors"];
+            evidence?: components["schemas"]["HierarchyEvidence"];
+            /** @description Matching descendant hits attached by the canonical hierarchy.group_by request. */
+            matches?: components["schemas"]["HierarchyMatchHit"][];
+            /**
+             * @deprecated
+             * @description Legacy child chunk hits included for source-level rollups.
+             */
+            chunks?: components["schemas"]["HierarchyMatchHit"][];
+        };
         /** @description A single query result hit */
         QueryHit: {
             /** @description ID of the record. */
@@ -7038,38 +7126,7 @@ export interface components {
              *     `ancestors` with response-local or requested DB-backed source/unit context when available.
              *     Legacy rollup requests continue to use `chunks` instead of `matches`.
              */
-            hierarchy?: {
-                /**
-                 * @description Hierarchy level represented by this hit.
-                 * @enum {string}
-                 */
-                level?: "source" | "unit" | "chunk" | "mention" | "artifact" | "embedding";
-                /** @description Source document key that owns this derived hit. */
-                parent_doc_key?: string;
-                /** @description Unit identifier when the hit is attached to a document unit. */
-                parent_unit_id?: string;
-                /** @description Artifact identity with `name`, `kind`, and optional `unit_id` or `chunk_id`. */
-                artifact?: {
-                    [key: string]: unknown;
-                };
-                /** @description Ancestor context. Includes `source.id` for derived hits, `source.document` for materialized source rollups or requested source hydration, and `unit.document` for direct unit hits or requested unit hydration when the unit payload is present. */
-                ancestors?: {
-                    [key: string]: unknown;
-                };
-                /** @description Matching descendant hits attached by the canonical hierarchy.group_by request. */
-                matches?: {
-                    [key: string]: unknown;
-                }[];
-                /**
-                 * @deprecated
-                 * @description Legacy child chunk hits included for source-level rollups.
-                 */
-                chunks?: {
-                    [key: string]: unknown;
-                }[];
-            } & {
-                [key: string]: unknown;
-            };
+            hierarchy?: components["schemas"]["QueryHitHierarchy"];
             /**
              * @description Sort key values for this hit. Pass as search_after or search_before
              *     to paginate to the next/previous page. Values preserve their JSON

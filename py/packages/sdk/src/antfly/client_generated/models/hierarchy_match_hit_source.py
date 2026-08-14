@@ -6,11 +6,11 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="QueryHitHierarchyMatchesItem")
+T = TypeVar("T", bound="HierarchyMatchHitSource")
 
 
 @_attrs_define
-class QueryHitHierarchyMatchesItem:
+class HierarchyMatchHitSource:
     """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -25,10 +25,10 @@ class QueryHitHierarchyMatchesItem:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        query_hit_hierarchy_matches_item = cls()
+        hierarchy_match_hit_source = cls()
 
-        query_hit_hierarchy_matches_item.additional_properties = d
-        return query_hit_hierarchy_matches_item
+        hierarchy_match_hit_source.additional_properties = d
+        return hierarchy_match_hit_source
 
     @property
     def additional_keys(self) -> list[str]:

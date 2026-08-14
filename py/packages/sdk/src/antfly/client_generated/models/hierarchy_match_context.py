@@ -10,27 +10,21 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.hierarchy_artifact import HierarchyArtifact
-    from ..models.hierarchy_evidence import HierarchyEvidence
-    from ..models.hierarchy_match_hit import HierarchyMatchHit
     from ..models.query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
 
 
-T = TypeVar("T", bound="QueryHitHierarchy")
+T = TypeVar("T", bound="HierarchyMatchContext")
 
 
 @_attrs_define
-class QueryHitHierarchy:
+class HierarchyMatchContext:
     """
     Attributes:
         level (QueryHitHierarchyLevel | Unset):
-        parent_doc_key (str | Unset): Source document key that owns this derived hit.
-        parent_unit_id (str | Unset): Unit identifier when the hit is attached to a document unit.
+        parent_doc_key (str | Unset):
+        parent_unit_id (str | Unset):
         artifact (HierarchyArtifact | Unset):
         ancestors (QueryHitHierarchyAncestors | Unset):
-        evidence (HierarchyEvidence | Unset):
-        matches (list[HierarchyMatchHit] | Unset): Matching descendant hits attached by the canonical hierarchy.group_by
-            request.
-        chunks (list[HierarchyMatchHit] | Unset): Legacy child chunk hits included for source-level rollups.
     """
 
     level: QueryHitHierarchyLevel | Unset = UNSET
@@ -38,9 +32,6 @@ class QueryHitHierarchy:
     parent_unit_id: str | Unset = UNSET
     artifact: HierarchyArtifact | Unset = UNSET
     ancestors: QueryHitHierarchyAncestors | Unset = UNSET
-    evidence: HierarchyEvidence | Unset = UNSET
-    matches: list[HierarchyMatchHit] | Unset = UNSET
-    chunks: list[HierarchyMatchHit] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         level: str | Unset = UNSET
@@ -59,24 +50,6 @@ class QueryHitHierarchy:
         if not isinstance(self.ancestors, Unset):
             ancestors = self.ancestors.to_dict()
 
-        evidence: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.evidence, Unset):
-            evidence = self.evidence.to_dict()
-
-        matches: list[dict[str, Any]] | Unset = UNSET
-        if not isinstance(self.matches, Unset):
-            matches = []
-            for matches_item_data in self.matches:
-                matches_item = matches_item_data.to_dict()
-                matches.append(matches_item)
-
-        chunks: list[dict[str, Any]] | Unset = UNSET
-        if not isinstance(self.chunks, Unset):
-            chunks = []
-            for chunks_item_data in self.chunks:
-                chunks_item = chunks_item_data.to_dict()
-                chunks.append(chunks_item)
-
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
@@ -90,20 +63,12 @@ class QueryHitHierarchy:
             field_dict["artifact"] = artifact
         if ancestors is not UNSET:
             field_dict["ancestors"] = ancestors
-        if evidence is not UNSET:
-            field_dict["evidence"] = evidence
-        if matches is not UNSET:
-            field_dict["matches"] = matches
-        if chunks is not UNSET:
-            field_dict["chunks"] = chunks
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.hierarchy_artifact import HierarchyArtifact
-        from ..models.hierarchy_evidence import HierarchyEvidence
-        from ..models.hierarchy_match_hit import HierarchyMatchHit
         from ..models.query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
 
         d = dict(src_dict)
@@ -132,40 +97,12 @@ class QueryHitHierarchy:
         else:
             ancestors = QueryHitHierarchyAncestors.from_dict(_ancestors)
 
-        _evidence = d.pop("evidence", UNSET)
-        evidence: HierarchyEvidence | Unset
-        if isinstance(_evidence, Unset):
-            evidence = UNSET
-        else:
-            evidence = HierarchyEvidence.from_dict(_evidence)
-
-        _matches = d.pop("matches", UNSET)
-        matches: list[HierarchyMatchHit] | Unset = UNSET
-        if _matches is not UNSET:
-            matches = []
-            for matches_item_data in _matches:
-                matches_item = HierarchyMatchHit.from_dict(matches_item_data)
-
-                matches.append(matches_item)
-
-        _chunks = d.pop("chunks", UNSET)
-        chunks: list[HierarchyMatchHit] | Unset = UNSET
-        if _chunks is not UNSET:
-            chunks = []
-            for chunks_item_data in _chunks:
-                chunks_item = HierarchyMatchHit.from_dict(chunks_item_data)
-
-                chunks.append(chunks_item)
-
-        query_hit_hierarchy = cls(
+        hierarchy_match_context = cls(
             level=level,
             parent_doc_key=parent_doc_key,
             parent_unit_id=parent_unit_id,
             artifact=artifact,
             ancestors=ancestors,
-            evidence=evidence,
-            matches=matches,
-            chunks=chunks,
         )
 
-        return query_hit_hierarchy
+        return hierarchy_match_context

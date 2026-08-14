@@ -21975,6 +21975,27 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(hierarchy_properties.get("rollup") == null);
     try std.testing.expect(hierarchy_properties.get("include") == null);
     try std.testing.expect(hierarchy_properties.get("max_children_per_parent") == null);
+    try std.testing.expect(hierarchy_schema.object.get("minProperties") == null);
+    const group_by_schema = hierarchy_properties.get("group_by").?.object;
+    const matches_schema = group_by_schema.get("properties").?.object.get("matches").?.object;
+    const matches_limit = matches_schema.get("properties").?.object.get("limit").?.object;
+    try std.testing.expectEqual(@as(i64, 100), matches_limit.get("maximum").?.integer);
+    const hierarchy_constraints = hierarchy_schema.object.get("allOf").?.array.items;
+    var found_source_group_projection_constraint = false;
+    for (hierarchy_constraints) |constraint| {
+        const not_schema = constraint.object.get("not") orelse continue;
+        const ancestor_properties = not_schema.object.get("properties") orelse continue;
+        const ancestor_schema = ancestor_properties.object.get("ancestors") orelse continue;
+        const required = ancestor_schema.object.get("required") orelse continue;
+        if (required.array.items.len == 1 and
+            required.array.items[0] == .string and
+            std.mem.eql(u8, required.array.items[0].string, "source"))
+        {
+            found_source_group_projection_constraint = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_source_group_projection_constraint);
 
     const sample_tool = mcp.testing.findTool(listed_tools, "sample_documents") orelse return error.TestExpectedEqual;
     const sample_properties = sample_tool.inputSchema.object.get("properties") orelse return error.TestExpectedEqual;
@@ -22049,7 +22070,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     defer parsed_restore.deinit();
     try std.testing.expect(parsed_restore.value.result.isError);
     const restore_error = mcp.testing.findTextContent(parsed_restore.value.result.content) orelse return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.indexOf(u8, restore_error, "asynchronous restore worker unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restore_error, "named backup connection is unavailable") != null);
     try std.testing.expect(std.mem.indexOf(u8, restore_error, "invalid restore request") == null);
 
     var describe_table_resp = try executeHttpxTestRequest(&server, .{

@@ -26,12 +26,10 @@ class QueryHierarchy:
     `limit` continues to control the number of groups.
 
     Ancestor and nested-match field projections are always explicit to keep response
-    size predictable. Direct matches are selected whenever `ancestors` is used without
-    `group_by`.
-
-    The legacy `return_level`, `rollup`, `include`, and
-    `max_children_per_parent` fields remain supported in legacy-only requests.
-    Do not mix legacy and new controls in one request.
+    size predictable. The presence of this object selects the canonical contract:
+    without `group_by`, including when the object is empty, direct index matches are
+    returned. `ancestors` only controls projected context and never changes result
+    cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
 
         Attributes:
             group_by (HierarchyGroupBy | Unset):

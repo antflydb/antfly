@@ -140,11 +140,16 @@ projection:
 }
 ```
 
-An `ancestors` projection without `group_by` returns direct index matches. `group_by.level` currently supports `source`;
-its nested `matches` retain their actual `hierarchy.level`, so the response is not tied to chunks. Every match or ancestor
-projection must specify `fields`; use an empty array when only hierarchy identity is needed. Omitting
-`group_by.matches.limit` defaults it to three. Grouping and ancestor projection may be combined when both contexts are
-useful.
+The presence of `hierarchy` selects the canonical contract. Without `group_by`, including for `hierarchy: {}`, Antfly
+returns direct index matches; `ancestors` only adds projected context and never changes result cardinality.
+`group_by.level` currently supports `source`; its nested `matches` retain their actual `hierarchy.level`, so the response
+is not tied to chunks. Every match or ancestor projection must specify `fields`; use an empty array when only hierarchy
+identity is needed. Omitting `group_by.matches.limit` defaults it to three, and the server rejects values above 100 before
+executing the query. Nested matches follow the effective query order and each group carries its best match score.
+
+For source-level groups, select source fields with the top-level `fields` projection. A source ancestor projection would
+duplicate the grouping-level document and is rejected. A unit ancestor projection may be combined with source grouping
+when nested matches need intermediate unit context.
 
 The legacy hierarchy controls remain accepted for existing callers, but they cannot be mixed with `group_by` or
 `ancestors`. They are intentionally omitted from MCP discovery so new integrations see only the canonical controls.

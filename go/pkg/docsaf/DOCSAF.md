@@ -150,7 +150,6 @@ of assuming docsaf section rows:
 {
   "semantic_search": "termination clause",
   "hierarchy": {
-    "return_level": "chunk",
     "ancestors": {
       "source": {"fields": ["title", "url"]},
       "unit": {"fields": ["page"]}

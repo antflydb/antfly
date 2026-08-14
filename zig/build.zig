@@ -4429,6 +4429,7 @@ pub fn build(b: *std.Build) void {
             "fuseNamedSets drops conflicting source hit ordinals",
             "applyGraphUnion deduplicates by ordinals when hit pages are complete",
             "applyGraphIntersection uses ordinals when hit pages are complete",
+            "reshapeChunkBackedResult uses the first ranked descendant for the group score",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4757,6 +4758,10 @@ pub fn build(b: *std.Build) void {
         "api http server retries interrupted metadata restore publication",
         "public API request body limit matches Go linear merge contract",
         "api query contract parses direct JSON-pointer path aliases",
+        "api query contract serializes derived hierarchy ancestry",
+        "api query contract serializes mention evidence hierarchy",
+        "api query contract validates canonical hierarchy controls",
+        "api http server serves fielded full-text search through mcp tools",
         "api query contract canonicalizes public Query filter roots and compositions",
         "api query contract accepts multi_match bool_prefix full text",
         "api query contract bounds public fuzzy integers without narrowing traps",

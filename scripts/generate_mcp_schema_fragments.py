@@ -40,7 +40,6 @@ class Fragment:
     tool_input: bool = False
     aliases: dict[str, str] = field(default_factory=dict)
     exclude_deprecated: bool = False
-    omit_top_level: tuple[str, ...] = ()
 
 
 FRAGMENTS = (
@@ -48,7 +47,6 @@ FRAGMENTS = (
         "QueryHierarchy",
         "mcp_query_hierarchy_schema.json",
         exclude_deprecated=True,
-        omit_top_level=("allOf",),
     ),
     Fragment("BackupRequest", "mcp_backup_input_schema.json", tool_input=True),
     Fragment("RestoreRequest", "mcp_restore_input_schema.json", tool_input=True),
@@ -133,6 +131,54 @@ def without_deprecated_properties(value: Any) -> Any:
     return result
 
 
+def deprecated_property_names(value: dict[str, Any]) -> set[str]:
+    properties = value.get("properties", {})
+    if not isinstance(properties, dict):
+        return set()
+    return {
+        name
+        for name, schema in properties.items()
+        if isinstance(schema, dict) and schema.get("deprecated") is True
+    }
+
+
+def constraint_requires_any(value: Any, property_names: set[str]) -> bool:
+    if isinstance(value, list):
+        return any(constraint_requires_any(item, property_names) for item in value)
+    if not isinstance(value, dict):
+        return False
+    required = value.get("required")
+    if isinstance(required, list) and any(name in property_names for name in required):
+        return True
+    return any(constraint_requires_any(item, property_names) for item in value.values())
+
+
+def without_constraints_referencing_properties(value: Any, property_names: set[str]) -> Any:
+    """Drop only combinator branches made stale by removed properties.
+
+    Keeping unrelated allOf/anyOf/oneOf branches ensures a future canonical
+    validation rule remains visible to MCP clients.
+    """
+    if isinstance(value, list):
+        return [without_constraints_referencing_properties(item, property_names) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if key in {"allOf", "anyOf", "oneOf"} and isinstance(item, list):
+            retained = [
+                without_constraints_referencing_properties(branch, property_names)
+                for branch in item
+                if not constraint_requires_any(branch, property_names)
+            ]
+            if retained:
+                result[key] = retained
+        else:
+            result[key] = without_constraints_referencing_properties(item, property_names)
+    return result
+
+
 def tool_input_schema(component: dict[str, Any], aliases: dict[str, str]) -> dict[str, Any]:
     compact = strip_annotations(component)
     properties = compact.get("properties", {})
@@ -165,9 +211,14 @@ def generated_content(fragment: Fragment, schemas: dict[str, Any]) -> str:
     schema = resolve_local_refs(schemas[fragment.component], schemas)
     schema = strip_vendor_extensions(schema)
     if fragment.exclude_deprecated:
+        removed_properties = deprecated_property_names(schema)
         schema = without_deprecated_properties(schema)
-    for key in fragment.omit_top_level:
-        schema.pop(key, None)
+        schema = without_constraints_referencing_properties(schema, removed_properties)
+        if constraint_requires_any(schema, removed_properties):
+            raise ValueError(
+                f"MCP schema {fragment.component} still constrains removed properties: "
+                f"{sorted(removed_properties)}"
+            )
     if fragment.tool_input:
         schema = tool_input_schema(schema, fragment.aliases)
     return json.dumps(schema, separators=(",", ":"), ensure_ascii=False) + "\n"

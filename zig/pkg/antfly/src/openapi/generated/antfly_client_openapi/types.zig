@@ -3968,9 +3968,47 @@ pub const GroundTruth = struct {
     expectations: ?[]const u8 = null,
 };
 
+pub const HierarchyAncestor = struct {
+    id: ?[]const u8 = null,
+    document: ?std.json.Value = null,
+    key: ?[]const u8 = null,
+    artifact_name: ?[]const u8 = null,
+    source_field: ?[]const u8 = null,
+    provenance: ?std.json.Value = null,
+};
+
 pub const HierarchyAncestors = struct {
     source: ?HierarchyProjection = null,
     unit: ?HierarchyProjection = null,
+};
+
+pub const HierarchyArtifact = struct {
+    name: []const u8,
+    kind: []const u8,
+    chunk_id: ?i64 = null,
+    unit_id: ?[]const u8 = null,
+    source: ?HierarchyArtifactSource = null,
+};
+
+pub const HierarchyArtifactSource = struct {
+    name: []const u8,
+    kind: []const u8,
+    chunk_id: ?i64 = null,
+    unit_id: ?[]const u8 = null,
+};
+
+pub const HierarchyEvidence = struct {
+    local_id: ?[]const u8 = null,
+    decision: ?[]const u8 = null,
+    confidence: ?f32 = null,
+    source_artifact: ?[]const u8 = null,
+    source_artifact_key: ?[]const u8 = null,
+    resolution_artifact: ?[]const u8 = null,
+    resolution_artifact_key: ?[]const u8 = null,
+    resolver: ?[]const u8 = null,
+    resolver_table: ?[]const u8 = null,
+    mention: ?std.json.Value = null,
+    canonical: ?std.json.Value = null,
 };
 
 pub const HierarchyGroupBy = struct {
@@ -3979,8 +4017,23 @@ pub const HierarchyGroupBy = struct {
     matches: ?HierarchyMatches = null,
 };
 
+pub const HierarchyMatchContext = struct {
+    level: ?QueryHitHierarchyLevel = null,
+    parent_doc_key: ?[]const u8 = null,
+    parent_unit_id: ?[]const u8 = null,
+    artifact: ?HierarchyArtifact = null,
+    ancestors: ?QueryHitHierarchyAncestors = null,
+};
+
+pub const HierarchyMatchHit = struct {
+    _id: []const u8,
+    _score: f32,
+    _source: ?std.json.Value = null,
+    hierarchy: ?HierarchyMatchContext = null,
+};
+
 pub const HierarchyMatches = struct {
-    /// Maximum matching descendant hits attached to each group, independent of the top-level query limit.
+    /// Maximum matching descendant hits attached to each group, independent of the top-level query limit. Matches follow the effective query order, and the group score is the score of its best matching descendant. The maximum is enforced before query execution to bound work and response growth.
     limit: ?i64 = null,
     /// Fields to include in each nested match. This projection is required because grouped and matching records commonly have different schemas. Use an empty array to return match identity and hierarchy metadata without stored fields.
     fields: []const []const u8,
@@ -6770,7 +6823,7 @@ pub const QueryBuilderResult = struct {
     warnings: ?[]const []const u8 = null,
 };
 
-/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. Ancestor and nested-match field projections are always explicit to keep response size predictable. Direct matches are selected whenever `ancestors` is used without `group_by`. The legacy `return_level`, `rollup`, `include`, and `max_children_per_parent` fields remain supported in legacy-only requests. Do not mix legacy and new controls in one request.
+/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
 pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
     ancestors: ?HierarchyAncestors = null,
@@ -6792,9 +6845,67 @@ pub const QueryHit = struct {
     _index_scores: ?std.json.Value = null,
     _source: ?std.json.Value = null,
     /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. Legacy rollup requests continue to use `chunks` instead of `matches`.
-    hierarchy: ?std.json.Value = null,
+    hierarchy: ?QueryHitHierarchy = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
     _sort: ?[]const std.json.Value = null,
+};
+
+pub const QueryHitHierarchy = struct {
+    /// Hierarchy level represented by this hit.
+    level: ?QueryHitHierarchyLevel = null,
+    /// Source document key that owns this derived hit.
+    parent_doc_key: ?[]const u8 = null,
+    /// Unit identifier when the hit is attached to a document unit.
+    parent_unit_id: ?[]const u8 = null,
+    artifact: ?HierarchyArtifact = null,
+    ancestors: ?QueryHitHierarchyAncestors = null,
+    evidence: ?HierarchyEvidence = null,
+    /// Matching descendant hits attached by the canonical hierarchy.group_by request.
+    matches: ?[]const HierarchyMatchHit = null,
+    /// Legacy child chunk hits included for source-level rollups.
+    chunks: ?[]const HierarchyMatchHit = null,
+};
+
+pub const QueryHitHierarchyAncestors = struct {
+    source: HierarchyAncestor,
+    unit: ?HierarchyAncestor = null,
+};
+
+pub const QueryHitHierarchyLevel = enum {
+    source,
+    unit,
+    chunk,
+    mention,
+    artifact,
+    embedding,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .source => "source",
+            .unit => "unit",
+            .chunk => "chunk",
+            .mention => "mention",
+            .artifact => "artifact",
+            .embedding => "embedding",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "source", .source },
+            .{ "unit", .unit },
+            .{ "chunk", .chunk },
+            .{ "mention", .mention },
+            .{ "artifact", .artifact },
+            .{ "embedding", .embedding },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// A list of query hits.

@@ -36,6 +36,7 @@ const algebraic_law = db_mod.algebraic.law;
 const algebraic_lexical = db_mod.algebraic.lexical;
 const public_query_max_tree_depth: usize = 64;
 const public_query_max_tree_nodes: usize = 16 * 1024;
+const max_canonical_hierarchy_matches_per_group: u32 = 100;
 
 pub const QueryResponse = @import("query_response.zig").QueryResponse;
 
@@ -3152,9 +3153,14 @@ pub fn encodeQueryResponses(
     };
 
     return .{
-        .json = try jsonStringifyAlloc(alloc, metadata_openapi.QueryResponses{
-            .responses = query_results,
-        }),
+        // OpenAPI optional response fields are absent unless populated; they
+        // are not nullable. Keeping nulls out also preserves the compact wire
+        // shape now that hierarchy is represented by generated response types.
+        .json = try std.json.Stringify.valueAlloc(
+            alloc,
+            metadata_openapi.QueryResponses{ .responses = query_results },
+            .{ .emit_null_optional_fields = false },
+        ),
     };
 }
 
@@ -3176,8 +3182,19 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
                 try parseStoredSourceValue(alloc, stored_data)
         else
             null,
-        .hierarchy = try searchHitHierarchyJsonValue(alloc, req, hit),
+        .hierarchy = try searchHitHierarchyOpenApiValue(alloc, req, hit),
     };
+}
+
+fn searchHitHierarchyOpenApiValue(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    hit: db_mod.types.SearchHit,
+) !?metadata_openapi.QueryHitHierarchy {
+    const value = (try searchHitHierarchyJsonValue(alloc, req, hit)) orelse return null;
+    return try std.json.parseFromValueLeaky(metadata_openapi.QueryHitHierarchy, alloc, value, .{
+        .ignore_unknown_fields = true,
+    });
 }
 
 fn validateOpenApiHitSortTuple(req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !void {
@@ -9155,11 +9172,10 @@ fn applyPublicHierarchyControls(
     var max_children_set = false;
     var group_by_set = false;
     var grouped_matches_set = false;
-    var ancestors_set = false;
-    var has_new_controls = false;
+    // Presence of an empty hierarchy object is the canonical direct-match form.
+    // Omitting hierarchy entirely retains the legacy default result shape.
+    var has_new_controls = hierarchy.object.count() == 0;
     var has_legacy_controls = false;
-
-    if (hierarchy.object.count() == 0) return error.InvalidQueryRequest;
 
     var style_it = hierarchy.object.iterator();
     while (style_it.next()) |entry| {
@@ -9169,7 +9185,6 @@ fn applyPublicHierarchyControls(
         {
             has_new_controls = true;
             if (std.mem.eql(u8, key, "group_by")) group_by_set = true;
-            if (std.mem.eql(u8, key, "ancestors")) ancestors_set = true;
         } else if (std.mem.eql(u8, key, "return_level") or
             std.mem.eql(u8, key, "rollup") or
             std.mem.eql(u8, key, "include") or
@@ -9248,7 +9263,9 @@ fn applyPublicHierarchyControls(
                         const matches_value = matches_entry.value_ptr.*;
                         if (std.mem.eql(u8, matches_key, "limit")) {
                             req.max_chunks_per_parent = try parseOptionalU32Json(matches_value, req.max_chunks_per_parent);
-                            if (req.max_chunks_per_parent == 0) return error.InvalidQueryRequest;
+                            if (req.max_chunks_per_parent == 0 or req.max_chunks_per_parent > max_canonical_hierarchy_matches_per_group) {
+                                return error.InvalidQueryRequest;
+                            }
                         } else if (std.mem.eql(u8, matches_key, "fields")) {
                             req.hierarchy_match_fields = try parseStringArrayJsonAlloc(alloc, matches_value);
                             req.hierarchy_match_include_all_fields = false;
@@ -9298,9 +9315,12 @@ fn applyPublicHierarchyControls(
 
     if (has_new_controls) {
         if (group_by_set) {
+            // A source group already carries its projected source document in
+            // the top-level hit. Repeating it on the group and every nested
+            // match defeats the bounded hierarchy response contract.
+            if (req.hierarchy_include_source) return error.InvalidQueryRequest;
             req.return_mode = if (grouped_matches_set) .parent_with_chunks else .parent;
         } else {
-            if (!ancestors_set) return error.InvalidQueryRequest;
             req.return_mode = .chunk;
         }
         return;
@@ -10770,17 +10790,26 @@ test "api query contract validates canonical hierarchy controls" {
     ;
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", unknown_group_field));
 
-    const composable_group_and_ancestors =
+    const composable_group_and_unit_ancestor =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"group_by":{"level":"source","matches":{"fields":["text"]}},"ancestors":{"unit":{"fields":["page"]}}}
+        \\}
+    ;
+    var composable = try parseQueryRequest(alloc, null, "docs", composable_group_and_unit_ancestor);
+    defer composable.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, composable.req.return_mode);
+    try std.testing.expect(composable.req.hierarchy_grouped_matches);
+    try std.testing.expect(!composable.req.hierarchy_include_source);
+    try std.testing.expect(composable.req.hierarchy_include_unit);
+
+    const redundant_group_source_ancestor =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
         \\  "hierarchy": {"group_by":{"level":"source","matches":{"fields":["text"]}},"ancestors":{"source":{"fields":["title"]}}}
         \\}
     ;
-    var composable = try parseQueryRequest(alloc, null, "docs", composable_group_and_ancestors);
-    defer composable.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, composable.req.return_mode);
-    try std.testing.expect(composable.req.hierarchy_grouped_matches);
-    try std.testing.expect(composable.req.hierarchy_include_source);
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", redundant_group_source_ancestor));
 
     const mixed_contract_generations =
         \\{
@@ -10817,6 +10846,14 @@ test "api query contract validates canonical hierarchy controls" {
     try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, bounded_grouped.req.return_mode);
     try std.testing.expectEqual(@as(u32, 2), bounded_grouped.req.max_chunks_per_parent);
 
+    const oversized_grouped_matches =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":101,"fields":["text"]}}}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", oversized_grouped_matches));
+
     const direct_matches_with_ancestors =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
@@ -10835,7 +10872,11 @@ test "api query contract validates canonical hierarchy controls" {
         \\  "hierarchy": {}
         \\}
     ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", empty_hierarchy));
+    var empty_direct = try parseQueryRequest(alloc, null, "docs", empty_hierarchy);
+    defer empty_direct.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, empty_direct.req.return_mode);
+    try std.testing.expect(!empty_direct.req.hierarchy_include_source);
+    try std.testing.expect(!empty_direct.req.hierarchy_include_unit);
 }
 
 test "api query contract keeps generated schema strict when with is present" {

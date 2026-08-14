@@ -6,12 +6,12 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="QueryHitHierarchyArtifact")
+T = TypeVar("T", bound="HierarchyEvidenceCanonical")
 
 
 @_attrs_define
-class QueryHitHierarchyArtifact:
-    """Artifact identity with `name`, `kind`, and optional `unit_id` or `chunk_id`."""
+class HierarchyEvidenceCanonical:
+    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -25,10 +25,10 @@ class QueryHitHierarchyArtifact:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        query_hit_hierarchy_artifact = cls()
+        hierarchy_evidence_canonical = cls()
 
-        query_hit_hierarchy_artifact.additional_properties = d
-        return query_hit_hierarchy_artifact
+        hierarchy_evidence_canonical.additional_properties = d
+        return hierarchy_evidence_canonical
 
     @property
     def additional_keys(self) -> list[str]:

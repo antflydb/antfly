@@ -17,8 +17,11 @@ class HierarchyMatches:
         fields (list[str]): Fields to include in each nested match. This projection is required because
             grouped and matching records commonly have different schemas. Use an empty
             array to return match identity and hierarchy metadata without stored fields.
-        limit (int | Unset): Maximum matching descendant hits attached to each group, independent of the top-level query
-            limit. Default: 3.
+        limit (int | Unset): Maximum matching descendant hits attached to each group, independent of
+            the top-level query limit. Matches follow the effective query order, and
+            the group score is the score of its best matching descendant. The maximum
+            is enforced before query execution to bound work and response growth.
+             Default: 3.
     """
 
     fields: list[str]
