@@ -35,9 +35,10 @@ var (
 
 // RequestQueue manages concurrent request limiting and queuing with backpressure
 type RequestQueue struct {
-	maxConcurrent int64         // Max concurrent requests (0 = unlimited)
-	maxQueueSize  int64         // Max queued requests (0 = unlimited)
-	timeout       time.Duration // Request timeout (0 = no timeout)
+	maxConcurrent  int64         // Max concurrent requests (0 = unlimited)
+	maxQueueSize   int64         // Max queued requests (0 = unlimited)
+	timeout        time.Duration // Request timeout (0 = no timeout)
+	rejectWhenBusy bool          // Reject immediately instead of retaining excess work
 
 	// Semaphore channel for concurrency control
 	sem chan struct{}
@@ -57,6 +58,7 @@ type RequestQueueConfig struct {
 	MaxConcurrentRequests int           // 0 = unlimited
 	MaxQueueSize          int           // 0 = unlimited (only when MaxConcurrent > 0)
 	RequestTimeout        time.Duration // 0 = no timeout
+	RejectWhenBusy        bool          // fail fast when all concurrent slots are occupied
 }
 
 // NewRequestQueue creates a new request queue with the given configuration
@@ -66,10 +68,11 @@ func NewRequestQueue(config RequestQueueConfig, logger *zap.Logger) *RequestQueu
 	}
 
 	q := &RequestQueue{
-		maxConcurrent: int64(config.MaxConcurrentRequests),
-		maxQueueSize:  int64(config.MaxQueueSize),
-		timeout:       config.RequestTimeout,
-		logger:        logger,
+		maxConcurrent:  int64(config.MaxConcurrentRequests),
+		maxQueueSize:   int64(config.MaxQueueSize),
+		timeout:        config.RequestTimeout,
+		rejectWhenBusy: config.RejectWhenBusy,
+		logger:         logger,
 	}
 
 	// Only create semaphore if concurrency limiting is enabled
@@ -120,6 +123,13 @@ func (q *RequestQueue) Acquire(ctx context.Context) (release func(), err error) 
 		return q.makeRelease(), nil
 	default:
 		// Need to queue
+	}
+	if q.rejectWhenBusy {
+		q.totalRejected.Add(1)
+		q.logger.Warn("Request rejected: admission capacity exhausted",
+			zap.Int64("active", q.currentActive.Load()),
+			zap.Int64("max_concurrent", q.maxConcurrent))
+		return nil, ErrQueueFull
 	}
 
 	// Check queue capacity before waiting

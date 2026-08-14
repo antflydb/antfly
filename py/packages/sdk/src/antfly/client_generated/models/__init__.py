@@ -302,9 +302,12 @@ from .index_repair_status_state import IndexRepairStatusState
 from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
+from .inference_admission_config import InferenceAdmissionConfig
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
 from .inference_backend_runtimes import InferenceBackendRuntimes
 from .inference_binary_content import InferenceBinaryContent
+from .inference_capacity_error import InferenceCapacityError
+from .inference_capacity_error_reason import InferenceCapacityErrorReason
 from .inference_chat_message import InferenceChatMessage
 from .inference_chunk import InferenceChunk
 from .inference_chunk_config import InferenceChunkConfig
@@ -314,8 +317,6 @@ from .inference_chunk_request import InferenceChunkRequest
 from .inference_chunk_response import InferenceChunkResponse
 from .inference_chunk_response_object import InferenceChunkResponseObject
 from .inference_config import InferenceConfig
-from .inference_config_model_strategies import InferenceConfigModelStrategies
-from .inference_config_model_strategies_additional_property import InferenceConfigModelStrategiesAdditionalProperty
 from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
@@ -410,6 +411,7 @@ from .inference_read_response import InferenceReadResponse
 from .inference_read_response_object import InferenceReadResponseObject
 from .inference_read_result import InferenceReadResult
 from .inference_read_result_fields import InferenceReadResultFields
+from .inference_request_admission_config import InferenceRequestAdmissionConfig
 from .inference_rerank_multimodal_document import InferenceRerankMultimodalDocument
 from .inference_rerank_multimodal_request import InferenceRerankMultimodalRequest
 from .inference_rerank_object import InferenceRerankObject
@@ -423,6 +425,11 @@ from .inference_rewrite_request import InferenceRewriteRequest
 from .inference_rewrite_response import InferenceRewriteResponse
 from .inference_rewrite_response_object import InferenceRewriteResponseObject
 from .inference_role import InferenceRole
+from .inference_runtime_config import InferenceRuntimeConfig
+from .inference_runtime_config_model_strategies import InferenceRuntimeConfigModelStrategies
+from .inference_runtime_config_model_strategies_additional_property import (
+    InferenceRuntimeConfigModelStrategiesAdditionalProperty,
+)
 from .inference_sparse_vector import InferenceSparseVector
 from .inference_style import InferenceStyle
 from .inference_text_content import InferenceTextContent
@@ -452,7 +459,6 @@ from .installed_extension import InstalledExtension
 from .installed_extension_status import InstalledExtensionStatus
 from .invoke_inference_connection_body import InvokeInferenceConnectionBody
 from .invoke_inference_connection_operation import InvokeInferenceConnectionOperation
-from .invoke_inference_connection_response_200 import InvokeInferenceConnectionResponse200
 from .ip_range_query import IPRangeQuery
 from .join_clause import JoinClause
 from .join_condition import JoinCondition
@@ -1032,9 +1038,12 @@ __all__ = (
     "IndexStatus",
     "IndexStatusShardStatus",
     "IndexType",
+    "InferenceAdmissionConfig",
     "InferenceAudioChunkConfig",
     "InferenceBackendRuntimes",
     "InferenceBinaryContent",
+    "InferenceCapacityError",
+    "InferenceCapacityErrorReason",
     "InferenceChatMessage",
     "InferenceChunk",
     "InferenceChunkConfig",
@@ -1044,8 +1053,6 @@ __all__ = (
     "InferenceChunkResponse",
     "InferenceChunkResponseObject",
     "InferenceConfig",
-    "InferenceConfigModelStrategies",
-    "InferenceConfigModelStrategiesAdditionalProperty",
     "InferenceConnection",
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
@@ -1140,6 +1147,7 @@ __all__ = (
     "InferenceReadResponseObject",
     "InferenceReadResult",
     "InferenceReadResultFields",
+    "InferenceRequestAdmissionConfig",
     "InferenceRerankMultimodalDocument",
     "InferenceRerankMultimodalRequest",
     "InferenceRerankObject",
@@ -1153,6 +1161,9 @@ __all__ = (
     "InferenceRewriteResponse",
     "InferenceRewriteResponseObject",
     "InferenceRole",
+    "InferenceRuntimeConfig",
+    "InferenceRuntimeConfigModelStrategies",
+    "InferenceRuntimeConfigModelStrategiesAdditionalProperty",
     "InferenceschemasConfig",
     "InferenceSparseVector",
     "InferenceStyle",
@@ -1182,7 +1193,6 @@ __all__ = (
     "InstallManifest",
     "InvokeInferenceConnectionBody",
     "InvokeInferenceConnectionOperation",
-    "InvokeInferenceConnectionResponse200",
     "IPRangeQuery",
     "JoinClause",
     "JoinCondition",

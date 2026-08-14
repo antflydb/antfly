@@ -1131,7 +1131,7 @@ def make_server_spec(args: argparse.Namespace, engine: str, port: int, run_dir: 
         config_path = run_dir / "antfly-server.json"
         write_json(config_path, {
             "models_dir": str(args.models_dir.resolve()),
-            "max_concurrent_requests": 1,
+            "admission": {"inference": {"max_concurrent_requests": 1}},
             "generation_batching": {
                 "mode": "off",
                 "max_step_items": 1,

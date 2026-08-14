@@ -24,6 +24,11 @@ const std = @import("std");
 /// request, query, Raft, and index-worker admission stays below this value.
 pub const service: u32 = 256;
 
+/// Nested inference I/O and model-runtime fan-out. Request admission defaults
+/// below this value; the ceiling leaves bounded headroom for model warmup and
+/// multi-part operations without sharing API listener workers.
+pub const inference: u32 = 64;
+
 /// The serverless object-store pool is shared by five storage lanes behind a
 /// listener admitting at most 64 connection handlers by default. Fourfold
 /// headroom covers background lanes and larger configured listeners without
@@ -44,6 +49,8 @@ pub fn initServerlessObjectStore(alloc: std.mem.Allocator) std.Io.Threaded {
 
 test "threaded io production limits are finite" {
     try std.testing.expect(service > 0);
+    try std.testing.expect(inference > 0);
+    try std.testing.expect(inference <= service);
     try std.testing.expect(serverless_object_store > 0);
     try std.testing.expect(serverless_object_store <= service);
 

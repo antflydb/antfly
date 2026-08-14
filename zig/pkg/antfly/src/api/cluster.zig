@@ -484,7 +484,7 @@ test "cluster status carries non-secret secret store health" {
 
 test "generationless secret store status serializes a null source generation" {
     const status: ClusterTopology = .{
-        .status = .healthy,
+        .health = .healthy,
         .secret_store = .{
             .supports_source_generation = true,
             .source_generation = null,

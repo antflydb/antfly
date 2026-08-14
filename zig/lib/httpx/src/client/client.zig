@@ -112,12 +112,89 @@ pub const RequestOptions = struct {
     /// Per-request response ceiling. This may lower, but never raise, the
     /// client-wide maximum.
     max_response_size: ?usize = null,
-    /// Borrowed cancellation signal. It must remain valid until the request
-    /// method returns.
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    /// Borrowed transport-neutral cancellation source. It must remain valid
+    /// until the request method returns.
+    cancellation: ?CancellationToken = null,
+};
+
+pub const CancellationToken = struct {
+    ptr: *const anyopaque,
+    is_cancelled_fn: *const fn (*const anyopaque) bool,
+
+    pub fn fromAtomic(signal: *const std.atomic.Value(bool)) CancellationToken {
+        return .{
+            .ptr = signal,
+            .is_cancelled_fn = struct {
+                fn call(raw: *const anyopaque) bool {
+                    const value: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+                    return value.load(.acquire);
+                }
+            }.call,
+        };
+    }
+
+    pub fn fromCallback(
+        ptr: ?*const anyopaque,
+        is_cancelled_fn: ?*const fn (*const anyopaque) bool,
+    ) ?CancellationToken {
+        return .{
+            .ptr = ptr orelse return null,
+            .is_cancelled_fn = is_cancelled_fn orelse return null,
+        };
+    }
+
+    pub fn isCancelled(self: CancellationToken) bool {
+        return self.is_cancelled_fn(self.ptr);
+    }
 };
 
 const cancellation_poll_interval_ms: u64 = 25;
+
+const RequestWatchdogOutcome = enum {
+    stopped,
+    cancelled,
+    timed_out,
+};
+
+/// Waits for request completion, application cancellation, or the
+/// whole-request deadline.
+///
+/// Keep these signals in one select branch. `std.Io.Threaded` may implement a
+/// sleep with a blocking worker, and a select with separate cancellation and
+/// timeout sleepers can leave one losing sleeper alive until the full request
+/// timeout after a successful response. The request winner explicitly stops
+/// this short-interval watchdog because cancelling a select does not
+/// necessarily interrupt a sleeper using the parent `Io`. This bounds
+/// successful-request cleanup while retaining cancellation and deadline
+/// enforcement for DNS, connect, TLS, and response work.
+fn waitForRequestCancellationOrTimeout(
+    io: Io,
+    stop: *const std.atomic.Value(bool),
+    cancellation: ?CancellationToken,
+    timeout_ms: u64,
+) anyerror!RequestWatchdogOutcome {
+    const deadline_ns: ?i128 = if (timeout_ms == 0)
+        null
+    else
+        Io.Clock.awake.now(io).nanoseconds +| @as(i128, timeout_ms) * std.time.ns_per_ms;
+
+    while (true) {
+        if (stop.load(.acquire)) return .stopped;
+        if (cancellation) |signal| {
+            if (signal.isCancelled()) return .cancelled;
+        }
+        const sleep_ms = if (deadline_ns) |deadline| blk: {
+            const now_ns = Io.Clock.awake.now(io).nanoseconds;
+            if (now_ns >= deadline) return .timed_out;
+            const remaining_ms = @max(
+                @as(i128, 1),
+                @divFloor(deadline - now_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms),
+            );
+            break :blk @min(cancellation_poll_interval_ms, @as(u64, @intCast(remaining_ms)));
+        } else cancellation_poll_interval_ms;
+        try io.sleep(Io.Duration.fromMilliseconds(@intCast(sleep_ms)), .awake);
+    }
+}
 
 fn shouldUseHttp2(config: ClientConfig) bool {
     return config.http2_enabled or config.force_http2;
@@ -148,6 +225,7 @@ test "filtered HTTP1 connections advertise close when pools are bypassed" {
 const RequestInterrupt = struct {
     mutex: Io.Mutex = Io.Mutex.init,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    external_cancellation: ?CancellationToken = null,
     socket: ?*Socket = null,
     h2_entry: ?*H2PoolEntry = null,
     h2_stream_id: ?u31 = null,
@@ -155,17 +233,31 @@ const RequestInterrupt = struct {
     fn publish(self: *RequestInterrupt, socket: *Socket, io: Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.cancelled.load(.acquire)) {
+        if (self.isCancellationRequested()) {
             socket.shutdown();
             return;
         }
+        socket.setRequestCancellation(isCancellationRequestedOpaque, self);
         self.socket = socket;
     }
 
     fn clear(self: *RequestInterrupt, socket: *Socket, io: Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.socket == socket) self.socket = null;
+        if (self.socket == socket) {
+            socket.setRequestCancellation(null, null);
+            self.socket = null;
+        }
+    }
+
+    fn isCancellationRequested(self: *const RequestInterrupt) bool {
+        if (self.cancelled.load(.acquire)) return true;
+        return if (self.external_cancellation) |signal| signal.isCancelled() else false;
+    }
+
+    fn isCancellationRequestedOpaque(context: ?*anyopaque) bool {
+        const self: *const RequestInterrupt = @ptrCast(@alignCast(context orelse return false));
+        return self.isCancellationRequested();
     }
 
     fn publishH2(self: *RequestInterrupt, entry: *H2PoolEntry, stream_id: u31, io: Io) void {
@@ -173,7 +265,7 @@ const RequestInterrupt = struct {
         defer self.mutex.unlock(io);
         self.h2_entry = entry;
         self.h2_stream_id = stream_id;
-        if (self.cancelled.load(.acquire)) {
+        if (self.isCancellationRequested()) {
             self.h2_entry = null;
             self.h2_stream_id = null;
             self.cancelH2Locked(entry, stream_id, io);
@@ -726,7 +818,7 @@ pub const Client = struct {
     }
 
     /// Executes the actual HTTP request.
-    fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64, cancellation: ?*const std.atomic.Value(bool)) !Response {
+    fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64, cancellation: ?CancellationToken) !Response {
         if (cancellation) |signal| return self.executeRequestCancellable(req, timeout_override_ms, signal);
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
         const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
@@ -734,18 +826,17 @@ pub const Client = struct {
         if (timeout_ms == 0) return self.executeRequestWithRetries(req, timeout_override_ms, deadline_ms, &interrupt);
 
         const RequestResult = anyerror!Response;
-        const TimeoutResult = anyerror!void;
         const SelectResult = union(enum) {
             request: RequestResult,
-            timeout: TimeoutResult,
+            watchdog: anyerror!RequestWatchdogOutcome,
         };
         const Task = struct {
             fn requestTask(client: *Self, request_value: *Request, socket_timeout_ms: ?u64, request_deadline_ms: ?i64, request_interrupt: *RequestInterrupt) RequestResult {
                 return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms, request_interrupt);
             }
 
-            fn timeoutTask(io: Io, timeout: Io.Timeout) TimeoutResult {
-                return timeout.sleep(io);
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(bool), request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestCancellationOrTimeout(io, stop, null, request_timeout_ms);
             }
 
             fn drainLateResult(result: SelectResult) void {
@@ -756,33 +847,31 @@ pub const Client = struct {
                             response.deinit();
                         } else |_| {}
                     },
-                    .timeout => {},
+                    .watchdog => {},
                 }
             }
         };
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        var watchdog_stop = std.atomic.Value(bool).init(false);
         try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt });
-        select.async(.timeout, Task.timeoutTask, .{
-            self.io,
-            Io.Timeout{ .duration = .{
-                .raw = Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
-                .clock = .awake,
-            } },
-        });
+        select.async(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms });
 
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
+                watchdog_stop.store(true, .release);
                 select.cancelDiscard();
                 return try request_result;
             },
-            .timeout => |timeout_result| {
-                try timeout_result;
+            .watchdog => |watchdog_result| {
                 interrupt.cancel(self.io);
                 while (select.cancel()) |late| Task.drainLateResult(late);
-                return error.Timeout;
+                return switch (try watchdog_result) {
+                    .timed_out => error.Timeout,
+                    .cancelled, .stopped => unreachable,
+                };
             },
         }
     }
@@ -791,33 +880,28 @@ pub const Client = struct {
         self: *Self,
         req: *Request,
         timeout_override_ms: ?u64,
-        cancellation: *const std.atomic.Value(bool),
+        cancellation: CancellationToken,
     ) !Response {
-        if (cancellation.load(.acquire)) return error.Cancelled;
+        if (cancellation.isCancelled()) return error.Cancelled;
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
         const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
-        var interrupt: RequestInterrupt = .{};
+        var interrupt: RequestInterrupt = .{ .external_cancellation = cancellation };
+        // Own the complete request attempt in a cancellable std.Io task for
+        // every protocol. The socket interrupt handles established HTTP/1 and
+        // HTTP/2 connections; cancelling the task also reaches operations that
+        // precede socket publication, including hostname lookup and connect.
         const RequestResult = anyerror!Response;
-        const CancelResult = anyerror!void;
         const SelectResult = union(enum) {
             request: RequestResult,
-            cancellation: CancelResult,
-            timeout: anyerror!void,
+            watchdog: anyerror!RequestWatchdogOutcome,
         };
         const Task = struct {
             fn requestTask(client: *Self, request_value: *Request, socket_timeout_ms: ?u64, request_deadline_ms: ?i64, request_interrupt: *RequestInterrupt) RequestResult {
                 return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms, request_interrupt);
             }
 
-            fn cancellationTask(io: Io, signal: *const std.atomic.Value(bool)) CancelResult {
-                while (!signal.load(.acquire)) {
-                    try io.sleep(Io.Duration.fromMilliseconds(cancellation_poll_interval_ms), .awake);
-                }
-                return error.Cancelled;
-            }
-
-            fn timeoutTask(io: Io, timeout: Io.Timeout) anyerror!void {
-                return timeout.sleep(io);
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(bool), signal: CancellationToken, request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestCancellationOrTimeout(io, stop, signal, request_timeout_ms);
             }
 
             fn drainLateResult(result: SelectResult) void {
@@ -826,52 +910,22 @@ pub const Client = struct {
                         var response = response_value;
                         response.deinit();
                     } else |_| {},
-                    .cancellation, .timeout => {},
+                    .watchdog => {},
                 }
             }
         };
 
-        if (timeout_ms == 0) {
-            var select_buffer: [2]SelectResult = undefined;
-            var select = Io.Select(SelectResult).init(self.io, &select_buffer);
-            try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt });
-            select.async(.cancellation, Task.cancellationTask, .{ self.io, cancellation });
-            const first = try select.await();
-            switch (first) {
-                .request => |request_result| {
-                    select.cancelDiscard();
-                    if (cancellation.load(.acquire)) {
-                        if (request_result) |response_value| {
-                            var response = response_value;
-                            response.deinit();
-                        } else |_| {}
-                        return error.Cancelled;
-                    }
-                    return try request_result;
-                },
-                .cancellation => |cancel_result| {
-                    interrupt.cancel(self.io);
-                    while (select.cancel()) |late| Task.drainLateResult(late);
-                    cancel_result catch |err| return err;
-                    return error.Cancelled;
-                },
-                .timeout => unreachable,
-            }
-        }
-
-        var select_buffer: [3]SelectResult = undefined;
+        var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        var watchdog_stop = std.atomic.Value(bool).init(false);
         try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt });
-        select.async(.cancellation, Task.cancellationTask, .{ self.io, cancellation });
-        select.async(.timeout, Task.timeoutTask, .{ self.io, Io.Timeout{ .duration = .{
-            .raw = Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
-            .clock = .awake,
-        } } });
+        select.async(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms });
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
+                watchdog_stop.store(true, .release);
                 select.cancelDiscard();
-                if (cancellation.load(.acquire)) {
+                if (cancellation.isCancelled()) {
                     if (request_result) |response_value| {
                         var response = response_value;
                         response.deinit();
@@ -880,18 +934,14 @@ pub const Client = struct {
                 }
                 return try request_result;
             },
-            .cancellation => |cancel_result| {
+            .watchdog => |watchdog_result| {
                 interrupt.cancel(self.io);
                 while (select.cancel()) |late| Task.drainLateResult(late);
-                cancel_result catch |err| return err;
-                return error.Cancelled;
-            },
-            .timeout => |timeout_result| {
-                try timeout_result;
-                interrupt.cancel(self.io);
-                while (select.cancel()) |late| Task.drainLateResult(late);
-                if (cancellation.load(.acquire)) return error.Cancelled;
-                return error.Timeout;
+                return switch (try watchdog_result) {
+                    .cancelled => error.Cancelled,
+                    .timed_out => error.Timeout,
+                    .stopped => unreachable,
+                };
             },
         }
     }
@@ -902,9 +952,9 @@ pub const Client = struct {
 
         var attempt: u32 = 0;
         while (true) {
-            if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+            if (interrupt.isCancellationRequested()) return error.Cancelled;
             var res = self.executeRequestOnce(req, timeout_override_ms, deadline_ms, interrupt) catch |err| {
-                if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+                if (interrupt.isCancellationRequested()) return error.Cancelled;
                 ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
                 const safe_unsent = isSafeUnsentRetryError(err);
                 const replayable_transport = policy.retry_on_connection_error and
@@ -943,7 +993,7 @@ pub const Client = struct {
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !Response {
         if (cancellation) |signal| return self.executeRequestToWriterCancellable(req, timeout_override_ms, writer, progress_cb, progress_ctx, signal);
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
@@ -953,10 +1003,9 @@ pub const Client = struct {
 
         const Writer = @TypeOf(writer);
         const RequestResult = anyerror!Response;
-        const TimeoutResult = anyerror!void;
         const SelectResult = union(enum) {
             request: RequestResult,
-            timeout: TimeoutResult,
+            watchdog: anyerror!RequestWatchdogOutcome,
         };
         const Task = struct {
             fn requestTask(
@@ -972,8 +1021,8 @@ pub const Client = struct {
                 return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context, request_interrupt);
             }
 
-            fn timeoutTask(io: Io, timeout: Io.Timeout) TimeoutResult {
-                return timeout.sleep(io);
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(bool), request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestCancellationOrTimeout(io, stop, null, request_timeout_ms);
             }
 
             fn drainLateResult(result: SelectResult) void {
@@ -984,33 +1033,31 @@ pub const Client = struct {
                             response.deinit();
                         } else |_| {}
                     },
-                    .timeout => {},
+                    .watchdog => {},
                 }
             }
         };
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        var watchdog_stop = std.atomic.Value(bool).init(false);
         try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt });
-        select.async(.timeout, Task.timeoutTask, .{
-            self.io,
-            Io.Timeout{ .duration = .{
-                .raw = Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
-                .clock = .awake,
-            } },
-        });
+        select.async(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms });
 
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
+                watchdog_stop.store(true, .release);
                 select.cancelDiscard();
                 return try request_result;
             },
-            .timeout => |timeout_result| {
-                try timeout_result;
+            .watchdog => |watchdog_result| {
                 interrupt.cancel(self.io);
                 while (select.cancel()) |late| Task.drainLateResult(late);
-                return error.Timeout;
+                return switch (try watchdog_result) {
+                    .timed_out => error.Timeout,
+                    .cancelled, .stopped => unreachable,
+                };
             },
         }
     }
@@ -1022,34 +1069,25 @@ pub const Client = struct {
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
-        cancellation: *const std.atomic.Value(bool),
+        cancellation: CancellationToken,
     ) !Response {
-        if (cancellation.load(.acquire)) return error.Cancelled;
+        if (cancellation.isCancelled()) return error.Cancelled;
         const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
         const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
-        var interrupt: RequestInterrupt = .{};
+        var interrupt: RequestInterrupt = .{ .external_cancellation = cancellation };
         const Writer = @TypeOf(writer);
         const RequestResult = anyerror!Response;
-        const CancelResult = anyerror!void;
         const SelectResult = union(enum) {
             request: RequestResult,
-            cancellation: CancelResult,
-            timeout: anyerror!void,
+            watchdog: anyerror!RequestWatchdogOutcome,
         };
         const Task = struct {
             fn requestTask(client: *Self, request_value: *Request, socket_timeout_ms: ?u64, request_deadline_ms: ?i64, output: Writer, callback: ?WriterProgressCallback, callback_context: ?*anyopaque, request_interrupt: *RequestInterrupt) RequestResult {
                 return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context, request_interrupt);
             }
 
-            fn cancellationTask(io: Io, signal: *const std.atomic.Value(bool)) CancelResult {
-                while (!signal.load(.acquire)) {
-                    try io.sleep(Io.Duration.fromMilliseconds(cancellation_poll_interval_ms), .awake);
-                }
-                return error.Cancelled;
-            }
-
-            fn timeoutTask(io: Io, timeout: Io.Timeout) anyerror!void {
-                return timeout.sleep(io);
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(bool), signal: CancellationToken, request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestCancellationOrTimeout(io, stop, signal, request_timeout_ms);
             }
 
             fn drainLateResult(result: SelectResult) void {
@@ -1058,52 +1096,22 @@ pub const Client = struct {
                         var response = response_value;
                         response.deinit();
                     } else |_| {},
-                    .cancellation, .timeout => {},
+                    .watchdog => {},
                 }
             }
         };
 
-        if (timeout_ms == 0) {
-            var select_buffer: [2]SelectResult = undefined;
-            var select = Io.Select(SelectResult).init(self.io, &select_buffer);
-            try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt });
-            select.async(.cancellation, Task.cancellationTask, .{ self.io, cancellation });
-            const first = try select.await();
-            switch (first) {
-                .request => |request_result| {
-                    select.cancelDiscard();
-                    if (cancellation.load(.acquire)) {
-                        if (request_result) |response_value| {
-                            var response = response_value;
-                            response.deinit();
-                        } else |_| {}
-                        return error.Cancelled;
-                    }
-                    return try request_result;
-                },
-                .cancellation => |cancel_result| {
-                    interrupt.cancel(self.io);
-                    while (select.cancel()) |late| Task.drainLateResult(late);
-                    cancel_result catch |err| return err;
-                    return error.Cancelled;
-                },
-                .timeout => unreachable,
-            }
-        }
-
-        var select_buffer: [3]SelectResult = undefined;
+        var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        var watchdog_stop = std.atomic.Value(bool).init(false);
         try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt });
-        select.async(.cancellation, Task.cancellationTask, .{ self.io, cancellation });
-        select.async(.timeout, Task.timeoutTask, .{ self.io, Io.Timeout{ .duration = .{
-            .raw = Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
-            .clock = .awake,
-        } } });
+        select.async(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms });
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
+                watchdog_stop.store(true, .release);
                 select.cancelDiscard();
-                if (cancellation.load(.acquire)) {
+                if (cancellation.isCancelled()) {
                     if (request_result) |response_value| {
                         var response = response_value;
                         response.deinit();
@@ -1112,18 +1120,14 @@ pub const Client = struct {
                 }
                 return try request_result;
             },
-            .cancellation => |cancel_result| {
+            .watchdog => |watchdog_result| {
                 interrupt.cancel(self.io);
                 while (select.cancel()) |late| Task.drainLateResult(late);
-                cancel_result catch |err| return err;
-                return error.Cancelled;
-            },
-            .timeout => |timeout_result| {
-                try timeout_result;
-                interrupt.cancel(self.io);
-                while (select.cancel()) |late| Task.drainLateResult(late);
-                if (cancellation.load(.acquire)) return error.Cancelled;
-                return error.Timeout;
+                return switch (try watchdog_result) {
+                    .cancelled => error.Cancelled,
+                    .timed_out => error.Timeout,
+                    .stopped => unreachable,
+                };
             },
         }
     }
@@ -1143,7 +1147,7 @@ pub const Client = struct {
         // writer semantics there is no safe way to distinguish a pre-send
         // failure from a partially committed response, so this API performs
         // exactly one attempt.
-        if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+        if (interrupt.isCancellationRequested()) return error.Cancelled;
         return self.executeRequestToWriterOnce(
             req,
             timeout_override_ms,
@@ -1153,7 +1157,7 @@ pub const Client = struct {
             progress_ctx,
             interrupt,
         ) catch |err| {
-            if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+            if (interrupt.isCancellationRequested()) return error.Cancelled;
             ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
             return err;
         };
@@ -1881,7 +1885,7 @@ pub const Client = struct {
                 // Cancellation before request HEADERS have reached the wire is
                 // local-only: emitting RST_STREAM for an idle stream violates
                 // RFC 7540 and can kill the shared connection.
-                if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+                if (interrupt.isCancellationRequested()) return error.Cancelled;
                 const published = h2.stream_manager.getStream(stream_id) orelse
                     return error.ConnectionClosed;
                 if (published.stream_error) |err| return normalizeH2ResponseError(err);
@@ -1914,7 +1918,7 @@ pub const Client = struct {
             try stream.completion_event.wait(self.io);
         } else {
             // Fallback mode: pump frames inline (no fiber support).
-            if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+            if (interrupt.isCancellationRequested()) return error.Cancelled;
             if (entry.is_tls) {
                 const r = try entry.session.getReader();
                 const w = try entry.session.getWriter();
@@ -1926,7 +1930,7 @@ pub const Client = struct {
                     try h2.writeData(w, stream_id, body, true);
                 }
                 h2.awaitStreamComplete(r, w, stream_id) catch |err| {
-                    if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+                    if (interrupt.isCancellationRequested()) return error.Cancelled;
                     return err;
                 };
             } else {
@@ -1938,7 +1942,7 @@ pub const Client = struct {
                     try h2.writeData(&entry.socket, stream_id, body, true);
                 }
                 h2.awaitStreamComplete(&entry.socket, &entry.socket, stream_id) catch |err| {
-                    if (interrupt.cancelled.load(.acquire)) return error.Cancelled;
+                    if (interrupt.isCancellationRequested()) return error.Cancelled;
                     return err;
                 };
             }
@@ -3180,7 +3184,27 @@ test "Client rejects an already cancelled request" {
     var cancellation = std.atomic.Value(bool).init(true);
     try std.testing.expectError(
         error.Cancelled,
-        client.get("http://127.0.0.1:1/never", .{ .cancellation = &cancellation }),
+        client.get("http://127.0.0.1:1/never", .{ .cancellation = .fromAtomic(&cancellation) }),
+    );
+}
+
+test "Client rejects callback-backed cancellation" {
+    const State = struct {
+        canceled: bool,
+
+        fn isCancelled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.canceled;
+        }
+    };
+
+    var state = State{ .canceled = true };
+    const token = CancellationToken.fromCallback(&state, State.isCancelled).?;
+    var client = Client.init(std.testing.allocator, std.testing.io);
+    defer client.deinit();
+    try std.testing.expectError(
+        error.Cancelled,
+        client.get("http://127.0.0.1:1/never", .{ .cancellation = token }),
     );
 }
 
@@ -3965,8 +3989,8 @@ const python_bounded_response_server_script =
     "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n" ++
     "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
     "listener.bind(('127.0.0.1', port))\n" ++
-    "listener.listen(2)\n" ++
-    "for _ in range(2):\n" ++
+    "listener.listen(4)\n" ++
+    "for _ in range(4):\n" ++
     "    conn, _ = listener.accept()\n" ++
     "    with conn:\n" ++
     "        data = b''\n" ++
@@ -4087,6 +4111,123 @@ test "per-request response limit rejects the body before allocation" {
         ),
     );
     try std.testing.expectEqual(@as(usize, 0), streamed.items.len);
+}
+
+test "successful H1 requests do not wait for their timeout deadline" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const port = try reserveEphemeralPort(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_bounded_response_server_script });
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, io, .{
+        .keep_alive = false,
+        .retry_policy = .{ .max_retries = 0 },
+        .timeouts = .{ .request_ms = 30_000, .read_ms = 30_000, .write_ms = 30_000 },
+    });
+    defer client.deinit();
+    var cancellation = std.atomic.Value(bool).init(false);
+
+    const started_ms = common.milliTimestamp(io);
+    var ordinary_response = try client.get(url, .{});
+    ordinary_response.deinit();
+
+    var ordinary_streamed = std.ArrayListUnmanaged(u8).empty;
+    defer ordinary_streamed.deinit(allocator);
+    var ordinary_streamed_response = try client.getToWriter(
+        url,
+        .{},
+        arrayListWriter(&ordinary_streamed, allocator),
+        null,
+        null,
+    );
+    ordinary_streamed_response.deinit();
+    try std.testing.expectEqual(@as(usize, 32), ordinary_streamed.items.len);
+
+    var response = try client.get(url, .{ .cancellation = .fromAtomic(&cancellation) });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+
+    var streamed = std.ArrayListUnmanaged(u8).empty;
+    defer streamed.deinit(allocator);
+    var streamed_response = try client.getToWriter(
+        url,
+        .{ .cancellation = .fromAtomic(&cancellation) },
+        arrayListWriter(&streamed, allocator),
+        null,
+        null,
+    );
+    defer streamed_response.deinit();
+    try std.testing.expectEqual(@as(usize, 32), streamed.items.len);
+    try std.testing.expect(common.milliTimestamp(io) - started_ms < 2_000);
+}
+
+test "H1 transport cancellation interrupts an active response read" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const port = try reserveEphemeralPort(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_slow_drip_server_script });
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, io, .{
+        .keep_alive = false,
+        .retry_policy = .{ .max_retries = 0 },
+        .timeouts = .{ .request_ms = 30_000, .read_ms = 30_000, .write_ms = 30_000 },
+    });
+    defer client.deinit();
+
+    var cancellation = std.atomic.Value(bool).init(false);
+    const CancelTask = struct {
+        fn run(task_io: Io, signal: *std.atomic.Value(bool)) void {
+            task_io.sleep(Io.Duration.fromMilliseconds(120), .awake) catch {};
+            signal.store(true, .release);
+        }
+    };
+    var cancel_future = try io.concurrent(CancelTask.run, .{ io, &cancellation });
+    defer cancel_future.await(io);
+
+    const started_ms = common.milliTimestamp(io);
+    try std.testing.expectError(
+        error.Cancelled,
+        client.get(url, .{ .cancellation = .fromAtomic(&cancellation) }),
+    );
+    try std.testing.expect(common.milliTimestamp(io) - started_ms < 1_000);
 }
 
 test "writer H1 timeout evicts an interrupted pooled connection" {

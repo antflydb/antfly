@@ -165,6 +165,7 @@ pub const BootstrapConfig = runtime.BootstrapConfig;
 pub const ServerlessRuntimeStatus = runtime.RuntimeStatus;
 pub const OwnedServerlessStack = runtime.OwnedStack;
 pub const ServerlessServerConfig = server.ServerlessServerConfig;
+pub const ListenerConfig = server.ListenerConfig;
 pub const ServerlessServer = server.ServerlessServer;
 
 test "serverless module compiles" {

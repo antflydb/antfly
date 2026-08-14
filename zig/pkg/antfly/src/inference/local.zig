@@ -18,6 +18,7 @@
 // provider-neutral Embedder, Generator, and Reranker interfaces.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
@@ -38,7 +39,7 @@ pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
     base_url: []const u8,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
     auth_header: ?[2][]const u8 = null,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
@@ -78,7 +79,7 @@ pub const Provider = struct {
         self.auth_header = .{ "Authorization", try self.allocator.dupe(u8, auth_header) };
     }
 
-    pub fn setRequestCancellation(self: *Provider, cancellation: ?*const std.atomic.Value(bool)) void {
+    pub fn setRequestCancellation(self: *Provider, cancellation: ?CancellationToken) void {
         self.cancellation = cancellation;
     }
 
@@ -143,7 +144,14 @@ pub const Provider = struct {
             .input = .{ .array = input_array },
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .cancellation = self.cancellation });
+        var resp = try self.http.post(url, .{
+            .json = json_body,
+            .headers = self.authHeaders(),
+            .cancellation = if (self.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
+        });
         defer resp.deinit();
 
         if (!resp.ok()) {
@@ -273,7 +281,14 @@ pub const Provider = struct {
             .input = input,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .cancellation = self.cancellation });
+        var resp = try self.http.post(url, .{
+            .json = json_body,
+            .headers = self.authHeaders(),
+            .cancellation = if (self.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
+        });
         defer resp.deinit();
 
         if (!resp.ok()) {

@@ -120,7 +120,7 @@ fn aggregationFullResultBudget() u32 {
 
 fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
     if (req.cancellation) |value| {
-        if (value.load(.acquire)) return error.Cancelled;
+        if (value.isCancelled()) return error.Cancelled;
     }
     const deadline_ns = req.execution_deadline_ns orelse return;
     if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
@@ -140,7 +140,7 @@ fn queryRemainingTimeoutMs(req: db_mod.types.SearchRequest) !?u32 {
 }
 
 fn queryRequestCancellation(req: db_mod.types.SearchRequest) http_common.RequestCancellation {
-    return .{ .borrowed = req.cancellation };
+    return if (req.cancellation) |token| .fromToken(token) else .{};
 }
 
 fn nsToUsFloat(ns: u64) f64 {
@@ -1708,68 +1708,7 @@ const ParsedTextStatsRequest = union(TextStatsRequestMode) {
 };
 
 pub const TableReadSource = table_read_source.TableReadSource;
-pub fn searchRequestFromVectorWorkerEnvelope(envelope: *const query_contract.OwnedAlgebraicVectorWorkerRequestEnvelope) db_mod.types.SearchRequest {
-    var req = switch (envelope.query) {
-        .dense => |dense| db_mod.types.SearchRequest{
-            .index_name = envelope.index_name,
-            .limit = envelope.options.limit,
-            .offset = envelope.options.offset,
-            .count_only = envelope.options.count_only,
-            .profile = envelope.options.profile,
-            .include_stored = envelope.options.include_stored,
-            .fields = envelope.options.fields,
-            .filter_query_json = envelope.options.filter_query_json,
-            .exclusion_query_json = envelope.options.exclusion_query_json,
-            .filter_prefix = envelope.options.filter_prefix,
-            .filter_ids = envelope.options.filter_ids,
-            .exclude_ids = envelope.options.exclude_ids,
-            .require_algebraic_filter_resolution = envelope.options.require_algebraic_filter_resolution,
-            .include_all_fields = envelope.options.include_all_fields,
-            .defer_stored_projection = envelope.options.defer_stored_projection,
-            .search_effort = envelope.options.search_effort,
-            .distance_over = envelope.options.distance_over,
-            .distance_under = envelope.options.distance_under,
-            .return_mode = envelope.options.return_mode,
-            .max_chunks_per_parent = envelope.options.max_chunks_per_parent,
-            .hierarchy_include_source = envelope.options.hierarchy_include_source,
-            .hierarchy_include_unit = envelope.options.hierarchy_include_unit,
-            .identity_read_generation = envelope.options.identity_read_generation,
-            .resolved_doc_filter = envelope.resolved_doc_filter,
-            .resolved_doc_filter_wire_context = envelope.resolved_doc_filter_wire_context,
-            .query = .{ .dense_knn = dense },
-        },
-        .sparse => |sparse| db_mod.types.SearchRequest{
-            .index_name = envelope.index_name,
-            .limit = envelope.options.limit,
-            .offset = envelope.options.offset,
-            .count_only = envelope.options.count_only,
-            .profile = envelope.options.profile,
-            .include_stored = envelope.options.include_stored,
-            .fields = envelope.options.fields,
-            .filter_query_json = envelope.options.filter_query_json,
-            .exclusion_query_json = envelope.options.exclusion_query_json,
-            .filter_prefix = envelope.options.filter_prefix,
-            .filter_ids = envelope.options.filter_ids,
-            .exclude_ids = envelope.options.exclude_ids,
-            .require_algebraic_filter_resolution = envelope.options.require_algebraic_filter_resolution,
-            .include_all_fields = envelope.options.include_all_fields,
-            .defer_stored_projection = envelope.options.defer_stored_projection,
-            .search_effort = envelope.options.search_effort,
-            .distance_over = envelope.options.distance_over,
-            .distance_under = envelope.options.distance_under,
-            .return_mode = envelope.options.return_mode,
-            .max_chunks_per_parent = envelope.options.max_chunks_per_parent,
-            .hierarchy_include_source = envelope.options.hierarchy_include_source,
-            .hierarchy_include_unit = envelope.options.hierarchy_include_unit,
-            .identity_read_generation = envelope.options.identity_read_generation,
-            .resolved_doc_filter = envelope.resolved_doc_filter,
-            .resolved_doc_filter_wire_context = envelope.resolved_doc_filter_wire_context,
-            .query = .{ .sparse_knn = sparse },
-        },
-    };
-    query_contract.applyNativeDocIdConstraintEnvelope(&req, envelope.native_doc_id_constraints.constraints);
-    return req;
-}
+pub const searchRequestFromVectorWorkerEnvelope = query_contract.searchRequestFromVectorWorkerEnvelope;
 
 const AlgebraicVectorWorkerCandidate = struct {
     index_name: []const u8,
@@ -13891,8 +13830,8 @@ fn graphExpandRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const body = try distributed_graph.encodeGraphExpandRequest(alloc, req);
     defer alloc.free(body);
-    var cancellation = if (req.cancellation) |signal|
-        http_common.RequestCancellation{ .borrowed = signal }
+    var cancellation = if (req.cancellation) |token|
+        http_common.RequestCancellation.fromToken(token)
     else
         null;
     var result = try client.fetchGroupGraphExpandWithControl(
@@ -13918,8 +13857,8 @@ fn graphHydrateRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const body = try distributed_graph.encodeGraphHydrateRequest(alloc, req);
     defer alloc.free(body);
-    var cancellation = if (req.cancellation) |signal|
-        http_common.RequestCancellation{ .borrowed = signal }
+    var cancellation = if (req.cancellation) |token|
+        http_common.RequestCancellation.fromToken(token)
     else
         null;
     var result = try client.fetchGroupGraphHydrateWithControl(
@@ -13945,8 +13884,8 @@ fn graphEdgesRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const body = try distributed_graph.encodeGraphEdgesRequest(alloc, req);
     defer alloc.free(body);
-    var cancellation = if (req.cancellation) |signal|
-        http_common.RequestCancellation{ .borrowed = signal }
+    var cancellation = if (req.cancellation) |token|
+        http_common.RequestCancellation.fromToken(token)
     else
         null;
     var result = try client.fetchGroupGraphEdgesWithControl(
@@ -19143,7 +19082,7 @@ test "remote shard query phases propagate deadline and request cancellation" {
     const alloc = std.testing.allocator;
 
     const ExecutorState = struct {
-        signal: *const std.atomic.Value(bool),
+        signal: *std.atomic.Value(bool),
         calls: usize = 0,
 
         fn iface(self: *@This()) http_common.RequestExecutor {
@@ -19160,8 +19099,10 @@ test "remote shard query phases propagate deadline and request cancellation" {
             try std.testing.expect(req.timeout_ms.? > 0);
             try std.testing.expect(req.timeout_ms.? <= 60_000);
             const cancellation = req.cancellation orelse return error.TestExpectedCancellation;
-            try std.testing.expect(cancellation.signal() == self.signal);
             try std.testing.expect(!cancellation.isCancelled());
+            self.signal.store(true, .release);
+            defer self.signal.store(false, .release);
+            try std.testing.expect(cancellation.isCancelled());
             return error.Timeout;
         }
     };
@@ -19170,7 +19111,7 @@ test "remote shard query phases propagate deadline and request cancellation" {
     var state = ExecutorState{ .signal = &cancelled };
     const controlled_request = db_mod.types.SearchRequest{
         .execution_deadline_ns = platform_time.monotonicNs() + 60 * std.time.ns_per_s,
-        .cancellation = &cancelled,
+        .cancellation = db_mod.types.CancellationToken.fromAtomic(&cancelled),
     };
     try std.testing.expectError(error.Timeout, queryRemote(
         state.iface(),

@@ -89,6 +89,7 @@ pub const HierarchyChildren = types.HierarchyChildren;
 pub const HierarchyProjection = types.HierarchyProjection;
 pub const IncompleteDetails = types.IncompleteDetails;
 pub const IndexStatus = types.IndexStatus;
+pub const InferenceCapacityError = types.InferenceCapacityError;
 pub const InferenceConnection = types.InferenceConnection;
 pub const InferenceProviderType = types.InferenceProviderType;
 pub const JoinClause = types.JoinClause;

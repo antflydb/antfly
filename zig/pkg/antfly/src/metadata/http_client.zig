@@ -1027,9 +1027,9 @@ test "metadata http client percent-encodes artifact enrichment path components" 
 }
 
 test "metadata http client round-trips server endpoints" {
+    const httpx = @import("httpx");
     const metadata_http_server = @import("http_server.zig");
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 
     const FakeSource = struct {
         reallocate_count: usize = 0,
@@ -1267,11 +1267,27 @@ test "metadata http client round-trips server endpoints" {
 
     var source = FakeSource{};
     var server = metadata_http_server.MetadataHttpServer.init(std.heap.page_allocator, .{}, source.iface());
-    var listener = std_http_listener.StdHttpListener.init(std.heap.page_allocator, .{}, server.executor());
+    var server_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer server_io.deinit();
+    var listener = httpx.Server.initWithConfig(std.heap.page_allocator, server_io.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
     defer listener.deinit();
-    try listener.start();
+    try server.registerRoutes(&listener);
+    try listener.bind();
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn listen(http_server: *httpx.Server) void {
+            http_server.listen() catch |err| std.debug.panic("metadata httpx test listener failed: {s}", .{@errorName(err)});
+        }
+    }.listen, .{&listener});
+    defer {
+        listener.stop();
+        listener_thread.join();
+    }
 
-    const base_uri = try listener.baseUri(std.heap.page_allocator);
+    const address = listener.boundAddress() orelse return error.AddressNotAvailable;
+    const base_uri = try std.fmt.allocPrint(std.heap.page_allocator, "http://127.0.0.1:{d}", .{address.ip4.port});
     defer std.heap.page_allocator.free(base_uri);
 
     var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
@@ -1303,6 +1319,8 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectEqual(@as(usize, 1), active.value.merge.len);
 
     try client.triggerReallocate(base_uri);
+    try std.testing.expectError(error.UnsupportedOperation, client.restoreExtensions(base_uri, "{}"));
+    try std.testing.expectError(error.UnsupportedOperation, client.enableExtension(base_uri, "memoryaf"));
     try client.createTable(base_uri, "docs", "{\"description\":\"docs table\"}");
     try client.updateSchema(base_uri, "docs", "{\"kind\":\"demo\"}");
     try client.createIndex(base_uri, "docs", "embed_idx", "{\"type\":\"managed_embeddings\"}");

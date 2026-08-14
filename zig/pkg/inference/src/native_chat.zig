@@ -861,7 +861,7 @@ const ServerChatSession = struct {
             .json = body,
             .headers = &headers,
             .timeout_ms = 300_000,
-            .cancellation = &chat_interrupt,
+            .cancellation = .fromAtomic(&chat_interrupt),
         }, writer, null, null) catch |err| {
             if (err == error.Cancelled and chat_interrupt.load(.acquire)) return error.ChatInterrupted;
             return err;

@@ -35,6 +35,9 @@ const default_max_shards_per_table: u32 = 20;
 const default_config_shards_per_table: u32 = 3;
 const default_standalone_shards_per_table: u32 = 1;
 pub const default_health_port: u16 = 4200;
+pub const default_query_max_concurrent_requests: u32 = 32;
+pub const default_write_max_concurrent_requests: u32 = 16;
+pub const default_inference_max_concurrent_requests: u32 = 32;
 pub const local_inference_connection_id = "local-inference";
 
 pub const DeploymentMode = enum {
@@ -64,6 +67,7 @@ pub const Config = struct {
     log: ?logging_openapi.Config = null,
     tls: ?TlsConfig = null,
     cors: ?CorsConfig = null,
+    admission: AdmissionConfig = .{},
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
     transaction_sessions: TransactionSessionConfig = .{},
@@ -71,6 +75,18 @@ pub const Config = struct {
     remote_content: ?RemoteContentConfig = null,
     connections: ConnectionsConfig = .{},
     shard_allocation: ShardAllocationConfig = .{},
+
+    pub const RequestAdmissionConfig = struct {
+        /// Zero disables this foreground admission class. Transport safeguards
+        /// and inference admission remain independent.
+        max_concurrent_requests: u32,
+    };
+
+    pub const AdmissionConfig = struct {
+        query: RequestAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
+        write: RequestAdmissionConfig = .{ .max_concurrent_requests = default_write_max_concurrent_requests },
+        inference: RequestAdmissionConfig = .{ .max_concurrent_requests = default_inference_max_concurrent_requests },
+    };
 
     pub const MetadataConfig = struct {
         pub const NodeUrl = struct {
@@ -100,6 +116,13 @@ pub const Config = struct {
             self.* = undefined;
         }
     };
+
+    /// The Zig HTTP server currently relies on trusted reverse-proxy TLS
+    /// termination. Every role must reject a configured server TLS block
+    /// instead of silently serving plaintext.
+    pub fn validateServerTlsConfig(tls: ?TlsConfig) !void {
+        if (tls != null) return error.ServerTlsUnsupported;
+    }
 
     pub const StorageConfig = struct {
         engine: common_openapi.StorageEngine = .local,
@@ -228,9 +251,6 @@ pub const Config = struct {
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
         preload: []WarmModelConfig = &.{},
-        /// Zero disables the admission limit. Positive values bound concurrent
-        /// inference work units; excess HTTP requests are rejected with 503.
-        max_concurrent_requests: ?usize = null,
         kernel_jit: KernelJitConfig = .{},
         prompt_cache: PromptCacheConfig = .{},
         keep_alive: ?[]u8 = null,
@@ -584,6 +604,45 @@ pub const Config = struct {
             .object => |object| object,
             else => return error.InvalidConfig,
         };
+        var canonical_inference_max_concurrent_requests: ?u32 = null;
+        if (root.get("admission")) |admission_value| {
+            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference" });
+            const admission_object = switch (admission_value) {
+                .object => |object| object,
+                else => return error.InvalidConfig,
+            };
+            if (admission_object.get("query") != null) {
+                try validateObjectMemberFields(admission_object, "query", &.{"max_concurrent_requests"});
+            }
+            if (admission_object.get("write") != null) {
+                try validateObjectMemberFields(admission_object, "write", &.{"max_concurrent_requests"});
+            }
+            if (admission_object.get("inference") != null) {
+                try validateObjectMemberFields(admission_object, "inference", &.{"max_concurrent_requests"});
+                canonical_inference_max_concurrent_requests = try optionalU32Field(
+                    admission_object.get("inference").?.object,
+                    "max_concurrent_requests",
+                );
+            }
+        }
+        var legacy_inference_max_concurrent_requests: ?u32 = null;
+        if (root.get("inference")) |inference_value| {
+            const inference_object = switch (inference_value) {
+                .object => |object| object,
+                else => return error.InvalidConfig,
+            };
+            if (inference_object.get("admission") != null) return error.InvalidConfig;
+            legacy_inference_max_concurrent_requests = try optionalU32Field(
+                inference_object,
+                "max_concurrent_requests",
+            );
+        }
+        if (canonical_inference_max_concurrent_requests != null and
+            legacy_inference_max_concurrent_requests != null and
+            canonical_inference_max_concurrent_requests.? != legacy_inference_max_concurrent_requests.?)
+        {
+            return error.InvalidConfig;
+        }
 
         var validated = std.json.parseFromValue(common_openapi.Config, alloc, parsed_tree.value, .{
             .allocate = .alloc_always,
@@ -647,6 +706,31 @@ pub const Config = struct {
                 .key = if (tls.key) |value| try alloc.dupe(u8, value) else null,
             } else null,
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
+            .admission = .{
+                .query = .{ .max_concurrent_requests = if (validated.value.admission) |admission|
+                    if (admission.query) |query|
+                        if (query.max_concurrent_requests) |value|
+                            std.math.cast(u32, value) orelse return error.InvalidConfig
+                        else
+                            default_query_max_concurrent_requests
+                    else
+                        default_query_max_concurrent_requests
+                else
+                    default_query_max_concurrent_requests },
+                .write = .{ .max_concurrent_requests = if (validated.value.admission) |admission|
+                    if (admission.write) |write|
+                        if (write.max_concurrent_requests) |value|
+                            std.math.cast(u32, value) orelse return error.InvalidConfig
+                        else
+                            default_write_max_concurrent_requests
+                    else
+                        default_write_max_concurrent_requests
+                else
+                    default_write_max_concurrent_requests },
+                .inference = .{ .max_concurrent_requests = canonical_inference_max_concurrent_requests orelse
+                    legacy_inference_max_concurrent_requests orelse
+                    default_inference_max_concurrent_requests },
+            },
             .metadata = try parseMetadataConfig(
                 alloc,
                 root,
@@ -662,10 +746,6 @@ pub const Config = struct {
                 .content_security = if (inference.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
                 .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
                 .preload = try parseInferencePreloadModels(alloc, raw_root.get("inference")),
-                .max_concurrent_requests = if (inference.max_concurrent_requests) |value|
-                    std.math.cast(usize, value) orelse return error.InvalidConfig
-                else
-                    null,
                 .kernel_jit = kernel_jit,
                 .prompt_cache = prompt_cache,
                 .keep_alive = if (inference.keep_alive) |value| try alloc.dupe(u8, value) else null,
@@ -2161,11 +2241,15 @@ test "common config extracts antfly settings" {
         \\  "default_shards_per_table": 1,
         \\  "max_shard_size_bytes": 1024,
         \\  "max_shards_per_table": 4,
+        \\  "admission": {
+        \\    "query": { "max_concurrent_requests": 11 },
+        \\    "write": { "max_concurrent_requests": 5 },
+        \\    "inference": { "max_concurrent_requests": 7 }
+        \\  },
         \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
         \\    "ml_dir": "/tmp/ml",
-        \\    "max_concurrent_requests": 7,
         \\    "kernel_jit": {
         \\      "mode": "shadow",
         \\      "cache_dir": "/tmp/antfly-jit",
@@ -2206,7 +2290,9 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.inference.api_url.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
-    try std.testing.expectEqual(@as(?usize, 7), cfg.inference.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 11), cfg.admission.query.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 5), cfg.admission.write.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 7), cfg.admission.inference.max_concurrent_requests);
     try std.testing.expectEqual(Config.InferenceConfig.KernelJitConfig.Mode.shadow, cfg.inference.kernel_jit.mode);
     try std.testing.expectEqualStrings("/tmp/antfly-jit", cfg.inference.kernel_jit.cache_dir.?);
     try std.testing.expectEqual(@as(usize, 256), cfg.inference.kernel_jit.max_cache_bytes_mb);
@@ -2229,6 +2315,52 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.inference.s3_credentials.?.endpoint.?);
     try std.testing.expectEqualStrings("antfly-key", cfg.inference.s3_credentials.?.access_key_id.?);
     try std.testing.expectEqualStrings("antfly-secret", cfg.inference.s3_credentials.?.secret_access_key.?);
+}
+
+test "common config preserves disabled foreground admission" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"admission":{"query":{"max_concurrent_requests":0},"write":{"max_concurrent_requests":0},"inference":{"max_concurrent_requests":0}}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 0), cfg.admission.query.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 0), cfg.admission.write.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 0), cfg.admission.inference.max_concurrent_requests);
+}
+
+test "common config rejects unknown admission settings" {
+    try std.testing.expectError(
+        error.InvalidConfig,
+        Config.parseFromSlice(std.testing.allocator,
+            \\{"admission":{"query":{"max_concurent_requests":1}}}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidConfig,
+        Config.parseFromSlice(std.testing.allocator,
+            \\{"admission":{"writes":{"max_concurrent_requests":1}}}
+        ),
+    );
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{"inference":{"admission":{"max_concurrent_requests":1}}}
+    ));
+}
+
+test "common config migrates the legacy inference admission spelling" {
+    var legacy = try Config.parseFromSlice(std.testing.allocator,
+        \\{"inference":{"api_url":"http://127.0.0.1:8090","max_concurrent_requests":7}}
+    );
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(u32, 7), legacy.admission.inference.max_concurrent_requests);
+
+    var matching = try Config.parseFromSlice(std.testing.allocator,
+        \\{"admission":{"inference":{"max_concurrent_requests":7}},"inference":{"api_url":"http://127.0.0.1:8090","max_concurrent_requests":7}}
+    );
+    defer matching.deinit();
+    try std.testing.expectEqual(@as(u32, 7), matching.admission.inference.max_concurrent_requests);
+
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{"admission":{"inference":{"max_concurrent_requests":8}},"inference":{"api_url":"http://127.0.0.1:8090","max_concurrent_requests":7}}
+    ));
 }
 
 test "common config parses inference preload" {
@@ -2975,7 +3107,7 @@ test "common config resolves stable local role base dir by default" {
     try std.testing.expectEqualStrings(expected, base);
 }
 
-test "common config parses minimal config with runtime defaults" {
+test "common config parses minimal config with admission defaults" {
     const alloc = std.testing.allocator;
     var cfg = try Config.parseFromSlice(alloc, "{}");
     defer cfg.deinit();
@@ -2985,6 +3117,9 @@ test "common config parses minimal config with runtime defaults" {
     try std.testing.expect(cfg.storage.local_base_dir == null);
     try std.testing.expect(cfg.health_enabled);
     try std.testing.expectEqual(@as(?u16, default_health_port), cfg.health_port);
+    try std.testing.expectEqual(default_query_max_concurrent_requests, cfg.admission.query.max_concurrent_requests);
+    try std.testing.expectEqual(default_write_max_concurrent_requests, cfg.admission.write.max_concurrent_requests);
+    try std.testing.expectEqual(default_inference_max_concurrent_requests, cfg.admission.inference.max_concurrent_requests);
     try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
     try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
@@ -3015,6 +3150,11 @@ test "common config can disable health server" {
 
     try std.testing.expect(!cfg.health_enabled);
     try std.testing.expectEqual(@as(?u16, default_health_port), cfg.health_port);
+}
+
+test "common config rejects unsupported built-in server TLS" {
+    try Config.validateServerTlsConfig(null);
+    try std.testing.expectError(error.ServerTlsUnsupported, Config.validateServerTlsConfig(.{}));
 }
 
 test "common config accepts partial metadata and storage objects" {

@@ -22,17 +22,21 @@ pub fn parseUpdateHAStandbyStatusBody(allocator: std.mem.Allocator, body: []cons
 }
 
 /// Route metadata for all operations.
+pub const RequestBodyMode = enum { none, buffered };
+
 pub const Route = struct {
     method: []const u8,
     path: []const u8,
     operation_id: []const u8,
+    request_body: RequestBodyMode,
+    streaming_response: bool,
 };
 
 pub const routes = [_]Route{
-    .{ .method = "GET", .path = "/ha/replication/identify", .operation_id = "identifyHAReplicationSystem" },
-    .{ .method = "POST", .path = "/ha/replication/slots", .operation_id = "createHAReplicationStreamingSlot" },
-    .{ .method = "POST", .path = "/ha/replication/start", .operation_id = "startHAReplication" },
-    .{ .method = "POST", .path = "/ha/replication/status", .operation_id = "updateHAStandbyStatus" },
+    .{ .method = "GET", .path = "/ha/replication/identify", .operation_id = "identifyHAReplicationSystem", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/ha/replication/slots", .operation_id = "createHAReplicationStreamingSlot", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/ha/replication/start", .operation_id = "startHAReplication", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/ha/replication/status", .operation_id = "updateHAStandbyStatus", .request_body = .buffered, .streaming_response = false },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -53,48 +57,41 @@ pub fn ServerRouter(comptime Impl: type) type {
     }
 
     return struct {
-        var active_impl: ?*Impl = null;
-
         impl: *Impl,
 
         pub fn init(impl: *Impl) @This() {
             return .{ .impl = impl };
         }
 
-        /// Register all routes on the server and activate the impl.
+        /// Register all routes on the server with explicit instance context.
         pub fn register(self: *const @This(), server: anytype) !void {
-            active_impl = self.impl;
-            try server.get("/ha/replication/identify", identifyHAReplicationSystem);
-            try server.post("/ha/replication/slots", createHAReplicationStreamingSlot);
-            try server.post("/ha/replication/start", startHAReplication);
-            try server.post("/ha/replication/status", updateHAStandbyStatus);
+            try server.get("/ha/replication/identify", httpx.Handler.bind(self.impl, identifyHAReplicationSystem));
+            try server.post("/ha/replication/slots", httpx.Handler.bind(self.impl, createHAReplicationStreamingSlot));
+            try server.post("/ha/replication/start", httpx.Handler.bind(self.impl, startHAReplication));
+            try server.post("/ha/replication/status", httpx.Handler.bind(self.impl, updateHAStandbyStatus));
         }
 
         /// Identify this primary replication system
         /// GET /ha/replication/identify
-        fn identifyHAReplicationSystem(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn identifyHAReplicationSystem(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.identifyHAReplicationSystem(ctx);
         }
 
         /// Create or reserve a runtime replication slot
         /// POST /ha/replication/slots
-        fn createHAReplicationStreamingSlot(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn createHAReplicationStreamingSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.createHAReplicationStreamingSlot(ctx);
         }
 
         /// Pull ordered HA replication records from a slot
         /// POST /ha/replication/start
-        fn startHAReplication(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn startHAReplication(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.startHAReplication(ctx);
         }
 
         /// Report durable receive and apply progress for a standby slot
         /// POST /ha/replication/status
-        fn updateHAStandbyStatus(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn updateHAStandbyStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.updateHAStandbyStatus(ctx);
         }
     };

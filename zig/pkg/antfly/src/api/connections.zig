@@ -31,6 +31,9 @@ const metadata_api = @import("../metadata/api.zig");
 const bedrock = @import("../inference/bedrock.zig");
 const list_models = @import("../inference/list_models.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const inference_connection_abi = @import("../inference_connection_abi.zig");
+const runtime_http_abi = @import("../runtime_http_abi.zig");
+const runtime_memory_abi = @import("../runtime_memory_abi.zig");
 const backups_api = @import("backups.zig");
 
 const Allocator = std.mem.Allocator;
@@ -146,32 +149,138 @@ pub const ConnectionsResponse = struct {
 pub const InvokeResult = struct {
     status: u16,
     body: []u8,
+    retry_after: ?[]u8 = null,
+    content_type: ?[]u8 = null,
+
+    pub fn deinit(self: *InvokeResult, alloc: Allocator) void {
+        alloc.free(self.body);
+        if (self.retry_after) |value| alloc.free(value);
+        if (self.content_type) |value| alloc.free(value);
+        self.* = undefined;
+    }
 };
+
+pub const inference_retry_after_seconds = "1";
+pub const inference_invoke_timeout_ms: u64 = 120_000;
+
+/// Stable public payload for caller-side inference admission failures. Keep
+/// this synchronized with TransientCapacityError in the inference API spec.
+pub const InferenceAdmissionFailure = struct {
+    @"error": []const u8 = "SERVICE_UNAVAILABLE",
+    message: []const u8 = "inference capacity exhausted",
+    reason: []const u8 = "inference_admission",
+    retryable: bool = true,
+    retry_after_ms: u32 = 1000,
+};
+
+pub fn inferenceAdmissionFailure() InferenceAdmissionFailure {
+    return .{};
+}
+
+pub const InferenceAdmissionOwner = enum {
+    caller,
+    target,
+};
+
+/// ABI-stable in-process transport for the runtime-reserved local-inference
+/// connection. The destination owns admission and no public listener
+/// connection is consumed.
+pub const LocalInferenceConnectionTarget = inference_connection_abi.Target;
+
+const RemoteInferenceConnection = struct {
+    url: []const u8,
+    api_key: ?[]const u8,
+};
+
+const ResolvedInferenceConnection = union(enum) {
+    local: LocalInferenceConnectionTarget,
+    remote: RemoteInferenceConnection,
+};
+
+/// Resolve the forwarding target before reading the request body. Only the
+/// reserved local-inference connection delegates admission to its destination
+/// route. Configured connections are caller-admitted; a URL is transport data,
+/// not a trustworthy process-identity signal.
+pub fn inferenceConnectionAdmissionOwner(
+    node_config: ?*const common_config.Config,
+    local_target: ?LocalInferenceConnectionTarget,
+    connection_id: []const u8,
+    operation: []const u8,
+) !InferenceAdmissionOwner {
+    return switch (try resolveInferenceConnection(node_config, local_target, connection_id, operation)) {
+        .local => .target,
+        .remote => .caller,
+    };
+}
 
 pub fn invokeInferenceConnection(
     alloc: Allocator,
-    http: *httpx.Client,
-    node_config: *const common_config.Config,
+    http: ?*httpx.Client,
+    node_config: ?*const common_config.Config,
+    local_target: ?LocalInferenceConnectionTarget,
     secret_store: ?*common_secrets.FileStore,
     connection_id: []const u8,
     operation: []const u8,
     body: []const u8,
+    cancellation: ?httpx.CancellationToken,
+    deadline_ns: u64,
+    stream: runtime_http_abi.StreamSink,
 ) !InvokeResult {
-    const required_capability = inferenceCapability(operation) orelse return error.UnsupportedInferenceOperation;
-    const connection = node_config.connections.get(connection_id) orelse return error.ConnectionNotFound;
-    if (connection.kind != .inference) return error.ConnectionNotInference;
-    try requireInferenceCapability(connection.capabilities, required_capability);
-    const cfg = connection.inference orelse return error.InvalidConfig;
-    if (!std.mem.eql(u8, cfg.provider, "antfly")) return error.ProviderNotAntflyCompatible;
-    const raw_url = cfg.url orelse return error.ConnectionURLMissing;
-    if (!validInferenceURL(raw_url)) return error.InvalidConnectionURL;
+    const resolved = try resolveInferenceConnection(node_config, local_target, connection_id, operation);
+    if (resolved == .local) {
+        const target = resolved.local;
+        if (!target.valid(inference_connection_abi.Capability.streaming_response))
+            return error.UnsupportedVersion;
+        var abi_alloc = runtime_memory_abi.Allocator.fromStd(&alloc);
+        var response: inference_connection_abi.InvokeResponse = .{};
+        var cancellation_token = cancellation;
+        const cancellation_view: runtime_http_abi.CancellationView = if (cancellation_token) |*token| .{
+            .context = token,
+            .is_cancelled = struct {
+                fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
+                    const source: *const httpx.CancellationToken = @ptrCast(@alignCast(raw orelse return 0));
+                    return @intFromBool(source.isCancelled());
+                }
+            }.isCancelled,
+        } else .{};
+        const status = target.invoke(&.{
+            .abi_version = inference_connection_abi.abi_version,
+            .target_context = target.context,
+            .allocator = &abi_alloc,
+            .operation = runtime_http_abi.Bytes.init(operation),
+            .body = runtime_http_abi.Bytes.init(body),
+            .cancellation = cancellation_view,
+            .deadline_ns = deadline_ns,
+            .stream = stream,
+            .out_response = &response,
+        });
+        if (!status.isOk()) {
+            response.deinit(&abi_alloc);
+            return inference_connection_abi.errorFromStatus(status);
+        }
+        if (!response.valid()) {
+            response.deinit(&abi_alloc);
+            return error.RuntimeBoundaryFailure;
+        }
+        const result: InvokeResult = .{
+            .status = response.status,
+            .body = response.body.slice(),
+            .retry_after = if (response.retry_after.present != 0) response.retry_after.bytes.slice() else null,
+            .content_type = if (response.content_type.present != 0) response.content_type.bytes.slice() else null,
+        };
+        response = .{};
+        return result;
+    }
+
+    const remote = resolved.remote;
+    const raw_url = remote.url;
     const base = std.mem.trimEnd(u8, raw_url, "/");
     const prefix = if (std.mem.endsWith(u8, base, "/ai/v1")) base else try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{base});
     defer if (prefix.ptr != base.ptr) alloc.free(prefix);
     const url = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
     defer alloc.free(url);
 
-    const resolved_key = try resolveInferenceApiKey(alloc, secret_store, cfg.api_key);
+    const resolved_key = try resolveInferenceApiKey(alloc, secret_store, remote.api_key);
     defer if (resolved_key) |key| alloc.free(key);
     const auth = if (resolved_key) |key| try std.fmt.allocPrint(alloc, "Bearer {s}", .{key}) else null;
     defer if (auth) |value| alloc.free(value);
@@ -180,11 +289,72 @@ pub fn invokeInferenceConnection(
         .{ "Content-Type", "application/json" },
     } else &[_][2][]const u8{.{ "Content-Type", "application/json" }};
 
-    var response = try http.request(.POST, url, .{ .headers = headers, .body = body, .timeout_ms = 120_000 });
+    const timeout_ms = try remainingInferenceInvocationMs(deadline_ns, platform_time.monotonicNs());
+    var response = try (http orelse return error.InferenceTransportUnavailable).request(.POST, url, .{
+        .headers = headers,
+        .body = body,
+        .timeout_ms = timeout_ms,
+        .cancellation = cancellation,
+    });
     defer response.deinit();
+    const response_body = try alloc.dupe(u8, response.body orelse "");
+    errdefer alloc.free(response_body);
+    const retry_after = if (response.header("Retry-After")) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (retry_after) |value| alloc.free(value);
+    const content_type = if (response.contentType()) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
     return .{
         .status = response.status.code,
-        .body = try alloc.dupe(u8, response.body orelse ""),
+        .body = response_body,
+        .retry_after = retry_after,
+        .content_type = content_type,
+    };
+}
+
+pub fn inferenceInvocationDeadlineNs() u64 {
+    return platform_time.monotonicNs() +| inference_invoke_timeout_ms * std.time.ns_per_ms;
+}
+
+fn remainingInferenceInvocationMs(deadline_ns: u64, now_ns: u64) !u64 {
+    if (deadline_ns == 0) return inference_invoke_timeout_ms;
+    if (now_ns >= deadline_ns) return error.Timeout;
+    const remaining_ns = deadline_ns - now_ns;
+    return @max(@as(u64, 1), (remaining_ns - 1) / std.time.ns_per_ms + 1);
+}
+
+fn resolveInferenceConnection(
+    node_config: ?*const common_config.Config,
+    local_target: ?LocalInferenceConnectionTarget,
+    connection_id: []const u8,
+    operation: []const u8,
+) !ResolvedInferenceConnection {
+    const required_capability = inferenceCapability(operation) orelse return error.UnsupportedInferenceOperation;
+    if (std.mem.eql(u8, connection_id, common_config.local_inference_connection_id)) {
+        return .{ .local = local_target orelse return error.ConnectionNotFound };
+    }
+
+    const config = node_config orelse return error.ConnectionNotFound;
+    const connection = config.connections.get(connection_id) orelse return error.ConnectionNotFound;
+    if (connection.kind != .inference) return error.ConnectionNotInference;
+    try requireInferenceCapability(connection.capabilities, required_capability);
+    const cfg = connection.inference orelse return error.InvalidConfig;
+    if (!std.mem.eql(u8, cfg.provider, "antfly")) return error.ProviderNotAntflyCompatible;
+    const raw_url = cfg.url orelse return error.ConnectionURLMissing;
+    if (!validInferenceURL(raw_url)) return error.InvalidConnectionURL;
+    return .{
+        .remote = .{
+            .url = raw_url,
+            .api_key = cfg.api_key,
+            // The reserved connection ID above is the only process-local identity.
+            // A configured URL may resolve through aliases, proxies, or a future
+            // listener at the same origin, so URL equality must never transfer
+            // admission ownership to the target.
+        },
     };
 }
 
@@ -1465,7 +1635,7 @@ test "inference connection operations are allowlisted" {
         \\}
     );
     defer cfg.deinit();
-    try std.testing.expectError(error.ConnectionCapabilityMissing, invokeInferenceConnection(alloc, undefined, &cfg, null, "embed-only", "generate", "{}"));
+    try std.testing.expectError(error.ConnectionCapabilityMissing, invokeInferenceConnection(alloc, null, &cfg, null, null, "embed-only", "generate", "{}", null, 0, .{}));
 
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-connection-secrets-{d}.json", .{platform_time.monotonicNs()});
     defer alloc.free(store_path);
@@ -1481,6 +1651,220 @@ test "inference connection operations are allowlisted" {
     const resolved = (try resolveInferenceApiKey(alloc, &secret_store, "${secret:openai.api_key}")).?;
     defer alloc.free(resolved);
     try std.testing.expectEqualStrings("resolved-key", resolved);
+}
+
+test "inference admission ownership uses explicit connection identity" {
+    const LocalTarget = struct {
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const alloc = context.allocator.asStd();
+            const body = std.fmt.allocPrint(alloc, "{s}:{s}", .{
+                context.operation.slice(),
+                context.body.slice(),
+            }) catch return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{
+                .status = 200,
+                .body = .{ .ptr = body.ptr, .len = body.len },
+            };
+            return .ok;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var local_context: u8 = 0;
+    const local_target: LocalInferenceConnectionTarget = .{
+        .capabilities = inference_connection_abi.Capability.streaming_response,
+        .context = &local_context,
+        .invoke = LocalTarget.invoke,
+    };
+    var cfg = try common_config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "configured-loopback": {
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.embed"],
+        \\      "inference": { "provider": "antfly", "url": "http://127.0.0.1:8080/ai/v1" }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+
+    // Even an exact URL match is an ordinary configured network boundary.
+    try std.testing.expectEqual(
+        InferenceAdmissionOwner.caller,
+        try inferenceConnectionAdmissionOwner(&cfg, local_target, "configured-loopback", "embed"),
+    );
+    // Only the runtime-reserved identity transfers ownership to the local route.
+    try std.testing.expectEqual(
+        InferenceAdmissionOwner.target,
+        try inferenceConnectionAdmissionOwner(null, local_target, common_config.local_inference_connection_id, "generate"),
+    );
+
+    var result = try invokeInferenceConnection(
+        alloc,
+        null,
+        null,
+        local_target,
+        null,
+        common_config.local_inference_connection_id,
+        "generate",
+        "{}",
+        null,
+        inferenceInvocationDeadlineNs(),
+        .{},
+    );
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), result.status);
+    try std.testing.expectEqualStrings("generate:{}", result.body);
+}
+
+test "inference connection invocation forwards streaming and deadline through stable target ABI" {
+    const LocalTarget = struct {
+        invoked: bool = false,
+        saw_deadline: bool = false,
+
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            self.invoked = true;
+            self.saw_deadline = context.deadline_ns != 0;
+            const stream = context.stream;
+            if (stream.start.?(stream.context, 200) != .ok or
+                stream.write.?(stream.context, runtime_http_abi.Bytes.init("data: linked\n\n")) != .ok or
+                stream.close.?(stream.context) != .ok)
+            {
+                return inference_connection_abi.statusFromError(error.Unavailable);
+            }
+            context.out_response.* = .{ .status = 200 };
+            return .ok;
+        }
+    };
+    const Stream = struct {
+        bytes: [32]u8 = undefined,
+        len: usize = 0,
+        started: bool = false,
+        closed: bool = false,
+
+        fn start(raw: ?*anyopaque, status: u16) callconv(.c) runtime_http_abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return .failed));
+            self.started = status == 200;
+            return .ok;
+        }
+
+        fn write(raw: ?*anyopaque, bytes: runtime_http_abi.Bytes) callconv(.c) runtime_http_abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return .failed));
+            const value = bytes.slice();
+            if (value.len > self.bytes.len - self.len) return .failed;
+            @memcpy(self.bytes[self.len..][0..value.len], value);
+            self.len += value.len;
+            return .ok;
+        }
+
+        fn close(raw: ?*anyopaque) callconv(.c) runtime_http_abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return .failed));
+            self.closed = true;
+            return .ok;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var context = LocalTarget{};
+    var stream = Stream{};
+    const target: LocalInferenceConnectionTarget = .{
+        .capabilities = inference_connection_abi.Capability.streaming_response,
+        .context = &context,
+        .invoke = LocalTarget.invoke,
+    };
+    var result = try invokeInferenceConnection(
+        alloc,
+        null,
+        null,
+        target,
+        null,
+        common_config.local_inference_connection_id,
+        "generate",
+        "{\"stream\":true}",
+        null,
+        inferenceInvocationDeadlineNs(),
+        .{ .context = &stream, .start = Stream.start, .write = Stream.write, .close = Stream.close },
+    );
+    defer result.deinit(alloc);
+    try std.testing.expect(context.invoked);
+    try std.testing.expect(context.saw_deadline);
+    try std.testing.expect(stream.started);
+    try std.testing.expect(stream.closed);
+    try std.testing.expectEqualStrings("data: linked\n\n", stream.bytes[0..stream.len]);
+}
+
+test "inference invocation remaining deadline rounds up and expires" {
+    try std.testing.expectEqual(@as(u64, 1), try remainingInferenceInvocationMs(101, 100));
+    try std.testing.expectEqual(@as(u64, 2), try remainingInferenceInvocationMs(std.time.ns_per_ms + 1, 0));
+    try std.testing.expectError(error.Timeout, remainingInferenceInvocationMs(100, 100));
+}
+
+test "inference connection ABI reclaims partial responses on target failure" {
+    const LocalTarget = struct {
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const body = context.allocator.asStd().dupe(u8, "partial") catch
+                return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{
+                .status = 500,
+                .body = .{ .ptr = body.ptr, .len = body.len },
+            };
+            return inference_connection_abi.statusFromError(error.Timeout);
+        }
+    };
+
+    var target_context: u8 = 0;
+    const target: LocalInferenceConnectionTarget = .{
+        .capabilities = inference_connection_abi.Capability.streaming_response,
+        .context = &target_context,
+        .invoke = LocalTarget.invoke,
+    };
+    try std.testing.expectError(error.Timeout, invokeInferenceConnection(
+        std.testing.allocator,
+        null,
+        null,
+        target,
+        null,
+        common_config.local_inference_connection_id,
+        "embed",
+        "{}",
+        null,
+        inferenceInvocationDeadlineNs(),
+        .{},
+    ));
+}
+
+test "inference connection ABI rejects malformed responses without dereferencing invalid ownership" {
+    const LocalTarget = struct {
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            context.out_response.* = .{
+                .status = 200,
+                .body = .{ .ptr = null, .len = 8 },
+            };
+            return .ok;
+        }
+    };
+
+    var target_context: u8 = 0;
+    const target: LocalInferenceConnectionTarget = .{
+        .capabilities = inference_connection_abi.Capability.streaming_response,
+        .context = &target_context,
+        .invoke = LocalTarget.invoke,
+    };
+    try std.testing.expectError(error.RuntimeBoundaryFailure, invokeInferenceConnection(
+        std.testing.allocator,
+        null,
+        null,
+        target,
+        null,
+        common_config.local_inference_connection_id,
+        "embed",
+        "{}",
+        null,
+        inferenceInvocationDeadlineNs(),
+        .{},
+    ));
 }
 
 test "inference connection URLs require an HTTP origin" {

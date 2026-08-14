@@ -14,14 +14,14 @@
 
 const batch = @import("api/batch.zig");
 const http_client = @import("api/http_client.zig");
-const http_internal_group_write_routes = @import("api/http_internal_group_write_routes.zig");
+const internal_transition_wire = @import("api/internal_transition_wire.zig");
 const provisioned_storage = @import("api/provisioned_storage.zig");
 const table_writes = @import("api/table_writes.zig");
 
 test {
     _ = batch;
     _ = http_client;
-    _ = http_internal_group_write_routes;
+    _ = internal_transition_wire;
     _ = provisioned_storage;
     _ = table_writes;
 }

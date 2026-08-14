@@ -1,6 +1,7 @@
 """Regression tests for generated inference-capacity responses."""
 
 import httpx
+import pytest
 
 from antfly.client_generated import Client
 from antfly.client_generated.api.default import create_embedding
@@ -12,14 +13,24 @@ from antfly.client_generated.models.inference_transient_capacity_error_reason im
 )
 
 
-def test_transient_capacity_response_preserves_retry_metadata() -> None:
+@pytest.mark.parametrize(
+    ("reason", "expected_reason"),
+    [
+        ("inference_capacity", InferenceTransientCapacityErrorReason.INFERENCE_CAPACITY),
+        ("inference_admission", InferenceTransientCapacityErrorReason.INFERENCE_ADMISSION),
+    ],
+)
+def test_transient_capacity_response_preserves_retry_metadata(
+    reason: str,
+    expected_reason: InferenceTransientCapacityErrorReason,
+) -> None:
     response = httpx.Response(
         status_code=503,
         headers={"Retry-After": "1"},
         json={
             "error": "MODEL_RESOURCE_BUSY",
             "message": "model resources are temporarily busy",
-            "reason": "inference_capacity",
+            "reason": reason,
             "retryable": True,
             "retry_after_ms": 1000,
         },
@@ -32,6 +43,6 @@ def test_transient_capacity_response_preserves_retry_metadata() -> None:
 
     assert isinstance(parsed, InferenceTransientCapacityError)
     assert parsed.error == "MODEL_RESOURCE_BUSY"
-    assert parsed.reason is InferenceTransientCapacityErrorReason.INFERENCE_CAPACITY
+    assert parsed.reason is expected_reason
     assert parsed.retryable is True
     assert parsed.retry_after_ms == 1000

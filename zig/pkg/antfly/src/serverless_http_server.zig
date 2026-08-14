@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const httpx = @import("httpx");
 const http_common = @import("raft/transport/http_common.zig");
 const serverless_http_routes = @import("serverless/api/http_routes.zig");
 const serverless_http_types = @import("serverless/api/http_types.zig");
@@ -67,19 +68,77 @@ pub const ServerlessHttpServer = struct {
             .DELETE => .delete,
         };
 
+        const path = if (std.mem.indexOfScalar(u8, req.uri, '?')) |query_index| req.uri[0..query_index] else req.uri;
         var resp = try self.handler.handle(.{
             .method = method,
-            .path = req.uri,
+            .path = path,
             .body = req.body,
+            .cancellation = if (req.cancellation) |value| value.token() else .none,
         });
         defer resp.deinit(self.alloc);
 
-        return .{
+        var response = http_common.HttpResponse{
             .status = resp.status,
             .owner_allocator = self.alloc,
             .content_type = try self.alloc.dupe(u8, resp.content_type),
             .body = try self.alloc.dupe(u8, resp.body),
         };
+        errdefer response.deinit(self.alloc);
+        if (resp.retry_after_seconds) |seconds| {
+            const value = try std.fmt.allocPrint(self.alloc, "{d}", .{seconds});
+            defer self.alloc.free(value);
+            const name_owned = try self.alloc.dupe(u8, "Retry-After");
+            errdefer self.alloc.free(name_owned);
+            const value_owned = try self.alloc.dupe(u8, value);
+            errdefer self.alloc.free(value_owned);
+            const headers = try self.alloc.alloc(http_common.Header, 1);
+            headers[0] = .{
+                .name = name_owned,
+                .value = value_owned,
+            };
+            response.headers = headers;
+        }
+        return response;
+    }
+
+    /// Native httpx adapter. Request decoding and response encoding remain at
+    /// the transport edge; the serverless handler receives its canonical
+    /// transport-neutral request exactly once.
+    pub fn handleHttpx(self: *ServerlessHttpServer, ctx: *httpx.Context) !httpx.Response {
+        _ = self.cfg;
+        const method: serverless_http_routes.HttpMethod = switch (ctx.request.method) {
+            .GET => .get,
+            .POST => .post,
+            .PUT => .put,
+            .DELETE => .delete,
+            else => return try ctx.status(405).text("method not allowed"),
+        };
+        const body = (try ctx.body()) orelse "";
+        var response = try self.handler.handle(.{
+            .method = method,
+            .path = ctx.request.uri.path,
+            .body = body,
+            .cancellation = .{
+                .ptr = ctx,
+                .is_cancelled_fn = struct {
+                    fn call(raw: *const anyopaque) bool {
+                        const request_context: *const httpx.Context = @ptrCast(@alignCast(raw));
+                        return request_context.isCancellationRequested();
+                    }
+                }.call,
+            },
+        });
+        defer response.deinit(self.alloc);
+
+        _ = ctx.status(response.status);
+        try ctx.setHeader("Content-Type", response.content_type);
+        if (response.retry_after_seconds) |seconds| {
+            var retry_after_buf: [10]u8 = undefined;
+            const value = try std.fmt.bufPrint(&retry_after_buf, "{d}", .{seconds});
+            try ctx.setHeader("Retry-After", value);
+        }
+        _ = ctx.response.body(response.body);
+        return try ctx.response.build();
     }
 
     fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -147,7 +206,7 @@ test "serverless http server adapts handler to common executor" {
 
     var status = try server.executor().execute(alloc, .{
         .method = .GET,
-        .uri = "/status",
+        .uri = "/status?probe=1",
     });
     defer status.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), status.status);
@@ -194,4 +253,62 @@ test "serverless http server passes through handler responses" {
     try std.testing.expectEqual(@as(u16, 405), resp.status);
     try std.testing.expectEqual(serverless_http_routes.HttpMethod.delete, handler.last_method.?);
     try std.testing.expectEqualStrings("/tables/docs", handler.last_path.?);
+}
+
+test "native serverless adapter preserves route path and retry metadata" {
+    const alloc = std.testing.allocator;
+    const FakeHandler = struct {
+        alloc: std.mem.Allocator,
+        observed_path: ?[]const u8 = null,
+
+        fn handle(self: *@This(), req: serverless_http_types.HttpRequest) !serverless_http_types.HttpResponse {
+            self.observed_path = req.path;
+            return .{
+                .status = 429,
+                .content_type = try self.alloc.dupe(u8, "text/plain"),
+                .body = try self.alloc.dupe(u8, "capacity exhausted"),
+                .retry_after_seconds = 3,
+            };
+        }
+    };
+
+    var handler = FakeHandler{ .alloc = alloc };
+    var server = ServerlessHttpServer.init(alloc, .{}, &handler);
+    var request = try httpx.Request.init(alloc, .GET, "/query/search?profile=true");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try server.handleHttpx(&ctx);
+    defer response.deinit();
+
+    try std.testing.expectEqualStrings("/query/search", handler.observed_path.?);
+    try std.testing.expectEqual(@as(u16, 429), response.status.code);
+    try std.testing.expectEqualStrings("3", response.header("Retry-After").?);
+}
+
+test "native serverless adapter lends request cancellation to the handler" {
+    const alloc = std.testing.allocator;
+    const FakeHandler = struct {
+        alloc: std.mem.Allocator,
+
+        fn handle(self: *@This(), req: serverless_http_types.HttpRequest) !serverless_http_types.HttpResponse {
+            try req.ensureActive();
+            return .{
+                .status = 200,
+                .content_type = try self.alloc.dupe(u8, "text/plain"),
+                .body = try self.alloc.dupe(u8, "ok"),
+            };
+        }
+    };
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    var handler = FakeHandler{ .alloc = alloc };
+    var server = ServerlessHttpServer.init(alloc, .{}, &handler);
+    var request = try httpx.Request.init(alloc, .GET, "/status");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    ctx.cancellation = &cancelled;
+
+    try std.testing.expectError(error.Canceled, server.handleHttpx(&ctx));
 }

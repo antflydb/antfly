@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
@@ -62,10 +63,10 @@ pub const ProviderKind = enum {
 pub const EmbeddingRequestContext = struct {
     io: std.Io,
     deadline_ns: ?u64,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 
     pub fn check(self: EmbeddingRequestContext) !void {
-        if (self.cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+        if (self.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         const deadline = self.deadline_ns orelse return;
         if (monotonicNowNs() >= deadline) return error.Timeout;
     }
@@ -173,7 +174,7 @@ pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
     io: ?std.Io = null,
     deadline_ns: ?u64 = null,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
@@ -192,6 +193,7 @@ pub const QueryTemplateError = error{
 
 const default_pacing_burst: u32 = 1;
 const pacing_safety_margin_ns: u64 = 50 * std.time.ns_per_ms;
+const pacing_cancellation_poll_ns: u64 = 5 * std.time.ns_per_ms;
 const max_embedding_request_timeout_ms: u64 = 30_000;
 const query_cache_secret_refresh_interval_ns: u64 = std.time.ns_per_s;
 const dimension_probe_text = "antfly embedding dimension probe";
@@ -234,9 +236,15 @@ const RequestPacer = struct {
         };
     }
 
-    fn acquire(self: *RequestPacer, io: std.Io, deadline_ns: ?u64) !void {
+    fn acquire(
+        self: *RequestPacer,
+        io: std.Io,
+        deadline_ns: ?u64,
+        cancellation: ?CancellationToken,
+    ) !void {
         if (self.capacity <= 1.0) {
             while (true) {
+                if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
                 lockAtomic(&self.mutex);
                 const now_ns = monotonicNowNs();
                 if (now_ns >= self.next_send_ns) {
@@ -252,11 +260,12 @@ const RequestPacer = struct {
                     }
                 }
                 self.mutex.unlock();
-                try io.sleep(.fromNanoseconds(@intCast(wait_ns)), .awake);
+                try io.sleep(.fromNanoseconds(@intCast(@min(wait_ns, pacing_cancellation_poll_ns))), .awake);
             }
         }
 
         while (true) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             lockAtomic(&self.mutex);
             const now_ns = monotonicNowNs();
             const elapsed_ns = now_ns - self.last_refill_ns;
@@ -276,7 +285,7 @@ const RequestPacer = struct {
             if (deadline_ns) |deadline| {
                 if (now_ns >= deadline or wait_ns >= deadline - now_ns) return error.Timeout;
             }
-            try io.sleep(.fromNanoseconds(@intCast(wait_ns)), .awake);
+            try io.sleep(.fromNanoseconds(@intCast(@min(wait_ns, pacing_cancellation_poll_ns))), .awake);
         }
     }
 };
@@ -389,7 +398,7 @@ pub const ManagedEmbeddingEntry = struct {
     alloc: std.mem.Allocator,
     io: ?std.Io = null,
     deadline_ns: ?u64 = null,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
     index_name: []u8,
     embedding_name: []u8 = "",
     provider: ProviderKind,
@@ -722,6 +731,23 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntry(alloc, entry, text, entry.dimensions);
     }
 
+    pub fn embedQueryWithCancellation(
+        self: *const ManagedEmbedder,
+        alloc: std.mem.Allocator,
+        index_name: []const u8,
+        text: []const u8,
+        cancellation: CancellationToken,
+    ) ![]f32 {
+        const configured_entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        var request_entry = configured_entry.*;
+        request_entry.bedrock_credentials = .{};
+        defer request_entry.bedrock_credentials.deinit(alloc);
+        request_entry.auth_header_cache = .{};
+        defer request_entry.auth_header_cache.deinit(alloc);
+        request_entry.cancellation = cancellation;
+        return try embedWithEntry(alloc, &request_entry, text, request_entry.dimensions);
+    }
+
     /// Digest the effective dense-text embedding operation. Table and index
     /// names are intentionally excluded so equivalent configurations share
     /// results; the server-derived scope prevents cross-principal reuse.
@@ -772,6 +798,30 @@ pub const ManagedEmbedder = struct {
         const parts = try template_mod.textToParts(alloc, rendered);
         defer template_mod.freeContentParts(alloc, parts);
         return embedWithEntryParts(alloc, entry, parts, entry.dimensions) catch |err| return err;
+    }
+
+    pub fn embedQueryWithTemplateAndCancellation(
+        self: *const ManagedEmbedder,
+        alloc: std.mem.Allocator,
+        index_name: []const u8,
+        text: []const u8,
+        embedding_template: []const u8,
+        cancellation: CancellationToken,
+    ) ![]f32 {
+        const configured_entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        var request_entry = configured_entry.*;
+        request_entry.bedrock_credentials = .{};
+        defer request_entry.bedrock_credentials.deinit(alloc);
+        request_entry.auth_header_cache = .{};
+        defer request_entry.auth_header_cache.deinit(alloc);
+        request_entry.cancellation = cancellation;
+        const rendered = try renderQueryTemplateWithEntry(alloc, embedding_template, text, &request_entry);
+        defer alloc.free(rendered);
+        try ensureEntryDeadline(&request_entry);
+        try validateRenderedTemplate(alloc, rendered);
+        const parts = try template_mod.textToParts(alloc, rendered);
+        defer template_mod.freeContentParts(alloc, parts);
+        return embedWithEntryParts(alloc, &request_entry, parts, request_entry.dimensions) catch |err| return err;
     }
 
     fn findEntry(self: *const ManagedEmbedder, index_name: []const u8) ?*const ManagedEmbeddingEntry {
@@ -899,7 +949,7 @@ fn hashQueryCacheSecretIdentity(hasher: *std.crypto.hash.sha2.Sha256, maybe_secr
 fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) !void {
     try ensureEntryDeadline(entry);
     const pacer = entry.pacer orelse return;
-    try pacer.acquire(embeddingIo(entry), entry.deadline_ns);
+    try pacer.acquire(embeddingIo(entry), entry.deadline_ns, entry.cancellation);
     try ensureEntryDeadline(entry);
 }
 
@@ -912,7 +962,7 @@ fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry) EmbeddingRequest
 }
 
 fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
-    if (entry.cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+    if (entry.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
     const deadline = entry.deadline_ns orelse return;
     if (monotonicNowNs() >= deadline) return error.Timeout;
 }
@@ -938,10 +988,26 @@ fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientC
 pub fn testEmbeddingProviderDeadlines() !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     var pacer = RequestPacer.init(60, 1);
-    try pacer.acquire(io, null);
+    try pacer.acquire(io, null, null);
     try std.testing.expect(pacer.mutex.tryLock());
     pacer.mutex.unlock();
-    try std.testing.expectError(error.Timeout, pacer.acquire(io, monotonicNowNs() + std.time.ns_per_ms));
+    try std.testing.expectError(error.Timeout, pacer.acquire(io, monotonicNowNs() + std.time.ns_per_ms, null));
+
+    const CancelAfterFirstPacingSlice = struct {
+        checks: usize = 0,
+
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            return self.checks >= 2;
+        }
+    };
+    var cancelled = CancelAfterFirstPacingSlice{};
+    try std.testing.expectError(
+        error.Cancelled,
+        pacer.acquire(io, null, .{ .ptr = &cancelled, .is_cancelled_fn = CancelAfterFirstPacingSlice.cancelled }),
+    );
+    try std.testing.expectEqual(@as(usize, 2), cancelled.checks);
 
     const indexes_json =
         \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small"}}}
@@ -2416,7 +2482,10 @@ fn embedBatchWithOpenAiCompatible(
     var response = try client.post(url, .{
         .json = json_body,
         .headers = headers_buf[0..header_count],
-        .cancellation = entry.cancellation,
+        .cancellation = if (entry.cancellation) |token|
+            httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+        else
+            null,
     });
     defer response.deinit();
     if (!response.ok()) return mapEmbedStatus(response.status.code);
@@ -3011,7 +3080,7 @@ pub fn testRemoteEmbeddingCancellation() !void {
     var cancellation = std.atomic.Value(bool).init(false);
     var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, .{
         .io = io_impl.io(),
-        .cancellation = &cancellation,
+        .cancellation = CancellationToken.fromAtomic(&cancellation),
     });
     defer managed.deinit();
 

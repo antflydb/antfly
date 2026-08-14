@@ -17,6 +17,37 @@ const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const search_results = @import("search_results.zig");
 
+pub const CancellationToken = struct {
+    ptr: *const anyopaque,
+    is_cancelled_fn: *const fn (*const anyopaque) bool,
+
+    pub fn fromAtomic(signal: *const std.atomic.Value(bool)) CancellationToken {
+        return .{
+            .ptr = signal,
+            .is_cancelled_fn = struct {
+                fn call(raw: *const anyopaque) bool {
+                    const value: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+                    return value.load(.acquire);
+                }
+            }.call,
+        };
+    }
+
+    pub fn fromCallback(
+        ptr: ?*const anyopaque,
+        is_cancelled_fn: ?*const fn (*const anyopaque) bool,
+    ) ?CancellationToken {
+        return .{
+            .ptr = ptr orelse return null,
+            .is_cancelled_fn = is_cancelled_fn orelse return null,
+        };
+    }
+
+    pub fn isCancelled(self: CancellationToken) bool {
+        return self.is_cancelled_fn(self.ptr);
+    }
+};
+
 pub const SearchResult = search_results.SearchResult;
 pub const SearchResults = search_results.SearchResults;
 
@@ -37,12 +68,12 @@ pub const SearchRequest = struct {
     exclude_ids: []const u64 = &.{},
     /// Borrowed request-lifecycle signal. Search loops poll this at bounded
     /// intervals so a disconnected caller does not retain query capacity.
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 };
 
 pub fn checkCancelled(req: SearchRequest) !void {
     if (req.cancellation) |cancellation| {
-        if (cancellation.load(.acquire)) return error.Cancelled;
+        if (cancellation.isCancelled()) return error.Cancelled;
     }
 }
 

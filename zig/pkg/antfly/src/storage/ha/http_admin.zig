@@ -24,6 +24,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const platform_sync = @import("antfly_platform").sync;
 const admin_api = @import("../../admin/mod.zig");
 const http_common = @import("../../common/http/http_common.zig");
+const http_operation = @import("http_operation.zig");
 const ha_admin = @import("admin.zig");
 const http_internal = @import("http_internal.zig");
 const internal_api = @import("../../internal/mod.zig");
@@ -196,32 +197,53 @@ pub const Server = struct {
         };
     }
 
+    pub fn operationExecutor(self: *Server) http_operation.Executor {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .execute = executeTyped },
+        };
+    }
+
     pub fn deinit(self: *Server) void {
         self.* = undefined;
     }
 
     pub fn handle(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
-        const path = requestPath(req.uri);
+        var response = try self.executeOperation(requestFromLegacy(req));
+        defer response.deinit();
+        return .{
+            .status = response.status,
+            .content_type = try self.alloc.dupe(u8, response.content_type),
+            .body = try self.alloc.dupe(u8, response.body),
+        };
+    }
+
+    pub fn executeOperation(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
+        return try self.handleOperation(req);
+    }
+
+    fn handleOperation(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
+        const path = requestPath(req.target);
         if (isAdminAuthRequired(path) and !self.authorized(req)) {
             return try textResponse(self.alloc, 401, "unauthorized");
         }
-        if (req.method == .GET and std.mem.eql(u8, path, Routes.health)) {
+        if (req.method == .get and std.mem.eql(u8, path, Routes.health)) {
             return try textResponse(self.alloc, 200, "ok");
         }
-        if (req.method == .POST and std.mem.eql(u8, path, admin_api.routes.ha_base_backups_capture)) {
+        if (req.method == .post and std.mem.eql(u8, path, admin_api.routes.ha_base_backups_capture)) {
             defer if (self.auth.state_changed) |hook| hook.run();
             return try self.handleAdminCaptureSeedArtifact(req);
         }
         if (std.mem.eql(u8, path, admin_api.routes.ha_seed_lifecycle_receipts)) {
-            if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
+            if (req.method != .get) return try textResponse(self.alloc, 405, "method not allowed");
             return try self.handleAdminLifecycleReceipts(req);
         }
         if (std.mem.eql(u8, path, admin_api.routes.ha_watchdog_proof)) {
-            if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
+            if (req.method != .get) return try textResponse(self.alloc, 405, "method not allowed");
             return try self.handleAdminWatchdogProof();
         }
         var primary_fence_lease: ?mutation_barrier.MutationBarrier.ExclusiveLease = null;
-        if (req.method == .POST and std.mem.eql(u8, path, admin_api.routes.ha_fence)) {
+        if (req.method == .post and std.mem.eql(u8, path, admin_api.routes.ha_fence)) {
             if (self.auth.primary_fence_barrier) |barrier| {
                 primary_fence_lease = barrier.acquireExclusive();
             }
@@ -234,7 +256,7 @@ pub const Server = struct {
         defer if (state_mutex) |mutex| mutex.unlock();
         defer if (self.auth.state_changed) |hook| hook.run();
         switch (req.method) {
-            .GET => {
+            .get => {
                 if (std.mem.eql(u8, path, Routes.ready)) {
                     if (self.ready()) return try textResponse(self.alloc, 200, "ready");
                     return try textResponse(self.alloc, 503, "not ready");
@@ -256,7 +278,7 @@ pub const Server = struct {
                 }
                 return try textResponse(self.alloc, 404, "not found");
             },
-            .POST => {
+            .post => {
                 if (std.mem.eql(u8, path, Routes.command)) {
                     return try self.handleCommand(req);
                 }
@@ -316,7 +338,7 @@ pub const Server = struct {
                 }
                 return try textResponse(self.alloc, 404, "not found");
             },
-            .PUT => {
+            .put => {
                 if (self.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_pause_suffix) catch return try textResponse(self.alloc, 400, "invalid HA replication slot path")) |slot_name| {
                     defer self.alloc.free(slot_name);
                     return try self.handleAdminReplicationSlotLifecycle(slot_name, .pause);
@@ -330,7 +352,7 @@ pub const Server = struct {
                 }
                 return try textResponse(self.alloc, 404, "not found");
             },
-            .DELETE => {
+            .delete => {
                 if (self.replicationSlotNameFromPath(path, "") catch return try textResponse(self.alloc, 400, "invalid HA replication slot path")) |slot_name| {
                     defer self.alloc.free(slot_name);
                     return try self.handleAdminReplicationSlotLifecycle(slot_name, .drop);
@@ -343,11 +365,11 @@ pub const Server = struct {
         }
     }
 
-    fn authorized(self: *const Server, req: http_common.HttpRequest) bool {
+    fn authorized(self: *const Server, req: http_operation.Request) bool {
         const raw_token = self.auth.bearer_token orelse return !self.auth.require_bearer_token;
         const token = std.mem.trim(u8, raw_token, " \t\r\n");
         if (token.len == 0) return false;
-        const authorization = req.authorization orelse req.header("authorization") orelse return false;
+        const authorization = req.authorization orelse return false;
         return bearerAuthorizationMatches(token, authorization);
     }
 
@@ -355,9 +377,9 @@ pub const Server = struct {
         return try admin_api.routes.replicationSlotNameFromPathAlloc(self.alloc, path, suffix);
     }
 
-    fn handleAdminPrimaryStatus(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminPrimaryStatus(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
-        const query = requestQuery(req.uri);
+        const query = requestQuery(req.target);
         const max_lag_lsn = if (queryValue(query, "max_lag_lsn")) |raw|
             uint64Text(raw) catch return try textResponse(self.alloc, 400, "invalid HA primary status request")
         else
@@ -398,7 +420,7 @@ pub const Server = struct {
         return try self.handleTypedJson(response);
     }
 
-    fn handleAdminWatchdogProof(self: *Server) !http_common.HttpResponse {
+    fn handleAdminWatchdogProof(self: *Server) !http_operation.OwnedResponse {
         const source = self.auth.lease_watchdog_proof orelse
             return try textResponse(self.alloc, 409, "WatchdogProofUnavailable");
         const proof = try source.snapshot(self.alloc) orelse
@@ -410,10 +432,10 @@ pub const Server = struct {
         });
     }
 
-    fn handleAdminStandbyStatus(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminStandbyStatus(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
         const node_id = self.standbyNodeID() orelse return try textResponse(self.alloc, 409, "StandbyNodeIDUnavailable");
-        const query = requestQuery(req.uri);
+        const query = requestQuery(req.target);
         const upstream_lsn = if (queryValue(query, "upstream_lsn")) |raw|
             uint64Text(raw) catch return try textResponse(self.alloc, 400, "invalid HA standby status request")
         else
@@ -436,7 +458,7 @@ pub const Server = struct {
         return try self.handleTypedJson(response);
     }
 
-    fn handleAdminReplicationSlots(self: *Server) !http_common.HttpResponse {
+    fn handleAdminReplicationSlots(self: *Server) !http_operation.OwnedResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         var snapshot = ha_admin.primaryStatus(self.alloc, primary, .{}, null) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
@@ -450,7 +472,7 @@ pub const Server = struct {
         });
     }
 
-    fn handleAdminCreateReplicationSlot(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminCreateReplicationSlot(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA replication slot request");
 
@@ -486,7 +508,7 @@ pub const Server = struct {
         self: *Server,
         slot_name: []const u8,
         action: ha_admin.SlotAction,
-    ) !http_common.HttpResponse {
+    ) !http_operation.OwnedResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
         const result = ha_admin.applySlotAction(primary, action, .{
@@ -520,7 +542,7 @@ pub const Server = struct {
         };
     }
 
-    fn handleAdminCommitCheck(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminCommitCheck(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA commit check request");
         var parsed = admin_api.server.parseCheckHACommitBody(
@@ -544,7 +566,7 @@ pub const Server = struct {
         });
     }
 
-    fn handleAdminCommitAppend(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminCommitAppend(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA commit append request");
         var parsed = admin_api.server.parseAppendHACommitBody(
@@ -569,7 +591,7 @@ pub const Server = struct {
         });
     }
 
-    fn handleAdminReadCheck(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminReadCheck(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
         const request = if (req.body.len == 0)
             read_gate.Request{}
@@ -595,7 +617,7 @@ pub const Server = struct {
         });
     }
 
-    fn handleAdminWriteCheck(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminWriteCheck(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA write check request");
         var parsed = admin_api.server.parseCheckHAWriteBody(
             self.alloc,
@@ -644,7 +666,7 @@ pub const Server = struct {
         });
     }
 
-    fn handleAdminOwnerJobCheck(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminOwnerJobCheck(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA owner job check request");
         var parsed = admin_api.server.parseCheckHAOwnerJobBody(
             self.alloc,
@@ -682,7 +704,7 @@ pub const Server = struct {
         });
     }
 
-    fn handleAdminBeginBaseBackup(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminBeginBaseBackup(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA base backup request");
         var parsed = admin_api.server.parseBeginHABaseBackupBody(
@@ -716,7 +738,7 @@ pub const Server = struct {
         });
     }
 
-    fn handleAdminFinishBaseBackup(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminFinishBaseBackup(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA base backup finish request");
         var parsed = admin_api.server.parseFinishHABaseBackupBody(
             self.alloc,
@@ -761,7 +783,7 @@ pub const Server = struct {
         };
     }
 
-    fn handleAdminCaptureSeedArtifact(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminCaptureSeedArtifact(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         const hook = self.auth.seed_capture orelse return try textResponse(self.alloc, 409, "SeedCaptureUnavailable");
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA seed capture request");
         var parsed = admin_api.server.parseCaptureHASeedArtifactBody(
@@ -862,10 +884,10 @@ pub const Server = struct {
         });
     }
 
-    fn handleAdminLifecycleReceipts(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminLifecycleReceipts(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         const config = self.auth.lifecycle_receipts orelse
             return try textResponse(self.alloc, 409, "LifecycleReceiptLedgerUnavailable");
-        const query = parseLifecycleReceiptQuery(requestQuery(req.uri)) catch
+        const query = parseLifecycleReceiptQuery(requestQuery(req.target)) catch
             return try textResponse(self.alloc, 400, "invalid lifecycle receipt query");
         const authoritative_root = switch (query.kind) {
             .capture => config.capture_root,
@@ -938,7 +960,7 @@ pub const Server = struct {
         });
     }
 
-    fn handleAdminActivateSeededSlot(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminActivateSeededSlot(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA seeded slot activation request");
         var parsed = admin_api.server.parseActivateHASeededSlotBody(
@@ -995,7 +1017,7 @@ pub const Server = struct {
         });
     }
 
-    fn handleAdminBootstrapStandby(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminBootstrapStandby(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA standby bootstrap request");
         var parsed = admin_api.server.parseBootstrapHAStandbyBody(
             self.alloc,
@@ -1047,7 +1069,7 @@ pub const Server = struct {
         };
     }
 
-    fn handleAdminFenceCurrent(self: *Server) !http_common.HttpResponse {
+    fn handleAdminFenceCurrent(self: *Server) !http_operation.OwnedResponse {
         const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
         var current = ha_admin.currentPromotionFence(self.alloc, fence_store) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
@@ -1068,7 +1090,7 @@ pub const Server = struct {
         });
     }
 
-    fn handleAdminAcquireFence(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminAcquireFence(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
         var fence = self.parseAcquireFenceRequest(req) catch {
             return try textResponse(self.alloc, 400, "invalid HA fence request");
@@ -1115,7 +1137,7 @@ pub const Server = struct {
         });
     }
 
-    fn handleAdminAssessPromotion(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminAssessPromotion(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         var command = admin_cli.PromoteAssessCommand{ .check = .{} };
         if (req.body.len != 0) {
             var parsed = admin_api.server.parseAssessHAPromotionBody(
@@ -1164,7 +1186,7 @@ pub const Server = struct {
         };
     }
 
-    fn handleAdminPromoteCurrentFence(self: *Server) !http_common.HttpResponse {
+    fn handleAdminPromoteCurrentFence(self: *Server) !http_operation.OwnedResponse {
         const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
         const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
         var result = ha_admin.promoteWithCurrentFence(self.alloc, fence_store, standby) catch |err| {
@@ -1176,7 +1198,7 @@ pub const Server = struct {
         return try self.handleTypedJson(document);
     }
 
-    fn handleAdminPromote(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminPromote(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
         const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
         const fence = self.parsePromoteFenceRequest(req) catch {
@@ -1191,19 +1213,19 @@ pub const Server = struct {
         return try self.handleTypedJson(document);
     }
 
-    fn handleAdminAssessRejoin(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminAssessRejoin(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         return try self.handleAdminRejoin(req, null);
     }
 
-    fn handleAdminRewindRejoin(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminRewindRejoin(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         return try self.handleAdminRejoin(req, .rewind);
     }
 
-    fn handleAdminReseedRejoin(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleAdminReseedRejoin(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         return try self.handleAdminRejoin(req, .reseed);
     }
 
-    fn handleAdminRejoin(self: *Server, req: http_common.HttpRequest, expected_action: ?rejoin.Action) !http_common.HttpResponse {
+    fn handleAdminRejoin(self: *Server, req: http_operation.Request, expected_action: ?rejoin.Action) !http_operation.OwnedResponse {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA rejoin assessment request");
         var parsed = admin_api.server.parseAssessHARejoinBody(
             self.alloc,
@@ -1371,7 +1393,7 @@ pub const Server = struct {
         return self.rejoinRewindLog();
     }
 
-    fn parseAcquireFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
+    fn parseAcquireFenceRequest(self: *Server, req: http_operation.Request) !fencing.FenceRequest {
         if (req.body.len == 0) return error.InvalidAdminRequest;
         var parsed = admin_api.server.parseAcquireHAFenceBody(
             self.alloc,
@@ -1381,7 +1403,7 @@ pub const Server = struct {
         return adminFenceRequestFromOpenApi(parsed.value) catch return error.InvalidAdminRequest;
     }
 
-    fn parsePromoteFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
+    fn parsePromoteFenceRequest(self: *Server, req: http_operation.Request) !fencing.FenceRequest {
         if (req.body.len == 0) return error.InvalidAdminRequest;
         var parsed = admin_api.server.parsePromoteHABody(
             self.alloc,
@@ -1391,7 +1413,7 @@ pub const Server = struct {
         return adminFenceRequestFromOpenApi(parsed.value) catch return error.InvalidAdminRequest;
     }
 
-    fn handleCommand(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleCommand(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA command request");
 
         var parsed = std.json.parseFromSlice(
@@ -1414,27 +1436,30 @@ pub const Server = struct {
         errdefer rendered.deinit(self.alloc);
 
         return .{
+            .owner_allocator = self.alloc,
             .status = 200,
             .content_type = try self.alloc.dupe(u8, rendered.content_type),
             .body = rendered.body,
         };
     }
 
-    fn handleJsonPlan(self: *Server, plan: admin_cli.Plan) !http_common.HttpResponse {
+    fn handleJsonPlan(self: *Server, plan: admin_cli.Plan) !http_operation.OwnedResponse {
         var result = admin_exec.execute(self.alloc, self.ctx, plan) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
 
         return .{
+            .owner_allocator = self.alloc,
             .status = 200,
             .content_type = try self.alloc.dupe(u8, "application/json"),
             .body = try admin_exec.renderJsonAlloc(self.alloc, result),
         };
     }
 
-    fn handleTypedJson(self: *Server, value: anytype) !http_common.HttpResponse {
+    fn handleTypedJson(self: *Server, value: anytype) !http_operation.OwnedResponse {
         return .{
+            .owner_allocator = self.alloc,
             .status = 200,
             .content_type = try self.alloc.dupe(u8, "application/json"),
             .body = try std.json.Stringify.valueAlloc(self.alloc, value, .{}),
@@ -1446,6 +1471,11 @@ pub const Server = struct {
         var response = try self.handle(req);
         if (response.owner_allocator == null) response.owner_allocator = self.alloc;
         return response;
+    }
+
+    fn executeTyped(ptr: *anyopaque, req: http_operation.Request) !http_operation.OwnedResponse {
+        const self: *Server = @ptrCast(@alignCast(ptr));
+        return self.executeOperation(req);
     }
 
     fn ready(self: *const Server) bool {
@@ -1466,6 +1496,21 @@ pub const Server = struct {
         return null;
     }
 };
+
+fn requestFromLegacy(req: http_common.HttpRequest) http_operation.Request {
+    return .{
+        .method = switch (req.method) {
+            .GET => .get,
+            .POST => .post,
+            .PUT => .put,
+            .DELETE => .delete,
+        },
+        .target = req.uri,
+        .authorization = req.authorization orelse req.header("authorization"),
+        .content_type = req.content_type,
+        .body = req.body,
+    };
+}
 
 const bearer_prefix = "Bearer ";
 
@@ -2461,8 +2506,9 @@ fn commandErrorStatus(err: anyerror) u16 {
     };
 }
 
-fn textResponse(alloc: Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
+fn textResponse(alloc: Allocator, status: u16, body: []const u8) !http_operation.OwnedResponse {
     return .{
+        .owner_allocator = alloc,
         .status = status,
         .content_type = try alloc.dupe(u8, "text/plain"),
         .body = try alloc.dupe(u8, body),
@@ -3412,6 +3458,18 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_promote.body, "\"node_id\":\"standby-a\"");
     try expectContains(typed_promote.body, "\"fence_generation\":1");
     try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2");
+}
+
+test "storage.ha admin typed operation bypasses legacy request dispatch" {
+    var server = Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    var response = try server.operationExecutor().execute(.{
+        .method = .get,
+        .target = Routes.health,
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqualStrings("ok", response.body);
 }
 
 test "storage.ha http admin holds state lock through mutation hook" {

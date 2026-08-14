@@ -61,6 +61,8 @@ def _data_command(
         host,
         "--raft-port",
         str(raft_port),
+        "--health-port",
+        str(find_free_port()),
         "--metadata-api",
         metadata_admin_base_uri,
         "--node-id",

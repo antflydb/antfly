@@ -70,6 +70,11 @@ const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseJsonObjectAlloc = json_helpers.parseJsonObjectAlloc;
 const parseJsonPathValueAlloc = json_helpers.parseJsonPathValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
+const common_config = @import("../../common/config.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const api_operation = @import("../../api/operation.zig");
+const request_admission = @import("../../common/request_admission.zig");
+const RequestAdmission = request_admission.RequestAdmission;
 
 pub const HttpRequest = http_types.HttpRequest;
 pub const HttpResponse = http_types.HttpResponse;
@@ -178,10 +183,13 @@ pub const HttpHandler = struct {
     query_cache: ?*query_mod.QueryCache = null,
     managed_query_embedder: ?*managed_embedder.ManagedEmbedder = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    io: ?std.Io = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     published_search_sources: search_sources.PublishedSearchSources = .{},
     runtime_status: *const api_types.RuntimeStatusResult,
     runtime_metrics: ?*runtime_manager.ManagedRuntime = null,
+    query_admission: RequestAdmission = RequestAdmission.init(common_config.default_query_max_concurrent_requests),
+    write_admission: RequestAdmission = RequestAdmission.init(common_config.default_write_max_concurrent_requests),
 
     pub fn init(
         alloc: Allocator,
@@ -203,10 +211,29 @@ pub const HttpHandler = struct {
         };
     }
 
-    pub fn handle(self: *HttpHandler, req: HttpRequest) !HttpResponse {
-        const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
+    pub fn setIo(self: *HttpHandler, io: ?std.Io) void {
+        self.io = io;
+    }
 
-        return switch (route) {
+    pub fn handle(self: *HttpHandler, req: HttpRequest) !HttpResponse {
+        try req.ensureActive();
+        const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
+        const admission: ?*RequestAdmission = switch (http_routes.admissionClass(route)) {
+            .none => null,
+            .query => &self.query_admission,
+            .write => &self.write_admission,
+        };
+        if (admission) |gate| {
+            if (!gate.tryAcquire()) {
+                var response = try textResponse(self.alloc, 429, if (gate == &self.query_admission) "query capacity exhausted" else "write capacity exhausted");
+                response.retry_after_seconds = 1;
+                return response;
+            }
+        }
+        defer if (admission) |gate| gate.release();
+        try req.ensureActive();
+
+        var response = switch (route) {
             .health => try self.handleHealth(),
             .healthz => try self.handleHealthz(),
             .readyz => try self.handleReadyz(),
@@ -225,7 +252,7 @@ pub const HttpHandler = struct {
             },
             .ingest_batch => |value| try self.handleIngestBatch(value.namespace, req.body),
             .ingest_table_batch => |value| try self.handleIngestTableBatch(value.table_name, req.body),
-            .table_batch => |value| try self.handleTableBatch(value.table_name, req.body),
+            .table_batch => |value| try self.handleTableBatch(value.table_name, req.body, req.cancellation),
             .build_namespace => |value| try self.handleBuildNamespace(value.namespace),
             .internal_table_build => |value| try self.handleBuildTable(value.table_name),
             .build_status => |value| try self.handleBuildStatus(value.namespace),
@@ -242,28 +269,36 @@ pub const HttpHandler = struct {
             },
             .head => |value| try self.handleHead(value.namespace),
             .publish_head => |value| try self.handlePublishHead(value.namespace, req.body),
-            .query => |value| try self.handleQuery(value.namespace),
-            .table_query => |value| try self.handleTableQuery(value.table_name),
-            .table_query_request => |value| try self.handleTableQueryRequest(value.table_name, req.body),
-            .table_query_published => |value| try self.handleTableQueryPublished(value.table_name),
-            .table_query_latest => |value| try self.handleTableQueryLatest(value.table_name),
-            .query_search => |value| try self.handleQuerySearch(value.namespace, req.body),
-            .table_query_search => |value| try self.handleTableQuerySearch(value.table_name, req.body),
-            .table_query_graph_neighbors => |value| try self.handleTableQueryGraphNeighbors(value.table_name, req.body),
-            .table_query_graph_traverse => |value| try self.handleTableQueryGraphTraverse(value.table_name, req.body),
-            .table_query_graph_shortest_path => |value| try self.handleTableQueryGraphShortestPath(value.table_name, req.body),
-            .query_graph_neighbors => |value| try self.handleQueryGraphNeighbors(value.namespace, req.body),
-            .query_graph_traverse => |value| try self.handleQueryGraphTraverse(value.namespace, req.body),
-            .query_graph_shortest_path => |value| try self.handleQueryGraphShortestPath(value.namespace, req.body),
-            .query_head => |value| try self.handleQueryHead(value.namespace),
-            .query_latest => |value| try self.handleQueryLatest(value.namespace),
-            .query_version => |value| try self.handleQueryVersion(value.namespace, value.version),
-            .query_version_graph_neighbors => |value| try self.handleQueryVersionGraphNeighbors(value.namespace, value.version, req.body),
-            .query_version_graph_traverse => |value| try self.handleQueryVersionGraphTraverse(value.namespace, value.version, req.body),
-            .query_version_graph_shortest_path => |value| try self.handleQueryVersionGraphShortestPath(value.namespace, value.version, req.body),
-            .query_head_artifact => |value| try self.handleQueryHeadArtifact(value.namespace, value.artifact_index),
-            .query_version_artifact => |value| try self.handleQueryVersionArtifact(value.namespace, value.version.?, value.artifact_index),
+            .query => |value| try self.handleQuery(value.namespace, req.cancellation),
+            .table_query => |value| try self.handleTableQuery(value.table_name, req.cancellation),
+            .table_query_request => |value| try self.handleTableQueryRequest(value.table_name, req.body, req.cancellation),
+            .table_query_published => |value| try self.handleTableQueryPublished(value.table_name, req.cancellation),
+            .table_query_latest => |value| try self.handleTableQueryLatest(value.table_name, req.cancellation),
+            .query_search => |value| try self.handleQuerySearch(value.namespace, req.body, req.cancellation),
+            .table_query_search => |value| try self.handleTableQuerySearch(value.table_name, req.body, req.cancellation),
+            .table_query_graph_neighbors => |value| try self.handleTableQueryGraphNeighbors(value.table_name, req.body, req.cancellation),
+            .table_query_graph_traverse => |value| try self.handleTableQueryGraphTraverse(value.table_name, req.body, req.cancellation),
+            .table_query_graph_shortest_path => |value| try self.handleTableQueryGraphShortestPath(value.table_name, req.body, req.cancellation),
+            .query_graph_neighbors => |value| try self.handleQueryGraphNeighbors(value.namespace, req.body, req.cancellation),
+            .query_graph_traverse => |value| try self.handleQueryGraphTraverse(value.namespace, req.body, req.cancellation),
+            .query_graph_shortest_path => |value| try self.handleQueryGraphShortestPath(value.namespace, req.body, req.cancellation),
+            .query_head => |value| try self.handleQueryHead(value.namespace, req.cancellation),
+            .query_latest => |value| try self.handleQueryLatest(value.namespace, req.cancellation),
+            .query_version => |value| try self.handleQueryVersion(value.namespace, value.version, req.cancellation),
+            .query_version_graph_neighbors => |value| try self.handleQueryVersionGraphNeighbors(value.namespace, value.version, req.body, req.cancellation),
+            .query_version_graph_traverse => |value| try self.handleQueryVersionGraphTraverse(value.namespace, value.version, req.body, req.cancellation),
+            .query_version_graph_shortest_path => |value| try self.handleQueryVersionGraphShortestPath(value.namespace, value.version, req.body, req.cancellation),
+            .query_head_artifact => |value| try self.handleQueryHeadArtifact(value.namespace, value.artifact_index, req.cancellation),
+            .query_version_artifact => |value| try self.handleQueryVersionArtifact(value.namespace, value.version.?, value.artifact_index, req.cancellation),
         };
+        errdefer response.deinit(self.alloc);
+        try req.ensureActive();
+        return response;
+    }
+
+    pub fn configureAdmission(self: *HttpHandler, query_capacity: usize, write_capacity: usize) void {
+        self.query_admission = RequestAdmission.init(query_capacity);
+        self.write_admission = RequestAdmission.init(write_capacity);
     }
 
     pub fn setRuntimeMetrics(self: *HttpHandler, runtime: *runtime_manager.ManagedRuntime) void {
@@ -487,11 +522,21 @@ pub const HttpHandler = struct {
             query_mod.QueryCacheStats{};
         const query_metrics = self.query.metricsSnapshot();
         const query_count_f32: f32 = if (query_metrics.total_queries == 0) 0 else @floatFromInt(query_metrics.total_queries);
+        const query_admission = self.query_admission.stats();
+        const write_admission = self.write_admission.stats();
 
         var result = api_types.MetricsResult{
             .live = true,
             .ready = self.runtime_status.validated,
             .validated = self.runtime_status.validated,
+            .query_capacity = query_admission.capacity,
+            .query_in_flight = query_admission.in_flight,
+            .query_peak_in_flight = query_admission.peak_in_flight,
+            .query_rejected_total = query_admission.rejected_total,
+            .write_capacity = write_admission.capacity,
+            .write_in_flight = write_admission.in_flight,
+            .write_peak_in_flight = write_admission.peak_in_flight,
+            .write_rejected_total = write_admission.rejected_total,
             .namespace_count = namespaces.len,
             .total_pending_records = total_pending_records,
             .total_retained_versions = total_retained_versions,
@@ -828,8 +873,8 @@ pub const HttpHandler = struct {
         return try jsonResponse(self.alloc, 202, table_result);
     }
 
-    fn handleTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi());
+    fn handleTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
+        var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi(cancellation));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             201 => blk: {
@@ -843,7 +888,7 @@ pub const HttpHandler = struct {
     }
 
     fn handlePublicTableListIndexes(self: *HttpHandler, table_name: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableListIndexes(self.alloc, table_name, self.tableApi());
+        var resp = try public_table_http.handleTableListIndexes(self.alloc, table_name, self.tableApi(.none));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => try jsonSliceResponse(self.alloc, 200, resp.body),
@@ -852,7 +897,7 @@ pub const HttpHandler = struct {
     }
 
     fn handlePublicTableGetIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableGetIndex(self.alloc, table_name, index_name, self.tableApi());
+        var resp = try public_table_http.handleTableGetIndex(self.alloc, table_name, index_name, self.tableApi(.none));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => try jsonSliceResponse(self.alloc, 200, resp.body),
@@ -861,7 +906,7 @@ pub const HttpHandler = struct {
     }
 
     fn handlePublicTableCreateIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8, body: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableCreateIndex(self.alloc, table_name, index_name, body, self.tableApi());
+        var resp = try public_table_http.handleTableCreateIndex(self.alloc, table_name, index_name, body, self.tableApi(.none));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             201 => try typedJsonResponse(struct {}, self.alloc, 201, resp.body),
@@ -870,7 +915,7 @@ pub const HttpHandler = struct {
     }
 
     fn handlePublicTableDeleteIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableDeleteIndex(self.alloc, table_name, index_name, self.tableApi());
+        var resp = try public_table_http.handleTableDeleteIndex(self.alloc, table_name, index_name, self.tableApi(.none));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             201 => try typedJsonResponse(struct {}, self.alloc, 201, resp.body),
@@ -1013,45 +1058,49 @@ pub const HttpHandler = struct {
         return try jsonResponse(self.alloc, if (published) 200 else 409, result);
     }
 
-    fn handleQuery(self: *HttpHandler, namespace: []const u8) !HttpResponse {
+    fn handleQuery(self: *HttpHandler, namespace: []const u8, cancellation: CancellationToken) !HttpResponse {
         const policy = self.catalog.getPolicy(namespace) catch return try textResponse(self.alloc, 404, "not found");
         return switch (policy.default_query_view) {
-            .published => try self.handleQueryHead(namespace),
-            .latest => try self.handleQueryLatest(namespace),
+            .published => try self.handleQueryHead(namespace, cancellation),
+            .latest => try self.handleQueryLatest(namespace, cancellation),
         };
     }
 
-    fn handleTableQuery(self: *HttpHandler, table_name: []const u8) !HttpResponse {
-        return try self.handlePublicTableQueryView(table_name, .default_view);
+    fn handleTableQuery(self: *HttpHandler, table_name: []const u8, cancellation: CancellationToken) !HttpResponse {
+        return try self.handlePublicTableQueryView(table_name, .default_view, cancellation);
     }
 
-    fn handleTableQueryPublished(self: *HttpHandler, table_name: []const u8) !HttpResponse {
-        return try self.handlePublicTableQueryView(table_name, .published);
+    fn handleTableQueryPublished(self: *HttpHandler, table_name: []const u8, cancellation: CancellationToken) !HttpResponse {
+        return try self.handlePublicTableQueryView(table_name, .published, cancellation);
     }
 
-    fn handleTableQueryLatest(self: *HttpHandler, table_name: []const u8) !HttpResponse {
-        return try self.handlePublicTableQueryView(table_name, .latest);
+    fn handleTableQueryLatest(self: *HttpHandler, table_name: []const u8, cancellation: CancellationToken) !HttpResponse {
+        return try self.handlePublicTableQueryView(table_name, .latest, cancellation);
     }
 
     fn handlePublicTableQueryView(
         self: *HttpHandler,
         table_name: []const u8,
         view: public_table_http.TableApi.TableQueryView,
+        cancellation: CancellationToken,
     ) !HttpResponse {
+        try cancellation.check();
         var resp = try public_table_http.handleTableQueryView(
             self.alloc,
             table_name,
             view,
-            self.tableApi(),
+            self.tableApi(cancellation),
         );
         defer resp.deinit(self.alloc);
+        try cancellation.check();
         return switch (resp.status) {
             200 => try typedJsonResponse(query_types.TableQueryResult, self.alloc, 200, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
     }
 
-    fn executePublishedSearch(self: *HttpHandler, namespace: []const u8, table_name: ?[]const u8, body: []const u8) !SearchExecution {
+    fn executePublishedSearch(self: *HttpHandler, namespace: []const u8, table_name: ?[]const u8, body: []const u8, cancellation: CancellationToken) !SearchExecution {
+        try cancellation.check();
         var status = try self.catalog.buildStatus(namespace);
         errdefer status.deinit(self.alloc);
         var plan = try query_mod.parseSearchPlanAlloc(self.alloc, body, status.published_search_sources);
@@ -1062,7 +1111,7 @@ pub const HttpHandler = struct {
             plan.request.offset = 0;
             plan.request.limit = std.math.maxInt(usize);
         }
-        try self.resolveSemanticQueryRequest(table_name, &plan);
+        try self.resolveSemanticQueryRequest(table_name, &plan, cancellation);
 
         var profile_requested = false;
         var public_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
@@ -1079,6 +1128,7 @@ pub const HttpHandler = struct {
         profile_requested = public_request.value.profile orelse false;
         var session = try self.query.openHeadSession(namespace);
         errdefer session.deinit();
+        session.setCancellation(cancellation);
         try query_mod.warmIndexedSearchPlanPath(&session, plan);
 
         var execution_stats = query_mod.QuerySearchExecutionStats{};
@@ -1098,8 +1148,9 @@ pub const HttpHandler = struct {
         };
     }
 
-    fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8) anyerror![]u8 {
-        if (self.executeForeignPublicTableQueryJsonAlloc(table_name, body) catch |err| switch (err) {
+    fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
+        try cancellation.check();
+        if (self.executeForeignPublicTableQueryJsonAlloc(table_name, body, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             else => return err,
         }) |json| {
@@ -1115,17 +1166,19 @@ pub const HttpHandler = struct {
                 var owned = parsed_join;
                 owned.deinit(self.alloc);
             }
-            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources);
+            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, cancellation);
         }
 
-        return try self.executePlainPublicTableQueryJsonAlloc(table_name, body);
+        return try self.executePlainPublicTableQueryJsonAlloc(table_name, body, cancellation);
     }
 
     fn executeForeignPublicTableQueryJsonAlloc(
         self: *HttpHandler,
         table_name: []const u8,
         body: []const u8,
+        cancellation: CancellationToken,
     ) anyerror!?[]u8 {
+        try cancellation.check();
         var parsed_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .allocate = .alloc_always,
         }) catch return error.InvalidQueryRequest;
@@ -1153,10 +1206,11 @@ pub const HttpHandler = struct {
                 foreign_source,
                 parsed_join.join,
                 parsed_join.foreign_sources,
+                cancellation,
             );
         }
 
-        return try self.encodeForeignPublicTableQueryResponseJsonAlloc(table_name, request, foreign_source);
+        return try self.encodeForeignPublicTableQueryResponseJsonAlloc(table_name, request, foreign_source, cancellation);
     }
 
     fn encodeForeignPublicTableQueryResponseJsonAlloc(
@@ -1164,7 +1218,9 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         request: metadata_openapi.QueryRequest,
         foreign_source: foreign_mod.PostgresConfig,
+        cancellation: CancellationToken,
     ) anyerror![]u8 {
+        try cancellation.check();
         const registry = self.foreign_registry orelse return error.UnsupportedQueryRequest;
         const started_ns = platform_time.monotonicNs();
         const limit = try foreignQueryLimit(request.limit);
@@ -1204,6 +1260,7 @@ pub const HttpHandler = struct {
             .order_by = foreign_order_by,
         });
         defer params.deinit(self.alloc);
+        params.cancellation = cancellation;
 
         const source_config = try foreign_source.toSourceConfig(self.alloc);
         var foreign_query_source = try registry.create(self.alloc, source_config);
@@ -1219,6 +1276,7 @@ pub const HttpHandler = struct {
                 filter_query_json,
             );
             defer aggregate_params.deinit(self.alloc);
+            aggregate_params.cancellation = cancellation;
             var aggregate_result = foreign_query_source.aggregate(self.alloc, aggregate_params) catch |err| switch (err) {
                 error.UnsupportedAggregate => return error.UnsupportedQueryRequest,
                 else => return err,
@@ -1262,7 +1320,9 @@ pub const HttpHandler = struct {
         foreign_source: foreign_mod.PostgresConfig,
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
+        cancellation: CancellationToken,
     ) anyerror![]u8 {
+        try cancellation.check();
         var contract_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
@@ -1279,7 +1339,7 @@ pub const HttpHandler = struct {
             .allocate = .alloc_always,
         }) catch return error.InvalidQueryRequest;
         defer primary_request.deinit();
-        const primary_json = try self.encodeForeignPublicTableQueryResponseJsonAlloc(table_name, primary_request.value, foreign_source);
+        const primary_json = try self.encodeForeignPublicTableQueryResponseJsonAlloc(table_name, primary_request.value, foreign_source, cancellation);
         errdefer self.alloc.free(primary_json);
 
         var owned_response = parseOwnedJsonValueAlloc(self.alloc, primary_json) catch return error.InternalQueryFailure;
@@ -1288,7 +1348,7 @@ pub const HttpHandler = struct {
         if (hits_ptr.items.len == 0) return primary_json;
 
         const plan = planSupportedJoinExecution(self, self.alloc, join, hits_ptr.items, foreign_sources);
-        var right_result = try self.executeSupportedRightJoinQuery(join, hits_ptr.items, plan, foreign_sources);
+        var right_result = try self.executeSupportedRightJoinQuery(join, hits_ptr.items, plan, foreign_sources, cancellation);
         defer right_result.deinit(self.alloc);
 
         var stats: JoinedQueryStats = .{
@@ -1463,7 +1523,8 @@ pub const HttpHandler = struct {
         return hits;
     }
 
-    fn executePlainPublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8) anyerror![]u8 {
+    fn executePlainPublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
+        try cancellation.check();
         const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             else => return error.InternalQueryFailure,
@@ -1473,7 +1534,7 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
-        if (try self.handleTablePublicGraphQueryRequest(table_name, namespace, body)) |owned_response| {
+        if (try self.handleTablePublicGraphQueryRequest(table_name, namespace, body, cancellation)) |owned_response| {
             var response = owned_response;
             defer response.deinit(self.alloc);
             if (response.status == 200) return try self.alloc.dupe(u8, response.body);
@@ -1484,7 +1545,7 @@ pub const HttpHandler = struct {
             };
         }
 
-        var execution = self.executePublishedSearch(namespace, table_name, body) catch |err| {
+        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| {
             switch (err) {
                 error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest,
@@ -2099,7 +2160,9 @@ pub const HttpHandler = struct {
         body: []const u8,
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
+        cancellation: CancellationToken,
     ) anyerror![]u8 {
+        try cancellation.check();
         var contract_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
@@ -2112,7 +2175,7 @@ pub const HttpHandler = struct {
         const primary_body = rewrite.body;
         defer self.alloc.free(primary_body);
 
-        const primary_json = try self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body);
+        const primary_json = try self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body, cancellation);
         errdefer self.alloc.free(primary_json);
 
         var owned_response = parseOwnedJsonValueAlloc(self.alloc, primary_json) catch return error.InternalQueryFailure;
@@ -2121,7 +2184,7 @@ pub const HttpHandler = struct {
         if (hits_ptr.items.len == 0) return primary_json;
 
         const plan = planSupportedJoinExecution(self, self.alloc, join, hits_ptr.items, foreign_sources);
-        var right_result = try self.executeSupportedRightJoinQuery(join, hits_ptr.items, plan, foreign_sources);
+        var right_result = try self.executeSupportedRightJoinQuery(join, hits_ptr.items, plan, foreign_sources, cancellation);
         defer right_result.deinit(self.alloc);
 
         var stats: JoinedQueryStats = .{
@@ -2207,9 +2270,11 @@ pub const HttpHandler = struct {
         left_hits: []const std.json.Value,
         plan: PlannedJoinExecution,
         foreign_sources: foreign_mod.PostgresSourceMap,
+        cancellation: CancellationToken,
     ) anyerror!RightJoinQueryResult {
+        try cancellation.check();
         if (foreign_sources.get(join.right_table)) |foreign_source| {
-            return try self.executeForeignRightJoinQuery(foreign_source, join, left_hits, foreign_sources);
+            return try self.executeForeignRightJoinQuery(foreign_source, join, left_hits, foreign_sources, cancellation);
         }
         const namespace = self.catalog.resolveTableNamespaceAlloc(join.right_table) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
@@ -2219,6 +2284,7 @@ pub const HttpHandler = struct {
             else => return err,
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
 
         const docs = try self.allocPublishedDocumentsAlloc(&session);
         defer query_materializer.freeDocuments(self.alloc, docs);
@@ -2241,7 +2307,8 @@ pub const HttpHandler = struct {
             hits.deinit(self.alloc);
         }
 
-        for (docs) |doc| {
+        for (docs, 0..) |doc, doc_index| {
+            if (doc_index % 64 == 0) try cancellation.check();
             if (join.right_filters) |filters| {
                 if (filters.filter_prefix) |prefix| {
                     if (!std.mem.startsWith(u8, doc.doc_id, prefix)) continue;
@@ -2275,7 +2342,7 @@ pub const HttpHandler = struct {
         }
 
         if (join.nested_join) |nested_join| {
-            const nested_hits = try self.executeSupportedJoinedHitsAlloc(nested_join.*, hits.items, foreign_sources);
+            const nested_hits = try self.executeSupportedJoinedHitsAlloc(nested_join.*, hits.items, foreign_sources, cancellation);
             for (hits.items) |*item| deinitJsonValue(self.alloc, item);
             hits.deinit(self.alloc);
             return .{
@@ -2296,7 +2363,9 @@ pub const HttpHandler = struct {
         join: SupportedJoinRequest,
         left_hits: []const std.json.Value,
         foreign_sources: foreign_mod.PostgresSourceMap,
+        cancellation: CancellationToken,
     ) anyerror!RightJoinQueryResult {
+        try cancellation.check();
         const registry = self.foreign_registry orelse return error.UnsupportedQueryRequest;
 
         const effective_fields = try buildForeignJoinFieldListAlloc(self.alloc, join);
@@ -2323,6 +2392,7 @@ pub const HttpHandler = struct {
             .limit = if (join.right_filters) |filters| filters.limit else null,
         });
         defer params.deinit(self.alloc);
+        params.cancellation = cancellation;
 
         const source_config = try foreign_source.toSourceConfig(self.alloc);
         var foreign_query_source = try registry.create(self.alloc, source_config);
@@ -2337,7 +2407,8 @@ pub const HttpHandler = struct {
             hits.deinit(self.alloc);
         }
 
-        for (result.rows) |row| {
+        for (result.rows, 0..) |row, row_index| {
+            if (row_index % 64 == 0) try cancellation.check();
             if (row != .object) return error.UnsupportedQueryRequest;
             const match_value = extractJsonPathValue(row, join.right_field) orelse continue;
             if (join.join_type != .right) {
@@ -2356,7 +2427,7 @@ pub const HttpHandler = struct {
 
         const owned_hits = try hits.toOwnedSlice(self.alloc);
         if (join.nested_join) |nested_join| {
-            try self.applyNestedJoinToRightHitsAlloc(join.right_table, owned_hits, nested_join, foreign_sources);
+            try self.applyNestedJoinToRightHitsAlloc(join.right_table, owned_hits, nested_join, foreign_sources, cancellation);
         }
 
         return .{
@@ -2370,11 +2441,13 @@ pub const HttpHandler = struct {
         join: SupportedJoinRequest,
         left_hits: []const std.json.Value,
         foreign_sources: foreign_mod.PostgresSourceMap,
+        cancellation: CancellationToken,
     ) anyerror![]std.json.Value {
+        try cancellation.check();
         if (left_hits.len == 0 and join.join_type != .right) return try self.alloc.alloc(std.json.Value, 0);
 
         const plan = planSupportedJoinExecution(self, self.alloc, join, left_hits, foreign_sources);
-        var right_result = try self.executeSupportedRightJoinQuery(join, left_hits, plan, foreign_sources);
+        var right_result = try self.executeSupportedRightJoinQuery(join, left_hits, plan, foreign_sources, cancellation);
         defer right_result.deinit(self.alloc);
 
         const requested_left_fields = if (join.join_type == .right)
@@ -2392,7 +2465,8 @@ pub const HttpHandler = struct {
             joined_hits.deinit(self.alloc);
         }
 
-        for (left_hits) |hit_value| {
+        for (left_hits, 0..) |hit_value, hit_index| {
+            if (hit_index % 64 == 0) try cancellation.check();
             var joined_hit = cloneJsonValue(self.alloc, hit_value) catch return error.InternalQueryFailure;
             errdefer deinitJsonValue(self.alloc, &joined_hit);
             const source_value = joined_hit.object.getPtr("_source") orelse return error.InvalidQueryRequest;
@@ -2445,15 +2519,17 @@ pub const HttpHandler = struct {
         right_hits: []std.json.Value,
         nested_join: *SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
+        cancellation: CancellationToken,
     ) anyerror!void {
         _ = parent_table_name;
         if (right_hits.len == 0) return;
 
         const plan = planSupportedJoinExecution(self, self.alloc, nested_join.*, right_hits, foreign_sources);
-        var nested_result = try self.executeSupportedRightJoinQuery(nested_join.*, right_hits, plan, foreign_sources);
+        var nested_result = try self.executeSupportedRightJoinQuery(nested_join.*, right_hits, plan, foreign_sources, cancellation);
         defer nested_result.deinit(self.alloc);
 
-        for (right_hits) |*hit| {
+        for (right_hits, 0..) |*hit, hit_index| {
+            if (hit_index % 64 == 0) try cancellation.check();
             const left_value = extractJoinValueFromHit(hit.*, nested_join.left_field) orelse continue;
             const matched_right = findFirstMatchingRightHit(nested_join.*, left_value, nested_result.hits) orelse continue;
             const source_value = hit.object.getPtr("_source") orelse return error.InvalidQueryRequest;
@@ -2466,7 +2542,9 @@ pub const HttpHandler = struct {
         self: *HttpHandler,
         table_name: []const u8,
         requested_view: public_table_http.TableApi.TableQueryView,
+        cancellation: CancellationToken,
     ) ![]u8 {
+        try cancellation.check();
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
@@ -2487,6 +2565,7 @@ pub const HttpHandler = struct {
             else => return err,
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
 
         if (resolved_view == .latest) {
             const records = try self.api.wal.readFromAlloc(namespace, session.manifest.wal_end_lsn + 1);
@@ -2500,15 +2579,17 @@ pub const HttpHandler = struct {
         return try self.encodeTableQuerySessionResponseJsonAlloc(table_name, &session, .published, &.{});
     }
 
-    fn handleTableQueryRequest(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
+    fn handleTableQueryRequest(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
+        try cancellation.check();
         var resp = try public_table_http.handleTableQueryRequest(
             self.alloc,
             table_name,
             body,
             null,
-            self.tableApi(),
+            self.tableApi(cancellation),
         );
         defer resp.deinit(self.alloc);
+        try cancellation.check();
         return switch (resp.status) {
             200 => try typedJsonResponse(metadata_openapi.QueryResponses, self.alloc, 200, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
@@ -2520,7 +2601,9 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         namespace: []const u8,
         body: []const u8,
+        cancellation: CancellationToken,
     ) !?HttpResponse {
+        try cancellation.check();
         public_graph_query.rejectInternalDocIdentityFields(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
         };
@@ -2560,6 +2643,7 @@ pub const HttpHandler = struct {
             .graph_queries = graph_queries,
             .limit = if (request.limit) |limit| std.math.cast(u32, limit) orelse 10 else 10,
             .offset = if (request.offset) |offset| std.math.cast(u32, offset) orelse 0 else 0,
+            .cancellation = cancellation,
         };
         var search_hits: []db_types.SearchHit = &.{};
         defer if (search_hits.len > 0) freeDbSearchHits(self.alloc, search_hits);
@@ -2577,7 +2661,7 @@ pub const HttpHandler = struct {
             const search_body = try std.json.Stringify.valueAlloc(self.alloc, search_request, .{});
             defer self.alloc.free(search_body);
 
-            var execution = self.executePublishedSearch(namespace, table_name, search_body) catch |err| switch (err) {
+            var execution = self.executePublishedSearch(namespace, table_name, search_body, cancellation) catch |err| switch (err) {
                 error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest,
                 error.EmbeddingIndexNotFound,
@@ -2631,6 +2715,7 @@ pub const HttpHandler = struct {
                 else => return err,
             };
             session_initialized = true;
+            session.setCancellation(cancellation);
         }
 
         const results = try self.executePublicGraphQueriesAlloc(&session, graph_queries, initial_sets.items);
@@ -2657,14 +2742,14 @@ pub const HttpHandler = struct {
         return try typedJsonResponse(metadata_openapi.QueryResponses, self.alloc, 200, response.json);
     }
 
-    fn handleQuerySearch(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
+    fn handleQuerySearch(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer if (aggregations_json) |json| self.alloc.free(json);
 
-        var execution = self.executePublishedSearch(namespace, null, body) catch |err| {
+        var execution = self.executePublishedSearch(namespace, null, body, cancellation) catch |err| {
             switch (err) {
                 error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest,
@@ -2748,7 +2833,7 @@ pub const HttpHandler = struct {
         });
     }
 
-    fn handleTableQuerySearch(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
+    fn handleTableQuerySearch(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
             else => return try textResponse(self.alloc, 500, "query failed"),
@@ -2757,7 +2842,7 @@ pub const HttpHandler = struct {
 
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
-        var execution = self.executePublishedSearch(namespace, table_name, body) catch |err| switch (err) {
+        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest,
             error.UnsupportedQueryRequest,
             error.EmbeddingIndexNotFound,
@@ -2824,7 +2909,7 @@ pub const HttpHandler = struct {
         });
     }
 
-    fn handleTableQueryGraphNeighbors(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
+    fn handleTableQueryGraphNeighbors(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphNeighborsPlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph query request");
         };
@@ -2838,10 +2923,11 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.tableQueryGraphNeighborsResponse(&session, table_name, namespace, req);
     }
 
-    fn handleTableQueryGraphTraverse(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
+    fn handleTableQueryGraphTraverse(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphTraversePlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph traverse request");
         };
@@ -2855,10 +2941,11 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.tableQueryGraphTraverseResponse(&session, table_name, namespace, req);
     }
 
-    fn handleTableQueryGraphShortestPath(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
+    fn handleTableQueryGraphShortestPath(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphShortestPathPlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph shortest path request");
         };
@@ -2872,10 +2959,12 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.tableQueryGraphShortestPathResponse(&session, table_name, namespace, req);
     }
 
-    fn resolveSemanticQueryRequest(self: *HttpHandler, table_name: ?[]const u8, plan: *query_mod.SearchPlan) !void {
+    fn resolveSemanticQueryRequest(self: *HttpHandler, table_name: ?[]const u8, plan: *query_mod.SearchPlan, cancellation: CancellationToken) !void {
+        try cancellation.check();
         const semantic_search = plan.request.semantic_search orelse return;
         if (plan.request.vector != null) return error.InvalidQueryRequest;
 
@@ -2890,26 +2979,27 @@ pub const HttpHandler = struct {
             defer table.deinit(self.alloc);
 
             var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(self.alloc, table.indexes_json, .{
+                .io = self.io,
                 .remote_content = self.remote_content,
             });
             defer runtime.deinit();
             if (runtime.hasDenseEntries()) {
                 plan.request.vector = if (plan.request.embedding_template) |value|
-                    try runtime.embedQueryWithTemplate(self.alloc, index_name, semantic_search, value)
+                    try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
                 else
-                    try runtime.embedQuery(self.alloc, index_name, semantic_search);
+                    try runtime.embedQueryWithCancellation(self.alloc, index_name, semantic_search, cancellation);
                 return;
             }
         }
 
         const runtime = self.managed_query_embedder orelse return error.InvalidQueryRequest;
         plan.request.vector = if (plan.request.embedding_template) |value|
-            try runtime.embedQueryWithTemplate(self.alloc, index_name, semantic_search, value)
+            try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
         else
-            try runtime.embedQuery(self.alloc, index_name, semantic_search);
+            try runtime.embedQueryWithCancellation(self.alloc, index_name, semantic_search, cancellation);
     }
 
-    fn handleQueryGraphNeighbors(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
+    fn handleQueryGraphNeighbors(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphNeighborsPlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph query request");
         };
@@ -2920,10 +3010,11 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryGraphNeighborsResponse(&session, namespace, req);
     }
 
-    fn handleQueryVersionGraphNeighbors(self: *HttpHandler, namespace: []const u8, version: u64, body: []const u8) !HttpResponse {
+    fn handleQueryVersionGraphNeighbors(self: *HttpHandler, namespace: []const u8, version: u64, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphNeighborsPlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph query request");
         };
@@ -2934,6 +3025,7 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryGraphNeighborsResponse(&session, namespace, req);
     }
 
@@ -2957,6 +3049,7 @@ pub const HttpHandler = struct {
             if (graph_queries.len > 0) self.alloc.free(results);
         }
         for (sorted_query_indexes, 0..) |query_index, idx| {
+            try session.checkCancellation();
             results[idx] = try self.executePublicGraphQueryAlloc(session, graph_queries[query_index], available_sets.items);
             try available_sets.append(self.alloc, .{
                 .name = results[idx].name,
@@ -3492,7 +3585,7 @@ pub const HttpHandler = struct {
         });
     }
 
-    fn handleQueryGraphTraverse(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
+    fn handleQueryGraphTraverse(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphTraversePlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph traverse request");
         };
@@ -3503,10 +3596,11 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryGraphTraverseResponse(&session, namespace, req);
     }
 
-    fn handleQueryVersionGraphTraverse(self: *HttpHandler, namespace: []const u8, version: u64, body: []const u8) !HttpResponse {
+    fn handleQueryVersionGraphTraverse(self: *HttpHandler, namespace: []const u8, version: u64, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphTraversePlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph traverse request");
         };
@@ -3517,10 +3611,11 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryGraphTraverseResponse(&session, namespace, req);
     }
 
-    fn handleQueryGraphShortestPath(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
+    fn handleQueryGraphShortestPath(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphShortestPathPlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph shortest path request");
         };
@@ -3531,10 +3626,11 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryGraphShortestPathResponse(&session, namespace, req);
     }
 
-    fn handleQueryVersionGraphShortestPath(self: *HttpHandler, namespace: []const u8, version: u64, body: []const u8) !HttpResponse {
+    fn handleQueryVersionGraphShortestPath(self: *HttpHandler, namespace: []const u8, version: u64, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphShortestPathPlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph shortest path request");
         };
@@ -3545,6 +3641,7 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryGraphShortestPathResponse(&session, namespace, req);
     }
 
@@ -3702,21 +3799,23 @@ pub const HttpHandler = struct {
         });
     }
 
-    fn handleQueryHead(self: *HttpHandler, namespace: []const u8) !HttpResponse {
+    fn handleQueryHead(self: *HttpHandler, namespace: []const u8, cancellation: CancellationToken) !HttpResponse {
         var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.querySessionResponse(&session, .published, &.{});
     }
 
-    fn handleQueryLatest(self: *HttpHandler, namespace: []const u8) !HttpResponse {
+    fn handleQueryLatest(self: *HttpHandler, namespace: []const u8, cancellation: CancellationToken) !HttpResponse {
         var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
 
         const records = self.api.wal.readFromAlloc(namespace, session.manifest.wal_end_lsn + 1) catch return try textResponse(self.alloc, 500, "query failed");
         defer wal_mod.freeRecords(self.alloc, records);
@@ -3726,30 +3825,33 @@ pub const HttpHandler = struct {
         return try self.querySessionResponse(&session, .latest, tail);
     }
 
-    fn handleQueryVersion(self: *HttpHandler, namespace: []const u8, version: u64) !HttpResponse {
+    fn handleQueryVersion(self: *HttpHandler, namespace: []const u8, version: u64, cancellation: CancellationToken) !HttpResponse {
         var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.querySessionResponse(&session, .published, &.{});
     }
 
-    fn handleQueryHeadArtifact(self: *HttpHandler, namespace: []const u8, artifact_index: usize) !HttpResponse {
+    fn handleQueryHeadArtifact(self: *HttpHandler, namespace: []const u8, artifact_index: usize, cancellation: CancellationToken) !HttpResponse {
         var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryArtifactResponse(&session, artifact_index);
     }
 
-    fn handleQueryVersionArtifact(self: *HttpHandler, namespace: []const u8, version: u64, artifact_index: usize) !HttpResponse {
+    fn handleQueryVersionArtifact(self: *HttpHandler, namespace: []const u8, version: u64, artifact_index: usize, cancellation: CancellationToken) !HttpResponse {
         var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryArtifactResponse(&session, artifact_index);
     }
 
@@ -4144,9 +4246,10 @@ pub const HttpHandler = struct {
         return mutations;
     }
 
-    fn tableApi(self: *HttpHandler) public_table_http.TableApi {
+    fn tableApi(self: *HttpHandler, cancellation: CancellationToken) public_table_http.TableApi {
         return .{
             .ptr = self,
+            .request = .{ .cancellation = cancellation },
             .vtable = &.{
                 .execute_table_batch = executePublicTableBatch,
                 .execute_table_query_request = executePublicTableQueryRequest,
@@ -4166,6 +4269,7 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         req: db_types.BatchRequest,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBatchError!void {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
@@ -4209,7 +4313,7 @@ pub const HttpHandler = struct {
         };
         defer result.deinit(self.alloc);
 
-        self.enforcePublicTableBatchSyncLevel(table_name, req.sync_level, result.end_lsn, status) catch |err| {
+        self.enforcePublicTableBatchSyncLevel(table_name, req.sync_level, result.end_lsn, status, request.cancellation) catch |err| {
             if (err == error.InternalFailure) {
                 std.log.err("serverless public table batch sync wait failed table={s} sync_level={} end_lsn={} err={}", .{
                     table_name,
@@ -4228,6 +4332,7 @@ pub const HttpHandler = struct {
         sync_level: db_types.SyncLevel,
         end_lsn: u64,
         status_before_write: catalog_types.BuildStatus,
+        cancellation: CancellationToken,
     ) public_table_http.TableApi.ExecuteBatchError!void {
         const requires_background_materialization =
             status_before_write.enrichment_enabled or
@@ -4246,6 +4351,7 @@ pub const HttpHandler = struct {
         const timeout_ns = 30 * std.time.ns_per_s;
         const start_ns = platform_time.monotonicNs();
         while (true) {
+            cancellation.check() catch return error.Canceled;
             const build_result = self.catalog.buildTable(table_name) catch |err| switch (err) {
                 error.NamespaceNotFound => return error.NotFound,
                 error.HeadChanged => null,
@@ -4362,11 +4468,12 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         body: []const u8,
         row_filter_json: ?[]const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteQueryError![]u8 {
         _ = alloc;
         _ = row_filter_json;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        return self.executePublicTableQueryJsonAlloc(table_name, body) catch |err| switch (err) {
+        return self.executePublicTableQueryJsonAlloc(table_name, body, request.cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -4376,6 +4483,7 @@ pub const HttpHandler = struct {
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.Canceled => return error.Canceled,
             else => {
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -4388,12 +4496,14 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         view: public_table_http.TableApi.TableQueryView,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteQueryViewError![]u8 {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        return self.executePublicTableQueryViewJsonAlloc(table_name, view) catch |err| switch (err) {
+        return self.executePublicTableQueryViewJsonAlloc(table_name, view, request.cancellation) catch |err| switch (err) {
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
+            error.Canceled => return error.Canceled,
             else => return error.InternalFailure,
         };
     }
@@ -4407,6 +4517,7 @@ pub const HttpHandler = struct {
         _: []const u8,
         _: []const u8,
         _: *backups_api.BackupLocation,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         return error.MethodNotAllowed;
     }
@@ -4419,6 +4530,7 @@ pub const HttpHandler = struct {
         _: []const u8,
         _: []const u8,
         _: *backups_api.BackupLocation,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteRestoreError!void {
         return error.MethodNotAllowed;
     }
@@ -4427,6 +4539,7 @@ pub const HttpHandler = struct {
         ptr: *anyopaque,
         alloc: Allocator,
         table_name: []const u8,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteListIndexesError![]u8 {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
@@ -4442,6 +4555,7 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         index_name: []const u8,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
@@ -4458,6 +4572,7 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         index_name: []const u8,
         body: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteCreateIndexError!void {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.MethodNotAllowed;
@@ -4489,6 +4604,11 @@ pub const HttpHandler = struct {
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
+        request.ensureActive() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => unreachable,
+        };
         const updated = self.catalog.setTableDefinition(
             table_name,
             table.schema_json,
@@ -4503,6 +4623,7 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         index_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteDeleteIndexError!void {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.MethodNotAllowed;
@@ -4514,6 +4635,11 @@ pub const HttpHandler = struct {
         };
         defer alloc.free(next_indexes_json);
         validateServerlessIndexCatalog(alloc, next_indexes_json) catch return error.InternalFailure;
+        request.ensureActive() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => unreachable,
+        };
         const updated = self.catalog.setTableDefinition(
             table_name,
             table.schema_json,
@@ -6250,7 +6376,7 @@ fn textResponse(alloc: Allocator, status: u16, body: []const u8) !HttpResponse {
     };
 }
 
-test "http handler serves internal namespace lifecycle and query head" {
+test "serverless http handler serves internal namespace lifecycle, admission, and query head" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -6373,6 +6499,8 @@ test "http handler serves internal namespace lifecycle and query head" {
     try std.testing.expectEqual(@as(u64, 0), parsed_metrics.value.cache_pinned_block_count);
     try std.testing.expectEqual(@as(u64, 0), parsed_metrics.value.cache_approx_payload_block_hits);
     try std.testing.expectEqual(@as(u64, 0), parsed_metrics.value.cache_max_payload_bytes);
+    try std.testing.expectEqual(@as(usize, common_config.default_query_max_concurrent_requests), parsed_metrics.value.query_capacity);
+    try std.testing.expectEqual(@as(usize, common_config.default_write_max_concurrent_requests), parsed_metrics.value.write_capacity);
 
     var create = try handler.handle(.{
         .method = .put,
@@ -6388,6 +6516,43 @@ test "http handler serves internal namespace lifecycle and query head" {
     try std.testing.expectEqual(@as(u64, 123), parsed_create.value.created_at_ns);
     try std.testing.expectEqual(@as(u64, 4), parsed_create.value.policy.keep_latest_versions);
     try std.testing.expectEqual(shared_vector.DistanceMetric.inner_product, parsed_create.value.policy.vector_distance_metric);
+
+    handler.configureAdmission(1, 1);
+    try std.testing.expect(handler.query_admission.tryAcquire());
+    try std.testing.expect(handler.write_admission.tryAcquire());
+    var saturated_query = try handler.handle(.{
+        .method = .get,
+        .path = "/internal/v1/namespaces/docs/query/head",
+    });
+    defer saturated_query.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), saturated_query.status);
+    try std.testing.expectEqual(@as(?u32, 1), saturated_query.retry_after_seconds);
+    var saturated_write = try handler.handle(.{
+        .method = .put,
+        .path = "/internal/v1/namespaces/docs/ingest-batch",
+        .body = "{}",
+    });
+    defer saturated_write.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), saturated_write.status);
+    try std.testing.expectEqual(@as(?u32, 1), saturated_write.retry_after_seconds);
+    handler.query_admission.release();
+    handler.write_admission.release();
+
+    var admission_metrics = try handler.handle(.{
+        .method = .get,
+        .path = "/metrics",
+    });
+    defer admission_metrics.deinit(alloc);
+    var parsed_admission_metrics = try parseJsonTestBody(api_types.MetricsResult, alloc, admission_metrics.body);
+    defer parsed_admission_metrics.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.query_capacity);
+    try std.testing.expectEqual(@as(usize, 0), parsed_admission_metrics.value.query_in_flight);
+    try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.query_peak_in_flight);
+    try std.testing.expectEqual(@as(u64, 1), parsed_admission_metrics.value.query_rejected_total);
+    try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.write_capacity);
+    try std.testing.expectEqual(@as(usize, 0), parsed_admission_metrics.value.write_in_flight);
+    try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.write_peak_in_flight);
+    try std.testing.expectEqual(@as(u64, 1), parsed_admission_metrics.value.write_rejected_total);
 
     var list = try handler.handle(.{
         .method = .get,
@@ -7153,7 +7318,7 @@ test "http handler executes foreign right join query through registry" {
     };
     defer foreign_config.deinit(alloc);
 
-    var right = try handler.executeForeignRightJoinQuery(foreign_config, join, parsed_hits.values, .{});
+    var right = try handler.executeForeignRightJoinQuery(foreign_config, join, parsed_hits.values, .{}, .none);
     defer right.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), right.hits.len);
@@ -7229,7 +7394,7 @@ test "http handler executes direct foreign table query through registry" {
         \\{"fields":["name"],"limit":1,"offset":2,"order_by":[{"field":"name"}],"filter_query":{"term":"active","field":"status"},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"${secret:pg_dsn}","postgres_table":"customers","columns":[{"name":"status","type":"text"}]}}}
     ;
 
-    const json = (try handler.executeForeignPublicTableQueryJsonAlloc("pg_customers", body)).?;
+    const json = (try handler.executeForeignPublicTableQueryJsonAlloc("pg_customers", body, .none)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});
@@ -9644,11 +9809,13 @@ test "serverless public graph query rejects exact sort controls" {
         "docs",
         "docs",
         "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"order_by\":[{\"field\":\"created_at\"}]}",
+        .none,
     ));
     try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
         "docs",
         "docs",
         "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
+        .none,
     ));
 }
 

@@ -2906,10 +2906,32 @@ fn logExactSortBudgetRejection(
 
 fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
     if (req.cancellation) |cancellation| {
-        if (cancellation.load(.acquire)) return error.Cancelled;
+        if (cancellation.isCancelled()) return error.Cancelled;
     }
     const deadline_ns = req.execution_deadline_ns orelse return;
     if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+}
+
+test "storage search observes callback-backed cancellation without an atomic signal" {
+    const State = struct {
+        canceled: bool,
+
+        fn isCancelled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.canceled;
+        }
+    };
+
+    var state = State{ .canceled = false };
+    const req = types.SearchRequest{
+        .cancellation = .{
+            .ptr = &state,
+            .is_cancelled_fn = State.isCancelled,
+        },
+    };
+    try checkSearchRequestDeadline(req);
+    state.canceled = true;
+    try std.testing.expectError(error.Cancelled, checkSearchRequestDeadline(req));
 }
 
 test "exact sort budget rejection reason names are stable for diagnostics" {
@@ -12843,7 +12865,10 @@ fn searchDenseInternal(
             .distance_under = req.distance_under,
             .filter_ids = effective_filter_ids,
             .exclude_ids = effective_exclude_ids,
-            .cancellation = req.cancellation,
+            .cancellation = if (req.cancellation) |token|
+                vectorindex_mod.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
         };
 
         const hbc_search_start = platform_time.monotonicNs();
@@ -13327,7 +13352,7 @@ fn exactScoreNativeDenseFilter(
 
 inline fn checkVectorSearchCancelled(req: vectorindex_mod.SearchRequest) !void {
     if (req.cancellation) |cancellation| {
-        if (cancellation.load(.acquire)) return error.Cancelled;
+        if (cancellation.isCancelled()) return error.Cancelled;
     }
 }
 
@@ -13497,7 +13522,7 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
         .query = &query,
         .k = result_count,
         .filter_ids = filter_ids,
-        .cancellation = &cancellation,
+        .cancellation = vectorindex_mod.CancellationToken.fromAtomic(&cancellation),
     }));
     try std.testing.expectEqual(exact_native_filter_cancellation_stride, counter.count);
 }
@@ -25653,7 +25678,7 @@ test "match_all aborts the real search execution path when request cancellation 
     try std.testing.expectError(error.Cancelled, searchMatchAll(alloc, .{
         .include_stored = false,
         .limit = 10,
-        .cancellation = &cancellation,
+        .cancellation = types.CancellationToken.fromAtomic(&cancellation),
     }, testMatchAllExecutor(&ctx)));
 }
 
@@ -25705,7 +25730,7 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
 
         fn run(self: *@This()) void {
             var candidates = collectMatchAllCandidatesWithOptions(std.heap.page_allocator, .{
-                .cancellation = self.cancellation,
+                .cancellation = types.CancellationToken.fromAtomic(self.cancellation),
             }, .{
                 .ctx = self.harness,
                 .scan_store_range = Harness.scanUnexpected,

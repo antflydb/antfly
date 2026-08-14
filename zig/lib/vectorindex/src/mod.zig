@@ -46,6 +46,7 @@ pub const SearchResults = search_results.SearchResults;
 pub const ApproxSearchResult = search_results.ApproxSearchResult;
 pub const ApproxSearchResults = search_results.ApproxSearchResults;
 pub const SearchRequest = search_types.SearchRequest;
+pub const CancellationToken = search_types.CancellationToken;
 pub const SearchProfile = search_types.SearchProfile;
 pub const DebugHit = search_types.DebugHit;
 pub const DebugPair = search_types.DebugPair;
