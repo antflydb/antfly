@@ -8,6 +8,7 @@ usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
   antfly
+  completions/
   share/
   lib/
   include/
@@ -246,6 +247,7 @@ if [ -d "$prefix/include" ]; then
 fi
 cp "$repo_root/README.md" "$stage/README.md"
 cp "$repo_root/LICENSE" "$stage/LICENSE"
+"$repo_root/scripts/completions.sh" "$stage/completions"
 
 python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
   --source "$stage" \
@@ -254,4 +256,7 @@ python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
 grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "./completions/antfly.bash" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "./completions/antfly.zsh" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "./completions/antfly.fish" "$work_root/archive-contents.txt" >/dev/null
 echo "wrote $out_dir/$archive_name"

@@ -175,9 +175,9 @@ kubectl get nodes
 # Build the operator image
 make docker-build
 
-# Build the Antfly database image (assumes you have the Antfly source)
-# Replace with your actual Antfly build process
-docker build -f /path/to/antfly/source/go/Dockerfile -t antfly:latest /path/to/antfly/source
+# Pull and tag the published Zig runtime image
+docker pull ghcr.io/antflydb/antfly:latest
+docker tag ghcr.io/antflydb/antfly:latest antfly:latest
 
 # Load images into minikube
 minikube image load antfly-operator:latest

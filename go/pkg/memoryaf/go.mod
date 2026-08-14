@@ -4,14 +4,11 @@ go 1.26.0
 
 replace github.com/antflydb/antfly/go/pkg/libaf => ../libaf
 
-replace github.com/antflydb/antfly/go/pkg/antfly => ../antfly
-
 replace github.com/antflydb/antfly/go/pkg/generating => ../generating
 
 replace github.com/antflydb/antfly/go/pkg/sdk => ../sdk
 
 require (
-	github.com/antflydb/antfly/go/pkg/antfly v0.0.0
 	github.com/antflydb/antfly/go/pkg/sdk v0.0.1
 	github.com/google/uuid v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.4.1

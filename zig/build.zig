@@ -9271,7 +9271,7 @@ pub fn build(b: *std.Build) void {
 
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
     const install_antfarm_assets = b.addInstallDirectory(.{
-        .source_dir = b.path("../go/pkg/antfly/src/metadata/antfarm"),
+        .source_dir = b.path("pkg/antfly/antfarm"),
         .install_dir = .prefix,
         .install_subdir = "share/antfly/antfarm",
     });

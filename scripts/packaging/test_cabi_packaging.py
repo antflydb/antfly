@@ -39,6 +39,7 @@ def write_release_archive(root: Path, version: str, os_name: str, arch: str) -> 
     (stage / "include").mkdir(parents=True)
     (stage / "lib").mkdir()
     (stage / "share" / "antfly").mkdir(parents=True)
+    (stage / "completions").mkdir()
 
     antfly = stage / "antfly"
     antfly.write_text("#!/bin/sh\n")
@@ -48,6 +49,8 @@ def write_release_archive(root: Path, version: str, os_name: str, arch: str) -> 
     lib_name = "libantfly.dylib" if os_name == "Darwin" else "libantfly.so"
     (stage / "lib" / lib_name).write_text("antfly library\n")
     (stage / "share" / "antfly" / "asset.txt").write_text("asset\n")
+    for shell in ("bash", "zsh", "fish"):
+        (stage / "completions" / f"antfly.{shell}").write_text(f"{shell} completion\n")
 
     archive = root / f"antfly_{version}_{os_name}_{arch}.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
@@ -73,8 +76,8 @@ class CAbiPackagingTests(unittest.TestCase):
             (repo / "ts" / "packages" / "cli-darwin-arm64" / "package.json").write_text(
                 '{"name":"@antfly/cli-darwin-arm64","version":"0.0.0","files":["bin","include","lib","share","README.md"]}\n'
             )
-            (repo / "go" / "pkg" / "antfly" / "src" / "metadata" / "antfarm").mkdir(parents=True)
-            (repo / "go" / "pkg" / "antfly" / "src" / "metadata" / "antfarm" / "index.html").write_text("antfarm\n")
+            (repo / "zig" / "pkg" / "antfly" / "antfarm").mkdir(parents=True)
+            (repo / "zig" / "pkg" / "antfly" / "antfarm" / "index.html").write_text("antfarm\n")
             (repo / "py" / "packages" / "cli" / "src" / "antfly_cli").mkdir(parents=True)
             (repo / "py" / "packages" / "cli" / "src" / "antfly_cli" / "__init__.py").write_text(
                 "def main(): return 0\n"
@@ -125,6 +128,9 @@ class CAbiPackagingTests(unittest.TestCase):
             self.assertIn('include.install Dir["include/*"] if Dir.exist?("include")', rendered)
             self.assertIn('lib.install Dir["lib/*"] if Dir.exist?("lib")', rendered)
             self.assertIn('(share/"antfly").install Dir["share/antfly/*"] if Dir.exist?("share/antfly")', rendered)
+            self.assertIn('bash_completion.install "completions/antfly.bash" => "antfly"', rendered)
+            self.assertIn('zsh_completion.install "completions/antfly.zsh" => "_antfly"', rendered)
+            self.assertIn('fish_completion.install "completions/antfly.fish"', rendered)
 
 
 if __name__ == "__main__":

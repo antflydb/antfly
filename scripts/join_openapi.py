@@ -240,13 +240,8 @@ def configure_for_repo_contracts(module) -> None:
         "eval.yaml": "specs/openapi/antfly/eval.yaml",
         "reranking.yaml": "specs/openapi/antfly/reranking.yaml",
         "query.yaml": "specs/openapi/antfly/query.yaml",
-        "../../../src/": "go/pkg/antfly/src/",
-        "../../../lib/": "go/pkg/antfly/lib/",
         "../../../": "",
         "../../": "",
-        "../metadata/": "go/pkg/antfly/src/metadata",
-        "../store/": "go/pkg/antfly/src/store",
-        "../usermgr/": "go/pkg/antfly/src/usermgr",
     }
 
     def target_schema_name(source_path: Path, schema_name: str) -> str:

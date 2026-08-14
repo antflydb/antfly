@@ -78,7 +78,8 @@ docker run --name postgres-antfly-demo \
 
 ```bash
 cd /path/to/antfly
-go run ./go/pkg/antfly/cmd standalone
+make build
+./antfly standalone
 ```
 
 ### 3. Build the sync tool
@@ -441,7 +442,7 @@ services:
       POSTGRES_DB: production
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
-      - postgres-data:/var/go/pkg/antfly/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql/data
       - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
 
   antfly:

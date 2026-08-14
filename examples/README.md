@@ -268,19 +268,19 @@ More examples coming soon:
 Both examples include comprehensive test suites:
 
 ```bash
-# Test markdown sync
-go test -v ./go/pkg/antfly/src/metadata -run TestLinearMergeMarkdownDemo
+# Test the docs ingestion example
+(cd examples/docsaf && go test ./...)
 
 # Test Postgres sync (requires Postgres)
 export POSTGRES_URL="postgresql://postgres:postgres@localhost:5432/postgres"
-go test -v ./go/pkg/antfly/src/metadata -run TestLinearMergePostgresDemo
+(cd examples/postgres-sync && go test ./...)
 ```
 
 ## Documentation
 
 - [Linear Merge API Implementation Summary](../work-log/006-create-linear-merge-api/IMPLEMENTATION_SUMMARY.md)
 - [Linear Merge API Plan](../work-log/006-create-linear-merge-api/plan.md)
-- OpenAPI spec: `go/pkg/antfly/src/metadata/api.yaml` (lines 578-1081)
+- OpenAPI specs: `specs/openapi/antfly/`
 
 ## Contributing
 
@@ -288,7 +288,7 @@ To add a new example:
 
 1. Create a new directory: `examples/my-example/`
 2. Add `main.go`, `README.md`, and optional `demo.sh`
-3. Include test suite in `go/pkg/antfly/src/metadata/`
+3. Include a test suite alongside the example
 4. Update this README
 5. Submit PR
 
