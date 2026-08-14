@@ -196,7 +196,7 @@ pub const ServerConfig = struct {
 /// its transport or shutdown source already made response delivery invalid.
 fn routeErrorStatus(err: anyerror) ?u16 {
     return switch (err) {
-        error.Canceled => null,
+        error.Canceled, error.Cancelled => null,
         error.Timeout => 408,
         error.DeadlineExceeded => 504,
         error.BodyTooLarge, error.StreamTooLong, error.ValueTooLong => 413,
@@ -3383,6 +3383,7 @@ test "routeErrorStatus maps oversized route errors to payload too large" {
     try std.testing.expectEqual(@as(?u16, 504), routeErrorStatus(error.DeadlineExceeded));
     try std.testing.expectEqual(@as(?u16, 500), routeErrorStatus(error.UnexpectedRouteFailure));
     try std.testing.expectEqual(@as(?u16, null), routeErrorStatus(error.Canceled));
+    try std.testing.expectEqual(@as(?u16, null), routeErrorStatus(error.Cancelled));
     try std.testing.expectEqualStrings(
         "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid request\"}",
         routeErrorBody(400),

@@ -490,7 +490,10 @@ class MultiNodeScalingCluster:
                 "--id",
                 str(node["id"]),
                 "--health-port",
-                str(find_free_port()),
+                # This listener is not addressed by the test. Let the kernel
+                # choose its port atomically so it cannot consume a port that
+                # was preselected for a later metadata/data listener.
+                "0",
                 "--raft-tick-ms",
                 "25",
                 "--control-tick-ms",
@@ -562,7 +565,12 @@ class MultiNodeScalingCluster:
             "--store-id",
             str(node["store_id"]),
             "--health-port",
-            str(find_free_port()),
+            # The test probes the public listener's root /healthz endpoint;
+            # the dedicated health listener only needs to start successfully.
+            # Port zero avoids the find-free-port/child-bind race and prevents
+            # collisions with ports reserved earlier for dynamically added
+            # data nodes.
+            "0",
             "--raft-tick-ms",
             "25",
             "--control-tick-ms",

@@ -31,6 +31,77 @@ pub const Config = struct {
     backend: Backend = runtime_backend.defaultExecutorBackend(),
 };
 
+/// Atomic admission gate for a lane whose backing executor is destroyed only
+/// after every committed borrower has released it. The high bit permanently
+/// closes admission; the remaining bits are the active lease count. Keeping
+/// both in one word eliminates the check/increment teardown race.
+const LaneLeaseGate = struct {
+    const closed_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
+    const count_mask: usize = closed_bit - 1;
+
+    state: std.atomic.Value(usize) = .init(0),
+    drain_mutex: Io.Mutex = .init,
+    drained: Io.Condition = .init,
+
+    fn tryAcquire(self: *LaneLeaseGate) ?usize {
+        var observed = self.state.load(.acquire);
+        while (true) {
+            if (observed & closed_bit != 0) return null;
+            const count = observed & count_mask;
+            std.debug.assert(count < count_mask);
+            if (self.state.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire)) |actual| {
+                observed = actual;
+                continue;
+            }
+            return count + 1;
+        }
+    }
+
+    fn release(self: *LaneLeaseGate, coordinator_io: ?Io) void {
+        const previous = self.state.fetchSub(1, .acq_rel);
+        std.debug.assert(previous & count_mask > 0);
+        if (previous & closed_bit != 0 and previous & count_mask == 1) {
+            if (coordinator_io) |io| {
+                // Synchronize with waitDrained's final state check so a last
+                // release cannot race between that check and parking.
+                self.drain_mutex.lockUncancelable(io);
+                self.drained.broadcast(io);
+                self.drain_mutex.unlock(io);
+            }
+        }
+    }
+
+    fn close(self: *LaneLeaseGate) void {
+        _ = self.state.fetchOr(closed_bit, .acq_rel);
+    }
+
+    fn active(self: *const LaneLeaseGate) usize {
+        return self.state.load(.acquire) & count_mask;
+    }
+
+    fn isClosed(self: *const LaneLeaseGate) bool {
+        return self.state.load(.acquire) & closed_bit != 0;
+    }
+
+    fn waitDrained(self: *LaneLeaseGate, coordinator_io: ?Io) void {
+        if (coordinator_io) |io| {
+            self.drain_mutex.lockUncancelable(io);
+            defer self.drain_mutex.unlock(io);
+            while (self.active() != 0) self.drained.waitUncancelable(io, &self.drain_mutex);
+            return;
+        }
+
+        if (comptime builtin.os.tag == .freestanding or builtin.single_threaded) {
+            if (self.active() != 0) @panic("cannot drain a lane lease without an I/O coordinator");
+            return;
+        }
+        // Manual runtimes have no executor to park on. They ordinarily have
+        // no successful lane leases; retain an executor-independent fallback
+        // for a close racing an unavailable acquisition.
+        while (self.active() != 0) std.Thread.yield() catch {};
+    }
+};
+
 /// Process-local hook used by composed runtimes to replace a filesystem DB
 /// open with another storage implementation. The options pointer is opaque here
 /// to keep the executor layer independent of the DB module; DB.open is the sole
@@ -222,18 +293,15 @@ pub const BackendRuntime = struct {
     api_io_impl: ?*IoImpl = null,
     inference_io_impl: ?*IoImpl = null,
     control_io_impl: ?*IoImpl = null,
-    api_lane_shutting_down: std.atomic.Value(bool) = .init(false),
-    api_lane_leases: std.atomic.Value(usize) = .init(0),
+    api_lane_gate: LaneLeaseGate = .{},
     api_lane_peak_leases: std.atomic.Value(usize) = .init(0),
     api_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
     api_lane_rejections_total: std.atomic.Value(u64) = .init(0),
-    inference_lane_shutting_down: std.atomic.Value(bool) = .init(false),
-    inference_lane_leases: std.atomic.Value(usize) = .init(0),
+    inference_lane_gate: LaneLeaseGate = .{},
     inference_lane_peak_leases: std.atomic.Value(usize) = .init(0),
     inference_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
     inference_lane_rejections_total: std.atomic.Value(u64) = .init(0),
-    control_lane_shutting_down: std.atomic.Value(bool) = .init(false),
-    control_lane_leases: std.atomic.Value(usize) = .init(0),
+    control_lane_gate: LaneLeaseGate = .{},
     control_lane_peak_leases: std.atomic.Value(usize) = .init(0),
     control_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
     control_lane_rejections_total: std.atomic.Value(u64) = .init(0),
@@ -305,12 +373,18 @@ pub const BackendRuntime = struct {
     }
 
     pub fn deinit(self: *BackendRuntime) void {
-        self.api_lane_shutting_down.store(true, .release);
-        self.inference_lane_shutting_down.store(true, .release);
-        self.control_lane_shutting_down.store(true, .release);
-        std.debug.assert(self.api_lane_leases.load(.acquire) == 0);
-        std.debug.assert(self.inference_lane_leases.load(.acquire) == 0);
-        std.debug.assert(self.control_lane_leases.load(.acquire) == 0);
+        // Close every lane before waiting for any one of them. Otherwise a
+        // borrower could continue entering a later lane while teardown drains
+        // an earlier one. These waits are production lifetime enforcement,
+        // not debug-only diagnostics: no executor is destroyed while a lease
+        // can still expose its std.Io interface.
+        const coordinator_io = self.io();
+        self.api_lane_gate.close();
+        self.inference_lane_gate.close();
+        self.control_lane_gate.close();
+        self.api_lane_gate.waitDrained(coordinator_io);
+        self.inference_lane_gate.waitDrained(coordinator_io);
+        self.control_lane_gate.waitDrained(coordinator_io);
         if (self.threaded_jobs) |jobs| {
             jobs.deinit();
             self.alloc.destroy(jobs);
@@ -412,25 +486,19 @@ pub const BackendRuntime = struct {
         pub fn release(self: *ApiLaneLease) void {
             if (self.released) return;
             self.released = true;
-            const previous = self.runtime.api_lane_leases.fetchSub(1, .acq_rel);
-            std.debug.assert(previous > 0);
+            self.runtime.api_lane_gate.release(self.runtime.io());
         }
     };
 
     /// Acquires an explicit lifetime lease for the API executor lane. The
     /// caller must stop and await every submitted task before releasing it.
     pub fn acquireApiLane(self: *BackendRuntime) !ApiLaneLease {
-        if (self.api_lane_shutting_down.load(.acquire)) {
+        const leases = self.api_lane_gate.tryAcquire() orelse {
             _ = self.api_lane_rejections_total.fetchAdd(1, .monotonic);
             return error.BackendRuntimeShuttingDown;
-        }
+        };
+        errdefer self.api_lane_gate.release(self.io());
         const borrowed_io = self.apiIo() orelse return error.BackendRuntimeUnavailable;
-        const leases = self.api_lane_leases.fetchAdd(1, .acq_rel) + 1;
-        if (self.api_lane_shutting_down.load(.acquire)) {
-            _ = self.api_lane_leases.fetchSub(1, .acq_rel);
-            _ = self.api_lane_rejections_total.fetchAdd(1, .monotonic);
-            return error.BackendRuntimeShuttingDown;
-        }
         updateAtomicMax(&self.api_lane_peak_leases, leases);
         _ = self.api_lane_acquisitions_total.fetchAdd(1, .monotonic);
         return .{
@@ -441,7 +509,7 @@ pub const BackendRuntime = struct {
     }
 
     pub fn outstandingApiLeases(self: *const BackendRuntime) usize {
-        return self.api_lane_leases.load(.acquire);
+        return self.api_lane_gate.active();
     }
 
     /// Executor isolated for inference graph I/O, model loading, and nested
@@ -466,30 +534,24 @@ pub const BackendRuntime = struct {
         pub fn release(self: *InferenceLaneLease) void {
             if (self.released) return;
             self.released = true;
-            const previous = self.runtime.inference_lane_leases.fetchSub(1, .acq_rel);
-            std.debug.assert(previous > 0);
+            self.runtime.inference_lane_gate.release(self.runtime.io());
         }
     };
 
     pub fn acquireInferenceLane(self: *BackendRuntime) !InferenceLaneLease {
-        if (self.inference_lane_shutting_down.load(.acquire)) {
+        const leases = self.inference_lane_gate.tryAcquire() orelse {
             _ = self.inference_lane_rejections_total.fetchAdd(1, .monotonic);
             return error.BackendRuntimeShuttingDown;
-        }
+        };
+        errdefer self.inference_lane_gate.release(self.io());
         const borrowed_io = self.inferenceIo() orelse return error.BackendRuntimeUnavailable;
-        const leases = self.inference_lane_leases.fetchAdd(1, .acq_rel) + 1;
-        if (self.inference_lane_shutting_down.load(.acquire)) {
-            _ = self.inference_lane_leases.fetchSub(1, .acq_rel);
-            _ = self.inference_lane_rejections_total.fetchAdd(1, .monotonic);
-            return error.BackendRuntimeShuttingDown;
-        }
         updateAtomicMax(&self.inference_lane_peak_leases, leases);
         _ = self.inference_lane_acquisitions_total.fetchAdd(1, .monotonic);
         return .{ .runtime = self, .borrowed_io = borrowed_io };
     }
 
     pub fn outstandingInferenceLeases(self: *const BackendRuntime) usize {
-        return self.inference_lane_leases.load(.acquire);
+        return self.inference_lane_gate.active();
     }
 
     /// Reserved control-plane executor for health, metrics, and shutdown
@@ -514,30 +576,24 @@ pub const BackendRuntime = struct {
         pub fn release(self: *ControlLaneLease) void {
             if (self.released) return;
             self.released = true;
-            const previous = self.runtime.control_lane_leases.fetchSub(1, .acq_rel);
-            std.debug.assert(previous > 0);
+            self.runtime.control_lane_gate.release(self.runtime.io());
         }
     };
 
     pub fn acquireControlLane(self: *BackendRuntime) !ControlLaneLease {
-        if (self.control_lane_shutting_down.load(.acquire)) {
+        const leases = self.control_lane_gate.tryAcquire() orelse {
             _ = self.control_lane_rejections_total.fetchAdd(1, .monotonic);
             return error.BackendRuntimeShuttingDown;
-        }
+        };
+        errdefer self.control_lane_gate.release(self.io());
         const borrowed_io = self.controlIo() orelse return error.BackendRuntimeUnavailable;
-        const leases = self.control_lane_leases.fetchAdd(1, .acq_rel) + 1;
-        if (self.control_lane_shutting_down.load(.acquire)) {
-            _ = self.control_lane_leases.fetchSub(1, .acq_rel);
-            _ = self.control_lane_rejections_total.fetchAdd(1, .monotonic);
-            return error.BackendRuntimeShuttingDown;
-        }
         updateAtomicMax(&self.control_lane_peak_leases, leases);
         _ = self.control_lane_acquisitions_total.fetchAdd(1, .monotonic);
         return .{ .runtime = self, .borrowed_io = borrowed_io };
     }
 
     pub fn outstandingControlLeases(self: *const BackendRuntime) usize {
-        return self.control_lane_leases.load(.acquire);
+        return self.control_lane_gate.active();
     }
 
     pub const LaneStats = struct {
@@ -557,15 +613,15 @@ pub const BackendRuntime = struct {
 
     pub fn laneStats(self: *const BackendRuntime) LaneStats {
         return .{
-            .api_active_leases = self.api_lane_leases.load(.acquire),
+            .api_active_leases = self.api_lane_gate.active(),
             .api_peak_leases = self.api_lane_peak_leases.load(.acquire),
             .api_acquisitions_total = self.api_lane_acquisitions_total.load(.acquire),
             .api_rejections_total = self.api_lane_rejections_total.load(.acquire),
-            .inference_active_leases = self.inference_lane_leases.load(.acquire),
+            .inference_active_leases = self.inference_lane_gate.active(),
             .inference_peak_leases = self.inference_lane_peak_leases.load(.acquire),
             .inference_acquisitions_total = self.inference_lane_acquisitions_total.load(.acquire),
             .inference_rejections_total = self.inference_lane_rejections_total.load(.acquire),
-            .control_active_leases = self.control_lane_leases.load(.acquire),
+            .control_active_leases = self.control_lane_gate.active(),
             .control_peak_leases = self.control_lane_peak_leases.load(.acquire),
             .control_acquisitions_total = self.control_lane_acquisitions_total.load(.acquire),
             .control_rejections_total = self.control_lane_rejections_total.load(.acquire),
@@ -900,6 +956,29 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     }
 }
 
+test "lane lease gate closes admission and drains a committed borrower" {
+    if (builtin.os.tag == .freestanding) return;
+
+    var gate = LaneLeaseGate{};
+    try std.testing.expectEqual(@as(?usize, 1), gate.tryAcquire());
+
+    var drained = std.atomic.Value(bool).init(false);
+    const closer = try std.Thread.spawn(.{}, struct {
+        fn run(g: *LaneLeaseGate, done: *std.atomic.Value(bool)) void {
+            g.close();
+            g.waitDrained(null);
+            done.store(true, .release);
+        }
+    }.run, .{ &gate, &drained });
+
+    while (!gate.isClosed()) std.Thread.yield() catch {};
+    try std.testing.expectEqual(@as(?usize, null), gate.tryAcquire());
+    try std.testing.expect(!drained.load(.acquire));
+    gate.release(null);
+    closer.join();
+    try std.testing.expect(drained.load(.acquire));
+}
+
 test "backend runtime handle owns a stable runtime pointer" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
     defer handle.deinit();
@@ -1060,12 +1139,34 @@ test "backend runtime API lane leases expose and release the interface" {
     try std.testing.expectEqual(@as(usize, 0), handle.ptr().outstandingApiLeases());
 }
 
+test "backend runtime deinit closes admission and waits for active lane leases" {
+    if (builtin.os.tag == .freestanding) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    const runtime = handle.ptr();
+    var lease = try runtime.acquireApiLane();
+    var deinitialized = std.atomic.Value(bool).init(false);
+    const deinit_thread = try std.Thread.spawn(.{}, struct {
+        fn run(h: *BackendRuntimeHandle, done: *std.atomic.Value(bool)) void {
+            h.deinit();
+            done.store(true, .release);
+        }
+    }.run, .{ &handle, &deinitialized });
+
+    while (!runtime.api_lane_gate.isClosed()) std.Thread.yield() catch {};
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquireApiLane());
+    try std.testing.expect(!deinitialized.load(.acquire));
+    lease.release();
+    deinit_thread.join();
+    try std.testing.expect(deinitialized.load(.acquire));
+}
+
 test "backend runtime rejects API lane leases after shutdown begins" {
     if (builtin.os.tag == .freestanding) return;
 
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
-    handle.ptr().api_lane_shutting_down.store(true, .release);
+    handle.ptr().api_lane_gate.close();
 
     try std.testing.expectError(error.BackendRuntimeShuttingDown, handle.ptr().acquireApiLane());
     try std.testing.expectEqual(@as(usize, 0), handle.ptr().outstandingApiLeases());
@@ -1118,7 +1219,7 @@ test "backend runtime rejects control lane leases after shutdown begins" {
 
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
-    handle.ptr().control_lane_shutting_down.store(true, .release);
+    handle.ptr().control_lane_gate.close();
 
     try std.testing.expectError(error.BackendRuntimeShuttingDown, handle.ptr().acquireControlLane());
     try std.testing.expectEqual(@as(usize, 0), handle.ptr().outstandingControlLeases());

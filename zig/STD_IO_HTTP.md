@@ -40,11 +40,12 @@ that end state:
   stream reset signal, while HTTP/1 registrations share the role's
   `HttpRuntime`. The linked API and inference ABIs carry the same semantic
   cancellation callback without route-specific OpenAPI policy.
-- `error.Canceled` is a response-free transport terminal outcome. `httpx`
-  closes or resets the affected request/connection and increments a dedicated
-  cancellation counter; it never converts cancellation into a synthetic 500.
-  Deadlines remain distinguishable and map to 504 when a response is still
-  legal.
+- `error.Canceled` is the canonical response-free transport terminal outcome.
+  `httpx` also normalizes `error.Cancelled`, which remains in client and
+  application error sets, at its ingress boundary. It closes or resets the
+  affected request/connection and increments a dedicated cancellation counter;
+  neither spelling can become a synthetic 500. Deadlines remain distinguishable
+  and map to 504 when a response is still legal.
 - The serverless HTTP boundary now borrows that same semantic callback in both
   its native `httpx` and compatibility-executor adapters. Admission rechecks
   it before and after dispatch; semantic embedding, artifact fetches, indexed
@@ -638,9 +639,23 @@ defer lease.release();
 const io = lease.io();
 ```
 
-Debug and test builds should assert that no leases or registered tasks remain
-when `BackendRuntime` is deinitialized. The component remains responsible for
-stopping and awaiting its tasks before releasing the lease.
+Lane admission and the active lease count share one atomic state so shutdown
+cannot race between a separate closed check and counter increment. Runtime
+deinitialization closes every lane first, then waits for all committed leases
+to drain before destroying any executor; this lifetime guarantee applies in
+production builds as well as debug and test builds. The backend's process-level
+`std.Io` lane remains alive through this phase and drives the gate's
+`std.Io.Condition`, so teardown parks without consuming a dedicated observer
+thread and without depending on a lane that it is waiting to destroy. Manual
+runtimes have no successful executor-lane borrows in normal operation and keep
+only an executor-independent fallback for a close racing an unavailable
+acquisition. The component remains responsible for stopping and awaiting its
+tasks before releasing the lease.
+
+As with any owned object, callers must retain the `BackendRuntimeHandle` while
+calling its methods. The lane gate synchronizes acquisitions already operating
+within that lifetime; it does not make a raw runtime pointer valid after its
+owning handle has been destroyed.
 
 ## HTTP transport runtime
 
@@ -909,13 +924,13 @@ cancellation after a commit has begun, because the durable outcome may already
 exist. Linear merge follows this rule before its single HA-mirrored batch
 boundary, and its scan and comparison loops contain bounded checkpoints.
 
-At HTTP ingress, application `error.Canceled` is not an application error
-response. If no response has committed, `httpx` terminates the stream or
-connection without emitting a status and records `request_cancellations_total`.
-This preserves the peer-disconnect/server-stop meaning and avoids misleading
-500 logs. `error.DeadlineExceeded` remains a 504 before commitment. After a
-response is committed, either outcome closes/resets the transport because a
-second status line is impossible.
+At HTTP ingress, application `error.Canceled` and `error.Cancelled` are not
+application error responses. If no response has committed, `httpx` terminates
+the stream or connection without emitting a status and records
+`request_cancellations_total`. This preserves the peer-disconnect/server-stop
+meaning and avoids misleading 500 logs. `error.DeadlineExceeded` remains a 504
+before commitment. After a response is committed, either outcome closes/resets
+the transport because a second status line is impossible.
 
 The universal representation is a borrowed `(context, is_cancelled)` callback.
 Atomic values are adapters used by concrete listener, lifecycle, or test
