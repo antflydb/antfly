@@ -3968,6 +3968,25 @@ pub const GroundTruth = struct {
     expectations: ?[]const u8 = null,
 };
 
+pub const HierarchyAncestors = struct {
+    source: ?HierarchyProjection = null,
+    unit: ?HierarchyProjection = null,
+};
+
+pub const HierarchyChildren = struct {
+    /// Descendant level to attach to each returned source hit.
+    level: ?[]const u8 = null,
+    /// Maximum child hits attached to each parent, independent of the top-level query limit.
+    limit: ?i64 = null,
+    /// Fields to include in each child hit. Omit to use the top-level fields projection.
+    fields: ?[]const []const u8 = null,
+};
+
+pub const HierarchyProjection = struct {
+    /// Fields to include from the hydrated hierarchy document. Omit to include all fields.
+    fields: ?[]const []const u8 = null,
+};
+
 pub const IPRangeQuery = struct {
     cidr: []const u8,
     field: ?[]const u8 = null,
@@ -6682,6 +6701,18 @@ pub const QueryBuilderResult = struct {
     warnings: ?[]const []const u8 = null,
 };
 
+/// Controls the hierarchy level returned by a query, optional bounded child hits, and projected ancestor context. `children` is analogous to a bounded nested inner-hit request: it defaults to three children per parent while the top-level `limit` continues to control the number of returned hits. The legacy `rollup`, `include`, and `max_children_per_parent` fields remain supported for compatibility. Prefer `children` and `ancestors` for new clients.
+pub const QueryHierarchy = struct {
+    /// Hierarchy level represented by each top-level hit.
+    return_level: ?[]const u8 = null,
+    children: ?HierarchyChildren = null,
+    ancestors: ?HierarchyAncestors = null,
+    rollup: ?[]const u8 = null,
+    include: ?[]const []const u8 = null,
+    /// Legacy child limit. Prefer children.limit.
+    max_children_per_parent: ?i64 = null,
+};
+
 /// A single query result hit
 pub const QueryHit = struct {
     /// ID of the record.
@@ -6755,7 +6786,8 @@ pub const QueryRequest = struct {
     search_effort: ?f32 = null,
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
     fields: ?[]const []const u8 = null,
-    /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
+    hierarchy: ?QueryHierarchy = null,
+    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit descendants attached through hierarchy.children; use hierarchy.children.limit for that. Default varies by query type (typically 10).
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
@@ -7299,7 +7331,8 @@ pub const RetrievalQueryRequest = struct {
     search_effort: ?f32 = null,
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
     fields: ?[]const []const u8 = null,
-    /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
+    hierarchy: ?QueryHierarchy = null,
+    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit descendants attached through hierarchy.children; use hierarchy.children.limit for that. Default varies by query type (typically 10).
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,

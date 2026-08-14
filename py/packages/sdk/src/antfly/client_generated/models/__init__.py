@@ -287,6 +287,10 @@ from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
 from .ground_truth import GroundTruth
+from .hierarchy_ancestors import HierarchyAncestors
+from .hierarchy_children import HierarchyChildren
+from .hierarchy_children_level import HierarchyChildrenLevel
+from .hierarchy_projection import HierarchyProjection
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
@@ -533,6 +537,10 @@ from .query_builder_request_example_documents_item import QueryBuilderRequestExa
 from .query_builder_result import QueryBuilderResult
 from .query_builder_result_plan import QueryBuilderResultPlan
 from .query_builder_result_query import QueryBuilderResultQuery
+from .query_hierarchy import QueryHierarchy
+from .query_hierarchy_include_item import QueryHierarchyIncludeItem
+from .query_hierarchy_return_level import QueryHierarchyReturnLevel
+from .query_hierarchy_rollup import QueryHierarchyRollup
 from .query_hit import QueryHit
 from .query_hit_hierarchy import QueryHitHierarchy
 from .query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
@@ -1008,6 +1016,10 @@ __all__ = (
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
     "GroundTruth",
+    "HierarchyAncestors",
+    "HierarchyChildren",
+    "HierarchyChildrenLevel",
+    "HierarchyProjection",
     "ImageURL",
     "ImageURLContentPart",
     "ImageURLContentPartType",
@@ -1254,6 +1266,10 @@ __all__ = (
     "QueryBuilderResult",
     "QueryBuilderResultPlan",
     "QueryBuilderResultQuery",
+    "QueryHierarchy",
+    "QueryHierarchyIncludeItem",
+    "QueryHierarchyReturnLevel",
+    "QueryHierarchyRollup",
     "QueryHit",
     "QueryHitHierarchy",
     "QueryHitHierarchyAncestors",

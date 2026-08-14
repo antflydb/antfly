@@ -488,6 +488,8 @@ pub const AlgebraicVectorWorkerRequestOptions = struct {
     distance_under: ?f32 = null,
     return_mode: db_mod.types.ReturnMode = .parent,
     max_chunks_per_parent: u32 = 0,
+    hierarchy_include_source: bool = false,
+    hierarchy_include_unit: bool = false,
     identity_read_generation: ?u64 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -1310,6 +1312,8 @@ fn appendAlgebraicVectorWorkerRequestOptions(
     if (options.distance_under) |value| try appendJsonFieldF32(alloc, out, &first, "distance_under", value);
     if (options.return_mode != .parent) try appendJsonFieldString(alloc, out, &first, "return_mode", @tagName(options.return_mode));
     if (options.max_chunks_per_parent != 0) try appendJsonFieldUsize(alloc, out, &first, "max_chunks_per_parent", options.max_chunks_per_parent);
+    if (options.hierarchy_include_source) try appendJsonFieldBool(alloc, out, &first, "hierarchy_include_source", true);
+    if (options.hierarchy_include_unit) try appendJsonFieldBool(alloc, out, &first, "hierarchy_include_unit", true);
     if (options.identity_read_generation) |generation| try appendJsonFieldU64(alloc, out, &first, "identity_read_generation", generation);
     try out.append(alloc, '}');
 }
@@ -1379,6 +1383,8 @@ fn parseAlgebraicVectorWorkerRequestOptions(alloc: std.mem.Allocator, value: std
         .distance_under = try parseOptionalF32Json(value.object.get("distance_under")),
         .return_mode = try parseOptionalReturnModeJson(value.object.get("return_mode")),
         .max_chunks_per_parent = try parseOptionalU32Json(value.object.get("max_chunks_per_parent"), 0),
+        .hierarchy_include_source = try parseOptionalBoolJson(value.object.get("hierarchy_include_source"), false),
+        .hierarchy_include_unit = try parseOptionalBoolJson(value.object.get("hierarchy_include_unit"), false),
         .identity_read_generation = try parseOptionalU64Json(value.object.get("identity_read_generation")),
     };
 }
@@ -2085,7 +2091,10 @@ fn applySearchRequestFields(
     req.fields = fields;
     req.include_all_fields = include_all_fields;
     req.include_stored = include_all_fields or fields.len > 0 or req.reranker != null;
-    req.defer_stored_projection = canDeferStoredProjection(fields);
+    req.defer_stored_projection = canDeferStoredProjection(fields) or
+        !req.hierarchy_child_include_all_fields or
+        !req.hierarchy_source_include_all_fields or
+        !req.hierarchy_unit_include_all_fields;
     return fields;
 }
 
@@ -3139,7 +3148,7 @@ fn searchHitHierarchyJsonValue(alloc: std.mem.Allocator, req: db_mod.types.Searc
         try putJsonString(alloc, &obj, "parent_doc_key", hit.id);
     }
 
-    if (try hierarchyAncestorsJsonValue(alloc, hit.artifact_ref, hit.id, hit.stored_data, hit.ancestor_source_data, hit.ancestor_unit_data)) |ancestors| {
+    if (try hierarchyAncestorsJsonValue(alloc, req, hit.artifact_ref, hit.id, hit.stored_data, hit.ancestor_source_data, hit.ancestor_unit_data)) |ancestors| {
         try obj.put(alloc, try alloc.dupe(u8, "ancestors"), ancestors);
     }
 
@@ -3199,10 +3208,11 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
     try putJsonString(alloc, &obj, "_id", hit.id);
     try obj.put(alloc, try alloc.dupe(u8, "_score"), .{ .float = hit.score orelse 0 });
     if (hit.stored_data) |stored_data| {
-        const source = if (req.defer_stored_projection)
+        const child_projection_configured = !req.hierarchy_child_include_all_fields;
+        const source = if (req.defer_stored_projection or child_projection_configured)
             try document_query.projectLookupJsonValue(alloc, stored_data, .{
-                .fields = req.fields,
-                .include_all_fields = req.include_all_fields,
+                .fields = if (child_projection_configured) req.hierarchy_child_fields else req.fields,
+                .include_all_fields = if (child_projection_configured) false else req.include_all_fields,
             })
         else
             try parseStoredSourceValue(alloc, stored_data);
@@ -3217,7 +3227,7 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
             try putJsonString(alloc, &hierarchy, "parent_unit_id", unit_id);
         }
         try hierarchy.put(alloc, try alloc.dupe(u8, "artifact"), try artifactRefJsonValue(alloc, artifact_ref));
-        if (try hierarchyAncestorsJsonValue(alloc, hit.artifact_ref, hit.id, hit.stored_data, hit.ancestor_source_data, hit.ancestor_unit_data)) |ancestors| {
+        if (try hierarchyAncestorsJsonValue(alloc, req, hit.artifact_ref, hit.id, hit.stored_data, hit.ancestor_source_data, hit.ancestor_unit_data)) |ancestors| {
             try hierarchy.put(alloc, try alloc.dupe(u8, "ancestors"), ancestors);
         }
         try obj.put(alloc, try alloc.dupe(u8, "hierarchy"), .{ .object = hierarchy });
@@ -3228,6 +3238,7 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
 
 fn hierarchyAncestorsJsonValue(
     alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
     artifact_ref_opt: ?db_mod.types.ArtifactRef,
     hit_id: []const u8,
     stored_data: ?[]const u8,
@@ -3242,10 +3253,22 @@ fn hierarchyAncestorsJsonValue(
     const source_id = if (artifact_ref_opt) |artifact_ref| artifact_ref.document_id else hit_id;
     try putJsonString(alloc, &source, "id", source_id);
     if (ancestor_source_data) |raw| {
-        try source.put(alloc, try alloc.dupe(u8, "document"), try parseStoredSourceValue(alloc, raw));
-    } else if (artifact_ref_opt == null) {
+        try source.put(alloc, try alloc.dupe(u8, "document"), try hierarchyStoredSourceJsonValue(
+            alloc,
+            raw,
+            req.hierarchy_source_fields,
+            req.hierarchy_source_include_all_fields,
+        ));
+    } else if (artifact_ref_opt == null and
+        (!req.hierarchy_omit_implicit_source_ancestor_document or req.hierarchy_include_source))
+    {
         if (stored_data) |raw| {
-            try source.put(alloc, try alloc.dupe(u8, "document"), try parseStoredSourceValue(alloc, raw));
+            try source.put(alloc, try alloc.dupe(u8, "document"), try hierarchyStoredSourceJsonValue(
+                alloc,
+                raw,
+                req.hierarchy_source_fields,
+                req.hierarchy_source_include_all_fields,
+            ));
         }
     }
     try ancestors.put(alloc, try alloc.dupe(u8, "source"), .{ .object = source });
@@ -3254,7 +3277,7 @@ fn hierarchyAncestorsJsonValue(
         return .{ .object = ancestors };
     };
 
-    if (try hierarchyUnitAncestorJsonValue(alloc, artifact_ref, stored_data, ancestor_unit_data)) |unit| {
+    if (try hierarchyUnitAncestorJsonValue(alloc, req, artifact_ref, stored_data, ancestor_unit_data)) |unit| {
         try ancestors.put(alloc, try alloc.dupe(u8, "unit"), unit);
     }
 
@@ -3263,6 +3286,7 @@ fn hierarchyAncestorsJsonValue(
 
 fn hierarchyUnitAncestorJsonValue(
     alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
     artifact_ref: db_mod.types.ArtifactRef,
     stored_data: ?[]const u8,
     ancestor_unit_data: ?[]const u8,
@@ -3275,13 +3299,25 @@ fn hierarchyUnitAncestorJsonValue(
     if (unit_id) |id| try putJsonString(alloc, &unit, "id", id);
 
     if (ancestor_unit_data) |raw| {
-        try unit.put(alloc, try alloc.dupe(u8, "document"), try parseStoredSourceValue(alloc, raw));
+        try unit.put(alloc, try alloc.dupe(u8, "document"), try hierarchyStoredSourceJsonValue(
+            alloc,
+            raw,
+            req.hierarchy_unit_fields,
+            req.hierarchy_unit_include_all_fields,
+        ));
     }
 
     if (stored_data) |raw| {
         const stored = try parseStoredSourceValue(alloc, raw);
         if (artifact_ref.kind == .asset and artifact_ref.unit_id != null) {
-            try unit.put(alloc, try alloc.dupe(u8, "document"), stored);
+            const document = if (req.hierarchy_unit_include_all_fields)
+                stored
+            else
+                try document_query.projectLookupJsonValue(alloc, raw, .{
+                    .fields = req.hierarchy_unit_fields,
+                    .include_all_fields = false,
+                });
+            try unit.put(alloc, try alloc.dupe(u8, "document"), document);
             return .{ .object = unit };
         }
 
@@ -3296,6 +3332,21 @@ fn hierarchyUnitAncestorJsonValue(
     }
 
     return if (unit.count() > 0) .{ .object = unit } else null;
+}
+
+fn hierarchyStoredSourceJsonValue(
+    alloc: std.mem.Allocator,
+    raw: []const u8,
+    fields: []const []const u8,
+    include_all_fields: bool,
+) !std.json.Value {
+    return if (include_all_fields)
+        try parseStoredSourceValue(alloc, raw)
+    else
+        try document_query.projectLookupJsonValue(alloc, raw, .{
+            .fields = fields,
+            .include_all_fields = false,
+        });
 }
 
 fn copyOptionalJsonField(
@@ -3849,6 +3900,7 @@ test "api query contract serializes derived hierarchy ancestry" {
     result.hits[0] = .{
         .id = try alloc.dupe(u8, "doc:a"),
         .score = 0.8,
+        .stored_data = try alloc.dupe(u8, "{\"title\":\"source title\",\"private\":\"omit me\"}"),
         .chunk_hits = try alloc.alloc(db_mod.types.ChunkHit, 1),
     };
     result.hits[0].chunk_hits[0] = .{
@@ -3866,9 +3918,17 @@ test "api query contract serializes derived hierarchy ancestry" {
         },
     };
 
+    const child_fields = [_][]const u8{"text"};
+    const source_hit_fields = [_][]const u8{"title"};
     var response = try encodeQueryResponses(alloc, "docs", .{
         .return_mode = .parent_with_chunks,
         .include_stored = false,
+        .defer_stored_projection = true,
+        .fields = &source_hit_fields,
+        .include_all_fields = false,
+        .hierarchy_child_fields = &child_fields,
+        .hierarchy_child_include_all_fields = false,
+        .hierarchy_omit_implicit_source_ancestor_document = true,
     }, .{}, result);
     defer response.deinit(alloc);
 
@@ -3876,12 +3936,17 @@ test "api query contract serializes derived hierarchy ancestry" {
     defer parsed.deinit();
     const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
     const hierarchy = hit.object.get("hierarchy") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("source title", hit.object.get("_source").?.object.get("title").?.string);
+    try std.testing.expect(hit.object.get("_source").?.object.get("private") == null);
     try std.testing.expectEqualStrings("source", hierarchy.object.get("level").?.string);
     try std.testing.expectEqualStrings("doc:a", hierarchy.object.get("parent_doc_key").?.string);
     const source_ancestor = hierarchy.object.get("ancestors").?.object.get("source").?.object;
     try std.testing.expectEqualStrings("doc:a", source_ancestor.get("id").?.string);
+    try std.testing.expect(source_ancestor.get("document") == null);
     const chunks = hierarchy.object.get("chunks").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), chunks.len);
+    try std.testing.expectEqualStrings("chunk text", chunks[0].object.get("_source").?.object.get("text").?.string);
+    try std.testing.expect(chunks[0].object.get("_source").?.object.get("_parent_doc_key") == null);
     const chunk_hierarchy = chunks[0].object.get("hierarchy").?.object;
     try std.testing.expectEqualStrings("chunk", chunk_hierarchy.get("level").?.string);
     try std.testing.expectEqualStrings("page:000001", chunk_hierarchy.get("parent_unit_id").?.string);
@@ -3950,8 +4015,8 @@ test "api query contract serializes db-backed ancestors for direct chunk hits" {
         .stored_data = try alloc.dupe(u8,
             \\{"text":"chunk text","_parent_doc_key":"doc:a","_parent_unit_id":"page:000001","_source_artifact_name":"document_units_v1"}
         ),
-        .ancestor_source_data = try alloc.dupe(u8, "{\"title\":\"source doc\"}"),
-        .ancestor_unit_data = try alloc.dupe(u8, "{\"unit_id\":\"page:000001\",\"text\":\"unit doc\"}"),
+        .ancestor_source_data = try alloc.dupe(u8, "{\"title\":\"source doc\",\"private\":\"omit me\"}"),
+        .ancestor_unit_data = try alloc.dupe(u8, "{\"unit_id\":\"page:000001\",\"text\":\"unit doc\",\"private\":\"omit me\"}"),
         .artifact_ref = .{
             .document_id = try alloc.dupe(u8, "doc:a"),
             .name = try alloc.dupe(u8, "document_chunks_v1"),
@@ -3961,9 +4026,15 @@ test "api query contract serializes db-backed ancestors for direct chunk hits" {
         },
     };
 
+    const source_fields = [_][]const u8{"title"};
+    const unit_fields = [_][]const u8{"text"};
     var response = try encodeQueryResponses(alloc, "docs", .{
         .return_mode = .chunk,
         .include_stored = true,
+        .hierarchy_source_fields = &source_fields,
+        .hierarchy_source_include_all_fields = false,
+        .hierarchy_unit_fields = &unit_fields,
+        .hierarchy_unit_include_all_fields = false,
     }, .{}, result);
     defer response.deinit(alloc);
 
@@ -3972,10 +4043,15 @@ test "api query contract serializes db-backed ancestors for direct chunk hits" {
     const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
     const hierarchy = hit.object.get("hierarchy").?.object;
     const ancestors = hierarchy.get("ancestors").?.object;
-    try std.testing.expectEqualStrings("source doc", ancestors.get("source").?.object.get("document").?.object.get("title").?.string);
+    const source_document = ancestors.get("source").?.object.get("document").?.object;
+    try std.testing.expectEqualStrings("source doc", source_document.get("title").?.string);
+    try std.testing.expect(source_document.get("private") == null);
     const unit = ancestors.get("unit").?.object;
     try std.testing.expectEqualStrings("page:000001", unit.get("id").?.string);
-    try std.testing.expectEqualStrings("unit doc", unit.get("document").?.object.get("text").?.string);
+    const unit_document = unit.get("document").?.object;
+    try std.testing.expectEqualStrings("unit doc", unit_document.get("text").?.string);
+    try std.testing.expect(unit_document.get("unit_id") == null);
+    try std.testing.expect(unit_document.get("private") == null);
 }
 
 test "api query contract serializes mention evidence hierarchy" {
@@ -7991,6 +8067,9 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
         freeOwnedStringItems(alloc, req.exclude_doc_ids);
         alloc.free(@constCast(req.exclude_doc_ids));
     }
+    freeOwnedStringSlice(alloc, req.hierarchy_child_fields);
+    freeOwnedStringSlice(alloc, req.hierarchy_source_fields);
+    freeOwnedStringSlice(alloc, req.hierarchy_unit_fields);
     if (req.resolved_doc_filter_owned) {
         if (req.resolved_doc_filter) |ptr| db_mod.doc_filter_wire.destroyResolvedDocFilter(alloc, ptr);
     }
@@ -8939,6 +9018,7 @@ fn applyPublicHierarchyControls(
     var rollup: ?[]const u8 = null;
     var include_chunk = false;
     var max_children_set = false;
+    var children_set = false;
 
     var it = hierarchy.object.iterator();
     while (it.next()) |entry| {
@@ -8978,14 +9058,66 @@ fn applyPublicHierarchyControls(
                 }
             }
         } else if (std.mem.eql(u8, key, "max_children_per_parent")) {
+            if (children_set) return error.InvalidQueryRequest;
             req.max_chunks_per_parent = try parseOptionalU32Json(value, req.max_chunks_per_parent);
             max_children_set = true;
+        } else if (std.mem.eql(u8, key, "children")) {
+            if (value != .object or max_children_set) return error.InvalidQueryRequest;
+            children_set = true;
+            include_chunk = true;
+            req.max_chunks_per_parent = 3;
+            req.hierarchy_omit_implicit_source_ancestor_document = true;
+
+            var child_it = value.object.iterator();
+            while (child_it.next()) |child_entry| {
+                const child_key = child_entry.key_ptr.*;
+                const child_value = child_entry.value_ptr.*;
+                if (std.mem.eql(u8, child_key, "level")) {
+                    if (child_value != .string) return error.InvalidQueryRequest;
+                    if (!std.mem.eql(u8, child_value.string, "chunk")) return error.UnsupportedQueryRequest;
+                } else if (std.mem.eql(u8, child_key, "limit")) {
+                    req.max_chunks_per_parent = try parseOptionalU32Json(child_value, req.max_chunks_per_parent);
+                    if (req.max_chunks_per_parent == 0) return error.InvalidQueryRequest;
+                } else if (std.mem.eql(u8, child_key, "fields")) {
+                    req.hierarchy_child_fields = try parseStringArrayJsonAlloc(alloc, child_value);
+                    req.hierarchy_child_include_all_fields = false;
+                } else {
+                    return error.InvalidQueryRequest;
+                }
+            }
+        } else if (std.mem.eql(u8, key, "ancestors")) {
+            if (value != .object) return error.InvalidQueryRequest;
+            var ancestor_it = value.object.iterator();
+            while (ancestor_it.next()) |ancestor_entry| {
+                const ancestor_key = ancestor_entry.key_ptr.*;
+                const ancestor_value = ancestor_entry.value_ptr.*;
+                if (ancestor_value != .object) return error.InvalidQueryRequest;
+
+                const is_source = std.mem.eql(u8, ancestor_key, "source");
+                const is_unit = std.mem.eql(u8, ancestor_key, "unit");
+                if (!is_source and !is_unit) return error.InvalidQueryRequest;
+                if (is_source) req.hierarchy_include_source = true;
+                if (is_unit) req.hierarchy_include_unit = true;
+
+                var projection_it = ancestor_value.object.iterator();
+                while (projection_it.next()) |projection_entry| {
+                    if (!std.mem.eql(u8, projection_entry.key_ptr.*, "fields")) return error.InvalidQueryRequest;
+                    const fields = try parseStringArrayJsonAlloc(alloc, projection_entry.value_ptr.*);
+                    if (is_source) {
+                        req.hierarchy_source_fields = fields;
+                        req.hierarchy_source_include_all_fields = false;
+                    } else {
+                        req.hierarchy_unit_fields = fields;
+                        req.hierarchy_unit_include_all_fields = false;
+                    }
+                }
+            }
         } else {
             return error.InvalidQueryRequest;
         }
     }
 
-    const has_child_limit = max_children_set and req.max_chunks_per_parent > 0;
+    const has_child_limit = (max_children_set or children_set) and req.max_chunks_per_parent > 0;
     const wants_source_rollup = if (rollup) |value| std.mem.eql(u8, value, "source") else false;
     const wants_no_rollup = if (rollup) |value| std.mem.eql(u8, value, "none") else false;
 
@@ -10355,6 +10487,35 @@ test "api query contract parses public hierarchy controls" {
     defer mention.deinit(alloc);
     try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, mention.req.return_mode);
     try std.testing.expect(mention.req.hierarchy_include_source);
+
+    const projected_body =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": ["title"],
+        \\  "hierarchy": {
+        \\    "return_level": "source",
+        \\    "children": {"level":"chunk","fields":["text"]},
+        \\    "ancestors": {
+        \\      "source": {"fields":["title","url"]},
+        \\      "unit": {"fields":["page"]}
+        \\    }
+        \\  }
+        \\}
+    ;
+    var projected = try parseQueryRequest(alloc, null, "docs", projected_body);
+    defer projected.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, projected.req.return_mode);
+    try std.testing.expectEqual(@as(u32, 3), projected.req.max_chunks_per_parent);
+    try std.testing.expect(projected.req.hierarchy_omit_implicit_source_ancestor_document);
+    try std.testing.expect(projected.req.hierarchy_include_source);
+    try std.testing.expect(projected.req.hierarchy_include_unit);
+    try std.testing.expect(!projected.req.hierarchy_child_include_all_fields);
+    try std.testing.expectEqualStrings("text", projected.req.hierarchy_child_fields[0]);
+    try std.testing.expect(!projected.req.hierarchy_source_include_all_fields);
+    try std.testing.expectEqualStrings("url", projected.req.hierarchy_source_fields[1]);
+    try std.testing.expect(!projected.req.hierarchy_unit_include_all_fields);
+    try std.testing.expectEqualStrings("page", projected.req.hierarchy_unit_fields[0]);
+    try std.testing.expect(projected.req.defer_stored_projection);
 }
 
 test "api query contract rejects unsupported hierarchy levels" {
@@ -10366,6 +10527,14 @@ test "api query contract rejects unsupported hierarchy levels" {
         \\}
     ;
     try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+
+    const unsupported_children =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"children":{"level":"unit"}}
+        \\}
+    ;
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", unsupported_children));
 }
 
 test "api query contract keeps generated schema strict when with is present" {
@@ -12288,6 +12457,8 @@ test "api query contract carries vector worker tensor program and native constra
             .distance_under = 0.9,
             .return_mode = .parent_with_chunks,
             .max_chunks_per_parent = 2,
+            .hierarchy_include_source = true,
+            .hierarchy_include_unit = true,
             .identity_read_generation = 12345,
         },
         constraints,
@@ -12343,6 +12514,8 @@ test "api query contract carries vector worker tensor program and native constra
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), parsed.options.distance_under.?, 0.0001);
     try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, parsed.options.return_mode);
     try std.testing.expectEqual(@as(u32, 2), parsed.options.max_chunks_per_parent);
+    try std.testing.expect(parsed.options.hierarchy_include_source);
+    try std.testing.expect(parsed.options.hierarchy_include_unit);
     try std.testing.expectEqual(@as(?u64, 12345), parsed.options.identity_read_generation);
     try std.testing.expectEqual(@as(usize, 3), parsed.query.dense.vector.len);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), parsed.query.dense.vector[0], 0.0001);

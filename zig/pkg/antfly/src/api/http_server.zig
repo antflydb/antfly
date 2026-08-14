@@ -602,6 +602,9 @@ pub const RestoreExecutionGuard = struct {
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     experimental: bool = false,
+    /// Maximum serialized MCP tools/call result size. Zero disables the guard.
+    /// The default leaves headroom beneath common connector response limits.
+    mcp_max_tool_result_bytes: usize = 384 * 1024,
     ard_base_url: ?[]const u8 = null,
     ard_publisher_domain: []const u8 = "antfly.local",
     ard_display_name: []const u8 = "Antfly",
@@ -23927,6 +23930,8 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "Raw Antfly QueryRequest body") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"fullTextSearchField\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"full_text_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"hierarchy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"children\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"oneOf\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"inclusiveFrom\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"boolean\"") != null);
@@ -24071,6 +24076,23 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expectEqual(@as(u16, 200), raw_query_request_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, raw_query_request_resp.body, "\"doc:a\"") != null);
 
+    // Some MCP clients ignore structuredContent. Verify the compatibility
+    // TextContent block independently carries the complete query response.
+    var parsed_mcp = try std.json.parseFromSlice(std.json.Value, alloc, raw_query_request_resp.body, .{});
+    defer parsed_mcp.deinit();
+    const text_content = parsed_mcp.value.object
+        .get("result").?.object
+        .get("content").?.array.items[0].object
+        .get("text").?.string;
+    var parsed_text_content = try std.json.parseFromSlice(std.json.Value, alloc, text_content, .{});
+    defer parsed_text_content.deinit();
+    const text_hit = parsed_text_content.value.object
+        .get("responses").?.array.items[0].object
+        .get("hits").?.object
+        .get("hits").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", text_hit.get("_id").?.string);
+    try std.testing.expectEqualStrings("hello", text_hit.get("_source").?.object.get("body").?.string);
+
     var mixed_query_request_resp = try server.handle(.{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
@@ -24107,8 +24129,23 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"structuredContent\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "metadata.yaml#/components/schemas/QueryRequest") != null);
     try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"queryRequest\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"chunk_retrieval\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "Never request _chunks.*") != null);
     try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fielded_full_text\":{\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fields\":[\"title\",\"body\"],\"limit\":5") != null);
+
+    server.cfg.mcp_max_tool_result_bytes = 80;
+    var oversized_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":18,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"fullTextSearch\":\"hello\",\"fullTextSearchField\":\"body\"}}}",
+    });
+    defer oversized_query_resp.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, oversized_query_resp.body, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, oversized_query_resp.body, "avoid _chunks.*") != null);
+    try std.testing.expect(std.mem.indexOf(u8, oversized_query_resp.body, "structuredContent") == null);
 }
 
 test "api http server serves table scan as ndjson" {

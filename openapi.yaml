@@ -12942,6 +12942,97 @@ components:
         - $ref: '#/components/schemas/Query'
       x-go-type: json.RawMessage
       description: A validated Antfly query retained as raw JSON by Go servers and clients.
+    HierarchyProjection:
+      type: object
+      additionalProperties: false
+      properties:
+        fields:
+          type: array
+          items:
+            type: string
+          description: Fields to include from the hydrated hierarchy document. Omit to include all fields.
+    HierarchyChildren:
+      type: object
+      additionalProperties: false
+      properties:
+        level:
+          type: string
+          enum:
+            - chunk
+          default: chunk
+          description: Descendant level to attach to each returned source hit.
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          default: 3
+          description: Maximum child hits attached to each parent, independent of the top-level query
+            limit.
+        fields:
+          type: array
+          items:
+            type: string
+          description: Fields to include in each child hit. Omit to use the top-level fields projection.
+    HierarchyAncestors:
+      type: object
+      additionalProperties: false
+      properties:
+        source:
+          $ref: '#/components/schemas/HierarchyProjection'
+        unit:
+          $ref: '#/components/schemas/HierarchyProjection'
+    QueryHierarchy:
+      type: object
+      additionalProperties: false
+      description: >
+        Controls the hierarchy level returned by a query, optional bounded child hits,
+
+        and projected ancestor context. `children` is analogous to a bounded nested
+
+        inner-hit request: it defaults to three children per parent while the top-level
+
+        `limit` continues to control the number of returned hits.
+
+
+        The legacy `rollup`, `include`, and `max_children_per_parent` fields remain
+
+        supported for compatibility. Prefer `children` and `ancestors` for new clients.
+      properties:
+        return_level:
+          type: string
+          enum:
+            - source
+            - unit
+            - chunk
+            - mention
+          description: Hierarchy level represented by each top-level hit.
+        children:
+          $ref: '#/components/schemas/HierarchyChildren'
+        ancestors:
+          $ref: '#/components/schemas/HierarchyAncestors'
+        rollup:
+          type: string
+          enum:
+            - source
+            - none
+          deprecated: true
+        include:
+          type: array
+          deprecated: true
+          items:
+            type: string
+            enum:
+              - source
+              - unit
+              - chunk
+              - chunks
+              - mention
+              - mentions
+        max_children_per_parent:
+          type: integer
+          format: uint32
+          deprecated: true
+          description: Legacy child limit. Prefer children.limit.
     QueryRequest:
       type: object
       properties:
@@ -13233,12 +13324,16 @@ components:
             - url
             - summary
             - created_at
+        hierarchy:
+          $ref: '#/components/schemas/QueryHierarchy'
         limit:
           type: integer
           description: >
-            Maximum number of results to return. For semantic_search, this is the topk parameter.
+            Maximum number of top-level results to return. For semantic_search, this is the topk parameter.
 
-            Default varies by query type (typically 10).
+            This does not limit descendants attached through hierarchy.children; use
+
+            hierarchy.children.limit for that. Default varies by query type (typically 10).
           example: 20
         offset:
           type: integer
@@ -14297,6 +14392,7 @@ components:
                 - source
                 - unit
                 - chunk
+                - mention
                 - artifact
                 - embedding
               description: Hierarchy level represented by this hit.

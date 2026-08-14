@@ -1,11 +1,11 @@
 from enum import Enum
 
 
-class QueryHitHierarchyLevel(str, Enum):
-    ARTIFACT = "artifact"
+class QueryHierarchyIncludeItem(str, Enum):
     CHUNK = "chunk"
-    EMBEDDING = "embedding"
+    CHUNKS = "chunks"
     MENTION = "mention"
+    MENTIONS = "mentions"
     SOURCE = "source"
     UNIT = "unit"
 

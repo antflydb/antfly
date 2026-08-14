@@ -95,7 +95,7 @@ Example raw QueryRequest call:
 
 The raw `queryRequest` path is intentionally generic. It can carry the OpenAPI `QueryRequest` fields such as `query`,
 `full_text_search`, `filter_query`, `exclusion_query`, `semantic_search`, `embedding_template`, `indexes`,
-`embeddings`, `fields`, `limit`, `offset`, `order_by`, `search_after`, `search_before`, `distance_under`,
+`embeddings`, `fields`, `hierarchy`, `limit`, `offset`, `order_by`, `search_after`, `search_before`, `distance_under`,
 `distance_over`, `search_effort`, `merge_config`, `count`, `profile`, `reranker`, `aggregations`, `graph_searches`,
 `expand_strategy`, `document_renderer`, `pruner`, `join`, and `foreign_sources`.
 
@@ -107,6 +107,43 @@ Raw mode rules:
   precedence rules would otherwise drift from the REST/OpenAPI contract.
 - `queryRequest.table` is rejected on table-scoped MCP calls. Use `tableName` instead.
 - The raw object is validated by the same `/tables/{tableName}/query` path as direct REST calls.
+
+For hierarchical document retrieval, `limit` controls top-level hits; it does not limit child values expanded from a
+source document. Prefer direct chunk hits when chunks are the evidence an agent needs:
+
+```json
+{
+  "tableName": "document_search_import",
+  "queryRequest": {
+    "semantic_search": "How does Antfly index documents?",
+    "indexes": ["document_vectors"],
+    "hierarchy": {
+      "return_level": "chunk",
+      "ancestors": {
+        "source": {"fields": ["title", "url"]}
+      }
+    },
+    "fields": ["text"],
+    "limit": 5
+  }
+}
+```
+
+When a caller needs source hits with matching children attached, use the independently bounded `children` projection:
+
+```json
+"hierarchy": {
+  "return_level": "source",
+  "children": {"level": "chunk", "limit": 3, "fields": ["text"]}
+}
+```
+
+Omitting `children.limit` defaults it to three. The legacy `include` and `max_children_per_parent` controls remain
+accepted, but new integrations should use `children` and `ancestors`. MCP callers should not request `_chunks.*`,
+which expands the stored child array and can create an oversized response. Antfly returns an actionable tool error
+instead of sending a serialized tool result larger than its MCP compatibility budget. The server default is 384 KiB,
+including TextContent and structuredContent; deployments with known client limits can change
+`ApiHttpServerConfig.mcp_max_tool_result_bytes`, or set it to zero to disable the guard.
 
 The full OpenAPI schema is not inlined into every `tools/list` response because the schema is large and references
 recursive query/reranker/graph/join definitions. The `query.queryRequest` input schema stays permissive with compact
@@ -144,7 +181,7 @@ validation, and error behavior aligned with the product API.
 The API auth test bucket includes HTTP-level coverage for MCP initialize. It also covers MCP session response headers
 and MCP GET event-stream endpoint framing.
 
-The standalone protocol tests also cover parse errors, invalid params, and unknown MCP tools.
+The standalone protocol tests also cover parse errors, invalid params, unknown MCP tools, and oversized tool results.
 
 ## Known Gaps
 

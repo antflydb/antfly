@@ -275,6 +275,10 @@ pub const Server = struct {
     implementation: Implementation = .{},
     tools: std.ArrayListUnmanaged(Tool) = .empty,
     session_store: ?SessionStore = null,
+    /// Maximum serialized `tools/call` result size. Zero disables the guard.
+    /// This includes both TextContent and structuredContent when both are present.
+    max_tool_result_bytes: usize = 0,
+    tool_result_too_large_text: []const u8 = "Tool result exceeds the configured MCP response budget. Reduce the result limit or requested fields and retry.",
 
     pub fn deinit(self: *Server, alloc: std.mem.Allocator) void {
         self.tools.deinit(alloc);
@@ -502,23 +506,37 @@ pub const Server = struct {
         for (self.tools.items) |tool| {
             if (!std.mem.eql(u8, tool.name, name)) continue;
             const called = try tool.handler.call(alloc, args);
-            var text_part = std.json.ObjectMap.empty;
-            try text_part.put(alloc, "type", .{ .string = "text" });
-            try text_part.put(alloc, "text", .{ .string = called.text });
-            var content = std.json.Array.init(alloc);
-            try content.append(.{ .object = text_part });
-
-            var result = std.json.ObjectMap.empty;
-            try result.put(alloc, "content", .{ .array = content });
-            try result.put(alloc, "isError", .{ .bool = called.is_error });
-            if (called.structured) |structured| {
-                try result.put(alloc, "structuredContent", structured);
+            const result = try callToolResultValue(alloc, called);
+            if (self.max_tool_result_bytes > 0) {
+                const encoded = try stringifyValue(alloc, result);
+                if (encoded.len > self.max_tool_result_bytes) {
+                    return try callToolResultValue(alloc, .{
+                        .is_error = true,
+                        .text = self.tool_result_too_large_text,
+                    });
+                }
             }
-            return .{ .object = result };
+            return result;
         }
         return error.UnknownTool;
     }
 };
+
+fn callToolResultValue(alloc: std.mem.Allocator, called: CallToolResult) !std.json.Value {
+    var text_part = std.json.ObjectMap.empty;
+    try text_part.put(alloc, "type", .{ .string = "text" });
+    try text_part.put(alloc, "text", .{ .string = called.text });
+    var content = std.json.Array.init(alloc);
+    try content.append(.{ .object = text_part });
+
+    var result = std.json.ObjectMap.empty;
+    try result.put(alloc, "content", .{ .array = content });
+    try result.put(alloc, "isError", .{ .bool = called.is_error });
+    if (called.structured) |structured| {
+        try result.put(alloc, "structuredContent", structured);
+    }
+    return .{ .object = result };
+}
 
 fn emptyObject() std.json.Value {
     return .{ .object = .empty };
@@ -604,6 +622,45 @@ test "mcp handles initialize and tool call" {
     defer alloc.free(call_resp);
     try std.testing.expect(std.mem.indexOf(u8, call_resp, "\"text\":\"hello\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, call_resp, "\"structuredContent\":{\"ok\":true}") != null);
+}
+
+test "mcp replaces oversized tool results with a text error" {
+    const alloc = std.testing.allocator;
+
+    const Large = struct {
+        fn call(_: *anyopaque, a: std.mem.Allocator, _: std.json.Value) !CallToolResult {
+            return .{
+                .text = "a payload that is duplicated for compatibility",
+                .structured = try std.json.parseFromSliceLeaky(
+                    std.json.Value,
+                    a,
+                    "{\"hits\":[{\"_source\":{\"text\":\"a payload that is duplicated for compatibility\"}}]}",
+                    .{},
+                ),
+            };
+        }
+    };
+
+    var ctx: u8 = 0;
+    var server = Server{
+        .max_tool_result_bytes = 100,
+        .tool_result_too_large_text = "narrow the query",
+    };
+    defer server.deinit(alloc);
+    try server.addTool(alloc, .{
+        .name = "large",
+        .description = "Return a large result",
+        .handler = .{ .ptr = &ctx, .call_fn = Large.call },
+    });
+
+    const response = (try server.handleJsonRpc(alloc,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"large","arguments":{}}}
+    )).?;
+    defer alloc.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "narrow the query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "structuredContent") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "duplicated for compatibility") == null);
 }
 
 test "mcp initialized notification has no response" {

@@ -5980,6 +5980,61 @@ export interface components {
         };
         /** @description A validated Antfly query retained as raw JSON by Go servers and clients. */
         RawQuery: components["schemas"]["Query"];
+        HierarchyProjection: {
+            /** @description Fields to include from the hydrated hierarchy document. Omit to include all fields. */
+            fields?: string[];
+        };
+        HierarchyChildren: {
+            /**
+             * @description Descendant level to attach to each returned source hit.
+             * @default chunk
+             * @enum {string}
+             */
+            level?: "chunk";
+            /**
+             * Format: uint32
+             * @description Maximum child hits attached to each parent, independent of the top-level query limit.
+             * @default 3
+             */
+            limit?: number;
+            /** @description Fields to include in each child hit. Omit to use the top-level fields projection. */
+            fields?: string[];
+        };
+        HierarchyAncestors: {
+            source?: components["schemas"]["HierarchyProjection"];
+            unit?: components["schemas"]["HierarchyProjection"];
+        };
+        /**
+         * @description Controls the hierarchy level returned by a query, optional bounded child hits,
+         *     and projected ancestor context. `children` is analogous to a bounded nested
+         *     inner-hit request: it defaults to three children per parent while the top-level
+         *     `limit` continues to control the number of returned hits.
+         *
+         *     The legacy `rollup`, `include`, and `max_children_per_parent` fields remain
+         *     supported for compatibility. Prefer `children` and `ancestors` for new clients.
+         */
+        QueryHierarchy: {
+            /**
+             * @description Hierarchy level represented by each top-level hit.
+             * @enum {string}
+             */
+            return_level?: "source" | "unit" | "chunk" | "mention";
+            children?: components["schemas"]["HierarchyChildren"];
+            ancestors?: components["schemas"]["HierarchyAncestors"];
+            /**
+             * @deprecated
+             * @enum {string}
+             */
+            rollup?: "source" | "none";
+            /** @deprecated */
+            include?: ("source" | "unit" | "chunk" | "chunks" | "mention" | "mentions")[];
+            /**
+             * Format: uint32
+             * @deprecated
+             * @description Legacy child limit. Prefer children.limit.
+             */
+            max_children_per_parent?: number;
+        };
         QueryRequest: {
             /**
              * @description Name of the table to query. Optional for global queries.
@@ -6202,9 +6257,11 @@ export interface components {
              *     ]
              */
             fields?: string[];
+            hierarchy?: components["schemas"]["QueryHierarchy"];
             /**
-             * @description Maximum number of results to return. For semantic_search, this is the topk parameter.
-             *     Default varies by query type (typically 10).
+             * @description Maximum number of top-level results to return. For semantic_search, this is the topk parameter.
+             *     This does not limit descendants attached through hierarchy.children; use
+             *     hierarchy.children.limit for that. Default varies by query type (typically 10).
              * @example 20
              */
             limit?: number;
@@ -6943,7 +7000,7 @@ export interface components {
                  * @description Hierarchy level represented by this hit.
                  * @enum {string}
                  */
-                level?: "source" | "unit" | "chunk" | "artifact" | "embedding";
+                level?: "source" | "unit" | "chunk" | "mention" | "artifact" | "embedding";
                 /** @description Source document key that owns this derived hit. */
                 parent_doc_key?: string;
                 /** @description Unit identifier when the hit is attached to a document unit. */

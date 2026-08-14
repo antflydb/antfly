@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/libaf/json"
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
 func TestQueryRequestMarshalOmitsZeroJoin(t *testing.T) {
@@ -17,6 +18,25 @@ func TestQueryRequestMarshalOmitsZeroJoin(t *testing.T) {
 	}
 	if bytes.Contains(body, []byte(`"join"`)) {
 		t.Fatalf("Marshal emitted zero join: %s", body)
+	}
+}
+
+func TestQueryRequestMarshalPreservesHierarchy(t *testing.T) {
+	body, err := json.Marshal(QueryRequest{
+		Hierarchy: QueryHierarchy{
+			ReturnLevel: oapi.QueryHierarchyReturnLevelChunk,
+			Ancestors: HierarchyAncestors{
+				Source: HierarchyProjection{Fields: []string{"title", "url"}},
+			},
+		},
+		Fields: []string{"text"},
+		Limit:  5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"hierarchy":{"ancestors":{"source":{"fields":["title","url"]}},"return_level":"chunk"}`)) {
+		t.Fatalf("hierarchy missing from request: %s", body)
 	}
 }
 

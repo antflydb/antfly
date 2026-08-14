@@ -79,6 +79,11 @@ type BatchResult struct {
 	} `json:"failed,omitempty"`
 }
 
+type HierarchyAncestors = oapi.HierarchyAncestors
+type HierarchyChildren = oapi.HierarchyChildren
+type HierarchyProjection = oapi.HierarchyProjection
+type QueryHierarchy = oapi.QueryHierarchy
+
 // QueryRequest represents a query request with strongly-typed query fields.
 // This is the SDK-friendly version of oapi.QueryRequest with Query types instead of json.RawMessage.
 type QueryRequest struct {
@@ -161,6 +166,9 @@ type QueryRequest struct {
 	// Results can reference search results using node selectors like $full_text_results.
 	GraphSearches map[string]GraphQuery `json:"graph_searches,omitempty"`
 
+	// Hierarchy controls top-level result shape, bounded child hits, and projected ancestors.
+	Hierarchy QueryHierarchy `json:"hierarchy,omitzero"`
+
 	// Join configuration for joining data from another table.
 	// Supports inner, left, and right joins with automatic strategy selection.
 	Join JoinClause `json:"join"`
@@ -199,6 +207,7 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		SemanticSearch:   q.SemanticSearch,
 		DocumentRenderer: q.DocumentRenderer,
 		GraphSearches:    q.GraphSearches,
+		Hierarchy:        q.Hierarchy,
 		ForeignSources:   q.ForeignSources,
 	}
 	if !reflect.ValueOf(q.Join).IsZero() {
@@ -272,6 +281,7 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	q.SemanticSearch = oapiReq.SemanticSearch
 	q.DocumentRenderer = oapiReq.DocumentRenderer
 	q.GraphSearches = oapiReq.GraphSearches
+	q.Hierarchy = oapiReq.Hierarchy
 	q.Join = oapiReq.Join
 	q.ForeignSources = oapiReq.ForeignSources
 

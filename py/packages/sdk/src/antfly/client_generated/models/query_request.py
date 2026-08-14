@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from ..models.phrase_query import PhraseQuery
     from ..models.prefix_query import PrefixQuery
     from ..models.pruner import Pruner
+    from ..models.query_hierarchy import QueryHierarchy
     from ..models.query_request_aggregations import QueryRequestAggregations
     from ..models.query_request_embeddings import QueryRequestEmbeddings
     from ..models.query_request_foreign_sources import QueryRequestForeignSources
@@ -173,8 +174,18 @@ class QueryRequest:
         fields (list[str] | Unset): List of fields to include in the results. If not specified, all fields are returned.
             Use to reduce response size and improve performance.
              Example: ['title', 'url', 'summary', 'created_at'].
-        limit (int | Unset): Maximum number of results to return. For semantic_search, this is the topk parameter.
-            Default varies by query type (typically 10).
+        hierarchy (QueryHierarchy | Unset): Controls the hierarchy level returned by a query, optional bounded child
+            hits,
+            and projected ancestor context. `children` is analogous to a bounded nested
+            inner-hit request: it defaults to three children per parent while the top-level
+            `limit` continues to control the number of returned hits.
+
+            The legacy `rollup`, `include`, and `max_children_per_parent` fields remain
+            supported for compatibility. Prefer `children` and `ancestors` for new clients.
+        limit (int | Unset): Maximum number of top-level results to return. For semantic_search, this is the topk
+            parameter.
+            This does not limit descendants attached through hierarchy.children; use
+            hierarchy.children.limit for that. Default varies by query type (typically 10).
              Example: 20.
         offset (int | Unset): Number of results to skip for pagination. Supported for text-backed,
             match_all, and filter-only requests. Not supported for semantic_search
@@ -418,6 +429,7 @@ class QueryRequest:
     embeddings: QueryRequestEmbeddings | Unset = UNSET
     search_effort: float | Unset = 0.5
     fields: list[str] | Unset = UNSET
+    hierarchy: QueryHierarchy | Unset = UNSET
     limit: int | Unset = UNSET
     offset: int | Unset = UNSET
     timeout_ms: int | Unset = UNSET
@@ -664,6 +676,10 @@ class QueryRequest:
         if not isinstance(self.fields, Unset):
             fields = self.fields
 
+        hierarchy: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.hierarchy, Unset):
+            hierarchy = self.hierarchy.to_dict()
+
         limit = self.limit
 
         offset = self.offset
@@ -756,6 +772,8 @@ class QueryRequest:
             field_dict["search_effort"] = search_effort
         if fields is not UNSET:
             field_dict["fields"] = fields
+        if hierarchy is not UNSET:
+            field_dict["hierarchy"] = hierarchy
         if limit is not UNSET:
             field_dict["limit"] = limit
         if offset is not UNSET:
@@ -824,6 +842,7 @@ class QueryRequest:
         from ..models.phrase_query import PhraseQuery
         from ..models.prefix_query import PrefixQuery
         from ..models.pruner import Pruner
+        from ..models.query_hierarchy import QueryHierarchy
         from ..models.query_request_aggregations import QueryRequestAggregations
         from ..models.query_request_embeddings import QueryRequestEmbeddings
         from ..models.query_request_foreign_sources import QueryRequestForeignSources
@@ -1596,6 +1615,13 @@ class QueryRequest:
 
         fields = cast(list[str], d.pop("fields", UNSET))
 
+        _hierarchy = d.pop("hierarchy", UNSET)
+        hierarchy: QueryHierarchy | Unset
+        if isinstance(_hierarchy, Unset):
+            hierarchy = UNSET
+        else:
+            hierarchy = QueryHierarchy.from_dict(_hierarchy)
+
         limit = d.pop("limit", UNSET)
 
         offset = d.pop("offset", UNSET)
@@ -1695,6 +1721,7 @@ class QueryRequest:
             embeddings=embeddings,
             search_effort=search_effort,
             fields=fields,
+            hierarchy=hierarchy,
             limit=limit,
             offset=offset,
             timeout_ms=timeout_ms,
