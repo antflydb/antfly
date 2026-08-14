@@ -6014,58 +6014,52 @@ export interface components {
              */
             fields: string[];
         };
-        HierarchyChildren: {
-            /**
-             * @description Descendant level to attach to each returned source hit.
-             * @default chunk
-             * @enum {string}
-             */
-            level?: "chunk";
+        HierarchyMatches: {
             /**
              * Format: uint32
-             * @description Maximum child hits attached to each parent, independent of the top-level query limit.
+             * @description Maximum matching descendant hits attached to each group, independent of the top-level query limit.
              * @default 3
              */
             limit?: number;
             /**
-             * @description Fields to include in each child hit. This projection is required because
-             *     source and child records commonly have different schemas. Use an empty
-             *     array to return child identity and hierarchy metadata without stored fields.
+             * @description Fields to include in each nested match. This projection is required because
+             *     grouped and matching records commonly have different schemas. Use an empty
+             *     array to return match identity and hierarchy metadata without stored fields.
              */
             fields: string[];
+        };
+        HierarchyGroupBy: {
+            /**
+             * @description Hierarchy level used to group the records matched by the targeted index.
+             * @enum {string}
+             */
+            level: "source";
+            matches?: components["schemas"]["HierarchyMatches"];
         };
         HierarchyAncestors: {
             source?: components["schemas"]["HierarchyProjection"];
             unit?: components["schemas"]["HierarchyProjection"];
         };
         /**
-         * @description Controls whether a query returns direct matches or source documents, optional
-         *     bounded child hits, and projected ancestor context. `children` is analogous to a bounded nested
-         *     inner-hit request: it defaults to three children per parent while the top-level
-         *     `limit` continues to control the number of returned hits.
+         * @description Returns direct index matches with optional projected ancestor context, or groups
+         *     those matches at a hierarchy level through `group_by`. A group's nested `matches`
+         *     projection is independently bounded and defaults to three hits while the top-level
+         *     `limit` continues to control the number of groups.
          *
-         *     The new controls are deliberately exclusive: `matches` may use `ancestors`,
-         *     while `sources` may use `children`. When `result_mode` is omitted, `ancestors`
-         *     implies `matches` and `children` implies `sources`. Ancestor and child field
-         *     projections are always explicit to keep response size predictable.
+         *     Ancestor and nested-match field projections are always explicit to keep response
+         *     size predictable. Direct matches are selected whenever `ancestors` is used without
+         *     `group_by`.
          *
          *     The legacy `return_level`, `rollup`, `include`, and
          *     `max_children_per_parent` fields remain supported in legacy-only requests.
          *     Do not mix legacy and new controls in one request.
          */
         QueryHierarchy: {
-            /**
-             * @description Top-level result shape. `matches` returns the records matched by the
-             *     targeted index; their actual hierarchy level is reported in each hit's
-             *     `hierarchy.level`. `sources` groups matches by source document.
-             * @enum {string}
-             */
-            result_mode?: "matches" | "sources";
-            children?: components["schemas"]["HierarchyChildren"];
+            group_by?: components["schemas"]["HierarchyGroupBy"];
             ancestors?: components["schemas"]["HierarchyAncestors"];
             /**
              * @deprecated
-             * @description Legacy result-shape control. Prefer result_mode.
+             * @description Legacy result-shape control. Prefer group_by or ancestors.
              * @enum {string}
              */
             return_level?: "source" | "chunk";
@@ -6079,10 +6073,10 @@ export interface components {
             /**
              * Format: uint32
              * @deprecated
-             * @description Legacy child limit. Prefer children.limit.
+             * @description Legacy child limit. Prefer group_by.matches.limit.
              */
             max_children_per_parent?: number;
-        } & (unknown & unknown & unknown & unknown);
+        } & unknown;
         QueryRequest: {
             /**
              * @description Name of the table to query. Optional for global queries.
@@ -6308,8 +6302,8 @@ export interface components {
             hierarchy?: components["schemas"]["QueryHierarchy"];
             /**
              * @description Maximum number of top-level results to return. For semantic_search, this is the topk parameter.
-             *     This does not limit descendants attached through hierarchy.children; use
-             *     hierarchy.children.limit for that. Default varies by query type (typically 10).
+             *     This does not limit nested matches attached through hierarchy.group_by.matches;
+             *     use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
              * @example 20
              */
             limit?: number;
@@ -7039,9 +7033,10 @@ export interface components {
             /**
              * @description Stable ancestry envelope for derived document hierarchy hits. Present when
              *     the hit is a derived unit/chunk/embedding artifact or when a source-level
-             *     rollup includes child chunks. Standard fields include `level`,
-             *     `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
+             *     group includes nested matches. Standard fields include `level`,
+             *     `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and
              *     `ancestors` with response-local or requested DB-backed source/unit context when available.
+             *     Legacy rollup requests continue to use `chunks` instead of `matches`.
              */
             hierarchy?: {
                 /**
@@ -7061,7 +7056,14 @@ export interface components {
                 ancestors?: {
                     [key: string]: unknown;
                 };
-                /** @description Child chunk hits included for source-level rollups. */
+                /** @description Matching descendant hits attached by the canonical hierarchy.group_by request. */
+                matches?: {
+                    [key: string]: unknown;
+                }[];
+                /**
+                 * @deprecated
+                 * @description Legacy child chunk hits included for source-level rollups.
+                 */
                 chunks?: {
                     [key: string]: unknown;
                 }[];

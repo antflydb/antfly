@@ -118,7 +118,6 @@ source document. Prefer direct matches when the records selected by an index are
     "semantic_search": "How does Antfly index documents?",
     "indexes": ["document_vectors"],
     "hierarchy": {
-      "result_mode": "matches",
       "ancestors": {
         "source": {"fields": ["title", "url"]}
       }
@@ -129,22 +128,27 @@ source document. Prefer direct matches when the records selected by an index are
 }
 ```
 
-When a caller needs source hits with matching children attached, use the independently bounded `children` projection:
+When a caller needs source groups with matching descendants attached, use the independently bounded `group_by.matches`
+projection:
 
 ```json
 "hierarchy": {
-  "result_mode": "sources",
-  "children": {"limit": 3, "fields": ["text"]}
+  "group_by": {
+    "level": "source",
+    "matches": {"limit": 3, "fields": ["text"]}
+  }
 }
 ```
 
-`children` and `ancestors` are mutually exclusive. Omitting `result_mode` is allowed when the projection makes the
-intent unambiguous: `children` implies `sources`, and `ancestors` implies `matches`. Every child or ancestor projection
-must specify `fields`; use an empty array when only hierarchy identity is needed. Omitting `children.limit` defaults it
-to three.
+An `ancestors` projection without `group_by` returns direct index matches. `group_by.level` currently supports `source`;
+its nested `matches` retain their actual `hierarchy.level`, so the response is not tied to chunks. Every match or ancestor
+projection must specify `fields`; use an empty array when only hierarchy identity is needed. Omitting
+`group_by.matches.limit` defaults it to three. Grouping and ancestor projection may be combined when both contexts are
+useful.
 
-The legacy hierarchy controls remain accepted for existing callers, but they cannot be mixed with `result_mode`,
-`children`, or `ancestors`. New integrations should use only the new controls. MCP callers should not request
+The legacy hierarchy controls remain accepted for existing callers, but they cannot be mixed with `group_by` or
+`ancestors`. They are intentionally omitted from MCP discovery so new integrations see only the canonical controls.
+MCP callers should not request
 `_chunks.*`, which expands the stored child array and can create an oversized response. Antfly returns an actionable tool error
 instead of sending a serialized tool result larger than its MCP compatibility budget. The server default is 384 KiB,
 including TextContent and structuredContent; deployments with known client limits can change

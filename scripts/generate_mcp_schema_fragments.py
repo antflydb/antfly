@@ -39,10 +39,17 @@ class Fragment:
     output: str
     tool_input: bool = False
     aliases: dict[str, str] = field(default_factory=dict)
+    exclude_deprecated: bool = False
+    omit_top_level: tuple[str, ...] = ()
 
 
 FRAGMENTS = (
-    Fragment("QueryHierarchy", "mcp_query_hierarchy_schema.json"),
+    Fragment(
+        "QueryHierarchy",
+        "mcp_query_hierarchy_schema.json",
+        exclude_deprecated=True,
+        omit_top_level=("allOf",),
+    ),
     Fragment("BackupRequest", "mcp_backup_input_schema.json", tool_input=True),
     Fragment("RestoreRequest", "mcp_restore_input_schema.json", tool_input=True),
     Fragment(
@@ -91,6 +98,41 @@ def strip_annotations(value: Any) -> Any:
     }
 
 
+def strip_vendor_extensions(value: Any) -> Any:
+    """Remove language- and generator-specific OpenAPI extensions from JSON Schema."""
+    if isinstance(value, list):
+        return [strip_vendor_extensions(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: strip_vendor_extensions(item)
+        for key, item in value.items()
+        if not key.startswith("x-")
+    }
+
+
+def without_deprecated_properties(value: Any) -> Any:
+    """Remove deprecated properties from a schema view intended for new callers."""
+    if isinstance(value, list):
+        return [without_deprecated_properties(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "deprecated":
+            continue
+        if key == "properties" and isinstance(item, dict):
+            result[key] = {
+                name: without_deprecated_properties(schema)
+                for name, schema in item.items()
+                if not (isinstance(schema, dict) and schema.get("deprecated") is True)
+            }
+        else:
+            result[key] = without_deprecated_properties(item)
+    return result
+
+
 def tool_input_schema(component: dict[str, Any], aliases: dict[str, str]) -> dict[str, Any]:
     compact = strip_annotations(component)
     properties = compact.get("properties", {})
@@ -121,6 +163,11 @@ def tool_input_schema(component: dict[str, Any], aliases: dict[str, str]) -> dic
 
 def generated_content(fragment: Fragment, schemas: dict[str, Any]) -> str:
     schema = resolve_local_refs(schemas[fragment.component], schemas)
+    schema = strip_vendor_extensions(schema)
+    if fragment.exclude_deprecated:
+        schema = without_deprecated_properties(schema)
+    for key in fragment.omit_top_level:
+        schema.pop(key, None)
     if fragment.tool_input:
         schema = tool_input_schema(schema, fragment.aliases)
     return json.dumps(schema, separators=(",", ":"), ensure_ascii=False) + "\n"

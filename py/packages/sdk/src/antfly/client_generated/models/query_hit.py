@@ -29,9 +29,10 @@ class QueryHit:
         hierarchy (QueryHitHierarchy | Unset): Stable ancestry envelope for derived document hierarchy hits. Present
             when
             the hit is a derived unit/chunk/embedding artifact or when a source-level
-            rollup includes child chunks. Standard fields include `level`,
-            `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
+            group includes nested matches. Standard fields include `level`,
+            `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and
             `ancestors` with response-local or requested DB-backed source/unit context when available.
+            Legacy rollup requests continue to use `chunks` instead of `matches`.
         field_sort (list[Any] | Unset): Sort key values for this hit. Pass as search_after or search_before
             to paginate to the next/previous page. Values preserve their JSON
             types. Present for ordered result pages, including cursor-only

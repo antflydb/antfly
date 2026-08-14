@@ -23,9 +23,8 @@ func TestQueryRequestMarshalOmitsZeroJoin(t *testing.T) {
 func TestQueryRequestMarshalPreservesHierarchy(t *testing.T) {
 	body, err := json.Marshal(QueryRequest{
 		Hierarchy: QueryHierarchy{
-			ResultMode: QueryHierarchyResultModeMatches,
-			Ancestors: HierarchyAncestors{
-				Source: HierarchyProjection{Fields: []string{"title", "url"}},
+			Ancestors: &HierarchyAncestors{
+				Source: &HierarchyProjection{Fields: []string{"title", "url"}},
 			},
 		},
 		Fields: []string{"text"},
@@ -34,8 +33,48 @@ func TestQueryRequestMarshalPreservesHierarchy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte(`"hierarchy":{"ancestors":{"source":{"fields":["title","url"]}},"result_mode":"matches"}`)) {
+	if !bytes.Contains(body, []byte(`"hierarchy":{"ancestors":{"source":{"fields":["title","url"]}}}`)) {
 		t.Fatalf("hierarchy missing from request: %s", body)
+	}
+}
+
+func TestQueryRequestMarshalPreservesHierarchyGrouping(t *testing.T) {
+	body, err := json.Marshal(QueryRequest{
+		Hierarchy: QueryHierarchy{
+			GroupBy: &HierarchyGroupBy{
+				Level: HierarchyGroupByLevelSource,
+				Matches: &HierarchyMatches{
+					Fields: []string{"text"},
+					Limit:  3,
+				},
+			},
+		},
+		Fields: []string{"title", "url"},
+		Limit:  5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"hierarchy":{"group_by":{"level":"source","matches":{"fields":["text"],"limit":3}}}`)) {
+		t.Fatalf("hierarchy grouping missing from request: %s", body)
+	}
+}
+
+func TestQueryRequestMarshalPreservesIdentityOnlyHierarchyProjection(t *testing.T) {
+	body, err := json.Marshal(QueryRequest{
+		Hierarchy: QueryHierarchy{
+			Ancestors: &HierarchyAncestors{
+				Source: &HierarchyProjection{Fields: []string{}},
+			},
+		},
+		Fields: []string{"text"},
+		Limit:  5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"hierarchy":{"ancestors":{"source":{"fields":[]}}}`)) {
+		t.Fatalf("identity-only hierarchy projection missing from request: %s", body)
 	}
 }
 

@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
     from ..models.query_hit_hierarchy_artifact import QueryHitHierarchyArtifact
     from ..models.query_hit_hierarchy_chunks_item import QueryHitHierarchyChunksItem
+    from ..models.query_hit_hierarchy_matches_item import QueryHitHierarchyMatchesItem
 
 
 T = TypeVar("T", bound="QueryHitHierarchy")
@@ -22,9 +23,10 @@ T = TypeVar("T", bound="QueryHitHierarchy")
 class QueryHitHierarchy:
     """Stable ancestry envelope for derived document hierarchy hits. Present when
     the hit is a derived unit/chunk/embedding artifact or when a source-level
-    rollup includes child chunks. Standard fields include `level`,
-    `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
+    group includes nested matches. Standard fields include `level`,
+    `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and
     `ancestors` with response-local or requested DB-backed source/unit context when available.
+    Legacy rollup requests continue to use `chunks` instead of `matches`.
 
         Attributes:
             level (QueryHitHierarchyLevel | Unset): Hierarchy level represented by this hit.
@@ -35,7 +37,9 @@ class QueryHitHierarchy:
             ancestors (QueryHitHierarchyAncestors | Unset): Ancestor context. Includes `source.id` for derived hits,
                 `source.document` for materialized source rollups or requested source hydration, and `unit.document` for direct
                 unit hits or requested unit hydration when the unit payload is present.
-            chunks (list[QueryHitHierarchyChunksItem] | Unset): Child chunk hits included for source-level rollups.
+            matches (list[QueryHitHierarchyMatchesItem] | Unset): Matching descendant hits attached by the canonical
+                hierarchy.group_by request.
+            chunks (list[QueryHitHierarchyChunksItem] | Unset): Legacy child chunk hits included for source-level rollups.
     """
 
     level: QueryHitHierarchyLevel | Unset = UNSET
@@ -43,6 +47,7 @@ class QueryHitHierarchy:
     parent_unit_id: str | Unset = UNSET
     artifact: QueryHitHierarchyArtifact | Unset = UNSET
     ancestors: QueryHitHierarchyAncestors | Unset = UNSET
+    matches: list[QueryHitHierarchyMatchesItem] | Unset = UNSET
     chunks: list[QueryHitHierarchyChunksItem] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -62,6 +67,13 @@ class QueryHitHierarchy:
         ancestors: dict[str, Any] | Unset = UNSET
         if not isinstance(self.ancestors, Unset):
             ancestors = self.ancestors.to_dict()
+
+        matches: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.matches, Unset):
+            matches = []
+            for matches_item_data in self.matches:
+                matches_item = matches_item_data.to_dict()
+                matches.append(matches_item)
 
         chunks: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.chunks, Unset):
@@ -83,6 +95,8 @@ class QueryHitHierarchy:
             field_dict["artifact"] = artifact
         if ancestors is not UNSET:
             field_dict["ancestors"] = ancestors
+        if matches is not UNSET:
+            field_dict["matches"] = matches
         if chunks is not UNSET:
             field_dict["chunks"] = chunks
 
@@ -93,6 +107,7 @@ class QueryHitHierarchy:
         from ..models.query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
         from ..models.query_hit_hierarchy_artifact import QueryHitHierarchyArtifact
         from ..models.query_hit_hierarchy_chunks_item import QueryHitHierarchyChunksItem
+        from ..models.query_hit_hierarchy_matches_item import QueryHitHierarchyMatchesItem
 
         d = dict(src_dict)
         _level = d.pop("level", UNSET)
@@ -120,6 +135,15 @@ class QueryHitHierarchy:
         else:
             ancestors = QueryHitHierarchyAncestors.from_dict(_ancestors)
 
+        _matches = d.pop("matches", UNSET)
+        matches: list[QueryHitHierarchyMatchesItem] | Unset = UNSET
+        if _matches is not UNSET:
+            matches = []
+            for matches_item_data in _matches:
+                matches_item = QueryHitHierarchyMatchesItem.from_dict(matches_item_data)
+
+                matches.append(matches_item)
+
         _chunks = d.pop("chunks", UNSET)
         chunks: list[QueryHitHierarchyChunksItem] | Unset = UNSET
         if _chunks is not UNSET:
@@ -135,6 +159,7 @@ class QueryHitHierarchy:
             parent_unit_id=parent_unit_id,
             artifact=artifact,
             ancestors=ancestors,
+            matches=matches,
             chunks=chunks,
         )
 

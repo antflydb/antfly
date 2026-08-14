@@ -288,8 +288,9 @@ from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
 from .ground_truth import GroundTruth
 from .hierarchy_ancestors import HierarchyAncestors
-from .hierarchy_children import HierarchyChildren
-from .hierarchy_children_level import HierarchyChildrenLevel
+from .hierarchy_group_by import HierarchyGroupBy
+from .hierarchy_group_by_level import HierarchyGroupByLevel
+from .hierarchy_matches import HierarchyMatches
 from .hierarchy_projection import HierarchyProjection
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
@@ -545,7 +546,6 @@ from .query_builder_result_plan import QueryBuilderResultPlan
 from .query_builder_result_query import QueryBuilderResultQuery
 from .query_hierarchy import QueryHierarchy
 from .query_hierarchy_include_item import QueryHierarchyIncludeItem
-from .query_hierarchy_result_mode import QueryHierarchyResultMode
 from .query_hierarchy_return_level import QueryHierarchyReturnLevel
 from .query_hierarchy_rollup import QueryHierarchyRollup
 from .query_hit import QueryHit
@@ -554,6 +554,7 @@ from .query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
 from .query_hit_hierarchy_artifact import QueryHitHierarchyArtifact
 from .query_hit_hierarchy_chunks_item import QueryHitHierarchyChunksItem
 from .query_hit_hierarchy_level import QueryHitHierarchyLevel
+from .query_hit_hierarchy_matches_item import QueryHitHierarchyMatchesItem
 from .query_hit_index_scores import QueryHitIndexScores
 from .query_hit_source import QueryHitSource
 from .query_hits import QueryHits
@@ -1024,8 +1025,9 @@ __all__ = (
     "GraphResultNodeEvidence",
     "GroundTruth",
     "HierarchyAncestors",
-    "HierarchyChildren",
-    "HierarchyChildrenLevel",
+    "HierarchyGroupBy",
+    "HierarchyGroupByLevel",
+    "HierarchyMatches",
     "HierarchyProjection",
     "ImageURL",
     "ImageURLContentPart",
@@ -1279,7 +1281,6 @@ __all__ = (
     "QueryBuilderResultQuery",
     "QueryHierarchy",
     "QueryHierarchyIncludeItem",
-    "QueryHierarchyResultMode",
     "QueryHierarchyReturnLevel",
     "QueryHierarchyRollup",
     "QueryHit",
@@ -1288,6 +1289,7 @@ __all__ = (
     "QueryHitHierarchyArtifact",
     "QueryHitHierarchyChunksItem",
     "QueryHitHierarchyLevel",
+    "QueryHitHierarchyMatchesItem",
     "QueryHitIndexScores",
     "QueryHits",
     "QueryHitSource",

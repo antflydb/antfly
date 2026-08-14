@@ -80,15 +80,13 @@ type BatchResult struct {
 }
 
 type HierarchyAncestors = oapi.HierarchyAncestors
-type HierarchyChildren = oapi.HierarchyChildren
+type HierarchyGroupBy = oapi.HierarchyGroupBy
+type HierarchyGroupByLevel = oapi.HierarchyGroupByLevel
+type HierarchyMatches = oapi.HierarchyMatches
 type HierarchyProjection = oapi.HierarchyProjection
 type QueryHierarchy = oapi.QueryHierarchy
-type QueryHierarchyResultMode = oapi.QueryHierarchyResultMode
 
-const (
-	QueryHierarchyResultModeMatches = oapi.QueryHierarchyResultModeMatches
-	QueryHierarchyResultModeSources = oapi.QueryHierarchyResultModeSources
-)
+const HierarchyGroupByLevelSource = oapi.HierarchyGroupByLevelSource
 
 // QueryRequest represents a query request with strongly-typed query fields.
 // This is the SDK-friendly version of oapi.QueryRequest with Query types instead of json.RawMessage.

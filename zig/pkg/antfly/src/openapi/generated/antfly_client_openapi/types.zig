@@ -3973,12 +3973,16 @@ pub const HierarchyAncestors = struct {
     unit: ?HierarchyProjection = null,
 };
 
-pub const HierarchyChildren = struct {
-    /// Descendant level to attach to each returned source hit.
-    level: ?[]const u8 = null,
-    /// Maximum child hits attached to each parent, independent of the top-level query limit.
+pub const HierarchyGroupBy = struct {
+    /// Hierarchy level used to group the records matched by the targeted index.
+    level: []const u8,
+    matches: ?HierarchyMatches = null,
+};
+
+pub const HierarchyMatches = struct {
+    /// Maximum matching descendant hits attached to each group, independent of the top-level query limit.
     limit: ?i64 = null,
-    /// Fields to include in each child hit. This projection is required because source and child records commonly have different schemas. Use an empty array to return child identity and hierarchy metadata without stored fields.
+    /// Fields to include in each nested match. This projection is required because grouped and matching records commonly have different schemas. Use an empty array to return match identity and hierarchy metadata without stored fields.
     fields: []const []const u8,
 };
 
@@ -6766,17 +6770,15 @@ pub const QueryBuilderResult = struct {
     warnings: ?[]const []const u8 = null,
 };
 
-/// Controls whether a query returns direct matches or source documents, optional bounded child hits, and projected ancestor context. `children` is analogous to a bounded nested inner-hit request: it defaults to three children per parent while the top-level `limit` continues to control the number of returned hits. The new controls are deliberately exclusive: `matches` may use `ancestors`, while `sources` may use `children`. When `result_mode` is omitted, `ancestors` implies `matches` and `children` implies `sources`. Ancestor and child field projections are always explicit to keep response size predictable. The legacy `return_level`, `rollup`, `include`, and `max_children_per_parent` fields remain supported in legacy-only requests. Do not mix legacy and new controls in one request.
+/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. Ancestor and nested-match field projections are always explicit to keep response size predictable. Direct matches are selected whenever `ancestors` is used without `group_by`. The legacy `return_level`, `rollup`, `include`, and `max_children_per_parent` fields remain supported in legacy-only requests. Do not mix legacy and new controls in one request.
 pub const QueryHierarchy = struct {
-    /// Top-level result shape. `matches` returns the records matched by the targeted index; their actual hierarchy level is reported in each hit's `hierarchy.level`. `sources` groups matches by source document.
-    result_mode: ?[]const u8 = null,
-    children: ?HierarchyChildren = null,
+    group_by: ?HierarchyGroupBy = null,
     ancestors: ?HierarchyAncestors = null,
-    /// Legacy result-shape control. Prefer result_mode.
+    /// Legacy result-shape control. Prefer group_by or ancestors.
     return_level: ?[]const u8 = null,
     rollup: ?[]const u8 = null,
     include: ?[]const []const u8 = null,
-    /// Legacy child limit. Prefer children.limit.
+    /// Legacy child limit. Prefer group_by.matches.limit.
     max_children_per_parent: ?i64 = null,
 };
 
@@ -6789,7 +6791,7 @@ pub const QueryHit = struct {
     /// Scores partitioned by index when using RRF search.
     _index_scores: ?std.json.Value = null,
     _source: ?std.json.Value = null,
-    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
+    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. Legacy rollup requests continue to use `chunks` instead of `matches`.
     hierarchy: ?std.json.Value = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
     _sort: ?[]const std.json.Value = null,
@@ -6854,7 +6856,7 @@ pub const QueryRequest = struct {
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
-    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit descendants attached through hierarchy.children; use hierarchy.children.limit for that. Default varies by query type (typically 10).
+    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
@@ -7399,7 +7401,7 @@ pub const RetrievalQueryRequest = struct {
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
-    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit descendants attached through hierarchy.children; use hierarchy.children.limit for that. Default varies by query type (typically 10).
+    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,

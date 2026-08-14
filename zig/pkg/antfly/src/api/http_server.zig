@@ -21968,6 +21968,13 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(query_request_properties.object.get("full_text_search") != null);
     const hierarchy_schema = query_request_properties.object.get("hierarchy") orelse return error.TestExpectedEqual;
     try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_query_hierarchy_schema.json"), hierarchy_schema);
+    const hierarchy_properties = hierarchy_schema.object.get("properties").?.object;
+    try std.testing.expect(hierarchy_properties.get("group_by") != null);
+    try std.testing.expect(hierarchy_properties.get("ancestors") != null);
+    try std.testing.expect(hierarchy_properties.get("return_level") == null);
+    try std.testing.expect(hierarchy_properties.get("rollup") == null);
+    try std.testing.expect(hierarchy_properties.get("include") == null);
+    try std.testing.expect(hierarchy_properties.get("max_children_per_parent") == null);
 
     const sample_tool = mcp.testing.findTool(listed_tools, "sample_documents") orelse return error.TestExpectedEqual;
     const sample_properties = sample_tool.inputSchema.object.get("properties") orelse return error.TestExpectedEqual;
@@ -22235,7 +22242,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     const query_description = parsed_description.value.result.structuredContent orelse return error.TestExpectedEqual;
     try ant_json.testing.expectSubsetJsonValue(
         alloc,
-        "{\"openapi_schema\":\"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest\",\"mcp_usage\":{\"raw_body_argument\":\"queryRequest\"},\"examples\":{\"fielded_full_text\":{\"fields\":[\"title\",\"body\"]},\"match_retrieval\":{\"hierarchy\":{\"result_mode\":\"matches\"}}}}",
+        "{\"openapi_schema\":\"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest\",\"mcp_usage\":{\"raw_body_argument\":\"queryRequest\"},\"examples\":{\"fielded_full_text\":{\"fields\":[\"title\",\"body\"]},\"match_retrieval\":{\"hierarchy\":{\"ancestors\":{\"source\":{\"fields\":[\"title\",\"url\"]}}}}}}",
         query_description,
     );
     const rules = query_description.object.get("mcp_usage").?.object.get("rules").?.array.items;

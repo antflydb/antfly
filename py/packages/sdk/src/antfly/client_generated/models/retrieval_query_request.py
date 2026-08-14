@@ -180,24 +180,23 @@ class RetrievalQueryRequest:
             fields (list[str] | Unset): List of fields to include in the results. If not specified, all fields are returned.
                 Use to reduce response size and improve performance.
                  Example: ['title', 'url', 'summary', 'created_at'].
-            hierarchy (QueryHierarchy | Unset): Controls whether a query returns direct matches or source documents,
-                optional
-                bounded child hits, and projected ancestor context. `children` is analogous to a bounded nested
-                inner-hit request: it defaults to three children per parent while the top-level
-                `limit` continues to control the number of returned hits.
+            hierarchy (QueryHierarchy | Unset): Returns direct index matches with optional projected ancestor context, or
+                groups
+                those matches at a hierarchy level through `group_by`. A group's nested `matches`
+                projection is independently bounded and defaults to three hits while the top-level
+                `limit` continues to control the number of groups.
 
-                The new controls are deliberately exclusive: `matches` may use `ancestors`,
-                while `sources` may use `children`. When `result_mode` is omitted, `ancestors`
-                implies `matches` and `children` implies `sources`. Ancestor and child field
-                projections are always explicit to keep response size predictable.
+                Ancestor and nested-match field projections are always explicit to keep response
+                size predictable. Direct matches are selected whenever `ancestors` is used without
+                `group_by`.
 
                 The legacy `return_level`, `rollup`, `include`, and
                 `max_children_per_parent` fields remain supported in legacy-only requests.
                 Do not mix legacy and new controls in one request.
             limit (int | Unset): Maximum number of top-level results to return. For semantic_search, this is the topk
                 parameter.
-                This does not limit descendants attached through hierarchy.children; use
-                hierarchy.children.limit for that. Default varies by query type (typically 10).
+                This does not limit nested matches attached through hierarchy.group_by.matches;
+                use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
                  Example: 20.
             offset (int | Unset): Number of results to skip for pagination. Supported for text-backed,
                 match_all, and filter-only requests. Not supported for semantic_search

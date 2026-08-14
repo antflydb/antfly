@@ -1855,6 +1855,14 @@ fn encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(
             .max_chunks_per_parent = req.max_chunks_per_parent,
             .hierarchy_include_source = req.hierarchy_include_source,
             .hierarchy_include_unit = req.hierarchy_include_unit,
+            .hierarchy_omit_implicit_source_ancestor_document = req.hierarchy_omit_implicit_source_ancestor_document,
+            .hierarchy_match_fields = @constCast(req.hierarchy_match_fields),
+            .hierarchy_match_include_all_fields = req.hierarchy_match_include_all_fields,
+            .hierarchy_grouped_matches = req.hierarchy_grouped_matches,
+            .hierarchy_source_fields = @constCast(req.hierarchy_source_fields),
+            .hierarchy_source_include_all_fields = req.hierarchy_source_include_all_fields,
+            .hierarchy_unit_fields = @constCast(req.hierarchy_unit_fields),
+            .hierarchy_unit_include_all_fields = req.hierarchy_unit_include_all_fields,
             .identity_read_generation = req.identity_read_generation,
         },
         constraints,
@@ -18888,6 +18896,14 @@ test "vector worker envelope converts to constrained search request" {
             .distance_under = 0.9,
             .return_mode = .parent_with_chunks,
             .max_chunks_per_parent = 2,
+            .hierarchy_omit_implicit_source_ancestor_document = true,
+            .hierarchy_match_fields = @constCast((&[_][]const u8{"text"})[0..]),
+            .hierarchy_match_include_all_fields = false,
+            .hierarchy_grouped_matches = true,
+            .hierarchy_source_fields = @constCast((&[_][]const u8{"title"})[0..]),
+            .hierarchy_source_include_all_fields = false,
+            .hierarchy_unit_fields = @constCast((&[_][]const u8{"page"})[0..]),
+            .hierarchy_unit_include_all_fields = false,
             .identity_read_generation = 12345,
         },
         .{
@@ -18929,6 +18945,14 @@ test "vector worker envelope converts to constrained search request" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), req.distance_under.?, 0.0001);
     try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, req.return_mode);
     try std.testing.expectEqual(@as(u32, 2), req.max_chunks_per_parent);
+    try std.testing.expect(req.hierarchy_omit_implicit_source_ancestor_document);
+    try std.testing.expectEqualStrings("text", req.hierarchy_match_fields[0]);
+    try std.testing.expect(!req.hierarchy_match_include_all_fields);
+    try std.testing.expect(req.hierarchy_grouped_matches);
+    try std.testing.expectEqualStrings("title", req.hierarchy_source_fields[0]);
+    try std.testing.expect(!req.hierarchy_source_include_all_fields);
+    try std.testing.expectEqualStrings("page", req.hierarchy_unit_fields[0]);
+    try std.testing.expect(!req.hierarchy_unit_include_all_fields);
     try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
     try std.testing.expect(req.filter_doc_ids_positive);
     try std.testing.expectEqual(@as(usize, 2), req.filter_doc_ids.len);
@@ -18965,6 +18989,16 @@ test "simple vector shard request lowers to vector worker envelope" {
         .distance_under = 0.9,
         .return_mode = .parent_with_chunks,
         .max_chunks_per_parent = 2,
+        .hierarchy_include_source = true,
+        .hierarchy_include_unit = true,
+        .hierarchy_omit_implicit_source_ancestor_document = true,
+        .hierarchy_match_fields = &.{"text"},
+        .hierarchy_match_include_all_fields = false,
+        .hierarchy_grouped_matches = true,
+        .hierarchy_source_fields = &.{ "title", "url" },
+        .hierarchy_source_include_all_fields = false,
+        .hierarchy_unit_fields = &.{"page"},
+        .hierarchy_unit_include_all_fields = false,
         .identity_read_generation = 54321,
         .query = .{ .dense_knn = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } },
         .filter_doc_ids_positive = true,
@@ -19000,6 +19034,16 @@ test "simple vector shard request lowers to vector worker envelope" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), envelope.options.distance_under.?, 0.0001);
     try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, envelope.options.return_mode);
     try std.testing.expectEqual(@as(u32, 2), envelope.options.max_chunks_per_parent);
+    try std.testing.expect(envelope.options.hierarchy_include_source);
+    try std.testing.expect(envelope.options.hierarchy_include_unit);
+    try std.testing.expect(envelope.options.hierarchy_omit_implicit_source_ancestor_document);
+    try std.testing.expectEqualStrings("text", envelope.options.hierarchy_match_fields[0]);
+    try std.testing.expect(!envelope.options.hierarchy_match_include_all_fields);
+    try std.testing.expect(envelope.options.hierarchy_grouped_matches);
+    try std.testing.expectEqualStrings("url", envelope.options.hierarchy_source_fields[1]);
+    try std.testing.expect(!envelope.options.hierarchy_source_include_all_fields);
+    try std.testing.expectEqualStrings("page", envelope.options.hierarchy_unit_fields[0]);
+    try std.testing.expect(!envelope.options.hierarchy_unit_include_all_fields);
     try std.testing.expectEqual(@as(?u64, 54321), envelope.options.identity_read_generation);
     try std.testing.expect(envelope.native_doc_id_constraints.constraints.positive_filter);
     try std.testing.expectEqualStrings("doc:a", envelope.native_doc_id_constraints.constraints.include_doc_ids[0]);

@@ -1,8 +1,8 @@
 from enum import Enum
 
 
-class HierarchyChildrenLevel(str, Enum):
-    CHUNK = "chunk"
+class HierarchyGroupByLevel(str, Enum):
+    SOURCE = "source"
 
     def __str__(self) -> str:
         return str(self.value)

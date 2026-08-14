@@ -23,7 +23,7 @@ const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
 
 const max_mcp_sample_documents_limit: i64 = 100;
-const mcp_tool_result_too_large_text = "Antfly produced more data than this MCP client can safely consume. Reduce limit and fields, avoid _chunks.*, or return direct matches with queryRequest.hierarchy.result_mode=\"matches\".";
+const mcp_tool_result_too_large_text = "Antfly produced more data than this MCP client can safely consume. Reduce limit and fields, avoid _chunks.*, or return direct matches with an explicit queryRequest.hierarchy.ancestors projection.";
 
 const McpToolKind = enum {
     create_table,
@@ -108,8 +108,8 @@ const query_request_description_json =
     \\      "queryRequest is mutually exclusive with shorthand query arguments such as fullTextSearch, semanticSearch, fields, limit, orderBy, indexes, and filterPrefix.",
     \\      "queryRequest.table is rejected because tableName selects the table-scoped route.",
     \\      "Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema.",
-    \\      "For hierarchical documents, prefer direct matches with hierarchy.result_mode=matches, explicit top-level fields, and explicit ancestor projections.",
-    \\      "Use hierarchy.result_mode=sources with children for grouped source results; top-level limit does not bound nested descendants, so set hierarchy.children.limit.",
+    \\      "For hierarchical documents, prefer direct matches with explicit top-level fields and hierarchy.ancestors projections.",
+    \\      "Use hierarchy.group_by.level=source with bounded group_by.matches for grouped source results; top-level limit does not bound nested matches.",
     \\      "Never request _chunks.* through MCP because it can expand every child stored on a matched source.",
     \\      "Structured filter_query.geo_bbox accepts field, min_lat, min_lon, max_lat, and max_lon; min_lon greater than max_lon represents an antimeridian-wrapped box."
     \\    ]
@@ -117,8 +117,8 @@ const query_request_description_json =
     \\  "top_level_fields": ["query", "full_text_search", "semantic_search", "embedding_template", "indexes", "filter_prefix", "filter_query", "exclusion_query", "aggregations", "embeddings", "search_effort", "fields", "hierarchy", "limit", "offset", "timeout_ms", "order_by", "search_after", "search_before", "distance_under", "distance_over", "merge_config", "count", "profile", "reranker", "analyses", "graph_searches", "expand_strategy", "document_renderer", "pruner", "join", "foreign_sources"],
     \\  "examples": {
     \\    "fielded_full_text": {"full_text_search":{"match":"hello","field":"body"},"fields":["title","body"],"limit":5,"timeout_ms":5000},
-    \\    "match_retrieval": {"semantic_search":"How does Antfly index documents?","indexes":["document_vectors"],"hierarchy":{"result_mode":"matches","ancestors":{"source":{"fields":["title","url"]}}},"fields":["text"],"limit":5},
-    \\    "source_with_children": {"semantic_search":"Antfly indexing","indexes":["document_vectors"],"hierarchy":{"result_mode":"sources","children":{"limit":3,"fields":["text"]}},"fields":["title","url"],"limit":5},
+    \\    "match_retrieval": {"semantic_search":"How does Antfly index documents?","indexes":["document_vectors"],"hierarchy":{"ancestors":{"source":{"fields":["title","url"]}}},"fields":["text"],"limit":5},
+    \\    "source_with_matches": {"semantic_search":"Antfly indexing","indexes":["document_vectors"],"hierarchy":{"group_by":{"level":"source","matches":{"limit":3,"fields":["text"]}}},"fields":["title","url"],"limit":5},
     \\    "hybrid": {"full_text_search":{"match":"raft","field":"body"},"semantic_search":"raft snapshot architecture","indexes":["body_embedding"],"merge_config":{"strategy":"rrf"},"fields":["title","body"],"limit":20,"profile":true},
     \\    "filtered": {"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"filter":[{"term":{"path":"/tenant","value":"acme"}}]}},"fields":["title","url"],"limit":10},
     \\    "geo_bbox_filter": {"filter_query":{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}},"limit":10}
@@ -236,7 +236,7 @@ const mcp_tool_specs = [_]McpToolSpec{
     .{
         .kind = .query,
         .name = "query",
-        .description = "Run an Antfly table query. For hierarchical documents, retrieve focused direct matches with queryRequest.hierarchy.result_mode=matches and explicit fields; never expand _chunks.* through MCP.",
+        .description = "Run an Antfly table query. For hierarchical documents, retrieve focused direct matches with explicit fields and projected ancestors; never expand _chunks.* through MCP.",
         .permission = .read,
         .table_argument = "tableName",
         .fields = &.{
