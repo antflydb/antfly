@@ -295,91 +295,77 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 		}
 	}
 
-	// Build preload model list
-	preload := make([]string, 0, len(pool.Spec.Models.Preload))
-	for _, m := range pool.Spec.Models.Preload {
-		preload = append(preload, m.Name)
+	loadingStrategy := pool.Spec.Models.LoadingStrategy
+	if loadingStrategy == "" {
+		loadingStrategy = antflyaiv1alpha1.LoadingStrategyEager
+	}
+
+	// Init containers provision every model. Eager pools also warm them before
+	// serving. Accelerator pools must preload so the runtime receives the
+	// explicit CUDA/PJRT backend selection instead of falling back to CPU.
+	preload := make([]map[string]any, 0, len(pool.Spec.Models.Preload))
+	for _, model := range pool.Spec.Models.Preload {
+		modelStrategy := model.Strategy
+		if modelStrategy == "" {
+			modelStrategy = loadingStrategy
+		}
+		if modelStrategy != antflyaiv1alpha1.LoadingStrategyEager && pool.Spec.Hardware.Accelerator == "" {
+			continue
+		}
+
+		entry := map[string]any{
+			"kind": zigWarmModelKind(model.Tasks),
+			"name": model.Name,
+		}
+		if format, quantization, ok := inferenceArtifactSelection(model.Name); ok {
+			entry["format"] = format
+			if quantization != "" {
+				entry["quantization"] = quantization
+			}
+		}
+		if pool.Spec.Hardware.Accelerator != "" {
+			if strings.Contains(strings.ToLower(pool.Spec.Hardware.Accelerator), "tpu") {
+				entry["backend"] = "xla"
+			} else {
+				entry["backend"] = "cuda"
+			}
+		}
+		preload = append(preload, entry)
 	}
 
 	// Set auto-generated config (don't override if user specified)
 	if _, exists := config["preload"]; !exists && len(preload) > 0 {
 		config["preload"] = preload
 	}
-
-	// Build per-model loading strategies map
-	// Only include models that have an explicit strategy override
-	// Key format is the canonical model ref from spec.models.preload[].name.
-	if _, exists := config["model_strategies"]; !exists {
-		modelStrategies := make(map[string]string)
-		for _, m := range pool.Spec.Models.Preload {
-			if m.Strategy != "" {
-				modelStrategies[m.Name] = string(m.Strategy)
-			}
-		}
-		if len(modelStrategies) > 0 {
-			config["model_strategies"] = modelStrategies
-		}
+	if _, exists := config["models_dir"]; !exists {
+		config["models_dir"] = "/models"
 	}
 
-	// Set model directories based on models-dir default
-	if _, exists := config["embedder_models_dir"]; !exists {
-		config["embedder_models_dir"] = "/models/embedders"
-	}
-	if _, exists := config["chunker_models_dir"]; !exists {
-		config["chunker_models_dir"] = "/models/chunkers"
-	}
-	if _, exists := config["reranker_models_dir"]; !exists {
-		config["reranker_models_dir"] = "/models/rerankers"
-	}
-
-	// Set loading strategy config
-	// Note: Inference defaults to lazy loading (5m keep_alive) like Ollama.
-	// Eager loading must be explicitly set with keep_alive="0".
-	if pool.Spec.Models.LoadingStrategy != "" {
-		switch pool.Spec.Models.LoadingStrategy {
+	// Translate Kubernetes durations to the Zig runtime's millisecond setting.
+	if _, exists := config["keep_alive_ms"]; !exists {
+		switch loadingStrategy {
 		case antflyaiv1alpha1.LoadingStrategyEager:
-			// Eager loading: explicitly set keep_alive=0 to load all models at startup
-			if _, exists := config["keep_alive"]; !exists {
-				config["keep_alive"] = "0"
-			}
+			config["keep_alive_ms"] = uint64(0)
 		case antflyaiv1alpha1.LoadingStrategyLazy:
-			// Lazy loading: set keep_alive if not specified (matches Inference default)
-			if _, exists := config["keep_alive"]; !exists {
-				if pool.Spec.Models.KeepAlive != nil {
-					config["keep_alive"] = pool.Spec.Models.KeepAlive.Duration.String()
-				} else {
-					config["keep_alive"] = "5m" // Default 5 minutes
-				}
+			keepAlive, err := inferenceKeepAliveMillis(pool)
+			if err != nil {
+				return "", err
 			}
+			config["keep_alive_ms"] = keepAlive
 		case antflyaiv1alpha1.LoadingStrategyBounded:
-			// Bounded loading: set max_loaded_models
-			if _, exists := config["max_loaded_models"]; !exists {
-				if pool.Spec.Models.MaxLoadedModels != nil {
-					config["max_loaded_models"] = *pool.Spec.Models.MaxLoadedModels
-				}
+			keepAlive, err := inferenceKeepAliveMillis(pool)
+			if err != nil {
+				return "", err
 			}
-			// Also set keep_alive for LRU eviction
-			if _, exists := config["keep_alive"]; !exists {
-				if pool.Spec.Models.KeepAlive != nil {
-					config["keep_alive"] = pool.Spec.Models.KeepAlive.Duration.String()
-				} else {
-					config["keep_alive"] = "5m"
-				}
-			}
+			config["keep_alive_ms"] = keepAlive
 		}
 	}
-
-	// Set backend_priority based on accelerator type.
-	// For CPU-only pools, the default from the container env var is sufficient.
-	// This must be a JSON array (not a comma-separated string) so that
-	// viper.GetStringSlice parses it correctly.
-	if _, exists := config["backend_priority"]; !exists && pool.Spec.Hardware.Accelerator != "" {
-		if strings.Contains(pool.Spec.Hardware.Accelerator, "tpu") {
-			// TPU: prefer XLA backend
-			config["backend_priority"] = []string{"xla", "onnx", "go"}
-		} else {
-			// GPU (nvidia, etc.): prefer ONNX backend (CUDA support)
-			config["backend_priority"] = []string{"onnx", "xla", "go"}
+	if _, exists := config["max_loaded_models"]; !exists {
+		if pool.Spec.Models.MaxLoadedModels != nil {
+			config["max_loaded_models"] = *pool.Spec.Models.MaxLoadedModels
+		} else if len(preload) > 10 {
+			// Ensure eager startup can retain every requested model.
+			config["max_loaded_models"] = len(preload)
 		}
 	}
 
@@ -390,6 +376,73 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	}
 
 	return string(configJSON), nil
+}
+
+func inferenceKeepAliveMillis(pool *antflyaiv1alpha1.InferencePool) (uint64, error) {
+	if pool.Spec.Models.KeepAlive == nil {
+		return uint64((5 * time.Minute).Milliseconds()), nil
+	}
+	milliseconds := pool.Spec.Models.KeepAlive.Duration.Milliseconds()
+	if milliseconds < 0 {
+		return 0, fmt.Errorf("models.keepAlive must not be negative")
+	}
+	return uint64(milliseconds), nil
+}
+
+func zigWarmModelKind(tasks []string) string {
+	// Match the Zig registry's task-to-kind precedence. Model task hints are
+	// written into the pulled manifest by the init container.
+	for _, candidate := range []struct {
+		tasks []string
+		kind  string
+	}{
+		{[]string{"extract", "extractors", "recognize", "recognizer"}, "extractor"},
+		{[]string{"rerank", "rerankers"}, "reranker"},
+		{[]string{"classify", "classifiers"}, "classifier"},
+		{[]string{"generate", "generators"}, "generator"},
+		{[]string{"read", "readers"}, "reader"},
+		{[]string{"transcribe", "transcribers"}, "transcriber"},
+		{[]string{"rewrite", "rewriters"}, "rewriter"},
+		{[]string{"chunk", "chunkers"}, "chunker"},
+		{[]string{"embed", "embedders"}, "embedder"},
+	} {
+		for _, task := range tasks {
+			for _, accepted := range candidate.tasks {
+				if strings.EqualFold(task, accepted) {
+					return candidate.kind
+				}
+			}
+		}
+	}
+	// Preserve the Zig CLI's historical default for untyped model refs.
+	return "generator"
+}
+
+// inferenceArtifactSelection recognizes only runtime artifact-family suffixes.
+// Other registry variants such as :i8 remain opaque pull references.
+func inferenceArtifactSelection(modelRef string) (format, quantization string, ok bool) {
+	ref := strings.TrimPrefix(modelRef, "hf:")
+	separator := strings.IndexByte(ref, ':')
+	if separator < 0 {
+		return "", "", false
+	}
+	suffix := ref[separator+1:]
+	if quantizationSeparator := strings.IndexByte(suffix, ':'); quantizationSeparator >= 0 {
+		format = suffix[:quantizationSeparator]
+		quantization = suffix[quantizationSeparator+1:]
+		if quantization == "" {
+			return "", "", false
+		}
+	} else {
+		format = suffix
+	}
+	format = strings.ToLower(format)
+	switch format {
+	case "gguf", "onnx", "safetensors", "hybrid":
+		return format, quantization, true
+	default:
+		return "", "", false
+	}
 }
 
 func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *antflyaiv1alpha1.InferencePool) error {
@@ -454,7 +507,13 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 							Name:    "inference",
 							Image:   image,
 							Command: []string{"/antfly"},
-							Args:    []string{"inference", "run", "--host", "0.0.0.0", "--port", strconv.Itoa(InferenceAPIPort), "--models-dir", "/models"},
+							Args: []string{
+								"inference", "run",
+								"--host", "0.0.0.0",
+								"--port", strconv.Itoa(InferenceAPIPort),
+								"--config", "/config/config.json",
+								"--allow-insecure-public-bind",
+							},
 							Ports: []corev1.ContainerPort{
 								{Name: "http", ContainerPort: InferenceAPIPort, Protocol: corev1.ProtocolTCP},
 							},

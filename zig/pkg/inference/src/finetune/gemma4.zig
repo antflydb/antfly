@@ -175,6 +175,9 @@ pub const TrainEpochOptions = struct {
     use_schedule_free: bool = false,
     warmup_steps: u32 = 0,
     compute_backend: ?*const @import("../ops/ops.zig").ComputeBackend = null,
+    /// Number of DDP replicas. PJRT training falls back to the CPU path when
+    /// more than one replica is active because that path has no collectives.
+    world_size: u32 = 1,
     ddp_rank: u32 = 0,
     pjrt_lora_steps: if (build_options.enable_pjrt) ?[]?graph_bridge.LoRAPjrtTrainStep else void =
         if (build_options.enable_pjrt) null else {},

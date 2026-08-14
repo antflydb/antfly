@@ -16,6 +16,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -103,6 +104,18 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_POOL"]).To(Equal(poolName))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_WORKLOAD_TYPE"]).To(Equal("general"))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_LOADING_STRATEGY"]).To(Equal("eager"))
+			var runtimeConfig map[string]any
+			Expect(json.Unmarshal([]byte(createdConfigMap.Data["config.json"]), &runtimeConfig)).To(Succeed())
+			Expect(runtimeConfig["models_dir"]).To(Equal("/models"))
+			Expect(runtimeConfig["keep_alive_ms"]).To(Equal(float64(0)))
+			preload, ok := runtimeConfig["preload"].([]any)
+			Expect(ok).To(BeTrue())
+			Expect(preload).To(HaveLen(1))
+			preloadModel, ok := preload[0].(map[string]any)
+			Expect(ok).To(BeTrue())
+			Expect(preloadModel).To(HaveKeyWithValue("kind", "embedder"))
+			Expect(preloadModel).To(HaveKeyWithValue("name", "bge-small-en-v1.5"))
+			Expect(preloadModel).To(HaveKeyWithValue("backend", "xla"))
 
 			// Verify the StatefulSet was created
 			stsLookupKey := types.NamespacedName{Name: poolName, Namespace: poolNamespace}
@@ -117,7 +130,13 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdSts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Name).To(Equal("inference"))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{"/antfly"}))
-			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{"inference", "run", "--host", "0.0.0.0", "--port", "8080", "--models-dir", "/models"}))
+			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+				"inference", "run",
+				"--host", "0.0.0.0",
+				"--port", "8080",
+				"--config", "/config/config.json",
+				"--allow-insecure-public-bind",
+			}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args).To(Equal([]string{

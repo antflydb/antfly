@@ -143,6 +143,17 @@ lite_lib_name="$(lite_library_name "$target")"
 lite_lib_archive_path="$(lite_library_archive_path "$target")"
 lite_lib_prefix_path="$prefix/${lite_lib_archive_path#./}"
 
+cuda=false
+pjrt=false
+case "$target" in
+  *-linux-*)
+    # Both backends load their driver/plugin at runtime, so the same Linux
+    # artifact remains usable on CPU-only hosts.
+    cuda=true
+    pjrt=true
+    ;;
+esac
+
 rm -rf "$work_root"
 mkdir -p "$prefix" "$stage" "$local_cache" "$cache_root/global" "$out_dir"
 
@@ -155,7 +166,8 @@ zig_build_options=(
   -Dantfly-version="$version"
   -Donnx=false
   -Dmetal="$metal"
-  -Dcuda=false
+  -Dcuda="$cuda"
+  -Dpjrt="$pjrt"
   -Dsystem-blas="$system_blas"
 )
 
