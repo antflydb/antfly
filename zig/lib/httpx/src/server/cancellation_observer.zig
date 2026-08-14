@@ -56,11 +56,16 @@ pub const Observer = struct {
         id: u64,
         fd: std.posix.fd_t,
         cancellation: *std.atomic.Value(bool),
-        /// Once normal input or an orderly half-close is observed, passive
-        /// probing cannot establish response abandonment. Stop watching this
-        /// request and leave cancellation to deadlines, explicit application
-        /// cancellation, response-write failure, or connection shutdown.
+        /// An orderly half-close cannot establish response abandonment. Stop
+        /// watching after one is observed and leave cancellation to deadlines,
+        /// explicit application cancellation, response-write failure, or
+        /// connection shutdown.
         watched: bool = true,
+        /// Once input for a pipelined request is visible, polling readability
+        /// would spin until the active handler finishes and the connection
+        /// parser consumes it. Keep the descriptor registered for hard socket
+        /// errors while suppressing further readability notifications.
+        unread_input: bool = false,
     };
 
     pub const Registration = struct {
@@ -225,7 +230,11 @@ pub const Observer = struct {
             ids.clearRetainingCapacity();
             for (self.entries.items) |entry| {
                 if (!entry.watched) continue;
-                fds.appendAssumeCapacity(.{ .fd = entry.fd, .events = WindowsPoll.poll_read, .revents = 0 });
+                fds.appendAssumeCapacity(.{
+                    .fd = entry.fd,
+                    .events = if (entry.unread_input) 0 else WindowsPoll.poll_read,
+                    .revents = 0,
+                });
                 ids.appendAssumeCapacity(entry.id);
             }
             self.mutex.unlock();
@@ -252,8 +261,14 @@ pub const Observer = struct {
                     self.cancelLocked(index, true);
                     continue;
                 }
-                if (poll_fd.revents & (WindowsPoll.poll_read | WindowsPoll.poll_hup) != 0)
+                if (poll_fd.revents & (WindowsPoll.poll_read | WindowsPoll.poll_hup) != 0) {
+                    const entry_id = self.entries.items[index].id;
                     self.probeWindowsLocked(index);
+                    if (poll_fd.revents & WindowsPoll.poll_hup != 0) {
+                        if (self.indexOfLocked(entry_id)) |remaining_index|
+                            self.stopWatchingLocked(remaining_index);
+                    }
+                }
             }
             self.mutex.unlock();
         }
@@ -273,7 +288,11 @@ pub const Observer = struct {
             ids.clearRetainingCapacity();
             for (self.entries.items) |entry| {
                 if (!entry.watched) continue;
-                fds.appendAssumeCapacity(.{ .fd = entry.fd, .events = std.posix.POLL.IN, .revents = 0 });
+                fds.appendAssumeCapacity(.{
+                    .fd = entry.fd,
+                    .events = if (entry.unread_input) 0 else std.posix.POLL.IN,
+                    .revents = 0,
+                });
                 ids.appendAssumeCapacity(entry.id);
             }
             self.mutex.unlock();
@@ -295,8 +314,14 @@ pub const Observer = struct {
                     self.cancelLocked(index, true);
                     continue;
                 }
-                if (poll_fd.revents & (std.posix.POLL.IN | std.posix.POLL.HUP) != 0)
+                if (poll_fd.revents & (std.posix.POLL.IN | std.posix.POLL.HUP) != 0) {
+                    const entry_id = self.entries.items[index].id;
                     self.probeLocked(index);
+                    if (poll_fd.revents & std.posix.POLL.HUP != 0) {
+                        if (self.indexOfLocked(entry_id)) |remaining_index|
+                            self.stopWatchingLocked(remaining_index);
+                    }
+                }
             }
             self.mutex.unlock();
         }
@@ -322,8 +347,15 @@ pub const Observer = struct {
                 const index = self.indexOfLocked(@intCast(event.udata)) orelse continue;
                 if (event.flags & std.c.EV.ERROR != 0) {
                     self.cancelLocked(index, false);
+                } else if (event.flags & std.c.EV.EOF != 0) {
+                    // EV_EOF is also reported for an orderly half-close. A
+                    // nonzero socket error distinguishes an abortive close.
+                    if (event.fflags != 0)
+                        self.cancelLocked(index, true)
+                    else
+                        self.stopWatchingLocked(index);
                 } else {
-                    self.probeLocked(index);
+                    if (!self.entries.items[index].unread_input) self.probeLocked(index);
                 }
             }
             self.mutex.unlock();
@@ -359,7 +391,7 @@ pub const Observer = struct {
         );
         if (n == 0) return self.stopWatchingLocked(index);
         if (n > 0) {
-            self.stopWatchingLocked(index);
+            entry.unread_input = true;
             return;
         }
         switch (std.posix.errno(n)) {
@@ -376,7 +408,7 @@ pub const Observer = struct {
         const n = WindowsPoll.recv(entry.fd, &byte, byte.len, 0x2); // MSG_PEEK
         if (n == 0) return self.stopWatchingLocked(index);
         if (n > 0) {
-            self.stopWatchingLocked(index);
+            entry.unread_input = true;
             return;
         }
         switch (WindowsPoll.WSAGetLastError()) {

@@ -58,6 +58,11 @@ that end state:
   that can silently drop it. The native adapter also preserves typed retry
   metadata, and both adapters route on the parsed path rather than the
   query-bearing raw target.
+- Serverless bootstrap also lends its process-owned application `std.Io` to
+  managed embedders and remote template helpers. Listener/request scheduling
+  remains isolated in `HttpRuntime`; nested outbound work therefore reuses a
+  stable application executor instead of creating short-lived threaded
+  executors that can exhaust process thread resources under sustained traffic.
 - Cancellable outbound requests own the complete resolve/connect/request
   attempt in a `std.Io` task. The semantic watchdog interrupts established
   sockets and cancels the owning task, so DNS and initial connection work no
@@ -684,8 +689,9 @@ serving the connection inline. Explicit serial execution remains available for
 small test or embedding configurations and is selected deliberately.
 
 Protocol-native overload behavior is decided before application code runs.
-HTTP/1 returns 503 and closes the connection when its listener has no request
-permit or cannot schedule the claimed task. HTTP/2 has an additional invariant:
+HTTP/1 returns 503 with `Connection: close` and closes the connection when its
+listener has no request permit or cannot schedule the claimed task. HTTP/2 has
+an additional invariant:
 the connection task is the sole frame pump and must remain able to receive DATA
 for streaming request bodies. A saturated HTTP/2 or h2c stream is therefore
 reset with `RST_STREAM(REFUSED_STREAM)` and is never executed inline on the
@@ -719,9 +725,12 @@ and libc-specific requirements that a transport library cannot safely size.
 Supported hosts reserve that address space virtually, so committed memory still
 tracks actual use; embedders may configure a smaller stack only after validating
 every deployment target. The observer only peeks; the HTTP parser remains the
-sole consumer of socket bytes. Unsupported freestanding targets fail listener
-startup when observation is required; no supported platform can silently turn
-`.required` into a no-op. An HTTP/1 peer may
+sole consumer of socket bytes. Readable pipelined input suppresses further
+readability notifications while retaining hard-error/reset observation; it
+must never unregister the descriptor before the active request completes.
+Unsupported freestanding targets fail listener startup when observation is
+required; no supported platform can silently turn `.required` into a no-op. An
+HTTP/1 peer may
 half-close its request side with FIN while legitimately awaiting the response,
 so orderly EOF is never treated as request cancellation. Only a hard socket
 failure/reset cancels an active H1 request; explicit protocol cancellation and

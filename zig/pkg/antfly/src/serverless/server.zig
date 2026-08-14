@@ -56,7 +56,7 @@ pub const ServerlessServer = struct {
     pub fn init(alloc: std.mem.Allocator, io: std.Io, cfg: ServerlessServerConfig) !ServerlessServer {
         const stack = try alloc.create(runtime_mod.OwnedStack);
         errdefer alloc.destroy(stack);
-        try stack.init(alloc, cfg.bootstrap);
+        try stack.init(alloc, cfg.bootstrap, io);
         errdefer stack.deinit();
 
         const http_server = try alloc.create(serverless_http_server.ServerlessHttpServer);

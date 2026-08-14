@@ -2899,6 +2899,9 @@ pub const Server = struct {
 
         resp.body = routeErrorBody(code);
         try resp.headers.set(HeaderName.CONTENT_TYPE, "application/json");
+        // Every sendError caller terminates the HTTP/1 connection. Make that
+        // lifecycle explicit so clients do not return the socket to a pool.
+        try resp.headers.set(HeaderName.CONNECTION, "close");
         if (code == 429) try resp.headers.set("Retry-After", "1");
         try ensureContentLengthHeader(&resp);
         try ensureDateHeader(self.io, &resp);
@@ -4536,6 +4539,7 @@ test "HTTP/1 and h2c request saturation reject before application work" {
     const rejected_len = try second_client.recv(&rejected_response);
 
     try std.testing.expect(mem.indexOf(u8, rejected_response[0..rejected_len], " 503 ") != null);
+    try std.testing.expect(mem.indexOf(u8, rejected_response[0..rejected_len], "Connection: close\r\n") != null);
 
     // An h2c upgrade is still an admitted request. Saturation must reject it
     // before switching protocols, otherwise h2c could bypass the universal
@@ -4553,6 +4557,7 @@ test "HTTP/1 and h2c request saturation reject before application work" {
     var h2c_rejected_response: [1024]u8 = undefined;
     const h2c_rejected_len = try h2c_client.recv(&h2c_rejected_response);
     try std.testing.expect(mem.indexOf(u8, h2c_rejected_response[0..h2c_rejected_len], " 503 ") != null);
+    try std.testing.expect(mem.indexOf(u8, h2c_rejected_response[0..h2c_rejected_len], "Connection: close\r\n") != null);
     try std.testing.expect(mem.indexOf(u8, h2c_rejected_response[0..h2c_rejected_len], " 101 ") == null);
 
     try std.testing.expectEqual(@as(u32, 1), State.handler_calls.load(.acquire));
@@ -4874,6 +4879,80 @@ test "H1 orderly half close does not cancel an active response" {
     try std.testing.expect(mem.indexOf(u8, response[0..response_len], "complete") != null);
     try std.testing.expect(!State.canceled.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), server.httpRuntimeStats().h1_hard_disconnect_cancellations_total);
+}
+
+test "H1 hard disconnect remains observable behind pipelined input" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const State = struct {
+        var started = std.atomic.Value(bool).init(false);
+        var canceled = std.atomic.Value(bool).init(false);
+
+        fn handler(ctx: *Context) anyerror!Response {
+            started.store(true, .release);
+            while (!ctx.isCancellationRequested())
+                try ctx.io.sleep(Io.Duration.fromMilliseconds(1), .awake);
+            canceled.store(true, .release);
+            return error.Canceled;
+        }
+    };
+    State.started.store(false, .release);
+    State.canceled.store(false, .release);
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
+    defer server.deinit();
+    try server.get("/slow", State.handler);
+    try server.bind();
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("hard-disconnect listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    var client_open = true;
+    defer if (client_open) client.close();
+    try client.sendAll("GET /slow HTTP/1.1\r\nHost: test\r\n\r\n");
+    while (!State.started.load(.acquire)) std.Thread.yield() catch {};
+    while (server.httpRuntimeStats().active_h1_cancellation_observers != 1) std.Thread.yield() catch {};
+
+    // Leave a partial next request unread while the active handler owns the
+    // connection, then abort. Readability must be suppressed without dropping
+    // the descriptor's hard-error observation.
+    try client.sendAll("G");
+    var observation_delay = std.posix.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+    _ = std.posix.system.nanosleep(&observation_delay, &observation_delay);
+    var linger = std.posix.linger{ .onoff = 1, .linger = 0 };
+    try std.posix.setsockopt(
+        client.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.LINGER,
+        std.mem.asBytes(&linger),
+    );
+    client.close();
+    client_open = false;
+
+    for (0..10_000) |_| {
+        if (State.canceled.load(.acquire) and server.httpRuntimeStats().active_h1_cancellation_observers == 0) break;
+        var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.posix.system.nanosleep(&delay, &delay);
+    }
+    try std.testing.expect(State.canceled.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.httpRuntimeStats().active_h1_cancellation_observers);
+    try std.testing.expectEqual(@as(u64, 1), server.httpRuntimeStats().h1_hard_disconnect_cancellations_total);
 }
 
 test "H1 context does not treat a partial pipeline suffix as buffered input" {

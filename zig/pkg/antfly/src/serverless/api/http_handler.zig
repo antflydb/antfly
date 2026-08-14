@@ -183,6 +183,7 @@ pub const HttpHandler = struct {
     query_cache: ?*query_mod.QueryCache = null,
     managed_query_embedder: ?*managed_embedder.ManagedEmbedder = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    io: ?std.Io = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     published_search_sources: search_sources.PublishedSearchSources = .{},
     runtime_status: *const api_types.RuntimeStatusResult,
@@ -208,6 +209,10 @@ pub const HttpHandler = struct {
             .query = query,
             .runtime_status = runtime_status,
         };
+    }
+
+    pub fn setIo(self: *HttpHandler, io: ?std.Io) void {
+        self.io = io;
     }
 
     pub fn handle(self: *HttpHandler, req: HttpRequest) !HttpResponse {
@@ -2974,6 +2979,7 @@ pub const HttpHandler = struct {
             defer table.deinit(self.alloc);
 
             var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(self.alloc, table.indexes_json, .{
+                .io = self.io,
                 .remote_content = self.remote_content,
             });
             defer runtime.deinit();
