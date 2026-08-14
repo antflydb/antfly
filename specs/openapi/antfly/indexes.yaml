@@ -42,7 +42,6 @@ components:
           description: "Optional description of the index and its purpose"
         type:
           $ref: "#/components/schemas/IndexType"
-          x-go-name: "type"
         version:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -993,10 +992,10 @@ components:
       discriminator:
         propertyName: index_type
         mapping:
-          full_text: "#/components/schemas/FullTextIndexStats"
-          embeddings: "#/components/schemas/EmbeddingsIndexStats"
-          graph: "#/components/schemas/GraphIndexStats"
-          algebraic: "#/components/schemas/AlgebraicIndexStats"
+          full_text: "indexes.yaml#/components/schemas/FullTextIndexStats"
+          embeddings: "indexes.yaml#/components/schemas/EmbeddingsIndexStats"
+          graph: "indexes.yaml#/components/schemas/GraphIndexStats"
+          algebraic: "indexes.yaml#/components/schemas/AlgebraicIndexStats"
       oneOf:
         - $ref: "#/components/schemas/FullTextIndexStats"
         - $ref: "#/components/schemas/EmbeddingsIndexStats"

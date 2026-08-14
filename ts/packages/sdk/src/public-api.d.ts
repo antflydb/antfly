@@ -5981,8 +5981,13 @@ export interface components {
         /** @description A validated Antfly query retained as raw JSON by Go servers and clients. */
         RawQuery: components["schemas"]["Query"];
         HierarchyProjection: {
-            /** @description Fields to include from the hydrated hierarchy document. Omit to include all fields. */
-            fields?: string[];
+            /**
+             * @description Fields to include from the hydrated hierarchy document. This projection is
+             *     required whenever the ancestor is requested so hierarchy hydration cannot
+             *     accidentally return an unbounded document. Use an empty array to return
+             *     hierarchy identity without stored document fields.
+             */
+            fields: string[];
         };
         HierarchyChildren: {
             /**
@@ -5997,34 +6002,48 @@ export interface components {
              * @default 3
              */
             limit?: number;
-            /** @description Fields to include in each child hit. Omit to use the top-level fields projection. */
-            fields?: string[];
+            /**
+             * @description Fields to include in each child hit. This projection is required because
+             *     source and child records commonly have different schemas. Use an empty
+             *     array to return child identity and hierarchy metadata without stored fields.
+             */
+            fields: string[];
         };
         HierarchyAncestors: {
             source?: components["schemas"]["HierarchyProjection"];
             unit?: components["schemas"]["HierarchyProjection"];
         };
         /**
-         * @description Controls the hierarchy level returned by a query, optional bounded child hits,
-         *     and projected ancestor context. `children` is analogous to a bounded nested
+         * @description Controls whether a query returns direct matches or source documents, optional
+         *     bounded child hits, and projected ancestor context. `children` is analogous to a bounded nested
          *     inner-hit request: it defaults to three children per parent while the top-level
          *     `limit` continues to control the number of returned hits.
          *
-         *     The legacy `rollup`, `include`, and `max_children_per_parent` fields remain
-         *     supported for compatibility. Prefer `children` and `ancestors` for new clients.
+         *     The new controls are deliberately exclusive: `matches` may use `ancestors`,
+         *     while `sources` may use `children`. When `result_mode` is omitted, `ancestors`
+         *     implies `matches` and `children` implies `sources`. Ancestor and child field
+         *     projections are always explicit to keep response size predictable.
+         *
+         *     The legacy `return_level`, `rollup`, `include`, and
+         *     `max_children_per_parent` fields remain supported in legacy-only requests.
+         *     Do not mix legacy and new controls in one request.
          */
         QueryHierarchy: {
             /**
-             * @description Top-level result shape. `source` rolls matches up to source documents;
-             *     `chunk` returns directly matched derived records. The targeted index
-             *     determines the actual derived level, which is reported in each hit's
-             *     `hierarchy.level`. Legacy JSON requests using `unit` or `mention` remain
-             *     accepted as direct-match aliases but are not exposed to new clients.
+             * @description Top-level result shape. `matches` returns the records matched by the
+             *     targeted index; their actual hierarchy level is reported in each hit's
+             *     `hierarchy.level`. `sources` groups matches by source document.
+             * @enum {string}
+             */
+            result_mode?: "matches" | "sources";
+            children?: components["schemas"]["HierarchyChildren"];
+            ancestors?: components["schemas"]["HierarchyAncestors"];
+            /**
+             * @deprecated
+             * @description Legacy result-shape control. Prefer result_mode.
              * @enum {string}
              */
             return_level?: "source" | "chunk";
-            children?: components["schemas"]["HierarchyChildren"];
-            ancestors?: components["schemas"]["HierarchyAncestors"];
             /**
              * @deprecated
              * @enum {string}
@@ -6038,7 +6057,7 @@ export interface components {
              * @description Legacy child limit. Prefer children.limit.
              */
             max_children_per_parent?: number;
-        };
+        } & (unknown & unknown & unknown & unknown);
         QueryRequest: {
             /**
              * @description Name of the table to query. Optional for global queries.

@@ -9014,17 +9014,51 @@ fn applyPublicHierarchyControls(
     const hierarchy = parsed.value.object.get("hierarchy") orelse return;
     if (hierarchy != .object) return error.InvalidQueryRequest;
 
+    var result_mode: ?[]const u8 = null;
     var return_level: ?[]const u8 = null;
     var rollup: ?[]const u8 = null;
     var include_chunk = false;
     var max_children_set = false;
     var children_set = false;
+    var ancestors_set = false;
+    var has_new_controls = false;
+    var has_legacy_controls = false;
+
+    var style_it = hierarchy.object.iterator();
+    while (style_it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "result_mode") or
+            std.mem.eql(u8, key, "children") or
+            std.mem.eql(u8, key, "ancestors"))
+        {
+            has_new_controls = true;
+            if (std.mem.eql(u8, key, "children")) children_set = true;
+            if (std.mem.eql(u8, key, "ancestors")) ancestors_set = true;
+        } else if (std.mem.eql(u8, key, "return_level") or
+            std.mem.eql(u8, key, "rollup") or
+            std.mem.eql(u8, key, "include") or
+            std.mem.eql(u8, key, "max_children_per_parent"))
+        {
+            has_legacy_controls = true;
+        } else {
+            return error.InvalidQueryRequest;
+        }
+    }
+    if (has_new_controls and has_legacy_controls) return error.InvalidQueryRequest;
+    if (children_set and ancestors_set) return error.InvalidQueryRequest;
 
     var it = hierarchy.object.iterator();
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         const value = entry.value_ptr.*;
-        if (std.mem.eql(u8, key, "return_level")) {
+        if (std.mem.eql(u8, key, "result_mode")) {
+            if (value != .string) return error.InvalidQueryRequest;
+            if (std.mem.eql(u8, value.string, "matches") or std.mem.eql(u8, value.string, "sources")) {
+                result_mode = value.string;
+            } else {
+                return error.InvalidQueryRequest;
+            }
+        } else if (std.mem.eql(u8, key, "return_level")) {
             if (value != .string) return error.InvalidQueryRequest;
             if (std.mem.eql(u8, value.string, "source") or std.mem.eql(u8, value.string, "unit") or std.mem.eql(u8, value.string, "chunk") or std.mem.eql(u8, value.string, "mention")) {
                 return_level = value.string;
@@ -9058,15 +9092,14 @@ fn applyPublicHierarchyControls(
                 }
             }
         } else if (std.mem.eql(u8, key, "max_children_per_parent")) {
-            if (children_set) return error.InvalidQueryRequest;
             req.max_chunks_per_parent = try parseOptionalU32Json(value, req.max_chunks_per_parent);
             max_children_set = true;
         } else if (std.mem.eql(u8, key, "children")) {
-            if (value != .object or max_children_set) return error.InvalidQueryRequest;
-            children_set = true;
+            if (value != .object) return error.InvalidQueryRequest;
             include_chunk = true;
             req.max_chunks_per_parent = 3;
             req.hierarchy_omit_implicit_source_ancestor_document = true;
+            var fields_set = false;
 
             var child_it = value.object.iterator();
             while (child_it.next()) |child_entry| {
@@ -9081,12 +9114,14 @@ fn applyPublicHierarchyControls(
                 } else if (std.mem.eql(u8, child_key, "fields")) {
                     req.hierarchy_child_fields = try parseStringArrayJsonAlloc(alloc, child_value);
                     req.hierarchy_child_include_all_fields = false;
+                    fields_set = true;
                 } else {
                     return error.InvalidQueryRequest;
                 }
             }
+            if (!fields_set) return error.InvalidQueryRequest;
         } else if (std.mem.eql(u8, key, "ancestors")) {
-            if (value != .object) return error.InvalidQueryRequest;
+            if (value != .object or value.object.count() == 0) return error.InvalidQueryRequest;
             var ancestor_it = value.object.iterator();
             while (ancestor_it.next()) |ancestor_entry| {
                 const ancestor_key = ancestor_entry.key_ptr.*;
@@ -9098,11 +9133,13 @@ fn applyPublicHierarchyControls(
                 if (!is_source and !is_unit) return error.InvalidQueryRequest;
                 if (is_source) req.hierarchy_include_source = true;
                 if (is_unit) req.hierarchy_include_unit = true;
+                var fields_set = false;
 
                 var projection_it = ancestor_value.object.iterator();
                 while (projection_it.next()) |projection_entry| {
                     if (!std.mem.eql(u8, projection_entry.key_ptr.*, "fields")) return error.InvalidQueryRequest;
                     const fields = try parseStringArrayJsonAlloc(alloc, projection_entry.value_ptr.*);
+                    fields_set = true;
                     if (is_source) {
                         req.hierarchy_source_fields = fields;
                         req.hierarchy_source_include_all_fields = false;
@@ -9111,25 +9148,26 @@ fn applyPublicHierarchyControls(
                         req.hierarchy_unit_include_all_fields = false;
                     }
                 }
+                if (!fields_set) return error.InvalidQueryRequest;
             }
-        } else {
-            return error.InvalidQueryRequest;
         }
+    }
+
+    if (has_new_controls) {
+        const resolved_mode = result_mode orelse if (children_set) "sources" else if (ancestors_set) "matches" else return;
+        if (std.mem.eql(u8, resolved_mode, "matches")) {
+            if (children_set) return error.InvalidQueryRequest;
+            req.return_mode = .chunk;
+        } else {
+            if (ancestors_set) return error.InvalidQueryRequest;
+            req.return_mode = if (children_set) .parent_with_chunks else .parent;
+        }
+        return;
     }
 
     const has_child_limit = (max_children_set or children_set) and req.max_chunks_per_parent > 0;
     const wants_source_rollup = if (rollup) |value| std.mem.eql(u8, value, "source") else false;
     const wants_no_rollup = if (rollup) |value| std.mem.eql(u8, value, "none") else false;
-
-    // `children` is a source-hit projection. Treating it as an override for a
-    // direct-hit request silently changes the top-level result shape and can
-    // multiply the response size, so reject contradictory new-style controls.
-    if (children_set) {
-        if (return_level) |level| {
-            if (!std.mem.eql(u8, level, "source")) return error.InvalidQueryRequest;
-        }
-        if (wants_no_rollup) return error.InvalidQueryRequest;
-    }
 
     if (return_level) |level| {
         if (std.mem.eql(u8, level, "chunk") or std.mem.eql(u8, level, "unit") or std.mem.eql(u8, level, "mention")) {
@@ -10498,13 +10536,12 @@ test "api query contract parses public hierarchy controls" {
     try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, mention.req.return_mode);
     try std.testing.expect(mention.req.hierarchy_include_source);
 
-    const projected_body =
+    const projected_matches_body =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": ["title"],
+        \\  "fields": ["text"],
         \\  "hierarchy": {
-        \\    "return_level": "source",
-        \\    "children": {"level":"chunk","fields":["text"]},
+        \\    "result_mode": "matches",
         \\    "ancestors": {
         \\      "source": {"fields":["title","url"]},
         \\      "unit": {"fields":["page"]}
@@ -10512,20 +10549,37 @@ test "api query contract parses public hierarchy controls" {
         \\  }
         \\}
     ;
-    var projected = try parseQueryRequest(alloc, null, "docs", projected_body);
-    defer projected.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, projected.req.return_mode);
-    try std.testing.expectEqual(@as(u32, 3), projected.req.max_chunks_per_parent);
-    try std.testing.expect(projected.req.hierarchy_omit_implicit_source_ancestor_document);
-    try std.testing.expect(projected.req.hierarchy_include_source);
-    try std.testing.expect(projected.req.hierarchy_include_unit);
-    try std.testing.expect(!projected.req.hierarchy_child_include_all_fields);
-    try std.testing.expectEqualStrings("text", projected.req.hierarchy_child_fields[0]);
-    try std.testing.expect(!projected.req.hierarchy_source_include_all_fields);
-    try std.testing.expectEqualStrings("url", projected.req.hierarchy_source_fields[1]);
-    try std.testing.expect(!projected.req.hierarchy_unit_include_all_fields);
-    try std.testing.expectEqualStrings("page", projected.req.hierarchy_unit_fields[0]);
-    try std.testing.expect(projected.req.defer_stored_projection);
+    var projected_matches = try parseQueryRequest(alloc, null, "docs", projected_matches_body);
+    defer projected_matches.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, projected_matches.req.return_mode);
+    try std.testing.expect(projected_matches.req.hierarchy_include_source);
+    try std.testing.expect(projected_matches.req.hierarchy_include_unit);
+    try std.testing.expect(!projected_matches.req.hierarchy_source_include_all_fields);
+    try std.testing.expectEqualStrings("url", projected_matches.req.hierarchy_source_fields[1]);
+    try std.testing.expect(!projected_matches.req.hierarchy_unit_include_all_fields);
+    try std.testing.expectEqualStrings("page", projected_matches.req.hierarchy_unit_fields[0]);
+    try std.testing.expect(projected_matches.req.defer_stored_projection);
+
+    const projected_sources_body =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": ["title"],
+        \\  "hierarchy": {
+        \\    "result_mode": "sources",
+        \\    "children": {"fields":["text"]}
+        \\  }
+        \\}
+    ;
+    var projected_sources = try parseQueryRequest(alloc, null, "docs", projected_sources_body);
+    defer projected_sources.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, projected_sources.req.return_mode);
+    try std.testing.expectEqual(@as(u32, 3), projected_sources.req.max_chunks_per_parent);
+    try std.testing.expect(projected_sources.req.hierarchy_omit_implicit_source_ancestor_document);
+    try std.testing.expect(!projected_sources.req.hierarchy_include_source);
+    try std.testing.expect(!projected_sources.req.hierarchy_include_unit);
+    try std.testing.expect(!projected_sources.req.hierarchy_child_include_all_fields);
+    try std.testing.expectEqualStrings("text", projected_sources.req.hierarchy_child_fields[0]);
+    try std.testing.expect(projected_sources.req.defer_stored_projection);
 }
 
 test "api query contract rejects unsupported hierarchy levels" {
@@ -10541,7 +10595,7 @@ test "api query contract rejects unsupported hierarchy levels" {
     const unsupported_children =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {"children":{"level":"unit"}}
+        \\  "hierarchy": {"children":{"level":"unit","fields":[]}}
         \\}
     ;
     try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", unsupported_children));
@@ -10549,29 +10603,73 @@ test "api query contract rejects unsupported hierarchy levels" {
     const contradictory_children =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {"return_level":"chunk","children":{"level":"chunk"}}
+        \\  "hierarchy": {"result_mode":"matches","children":{"fields":["text"]}}
         \\}
     ;
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", contradictory_children));
 
-    const contradictory_rollup =
+    const contradictory_ancestors =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {"rollup":"none","children":{"level":"chunk"}}
+        \\  "hierarchy": {"result_mode":"sources","ancestors":{"source":{"fields":["title"]}}}
         \\}
     ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", contradictory_rollup));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", contradictory_ancestors));
+
+    const mixed_projections =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"children":{"fields":["text"]},"ancestors":{"source":{"fields":["title"]}}}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", mixed_projections));
+
+    const mixed_contract_generations =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"result_mode":"sources","include":["chunk"]}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", mixed_contract_generations));
+
+    const missing_child_fields =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"children":{"limit":2}}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", missing_child_fields));
+
+    const missing_ancestor_fields =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"ancestors":{"source":{}}}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", missing_ancestor_fields));
 
     const implicit_source_children =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {"children":{"level":"chunk","limit":2}}
+        \\  "hierarchy": {"children":{"limit":2,"fields":["text"]}}
         \\}
     ;
     var implicit_source = try parseQueryRequest(alloc, null, "docs", implicit_source_children);
     defer implicit_source.deinit(alloc);
     try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, implicit_source.req.return_mode);
     try std.testing.expectEqual(@as(u32, 2), implicit_source.req.max_chunks_per_parent);
+
+    const implicit_matches_ancestors =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"ancestors":{"source":{"fields":[]}}}
+        \\}
+    ;
+    var implicit_matches = try parseQueryRequest(alloc, null, "docs", implicit_matches_ancestors);
+    defer implicit_matches.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, implicit_matches.req.return_mode);
+    try std.testing.expect(implicit_matches.req.hierarchy_include_source);
+    try std.testing.expect(!implicit_matches.req.hierarchy_source_include_all_fields);
 }
 
 test "api query contract keeps generated schema strict when with is present" {

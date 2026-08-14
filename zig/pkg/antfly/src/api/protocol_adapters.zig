@@ -23,7 +23,7 @@ const a2a = @import("antfly_a2a");
 
 const trusted_principal_header = "X-Antfly-Trusted-Principal";
 const max_mcp_sample_documents_limit: i64 = 100;
-const mcp_tool_result_too_large_text = "Antfly produced more data than this MCP client can safely consume. Reduce limit and fields, avoid _chunks.*, or retrieve individual chunks with queryRequest.hierarchy.return_level=\"chunk\".";
+const mcp_tool_result_too_large_text = "Antfly produced more data than this MCP client can safely consume. Reduce limit and fields, avoid _chunks.*, or return direct matches with queryRequest.hierarchy.result_mode=\"matches\".";
 
 const McpToolKind = enum {
     create_table,
@@ -83,12 +83,43 @@ const full_text_search_schema_json =
     \\{"oneOf":[{"type":"string"},{"type":"object","additionalProperties":true}],"description":"Full-text query string shorthand, or the generic full_text_search query object accepted by the REST API"}
 ;
 
+const query_hierarchy_schema_json = @embedFile("generated/mcp_query_hierarchy_schema.json");
+
 const query_request_schema_json =
-    \\{"type":"object","additionalProperties":true,"description":"Raw Antfly QueryRequest body for POST /tables/{tableName}/query. Use this to access the full OpenAPI query contract. Mutually exclusive with query shorthand arguments.","properties":{"query":{"type":"object","additionalProperties":true},"full_text_search":{"type":"object","additionalProperties":true},"filter_query":{"type":"object","additionalProperties":true},"exclusion_query":{"type":"object","additionalProperties":true},"semantic_search":{"type":"string"},"embedding_template":{"type":"string"},"indexes":{"type":"array","items":{"type":"string"}},"embeddings":{"type":"object","additionalProperties":true},"fields":{"type":"array","items":{"type":"string"}},"hierarchy":{"type":"object","additionalProperties":false,"properties":{"return_level":{"type":"string","enum":["source","chunk"]},"children":{"type":"object","additionalProperties":false,"properties":{"level":{"type":"string","enum":["chunk"],"default":"chunk"},"limit":{"type":"integer","minimum":1,"default":3},"fields":{"type":"array","items":{"type":"string"}}}},"ancestors":{"type":"object","additionalProperties":false,"properties":{"source":{"type":"object","properties":{"fields":{"type":"array","items":{"type":"string"}}},"additionalProperties":false},"unit":{"type":"object","properties":{"fields":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}}},"rollup":{"type":"string","enum":["source","none"],"deprecated":true},"include":{"type":"array","items":{"type":"string"},"deprecated":true},"max_children_per_parent":{"type":"integer","minimum":0,"deprecated":true}}},"limit":{"type":"integer"},"offset":{"type":"integer"},"timeout_ms":{"type":"integer","minimum":0},"order_by":{"type":"array"},"search_after":{"type":"array","items":{}},"search_before":{"type":"array","items":{}},"filter_prefix":{"type":"string"},"distance_under":{"type":"number"},"distance_over":{"type":"number"},"search_effort":{"type":"number"},"merge_config":{"type":"object","additionalProperties":true},"count":{"type":"boolean"},"profile":{"type":"boolean"},"reranker":{"type":"object","additionalProperties":true},"aggregations":{"type":"object","additionalProperties":true},"graph_searches":{"type":"object","additionalProperties":true},"expand_strategy":{"type":"string"},"document_renderer":{"type":"string"},"pruner":{"type":"object","additionalProperties":true},"join":{"type":"object","additionalProperties":true},"foreign_sources":{"type":"object","additionalProperties":true}}}
+    \\{"type":"object","additionalProperties":true,"description":"Raw Antfly QueryRequest body for POST /tables/{tableName}/query. Use this to access the full OpenAPI query contract. Mutually exclusive with query shorthand arguments.","properties":{"query":{"type":"object","additionalProperties":true},"full_text_search":{"type":"object","additionalProperties":true},"filter_query":{"type":"object","additionalProperties":true},"exclusion_query":{"type":"object","additionalProperties":true},"semantic_search":{"type":"string"},"embedding_template":{"type":"string"},"indexes":{"type":"array","items":{"type":"string"}},"embeddings":{"type":"object","additionalProperties":true},"fields":{"type":"array","items":{"type":"string"}},"hierarchy":
+++ query_hierarchy_schema_json ++
+    \\,"limit":{"type":"integer"},"offset":{"type":"integer"},"timeout_ms":{"type":"integer","minimum":0},"order_by":{"type":"array"},"search_after":{"type":"array","items":{}},"search_before":{"type":"array","items":{}},"filter_prefix":{"type":"string"},"distance_under":{"type":"number"},"distance_over":{"type":"number"},"search_effort":{"type":"number"},"merge_config":{"type":"object","additionalProperties":true},"count":{"type":"boolean"},"profile":{"type":"boolean"},"reranker":{"type":"object","additionalProperties":true},"aggregations":{"type":"object","additionalProperties":true},"graph_searches":{"type":"object","additionalProperties":true},"expand_strategy":{"type":"string"},"document_renderer":{"type":"string"},"pruner":{"type":"object","additionalProperties":true},"join":{"type":"object","additionalProperties":true},"foreign_sources":{"type":"object","additionalProperties":true}}}
 ;
 
 const query_request_description_json =
-    \\{"openapi_schema":"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest","query_ast_schema":"specs/openapi/antfly/query.yaml#/components/schemas/Query","mcp_usage":{"tool":"query","path_table_argument":"tableName","raw_body_argument":"queryRequest","rules":["queryRequest is forwarded unchanged as the POST /tables/{tableName}/query body.","queryRequest is mutually exclusive with shorthand query arguments such as fullTextSearch, semanticSearch, fields, limit, orderBy, indexes, and filterPrefix.","queryRequest.table is rejected because tableName selects the table-scoped route.","Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema.","For hierarchical documents, prefer top-level chunk hits with hierarchy.return_level=chunk and projected fields.","Top-level limit does not bound nested descendants; use hierarchy.children.limit.","Never request _chunks.* through MCP because it can expand every child stored on a matched source.","Structured filter_query.geo_bbox accepts field, min_lat, min_lon, max_lat, and max_lon; min_lon greater than max_lon represents an antimeridian-wrapped box."]},"top_level_fields":["query","full_text_search","semantic_search","embedding_template","indexes","filter_prefix","filter_query","exclusion_query","aggregations","embeddings","search_effort","fields","hierarchy","limit","offset","timeout_ms","order_by","search_after","search_before","distance_under","distance_over","merge_config","count","profile","reranker","analyses","graph_searches","expand_strategy","document_renderer","pruner","join","foreign_sources"],"examples":{"fielded_full_text":{"full_text_search":{"match":"hello","field":"body"},"fields":["title","body"],"limit":5,"timeout_ms":5000},"chunk_retrieval":{"semantic_search":"How does Antfly index documents?","indexes":["document_vectors"],"hierarchy":{"return_level":"chunk","ancestors":{"source":{"fields":["title","url"]}}},"fields":["text"],"limit":5},"source_with_children":{"semantic_search":"Antfly indexing","indexes":["document_vectors"],"hierarchy":{"return_level":"source","children":{"level":"chunk","limit":3,"fields":["text"]}},"fields":["title","url"],"limit":5},"hybrid":{"full_text_search":{"match":"raft","field":"body"},"semantic_search":"raft snapshot architecture","indexes":["body_embedding"],"merge_config":{"strategy":"rrf"},"fields":["title","body"],"limit":20,"profile":true},"filtered":{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"filter":[{"term":{"path":"/tenant","value":"acme"}}]}},"fields":["title","url"],"limit":10},"geo_bbox_filter":{"filter_query":{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}},"limit":10}}}
+    \\{
+    \\  "openapi_schema": "specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest",
+    \\  "query_ast_schema": "specs/openapi/antfly/query.yaml#/components/schemas/Query",
+    \\  "mcp_usage": {
+    \\    "tool": "query",
+    \\    "path_table_argument": "tableName",
+    \\    "raw_body_argument": "queryRequest",
+    \\    "rules": [
+    \\      "queryRequest is forwarded unchanged as the POST /tables/{tableName}/query body.",
+    \\      "queryRequest is mutually exclusive with shorthand query arguments such as fullTextSearch, semanticSearch, fields, limit, orderBy, indexes, and filterPrefix.",
+    \\      "queryRequest.table is rejected because tableName selects the table-scoped route.",
+    \\      "Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema.",
+    \\      "For hierarchical documents, prefer direct matches with hierarchy.result_mode=matches, explicit top-level fields, and explicit ancestor projections.",
+    \\      "Use hierarchy.result_mode=sources with children for grouped source results; top-level limit does not bound nested descendants, so set hierarchy.children.limit.",
+    \\      "Never request _chunks.* through MCP because it can expand every child stored on a matched source.",
+    \\      "Structured filter_query.geo_bbox accepts field, min_lat, min_lon, max_lat, and max_lon; min_lon greater than max_lon represents an antimeridian-wrapped box."
+    \\    ]
+    \\  },
+    \\  "top_level_fields": ["query", "full_text_search", "semantic_search", "embedding_template", "indexes", "filter_prefix", "filter_query", "exclusion_query", "aggregations", "embeddings", "search_effort", "fields", "hierarchy", "limit", "offset", "timeout_ms", "order_by", "search_after", "search_before", "distance_under", "distance_over", "merge_config", "count", "profile", "reranker", "analyses", "graph_searches", "expand_strategy", "document_renderer", "pruner", "join", "foreign_sources"],
+    \\  "examples": {
+    \\    "fielded_full_text": {"full_text_search":{"match":"hello","field":"body"},"fields":["title","body"],"limit":5,"timeout_ms":5000},
+    \\    "match_retrieval": {"semantic_search":"How does Antfly index documents?","indexes":["document_vectors"],"hierarchy":{"result_mode":"matches","ancestors":{"source":{"fields":["title","url"]}}},"fields":["text"],"limit":5},
+    \\    "source_with_children": {"semantic_search":"Antfly indexing","indexes":["document_vectors"],"hierarchy":{"result_mode":"sources","children":{"limit":3,"fields":["text"]}},"fields":["title","url"],"limit":5},
+    \\    "hybrid": {"full_text_search":{"match":"raft","field":"body"},"semantic_search":"raft snapshot architecture","indexes":["body_embedding"],"merge_config":{"strategy":"rrf"},"fields":["title","body"],"limit":20,"profile":true},
+    \\    "filtered": {"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"filter":[{"term":{"path":"/tenant","value":"acme"}}]}},"fields":["title","url"],"limit":10},
+    \\    "geo_bbox_filter": {"filter_query":{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}},"limit":10}
+    \\  }
+    \\}
 ;
 
 const mcp_capabilities_description_json =
@@ -201,7 +232,7 @@ const mcp_tool_specs = [_]McpToolSpec{
     .{
         .kind = .query,
         .name = "query",
-        .description = "Run an Antfly table query. For hierarchical documents, retrieve focused chunk hits with queryRequest.hierarchy.return_level=chunk and fields=[\"text\"]; never expand _chunks.* through MCP.",
+        .description = "Run an Antfly table query. For hierarchical documents, retrieve focused direct matches with queryRequest.hierarchy.result_mode=matches and explicit fields; never expand _chunks.* through MCP.",
         .permission = .read,
         .table_argument = "tableName",
         .fields = &.{

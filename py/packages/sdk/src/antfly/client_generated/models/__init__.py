@@ -539,6 +539,7 @@ from .query_builder_result_plan import QueryBuilderResultPlan
 from .query_builder_result_query import QueryBuilderResultQuery
 from .query_hierarchy import QueryHierarchy
 from .query_hierarchy_include_item import QueryHierarchyIncludeItem
+from .query_hierarchy_result_mode import QueryHierarchyResultMode
 from .query_hierarchy_return_level import QueryHierarchyReturnLevel
 from .query_hierarchy_rollup import QueryHierarchyRollup
 from .query_hit import QueryHit
@@ -1268,6 +1269,7 @@ __all__ = (
     "QueryBuilderResultQuery",
     "QueryHierarchy",
     "QueryHierarchyIncludeItem",
+    "QueryHierarchyResultMode",
     "QueryHierarchyReturnLevel",
     "QueryHierarchyRollup",
     "QueryHit",

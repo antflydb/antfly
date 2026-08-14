@@ -1414,13 +1414,13 @@ pub const HierarchyChildren = struct {
     level: ?[]const u8 = null,
     /// Maximum child hits attached to each parent, independent of the top-level query limit.
     limit: ?i64 = null,
-    /// Fields to include in each child hit. Omit to use the top-level fields projection.
-    fields: ?[]const []const u8 = null,
+    /// Fields to include in each child hit. This projection is required because source and child records commonly have different schemas. Use an empty array to return child identity and hierarchy metadata without stored fields.
+    fields: []const []const u8,
 };
 
 pub const HierarchyProjection = struct {
-    /// Fields to include from the hydrated hierarchy document. Omit to include all fields.
-    fields: ?[]const []const u8 = null,
+    /// Fields to include from the hydrated hierarchy document. This projection is required whenever the ancestor is requested so hierarchy hydration cannot accidentally return an unbounded document. Use an empty array to return hierarchy identity without stored document fields.
+    fields: []const []const u8,
 };
 
 /// Explains why the agent stopped before completion. Present when status is "incomplete".
@@ -1942,12 +1942,14 @@ pub const QueryBuilderResult = struct {
     warnings: ?[]const []const u8 = null,
 };
 
-/// Controls the hierarchy level returned by a query, optional bounded child hits, and projected ancestor context. `children` is analogous to a bounded nested inner-hit request: it defaults to three children per parent while the top-level `limit` continues to control the number of returned hits. The legacy `rollup`, `include`, and `max_children_per_parent` fields remain supported for compatibility. Prefer `children` and `ancestors` for new clients.
+/// Controls whether a query returns direct matches or source documents, optional bounded child hits, and projected ancestor context. `children` is analogous to a bounded nested inner-hit request: it defaults to three children per parent while the top-level `limit` continues to control the number of returned hits. The new controls are deliberately exclusive: `matches` may use `ancestors`, while `sources` may use `children`. When `result_mode` is omitted, `ancestors` implies `matches` and `children` implies `sources`. Ancestor and child field projections are always explicit to keep response size predictable. The legacy `return_level`, `rollup`, `include`, and `max_children_per_parent` fields remain supported in legacy-only requests. Do not mix legacy and new controls in one request.
 pub const QueryHierarchy = struct {
-    /// Top-level result shape. `source` rolls matches up to source documents; `chunk` returns directly matched derived records. The targeted index determines the actual derived level, which is reported in each hit's `hierarchy.level`. Legacy JSON requests using `unit` or `mention` remain accepted as direct-match aliases but are not exposed to new clients.
-    return_level: ?[]const u8 = null,
+    /// Top-level result shape. `matches` returns the records matched by the targeted index; their actual hierarchy level is reported in each hit's `hierarchy.level`. `sources` groups matches by source document.
+    result_mode: ?[]const u8 = null,
     children: ?HierarchyChildren = null,
     ancestors: ?HierarchyAncestors = null,
+    /// Legacy result-shape control. Prefer result_mode.
+    return_level: ?[]const u8 = null,
     rollup: ?[]const u8 = null,
     include: ?[]const []const u8 = null,
     /// Legacy child limit. Prefer children.limit.

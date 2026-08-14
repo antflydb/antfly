@@ -109,7 +109,7 @@ Raw mode rules:
 - The raw object is validated by the same `/tables/{tableName}/query` path as direct REST calls.
 
 For hierarchical document retrieval, `limit` controls top-level hits; it does not limit child values expanded from a
-source document. Prefer direct chunk hits when chunks are the evidence an agent needs:
+source document. Prefer direct matches when the records selected by an index are the evidence an agent needs:
 
 ```json
 {
@@ -118,7 +118,7 @@ source document. Prefer direct chunk hits when chunks are the evidence an agent 
     "semantic_search": "How does Antfly index documents?",
     "indexes": ["document_vectors"],
     "hierarchy": {
-      "return_level": "chunk",
+      "result_mode": "matches",
       "ancestors": {
         "source": {"fields": ["title", "url"]}
       }
@@ -133,14 +133,19 @@ When a caller needs source hits with matching children attached, use the indepen
 
 ```json
 "hierarchy": {
-  "return_level": "source",
-  "children": {"level": "chunk", "limit": 3, "fields": ["text"]}
+  "result_mode": "sources",
+  "children": {"limit": 3, "fields": ["text"]}
 }
 ```
 
-Omitting `children.limit` defaults it to three. The legacy `include` and `max_children_per_parent` controls remain
-accepted, but new integrations should use `children` and `ancestors`. MCP callers should not request `_chunks.*`,
-which expands the stored child array and can create an oversized response. Antfly returns an actionable tool error
+`children` and `ancestors` are mutually exclusive. Omitting `result_mode` is allowed when the projection makes the
+intent unambiguous: `children` implies `sources`, and `ancestors` implies `matches`. Every child or ancestor projection
+must specify `fields`; use an empty array when only hierarchy identity is needed. Omitting `children.limit` defaults it
+to three.
+
+The legacy hierarchy controls remain accepted for existing callers, but they cannot be mixed with `result_mode`,
+`children`, or `ancestors`. New integrations should use only the new controls. MCP callers should not request
+`_chunks.*`, which expands the stored child array and can create an oversized response. Antfly returns an actionable tool error
 instead of sending a serialized tool result larger than its MCP compatibility budget. The server default is 384 KiB,
 including TextContent and structuredContent; deployments with known client limits can change
 `ApiHttpServerConfig.mcp_max_tool_result_bytes`, or set it to zero to disable the guard.

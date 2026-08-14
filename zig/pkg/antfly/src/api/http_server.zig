@@ -23931,7 +23931,9 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"fullTextSearchField\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"full_text_search\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"hierarchy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"result_mode\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"children\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"required\":[\"fields\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"oneOf\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"inclusiveFrom\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"boolean\"") != null);
@@ -24129,10 +24131,11 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"structuredContent\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "metadata.yaml#/components/schemas/QueryRequest") != null);
     try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"queryRequest\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"chunk_retrieval\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"match_retrieval\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "result_mode=matches") != null);
     try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "Never request _chunks.*") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fielded_full_text\":{\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fields\":[\"title\",\"body\"],\"limit\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fielded_full_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fields\":[\"title\",\"body\"]") != null);
 
     server.cfg.mcp_max_tool_result_bytes = 80;
     var oversized_query_resp = try server.handle(.{

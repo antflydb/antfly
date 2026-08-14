@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 
 from ..models.query_hierarchy_include_item import QueryHierarchyIncludeItem
+from ..models.query_hierarchy_result_mode import QueryHierarchyResultMode
 from ..models.query_hierarchy_return_level import QueryHierarchyReturnLevel
 from ..models.query_hierarchy_rollup import QueryHierarchyRollup
 from ..types import UNSET, Unset
@@ -20,39 +21,45 @@ T = TypeVar("T", bound="QueryHierarchy")
 
 @_attrs_define
 class QueryHierarchy:
-    """Controls the hierarchy level returned by a query, optional bounded child hits,
-    and projected ancestor context. `children` is analogous to a bounded nested
+    """Controls whether a query returns direct matches or source documents, optional
+    bounded child hits, and projected ancestor context. `children` is analogous to a bounded nested
     inner-hit request: it defaults to three children per parent while the top-level
     `limit` continues to control the number of returned hits.
 
-    The legacy `rollup`, `include`, and `max_children_per_parent` fields remain
-    supported for compatibility. Prefer `children` and `ancestors` for new clients.
+    The new controls are deliberately exclusive: `matches` may use `ancestors`,
+    while `sources` may use `children`. When `result_mode` is omitted, `ancestors`
+    implies `matches` and `children` implies `sources`. Ancestor and child field
+    projections are always explicit to keep response size predictable.
+
+    The legacy `return_level`, `rollup`, `include`, and
+    `max_children_per_parent` fields remain supported in legacy-only requests.
+    Do not mix legacy and new controls in one request.
 
         Attributes:
-            return_level (QueryHierarchyReturnLevel | Unset): Top-level result shape. `source` rolls matches up to source
-                documents;
-                `chunk` returns directly matched derived records. The targeted index
-                determines the actual derived level, which is reported in each hit's
-                `hierarchy.level`. Legacy JSON requests using `unit` or `mention` remain
-                accepted as direct-match aliases but are not exposed to new clients.
+            result_mode (QueryHierarchyResultMode | Unset): Top-level result shape. `matches` returns the records matched by
+                the
+                targeted index; their actual hierarchy level is reported in each hit's
+                `hierarchy.level`. `sources` groups matches by source document.
             children (HierarchyChildren | Unset):
             ancestors (HierarchyAncestors | Unset):
+            return_level (QueryHierarchyReturnLevel | Unset): Legacy result-shape control. Prefer result_mode.
             rollup (QueryHierarchyRollup | Unset):
             include (list[QueryHierarchyIncludeItem] | Unset):
             max_children_per_parent (int | Unset): Legacy child limit. Prefer children.limit.
     """
 
-    return_level: QueryHierarchyReturnLevel | Unset = UNSET
+    result_mode: QueryHierarchyResultMode | Unset = UNSET
     children: HierarchyChildren | Unset = UNSET
     ancestors: HierarchyAncestors | Unset = UNSET
+    return_level: QueryHierarchyReturnLevel | Unset = UNSET
     rollup: QueryHierarchyRollup | Unset = UNSET
     include: list[QueryHierarchyIncludeItem] | Unset = UNSET
     max_children_per_parent: int | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
-        return_level: str | Unset = UNSET
-        if not isinstance(self.return_level, Unset):
-            return_level = self.return_level.value
+        result_mode: str | Unset = UNSET
+        if not isinstance(self.result_mode, Unset):
+            result_mode = self.result_mode.value
 
         children: dict[str, Any] | Unset = UNSET
         if not isinstance(self.children, Unset):
@@ -61,6 +68,10 @@ class QueryHierarchy:
         ancestors: dict[str, Any] | Unset = UNSET
         if not isinstance(self.ancestors, Unset):
             ancestors = self.ancestors.to_dict()
+
+        return_level: str | Unset = UNSET
+        if not isinstance(self.return_level, Unset):
+            return_level = self.return_level.value
 
         rollup: str | Unset = UNSET
         if not isinstance(self.rollup, Unset):
@@ -78,12 +89,14 @@ class QueryHierarchy:
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
-        if return_level is not UNSET:
-            field_dict["return_level"] = return_level
+        if result_mode is not UNSET:
+            field_dict["result_mode"] = result_mode
         if children is not UNSET:
             field_dict["children"] = children
         if ancestors is not UNSET:
             field_dict["ancestors"] = ancestors
+        if return_level is not UNSET:
+            field_dict["return_level"] = return_level
         if rollup is not UNSET:
             field_dict["rollup"] = rollup
         if include is not UNSET:
@@ -99,12 +112,12 @@ class QueryHierarchy:
         from ..models.hierarchy_children import HierarchyChildren
 
         d = dict(src_dict)
-        _return_level = d.pop("return_level", UNSET)
-        return_level: QueryHierarchyReturnLevel | Unset
-        if isinstance(_return_level, Unset):
-            return_level = UNSET
+        _result_mode = d.pop("result_mode", UNSET)
+        result_mode: QueryHierarchyResultMode | Unset
+        if isinstance(_result_mode, Unset):
+            result_mode = UNSET
         else:
-            return_level = QueryHierarchyReturnLevel(_return_level)
+            result_mode = QueryHierarchyResultMode(_result_mode)
 
         _children = d.pop("children", UNSET)
         children: HierarchyChildren | Unset
@@ -119,6 +132,13 @@ class QueryHierarchy:
             ancestors = UNSET
         else:
             ancestors = HierarchyAncestors.from_dict(_ancestors)
+
+        _return_level = d.pop("return_level", UNSET)
+        return_level: QueryHierarchyReturnLevel | Unset
+        if isinstance(_return_level, Unset):
+            return_level = UNSET
+        else:
+            return_level = QueryHierarchyReturnLevel(_return_level)
 
         _rollup = d.pop("rollup", UNSET)
         rollup: QueryHierarchyRollup | Unset
@@ -139,9 +159,10 @@ class QueryHierarchy:
         max_children_per_parent = d.pop("max_children_per_parent", UNSET)
 
         query_hierarchy = cls(
-            return_level=return_level,
+            result_mode=result_mode,
             children=children,
             ancestors=ancestors,
+            return_level=return_level,
             rollup=rollup,
             include=include,
             max_children_per_parent=max_children_per_parent,

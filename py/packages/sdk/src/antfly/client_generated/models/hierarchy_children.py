@@ -15,43 +15,47 @@ T = TypeVar("T", bound="HierarchyChildren")
 class HierarchyChildren:
     """
     Attributes:
+        fields (list[str]): Fields to include in each child hit. This projection is required because
+            source and child records commonly have different schemas. Use an empty
+            array to return child identity and hierarchy metadata without stored fields.
         level (HierarchyChildrenLevel | Unset): Descendant level to attach to each returned source hit. Default:
             HierarchyChildrenLevel.CHUNK.
         limit (int | Unset): Maximum child hits attached to each parent, independent of the top-level query limit.
             Default: 3.
-        fields (list[str] | Unset): Fields to include in each child hit. Omit to use the top-level fields projection.
     """
 
+    fields: list[str]
     level: HierarchyChildrenLevel | Unset = HierarchyChildrenLevel.CHUNK
     limit: int | Unset = 3
-    fields: list[str] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        fields = self.fields
+
         level: str | Unset = UNSET
         if not isinstance(self.level, Unset):
             level = self.level.value
 
         limit = self.limit
 
-        fields: list[str] | Unset = UNSET
-        if not isinstance(self.fields, Unset):
-            fields = self.fields
-
         field_dict: dict[str, Any] = {}
 
-        field_dict.update({})
+        field_dict.update(
+            {
+                "fields": fields,
+            }
+        )
         if level is not UNSET:
             field_dict["level"] = level
         if limit is not UNSET:
             field_dict["limit"] = limit
-        if fields is not UNSET:
-            field_dict["fields"] = fields
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        fields = cast(list[str], d.pop("fields"))
+
         _level = d.pop("level", UNSET)
         level: HierarchyChildrenLevel | Unset
         if isinstance(_level, Unset):
@@ -61,12 +65,10 @@ class HierarchyChildren:
 
         limit = d.pop("limit", UNSET)
 
-        fields = cast(list[str], d.pop("fields", UNSET))
-
         hierarchy_children = cls(
+            fields=fields,
             level=level,
             limit=limit,
-            fields=fields,
         )
 
         return hierarchy_children
