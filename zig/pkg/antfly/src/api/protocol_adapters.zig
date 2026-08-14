@@ -51,6 +51,7 @@ const McpToolSpec = struct {
     permission: McpToolPermission,
     table_argument: ?[]const u8 = null,
     wildcard_table: bool = false,
+    input_schema_json: ?[]const u8 = null,
     fields: []const McpToolFieldSpec = &.{},
 };
 
@@ -84,6 +85,9 @@ const full_text_search_schema_json =
 ;
 
 const query_hierarchy_schema_json = @embedFile("generated/mcp_query_hierarchy_schema.json");
+const backup_input_schema_json = @embedFile("generated/mcp_backup_input_schema.json");
+const restore_input_schema_json = @embedFile("generated/mcp_restore_input_schema.json");
+const batch_input_schema_json = @embedFile("generated/mcp_batch_input_schema.json");
 
 const query_request_schema_json =
     \\{"type":"object","additionalProperties":true,"description":"Raw Antfly QueryRequest body for POST /tables/{tableName}/query. Use this to access the full OpenAPI query contract. Mutually exclusive with query shorthand arguments.","properties":{"query":{"type":"object","additionalProperties":true},"full_text_search":{"type":"object","additionalProperties":true},"filter_query":{"type":"object","additionalProperties":true},"exclusion_query":{"type":"object","additionalProperties":true},"semantic_search":{"type":"string"},"embedding_template":{"type":"string"},"indexes":{"type":"array","items":{"type":"string"}},"embeddings":{"type":"object","additionalProperties":true},"fields":{"type":"array","items":{"type":"string"}},"hierarchy":
@@ -267,11 +271,7 @@ const mcp_tool_specs = [_]McpToolSpec{
         .description = "Backup an Antfly table",
         .permission = .admin,
         .table_argument = "tableName",
-        .fields = &.{
-            .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "backupId", .schema_type = .string, .required = true },
-            .{ .name = "location", .schema_type = .string, .required = true },
-        },
+        .input_schema_json = backup_input_schema_json,
     },
     .{
         .kind = .restore,
@@ -279,23 +279,15 @@ const mcp_tool_specs = [_]McpToolSpec{
         .description = "Restore an Antfly table",
         .permission = .admin,
         .table_argument = "tableName",
-        .fields = &.{
-            .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "backupId", .schema_type = .string, .required = true },
-            .{ .name = "location", .schema_type = .string, .required = true },
-        },
+        .input_schema_json = restore_input_schema_json,
     },
     .{
         .kind = .batch,
         .name = "batch",
-        .description = "Insert and delete documents in an Antfly table",
+        .description = "Insert, delete, or atomically transform documents in an Antfly table",
         .permission = .write,
         .table_argument = "tableName",
-        .fields = &.{
-            .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "writes", .schema_type = .object },
-            .{ .name = "deletes", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
-        },
+        .input_schema_json = batch_input_schema_json,
     },
 };
 
@@ -535,9 +527,14 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             const backup_id = jsonStringArg(args, "backupId") orelse return mcpError(alloc, "missing backupId");
             const location = jsonStringArg(args, "location") orelse return mcpError(alloc, "missing location");
+            const connection = jsonStringArg(args, "connection") orelse return mcpError(alloc, "missing connection");
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "backup_id", .{ .string = backup_id });
             try body.put(alloc, "location", .{ .string = location });
+            try body.put(alloc, "connection", .{ .string = connection });
+            if (std.mem.eql(u8, operation, "backup")) {
+                if (jsonStringArg(args, "format")) |format| try body.put(alloc, "format", .{ .string = format });
+            }
             const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ routes.Routes.tables, table_name, operation });
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
         }
@@ -545,8 +542,13 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         fn batch(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             var body = std.json.ObjectMap.empty;
-            if (jsonValueArg(args, "writes")) |writes| try body.put(alloc, "inserts", writes);
+            const inserts = jsonValueArg(args, "inserts");
+            const writes = jsonValueArg(args, "writes");
+            if (inserts != null and writes != null) return mcpError(alloc, "inserts and writes cannot be combined");
+            if (inserts orelse writes) |value| try body.put(alloc, "inserts", value);
             if (jsonValueArg(args, "deletes")) |deletes| try body.put(alloc, "deletes", deletes);
+            if (jsonValueArg(args, "transforms")) |transforms| try body.put(alloc, "transforms", transforms);
+            if (jsonStringArg(args, "syncLevel")) |sync_level| try body.put(alloc, "sync_level", .{ .string = sync_level });
             const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/batch", .{ routes.Routes.tables, table_name });
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
         }
@@ -1319,6 +1321,10 @@ fn cloneValidMcpInputSchemaJson(alloc: std.mem.Allocator, schema_json: []const u
 }
 
 fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {
+    if (spec.input_schema_json) |schema_json| {
+        return (try cloneValidMcpInputSchemaJson(alloc, schema_json)) orelse error.InvalidMcpInputSchema;
+    }
+
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 

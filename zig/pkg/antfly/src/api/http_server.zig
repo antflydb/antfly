@@ -23853,6 +23853,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
 
     var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_write_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
         fn iface(self: *@This()) StatusSource {
@@ -23897,7 +23898,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     };
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), table_write_source.source());
     defer server.deinit();
 
     var init_resp = try server.handle(.{
@@ -23937,6 +23938,70 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"oneOf\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"inclusiveFrom\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"boolean\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"required\":[\"tableName\",\"backupId\",\"location\",\"connection\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"format\":{\"type\":\"string\",\"enum\":[\"native\",\"portable\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"inserts\":{\"type\":\"object\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"transforms\":{\"type\":\"array\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"syncLevel\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "Compatibility alias for inserts") != null);
+
+    var batch_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"tableName\":\"docs\",\"inserts\":{\"doc:b\":{\"title\":\"beta\",\"body\":\"world\"}},\"transforms\":[{\"key\":\"doc:a\",\"operations\":[{\"op\":\"$set\",\"path\":\"$.title\",\"value\":\"updated\"}]}],\"syncLevel\":\"full_index\"}}}",
+    });
+    defer batch_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), batch_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, batch_resp.body, "\"isError\":false") != null);
+    var inserted = (try db.lookup(alloc, "doc:b", .{})) orelse return error.TestExpectedEqual;
+    defer inserted.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, inserted.json, "world") != null);
+    var transformed = (try db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
+    defer transformed.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, transformed.json, "updated") != null);
+
+    var ambiguous_batch_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"tableName\":\"docs\",\"inserts\":{},\"writes\":{}}}}",
+    });
+    defer ambiguous_batch_resp.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, ambiguous_batch_resp.body, "inserts and writes cannot be combined") != null);
+
+    var missing_backup_connection_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"backup\",\"arguments\":{\"tableName\":\"docs\",\"backupId\":\"backup-1\",\"location\":\"s3://bucket/path\"}}}",
+    });
+    defer missing_backup_connection_resp.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, missing_backup_connection_resp.body, "missing connection") != null);
+
+    var forwarded_backup_format_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/call\",\"params\":{\"name\":\"backup\",\"arguments\":{\"tableName\":\"docs\",\"backupId\":\"backup-1\",\"location\":\"s3://bucket/path\",\"connection\":\"archive\",\"format\":\"invalid\"}}}",
+    });
+    defer forwarded_backup_format_resp.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, forwarded_backup_format_resp.body, "unsupported backup format") != null);
+
+    var forwarded_restore_connection_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"tools/call\",\"params\":{\"name\":\"restore\",\"arguments\":{\"tableName\":\"docs\",\"backupId\":\"backup-1\",\"location\":\"s3://bucket/path\",\"connection\":\"archive\"}}}",
+    });
+    defer forwarded_restore_connection_resp.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, forwarded_restore_connection_resp.body, "asynchronous restore worker unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forwarded_restore_connection_resp.body, "invalid restore request") == null);
 
     var describe_table_resp = try server.handle(.{
         .method = .POST,

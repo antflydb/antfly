@@ -171,6 +171,10 @@ without needing to scrape broad list responses:
   `inclusiveFrom`, and `fields` arguments. It is for schema/content inspection, not agentic retrieval planning.
 - `describe_mcp_capabilities` returns MCP transport/session capabilities, deterministic tool categories, raw
   `queryRequest` support, shorthand query args, and native-agent query-builder handoff guidance.
+- `backup` and `restore` require the same `connection` as their REST request contracts; `backup` also exposes the
+  optional `format` selector.
+- `batch` exposes the REST request capabilities as `inserts`, `deletes`, `transforms`, and `syncLevel`. The older
+  `writes` spelling remains a compatibility alias for `inserts`, but the two cannot be combined.
 
 These tools route through the same HTTP handlers as REST calls where possible. That keeps auth, permission checks,
 validation, and error behavior aligned with the product API.
@@ -199,10 +203,12 @@ The standalone protocol tests also cover parse errors, invalid params, unknown M
   the surface grows.
 - Protocol structs are intentionally minimal. Dynamic `std.json.Value` remains the extension path for evolving MCP
   fields and tool payloads.
-- MCP schemas are generated from Antfly MCP tool descriptors. They are
-  not yet derived from generated OpenAPI or Zig request structs. The raw `queryRequest` field deliberately uses a
-  permissive schema plus the `describe_query_request` helper to avoid inlining the full recursive OpenAPI query schema
-  into every MCP `tools/list` response.
+- Simple MCP schemas are generated from Antfly MCP tool descriptors. Compact schemas for hierarchy, backup, restore,
+  and batch are generated from their canonical OpenAPI components by `scripts/generate_mcp_schema_fragments.py`.
+  The generator resolves local references, removes verbose API-only annotations from complete tool inputs, applies
+  the MCP camelCase argument overlay, and emits self-contained JSON Schema for Zig to embed at compile time.
+- The raw `queryRequest` field deliberately uses a permissive top-level schema plus the `describe_query_request`
+  helper to avoid inlining the full recursive OpenAPI query schema into every MCP `tools/list` response.
 
 ## Long-Term Direction
 
@@ -214,5 +220,5 @@ The next durability improvements should be:
 1. Add MCP historical event replay if clients need more than cursor-aware stream continuation.
 2. Expose the `go/pkg/antfly/lib/mcp` stdio dispatcher through a product CLI/server mode if local agent hosts need it.
 3. Broaden adapter failure mapping and tool schema stability tests.
-4. Consider deriving MCP tool schemas from generated OpenAPI or Zig request structs if the tool surface continues to
-   expand.
+4. Extend OpenAPI-derived compact schema fragments selectively when another MCP tool has a substantial structured
+   request; keep simple scalar tools and runtime permission filtering in the Zig registry.
