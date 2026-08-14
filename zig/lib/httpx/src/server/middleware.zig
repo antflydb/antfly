@@ -21,8 +21,46 @@ const milliTimestamp = @import("../util/common.zig").milliTimestamp;
 
 /// Middleware function type.
 pub const Middleware = struct {
-    handler: *const fn (*Context, *Next) anyerror!Response,
+    handler: *const fn (*Context, *Next) anyerror!Response = unbound,
     name: []const u8 = "unnamed",
+    bound: ?Bound = null,
+
+    pub const Bound = struct {
+        ptr: *anyopaque,
+        call: *const fn (*anyopaque, *Context, *Next) anyerror!Response,
+    };
+
+    pub fn bind(name: []const u8, instance: anytype, comptime method: anytype) Middleware {
+        const Instance = @TypeOf(instance);
+        comptime {
+            switch (@typeInfo(Instance)) {
+                .pointer => |pointer| {
+                    if (pointer.size != .one) @compileError("httpx.Middleware.bind requires a single-item pointer");
+                    if (pointer.is_const) @compileError("httpx.Middleware.bind currently requires a mutable instance pointer");
+                },
+                else => @compileError("httpx.Middleware.bind requires an instance pointer"),
+            }
+        }
+        const Adapter = struct {
+            fn call(raw: *anyopaque, ctx: *Context, next: *Next) anyerror!Response {
+                const typed: Instance = @ptrCast(@alignCast(raw));
+                return @call(.auto, method, .{ typed, ctx, next });
+            }
+        };
+        return .{
+            .name = name,
+            .bound = .{ .ptr = @ptrCast(instance), .call = Adapter.call },
+        };
+    }
+
+    pub fn invoke(self: Middleware, ctx: *Context, next: *Next) anyerror!Response {
+        if (self.bound) |bound| return bound.call(bound.ptr, ctx, next);
+        return self.handler(ctx, next);
+    }
+
+    fn unbound(_: *Context, _: *Next) anyerror!Response {
+        return error.UnboundMiddleware;
+    }
 };
 
 /// Opaque handle for calling the next middleware in the chain.

@@ -21,12 +21,13 @@ const table_writes = @import("table_write_source.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
-const http_common = @import("../raft/transport/http_common.zig");
+const ha_http_operation = @import("../storage/ha/http_operation.zig");
+const httpx = @import("httpx");
+const platform_sync = @import("antfly_platform").sync;
+const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
-const httpx = @import("httpx");
-
-extern fn antfly_distributed_httpx_register(context: *const abi.RouteContext) callconv(.c) abi.Status;
 
 pub const CreateContext = abi.CreateContext;
 pub const CallContext = abi.CallContext;
@@ -41,8 +42,11 @@ const ServerState = struct {
 const HandlerState = struct {
     alloc: std.mem.Allocator,
     handler: handler_mod.AntflyApiHandler,
-    io_impl: ?std.Io.Threaded = null,
     routes: std.ArrayListUnmanaged(*RouteState) = .empty,
+    route_manifest: std.ArrayListUnmanaged(abi.RouteManifestEntry) = .empty,
+    route_validator: httpx.Router,
+    route_manifest_mutex: std.atomic.Mutex = .unlocked,
+    route_manifest_ready: bool = false,
 };
 
 const RouteState = struct {
@@ -63,6 +67,11 @@ fn fail(err: anyerror) abi.Status {
 fn validateVersion(version: u32) ?abi.Status {
     if (version == abi.abi_version) return null;
     return fail(error.UnsupportedVersion);
+}
+
+fn validateContext(comptime T: type, version: u32, struct_size: u32) ?abi.Status {
+    if (!abi.validContext(T, version, struct_size)) return fail(error.UnsupportedVersion);
+    return null;
 }
 
 fn validateNativeValue(
@@ -89,8 +98,7 @@ fn validateNativeOutput(
 }
 
 fn validateCall(comptime Input: type, comptime Output: type, context: *const CallContext) ?abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
-    if (context._reserved != 0) return fail(error.UnsupportedVersion);
+    if (validateContext(CallContext, context.abi_version, context.struct_size)) |failure| return failure;
     if (validateNativeValue(Input, context.input, context.input_contract)) |failure| return failure;
     if (validateNativeOutput(Output, context.output, context.output_contract)) |failure| return failure;
     return null;
@@ -109,7 +117,7 @@ fn output(comptime T: type, context: *const CallContext) *T {
 }
 
 pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateContext(CreateContext, context.abi_version, context.struct_size)) |failure| return failure;
     if (context.flags & ~CreateContext.fallible_init != 0)
         return fail(error.UnsupportedVersion);
     if (!context.owner_alloc.valid())
@@ -160,6 +168,24 @@ pub fn requestStats(context: *const CallContext) callconv(.c) abi.Status {
     return .ok;
 }
 
+pub fn queryAdmissionStats(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, server_mod.RequestAdmission.Stats, context)) |failure| return failure;
+    output(server_mod.RequestAdmission.Stats, context).* = serverState(context).server.queryAdmissionStats();
+    return .ok;
+}
+
+pub fn writeAdmissionStats(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, server_mod.RequestAdmission.Stats, context)) |failure| return failure;
+    output(server_mod.RequestAdmission.Stats, context).* = serverState(context).server.writeAdmissionStats();
+    return .ok;
+}
+
+pub fn inferenceAdmissionStats(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, server_mod.RequestAdmission.Stats, context)) |failure| return failure;
+    output(server_mod.RequestAdmission.Stats, context).* = serverState(context).server.inferenceAdmissionStats();
+    return .ok;
+}
+
 pub fn setProvider(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(?managed_embedder.AntflyProvider, void, context)) |failure| return failure;
     serverState(context).server.antfly_provider = input(?managed_embedder.AntflyProvider, context).*;
@@ -167,20 +193,8 @@ pub fn setProvider(context: *const CallContext) callconv(.c) abi.Status {
 }
 
 pub fn setHAExecutor(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(?http_common.RequestExecutor, void, context)) |failure| return failure;
-    serverState(context).server.setHAInternalExecutor(input(?http_common.RequestExecutor, context).*);
-    return .ok;
-}
-
-pub fn executor(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(void, http_common.RequestExecutor, context)) |failure| return failure;
-    output(http_common.RequestExecutor, context).* = serverState(context).server.executor();
-    return .ok;
-}
-
-pub fn streamingExecutor(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(void, http_common.StreamingRequestExecutor, context)) |failure| return failure;
-    output(http_common.StreamingRequestExecutor, context).* = serverState(context).server.streamingExecutor();
+    if (validateCall(?ha_http_operation.Executor, void, context)) |failure| return failure;
+    serverState(context).server.setHAInternalExecutor(input(?ha_http_operation.Executor, context).*);
     return .ok;
 }
 
@@ -194,9 +208,10 @@ pub fn attachRuntimeRestoreStore(context: *const CallContext) callconv(.c) abi.S
 pub fn attachReplicatedRestoreStore(
     abi_version: u32,
     server_handle: *anyopaque,
-    persistence: *const restore_jobs.ReplicatedPersistence,
+    persistence_opaque: *const anyopaque,
 ) callconv(.c) abi.Status {
     if (validateVersion(abi_version)) |failure| return failure;
+    const persistence: *const restore_jobs.ReplicatedPersistence = @ptrCast(@alignCast(persistence_opaque));
     if (persistence.version != restore_jobs.ReplicatedPersistence.abi_version)
         return fail(error.UnsupportedVersion);
     const state: *ServerState = @ptrCast(@alignCast(server_handle));
@@ -235,9 +250,14 @@ pub fn storageMaintenanceActive(context: *const CallContext) callconv(.c) abi.St
     return .ok;
 }
 
+pub fn checkReady(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, void, context)) |failure| return failure;
+    serverState(context).server.checkReady() catch |err| return fail(err);
+    return .ok;
+}
+
 pub fn authorizeInference(context: *const abi.AuthorizeInferenceContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
-    if (context._reserved != 0) return fail(error.UnsupportedVersion);
+    if (validateContext(abi.AuthorizeInferenceContext, context.abi_version, context.struct_size)) |failure| return failure;
     const state: *ServerState = @ptrCast(@alignCast(context.handle));
     context.out_decision.* = state.server.authorizeInferenceRequest(.{
         .authorization = context.authorization.slice(),
@@ -246,28 +266,14 @@ pub fn authorizeInference(context: *const abi.AuthorizeInferenceContext) callcon
     return .ok;
 }
 
-pub fn handle(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(http_common.HttpRequest, http_common.HttpResponse, context)) |failure| return failure;
-    output(http_common.HttpResponse, context).* = serverState(context).server.handle(input(http_common.HttpRequest, context).*) catch |err|
-        return fail(err);
-    return .ok;
-}
-
-pub fn handleInternal(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(http_common.HttpRequest, ?http_common.HttpResponse, context)) |failure| return failure;
-    output(?http_common.HttpResponse, context).* = serverState(context).server.handleInternalRoute(input(http_common.HttpRequest, context).*) catch |err|
-        return fail(err);
-    return .ok;
-}
-
 pub fn handlerCreate(context: *const HandlerCreateContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
-    if (context._reserved != 0) return fail(error.UnsupportedVersion);
+    if (validateContext(HandlerCreateContext, context.abi_version, context.struct_size)) |failure| return failure;
     const api_state: *ServerState = @ptrCast(@alignCast(context.api_server_handle));
     const state = api_state.owner_alloc.create(HandlerState) catch |err| return fail(err);
     state.* = .{
         .alloc = api_state.owner_alloc,
         .handler = .{ .api_server = &api_state.server },
+        .route_validator = httpx.Router.init(api_state.owner_alloc),
     };
     context.out_handle.* = state;
     return .ok;
@@ -282,56 +288,66 @@ pub fn handlerInit(context: *const CallContext) callconv(.c) abi.Status {
     const state = handlerState(context);
     state.handler.initRuntime(state.alloc) catch |err|
         return fail(err);
-    state.io_impl = std.Io.Threaded.init(state.alloc, .{});
     return .ok;
 }
 
 pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, abi.HandlerStats, context)) |failure| return failure;
     const handler = &handlerState(context).handler;
-    const query = handler.query_admission.stats();
+    const query = handler.api_server.queryAdmissionStats();
+    const write = handler.api_server.writeAdmissionStats();
+    const inference = handler.api_server.inferenceAdmissionStats();
     const query_body = handler.query_body_admission.stats();
-    const runtime = handler.runtimeStats();
     output(abi.HandlerStats, context).* = .{
         .query_capacity = query.capacity,
         .query_in_flight = query.in_flight,
         .query_peak_in_flight = query.peak_in_flight,
         .query_rejected_total = query.rejected_total,
+        .write_capacity = write.capacity,
+        .write_in_flight = write.in_flight,
+        .write_peak_in_flight = write.peak_in_flight,
+        .write_rejected_total = write.rejected_total,
+        .inference_capacity = inference.capacity,
+        .inference_in_flight = inference.in_flight,
+        .inference_peak_in_flight = inference.peak_in_flight,
+        .inference_rejected_total = inference.rejected_total,
         .query_body_capacity = query_body.capacity,
         .query_body_in_flight = query_body.in_flight,
         .query_body_peak_in_flight = query_body.peak_in_flight,
         .query_body_rejected_total = query_body.rejected_total,
-        .cancellation_watcher_start_failures_total = runtime.cancellation_watcher_start_failures_total,
-        .peer_disconnect_cancellations_total = runtime.peer_disconnect_cancellations_total,
-        .peer_observer_failures_total = runtime.peer_observer_failures_total,
-        .active_peer_observers = runtime.active_peer_observers,
     };
     return .ok;
 }
 
-pub fn handlerRegisterRoutes(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(httpx.Server, void, context)) |failure| return failure;
-    const server: *httpx.Server = @constCast(input(httpx.Server, context));
-    const state = handlerState(context);
-    const handler = &state.handler;
-    const public_router = metadata_openapi.server.ServerRouter(handler_mod.AntflyApiHandler).init(handler);
-    var public_prefixed = BoundaryServer("/db/v1"){
-        .inner = server,
-        .owner = state,
-    };
-    public_router.register(&public_prefixed) catch |err| return fail(err);
-    const usermgr_router = usermgr_openapi.server.ServerRouter(handler_mod.AntflyApiHandler).init(handler);
-    var usermgr_boundary = BoundaryServer(""){
-        .inner = server,
-        .owner = state,
-    };
-    usermgr_router.register(&usermgr_boundary) catch |err| return fail(err);
+pub fn handlerRouteManifest(context: *const abi.RouteManifestContext) callconv(.c) abi.Status {
+    if (validateContext(abi.RouteManifestContext, context.abi_version, context.struct_size)) |failure| return failure;
+    const state: *HandlerState = @ptrCast(@alignCast(context.handler_handle));
+    platform_sync.lockYielding(&state.route_manifest_mutex);
+    defer state.route_manifest_mutex.unlock();
+    if (!state.route_manifest_ready) {
+        const routes_start = state.routes.items.len;
+        const manifest_start = state.route_manifest.items.len;
+        const handler = &state.handler;
+        var public_manifest = ManifestServer("/db/v1"){ .owner = state };
+        var root_manifest = ManifestServer(""){ .owner = state };
+        handler.registerRouteSets(&public_manifest, &root_manifest, true, true) catch |err| {
+            for (state.routes.items[routes_start..]) |route| state.alloc.destroy(route);
+            state.routes.shrinkRetainingCapacity(routes_start);
+            state.route_manifest.shrinkRetainingCapacity(manifest_start);
+            state.route_validator.deinit();
+            state.route_validator = httpx.Router.init(state.alloc);
+            return fail(err);
+        };
+        state.route_manifest_ready = true;
+    }
+    context.out_entries.* = if (state.route_manifest.items.len == 0) null else state.route_manifest.items.ptr;
+    context.out_len.* = state.route_manifest.items.len;
     return .ok;
 }
 
 pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
-    if (context._reserved != 0) return fail(error.UnsupportedVersion);
+    if (validateContext(abi.HttpHandleContext, context.abi_version, context.struct_size)) |failure| return failure;
+    const io = context.executor.get() catch |err| return fail(err);
     const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
     const state = route.owner;
     const request = context.request;
@@ -363,11 +379,11 @@ pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi
         params[i] = .{ .name = param.name.slice(), .value = param.value.slice() };
     }
 
-    const io_impl = &(state.io_impl orelse return fail(error.ApiKernelNotInitialized));
-    var http_context = httpx.Context.init(alloc, io_impl.io(), &http_request);
+    var http_context = httpx.Context.init(alloc, io, &http_request);
     defer http_context.deinit();
     http_context.params = params;
-    var response = route.handler(&http_context) catch |err| return fail(err);
+    runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
+    var response = state.handler.dispatchLinkedRoute(&http_context, route.handler) catch |err| return fail(err);
     errdefer response.deinit();
 
     const response_state = alloc.create(HttpResponseState) catch |err| return fail(err);
@@ -410,48 +426,263 @@ pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
     const alloc = state.alloc;
     for (state.routes.items) |route| alloc.destroy(route);
     state.routes.deinit(alloc);
+    state.route_manifest.deinit(alloc);
+    state.route_validator.deinit();
     state.handler.deinitRuntime();
-    if (state.io_impl) |*io_impl| io_impl.deinit();
     alloc.destroy(state);
 }
 
-fn BoundaryServer(comptime prefix: []const u8) type {
+const function_table: abi.FunctionTable = .{
+    .abi_version = abi.abi_version,
+    .struct_size = @sizeOf(abi.FunctionTable),
+    .capabilities = abi.Capability.core |
+        abi.Capability.route_manifest |
+        abi.Capability.inference_admission_stats,
+    .create = &create,
+    .destroy = &destroy,
+    .request_stats = &requestStats,
+    .query_admission_stats = &queryAdmissionStats,
+    .write_admission_stats = &writeAdmissionStats,
+    .set_provider = &setProvider,
+    .set_ha_executor = &setHAExecutor,
+    .attach_runtime_restore_store = &attachRuntimeRestoreStore,
+    .attach_replicated_restore_store = &attachReplicatedRestoreStore,
+    .resume_restore_jobs = &resumeRestoreJobs,
+    .poll_restore_jobs = &pollRestoreJobs,
+    .prepare_restore_leadership = &prepareRestoreLeadership,
+    .schedule_session_maintenance = &scheduleSessionMaintenance,
+    .storage_maintenance_active = &storageMaintenanceActive,
+    .check_ready = &checkReady,
+    .authorize_inference = &authorizeInference,
+    .handler_create = &handlerCreate,
+    .handler_init = &handlerInit,
+    .handler_stats = &handlerStats,
+    .handler_route_manifest = &handlerRouteManifest,
+    .handler_handle_http = &handlerHandleHttp,
+    .handler_destroy_http_response = &handlerDestroyHttpResponse,
+    .handler_destroy = &handlerDestroy,
+    .inference_admission_stats = &inferenceAdmissionStats,
+};
+
+pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {
+    return &function_table;
+}
+
+fn ManifestServer(comptime prefix: []const u8) type {
     return struct {
-        inner: *httpx.Server,
         owner: *HandlerState,
 
-        fn register(self: *const @This(), method: abi.HttpMethod, comptime path: []const u8, comptime handler: httpx.Handler) !void {
-            const route = self.owner.alloc.create(RouteState) catch |err| return err;
+        fn register(self: *const @This(), method: abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
+            const metadata = routeMetadata(method, path);
+            self.owner.route_validator.add(switch (method) {
+                .get => .GET,
+                .post => .POST,
+                .put => .PUT,
+                .delete => .DELETE,
+            }, prefix ++ path, handler) catch |err| {
+                std.log.err("API kernel route manifest rejected method={s} path={s} err={}", .{
+                    @tagName(method),
+                    prefix ++ path,
+                    err,
+                });
+                return err;
+            };
+            const route = try self.owner.alloc.create(RouteState);
             errdefer self.owner.alloc.destroy(route);
-            route.* = .{ .owner = self.owner, .handler = handler };
-            self.owner.routes.append(self.owner.alloc, route) catch |err| return err;
+            route.* = .{
+                .owner = self.owner,
+                .handler = handler,
+            };
+            try self.owner.routes.append(self.owner.alloc, route);
             errdefer _ = self.owner.routes.pop();
-            const full_path = prefix ++ path;
-            const status = antfly_distributed_httpx_register(&.{
-                .abi_version = abi.abi_version,
-                .server = self.inner,
+            try self.owner.route_manifest.append(self.owner.alloc, .{
                 .route_handle = route,
                 .method = method,
-                .path_ptr = full_path.ptr,
-                .path_len = full_path.len,
+                .path = abi.Bytes.init(prefix ++ path),
+                .request_body = metadata.request_body,
+                .streaming_response = @intFromBool(metadata.streaming_response),
             });
-            if (!status.isOk()) return abi.errorFromStatus(status);
         }
 
-        pub fn get(self: *const @This(), comptime path: []const u8, comptime handler: httpx.Handler) !void {
+        pub fn get(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             try self.register(.get, path, handler);
         }
 
-        pub fn post(self: *const @This(), comptime path: []const u8, comptime handler: httpx.Handler) !void {
+        pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             try self.register(.post, path, handler);
         }
 
-        pub fn put(self: *const @This(), comptime path: []const u8, comptime handler: httpx.Handler) !void {
+        pub fn put(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             try self.register(.put, path, handler);
         }
 
-        pub fn delete(self: *const @This(), comptime path: []const u8, comptime handler: httpx.Handler) !void {
+        pub fn delete(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             try self.register(.delete, path, handler);
         }
     };
+}
+
+const RouteMetadata = struct {
+    request_body: abi.RequestBodyMode,
+    streaming_response: bool,
+};
+
+fn routeMetadata(method: abi.HttpMethod, path: []const u8) RouteMetadata {
+    const method_name = switch (method) {
+        .get => "GET",
+        .post => "POST",
+        .put => "PUT",
+        .delete => "DELETE",
+    };
+    inline for (.{ metadata_openapi.server.routes, usermgr_openapi.server.routes }) |routes| {
+        for (routes) |route| {
+            if (std.mem.eql(u8, route.method, method_name) and metadataPathMatches(route.path, path)) {
+                return .{
+                    .request_body = switch (route.request_body) {
+                        .none => .none,
+                        .buffered => .buffered,
+                    },
+                    .streaming_response = route.streaming_response,
+                };
+            }
+        }
+    }
+    // Contextual routes predate generated metadata. Conservatively buffer
+    // mutating methods; body-less operations remain correct and future manual
+    // handlers cannot accidentally observe a partial H2 body.
+    return .{
+        .request_body = if (method == .get) .none else .buffered,
+        .streaming_response = false,
+    };
+}
+
+fn metadataPathMatches(metadata_path: []const u8, registered_path: []const u8) bool {
+    var metadata_index: usize = 0;
+    var registered_index: usize = 0;
+    while (metadata_index < metadata_path.len and registered_index < registered_path.len) {
+        if (metadata_path[metadata_index] == '{') {
+            if (registered_path[registered_index] != ':') return false;
+            const close = std.mem.indexOfScalarPos(u8, metadata_path, metadata_index + 1, '}') orelse return false;
+            const name = metadata_path[metadata_index + 1 .. close];
+            if (!std.mem.startsWith(u8, registered_path[registered_index + 1 ..], name)) return false;
+            metadata_index = close + 1;
+            registered_index += name.len + 1;
+            continue;
+        }
+        if (metadata_path[metadata_index] != registered_path[registered_index]) return false;
+        metadata_index += 1;
+        registered_index += 1;
+    }
+    return metadata_index == metadata_path.len and registered_index == registered_path.len;
+}
+
+const KernelIngressTestStatus = struct {
+    fn source(self: *@This()) server_mod.StatusSource {
+        return .{ .ptr = self, .vtable = &.{ .status = status } };
+    }
+
+    fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+        return .{
+            .metadata_group_id = 1,
+            .metrics = .{},
+            .projected_stores = 1,
+        };
+    }
+};
+
+const KernelIngressTestRoutes = struct {
+    var mutation_calls: usize = 0;
+
+    fn mutation(ctx: *httpx.Context) !httpx.Response {
+        mutation_calls += 1;
+        return ctx.text("unexpected mutation execution");
+    }
+
+    fn metadataNotLeader(_: *httpx.Context) !httpx.Response {
+        return error.NotLeader;
+    }
+};
+
+fn responseHeader(response: abi.HttpResponseView, name: []const u8) ?[]const u8 {
+    const headers = if (response.headers_ptr) |ptr| ptr[0..response.headers_len] else return null;
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name.slice(), name)) return header.value.slice();
+    }
+    return null;
+}
+
+test "linked API dispatch preserves kernel-owned ingress policy" {
+    const alloc = std.testing.allocator;
+    var status_source = KernelIngressTestStatus{};
+    const api_server = try alloc.create(server_mod.ApiHttpServer);
+    defer alloc.destroy(api_server);
+    api_server.* = server_mod.ApiHttpServer.init(
+        alloc,
+        .{ .ha_failover_safe_mutations_only = true },
+        status_source.source(),
+        null,
+        null,
+    );
+    defer api_server.deinit();
+
+    var state = HandlerState{
+        .alloc = alloc,
+        .handler = .{ .api_server = api_server },
+        .route_validator = httpx.Router.init(alloc),
+    };
+    defer state.route_validator.deinit();
+    const test_io = std.testing.io;
+
+    KernelIngressTestRoutes.mutation_calls = 0;
+    var mutation_route = RouteState{
+        .owner = &state,
+        .handler = httpx.Handler.from(KernelIngressTestRoutes.mutation),
+    };
+    const mutation_request = abi.HttpRequestView{
+        .method = .post,
+        .path = abi.Bytes.init("/db/v1/tables/docs"),
+        .body = abi.OptionalBytes.init("{}"),
+    };
+    var mutation_response_handle: ?*anyopaque = null;
+    var mutation_response: abi.HttpResponseView = undefined;
+    const mutation_status = handlerHandleHttp(&.{
+        .abi_version = abi.abi_version,
+        .route_handle = &mutation_route,
+        .request = &mutation_request,
+        .executor = .init(&test_io),
+        .out_response_handle = &mutation_response_handle,
+        .out_response = &mutation_response,
+    });
+    try std.testing.expect(mutation_status.isOk());
+    defer handlerDestroyHttpResponse(mutation_response_handle.?);
+    try std.testing.expectEqual(@as(u16, 503), mutation_response.status);
+    try std.testing.expectEqual(@as(usize, 0), KernelIngressTestRoutes.mutation_calls);
+    try std.testing.expect(std.mem.indexOf(u8, mutation_response.body.slice(), "ha_mutation_not_replicated") != null);
+
+    var retry_route = RouteState{
+        .owner = &state,
+        .handler = httpx.Handler.from(KernelIngressTestRoutes.metadataNotLeader),
+    };
+    const retry_request = abi.HttpRequestView{
+        .method = .get,
+        .path = abi.Bytes.init("/db/v1/tables/docs"),
+        .body = abi.OptionalBytes.init(""),
+    };
+    var retry_response_handle: ?*anyopaque = null;
+    var retry_response: abi.HttpResponseView = undefined;
+    const retry_status = handlerHandleHttp(&.{
+        .abi_version = abi.abi_version,
+        .route_handle = &retry_route,
+        .request = &retry_request,
+        .executor = .init(&test_io),
+        .out_response_handle = &retry_response_handle,
+        .out_response = &retry_response,
+    });
+    try std.testing.expect(retry_status.isOk());
+    defer handlerDestroyHttpResponse(retry_response_handle.?);
+    try std.testing.expectEqual(@as(u16, 503), retry_response.status);
+    try std.testing.expectEqualStrings("1", responseHeader(retry_response, "Retry-After").?);
+    try std.testing.expectEqualStrings("true", responseHeader(retry_response, "X-Antfly-Metadata-Not-Leader").?);
+    try std.testing.expectEqualStrings("{\"error\":\"metadata leader unavailable\"}", retry_response.body.slice());
+    try std.testing.expectEqual(@as(u64, 2), api_server.requestStats().request_count);
 }

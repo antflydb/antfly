@@ -132,11 +132,12 @@ def sync_detailed(
     weighted capacity unit and at least one unit per two declared images. The effective
     ceiling is the minimum of the configured per-image limit times image count, the
     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-    `max_concurrent_requests`. Admission happens before model resolution or download.
+    `admission.inference.max_concurrent_requests`. Admission happens before model resolution or
+    download.
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+    512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -202,11 +203,12 @@ def sync(
     weighted capacity unit and at least one unit per two declared images. The effective
     ceiling is the minimum of the configured per-image limit times image count, the
     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-    `max_concurrent_requests`. Admission happens before model resolution or download.
+    `admission.inference.max_concurrent_requests`. Admission happens before model resolution or
+    download.
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+    512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -267,11 +269,12 @@ async def asyncio_detailed(
     weighted capacity unit and at least one unit per two declared images. The effective
     ceiling is the minimum of the configured per-image limit times image count, the
     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-    `max_concurrent_requests`. Admission happens before model resolution or download.
+    `admission.inference.max_concurrent_requests`. Admission happens before model resolution or
+    download.
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+    512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -335,11 +338,12 @@ async def asyncio(
     weighted capacity unit and at least one unit per two declared images. The effective
     ceiling is the minimum of the configured per-image limit times image count, the
     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-    `max_concurrent_requests`. Admission happens before model resolution or download.
+    `admission.inference.max_concurrent_requests`. Admission happens before model resolution or
+    download.
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+    512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess

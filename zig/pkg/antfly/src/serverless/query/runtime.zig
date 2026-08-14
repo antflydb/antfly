@@ -22,6 +22,7 @@ const graph_segment_mod = @import("../graph_segment/mod.zig");
 const cache_mod = @import("cache.zig");
 const graph_reader = @import("graph_reader.zig");
 const request_mod = @import("request.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const QueryExecutionMetrics = struct {
     total_queries: u64 = 0,
@@ -157,6 +158,7 @@ pub const QuerySession = struct {
     artifacts: *artifacts_mod.ArtifactStore,
     cache: ?*cache_mod.QueryCache = null,
     manifest: manifest_mod.Manifest,
+    cancellation: CancellationToken = .none,
 
     pub fn deinit(self: *QuerySession) void {
         self.manifest.deinit(self.alloc);
@@ -180,6 +182,14 @@ pub const QuerySession = struct {
         return self.manifest.artifacts[index];
     }
 
+    pub fn setCancellation(self: *QuerySession, cancellation: CancellationToken) void {
+        self.cancellation = cancellation;
+    }
+
+    pub fn checkCancellation(self: *const QuerySession) !void {
+        return self.cancellation.check();
+    }
+
     pub fn findArtifactIndex(self: *const QuerySession, kind: manifest_mod.ArtifactKind) ?usize {
         for (self.manifest.artifacts, 0..) |artifact, idx| {
             if (artifact.kind == kind) return idx;
@@ -196,21 +206,39 @@ pub const QuerySession = struct {
     }
 
     pub fn fetchArtifactAlloc(self: *QuerySession, index: usize) ![]u8 {
+        try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
-        if (self.cache) |cache| return try cache.getOrFetchAlloc(self.artifacts, artifact.artifact_id);
-        return try self.artifacts.getAlloc(artifact.artifact_id);
+        const result = if (self.cache) |cache|
+            try cache.getOrFetchAlloc(self.artifacts, artifact.artifact_id)
+        else
+            try self.artifacts.getAlloc(artifact.artifact_id);
+        errdefer self.alloc.free(result);
+        try self.checkCancellation();
+        return result;
     }
 
     pub fn fetchArtifactRangeAlloc(self: *QuerySession, index: usize, offset: u64, len: usize) ![]u8 {
+        try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
-        if (self.cache) |cache| return try cache.getRangeOrFetchAlloc(self.artifacts, artifact.artifact_id, offset, len);
-        return try self.artifacts.getRangeAlloc(artifact.artifact_id, offset, len);
+        const result = if (self.cache) |cache|
+            try cache.getRangeOrFetchAlloc(self.artifacts, artifact.artifact_id, offset, len)
+        else
+            try self.artifacts.getRangeAlloc(artifact.artifact_id, offset, len);
+        errdefer self.alloc.free(result);
+        try self.checkCancellation();
+        return result;
     }
 
     pub fn fetchArtifactBlockRangeAlloc(self: *QuerySession, index: usize, block_id: []const u8, offset: u64, len: usize) ![]u8 {
+        try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
-        if (self.cache) |cache| return try cache.getBlockOrFetchRangeAlloc(self.artifacts, artifact.artifact_id, block_id, offset, len);
-        return try self.artifacts.getRangeAlloc(artifact.artifact_id, offset, len);
+        const result = if (self.cache) |cache|
+            try cache.getBlockOrFetchRangeAlloc(self.artifacts, artifact.artifact_id, block_id, offset, len)
+        else
+            try self.artifacts.getRangeAlloc(artifact.artifact_id, offset, len);
+        errdefer self.alloc.free(result);
+        try self.checkCancellation();
+        return result;
     }
 
     pub fn warmArtifact(self: *QuerySession, index: usize) !void {

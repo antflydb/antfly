@@ -56,6 +56,7 @@ const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
 const coverage_policy_mod = @import("coverage_policy.zig");
 const query_api = @import("query.zig");
+const public_table_http = @import("public_table_http.zig");
 const runtime_status = @import("runtime_status.zig");
 
 fn publishRuntimeStatusGroupForTest(
@@ -32572,7 +32573,10 @@ test "provisioned table write source read cache overlay preserves live replay st
         defer db.close();
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
-            .sync_level = .write,
+            // The replay fields exercised below are supplied by the live
+            // status fixture. Make the separate read-cache/HBC precondition
+            // deterministic instead of racing asynchronous dense indexing.
+            .sync_level = .full_index,
         });
     }
 
@@ -34568,7 +34572,12 @@ test "provisioned table read source survives many external write-sync batches be
 
     var ready = false;
     for (0..200) |_| {
-        var detail = try server.handlePublicTableGetIndex("docs", "semantic_idx");
+        var detail = try public_table_http.handleTableGetIndex(
+            alloc,
+            "docs",
+            "semantic_idx",
+            server.tableApi(.{}),
+        );
         defer detail.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 200), detail.status);
         var parsed_detail = try std.json.parseFromSlice(IndexDetail, alloc, detail.body, .{ .ignore_unknown_fields = true });
@@ -36524,7 +36533,7 @@ test "managed startup catch-up reclaims due obsolete primary run files" {
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(@as(u64, 0), statuses.items[0].lsm_storage_stats.?.obsolete_paths_reclaimable);
+    try std.testing.expectEqual(@as(u64, 0), statuses.items[0].lsm_storage_stats.?.maintenance.obsolete_paths_reclaimable);
 }
 
 test "managed startup catch-up bypasses shared write cache" {

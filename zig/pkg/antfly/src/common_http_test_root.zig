@@ -7,4 +7,5 @@
 test {
     _ = @import("common/http/std_http_executor.zig");
     _ = @import("common/http/std_http_listener.zig");
+    _ = @import("common/runtime_lifecycle.zig");
 }

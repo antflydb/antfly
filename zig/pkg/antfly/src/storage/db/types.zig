@@ -26,6 +26,7 @@ const transactions_mod = @import("../transactions.zig");
 const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
+pub const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const GeoPoint = struct {
     lon: f64,
@@ -1318,7 +1319,7 @@ pub const SearchRequest = struct {
     execution_deadline_ns: ?u64 = null,
     /// Borrowed listener lifecycle signal. It is request-local and must never
     /// be retained by asynchronous work after query execution returns.
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
 };

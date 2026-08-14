@@ -82,6 +82,7 @@ pub const ForeignColumn = types.ForeignColumn;
 pub const ForeignSource = types.ForeignSource;
 pub const IncompleteDetails = types.IncompleteDetails;
 pub const IndexStatus = types.IndexStatus;
+pub const InferenceCapacityError = types.InferenceCapacityError;
 pub const InferenceConnection = types.InferenceConnection;
 pub const InferenceProviderType = types.InferenceProviderType;
 pub const JoinClause = types.JoinClause;

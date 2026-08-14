@@ -15,6 +15,7 @@
 package common
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -30,6 +31,28 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAdmissionMaxConcurrentRequestsZeroRoundTrip(t *testing.T) {
+	zero := 0
+	original := Config{Admission: AdmissionConfig{
+		Query:     QueryAdmissionConfig{MaxConcurrentRequests: &zero},
+		Write:     WriteAdmissionConfig{MaxConcurrentRequests: &zero},
+		Inference: InferenceAdmissionConfig{MaxConcurrentRequests: &zero},
+	}}
+
+	encoded, err := json.Marshal(original)
+	require.NoError(t, err)
+	require.Contains(t, string(encoded), `"max_concurrent_requests":0`)
+
+	var decoded Config
+	require.NoError(t, json.Unmarshal(encoded, &decoded))
+	require.NotNil(t, decoded.Admission.Query.MaxConcurrentRequests)
+	require.Zero(t, *decoded.Admission.Query.MaxConcurrentRequests)
+	require.NotNil(t, decoded.Admission.Write.MaxConcurrentRequests)
+	require.Zero(t, *decoded.Admission.Write.MaxConcurrentRequests)
+	require.NotNil(t, decoded.Admission.Inference.MaxConcurrentRequests)
+	require.Zero(t, *decoded.Admission.Inference.MaxConcurrentRequests)
+}
 
 // JSONStructTag returns a viper.DecoderConfigOption that uses json tags instead of mapstructure tags
 func JSONStructTag() viper.DecoderConfigOption {
