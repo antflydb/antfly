@@ -336,6 +336,7 @@ pub fn reshapeChunkBackedResult(
                 .id = try alloc.dupe(u8, parent_id),
                 .doc_ordinal = chunk_hit.doc_ordinal,
                 .score = chunk_hit.score,
+                .distance = chunk_hit.distance,
                 .stored_data = null,
                 .chunk_hits = &.{},
             });
@@ -345,11 +346,10 @@ pub fn reshapeChunkBackedResult(
 
         const parent_hit = &parents.items[gop.value_ptr.*];
         if (parent_hit.doc_ordinal == null) parent_hit.doc_ordinal = chunk_hit.doc_ordinal;
-        // Raw hits are already in the query's effective order: descending for
-        // relevance scores and ascending for dense distances. The first match
-        // encountered for a group is therefore its best match regardless of
-        // score direction. Retaining it also keeps distributed group ranking
-        // consistent with the nested match order.
+        if (parent_hit.score == null or (chunk_hit.score != null and chunk_hit.score.? > parent_hit.score.?)) {
+            parent_hit.score = chunk_hit.score;
+            parent_hit.distance = chunk_hit.distance;
+        }
         if (req.return_mode == .parent_with_chunks) {
             if (req.max_chunks_per_parent > 0 and parent_hit.chunk_hits.len >= req.max_chunks_per_parent) {
                 continue;
@@ -362,6 +362,7 @@ pub fn reshapeChunkBackedResult(
             try chunks.append(alloc, .{
                 .id = try alloc.dupe(u8, chunk_hit.id),
                 .score = chunk_hit.score,
+                .distance = chunk_hit.distance,
                 .stored_data = if (chunk_hit.stored_data) |stored| try alloc.dupe(u8, stored) else null,
                 .ancestor_source_data = if (chunk_hit.ancestor_source_data) |stored| try alloc.dupe(u8, stored) else null,
                 .ancestor_unit_data = if (chunk_hit.ancestor_unit_data) |stored| try alloc.dupe(u8, stored) else null,
@@ -1875,19 +1876,21 @@ test "reshapeChunkBackedResult orders equal-score parent hits by doc id" {
     try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
 }
 
-test "reshapeChunkBackedResult uses the first ranked descendant for the group score" {
+test "reshapeChunkBackedResult uses the best descendant relevance score and distance" {
     const alloc = std.testing.allocator;
 
     var raw_hits = try alloc.alloc(types.SearchHit, 2);
     raw_hits[0] = .{
         .id = try alloc.dupe(u8, "doc:a#0"),
         .doc_ordinal = 7,
-        .score = 0.4,
+        .score = 0.6,
+        .distance = 0.4,
     };
     raw_hits[1] = .{
         .id = try alloc.dupe(u8, "doc:a#1"),
         .doc_ordinal = 7,
-        .score = 0.6,
+        .score = 0.4,
+        .distance = 0.6,
     };
 
     var result = try reshapeChunkBackedResult(alloc, .{
@@ -1909,7 +1912,8 @@ test "reshapeChunkBackedResult uses the first ranked descendant for the group sc
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 7), result.hits[0].doc_ordinal);
-    try std.testing.expectEqual(@as(?f32, 0.4), result.hits[0].score);
+    try std.testing.expectEqual(@as(?f32, 0.6), result.hits[0].score);
+    try std.testing.expectEqual(@as(?f32, 0.4), result.hits[0].distance);
 }
 
 test "reshapeChunkBackedResult preserves nested chunk artifact refs" {

@@ -170,6 +170,7 @@ pub const QueryHit = struct {
     doc_id: []const u8,
     body: []const u8,
     score: u32,
+    distance: ?f32 = null,
 };
 
 pub const GraphNeighbor = struct {

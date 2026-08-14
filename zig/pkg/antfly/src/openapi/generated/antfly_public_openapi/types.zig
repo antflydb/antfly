@@ -1533,13 +1533,16 @@ pub const HierarchyMatchContext = struct {
 
 pub const HierarchyMatchHit = struct {
     _id: []const u8,
+    /// Relevance score, normalized so higher values always rank first.
     _score: f32,
+    /// Raw vector distance when this hit came directly from a dense-vector search; lower values are better.
+    _distance: ?f32 = null,
     _source: ?std.json.Value = null,
     hierarchy: ?HierarchyMatchContext = null,
 };
 
 pub const HierarchyMatches = struct {
-    /// Maximum matching descendant hits attached to each group, independent of the top-level query limit. Matches follow the effective query order, and the group score is the score of its best matching descendant. The maximum is enforced before query execution to bound work and response growth.
+    /// Maximum matching descendant hits attached to each group, independent of the top-level query limit. Matches follow the effective query order, and the group score is the score of its best matching descendant. The maximum bounds nested response growth; grouped collection uses an adaptive candidate window and stops once the requested group page is satisfied.
     limit: ?i64 = null,
     /// Fields to include in each nested match. This projection is required because grouped and matching records commonly have different schemas. Use an empty array to return match identity and hierarchy metadata without stored fields.
     fields: []const []const u8,
@@ -2123,20 +2126,16 @@ pub const QueryBuilderResult = struct {
 pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
     ancestors: ?HierarchyAncestors = null,
-    /// Legacy result-shape control. Prefer group_by or ancestors.
-    return_level: ?[]const u8 = null,
-    rollup: ?[]const u8 = null,
-    include: ?[]const []const u8 = null,
-    /// Legacy child limit. Prefer group_by.matches.limit.
-    max_children_per_parent: ?i64 = null,
 };
 
 /// A single query result hit
 pub const QueryHit = struct {
     /// ID of the record.
     _id: []const u8,
-    /// Relevance score of the hit.
+    /// Relevance score of the hit, normalized so higher values always rank first.
     _score: f32,
+    /// Raw vector distance for dense-vector hits; lower values are better. Omitted for non-dense and fused results.
+    _distance: ?f32 = null,
     /// Scores partitioned by index when using RRF search.
     _index_scores: ?std.json.Value = null,
     _source: ?std.json.Value = null,
@@ -2209,7 +2208,7 @@ pub const QueryHits = struct {
     /// Total number of hits available and whether it is exact.
     total: ?QueryHitsTotal = null,
     hits: ?[]const QueryHit = null,
-    /// Maximum score of the results.
+    /// Best relevance score among the returned results. Scores are always higher-is-better.
     max_score: ?f32 = null,
 };
 

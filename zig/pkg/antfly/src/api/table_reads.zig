@@ -14944,6 +14944,7 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
         hits[i] = .{
             .id = try alloc.dupe(u8, item._id),
             .score = item._score,
+            .distance = item._distance,
             .index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores),
             .stored_data = if (item._source) |value| try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}) else null,
         };

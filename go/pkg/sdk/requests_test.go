@@ -95,7 +95,7 @@ func TestQueryRequestMarshalPreservesEmptyDirectHierarchy(t *testing.T) {
 func TestQueryHitUnmarshalUsesTypedHierarchy(t *testing.T) {
 	var hit Hit
 	err := json.Unmarshal([]byte(`{
-		"_id":"doc:a","_score":0.8,
+		"_id":"doc:a","_score":0.8,"_distance":0.2,
 		"hierarchy":{
 			"level":"source","parent_doc_key":"doc:a",
 			"matches":[{"_id":"chunk:1","_score":0.7,"_source":{"text":"chunk text"}}],
@@ -107,6 +107,9 @@ func TestQueryHitUnmarshalUsesTypedHierarchy(t *testing.T) {
 	}
 	if hit.Hierarchy.Level != QueryHitHierarchyLevelSource {
 		t.Fatalf("unexpected hierarchy level: %q", hit.Hierarchy.Level)
+	}
+	if hit.Distance != 0.2 {
+		t.Fatalf("unexpected raw vector distance: %v", hit.Distance)
 	}
 	if len(hit.Hierarchy.Matches) != 1 || hit.Hierarchy.Matches[0].ID != "chunk:1" {
 		t.Fatalf("unexpected typed hierarchy matches: %#v", hit.Hierarchy.Matches)

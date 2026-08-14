@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const vector_mod = @import("antfly_vector").vector;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -65541,7 +65542,8 @@ test "db dense vector index routes knn search" {
 
     try std.testing.expectEqual(@as(u32, 2), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
-    try std.testing.expect(result.hits[0].score.? <= result.hits[1].score.?);
+    try std.testing.expect(result.hits[0].score.? >= result.hits[1].score.?);
+    try std.testing.expect(result.hits[0].distance.? <= result.hits[1].distance.?);
 }
 
 test "db dense vector index routes knn search with durable lsm primary backend" {
@@ -65581,7 +65583,8 @@ test "db dense vector index routes knn search with durable lsm primary backend" 
 
     try std.testing.expectEqual(@as(u32, 2), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
-    try std.testing.expect(result.hits[0].score.? <= result.hits[1].score.?);
+    try std.testing.expect(result.hits[0].score.? >= result.hits[1].score.?);
+    try std.testing.expect(result.hits[0].distance.? <= result.hits[1].distance.?);
 }
 
 test "db full text conjunction query" {
@@ -84450,7 +84453,8 @@ test "db dense lsm cache profile benchmark" {
 
             try hits.append(alloc, .{
                 .id = doc_key,
-                .score = hit.distance,
+                .score = vector_mod.similarityFromDistance(hit.distance, profiled_entry.metric),
+                .distance = hit.distance,
                 .stored_data = stored_data,
             });
         }

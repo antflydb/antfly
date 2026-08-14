@@ -1424,7 +1424,11 @@ pub const SearchHit = struct {
     source_table: ?[]u8 = null,
     doc_ordinal: ?u32 = null,
     native_text_doc_id: ?u32 = null,
+    /// Higher-is-better relevance score used by every public query path.
     score: ?f32 = null,
+    /// Metric-native dense-vector distance. Lower values are better. This is
+    /// retained separately so score ordering never depends on the metric.
+    distance: ?f32 = null,
     index_scores: []fusion_mod.IndexScore = &.{},
     sort_values: []std.json.Value = &.{},
     stored_data: ?[]u8 = null,
@@ -1449,6 +1453,7 @@ pub const SearchHit = struct {
         cloned.doc_ordinal = self.doc_ordinal;
         cloned.native_text_doc_id = self.native_text_doc_id;
         cloned.score = self.score;
+        cloned.distance = self.distance;
         cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
         cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
@@ -1614,6 +1619,7 @@ pub fn freeIndexScores(alloc: Allocator, scores: []fusion_mod.IndexScore) void {
 pub const ChunkHit = struct {
     id: []u8,
     score: ?f32 = null,
+    distance: ?f32 = null,
     stored_data: ?[]u8 = null,
     ancestor_source_data: ?[]u8 = null,
     ancestor_unit_data: ?[]u8 = null,
@@ -1623,6 +1629,7 @@ pub const ChunkHit = struct {
         return .{
             .id = try alloc.dupe(u8, self.id),
             .score = self.score,
+            .distance = self.distance,
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
             .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
             .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,

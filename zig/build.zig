@@ -4307,6 +4307,9 @@ pub fn build(b: *std.Build) void {
     lib_db_enrichment_merge_cutover_reopen_step.dependOn(&run_lib_db_enrichment_merge_cutover_reopen_tests.step);
 
     const lib_db_query_default_filters = [_][]const u8{
+        "grouped candidate budget parses disabled and fallback values",
+        "adaptive candidate window covers requested offset page and grows bounded",
+        "grouped result satisfaction includes page and requested nested matches",
         "storage.db.db.test.db full-text",
         "storage.db.db.test.db dense ",
         "storage.db.db.test.db sparse ",
@@ -4429,7 +4432,7 @@ pub fn build(b: *std.Build) void {
             "fuseNamedSets drops conflicting source hit ordinals",
             "applyGraphUnion deduplicates by ordinals when hit pages are complete",
             "applyGraphIntersection uses ordinals when hit pages are complete",
-            "reshapeChunkBackedResult uses the first ranked descendant for the group score",
+            "reshapeChunkBackedResult uses the best descendant relevance score and distance",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4761,6 +4764,9 @@ pub fn build(b: *std.Build) void {
         "api query contract serializes derived hierarchy ancestry",
         "api query contract serializes mention evidence hierarchy",
         "api query contract validates canonical hierarchy controls",
+        "query max score preserves negative relevance scores",
+        "query hit exposes relevance score and raw vector distance separately",
+        "query merge orders pure dense results by descending relevance score",
         "api http server serves fielded full-text search through mcp tools",
         "api query contract canonicalizes public Query filter roots and compositions",
         "api query contract accepts multi_match bool_prefix full text",

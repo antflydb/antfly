@@ -6210,7 +6210,8 @@ components:
             Maximum matching descendant hits attached to each group, independent of
             the top-level query limit. Matches follow the effective query order, and
             the group score is the score of its best matching descendant. The maximum
-            is enforced before query execution to bound work and response growth.
+            bounds nested response growth; grouped collection uses an adaptive candidate
+            window and stops once the requested group page is satisfied.
         fields:
           type: array
           items:
@@ -6261,16 +6262,6 @@ components:
         cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
       allOf:
         - not:
-            allOf:
-              - anyOf:
-                  - required: [group_by]
-                  - required: [ancestors]
-              - anyOf:
-                  - required: [return_level]
-                  - required: [rollup]
-                  - required: [include]
-                  - required: [max_children_per_parent]
-        - not:
             description: A source-level group already carries source fields in the top-level hit.
             required: [group_by, ancestors]
             properties:
@@ -6283,26 +6274,6 @@ components:
         ancestors:
           $ref: "#/components/schemas/HierarchyAncestors"
           x-go-type-skip-optional-pointer: false
-        return_level:
-          type: string
-          enum: [source, chunk]
-          deprecated: true
-          description: Legacy result-shape control. Prefer group_by or ancestors.
-        rollup:
-          type: string
-          enum: [source, none]
-          deprecated: true
-        include:
-          type: array
-          deprecated: true
-          items:
-            type: string
-            enum: [source, unit, chunk, chunks, mention, mentions]
-        max_children_per_parent:
-          type: integer
-          format: uint32
-          deprecated: true
-          description: Legacy child limit. Prefer group_by.matches.limit.
     QueryRequest: # Based on remoteindex.Query
       type: object
       properties:
@@ -7403,6 +7374,13 @@ components:
           format: float
           x-go-type: float64
           x-go-name: score
+          description: Relevance score, normalized so higher values always rank first.
+        _distance:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-name: distance
+          description: Raw vector distance when this hit came directly from a dense-vector search; lower values are better.
         _source:
           type: object
           additionalProperties: true
@@ -7456,8 +7434,14 @@ components:
           type: number
           format: float
           x-go-type: float64
-          description: Relevance score of the hit.
+          description: Relevance score of the hit, normalized so higher values always rank first.
           x-go-name: score
+        _distance:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-name: distance
+          description: Raw vector distance for dense-vector hits; lower values are better. Omitted for non-dense and fused results.
         _index_scores:
           type: object # map[string]float64
           additionalProperties: true
@@ -7505,7 +7489,7 @@ components:
           type: number
           format: float
           x-go-type: float64
-          description: Maximum score of the results.
+          description: Best relevance score among the returned results. Scores are always higher-is-better.
     QueryHitsTotal:
       x-omitempty: false
       x-omitzero: false

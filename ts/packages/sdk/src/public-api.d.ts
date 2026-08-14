@@ -6020,7 +6020,8 @@ export interface components {
              * @description Maximum matching descendant hits attached to each group, independent of
              *     the top-level query limit. Matches follow the effective query order, and
              *     the group score is the score of its best matching descendant. The maximum
-             *     is enforced before query execution to bound work and response growth.
+             *     bounds nested response growth; grouped collection uses an adaptive candidate
+             *     window and stops once the requested group page is satisfied.
              * @default 3
              */
             limit?: number;
@@ -6058,26 +6059,7 @@ export interface components {
         QueryHierarchy: {
             group_by?: components["schemas"]["HierarchyGroupBy"];
             ancestors?: components["schemas"]["HierarchyAncestors"];
-            /**
-             * @deprecated
-             * @description Legacy result-shape control. Prefer group_by or ancestors.
-             * @enum {string}
-             */
-            return_level?: "source" | "chunk";
-            /**
-             * @deprecated
-             * @enum {string}
-             */
-            rollup?: "source" | "none";
-            /** @deprecated */
-            include?: ("source" | "unit" | "chunk" | "chunks" | "mention" | "mentions")[];
-            /**
-             * Format: uint32
-             * @deprecated
-             * @description Legacy child limit. Prefer group_by.matches.limit.
-             */
-            max_children_per_parent?: number;
-        } & (unknown & unknown);
+        } & unknown;
         QueryRequest: {
             /**
              * @description Name of the table to query. Optional for global queries.
@@ -7077,8 +7059,16 @@ export interface components {
         };
         HierarchyMatchHit: {
             _id: string;
-            /** Format: float */
+            /**
+             * Format: float
+             * @description Relevance score, normalized so higher values always rank first.
+             */
             _score: number;
+            /**
+             * Format: float
+             * @description Raw vector distance when this hit came directly from a dense-vector search; lower values are better.
+             */
+            _distance?: number;
             _source?: {
                 [key: string]: unknown;
             };
@@ -7108,9 +7098,14 @@ export interface components {
             _id: string;
             /**
              * Format: float
-             * @description Relevance score of the hit.
+             * @description Relevance score of the hit, normalized so higher values always rank first.
              */
             _score: number;
+            /**
+             * Format: float
+             * @description Raw vector distance for dense-vector hits; lower values are better. Omitted for non-dense and fused results.
+             */
+            _distance?: number;
             /** @description Scores partitioned by index when using RRF search. */
             _index_scores?: {
                 [key: string]: unknown;
@@ -7142,7 +7137,7 @@ export interface components {
             hits?: components["schemas"]["QueryHit"][];
             /**
              * Format: float
-             * @description Maximum score of the results.
+             * @description Best relevance score among the returned results. Scores are always higher-is-better.
              */
             max_score?: number;
         };

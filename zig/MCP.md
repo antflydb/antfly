@@ -155,7 +155,7 @@ The legacy hierarchy controls remain accepted for existing callers, but they can
 `ancestors`. They are intentionally omitted from MCP discovery so new integrations see only the canonical controls.
 MCP callers should not request
 `_chunks.*`, which expands the stored child array and can create an oversized response. Antfly returns an actionable tool error
-instead of sending a serialized tool result larger than its MCP compatibility budget. The server default is 384 KiB,
+instead of sending a serialized tool result larger than its MCP compatibility budget. The server default is 96 KiB,
 including TextContent and structuredContent; deployments with known client limits can change
 `ApiHttpServerConfig.mcp_max_tool_result_bytes`, or set it to zero to disable the guard.
 

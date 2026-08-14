@@ -155,15 +155,12 @@ pub fn mergeSearchResultsWithRuntimeSchema(
 
     std.sort.pdq(db_mod.types.SearchHit, merged_hits.items, ScoreMergeOrder{
         .use_score = score_ordered_merge,
-        .ascending_scores = isPureDenseRequest(req),
     }, struct {
         fn lessThan(order: ScoreMergeOrder, a: db_mod.types.SearchHit, b: db_mod.types.SearchHit) bool {
             if (order.use_score) {
                 const a_score = a.score.?;
                 const b_score = b.score.?;
-                if (a_score != b_score) {
-                    return if (order.ascending_scores) a_score < b_score else a_score > b_score;
-                }
+                if (a_score != b_score) return a_score > b_score;
             }
             return std.mem.order(u8, a.id, b.id) == .lt;
         }
@@ -240,7 +237,6 @@ fn validateScoreOrderedMergeHit(hit: db_mod.types.SearchHit) !void {
 
 const ScoreMergeOrder = struct {
     use_score: bool,
-    ascending_scores: bool,
 };
 
 fn requestUsesScoreOrderedMerge(req: db_mod.types.SearchRequest) bool {
@@ -332,16 +328,6 @@ fn textBoolQueryIsScoreBearing(query: db_mod.types.TextBoolQuery) bool {
         if (textQueryIsScoreBearing(child)) return true;
     }
     return false;
-}
-
-fn isPureDenseRequest(req: db_mod.types.SearchRequest) bool {
-    return req.dense_queries.len > 0 and
-        req.full_text_queries.len == 0 and
-        req.full_text == null and
-        req.sparse_queries.len == 0 and
-        req.graph_queries.len == 0 and
-        req.sparse == null and
-        req.merge_config == null;
 }
 
 const GraphSearchResultBuilder = struct {
@@ -2134,24 +2120,27 @@ test "query merge preserves common identity read generation" {
     try std.testing.expectEqual(@as(?u64, null), mixed.identity_read_generation);
 }
 
-test "query merge orders pure dense results by ascending distance" {
+test "query merge orders pure dense results by descending relevance score" {
     const alloc = std.testing.allocator;
 
     var left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
     left_hits[0] = .{
         .id = try alloc.dupe(u8, "doc:b"),
-        .score = 1.0,
+        .score = 0.5,
+        .distance = 1.0,
         .stored_data = null,
     };
     left_hits[1] = .{
         .id = try alloc.dupe(u8, "doc:c"),
-        .score = 0.2,
+        .score = 0.8,
+        .distance = 0.2,
         .stored_data = null,
     };
     var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
     right_hits[0] = .{
         .id = try alloc.dupe(u8, "doc:a"),
-        .score = 0.0,
+        .score = 1.0,
+        .distance = 0.0,
         .stored_data = null,
     };
 
@@ -2184,4 +2173,5 @@ test "query merge orders pure dense results by ascending distance" {
     try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
     try std.testing.expectEqualStrings("doc:c", merged.hits[1].id);
     try std.testing.expectEqualStrings("doc:b", merged.hits[2].id);
+    try std.testing.expectEqual(@as(?f32, 0.0), merged.hits[0].distance);
 }

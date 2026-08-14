@@ -3170,6 +3170,7 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
     return .{
         ._id = hit.id,
         ._score = if (hit.score) |score| finiteScoreOrZero(score) else 0,
+        ._distance = if (hit.distance) |distance| finiteScoreOrZero(distance) else null,
         ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
         ._sort = if (hit.sort_values.len > 0) hit.sort_values else null,
         ._source = if (hit.stored_data) |stored_data|
@@ -3348,6 +3349,9 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
 
     try putJsonString(alloc, &obj, "_id", hit.id);
     try obj.put(alloc, try alloc.dupe(u8, "_score"), .{ .float = hit.score orelse 0 });
+    if (hit.distance) |distance| {
+        try obj.put(alloc, try alloc.dupe(u8, "_distance"), .{ .float = finiteScoreOrZero(distance) });
+    }
     if (hit.stored_data) |stored_data| {
         const match_projection_configured = !req.hierarchy_match_include_all_fields;
         const source = if (req.defer_stored_projection or match_projection_configured)
@@ -4275,11 +4279,33 @@ fn parseStoredSourceValue(alloc: std.mem.Allocator, stored_data: []const u8) !st
 
 fn computeMaxScore(hits: []const db_mod.types.SearchHit) f32 {
     var max_score: f32 = 0;
+    var found = false;
     for (hits) |hit| {
-        const score = hit.score orelse 0;
-        if (score > max_score) max_score = score;
+        const score = hit.score orelse continue;
+        if (!found or score > max_score) max_score = score;
+        found = true;
     }
     return max_score;
+}
+
+test "query max score preserves negative relevance scores" {
+    const hits = [_]db_mod.types.SearchHit{
+        .{ .id = @constCast("doc:a"), .score = -0.75 },
+        .{ .id = @constCast("doc:b"), .score = -0.25 },
+        .{ .id = @constCast("doc:c") },
+    };
+    try std.testing.expectEqual(@as(f32, -0.25), computeMaxScore(&hits));
+    try std.testing.expectEqual(@as(f32, 0), computeMaxScore(&.{}));
+}
+
+test "query hit exposes relevance score and raw vector distance separately" {
+    const hit = try toOpenApiHit(std.testing.allocator, .{}, .{
+        .id = @constCast("doc:a"),
+        .score = 0.8,
+        .distance = 0.25,
+    });
+    try std.testing.expectEqual(@as(f32, 0.8), hit._score);
+    try std.testing.expectEqual(@as(f32, 0.25), hit._distance.?);
 }
 
 pub fn parseAggregationRequestsJson(

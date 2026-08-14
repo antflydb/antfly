@@ -651,8 +651,9 @@ pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     experimental: bool = false,
     /// Maximum serialized MCP tools/call result size. Zero disables the guard.
-    /// The default leaves headroom beneath common connector response limits.
-    mcp_max_tool_result_bytes: usize = 384 * 1024,
+    /// The conservative default leaves headroom beneath 100 KiB connector
+    /// limits after the JSON-RPC response envelope is added.
+    mcp_max_tool_result_bytes: usize = 96 * 1024,
     /// Node-local public database-query admission capacity. Zero is unlimited.
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
     /// Node-local foreground data-mutation admission capacity. Zero is unlimited.

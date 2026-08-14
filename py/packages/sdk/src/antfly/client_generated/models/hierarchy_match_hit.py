@@ -20,13 +20,16 @@ class HierarchyMatchHit:
     """
     Attributes:
         field_id (str):
-        field_score (float):
+        field_score (float): Relevance score, normalized so higher values always rank first.
+        field_distance (float | Unset): Raw vector distance when this hit came directly from a dense-vector search;
+            lower values are better.
         field_source (HierarchyMatchHitSource | Unset):
         hierarchy (HierarchyMatchContext | Unset):
     """
 
     field_id: str
     field_score: float
+    field_distance: float | Unset = UNSET
     field_source: HierarchyMatchHitSource | Unset = UNSET
     hierarchy: HierarchyMatchContext | Unset = UNSET
 
@@ -34,6 +37,8 @@ class HierarchyMatchHit:
         field_id = self.field_id
 
         field_score = self.field_score
+
+        field_distance = self.field_distance
 
         field_source: dict[str, Any] | Unset = UNSET
         if not isinstance(self.field_source, Unset):
@@ -51,6 +56,8 @@ class HierarchyMatchHit:
                 "_score": field_score,
             }
         )
+        if field_distance is not UNSET:
+            field_dict["_distance"] = field_distance
         if field_source is not UNSET:
             field_dict["_source"] = field_source
         if hierarchy is not UNSET:
@@ -67,6 +74,8 @@ class HierarchyMatchHit:
         field_id = d.pop("_id")
 
         field_score = d.pop("_score")
+
+        field_distance = d.pop("_distance", UNSET)
 
         _field_source = d.pop("_source", UNSET)
         field_source: HierarchyMatchHitSource | Unset
@@ -85,6 +94,7 @@ class HierarchyMatchHit:
         hierarchy_match_hit = cls(
             field_id=field_id,
             field_score=field_score,
+            field_distance=field_distance,
             field_source=field_source,
             hierarchy=hierarchy,
         )

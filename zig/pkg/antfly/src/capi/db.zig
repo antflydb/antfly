@@ -2657,7 +2657,7 @@ fn resolveDenseHitsFromProfiled(
             (try entry.index.getMetadata(hit.vector_id)) orelse return error.Internal;
         resolved[i] = .{
             .id = id,
-            .score = hit.distance,
+            .score = antfly.vector.similarityFromDistance(hit.distance, entry.metric),
         };
         resolved_count += 1;
     }
