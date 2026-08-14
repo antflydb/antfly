@@ -79,6 +79,7 @@ mcp-schema-fragments-generate:
 	$(SCRIPTS_PY) ../scripts/generate_mcp_schema_fragments.py
 
 mcp-schema-fragments-check:
+	cd .. && $(UV) run --project scripts --locked python -m unittest scripts.test_generate_mcp_schema_fragments
 	$(SCRIPTS_PY) ../scripts/generate_mcp_schema_fragments.py --check
 
 snowball-generate:
