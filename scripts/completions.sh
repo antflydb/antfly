@@ -35,7 +35,7 @@ cat >"$output_dir/antfly.zsh" <<EOF
 #compdef antfly
 
 _antfly() {
-  local -a commands
+  local -a commands subcommands
   commands=(
     'data:Run a data node'
     'metadata:Run a metadata node'
@@ -62,7 +62,40 @@ _antfly() {
     'help:Show command help'
     'version:Show the Antfly version'
   )
-  _describe 'command' commands
+  if (( CURRENT == 2 )); then
+    _describe 'command' commands
+    return
+  fi
+
+  case "\$words[2]" in
+    table|index)
+      subcommands=(create drop list get)
+      ;;
+    artifact)
+      subcommands=(list get put delete reprocess job)
+      ;;
+    agents)
+      subcommands=(retrieval query-builder)
+      ;;
+    auth)
+      subcommands=(me users permissions roles row-filters subjects api-keys)
+      ;;
+    inference)
+      subcommands=(run embed classify generate chat compile-artifact export quantize run-artifact transcribe read extract compare finetune smoke list pull convert)
+      ;;
+    lite)
+      subcommands=(init status info batch lookup scan query index enrichment schema run-until-idle backup export snapshot restore import promote check compact vacuum serve)
+      ;;
+    serverless)
+      subcommands=(api query maintenance combined)
+      ;;
+    internal)
+      subcommands=(metadata)
+      ;;
+  esac
+  if (( \${#subcommands[@]} )); then
+    _describe 'subcommand' subcommands
+  fi
 }
 
 compdef _antfly antfly

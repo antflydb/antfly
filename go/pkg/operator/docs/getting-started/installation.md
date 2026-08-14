@@ -36,6 +36,13 @@ mirrored or available to your cluster, add `--inference-antfly-image=<image>` to
 the deployment args. The image must provide the `/antfly inference` runtime
 contract.
 
+For TPU-backed `InferencePool` resources, the controller downloads the
+checksum-pinned PJRT `libtpu.so` plugin into an ephemeral volume before starting
+the inference container. TPU pods therefore need outbound HTTPS access to
+`storage.googleapis.com`. The published Antfly runtime image provides the shell,
+certificate roots, and download utilities used by that init container; custom
+InferencePool images must provide the same utilities.
+
 For production environments that manage CRDs through GitOps or another platform
 workflow, run the operator with `--skip-crd-install=true` and remove the
 `customresourcedefinitions` verbs from the operator ClusterRole. The default

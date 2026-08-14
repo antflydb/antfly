@@ -104,6 +104,9 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_POOL"]).To(Equal(poolName))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_WORKLOAD_TYPE"]).To(Equal("general"))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_LOADING_STRATEGY"]).To(Equal("eager"))
+			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_PREFERRED_BACKEND"]).To(Equal("pjrt"))
+			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_PJRT_PLUGIN"]).To(Equal(pjrtPluginPath))
+			Expect(createdConfigMap.Data["PJRT_PLUGIN_PATH"]).To(Equal(pjrtPluginPath))
 			var runtimeConfig map[string]any
 			Expect(json.Unmarshal([]byte(createdConfigMap.Data["config.json"]), &runtimeConfig)).To(Succeed())
 			Expect(runtimeConfig["models_dir"]).To(Equal("/models"))
@@ -115,7 +118,7 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(ok).To(BeTrue())
 			Expect(preloadModel).To(HaveKeyWithValue("kind", "embedder"))
 			Expect(preloadModel).To(HaveKeyWithValue("name", "bge-small-en-v1.5"))
-			Expect(preloadModel).To(HaveKeyWithValue("backend", "xla"))
+			Expect(preloadModel).NotTo(HaveKey("backend"))
 
 			// Verify the StatefulSet was created
 			stsLookupKey := types.NamespacedName{Name: poolName, Namespace: poolNamespace}
@@ -137,11 +140,18 @@ var _ = Describe("InferencePool Controller", func() {
 				"--config", "/config/config.json",
 				"--allow-insecure-public-bind",
 			}))
-			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
-			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/antfly"}))
-			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args).To(Equal([]string{
+			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(2))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Name).To(Equal("pjrt-plugin"))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/bin/sh", "-ec"}))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args).To(HaveLen(1))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args[0]).To(ContainSubstring(defaultLibTPUURL))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[1].Command).To(Equal([]string{"/antfly"}))
+			Expect(createdSts.Spec.Template.Spec.InitContainers[1].Args).To(Equal([]string{
 				"inference", "pull", "bge-small-en-v1.5", "--models-dir", "/models",
 				"--tasks", "embed", "--capabilities", "text",
+			}))
+			Expect(createdSts.Spec.Template.Spec.Containers[0].VolumeMounts).To(ContainElement(corev1.VolumeMount{
+				Name: "pjrt-plugin", MountPath: pjrtPluginMountPath, ReadOnly: true,
 			}))
 
 			// Verify TPU node selector

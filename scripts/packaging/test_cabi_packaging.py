@@ -60,6 +60,20 @@ def write_release_archive(root: Path, version: str, os_name: str, arch: str) -> 
 
 
 class CAbiPackagingTests(unittest.TestCase):
+    def test_generated_completions_include_nested_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output_dir = Path(raw) / "completions"
+            subprocess.run(
+                [str(REPO_ROOT / "scripts" / "completions.sh"), str(output_dir)],
+                cwd=REPO_ROOT,
+                check=True,
+            )
+
+            zsh = (output_dir / "antfly.zsh").read_text()
+            self.assertIn('case "$words[2]" in', zsh)
+            self.assertIn("subcommands=(run embed classify generate chat", zsh)
+            self.assertIn("_describe 'subcommand' subcommands", zsh)
+
     def test_python_and_npm_packages_preserve_cabi_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

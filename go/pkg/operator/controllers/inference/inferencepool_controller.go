@@ -57,6 +57,12 @@ const (
 	// InferenceAPIPort is the port the Inference API server listens on.
 	// This must match ANTFLY_INFERENCE_URL in the container image (default: http://0.0.0.0:8080).
 	InferenceAPIPort = 8080
+
+	defaultInferenceKeepAliveMillis uint64 = 300_000
+	defaultLibTPUURL                       = "https://storage.googleapis.com/cloud-tpu-tpuvm-artifacts/libtpu/1.12.0/libtpu.so"
+	defaultLibTPUSHA256                    = "1bb180fcc38ca309e8b7fbe04e7c47d5fdf8c5157a4f5dcb67fc05710652c4f5"
+	pjrtPluginMountPath                    = "/pjrt"
+	pjrtPluginPath                         = pjrtPluginMountPath + "/libtpu.so"
 )
 
 var (
@@ -261,6 +267,13 @@ func (r *InferencePoolReconciler) reconcileConfigMap(ctx context.Context, pool *
 	if pool.Spec.Models.RegistryURL != "" {
 		cm.Data["ANTFLY_REGISTRY_URL"] = pool.Spec.Models.RegistryURL
 	}
+	if backend := inferencePreferredBackend(pool); backend != "" {
+		cm.Data["ANTFLY_INFERENCE_PREFERRED_BACKEND"] = backend
+	}
+	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
+		cm.Data["ANTFLY_INFERENCE_PJRT_PLUGIN"] = pjrtPluginPath
+		cm.Data["PJRT_PLUGIN_PATH"] = pjrtPluginPath
+	}
 
 	// Set owner reference
 	if err := ctrl.SetControllerReference(pool, cm, r.Scheme); err != nil {
@@ -300,16 +313,17 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 		loadingStrategy = antflyaiv1alpha1.LoadingStrategyEager
 	}
 
-	// Init containers provision every model. Eager pools also warm them before
-	// serving. Accelerator pools must preload so the runtime receives the
-	// explicit CUDA/PJRT backend selection instead of falling back to CPU.
+	// Init containers provision every model. Only eager models are warmed before
+	// serving; lazy and bounded models remain available for request-time loading.
+	// Accelerator selection is configured independently through
+	// ANTFLY_INFERENCE_PREFERRED_BACKEND.
 	preload := make([]map[string]any, 0, len(pool.Spec.Models.Preload))
 	for _, model := range pool.Spec.Models.Preload {
 		modelStrategy := model.Strategy
 		if modelStrategy == "" {
 			modelStrategy = loadingStrategy
 		}
-		if modelStrategy != antflyaiv1alpha1.LoadingStrategyEager && pool.Spec.Hardware.Accelerator == "" {
+		if modelStrategy != antflyaiv1alpha1.LoadingStrategyEager {
 			continue
 		}
 
@@ -321,13 +335,6 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 			entry["format"] = format
 			if quantization != "" {
 				entry["quantization"] = quantization
-			}
-		}
-		if pool.Spec.Hardware.Accelerator != "" {
-			if strings.Contains(strings.ToLower(pool.Spec.Hardware.Accelerator), "tpu") {
-				entry["backend"] = "xla"
-			} else {
-				entry["backend"] = "cuda"
 			}
 		}
 		preload = append(preload, entry)
@@ -380,13 +387,42 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 
 func inferenceKeepAliveMillis(pool *antflyaiv1alpha1.InferencePool) (uint64, error) {
 	if pool.Spec.Models.KeepAlive == nil {
-		return uint64((5 * time.Minute).Milliseconds()), nil
+		return defaultInferenceKeepAliveMillis, nil
 	}
-	milliseconds := pool.Spec.Models.KeepAlive.Duration.Milliseconds()
+	milliseconds := pool.Spec.Models.KeepAlive.Milliseconds()
 	if milliseconds < 0 {
 		return 0, fmt.Errorf("models.keepAlive must not be negative")
 	}
 	return uint64(milliseconds), nil
+}
+
+func isTPUAccelerator(accelerator string) bool {
+	return strings.Contains(strings.ToLower(accelerator), "tpu")
+}
+
+func inferencePreferredBackend(pool *antflyaiv1alpha1.InferencePool) string {
+	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
+		return "pjrt"
+	}
+	if pool.Spec.Hardware.Accelerator != "" || hasInferenceGPUResources(pool.Spec.Resources) {
+		return "cuda"
+	}
+	return ""
+}
+
+func hasInferenceGPUResources(resources *corev1.ResourceRequirements) bool {
+	if resources == nil {
+		return false
+	}
+	for _, resourceName := range []corev1.ResourceName{"nvidia.com/gpu", "cloud.google.com/gke-gpu"} {
+		if _, ok := resources.Limits[resourceName]; ok {
+			return true
+		}
+		if _, ok := resources.Requests[resourceName]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func zigWarmModelKind(tasks []string) string {
@@ -459,7 +495,20 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 		return strings.Compare(a.Name, b.Name)
 	})
 
-	initContainers := make([]corev1.Container, 0, len(preloadModels))
+	initContainers := make([]corev1.Container, 0, len(preloadModels)+1)
+	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
+		initContainers = append(initContainers, corev1.Container{
+			Name:    "pjrt-plugin",
+			Image:   image,
+			Command: []string{"/bin/sh", "-ec"},
+			Args: []string{
+				fmt.Sprintf("wget -qO %s %s && echo '%s  %s' | sha256sum -c - && chmod 0555 %s", pjrtPluginPath, defaultLibTPUURL, defaultLibTPUSHA256, pjrtPluginPath, pjrtPluginPath),
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "pjrt-plugin", MountPath: pjrtPluginMountPath},
+			},
+		})
+	}
 	for i, model := range preloadModels {
 		args := []string{"inference", "pull", model.Name, "--models-dir", "/models"}
 		if len(model.Tasks) > 0 {
@@ -480,6 +529,43 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 				{ConfigMapRef: &corev1.ConfigMapEnvSource{
 					LocalObjectReference: corev1.LocalObjectReference{Name: pool.Name + "-config"},
 				}},
+			},
+		})
+	}
+
+	inferenceVolumeMounts := []corev1.VolumeMount{
+		{Name: "models", MountPath: "/models"},
+		{Name: "config", MountPath: "/config", ReadOnly: true},
+	}
+	volumes := []corev1.Volume{
+		{
+			Name: "models",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: "config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: pool.Name + "-config",
+					},
+					Items: []corev1.KeyToPath{
+						{Key: "config.json", Path: "config.json"},
+					},
+				},
+			},
+		},
+	}
+	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
+		inferenceVolumeMounts = append(inferenceVolumeMounts, corev1.VolumeMount{
+			Name: "pjrt-plugin", MountPath: pjrtPluginMountPath, ReadOnly: true,
+		})
+		volumes = append(volumes, corev1.Volume{
+			Name: "pjrt-plugin",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		})
 	}
@@ -517,10 +603,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 							Ports: []corev1.ContainerPort{
 								{Name: "http", ContainerPort: InferenceAPIPort, Protocol: corev1.ProtocolTCP},
 							},
-							VolumeMounts: []corev1.VolumeMount{
-								{Name: "models", MountPath: "/models"},
-								{Name: "config", MountPath: "/config", ReadOnly: true},
-							},
+							VolumeMounts: inferenceVolumeMounts,
 							EnvFrom: []corev1.EnvFromSource{
 								{ConfigMapRef: &corev1.ConfigMapEnvSource{
 									LocalObjectReference: corev1.LocalObjectReference{Name: pool.Name + "-config"},
@@ -529,27 +612,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 							Resources: r.buildResources(pool),
 						},
 					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "models",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{},
-							},
-						},
-						{
-							Name: "config",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: pool.Name + "-config",
-									},
-									Items: []corev1.KeyToPath{
-										{Key: "config.json", Path: "config.json"},
-									},
-								},
-							},
-						},
-					},
+					Volumes:          volumes,
 					ImagePullSecrets: pool.Spec.ImagePullSecrets,
 				},
 			},
@@ -567,7 +630,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 
 	// Add TPU node selector and tolerations (works in both Standard and Autopilot modes)
 	// In Autopilot, TPU provisioning is triggered by these selectors, not by compute class
-	if pool.Spec.Hardware.Accelerator != "" {
+	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
 		if sts.Spec.Template.Spec.NodeSelector == nil {
 			sts.Spec.Template.Spec.NodeSelector = make(map[string]string)
 		}
@@ -1042,7 +1105,7 @@ func (r *InferencePoolReconciler) applyGKEPodSpec(podTemplate *corev1.PodTemplat
 		// annotation because the TPU node selectors (gke-tpu-accelerator, gke-tpu-topology)
 		// drive node provisioning directly. Adding a compute class like "Balanced" prevents
 		// the cluster autoscaler from creating TPU nodes.
-		isTPUWorkload := strings.Contains(pool.Spec.Hardware.Accelerator, "tpu")
+		isTPUWorkload := isTPUAccelerator(pool.Spec.Hardware.Accelerator)
 
 		if isTPUWorkload {
 			// For TPU workloads: don't set compute-class, let node selectors drive provisioning
@@ -1466,7 +1529,7 @@ func (r *InferencePoolReconciler) buildResources(pool *antflyaiv1alpha1.Inferenc
 // and TPU resources are not already specified. This is required for GKE Autopilot.
 func (r *InferencePoolReconciler) ensureTPUResources(resources *corev1.ResourceRequirements, pool *antflyaiv1alpha1.InferencePool) {
 	// Only add TPU resources if accelerator is configured
-	if pool.Spec.Hardware.Accelerator == "" {
+	if !isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
 		return
 	}
 
