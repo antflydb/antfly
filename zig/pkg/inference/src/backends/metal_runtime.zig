@@ -9661,6 +9661,10 @@ pub const RawRuntimeMemoryStats = extern struct {
     q4_k_pair_activation_reduce: u64 = 0,
     q4_k_pair_activation_reduce_f16_output: u64 = 0,
     q4_k_activation_rhs_reduce: u64 = 0,
+    florence_q4_k_mm_matrix_dispatches: u64 = 0,
+    florence_q4_k_mm_nr4_dispatches: u64 = 0,
+    florence_attention_1x_dispatches: u64 = 0,
+    florence_window_sdpa_dispatches: u64 = 0,
     q6_k_linear_reduce: u64 = 0,
     q6_k_linear_reduce_rows_1: u64 = 0,
     q6_k_linear_reduce_rows_2_8: u64 = 0,
@@ -29513,16 +29517,57 @@ test "metal native decoderRuntimeApplyLinear q8_0 device rows match reference" {
     }
 }
 
-test "metal native decoderRuntimeApplyLinear q4_k device rows match reference" {
+test "metal native decoderRuntimeApplyLinear florence q4_k matrix matches reference" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const force_env = "TERMITE_FLORENCE2_METAL_Q4_K_MM";
+    const disable_env = "TERMITE_FLORENCE2_METAL_DISABLE_Q4_K_MM";
+    const disable_matrix_env = "TERMITE_FLORENCE2_METAL_DISABLE_Q4_K_MM_MATRIX";
+    const original_force = if (std.c.getenv(force_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    const original_disable = if (std.c.getenv(disable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    const original_disable_matrix = if (std.c.getenv(disable_matrix_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (original_force) |value| {
+            _ = setenv(force_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(force_env);
+        }
+        if (original_disable) |value| {
+            _ = setenv(disable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(disable_env);
+        }
+        if (original_disable_matrix) |value| {
+            _ = setenv(disable_matrix_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(disable_matrix_env);
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), setenv(force_env, "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(disable_env));
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(disable_matrix_env));
 
     const metal_native_provider = @import("metal_native_provider.zig");
     var provider = try metal_native_provider.MetalNativeProvider.create();
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
 
-    const rows: usize = 9;
+    // Sixty-five rows is the first Florence high-row Q4_K MM bucket and 23
+    // output columns exercises both row and column tails of the 64x64 tile.
+    const rows: usize = 65;
     const in_dim: usize = 2048;
     const out_dim: usize = 23;
     const q4k_values_per_block: usize = 256;
@@ -29580,13 +29625,42 @@ test "metal native decoderRuntimeApplyLinear q4_k device rows match reference" {
     var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ @intCast(rows), @intCast(in_dim) });
     defer input.deinit();
 
-    var output = (try decoderRuntimeApplyLinear(&provider, .{
+    const generated_before = runtimeMemorySnapshot(runtime);
+    var matrix_output = (try decoderRuntimeApplyLinear(&provider, .{
         .slot = 0,
         .input = input,
         .in_dim = in_dim,
         .out_dim = out_dim,
     })) orelse return error.UnexpectedNull;
-    defer output.deinit();
+    defer matrix_output.deinit();
+    const generated_after = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(
+        quant_matmul.generatedQuantDispatchCount(
+            &generated_before.antfly_generated_dispatch_counts,
+            .q4_k,
+            .none,
+        ) + 1,
+        quant_matmul.generatedQuantDispatchCount(
+            &generated_after.antfly_generated_dispatch_counts,
+            .q4_k,
+            .none,
+        ),
+    );
+    try std.testing.expectEqual(generated_before.florence_q4_k_mm_matrix_dispatches + 1, generated_after.florence_q4_k_mm_matrix_dispatches);
+    try std.testing.expectEqual(generated_before.florence_q4_k_mm_nr4_dispatches, generated_after.florence_q4_k_mm_nr4_dispatches);
+
+    try std.testing.expectEqual(@as(c_int, 0), setenv(disable_matrix_env, "1", 1));
+    const nr4_before = runtimeMemorySnapshot(runtime);
+    var nr4_output = (try decoderRuntimeApplyLinear(&provider, .{
+        .slot = 0,
+        .input = input,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    defer nr4_output.deinit();
+    const nr4_after = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(nr4_before.florence_q4_k_mm_matrix_dispatches, nr4_after.florence_q4_k_mm_matrix_dispatches);
+    try std.testing.expectEqual(nr4_before.florence_q4_k_mm_nr4_dispatches + 1, nr4_after.florence_q4_k_mm_nr4_dispatches);
 
     var weight_host: [out_dim * in_dim]f32 = undefined;
     try quant_codec.dequantizeToFloat32(.{ .known = .Q4_K }, &weight_raw, &weight_host);
@@ -29596,12 +29670,25 @@ test "metal native decoderRuntimeApplyLinear q4_k device rows match reference" {
         for (0..out_dim) |col| expected[row * out_dim + col] += bias_data[col];
     }
 
-    var output_mut = output;
-    const actual = try tensorHostSlice(&output_mut);
-    try std.testing.expectEqual(expected.len, actual.len);
-    for (expected, actual, 0..) |exp, got, i| {
+    var matrix_output_mut = matrix_output;
+    const matrix_actual = try tensorHostSlice(&matrix_output_mut);
+    try std.testing.expectEqual(expected.len, matrix_actual.len);
+    for (expected, matrix_actual, 0..) |exp, got, i| {
+        // The simdgroup-matrix path converts activation and dequantized-weight
+        // tiles to f16, then accumulates in f32. Keep its precision allowance
+        // local to this explicitly counted route; other Q4_K paths retain
+        // their tighter contracts.
+        if (!std.math.approxEqAbs(f32, exp, got, 5e-3)) {
+            std.debug.print("florence q4_k matrix mismatch idx={d} expected={d} got={d}\n", .{ i, exp, got });
+            return error.TestUnexpectedResult;
+        }
+    }
+    var nr4_output_mut = nr4_output;
+    const nr4_actual = try tensorHostSlice(&nr4_output_mut);
+    try std.testing.expectEqual(expected.len, nr4_actual.len);
+    for (expected, nr4_actual, 0..) |exp, got, i| {
         if (!std.math.approxEqAbs(f32, exp, got, 2e-3)) {
-            std.debug.print("q4_k device linear mismatch idx={d} expected={d} got={d}\n", .{ i, exp, got });
+            std.debug.print("florence q4_k nr4 mismatch idx={d} expected={d} got={d}\n", .{ i, exp, got });
             return error.TestUnexpectedResult;
         }
     }
@@ -36005,6 +36092,101 @@ test "metal native decoder runtime attention device bias mask matches host" {
     }
 }
 
+fn testMarkDecodeRuntimeAsFlorence(provider: anytype, runtime: *RawMetalDecodeRuntime) !void {
+    const marker_data = [_]f32{1.0};
+    var marker = try testDeviceTensorFromSlice(runtime, &marker_data, &[_]i32{ 1, 1 });
+    defer marker.deinit();
+    var packed_windows = (try decoderRuntimeFlorenceWindowPackF32Device(provider, marker, 1, 1, 1, 1, 1)) orelse return error.UnexpectedNull;
+    defer packed_windows.deinit();
+}
+
+test "metal native decoder runtime florence decode 1x attention matches generic device" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const batch: usize = 2;
+    const q_len: usize = 1;
+    const kv_len: usize = 37;
+    const num_heads: usize = 4;
+    const num_kv_heads: usize = 2;
+    const head_dim: usize = 64;
+    const q_width = num_heads * head_dim;
+    const kv_width = num_kv_heads * head_dim;
+
+    var q_data: [batch * q_width]f32 = undefined;
+    var k_data: [batch * kv_len * kv_width]f32 = undefined;
+    var v_data: [batch * kv_len * kv_width]f32 = undefined;
+    for (&q_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 7 + 3) % 29)) - 14;
+        value.* = @as(f32, @floatFromInt(signed)) * 0.03125;
+    }
+    for (&k_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 11 + 5) % 31)) - 15;
+        value.* = @as(f32, @floatFromInt(signed)) * 0.025;
+    }
+    for (&v_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 13 + 7) % 37)) - 18;
+        value.* = @as(f32, @floatFromInt(signed)) * 0.02;
+    }
+
+    var q = try testDeviceTensorFromSlice(runtime, &q_data, &[_]i32{ @intCast(batch), @intCast(q_width) });
+    defer q.deinit();
+    var k = try testDeviceTensorFromSlice(runtime, &k_data, &[_]i32{ @intCast(batch * kv_len), @intCast(kv_width) });
+    defer k.deinit();
+    var v = try testDeviceTensorFromSlice(runtime, &v_data, &[_]i32{ @intCast(batch * kv_len), @intCast(kv_width) });
+    defer v.deinit();
+
+    var generic = (try decoderRuntimeApplyAttentionF32DeviceBatched(&provider, .{
+        .q = q,
+        .k = k,
+        .v = v,
+        .batch = batch,
+        .q_len = q_len,
+        .kv_len = kv_len,
+        .num_heads = num_heads,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .query_position_offset = kv_len - 1,
+        .kv_position_offset = 0,
+        .sliding_window = 0,
+        .total_sequence_len = kv_len,
+    })) orelse return error.UnexpectedNull;
+    defer generic.deinit();
+    const generic_values = try generic.toHostSlice();
+
+    try testMarkDecodeRuntimeAsFlorence(&provider, runtime);
+    const before = runtimeMemorySnapshot(runtime);
+    var specialized = (try decoderRuntimeApplyAttentionF32DeviceBatched(&provider, .{
+        .q = q,
+        .k = k,
+        .v = v,
+        .batch = batch,
+        .q_len = q_len,
+        .kv_len = kv_len,
+        .num_heads = num_heads,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .query_position_offset = kv_len - 1,
+        .kv_position_offset = 0,
+        .sliding_window = 0,
+        .total_sequence_len = kv_len,
+    })) orelse return error.UnexpectedNull;
+    defer specialized.deinit();
+    const specialized_values = try specialized.toHostSlice();
+    const after = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(before.florence_attention_1x_dispatches + 1, after.florence_attention_1x_dispatches);
+    try std.testing.expectEqual(generic_values.len, specialized_values.len);
+    for (generic_values, specialized_values) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+}
+
 test "metal native decoder runtime florence window pack unpack matches host" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
@@ -36044,6 +36226,79 @@ test "metal native decoder runtime florence window pack unpack matches host" {
 
     const unpacked_values = try unpacked.toHostSlice();
     try std.testing.expectEqualSlices(f32, &input_data, unpacked_values);
+}
+
+test "metal native decoder runtime florence window sdpa matches generic device" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const batch: usize = 1;
+    const seq_len: usize = 49;
+    const num_heads: usize = 3;
+    const head_dim: usize = 32;
+    const hidden = num_heads * head_dim;
+    const total = batch * seq_len * hidden;
+    var q_data: [total]f32 = undefined;
+    var k_data: [total]f32 = undefined;
+    var v_data: [total]f32 = undefined;
+    for (&q_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 5 + 1) % 23)) - 11;
+        value.* = @as(f32, @floatFromInt(signed)) * 0.03125;
+    }
+    for (&k_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 7 + 3) % 29)) - 14;
+        value.* = @as(f32, @floatFromInt(signed)) * 0.025;
+    }
+    for (&v_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 11 + 5) % 31)) - 15;
+        value.* = @as(f32, @floatFromInt(signed)) * 0.02;
+    }
+
+    const shape = [_]i32{ @intCast(batch * seq_len), @intCast(hidden) };
+    var q = try testDeviceTensorFromSlice(runtime, &q_data, &shape);
+    defer q.deinit();
+    var k = try testDeviceTensorFromSlice(runtime, &k_data, &shape);
+    defer k.deinit();
+    var v = try testDeviceTensorFromSlice(runtime, &v_data, &shape);
+    defer v.deinit();
+
+    var generic = (try decoderRuntimeSdpaF32Device(&provider, .{
+        .q = q,
+        .k = k,
+        .v = v,
+        .batch = batch,
+        .seq_len = seq_len,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+    })) orelse return error.UnexpectedNull;
+    defer generic.deinit();
+    const generic_values = try generic.toHostSlice();
+
+    try testMarkDecodeRuntimeAsFlorence(&provider, runtime);
+    const before = runtimeMemorySnapshot(runtime);
+    var specialized = (try decoderRuntimeSdpaF32Device(&provider, .{
+        .q = q,
+        .k = k,
+        .v = v,
+        .batch = batch,
+        .seq_len = seq_len,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+    })) orelse return error.UnexpectedNull;
+    defer specialized.deinit();
+    const specialized_values = try specialized.toHostSlice();
+    const after = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(before.florence_window_sdpa_dispatches + 1, after.florence_window_sdpa_dispatches);
+    try std.testing.expectEqual(generic_values.len, specialized_values.len);
+    for (generic_values, specialized_values) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+    }
 }
 
 fn testFlorenceChannelAttentionHost(
