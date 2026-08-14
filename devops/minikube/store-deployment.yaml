@@ -41,6 +41,9 @@ spec:
         app: antfly
         role: worker
     spec:
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
       volumes:
         - name: config
           configMap:
@@ -49,6 +52,11 @@ spec:
         - name: antfly
           image: antfly:latest
           imagePullPolicy: Never # Use the local minikube image
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           volumeMounts:
             - name: worker-storage
               mountPath: /antflydb
@@ -60,10 +68,12 @@ spec:
             - |
               ORDINAL=${HOSTNAME##*-}
               ID=$((ORDINAL + 1))
-              exec /antfly store --id $ID --config /config/config.json \
-                --api http://0.0.0.0:12380 \
-                --raft http://0.0.0.0:9021 \
-                --service ${HOSTNAME}.antfly-workers-svc.default.svc.cluster.local
+              exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
+                --api-host ${POD_IP} \
+                --api-port 12380 \
+                --raft-host ${POD_IP} \
+                --raft-port 9021 \
+                --health-port 4200
           livenessProbe:
             httpGet:
               path: /healthz

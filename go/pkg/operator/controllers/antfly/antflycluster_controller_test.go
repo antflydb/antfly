@@ -10253,7 +10253,7 @@ func TestReconcileInferencePoolCreatesManagedPool(t *testing.T) {
 		Client:                fake.NewClientBuilder().WithScheme(s).Build(),
 		Scheme:                s,
 		ManageInferencePools:  true,
-		DefaultInferenceImage: "ghcr.io/antflydb/antfly:omni-test",
+		DefaultInferenceImage: "ghcr.io/antflydb/antfly:zig-test",
 	}
 	cluster := baseClusterWithInferenceSpec()
 
@@ -10263,7 +10263,7 @@ func TestReconcileInferencePoolCreatesManagedPool(t *testing.T) {
 	pool := &inferencev1alpha1.InferencePool{}
 	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-inference", Namespace: "default"}, pool)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(pool.Spec.Image).To(Equal("ghcr.io/antflydb/antfly:omni-test"))
+	g.Expect(pool.Spec.Image).To(Equal("ghcr.io/antflydb/antfly:zig-test"))
 	g.Expect(pool.Labels).To(HaveKeyWithValue("app.kubernetes.io/instance", "test-cluster"))
 	g.Expect(pool.Labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "antfly-operator"))
 	g.Expect(metav1.IsControlledBy(pool, cluster)).To(BeTrue())
@@ -10277,7 +10277,7 @@ func TestReconcileInferencePoolPreservesCustomImage(t *testing.T) {
 		Client:                fake.NewClientBuilder().WithScheme(s).Build(),
 		Scheme:                s,
 		ManageInferencePools:  true,
-		DefaultInferenceImage: "ghcr.io/antflydb/antfly:omni-test",
+		DefaultInferenceImage: "ghcr.io/antflydb/antfly:zig-test",
 	}
 	cluster := baseClusterWithInferenceSpec()
 	cluster.Spec.Inference.ManagedPools[0].Spec.Image = "registry.example.com/antfly:custom-inference"
@@ -10314,7 +10314,7 @@ func TestReconcileInferencePoolDeletesOnlyManagedPool(t *testing.T) {
 		Client:                fake.NewClientBuilder().WithScheme(s).WithObjects(managedPool, unmanagedPool).Build(),
 		Scheme:                s,
 		ManageInferencePools:  true,
-		DefaultInferenceImage: "ghcr.io/antflydb/antfly:omni-test",
+		DefaultInferenceImage: "ghcr.io/antflydb/antfly:zig-test",
 	}
 
 	err := reconciler.reconcileInferencePool(ctx, cluster)
@@ -10345,7 +10345,7 @@ func TestReconcileInferencePoolDoesNotAdoptExistingUnmanagedPool(t *testing.T) {
 		Client:                fake.NewClientBuilder().WithScheme(s).WithObjects(existingPool).Build(),
 		Scheme:                s,
 		ManageInferencePools:  true,
-		DefaultInferenceImage: "ghcr.io/antflydb/antfly:omni-test",
+		DefaultInferenceImage: "ghcr.io/antflydb/antfly:zig-test",
 	}
 
 	err := reconciler.reconcileInferencePool(ctx, cluster)

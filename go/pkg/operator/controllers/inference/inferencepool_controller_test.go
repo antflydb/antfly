@@ -372,7 +372,7 @@ var _ = Describe("InferencePool Controller", func() {
 				},
 				Spec: antflyaiv1alpha1.InferencePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
-					Image:        "my-registry/antfly:omni-v1.0.0",
+					Image:        "my-registry/antfly:zig-v1.0.0",
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
 							{Name: "test-model"},
@@ -397,7 +397,7 @@ var _ = Describe("InferencePool Controller", func() {
 				return err == nil
 			}, timeout, interval).Should(BeTrue())
 
-			Expect(createdSts.Spec.Template.Spec.Containers[0].Image).To(Equal("my-registry/antfly:omni-v1.0.0"))
+			Expect(createdSts.Spec.Template.Spec.Containers[0].Image).To(Equal("my-registry/antfly:zig-v1.0.0"))
 
 			// Cleanup
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())

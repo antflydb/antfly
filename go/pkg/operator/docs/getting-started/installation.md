@@ -31,7 +31,7 @@ This installs:
 - Operator Deployment
 
 The operator binary defaults `--inference-antfly-image` to
-`ghcr.io/antflydb/antfly:omni`. If you use `spec.inference` and that image is not
+`ghcr.io/antflydb/antfly:latest`. If you use `spec.inference` and that image is not
 mirrored or available to your cluster, add `--inference-antfly-image=<image>` to
 the deployment args. The image must provide the `/antfly inference` runtime
 contract.
