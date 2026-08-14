@@ -742,14 +742,15 @@ const DataPublicHttpRuntime = struct {
         rejected_writes_total: u64,
         accept_errors_total: u64,
         connection_dispatch_rejections_total: u64,
+        request_dispatch_rejections_total: u64,
         h2_stream_dispatch_rejections_total: u64,
         request_cancellations_total: u64,
         listener_capacity: usize,
         active_listener_leases: usize,
         connection_capacity: usize,
         reserved_connection_capacity: usize,
-        h2_stream_capacity: usize,
-        reserved_h2_stream_capacity: usize,
+        request_task_capacity: usize,
+        reserved_request_task_capacity: usize,
         cancellation_watcher_start_failures_total: u64,
         peer_observer_failures_total: u64,
         deadline_observer_failures_total: u64,
@@ -837,14 +838,15 @@ const DataPublicHttpRuntime = struct {
             .rejected_writes_total = application.write_rejected_total,
             .accept_errors_total = transport.accept_errors_total,
             .connection_dispatch_rejections_total = transport.connection_dispatch_rejections_total,
+            .request_dispatch_rejections_total = transport.request_dispatch_rejections_total,
             .h2_stream_dispatch_rejections_total = transport.h2_stream_dispatch_rejections_total,
             .request_cancellations_total = transport.request_cancellations_total,
             .listener_capacity = http_runtime.listener_capacity,
             .active_listener_leases = http_runtime.active_listener_leases,
             .connection_capacity = http_runtime.connection_capacity,
             .reserved_connection_capacity = http_runtime.reserved_connection_capacity,
-            .h2_stream_capacity = http_runtime.h2_stream_capacity,
-            .reserved_h2_stream_capacity = http_runtime.reserved_h2_stream_capacity,
+            .request_task_capacity = http_runtime.request_capacity,
+            .reserved_request_task_capacity = http_runtime.reserved_request_capacity,
             .cancellation_watcher_start_failures_total = http_runtime.h1_cancellation_registration_failures_total,
             .peer_observer_failures_total = http_runtime.h1_cancellation_observer_failures_total,
             .deadline_observer_failures_total = 0,
@@ -1315,14 +1317,15 @@ pub const HealthSource = struct {
             }
             try health_metrics.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_connection_dispatch_rejections_total", "counter", "Accepted public HTTP connections closed because concurrent execution was unavailable", http.connection_dispatch_rejections_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_request_dispatch_rejections_total", "counter", "HTTP requests rejected before application execution because listener or runtime request capacity was unavailable", http.request_dispatch_rejections_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_h2_stream_dispatch_rejections_total", "counter", "HTTP/2 streams reset before application execution because bounded handler execution was unavailable", http.h2_stream_dispatch_rejections_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_request_cancellations_total", "counter", "Public HTTP requests terminated by application cancellation", http.request_cancellations_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_listener_capacity", "gauge", "Maximum concurrent long-lived HTTP listeners", http.listener_capacity);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_listener_leases", "gauge", "Long-lived HTTP listeners currently owned by the shared runtime", http.active_listener_leases);
             try health_metrics.appendPromMetric(writer, "antfly_http_transport_connection_capacity", "gauge", "Shared HTTP transport connection-task capacity", http.connection_capacity);
             try health_metrics.appendPromMetric(writer, "antfly_http_transport_reserved_connections", "gauge", "HTTP transport connection-task capacity reserved by live listeners", http.reserved_connection_capacity);
-            try health_metrics.appendPromMetric(writer, "antfly_http_h2_stream_task_capacity", "gauge", "Shared HTTP/2 handler-task capacity", http.h2_stream_capacity);
-            try health_metrics.appendPromMetric(writer, "antfly_http_h2_stream_task_reserved", "gauge", "HTTP/2 handler-task capacity reserved by live listeners", http.reserved_h2_stream_capacity);
+            try health_metrics.appendPromMetric(writer, "antfly_http_request_task_capacity", "gauge", "Shared HTTP application request-task capacity", http.request_task_capacity);
+            try health_metrics.appendPromMetric(writer, "antfly_http_request_task_reserved", "gauge", "HTTP request-task capacity reserved by live listeners", http.reserved_request_task_capacity);
             try health_metrics.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests cancelled because peer observation could not be scheduled", http.cancellation_watcher_start_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public requests cancelled after transport cancellation observation failed", http.peer_observer_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_deadline_observer_failures_total", "counter", "Public requests closed because deadline observation could not be scheduled", http.deadline_observer_failures_total);
@@ -6241,7 +6244,7 @@ pub const DataServer = struct {
         runtime.* = httpx.HttpRuntime.init(self.alloc, .{
             .max_active_h1_requests = capacity,
             .max_active_connections = capacity +| health_metrics.max_connections,
-            .max_active_h2_streams = capacity +| health_metrics.max_connections,
+            .max_active_requests = capacity +| health_metrics.max_connections,
         });
         self.owned_http_runtime = runtime;
         return runtime;

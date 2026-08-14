@@ -647,9 +647,10 @@ pub const NodeConfig = struct {
     /// keep-alive clients without allowing retained Threaded workers to grow
     /// with an unbounded connection population.
     http_max_connections: u32 = 64,
-    /// HTTP/2 handlers cannot share the connection frame-pump task: streaming
-    /// request bodies require that pump to keep receiving DATA frames.
-    http_max_h2_stream_tasks: u32 = 64,
+    /// Protocol-neutral application request capacity. Handlers run separately
+    /// from connection lifetimes; in particular, HTTP/2 frame pumps remain
+    /// available to receive streaming request bodies.
+    http_max_request_tasks: u32 = 64,
     pool_size: usize = 2,
     generation_budget_overrides: BudgetOverrides = .{},
     generation_batching: GenerationBatchingConfig = .{},
@@ -2598,7 +2599,7 @@ pub const Node = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
-        if (config.http_max_connections == 0 or config.http_max_h2_stream_tasks == 0)
+        if (config.http_max_connections == 0 or config.http_max_request_tasks == 0)
             return error.InvalidHttpTransportCapacity;
         if (config.kernel_jit.profile_capture_only) {
             return error.KernelJitProfileCaptureUnsupportedInServer;
@@ -10338,7 +10339,7 @@ pub const Node = struct {
             .host = host,
             .port = port,
             .max_connections = self.config.http_max_connections,
-            .max_h2_stream_tasks = self.config.http_max_h2_stream_tasks,
+            .max_request_tasks = self.config.http_max_request_tasks,
             // Generation can legitimately take longer than the generic 30s HTTP
             // default during cold model startup or first-token GPU execution.
             .header_read_timeout_ms = 300_000,

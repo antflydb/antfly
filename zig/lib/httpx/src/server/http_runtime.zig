@@ -1,8 +1,8 @@
 //! Shared transport services for one or more HTTP listeners.
 //!
-//! `HttpRuntime` is independent of the executor used by `Server`. It owns the
-//! bounded transport executors and HTTP/1 cancellation monitor needed by
-//! `std.Io.Threaded` without consuming workers from an application lane.
+//! `HttpRuntime` is independent of the executor injected into `Server` for
+//! nested operations. It owns bounded HTTP listener, connection, and request
+//! executors plus the HTTP/1 cancellation monitor needed by `std.Io.Threaded`.
 
 const std = @import("std");
 const CancellationObserver = @import("cancellation_observer.zig").Observer;
@@ -14,10 +14,11 @@ pub const HttpRuntime = struct {
         /// inherits `max_active_h1_requests` for source compatibility with a
         /// single application listener.
         max_active_connections: ?usize = null,
-        /// Aggregate HTTP/2 stream-task capacity. HTTP/1 handlers execute on
-        /// their connection task; HTTP/2 needs an independent bounded lane so
-        /// its frame pump can continue delivering request bodies.
-        max_active_h2_streams: ?usize = null,
+        /// Aggregate application request-task capacity shared by every
+        /// listener. Request execution is independent from connection
+        /// lifetimes so keep-alive sockets and HTTP/2 frame pumps cannot
+        /// consume the workers that run handlers.
+        max_active_requests: ?usize = null,
         /// Maximum number of long-lived listener tasks owned by this runtime.
         /// Listener tasks use a dedicated executor so accepting connections
         /// never consumes capacity from an application or backend lane.
@@ -35,8 +36,8 @@ pub const HttpRuntime = struct {
         reserved_h1_request_capacity: usize,
         connection_capacity: usize,
         reserved_connection_capacity: usize,
-        h2_stream_capacity: usize,
-        reserved_h2_stream_capacity: usize,
+        request_capacity: usize,
+        reserved_request_capacity: usize,
         active_listener_leases: usize,
         listener_capacity: usize,
         active_h1_cancellation_observers: usize,
@@ -50,14 +51,14 @@ pub const HttpRuntime = struct {
         runtime: ?*HttpRuntime = null,
         reserved_h1_requests: usize = 0,
         reserved_connections: usize = 0,
-        reserved_h2_streams: usize = 0,
+        reserved_requests: usize = 0,
 
         pub fn release(self: *ListenerLease) void {
             const runtime = self.runtime orelse return;
             runtime.releaseListener(
                 self.reserved_h1_requests,
                 self.reserved_connections,
-                self.reserved_h2_streams,
+                self.reserved_requests,
             );
             self.* = .{};
         }
@@ -81,41 +82,41 @@ pub const HttpRuntime = struct {
             return runtime.connection_io_impl.io();
         }
 
-        pub fn h2StreamIo(self: *const ListenerLease) std.Io {
+        pub fn requestIo(self: *const ListenerLease) std.Io {
             const runtime = self.runtime orelse @panic("released HTTP listener lease");
-            return runtime.h2_stream_io_impl.io();
+            return runtime.request_io_impl.io();
         }
     };
 
     pub const ListenerRequirements = struct {
         max_h1_requests: usize,
         max_connections: usize,
-        max_h2_streams: usize,
+        max_requests: usize,
     };
 
     observer: CancellationObserver,
     listener_io_impl: std.Io.Threaded,
     connection_io_impl: std.Io.Threaded,
-    h2_stream_io_impl: std.Io.Threaded,
+    request_io_impl: std.Io.Threaded,
     h1_request_capacity: usize,
     connection_capacity: usize,
-    h2_stream_capacity: usize,
+    request_capacity: usize,
     listener_capacity: usize,
     lifecycle_mutex: std.atomic.Mutex = .unlocked,
     listener_leases: std.atomic.Value(usize) = .init(0),
     reserved_h1_request_capacity: std.atomic.Value(usize) = .init(0),
     reserved_connection_capacity: std.atomic.Value(usize) = .init(0),
-    reserved_h2_stream_capacity: std.atomic.Value(usize) = .init(0),
+    reserved_request_capacity: std.atomic.Value(usize) = .init(0),
     registration_failures_total: std.atomic.Value(u64) = .init(0),
 
     pub fn init(alloc: std.mem.Allocator, config: Config) HttpRuntime {
         const listener_capacity = @max(config.max_listeners, 1);
         const connection_capacity = @max(config.max_active_connections orelse config.max_active_h1_requests, 1);
-        const h2_stream_capacity = @max(config.max_active_h2_streams orelse connection_capacity, 1);
+        const request_capacity = @max(config.max_active_requests orelse connection_capacity, 1);
         return .{
             .h1_request_capacity = config.max_active_h1_requests,
             .connection_capacity = connection_capacity,
-            .h2_stream_capacity = h2_stream_capacity,
+            .request_capacity = request_capacity,
             .listener_capacity = listener_capacity,
             .listener_io_impl = std.Io.Threaded.init(alloc, .{
                 .concurrent_limit = .limited(listener_capacity),
@@ -123,8 +124,8 @@ pub const HttpRuntime = struct {
             .connection_io_impl = std.Io.Threaded.init(alloc, .{
                 .concurrent_limit = .limited(connection_capacity),
             }),
-            .h2_stream_io_impl = std.Io.Threaded.init(alloc, .{
-                .concurrent_limit = .limited(h2_stream_capacity),
+            .request_io_impl = std.Io.Threaded.init(alloc, .{
+                .concurrent_limit = .limited(request_capacity),
             }),
             .observer = CancellationObserver.init(
                 alloc,
@@ -139,12 +140,12 @@ pub const HttpRuntime = struct {
         self.observer.deinit();
         self.listener_io_impl.deinit();
         self.connection_io_impl.deinit();
-        self.h2_stream_io_impl.deinit();
+        self.request_io_impl.deinit();
         self.* = undefined;
     }
 
-    /// Reserves the listener's complete H1 observer, connection-task, and H2
-    /// handler-task bounds before it is published. This turns an undersized
+    /// Reserves the listener's complete H1 observer, connection-task, and
+    /// request-task bounds before it is published. This turns an undersized
     /// shared runtime into a startup error instead of a partial listener that
     /// only fails after the process is already live.
     pub fn acquireListener(self: *HttpRuntime, requirements: ListenerRequirements) !ListenerLease {
@@ -153,24 +154,24 @@ pub const HttpRuntime = struct {
         const leases = self.listener_leases.load(.acquire);
         const reserved_h1 = self.reserved_h1_request_capacity.load(.acquire);
         const reserved_connections = self.reserved_connection_capacity.load(.acquire);
-        const reserved_h2_streams = self.reserved_h2_stream_capacity.load(.acquire);
+        const reserved_requests = self.reserved_request_capacity.load(.acquire);
         if (leases >= self.listener_capacity) return error.HttpRuntimeListenerCapacityExceeded;
         if (requirements.max_h1_requests > self.h1_request_capacity -| reserved_h1)
             return error.HttpRuntimeCapacityExceeded;
         if (requirements.max_connections > self.connection_capacity -| reserved_connections)
             return error.HttpRuntimeConnectionCapacityExceeded;
-        if (requirements.max_h2_streams > self.h2_stream_capacity -| reserved_h2_streams)
-            return error.HttpRuntimeH2StreamCapacityExceeded;
+        if (requirements.max_requests > self.request_capacity -| reserved_requests)
+            return error.HttpRuntimeRequestCapacityExceeded;
         if (reserved_h1 == 0 and requirements.max_h1_requests > 0) try self.observer.start();
         self.listener_leases.store(leases + 1, .release);
         self.reserved_h1_request_capacity.store(reserved_h1 + requirements.max_h1_requests, .release);
         self.reserved_connection_capacity.store(reserved_connections + requirements.max_connections, .release);
-        self.reserved_h2_stream_capacity.store(reserved_h2_streams + requirements.max_h2_streams, .release);
+        self.reserved_request_capacity.store(reserved_requests + requirements.max_requests, .release);
         return .{
             .runtime = self,
             .reserved_h1_requests = requirements.max_h1_requests,
             .reserved_connections = requirements.max_connections,
-            .reserved_h2_streams = requirements.max_h2_streams,
+            .reserved_requests = requirements.max_requests,
         };
     }
 
@@ -180,8 +181,8 @@ pub const HttpRuntime = struct {
             .reserved_h1_request_capacity = self.reserved_h1_request_capacity.load(.acquire),
             .connection_capacity = self.connection_capacity,
             .reserved_connection_capacity = self.reserved_connection_capacity.load(.acquire),
-            .h2_stream_capacity = self.h2_stream_capacity,
-            .reserved_h2_stream_capacity = self.reserved_h2_stream_capacity.load(.acquire),
+            .request_capacity = self.request_capacity,
+            .reserved_request_capacity = self.reserved_request_capacity.load(.acquire),
             .active_listener_leases = self.listener_leases.load(.acquire),
             .listener_capacity = self.listener_capacity,
             .active_h1_cancellation_observers = self.observer.activeCount(),
@@ -208,23 +209,23 @@ pub const HttpRuntime = struct {
         self: *HttpRuntime,
         reserved_h1_requests: usize,
         reserved_connections: usize,
-        reserved_h2_streams: usize,
+        reserved_requests: usize,
     ) void {
         self.lock();
         defer self.lifecycle_mutex.unlock();
         const leases = self.listener_leases.load(.acquire);
         const reserved_h1 = self.reserved_h1_request_capacity.load(.acquire);
         const current_connections = self.reserved_connection_capacity.load(.acquire);
-        const current_h2_streams = self.reserved_h2_stream_capacity.load(.acquire);
+        const current_requests = self.reserved_request_capacity.load(.acquire);
         std.debug.assert(leases > 0);
         std.debug.assert(reserved_h1 >= reserved_h1_requests);
         std.debug.assert(current_connections >= reserved_connections);
-        std.debug.assert(current_h2_streams >= reserved_h2_streams);
+        std.debug.assert(current_requests >= reserved_requests);
         self.listener_leases.store(leases - 1, .release);
         const remaining_h1 = reserved_h1 - reserved_h1_requests;
         self.reserved_h1_request_capacity.store(remaining_h1, .release);
         self.reserved_connection_capacity.store(current_connections - reserved_connections, .release);
-        self.reserved_h2_stream_capacity.store(current_h2_streams - reserved_h2_streams, .release);
+        self.reserved_request_capacity.store(current_requests - reserved_requests, .release);
         if (reserved_h1 > 0 and remaining_h1 == 0) self.observer.stop();
     }
 
@@ -243,12 +244,12 @@ test "HTTP runtime listener leases share one cancellation observer lifecycle" {
     const control_requirements: HttpRuntime.ListenerRequirements = .{
         .max_h1_requests = 0,
         .max_connections = 0,
-        .max_h2_streams = 0,
+        .max_requests = 0,
     };
     const one_request: HttpRuntime.ListenerRequirements = .{
         .max_h1_requests = 1,
         .max_connections = 1,
-        .max_h2_streams = 1,
+        .max_requests = 1,
     };
     var control = try runtime.acquireListener(control_requirements);
     var first = try runtime.acquireListener(one_request);
@@ -264,7 +265,7 @@ test "HTTP runtime listener leases share one cancellation observer lifecycle" {
     var restarted = try runtime.acquireListener(.{
         .max_h1_requests = 2,
         .max_connections = 2,
-        .max_h2_streams = 2,
+        .max_requests = 2,
     });
     restarted.release();
     control.release();
@@ -282,7 +283,7 @@ test "HTTP runtime reserves bounded dedicated listener workers" {
     const requirements: HttpRuntime.ListenerRequirements = .{
         .max_h1_requests = 0,
         .max_connections = 0,
-        .max_h2_streams = 0,
+        .max_requests = 0,
     };
     var listener = try runtime.acquireListener(requirements);
     try std.testing.expectEqual(@as(usize, 1), runtime.stats().listener_capacity);
@@ -292,19 +293,19 @@ test "HTTP runtime reserves bounded dedicated listener workers" {
     replacement.release();
 }
 
-test "HTTP runtime reserves connection and H2 stream execution independently" {
+test "HTTP runtime reserves connection and request execution independently" {
     if (@import("builtin").os.tag == .freestanding) return;
     var runtime = HttpRuntime.init(std.testing.allocator, .{
         .max_active_h1_requests = 4,
         .max_active_connections = 3,
-        .max_active_h2_streams = 2,
+        .max_active_requests = 2,
     });
     defer runtime.deinit();
 
     var first = try runtime.acquireListener(.{
         .max_h1_requests = 2,
         .max_connections = 2,
-        .max_h2_streams = 1,
+        .max_requests = 1,
     });
     defer first.release();
     try std.testing.expectError(
@@ -312,18 +313,18 @@ test "HTTP runtime reserves connection and H2 stream execution independently" {
         runtime.acquireListener(.{
             .max_h1_requests = 1,
             .max_connections = 2,
-            .max_h2_streams = 1,
+            .max_requests = 1,
         }),
     );
     try std.testing.expectError(
-        error.HttpRuntimeH2StreamCapacityExceeded,
+        error.HttpRuntimeRequestCapacityExceeded,
         runtime.acquireListener(.{
             .max_h1_requests = 1,
             .max_connections = 1,
-            .max_h2_streams = 2,
+            .max_requests = 2,
         }),
     );
     const stats_snapshot = runtime.stats();
     try std.testing.expectEqual(@as(usize, 2), stats_snapshot.reserved_connection_capacity);
-    try std.testing.expectEqual(@as(usize, 1), stats_snapshot.reserved_h2_stream_capacity);
+    try std.testing.expectEqual(@as(usize, 1), stats_snapshot.reserved_request_capacity);
 }

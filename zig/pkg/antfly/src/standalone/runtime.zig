@@ -620,6 +620,7 @@ const StandaloneHealthSource = struct {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_requests", "gauge", "Currently active public HTTP requests", http.active_requests);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_connection_dispatch_rejections_total", "counter", "Accepted public HTTP connections closed because concurrent execution was unavailable", http.connection_dispatch_rejections_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_request_dispatch_rejections_total", "counter", "HTTP requests rejected before application execution because listener or runtime request capacity was unavailable", http.request_dispatch_rejections_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_h2_stream_dispatch_rejections_total", "counter", "HTTP/2 streams reset before application execution because bounded handler execution was unavailable", http.h2_stream_dispatch_rejections_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_request_cancellations_total", "counter", "Public HTTP requests terminated by application cancellation", http.request_cancellations_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_capacity_bytes", "gauge", "Aggregate HTTP request-body buffer capacity", http.body_buffer_capacity_bytes);
@@ -632,8 +633,8 @@ const StandaloneHealthSource = struct {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_listener_leases", "gauge", "Long-lived HTTP listeners currently owned by the shared runtime", http_runtime.active_listener_leases);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_transport_connection_capacity", "gauge", "Shared HTTP transport connection-task capacity", http_runtime.connection_capacity);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_transport_reserved_connections", "gauge", "HTTP transport connection-task capacity reserved by live listeners", http_runtime.reserved_connection_capacity);
-            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_h2_stream_task_capacity", "gauge", "Shared HTTP/2 handler-task capacity", http_runtime.h2_stream_capacity);
-            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_h2_stream_task_reserved", "gauge", "HTTP/2 handler-task capacity reserved by live listeners", http_runtime.reserved_h2_stream_capacity);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_request_task_capacity", "gauge", "Shared HTTP application request-task capacity", http_runtime.request_capacity);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_request_task_reserved", "gauge", "HTTP request-task capacity reserved by live listeners", http_runtime.reserved_request_capacity);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests rejected because transport cancellation observation could not be registered", http_runtime.h1_cancellation_registration_failures_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_hard_disconnect_cancellations_total", "counter", "Public requests cancelled after a hard transport failure", http_runtime.h1_hard_disconnect_cancellations_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public requests cancelled after transport cancellation observation failed", http_runtime.h1_cancellation_observer_failures_total);
@@ -2206,7 +2207,7 @@ pub fn runFromIterator(
     var http_runtime = httpx.HttpRuntime.init(alloc, .{
         .max_active_h1_requests = public_http_config.max_connections,
         .max_active_connections = @as(usize, public_http_config.max_connections) +| antfly.common.health_server.max_connections,
-        .max_active_h2_streams = @as(usize, public_http_config.max_h2_stream_tasks) +| antfly.common.health_server.max_connections,
+        .max_active_requests = @as(usize, public_http_config.max_request_tasks) +| antfly.common.health_server.max_connections,
     });
     defer http_runtime.deinit();
     var standalone_health = StandaloneHealthSource{

@@ -58,7 +58,7 @@ pub const ServerlessServer = struct {
         http_runtime.* = httpx.HttpRuntime.init(alloc, .{
             .max_active_h1_requests = public_capacity,
             .max_active_connections = public_capacity +| health_server.max_connections,
-            .max_active_h2_streams = public_capacity +| health_server.max_connections,
+            .max_active_requests = public_capacity +| health_server.max_connections,
         });
         errdefer http_runtime.deinit();
 

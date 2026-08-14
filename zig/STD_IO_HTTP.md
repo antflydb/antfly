@@ -29,10 +29,13 @@ that end state:
   control lanes from `BackendRuntime`.
 - `HttpRuntime` is the role-owned transport service shared by `httpx`
   listeners. It owns one bounded HTTP/1 cancellation multiplexer, listener
-  leases, independent bounded listener, connection, and HTTP/2 handler lanes,
-  reserved capacity, health state, and transport metrics. The executor injected
-  into each server is now reserved for application work; long-lived keep-alive
-  connections cannot exhaust a `BackendRuntime` API lane.
+  leases, independent bounded listener, connection, and protocol-neutral
+  request-execution lanes, reserved capacity, health state, and HTTP runtime
+  metrics. The executor injected into each server remains the `std.Io` used by
+  handlers for nested application/backend operations; handler invocation itself
+  is admitted and scheduled by `HttpRuntime`. Long-lived keep-alive connections
+  and HTTP/2 frame pumps therefore cannot exhaust request execution or a
+  `BackendRuntime` API lane.
 - Every `httpx.Context` has transport-provided cancellation. HTTP/2 uses the
   stream reset signal, while HTTP/1 registrations share the role's
   `HttpRuntime`. The linked API and inference ABIs carry the same semantic
@@ -393,6 +396,8 @@ Process Runtime Supervisor
 ├── HTTP Runtime
 │   ├── listener leases
 │   ├── bounded listener executor
+│   ├── bounded connection executor
+│   ├── bounded request executor
 │   ├── bounded HTTP/1 cancellation registry
 │   └── one multiplexed observer thread
 ├── Data/Metadata/Standalone Server
@@ -532,10 +537,10 @@ Use `std.Io.concurrent` for a listener that must progress concurrently with its
 caller. `std.Io.async` is appropriate for operations that can use its weaker
 scheduling guarantee. Under `Io.Threaded`, a long-lived concurrent listener
 still consumes a worker thread. That worker comes from `HttpRuntime`'s bounded
-listener lane; accepted connections and HTTP/2 handlers use separate bounded
-transport lanes. None of those long-lived tasks consumes capacity promised to
-application or storage work. The benefit is structured and isolated ownership
-rather than elimination of threads.
+listener lane; accepted connections and application requests use separate
+bounded connection and request lanes. None of those long-lived tasks consumes
+capacity promised to nested backend or storage operations. The benefit is
+structured and isolated ownership rather than elimination of threads.
 
 ## Listener bind ownership
 
@@ -591,11 +596,13 @@ Each lane needs:
 - Queue-depth, active-worker, rejection, and saturation metrics
 - A documented policy for blocking and CPU-bound operations
 
-HTTP handlers borrow the API lane rather than the general storage lane.
-Long-lived accept loops, connection lifetimes, and HTTP/2 stream handlers use
-three independent bounded lanes owned by `HttpRuntime`. CPU-heavy model
-execution should not occupy the workers required to serve readiness probes,
-wake shutdown, or complete storage commits.
+HTTP handler invocations run on `HttpRuntime`'s bounded request lane. Their
+`Context.io` borrows the API lane rather than the general storage lane, so
+nested futures, backend waits, and outbound operations retain role-specific
+isolation. Long-lived accept loops and connection lifetimes use two other
+bounded lanes owned by `HttpRuntime`. CPU-heavy model execution should not
+occupy the workers required to admit requests, serve readiness probes, wake
+shutdown, or complete storage commits.
 
 The first implementation should keep these lanes on `Io.Threaded`. Moving a
 lane to an evented backend requires auditing every task for synchronous file
@@ -641,13 +648,22 @@ it into each `httpx.Server` they compose. A standalone library `Server` creates
 a private fallback runtime for convenience.
 
 `HttpRuntime` owns independent bounded `Io.Threaded` lanes for accept loops,
-connection lifetimes, and HTTP/2 stream handlers. Listener-lease acquisition
-atomically reserves each listener's complete declared connection and H2 task
-bounds before bind; an undersized shared runtime is therefore a startup error.
-Once bound, `ListenerTask` runs on `listenerIo()`, accepted sockets and their
-connection groups run on `connectionIo()`, and H2 handlers run on
-`h2StreamIo()`. These lanes stop only after every listener and connection task
-has been joined.
+connection lifetimes, and application request execution. Listener-lease
+acquisition atomically reserves each listener's complete declared connection
+and request-task bounds before bind; an undersized shared runtime is therefore
+a startup error. Once bound, `ListenerTask` runs on `listenerIo()`, accepted
+sockets and their connection groups run on `connectionIo()`, and every HTTP/1,
+HTTP/2, and h2c handler runs on `requestIo()`. These lanes stop only after every
+listener, connection, and request task has been joined.
+
+Aggregate reservation alone is insufficient: a shared executor does not know
+which listener a task belongs to. Each `httpx.Server` therefore owns a local
+atomic request-permit pool equal to its leased request capacity. It must claim a
+permit before publishing application work and retain it through the response
+lifecycle. This prevents a busy public listener from consuming capacity
+reserved for health, admin, or another application listener. Releasing the
+permit and active-request accounting is one invariant on every success,
+rejection, cancellation, and shutdown path.
 
 Concurrent connection execution is a declared contract, not a best-effort
 optimization. A server reserves `max_connections` from its `HttpRuntime`, and
@@ -658,12 +674,15 @@ admission/accounting state, and increments
 serving the connection inline. Explicit serial execution remains available for
 small test or embedding configurations and is selected deliberately.
 
-HTTP/2 has an additional invariant: the connection task is the sole frame pump
-and must remain able to receive DATA for streaming request bodies. Stream
-handlers therefore use the independent H2 lane. If that lane rejects a task,
-the server unwinds request accounting and sends `RST_STREAM(REFUSED_STREAM)`;
-it never invokes application code inline on the frame pump. The rejection is
-reported by `h2_stream_dispatch_rejections_total`.
+Protocol-native overload behavior is decided before application code runs.
+HTTP/1 returns 503 and closes the connection when its listener has no request
+permit or cannot schedule the claimed task. HTTP/2 has an additional invariant:
+the connection task is the sole frame pump and must remain able to receive DATA
+for streaming request bodies. A saturated HTTP/2 or h2c stream is therefore
+reset with `RST_STREAM(REFUSED_STREAM)` and is never executed inline on the
+frame pump. Every such outcome increments
+`request_dispatch_rejections_total`; the HTTP/2 subset also increments
+`h2_stream_dispatch_rejections_total`.
 
 Each listening server acquires a lease before bind/accept and releases it only
 after its connection group has drained. The first lease starts the HTTP/1
@@ -703,7 +722,7 @@ registrations, and make shared-role readiness fail until the runtime is
 restarted.
 
 Retained `Io.Threaded` workers are an executor capacity plateau, not leaked
-connection ownership. The three finite transport lane capacities put a hard
+connection ownership. The three finite HTTP runtime lane capacities put a hard
 ceiling on that plateau even as connections churn. Cancellation-storm tests
 therefore require descriptors, active tasks, and observer registrations to
 return to baseline while asserting that the warmed worker count remains bounded
@@ -1277,10 +1296,12 @@ Lifecycle tests should cover:
 - Failure after every startup phase
 - Bind failure and partial route registration
 - Executor and queue exhaustion
-- Listener, connection, and H2 transport-lane reservation exhaustion at bind
+- Listener, connection, and request-lane reservation exhaustion at bind
 - Connection scheduling rejection without inline accept-loop fallback
-- H2 task scheduling rejection with `REFUSED_STREAM` and no inline frame-pump
-  execution
+- HTTP/1 request saturation with 503 and no handler execution
+- H2 request scheduling rejection with `REFUSED_STREAM` and no inline
+  frame-pump execution
+- Per-listener request-quota isolation on a shared `HttpRuntime`
 - Shutdown during active HTTP/1 and HTTP/2 requests
 - Shutdown during storage commits and model generation
 - Client disconnect during distributed and inference work
@@ -1354,9 +1375,10 @@ The branch completed the migration in this order:
 10. Replaced embedded inference listener threads with owned Futures.
 11. Added API/control lane leases, bounded HTTP capacity, and lifecycle and
     listener metrics.
-    Long-lived accept loops, connections, and HTTP/2 handlers use independent
-    bounded `HttpRuntime` lanes, while the injected API executor is reserved
-    for application work.
+    Long-lived accept loops, connections, and protocol-neutral request handlers
+    use independent bounded `HttpRuntime` lanes. Per-listener request permits
+    enforce each lease locally, while the injected API executor supplies
+    `Context.io` for nested application/backend work.
 12. Audited long-lived background work and retained explicit OS threads only
     where they remain owned, stopped, and joined.
 13. Hardened the API-kernel and linked-inference boundaries with versioned

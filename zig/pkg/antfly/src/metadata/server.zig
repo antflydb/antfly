@@ -218,7 +218,7 @@ pub const MetadataServer = struct {
             http_runtime.* = httpx.HttpRuntime.init(alloc, .{
                 .max_active_h1_requests = max_connections,
                 .max_active_connections = max_connections +| health_server.max_connections,
-                .max_active_h2_streams = max_connections +| health_server.max_connections,
+                .max_active_requests = max_connections +| health_server.max_connections,
             });
             owned_http_runtime = http_runtime;
 
