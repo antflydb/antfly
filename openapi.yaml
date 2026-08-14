@@ -2213,6 +2213,14 @@ paths:
   /db/v1/connections/{connection_id}/inference/{operation}:
     post:
       summary: Invoke an Antfly-compatible inference connection
+      description: >
+        Invokes an inference operation through the selected connection.
+
+        Requires `inference/*` write permission. Generation requests with
+
+        `stream: true` return the provider's Server-Sent Events stream; all
+
+        other responses are returned as buffered JSON.
       tags:
         - cluster_management
       operationId: invokeInferenceConnection
@@ -2248,6 +2256,10 @@ paths:
         '200':
           description: Inference provider response
           content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Streaming inference events when requested by the operation payload.
             application/json:
               schema:
                 type: object
@@ -2257,9 +2269,12 @@ paths:
         '401':
           description: Unauthorized - authentication required
         '403':
-          description: The connection does not declare the capability required by this operation
+          description: Inference write permission is missing, or the connection does not declare the required
+            capability
         '502':
           description: Inference provider request failed
+        '503':
+          $ref: '#/components/responses/InferenceTransientCapacity'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -6476,7 +6491,7 @@ paths:
 
         to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
 
-        `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+        `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
 
         download limit disables nonempty media. Remote URL byte potential is reserved before
 
@@ -6486,7 +6501,8 @@ paths:
 
         decoded source pixels are admitted at a conservative 16 bytes per pixel against
 
-        the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+        the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`;
+        a zero
 
         concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
 
@@ -6791,59 +6807,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ai/v1/classify:
-    post:
-      summary: Classify text against candidate labels
-      description: >
-        Classifies one or more texts with either a zero-shot NLI classifier or
-
-        a classification-capable extractor model. Candidate labels are supplied
-
-        per request, and `multi_label` controls whether their scores are
-
-        independent or normalized across labels.
-      operationId: classifyText
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/InferenceClassifyRequest'
-      responses:
-        '200':
-          description: Text classified successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceClassifyResponse'
-        '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
-        '404':
-          description: Model not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
-        '503':
-          $ref: '#/components/responses/TransientCapacity'
-          description: Inference service unavailable. The unified Antfly server also returns this status
-            when authentication is enabled but its backend is not ready.
-        '401':
-          description: Authentication is enabled and valid credentials were not supplied
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
   /ai/v1/read:
     post:
       summary: Read text from images (OCR/document understanding)
@@ -6898,14 +6861,14 @@ paths:
 
         read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
 
-        `max_concurrent_requests`. Admission happens before model resolution or download.
+        `admission.inference.max_concurrent_requests`. Admission happens before model resolution or download.
 
 
         After download, image headers are validated before model loading. Decoded source
 
         pixels are admitted at a conservative 16 bytes per pixel against the lower of
 
-        512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+        512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
 
         setting still uses the finite 512 MiB ceiling. The reservation grows atomically
 
@@ -7747,6 +7710,37 @@ components:
           example: An error message
       required:
         - error
+    InferenceCapacityError:
+      type: object
+      description: Actionable retry contract for temporary inference-capacity failures.
+      required:
+        - error
+        - message
+        - reason
+        - retryable
+        - retry_after_ms
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable error description.
+        reason:
+          type: string
+          enum:
+            - inference_capacity
+            - inference_admission
+          description: Machine-readable capacity source.
+        retryable:
+          type: boolean
+          enum:
+            - true
+          description: Always true for a transient-capacity response.
+        retry_after_ms:
+          type: integer
+          minimum: 1
+          description: Minimum retry delay in milliseconds.
     TableStorageUnreadableError:
       type: object
       additionalProperties: false
@@ -20863,7 +20857,7 @@ components:
           description: Machine-readable capacity source when the failure is retryable
           enum:
             - inference_capacity
-            - request_queue
+            - inference_admission
         retryable:
           type: boolean
           x-go-type-skip-optional-pointer: false
@@ -20893,7 +20887,7 @@ components:
           description: Machine-readable capacity source
           enum:
             - inference_capacity
-            - request_queue
+            - inference_admission
         retryable:
           type: boolean
           enum:
@@ -21462,111 +21456,6 @@ components:
           items:
             type: string
           description: Rewritten texts for this input, one per beam.
-    InferenceClassifyRequest:
-      type: object
-      required:
-        - model
-        - texts
-        - labels
-      properties:
-        model:
-          type: string
-          description: Name of classifier model from models_dir/classifiers/
-          example: MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
-        texts:
-          type: array
-          items:
-            type: string
-          description: Texts to classify
-          example:
-            - I love this product!
-            - The service was terrible.
-        labels:
-          type: array
-          items:
-            type: string
-          description: >
-            Candidate labels for zero-shot classification.
-
-            The model will predict which label(s) best describe each text.
-          example:
-            - positive
-            - negative
-            - neutral
-        hypothesis_template:
-          type: string
-          description: >
-            Custom hypothesis template for NLI-based classification.
-
-            Use "{}" as placeholder for the label.
-
-            Default: "This example is {}."
-          example: This text expresses a {} sentiment.
-        multi_label:
-          type: boolean
-          default: false
-          description: >
-            If true, allows multiple labels per text (independent scoring).
-
-            If false (default), scores are normalized across labels.
-    InferenceClassifyResult:
-      type: object
-      required:
-        - label
-        - score
-      properties:
-        label:
-          type: string
-          description: The predicted class/category
-          example: positive
-        score:
-          type: number
-          format: float
-          description: Confidence score (0.0 to 1.0)
-          example: 0.95
-    InferenceClassifyResponse:
-      type: object
-      required:
-        - object
-        - data
-        - model
-        - usage
-      properties:
-        object:
-          type: string
-          enum:
-            - list
-          description: Object type, always "list"
-        data:
-          type: array
-          items:
-            $ref: '#/components/schemas/InferenceClassifyObject'
-          description: Classification result objects, one per input text.
-        model:
-          type: string
-          description: Name of model used for classification
-        usage:
-          $ref: '#/components/schemas/InferenceGenerateUsage'
-    InferenceClassifyObject:
-      type: object
-      required:
-        - object
-        - index
-        - classifications
-      properties:
-        object:
-          type: string
-          enum:
-            - classification
-        index:
-          type: integer
-          description: Original input text index.
-        classifications:
-          type: array
-          items:
-            $ref: '#/components/schemas/InferenceClassifyResult'
-          description: >
-            Classification results for this input text.
     InferenceReadRequest:
       type: object
       required:
@@ -22707,11 +22596,80 @@ components:
 
             hit, so only entries left unused for this duration expire.
           default: 300000
+    InferenceAdmissionConfig:
+      type: object
+      additionalProperties: false
+      description: Process-local foreground request admission settings.
+      properties:
+        inference:
+          $ref: '#/components/schemas/InferenceRequestAdmissionConfig'
+    InferenceRequestAdmissionConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        max_concurrent_requests:
+          type: integer
+          x-go-type-skip-optional-pointer: false
+          description: >
+            Maximum concurrent inference requests in this process. The same
+
+            value also sizes the weighted work budget shared by every executing
+
+            inference endpoint: each request consumes one request slot and at
+
+            least one unit, while request body size, generation workload, and
+
+            image byte/count reservations can consume more than one unit. The
+
+            request count can therefore never exceed this value, while expensive
+
+            requests may exhaust weighted capacity sooner. Read and
+
+            image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB
+
+            per unit and at least one unit per two images. A positive capacity also
+
+            clamps each such request's downloaded-image ceiling to 16 MiB times
+
+            this value. When either ceiling is exhausted, new HTTP requests are
+
+            rejected immediately with 503 Service Unavailable and Retry-After: 1;
+
+            they are not retained
+
+            in an in-process queue. Set to 0 to disable both ceilings, admission
+
+            unit accounting, and the capacity-derived clamp. The default is 32.
+          minimum: 0
+          maximum: 4294967295
+          default: 32
+          example: 32
     InferenceConfig:
+      allOf:
+        - $ref: '#/components/schemas/InferenceRuntimeConfig'
+        - type: object
+          properties:
+            admission:
+              $ref: '#/components/schemas/InferenceAdmissionConfig'
+    InferenceRuntimeConfig:
       type: object
       required:
         - api_url
       properties:
+        max_concurrent_requests:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          deprecated: true
+          description: >
+            Deprecated compatibility alias for
+
+            `admission.inference.max_concurrent_requests`. New configurations
+
+            should use the process-level admission setting. If both spellings
+
+            are supplied, they must have the same value.
+          example: 32
         api_url:
           type: string
           format: uri
@@ -22759,14 +22717,15 @@ components:
             and the connection is pinned to a vetted address. Setting it to false explicitly opts into
             private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded
             and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes,
-            and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes
-            disables nonempty media. Remote URL byte potential is reserved before fetch, while inline
-            sources use their actual encoded size. Accepted image inputs also undergo header-only dimension
-            and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal
-            content before fetch. Embedded direct transcription and extraction use the configured encoded-media
-            per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image
-            admission. In unified Antfly configuration, an empty inference policy may first inherit a
-            nonempty remote_content security policy, which is then merged over this baseline.
+            and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity;
+            zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved
+            before fetch, while inline sources use their actual encoded size. Accepted image inputs also
+            undergo header-only dimension and aggregate decoded-pixel admission before model execution.
+            Batch generation rejects multimodal content before fetch. Embedded direct transcription and
+            extraction use the configured encoded-media per-call ceiling, and direct dense embedding also
+            applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty
+            inference policy may first inherit a nonempty remote_content security policy, which is then
+            merged over this baseline.
         s3_credentials:
           $ref: '#/components/schemas/InferenceCredentials'
           description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
@@ -22817,35 +22776,6 @@ components:
 
             configuring this list has no effect.
           deprecated: true
-        max_concurrent_requests:
-          type: integer
-          description: >
-            Maximum concurrent weighted inference admission units in the Zig runtime.
-
-            Request body size, generation workload, and image byte/count reservations
-
-            can consume more than one unit. Read and image-extraction admission reserves the
-
-            effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per
-
-            two images. A positive capacity also clamps each such request's downloaded-image
-
-            ceiling to 16 MiB times this value. Set to 0 disables both admission accounting
-
-            and that capacity-derived clamp.
-
-            When a positive limit is exhausted, new requests are rejected immediately
-
-            with 503 Service Unavailable and Retry-After: 1; they are not retained in
-
-            an in-process queue. Set to 0 only as an operational escape hatch for
-
-            trusted testing environments; unlimited admission is not recommended for
-
-            production native generation. Use a positive production limit. The default is 32.
-          minimum: 0
-          default: 32
-          example: 32
         max_queue_size:
           type: integer
           description: >
@@ -23597,6 +23527,27 @@ components:
         multi_label:
           type: boolean
           default: false
+          description: >
+            When false, return the highest-ranked labels up to `top_k` (one by
+
+            default). When true, return every label meeting `options.threshold`.
+        hypothesis_template:
+          type: string
+          default: This example is {}.
+          description: >
+            NLI hypothesis template for this named taxonomy. Use `{}` as the
+
+            candidate-label placeholder. Non-NLI extractors ignore this field.
+        top_k:
+          type: integer
+          minimum: 1
+          default: 1
+          description: >
+            Maximum labels returned for single-label classification. Ignored
+
+            when `multi_label` is true, where `options.threshold` controls the
+
+            returned set.
     ExtractionStructureField:
       oneOf:
         - type: string
@@ -23926,6 +23877,19 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    InferenceTransientCapacity:
+      description: Inference capacity is temporarily unavailable
+      headers:
+        Retry-After:
+          required: true
+          description: Minimum number of seconds clients should wait before retrying.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/InferenceCapacityError'
     StatelessTransactionFailure:
       description: >
         Internal transaction failure. If the response says that the outcome is

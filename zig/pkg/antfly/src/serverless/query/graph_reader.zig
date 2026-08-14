@@ -117,6 +117,7 @@ pub fn neighborsAlloc(
     session: *runtime_mod.QuerySession,
     req: request_mod.GraphNeighborsRequest,
 ) ![]Neighbor {
+    try session.checkCancellation();
     const graph_index = findGraphArtifactIndex(session, req.index_name) orelse return error.GraphSegmentNotFound;
     try session.warmArtifact(graph_index);
     const payload = try session.fetchArtifactAlloc(graph_index);
@@ -185,6 +186,7 @@ pub fn traverseAlloc(
 
     var cursor: usize = 0;
     while (cursor < queue.items.len and out.items.len < req.limit) : (cursor += 1) {
+        if (cursor % 64 == 0) try session.checkCancellation();
         const item = queue.items[cursor];
         if (item.depth > req.max_depth) continue;
         if (item.depth > 0 or req.include_start) {
@@ -266,6 +268,7 @@ pub fn shortestPathAlloc(
     var found_depth: ?u32 = null;
     var cursor: usize = 0;
     search: while (cursor < queue.items.len) : (cursor += 1) {
+        if (cursor % 64 == 0) try session.checkCancellation();
         const item = queue.items[cursor];
         if (item.depth >= req.max_depth) continue;
         const adjacency = findAdjacency(segment, item.doc_id) orelse continue;

@@ -71,7 +71,7 @@ def _raise_inference_error(response: Response) -> None:
                     response.status_code == 503
                     and code is not None
                     and retryable is True
-                    and reason in {"inference_capacity", "request_queue"}
+                    and reason in {"inference_capacity", "inference_admission", "request_queue"}
                     and type(retry_after_ms) is int
                     and retry_after_ms > 0
                 ):

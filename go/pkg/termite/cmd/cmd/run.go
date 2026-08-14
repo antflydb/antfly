@@ -15,6 +15,8 @@ package cmd
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"os/signal"
 	"sync/atomic"
 	"syscall"
@@ -27,6 +29,43 @@ import (
 )
 
 var healthPort int
+
+const (
+	canonicalInferenceAdmissionKey = "admission.inference.max_concurrent_requests"
+	legacyInferenceAdmissionKey    = "max_concurrent_requests"
+)
+
+func resolvedInferenceMaxConcurrentRequests() (int, error) {
+	canonical := viper.GetInt(canonicalInferenceAdmissionKey)
+	legacy := viper.GetInt(legacyInferenceAdmissionKey)
+	_, canonicalEnv := os.LookupEnv("TERMITE_ADMISSION_INFERENCE_MAX_CONCURRENT_REQUESTS")
+	_, legacyEnv := os.LookupEnv("TERMITE_MAX_CONCURRENT_REQUESTS")
+	return resolveInferenceAdmissionValues(
+		canonical,
+		canonicalEnv || viper.InConfig(canonicalInferenceAdmissionKey),
+		legacy,
+		legacyEnv || viper.InConfig(legacyInferenceAdmissionKey),
+	)
+}
+
+func resolveInferenceAdmissionValues(canonical int, canonicalExplicit bool, legacy int, legacyExplicit bool) (int, error) {
+	if canonicalExplicit && canonical < 0 {
+		return 0, fmt.Errorf("%s must be non-negative", canonicalInferenceAdmissionKey)
+	}
+	if legacyExplicit && legacy < 0 {
+		return 0, fmt.Errorf("deprecated %s must be non-negative", legacyInferenceAdmissionKey)
+	}
+	if canonicalExplicit && legacyExplicit && canonical != legacy {
+		return 0, fmt.Errorf(
+			"conflicting %s (%d) and deprecated %s (%d)",
+			canonicalInferenceAdmissionKey, canonical, legacyInferenceAdmissionKey, legacy,
+		)
+	}
+	if legacyExplicit && !canonicalExplicit {
+		return legacy, nil
+	}
+	return canonical, nil
+}
 
 var runCmd = &cobra.Command{
 	Use:   "run",
@@ -59,6 +98,10 @@ func runServer(cmd *cobra.Command, args []string) error {
 	logger.Info("Running as termite")
 
 	// Build termite config from viper/env
+	maxConcurrentRequests, err := resolvedInferenceMaxConcurrentRequests()
+	if err != nil {
+		return err
+	}
 	cfg := termite.Config{
 		ApiUrl:          viper.GetString("api_url"),
 		ModelsDir:       modelsDir, // Set from --models-dir flag (defaults to ~/.termite/models)
@@ -67,6 +110,11 @@ func runServer(cmd *cobra.Command, args []string) error {
 		MaxLoadedModels: viper.GetInt("max_loaded_models"),
 		MaxMemoryMb:     viper.GetInt("max_memory_mb"),
 		Preload:         preloadModelRefs(viper.GetStringSlice("preload")),
+		Admission: termite.AdmissionConfig{
+			Inference: termite.RequestAdmissionConfig{
+				MaxConcurrentRequests: &maxConcurrentRequests,
+			},
+		},
 	}
 
 	// Parse model_strategies from config (map[string]string -> map[string]ConfigModelStrategies)

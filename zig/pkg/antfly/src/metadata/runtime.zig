@@ -21,6 +21,7 @@ const raft_engine = @import("raft_engine");
 const platform = @import("antfly_platform");
 const tracing = @import("../tracing/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
+const metadata_http_client = @import("http_client.zig");
 const platform_time = @import("antfly_platform").time;
 const thread_config = @import("../runtime_thread_config.zig");
 
@@ -161,6 +162,7 @@ const ResolvedPaths = struct {
 pub const HealthSource = struct {
     server: *Server,
     raft_progress: ?*const antfly.raft.ManagedProgressDriver = null,
+    supervisor: ?*const antfly.common.runtime_lifecycle.RuntimeSupervisor = null,
 
     pub fn readiness(self: *HealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
@@ -178,7 +180,9 @@ pub const HealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
-        return self.server.metadataHttpService().probeReady() and
+        return (self.supervisor == null or self.supervisor.?.currentState() == .ready) and
+            self.server.metadataHttpService().probeReady() and
+            self.server.server.adminListenerHealthy() and
             (self.raft_progress == null or self.raft_progress.?.isHealthy());
     }
 
@@ -189,8 +193,39 @@ pub const HealthSource = struct {
         const svc_metrics = svc.metrics();
         const memory = svc.memoryDiagnostics();
         const raft_storage = self.server.metadataRaftStorageDiagnostics();
+        const backend_runtime = self.server.server.svc.ensureBackendRuntime() catch null;
 
         const append = antfly.common.health_server.appendPromMetric;
+
+        if (self.supervisor) |supervisor| {
+            try append(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(supervisor.currentState()));
+            try append(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(supervisor.token().isCancelled()));
+        }
+
+        if (backend_runtime) |runtime| {
+            const lanes = runtime.laneStats();
+            try append(writer, "antfly_executor_api_active_leases", "gauge", "Active API executor lifetime leases", lanes.api_active_leases);
+            try append(writer, "antfly_executor_api_peak_leases", "gauge", "Peak API executor lifetime leases", lanes.api_peak_leases);
+            try append(writer, "antfly_executor_api_acquisitions_total", "counter", "Successful API executor lease acquisitions", lanes.api_acquisitions_total);
+            try append(writer, "antfly_executor_api_rejections_total", "counter", "API executor lease acquisitions rejected during shutdown", lanes.api_rejections_total);
+            try append(writer, "antfly_executor_inference_active_leases", "gauge", "Active inference executor lifetime leases", lanes.inference_active_leases);
+            try append(writer, "antfly_executor_inference_peak_leases", "gauge", "Peak inference executor lifetime leases", lanes.inference_peak_leases);
+            try append(writer, "antfly_executor_inference_acquisitions_total", "counter", "Successful inference executor lease acquisitions", lanes.inference_acquisitions_total);
+            try append(writer, "antfly_executor_inference_rejections_total", "counter", "Inference executor lease acquisitions rejected during shutdown", lanes.inference_rejections_total);
+            try append(writer, "antfly_executor_control_active_leases", "gauge", "Active control executor lifetime leases", lanes.control_active_leases);
+            try append(writer, "antfly_executor_control_peak_leases", "gauge", "Peak control executor lifetime leases", lanes.control_peak_leases);
+            try append(writer, "antfly_executor_control_acquisitions_total", "counter", "Successful control executor lease acquisitions", lanes.control_acquisitions_total);
+            try append(writer, "antfly_executor_control_rejections_total", "counter", "Control executor lease acquisitions rejected during shutdown", lanes.control_rejections_total);
+        }
+
+        if (self.server.server.owned_public_http_server) |public_api| {
+            const query = public_api.queryAdmissionStats();
+            const write = public_api.writeAdmissionStats();
+            const inference = public_api.inferenceAdmissionStats();
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, query);
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, write);
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .inference, inference);
+        }
 
         try append(writer, "antfly_raft_hosted_groups", "gauge", "Number of raft groups hosted on this node", @intCast(host_metrics.hosted_groups));
         try append(writer, "antfly_raft_reconcile_rounds_total", "counter", "Total number of reconcile rounds", @intCast(host_metrics.reconcile_rounds));
@@ -312,6 +347,7 @@ pub const ListenerConfig = struct {
 pub const MetadataClusterPeer = struct {
     node_id: u64,
     raft_url: []const u8,
+    orchestration_url: ?[]const u8 = null,
 };
 
 pub const ServerConfig = struct {
@@ -397,6 +433,7 @@ pub const Server = struct {
     snapshot_root_dir: []u8,
     bind_host: []u8,
     admin_bind_host: []u8,
+    reallocation_protocol_peers: []antfly.metadata_service.ReallocationProtocolPeer,
     raft_storage_diagnostics: MetadataRaftStorageDiagnosticsCache = .{},
 
     pub fn init(alloc: std.mem.Allocator, cfg: ServerConfig) !Server {
@@ -426,10 +463,13 @@ pub const Server = struct {
         errdefer alloc.free(result.bind_host);
         result.admin_bind_host = try alloc.dupe(u8, cfg.admin_bind_host);
         errdefer alloc.free(result.admin_bind_host);
+        result.reallocation_protocol_peers = try reallocationProtocolPeersFromClusterPeers(alloc, cfg.metadata_cluster_peers);
+        errdefer freeReallocationProtocolPeers(alloc, result.reallocation_protocol_peers);
         const service_cfg = antfly.metadata_service.MetadataServiceConfig{
             .observe_local_replica_root = cfg.observe_local_replica_root,
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
+            .reallocation_protocol_peers = result.reallocation_protocol_peers,
         };
         result.server = try antfly.metadata_server.MetadataServer.init(alloc, .{
             .http = .{
@@ -477,7 +517,15 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        self.server.deinit();
+        self.deinitWithDeadline(antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    pub fn deinitWithDeadline(
+        self: *Server,
+        deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
+    ) void {
+        self.server.deinitWithDeadline(deadline);
+        freeReallocationProtocolPeers(self.alloc, self.reallocation_protocol_peers);
         self.alloc.free(self.admin_bind_host);
         self.alloc.free(self.bind_host);
         self.alloc.free(self.snapshot_root_dir);
@@ -492,6 +540,10 @@ pub const Server = struct {
 
     pub fn start(self: *Server) !void {
         try self.server.start();
+    }
+
+    pub fn adminListenerFailure(self: *const Server) ?anyerror {
+        return self.server.adminListenerFailure();
     }
 
     pub fn bootstrapCluster(
@@ -760,6 +812,8 @@ pub fn runFromIterator(
     argv0: []const u8,
     args: *std.process.Args.Iterator,
 ) !void {
+    var termination_signals = antfly.common.runtime_lifecycle.ProcessSignalScope.install();
+    defer termination_signals.deinit();
     const alloc = init.gpa;
     var cli = try parseCli(alloc, args);
     defer cli.deinit(alloc);
@@ -767,6 +821,8 @@ pub fn runFromIterator(
         printUsage(argv0);
         return;
     }
+    var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
+    defer supervisor.markStopped();
     const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
         cli.raft_tick_ms,
         cli.control_tick_ms,
@@ -790,6 +846,10 @@ pub fn runFromIterator(
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
+    antfly.common.config.Config.validateServerTlsConfig(if (loaded_config) |*cfg| cfg.tls else null) catch |err| {
+        std.log.err("metadata startup rejected configured tls: built-in server TLS is unsupported; terminate TLS at a trusted reverse proxy", .{});
+        return err;
+    };
 
     var remote_content_runtime: antfly.common.remote_content_runtime.Runtime = undefined;
     var remote_content_runtime_initialized = false;
@@ -898,10 +958,13 @@ pub fn runFromIterator(
             .remote_content = remote_content,
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
             .extension_package_store_dir = resolved.extension_package_store_dir,
+            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
+            .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
     });
-    defer server.deinit();
+    defer server.deinitWithDeadline(supervisor.deadline());
     try server.start();
     try server.bootstrapCluster(metadata_group_id, local_node_id, cluster_peers);
     const synced_extension_packages = try server.server.svc.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir);
@@ -928,50 +991,62 @@ pub fn runFromIterator(
     var metadata_health = HealthSource{
         .server = &server,
         .raft_progress = &raft_progress,
+        .supervisor = &supervisor,
     };
     const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
     const health_port = if (health_enabled)
         cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
     else
         null;
-    const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
+    const metadata_backend_runtime = try server.server.svc.ensureBackendRuntime();
+    var control_lane_lease = try metadata_backend_runtime.acquireControlLane();
+    defer control_lane_lease.release();
+    const health_server = try antfly.common.health_server.HealthServer.startIfConfiguredOnHostWithRuntime(
         alloc,
+        control_lane_lease.io(),
         "metadata",
+        null,
         health_port,
         metadata_health.readiness(),
         metadata_health.metricsWriter(),
+        server.server.httpRuntime(),
     );
-    defer if (health_server) |hs| hs.deinit();
+    defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
 
     const preferred_bootstrap_campaigner = metadataClusterPreferredCampaigner(cluster_peers, local_node_id);
     const bootstrap_campaign_retry_interval_ns = metadataBootstrapCampaignRetryIntervalNs(cli.raft_tick_ms);
     var last_bootstrap_campaign_retry_ns = platform_time.monotonicNs();
-    while (true) {
-        try raft_progress.check();
+    try supervisor.publishReady();
+    while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
+        if (server.adminListenerFailure()) |err| return supervisor.fail("metadata", "admin-http", err);
+        if (health_server) |hs| if (hs.runtimeFailure()) |err| return supervisor.fail("health", "http", err);
+        raft_progress.check() catch |err| return supervisor.fail("metadata", "raft-progress", err);
         if (preferred_bootstrap_campaigner) {
             const now_ns = platform_time.monotonicNs();
             if (last_bootstrap_campaign_retry_ns == 0 or
                 now_ns -| last_bootstrap_campaign_retry_ns >= bootstrap_campaign_retry_interval_ns)
             {
-                if (try server.campaignMetadataGroupIfBootstrapLeaderless(metadata_group_id, local_node_id)) {
+                if (server.campaignMetadataGroupIfBootstrapLeaderless(metadata_group_id, local_node_id) catch |err| return supervisor.fail("metadata", "bootstrap-campaign", err)) {
                     std.log.warn("metadata bootstrap campaign retry node_id={}", .{local_node_id});
                     last_bootstrap_campaign_retry_ns = now_ns;
                 }
             }
         }
         const run_round_start_ns = platform_time.monotonicNs();
-        try server.runControlRoundOnly();
+        server.runControlRoundOnly() catch |err| return supervisor.fail("metadata", "control-round", err);
         const run_round_elapsed_ns = platform_time.monotonicNs() -| run_round_start_ns;
         if (run_round_elapsed_ns > antfly.metadata_service.metadata_run_round_slow_threshold_ns) {
             std.log.warn("metadata runRound slow elapsed_ms={d}", .{@divTrunc(run_round_elapsed_ns, std.time.ns_per_ms)});
         }
         const cdc_round_start_ns = platform_time.monotonicNs();
-        try server.runCdcRound();
+        server.runCdcRound() catch |err| return supervisor.fail("metadata", "cdc-round", err);
         const cdc_round_elapsed_ns = platform_time.monotonicNs() -| cdc_round_start_ns;
         if (cdc_round_elapsed_ns > std.time.ns_per_s) {
             std.log.warn("metadata runCdcRound slow elapsed_ms={d}", .{@divTrunc(cdc_round_elapsed_ns, std.time.ns_per_ms)});
         }
-        try raft_progress.waitForFailureOrTimeout(runtime_cadence.control_tick_ns);
+        raft_progress.waitForFailureOrTimeout(runtime_cadence.control_tick_ns) catch |err| {
+            return supervisor.fail("metadata", "raft-progress", err);
+        };
     }
 }
 
@@ -1277,9 +1352,53 @@ fn resolveMetadataClusterPeers(
     cluster_json: ?[]const u8,
     cfg: ?*const antfly.common.config.Config,
 ) ![]MetadataClusterPeer {
-    if (cluster_json) |raw| return try parseMetadataClusterJson(alloc, raw);
+    if (cluster_json) |raw| {
+        const peers = try parseMetadataClusterJson(alloc, raw);
+        errdefer freeMetadataClusterPeers(alloc, peers);
+        if (cfg) |loaded| {
+            for (peers) |*peer| {
+                if (peer.orchestration_url != null) continue;
+                const orchestration_url = metadataOrchestrationPeerUrl(loaded, peer.node_id) orelse continue;
+                peer.orchestration_url = try alloc.dupe(u8, orchestration_url);
+            }
+        }
+        return peers;
+    }
     if (cfg) |loaded| return try metadataClusterPeersFromConfig(alloc, loaded);
     return &.{};
+}
+
+fn reallocationProtocolPeersFromClusterPeers(
+    alloc: std.mem.Allocator,
+    cluster_peers: []const MetadataClusterPeer,
+) ![]antfly.metadata_service.ReallocationProtocolPeer {
+    if (cluster_peers.len == 0) return &.{};
+    const peers = try alloc.alloc(antfly.metadata_service.ReallocationProtocolPeer, cluster_peers.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (peers[0..initialized]) |peer| {
+            if (peer.orchestration_url) |url| alloc.free(url);
+        }
+        alloc.free(peers);
+    }
+    for (cluster_peers, 0..) |peer, index| {
+        peers[index] = .{
+            .node_id = peer.node_id,
+            .orchestration_url = if (peer.orchestration_url) |url| try alloc.dupe(u8, url) else null,
+        };
+        initialized += 1;
+    }
+    return peers;
+}
+
+fn freeReallocationProtocolPeers(
+    alloc: std.mem.Allocator,
+    peers: []antfly.metadata_service.ReallocationProtocolPeer,
+) void {
+    for (peers) |peer| {
+        if (peer.orchestration_url) |url| alloc.free(url);
+    }
+    if (peers.len > 0) alloc.free(peers);
 }
 
 pub fn metadataClusterPeersFromConfig(
@@ -1290,13 +1409,24 @@ pub fn metadataClusterPeersFromConfig(
     var out = try alloc.alloc(MetadataClusterPeer, cfg.metadata.raft_urls.len);
     var initialized: usize = 0;
     errdefer {
-        for (out[0..initialized]) |peer| alloc.free(peer.raft_url);
+        for (out[0..initialized]) |peer| {
+            alloc.free(peer.raft_url);
+            if (peer.orchestration_url) |url| alloc.free(url);
+        }
         alloc.free(out);
     }
     for (cfg.metadata.raft_urls, 0..) |entry, index| {
-        out[index] = .{
-            .node_id = entry.node_id,
-            .raft_url = try alloc.dupe(u8, entry.url),
+        const orchestration_url = metadataOrchestrationPeerUrl(cfg, entry.node_id);
+        out[index] = owned: {
+            const raft_url = try alloc.dupe(u8, entry.url);
+            errdefer alloc.free(raft_url);
+            const owned_orchestration_url = if (orchestration_url) |url| try alloc.dupe(u8, url) else null;
+            errdefer if (owned_orchestration_url) |url| alloc.free(url);
+            break :owned .{
+                .node_id = entry.node_id,
+                .raft_url = raft_url,
+                .orchestration_url = owned_orchestration_url,
+            };
         };
         initialized += 1;
     }
@@ -1324,6 +1454,10 @@ pub fn metadataOrchestrationPeerUrl(
 }
 
 pub fn parseMetadataClusterJson(alloc: std.mem.Allocator, raw: []const u8) ![]MetadataClusterPeer {
+    const ParsedPeerUrls = struct {
+        raft: []const u8,
+        orchestration: ?[]const u8,
+    };
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     const object = switch (parsed.value) {
@@ -1335,19 +1469,41 @@ pub fn parseMetadataClusterJson(alloc: std.mem.Allocator, raw: []const u8) ![]Me
     var out = try alloc.alloc(MetadataClusterPeer, object.count());
     var initialized: usize = 0;
     errdefer {
-        for (out[0..initialized]) |peer| alloc.free(peer.raft_url);
+        for (out[0..initialized]) |peer| {
+            alloc.free(peer.raft_url);
+            if (peer.orchestration_url) |url| alloc.free(url);
+        }
         alloc.free(out);
     }
 
     var it = object.iterator();
     while (it.next()) |entry| {
-        const url = switch (entry.value_ptr.*) {
-            .string => |value| value,
+        const urls: ParsedPeerUrls = switch (entry.value_ptr.*) {
+            .string => |value| .{ .raft = value, .orchestration = @as(?[]const u8, null) },
+            .object => |value| blk: {
+                const raft_value = value.get("raft_url") orelse return error.InvalidArguments;
+                const raft_url = switch (raft_value) {
+                    .string => |url| url,
+                    else => return error.InvalidArguments,
+                };
+                const orchestration_url = if (value.get("orchestration_url")) |orchestration_value| switch (orchestration_value) {
+                    .string => |url| url,
+                    else => return error.InvalidArguments,
+                } else null;
+                break :blk .{ .raft = raft_url, .orchestration = orchestration_url };
+            },
             else => return error.InvalidArguments,
         };
-        out[initialized] = .{
-            .node_id = try parseMetadataNodeId(entry.key_ptr.*),
-            .raft_url = try alloc.dupe(u8, url),
+        out[initialized] = owned: {
+            const raft_url = try alloc.dupe(u8, urls.raft);
+            errdefer alloc.free(raft_url);
+            const orchestration_url = if (urls.orchestration) |url| try alloc.dupe(u8, url) else null;
+            errdefer if (orchestration_url) |url| alloc.free(url);
+            break :owned .{
+                .node_id = try parseMetadataNodeId(entry.key_ptr.*),
+                .raft_url = raft_url,
+                .orchestration_url = orchestration_url,
+            };
         };
         initialized += 1;
     }
@@ -1361,7 +1517,10 @@ fn parseMetadataNodeId(raw: []const u8) !u64 {
 }
 
 pub fn freeMetadataClusterPeers(alloc: std.mem.Allocator, peers: []MetadataClusterPeer) void {
-    for (peers) |peer| alloc.free(peer.raft_url);
+    for (peers) |peer| {
+        alloc.free(peer.raft_url);
+        if (peer.orchestration_url) |url| alloc.free(url);
+    }
     if (peers.len > 0) alloc.free(peers);
 }
 
@@ -1393,7 +1552,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --raft-port <port>             Metadata raft bind port (default: 0)
         \\  --api-host <host>              Metadata admin API bind host (default: raft host)
         \\  --api-port <port>              Metadata admin API bind port (default: 0)
-        \\  --cluster <json>               Metadata raft peer URLs, e.g. {{"1":"http://127.0.0.1:9017"}}
+        \\  --cluster <json>               Metadata peer endpoints, e.g. {{"1":{{"raft_url":"http://127.0.0.1:9017","orchestration_url":"http://127.0.0.1:12377"}}}}
         \\  --health <true|false>          Enable health/metrics server (default: true)
         \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
         \\  --experimental                 Enable experimental A2A protocol surfaces
@@ -1529,6 +1688,61 @@ test "metadata runtime cli accepts experimental flag" {
     try std.testing.expect(cfg.experimental);
 }
 
+test "metadata runtime cluster json carries raft and orchestration endpoints" {
+    const alloc = std.testing.allocator;
+    const peers = try parseMetadataClusterJson(alloc,
+        \\{
+        \\  "1": {
+        \\    "raft_url": "http://127.0.0.1:9017",
+        \\    "orchestration_url": "http://127.0.0.1:12377"
+        \\  },
+        \\  "2": "http://127.0.0.1:9018"
+        \\}
+    );
+    defer freeMetadataClusterPeers(alloc, peers);
+
+    try std.testing.expectEqual(@as(usize, 2), peers.len);
+    var structured: ?MetadataClusterPeer = null;
+    var legacy: ?MetadataClusterPeer = null;
+    for (peers) |peer| {
+        if (peer.node_id == 1) structured = peer;
+        if (peer.node_id == 2) legacy = peer;
+    }
+    try std.testing.expectEqualStrings("http://127.0.0.1:9017", structured.?.raft_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:12377", structured.?.orchestration_url.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9018", legacy.?.raft_url);
+    try std.testing.expect(legacy.?.orchestration_url == null);
+
+    const protocol_peers = try reallocationProtocolPeersFromClusterPeers(alloc, peers);
+    defer freeReallocationProtocolPeers(alloc, protocol_peers);
+    try std.testing.expectEqual(@as(usize, 2), protocol_peers.len);
+    try std.testing.expectEqual(@as(u64, 1), protocol_peers[0].node_id);
+    try std.testing.expectEqualStrings("http://127.0.0.1:12377", protocol_peers[0].orchestration_url.?);
+    try std.testing.expectEqual(@as(u64, 2), protocol_peers[1].node_id);
+    try std.testing.expect(protocol_peers[1].orchestration_url == null);
+
+    var cfg = try antfly.common.config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "metadata": {
+        \\    "orchestration_urls": {
+        \\      "1": "http://127.0.0.1:12377",
+        \\      "2": "http://127.0.0.1:12378"
+        \\    }
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+    const legacy_cluster_json = "{\"1\":\"http://127.0.0.1:9017\",\"2\":\"http://127.0.0.1:9018\"}";
+    const merged_peers = try resolveMetadataClusterPeers(alloc, legacy_cluster_json, &cfg);
+    defer freeMetadataClusterPeers(alloc, merged_peers);
+    for (merged_peers) |peer| {
+        try std.testing.expectEqualStrings(
+            if (peer.node_id == 1) "http://127.0.0.1:12377" else "http://127.0.0.1:12378",
+            peer.orchestration_url.?,
+        );
+    }
+}
+
 test "metadata runtime preserves trusted principal auth material bytes" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1638,6 +1852,35 @@ test "metadata runtime server uses wal replica state backend by default" {
 
     try std.testing.expect(server.server.svc.raft.host.owned_wal_replica_provider != null);
     try std.testing.expect(server.server.svc.raft.host.owned_file_replica_provider == null);
+}
+
+test "metadata runtime legacy multi-node cluster config does not require orchestration endpoints at startup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-legacy-cluster/replicas", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-legacy-cluster/catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-legacy-cluster/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+    const peers = [_]MetadataClusterPeer{
+        .{ .node_id = 1, .raft_url = "http://127.0.0.1:19017" },
+        .{ .node_id = 2, .raft_url = "http://127.0.0.1:19018" },
+    };
+
+    var server = try Server.init(std.testing.allocator, .{
+        .local_node_id = 1,
+        .metadata_cluster_peers = &peers,
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .snapshot_root_dir = snapshot_root,
+    });
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), server.reallocation_protocol_peers.len);
+    try std.testing.expect(server.reallocation_protocol_peers[0].orchestration_url == null);
+    try std.testing.expect(server.reallocation_protocol_peers[1].orchestration_url == null);
 }
 
 test "metadata runtime enables bounded raft storage compaction for multi-node groups" {
@@ -1756,10 +1999,12 @@ test "metadata runtime metrics expose memory ownership buckets" {
     try server.start();
     try server.bootstrapLocal(group_ids.main_metadata_group_id, 1);
 
-    if (server.server.owned_admin_http_server) |admin| {
-        var resp = try admin.handle(.{ .method = .GET, .uri = antfly.metadata.http_routes.Routes.status });
-        defer resp.deinit(std.testing.allocator);
-    }
+    const admin_base_uri = try server.server.adminBaseUri(std.testing.allocator);
+    defer std.testing.allocator.free(admin_base_uri);
+    var admin_executor = antfly.raft.transport.StdHttpExecutor.init(std.testing.allocator, .{});
+    defer admin_executor.deinit();
+    var admin_client = metadata_http_client.MetadataHttpClient.init(std.testing.allocator, admin_executor.executor());
+    _ = try admin_client.fetchStatus(admin_base_uri);
 
     var health = HealthSource{ .server = &server };
     var buf: [128 * 1024]u8 = undefined;
@@ -1774,6 +2019,16 @@ test "metadata runtime metrics expose memory ownership buckets" {
     try expectMetricPresent(output, "antfly_metadata_raft_memory_storage_estimated_bytes");
     try expectMetricPresent(output, "antfly_metadata_hosted_write_cache_entries");
     try expectMetricPresent(output, "antfly_metadata_hosted_write_cache_lsm_wal_retained_bytes");
+    try expectMetricPresent(output, "antfly_admission_query_capacity_requests");
+    try expectMetricPresent(output, "antfly_admission_query_in_flight_requests");
+    try expectMetricPresent(output, "antfly_admission_query_rejected_requests_total");
+    try expectMetricPresent(output, "antfly_admission_write_capacity_requests");
+    try expectMetricPresent(output, "antfly_admission_write_in_flight_requests");
+    try expectMetricPresent(output, "antfly_admission_write_rejected_requests_total");
+    try expectMetricPresent(output, "antfly_admission_inference_capacity_requests");
+    try expectMetricPresent(output, "antfly_admission_inference_in_flight_requests");
+    try expectMetricPresent(output, "antfly_admission_inference_peak_in_flight_requests");
+    try expectMetricPresent(output, "antfly_admission_inference_rejected_requests_total");
 }
 
 test "metadata runtime memory soak diagnostic" {
@@ -1858,6 +2113,12 @@ test "metadata runtime memory soak diagnostic" {
     try server.runRound();
 
     const admin = server.server.owned_admin_http_server orelse return error.MissingMetadataAdminServer;
+    _ = admin;
+    const admin_base_uri = try server.server.adminBaseUri(server.alloc);
+    defer server.alloc.free(admin_base_uri);
+    var admin_executor = antfly.raft.transport.StdHttpExecutor.init(server.alloc, .{});
+    defer admin_executor.deinit();
+    var admin_client = metadata_http_client.MetadataHttpClient.init(server.alloc, admin_executor.executor());
     printMetadataMemorySoakSample("baseline", 0, svc.memoryDiagnostics(), server.metadataRaftStorageDiagnostics());
 
     var round: usize = 0;
@@ -1897,10 +2158,9 @@ test "metadata runtime memory soak diagnostic" {
         });
         try server.runRound();
 
-        var status_resp = try admin.handle(.{ .method = .GET, .uri = antfly.metadata.http_routes.Routes.status });
-        defer status_resp.deinit(server.alloc);
-        var snapshot_resp = try admin.handle(.{ .method = .GET, .uri = antfly.metadata.http_routes.Routes.admin_snapshot });
-        defer snapshot_resp.deinit(server.alloc);
+        _ = try admin_client.fetchStatus(admin_base_uri);
+        var snapshot = try admin_client.fetchSnapshot(admin_base_uri);
+        snapshot.deinit();
 
         if ((round + 1) % sample_every == 0) {
             printMetadataMemorySoakSample("sample", round + 1, svc.memoryDiagnostics(), server.metadataRaftStorageDiagnostics());

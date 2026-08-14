@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const request_admission_policy = @import("request_admission_policy.zig");
 
 const public_openapi_types_source = @embedFile("../openapi/generated/antfly_public_openapi/types.zig");
 const metadata_openapi_types_source = @embedFile("../openapi/generated/antfly_metadata_openapi/types.zig");
@@ -610,6 +611,59 @@ test "generated extractors: route table covers public API" {
     try std.testing.expect(found_get_row_filter);
     try std.testing.expect(found_set_row_filter);
     try std.testing.expect(found_remove_row_filter);
+}
+
+test "generated route policy inventory is unique and describes wire modes" {
+    const server = generated.server;
+    var found_buffered_query = false;
+    var found_streaming_retrieval = false;
+    var found_streaming_inference_connection = false;
+    for (server.routes, 0..) |route, index| {
+        for (server.routes[index + 1 ..]) |other| {
+            try std.testing.expect(!(std.mem.eql(u8, route.method, other.method) and
+                std.mem.eql(u8, route.path, other.path)));
+            try std.testing.expect(!std.mem.eql(u8, route.operation_id, other.operation_id));
+        }
+        if (std.mem.eql(u8, route.operation_id, "globalQuery"))
+            found_buffered_query = route.request_body == .buffered and !route.streaming_response;
+        if (std.mem.eql(u8, route.operation_id, "retrievalAgent"))
+            found_streaming_retrieval = route.request_body == .buffered and route.streaming_response;
+        if (std.mem.eql(u8, route.operation_id, "invokeInferenceConnection"))
+            found_streaming_inference_connection = route.request_body == .buffered and route.streaming_response;
+    }
+    try std.testing.expect(found_buffered_query);
+    try std.testing.expect(found_streaming_retrieval);
+    try std.testing.expect(found_streaming_inference_connection);
+    try std.testing.expectEqual(server.routes.len, request_admission_policy.public_operation_policies.len);
+
+    for (server.routes) |route| {
+        try std.testing.expect(request_admission_policy.publicOperationClass(route.operation_id) != null);
+    }
+    for (request_admission_policy.public_operation_policies, 0..) |policy, index| {
+        for (request_admission_policy.public_operation_policies[index + 1 ..]) |other| {
+            try std.testing.expect(!std.mem.eql(u8, policy.operation_id, other.operation_id));
+        }
+        var found = false;
+        for (server.routes) |route| {
+            if (std.mem.eql(u8, policy.operation_id, route.operation_id)) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+
+    try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("queryBuilderAgent").?);
+    try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("retrievalAgent").?);
+    try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("globalQuery").?);
+    try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("queryTable").?);
+    try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("scanKeys").?);
+    try std.testing.expectEqual(.inference, request_admission_policy.publicOperationClass("invokeInferenceConnection").?);
+    try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("multiBatchWrite").?);
+    try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("batchWrite").?);
+    try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("linearMerge").?);
+    try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("commitTransaction").?);
+    try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("commitTransactionSession").?);
 }
 
 test "bleve and metadata openapi modules are generated and wired" {

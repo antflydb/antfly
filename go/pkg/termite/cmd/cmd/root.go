@@ -86,6 +86,7 @@ func init() {
 	// Default values
 	viper.SetDefault("api_url", "http://localhost:11433")
 	viper.SetDefault("models_dir", paths.DefaultModelsDir())
+	viper.SetDefault("admission.inference.max_concurrent_requests", 32)
 	viper.SetDefault("health_port", 4200)
 	viper.SetDefault("log.level", "info")
 	// Default to JSON logging in Kubernetes for structured log aggregation

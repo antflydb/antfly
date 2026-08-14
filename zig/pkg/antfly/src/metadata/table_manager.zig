@@ -320,6 +320,10 @@ pub const GroupStatusReport = struct {
     empty: bool = true,
     created_at_millis: u64 = 0,
     updated_at_millis: u64 = 0,
+    /// Durable reallocation request observed before this status was collected.
+    /// This is a causal barrier; timestamps remain only a rolling-upgrade
+    /// fallback for reporters that predate this field.
+    observed_reallocation_request_id: u128 = 0,
     local_leader: bool = false,
     local_voter: bool = false,
     voter_count: u16 = 0,
@@ -1941,6 +1945,7 @@ pub fn cloneGroupStatus(alloc: std.mem.Allocator, record: GroupStatusReport) !Gr
         .empty = record.empty,
         .created_at_millis = record.created_at_millis,
         .updated_at_millis = record.updated_at_millis,
+        .observed_reallocation_request_id = record.observed_reallocation_request_id,
         .local_leader = record.local_leader,
         .local_voter = record.local_voter,
         .voter_count = record.voter_count,

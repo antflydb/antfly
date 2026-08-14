@@ -17,6 +17,7 @@ package termite
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -32,6 +33,32 @@ import (
 	"github.com/antflydb/antfly/go/pkg/termite/lib/transcribing"
 	"go.uber.org/zap"
 )
+
+const defaultInferenceMaxConcurrentRequests = 32
+
+func resolveInferenceMaxConcurrentRequests(config Config) (int, error) {
+	canonical := config.Admission.Inference.MaxConcurrentRequests
+	legacy := config.MaxConcurrentRequests
+	if canonical != nil {
+		if *canonical < 0 {
+			return 0, fmt.Errorf("admission.inference.max_concurrent_requests must be non-negative")
+		}
+		if legacy != 0 && legacy != *canonical {
+			return 0, fmt.Errorf(
+				"conflicting admission.inference.max_concurrent_requests (%d) and deprecated max_concurrent_requests (%d)",
+				*canonical, legacy,
+			)
+		}
+		return *canonical, nil
+	}
+	if legacy != 0 {
+		if legacy < 0 {
+			return 0, fmt.Errorf("deprecated max_concurrent_requests must be non-negative")
+		}
+		return legacy, nil
+	}
+	return defaultInferenceMaxConcurrentRequests, nil
+}
 
 type TermiteNode struct {
 	logger *zap.Logger
@@ -563,6 +590,10 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 	}
 
 	// Initialize request queue for backpressure control
+	maxConcurrentRequests, err := resolveInferenceMaxConcurrentRequests(config)
+	if err != nil {
+		zl.Fatal("Invalid inference admission configuration", zap.Error(err))
+	}
 	var requestTimeout time.Duration
 	if config.RequestTimeout != "" && config.RequestTimeout != "0" {
 		requestTimeout, err = time.ParseDuration(config.RequestTimeout)
@@ -572,9 +603,10 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 	}
 
 	requestQueue := NewRequestQueue(RequestQueueConfig{
-		MaxConcurrentRequests: config.MaxConcurrentRequests,
+		MaxConcurrentRequests: maxConcurrentRequests,
 		MaxQueueSize:          config.MaxQueueSize,
 		RequestTimeout:        requestTimeout,
+		RejectWhenBusy:        true,
 	}, zl.Named("queue"))
 
 	// Initialize result caches for inference deduplication

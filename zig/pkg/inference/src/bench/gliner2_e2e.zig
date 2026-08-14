@@ -345,12 +345,13 @@ pub fn main(init: std.process.Init) !void {
         defer debug_backend.deinit();
         const provider_stats = debug_backend.debugTimingSnapshot().provider;
         std.debug.print(
-            "provider_stats: mps_linears={} dense_f16_mb={} dense_f16_slots={} qkv_pack_mb={} runtime_mb={} quant_qkv={} quant_linear={} qkv_packed={}/{} ffn_fused={}/{}/{} attention_flash={} attention_legacy={} attention_gemm={}/{} compute_encoders={} last_frame_compute_encoders={} last_frame_attention={}\n",
+            "provider_stats: mps_linears={} dense_f16_mb={} dense_f16_slots={} qkv_pack_mb={} relative_cache_mb={} runtime_mb={} quant_qkv={} quant_linear={} qkv_packed={}/{} ffn_fused={}/{}/{} attention_flash={} attention_legacy={} attention_gemm={}/{} compute_encoders={} last_frame_compute_encoders={} last_frame_attention={}\n",
             .{
                 provider_stats.metal_runtime_last_frame_mps_dense_linear_count,
                 provider_stats.metal_runtime_dense_linear_f16_weight_bytes / (1024 * 1024),
                 provider_stats.metal_runtime_dense_linear_f16_slots,
                 provider_stats.metal_runtime_dense_qkv_packed_bytes / (1024 * 1024),
+                provider_stats.metal_runtime_deberta_relative_cache_bytes / (1024 * 1024),
                 provider_stats.metal_runtime_total_bytes / (1024 * 1024),
                 provider_stats.metal_runtime_last_frame_compute_quant_qkv_count,
                 provider_stats.metal_runtime_last_frame_compute_quant_linear_count,

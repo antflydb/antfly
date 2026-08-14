@@ -1908,6 +1908,13 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, lib_test_mod, true, true);
 
+    const api_http_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_http_runtime_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_http_runtime_test_mod, true, true);
+
     const metadata_unit_test_root_paths = [_][]const u8{
         "pkg/antfly/src/metadata_reconciler_test_root.zig",
         "pkg/antfly/src/metadata_service_http_test_root.zig",
@@ -2503,6 +2510,13 @@ pub fn build(b: *std.Build) void {
     const lib_regex_test_step = b.step("lib-regex-test", "Run standalone lib/regex tests");
     lib_regex_test_step.dependOn(&run_lib_regex_tests.step);
 
+    const lib_scraping_tests = b.addTest(.{
+        .root_module = scraping_mod,
+    });
+    const run_lib_scraping_tests = b.addRunArtifact(lib_scraping_tests);
+    const lib_scraping_test_step = b.step("lib-scraping-test", "Run standalone lib/scraping tests");
+    lib_scraping_test_step.dependOn(&run_lib_scraping_tests.step);
+
     const lib_jsonschema_tests = b.addTest(.{
         .root_module = jsonschema_mod,
     });
@@ -2656,9 +2670,13 @@ pub fn build(b: *std.Build) void {
     common_http_test_mod.addImport("httpx", httpx_mod);
     const common_http_tests = b.addTest(.{
         .root_module = common_http_test_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     common_http_tests.root_module.link_libc = true;
-    const run_common_http_tests = b.addRunArtifact(common_http_tests);
+    const run_common_http_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, common_http_tests, &.{});
     const common_http_test_step = b.step("common-http-test", "Run common HTTP listener and client tests");
     common_http_test_step.dependOn(&run_common_http_tests.step);
 
@@ -2713,7 +2731,6 @@ pub fn build(b: *std.Build) void {
             "api http client maps remote repair cancel unavailable",
             "api http client encodes table name for repair cancel callback",
             "public api routes compile",
-            "internal group artifact repair rejects callback token without cancel executor",
             "table repair job records bounded pass and continuation",
         },
         .test_runner = .{
@@ -2797,19 +2814,20 @@ pub fn build(b: *std.Build) void {
     const lib_embeddings_test_step = b.step("lib-embeddings-test", "Run standalone lib/embeddings tests");
     lib_embeddings_test_step.dependOn(&run_lib_embeddings_tests.step);
 
-    const lib_scraping_tests = b.addTest(.{
-        .root_module = scraping_mod,
-    });
-    const run_lib_scraping_tests = b.addRunArtifact(lib_scraping_tests);
-    const lib_scraping_test_step = b.step("lib-scraping-test", "Run standalone lib/scraping tests");
-    lib_scraping_test_step.dependOn(&run_lib_scraping_tests.step);
-
     const lib_vectorindex_tests = b.addTest(.{
         .root_module = vectorindex_mod,
     });
     const run_lib_vectorindex_tests = b.addRunArtifact(lib_vectorindex_tests);
     const lib_vectorindex_test_step = b.step("lib-vectorindex-test", "Run standalone lib/vectorindex tests");
     lib_vectorindex_test_step.dependOn(&run_lib_vectorindex_tests.step);
+
+    const vector_cancellation_tests = b.addTest(.{
+        .root_module = vector_mod,
+        .filters = &.{"RaBitQuantizer checks cancellation inside distance scans"},
+    });
+    const run_vector_cancellation_tests = b.addRunArtifact(vector_cancellation_tests);
+    const vector_cancellation_test_step = b.step("lib-vector-cancellation-test", "Run bounded vector-kernel cancellation tests");
+    vector_cancellation_test_step.dependOn(&run_vector_cancellation_tests.step);
 
     const lib_chunking_tests = b.addTest(.{
         .root_module = chunking_mod,
@@ -3164,7 +3182,7 @@ pub fn build(b: *std.Build) void {
     const lib_reranking_runtime_test_step = b.step("lib-reranking-runtime-test", "Run reranking backend adapter tests");
     lib_reranking_runtime_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
 
-    const lib_common_default_filters = [_][]const u8{ "provider registry", "std http listener", "std http executor", "threaded connector", "health server" };
+    const lib_common_default_filters = [_][]const u8{ "provider registry", "std http listener", "std http executor", "threaded connector", "health server", "runtime lifecycle" };
     const lib_common_runtime_filters = selectTestFilters(b, &lib_common_default_filters);
     const lib_common_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -3332,8 +3350,6 @@ pub fn build(b: *std.Build) void {
         "query embedding cache keys isolate security domains",
         "managed embedder deadlines bound provider pacing and transport",
         "managed embedder rejects malformed provider vectors",
-        "api http retryable embedding failures provide retry guidance",
-        "api http server obtains query embedding policy from resource manager",
         "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
@@ -3356,6 +3372,11 @@ pub fn build(b: *std.Build) void {
         "backend runtime durable lane runs inline jobs",
         "backend runtime durable lane leaves inline failed jobs owned by caller",
         "backend runtime threaded durable lane rejects jobs after owner close",
+        "backend runtime API lane leases expose and release the interface",
+        "backend runtime rejects API lane leases after shutdown begins",
+        "backend runtime control lane leases are isolated from API leases",
+        "backend runtime inference lane has an isolated bounded executor",
+        "backend runtime rejects control lane leases after shutdown begins",
         "provisioned table write cache retires stale db when index metadata changes",
         "managed startup catch-up advances counterless incomplete dense repair",
         "provisioned leader admission rejects uncommitted writes under dense repair pressure",
@@ -3377,8 +3398,6 @@ pub fn build(b: *std.Build) void {
         "inference run recognizes help before server startup",
         "inference pull classifies order independent value flags",
         "inference pull rejects flags from the other model domain",
-        "api http public sort capability gate validates mapped sortable fields",
-        "api http public sort capability gate fails closed for uncovered observed dynamic fields",
         "metadata.table generated field capabilities include schema dynamic templates",
         "metadata.table status exposes stable field capabilities",
         "metadata.table status promotes schema capability when runtime coverage is complete",
@@ -3520,6 +3539,58 @@ pub fn build(b: *std.Build) void {
     }
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
+
+    const api_http_runtime_default_filters = [_][]const u8{
+        "api http retryable embedding failures provide retry guidance",
+        "api http server obtains query embedding policy from resource manager",
+        "api http public sort capability gate validates mapped sortable fields",
+        "api http public sort capability gate fails closed for uncovered observed dynamic fields",
+        "generated route policy inventory is unique and describes wire modes",
+        "linked API dispatch preserves kernel-owned ingress policy",
+        "linked transport projects the universal request cancellation callback",
+        "linked transport admits a streaming body before the kernel pulls it",
+        "linked callbacks preserve streaming and cancellation semantics",
+        "outbound stream callbacks preserve terminal status classes",
+        "outbound callbacks prefer cancellation that arrives during transport IO",
+        "linked request bodies remain lazy and transport neutral",
+        "native executor borrows validate before reconstructing std.Io",
+        "httpx production path sheds 128 abandoned queries and preserves control recovery",
+        "httpx write admission rejects saturated table mutations",
+        "httpx inference connection uses the configured shared admission owner",
+        "local inference connection admission is owned exactly once by its target",
+        "httpx inference connection requires inference write permission",
+        "httpx inference connection propagates failures after stream commit",
+        "inference connection invocation forwards streaming and deadline through stable target ABI",
+        "inference invocation remaining deadline rounds up and expires",
+        "inference connection ABI reclaims partial responses on target failure",
+        "inference connection ABI rejects malformed responses without dereferencing invalid ownership",
+        "local inference connection ABI retains C layout and validates capabilities",
+        "local inference response validation contains malformed ownership",
+        "inference connection invocation requires inference write permission",
+        "httpx inference connection preserves upstream retry guidance",
+        "request admission bounds positive capacity and preserves unlimited mode",
+        "request admission metrics use the shared admission namespace",
+        "shared application admission covers MCP query and write operations",
+        "API kernel ABI rejects mismatched context and function-table prefixes",
+        "runtime HTTP values retain C layout",
+    };
+    const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
+    const api_http_runtime_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = api_http_runtime_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_api_http_runtime_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        api_http_runtime_tests,
+        api_http_runtime_filters,
+    );
+    const api_http_runtime_test_step = b.step("api-http-runtime-test", "Run focused API HTTP and linked-boundary tests");
+    api_http_runtime_test_step.dependOn(&run_api_http_runtime_tests.step);
+    root_test_step.dependOn(&run_api_http_runtime_tests.step);
 
     const introducer_tests = b.addTest(.{
         .root_module = introducer_test_mod,
@@ -3704,7 +3775,10 @@ pub fn build(b: *std.Build) void {
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
 
-    const http_low_fd_ratchet_filter = "std http listener process threads and descriptors recover after cancellation storms";
+    // Keep this as the stable behavioral suffix of the declaration rather
+    // than duplicating its descriptive worker-model prefix. The exact-filter
+    // runner still fails when the regression is no longer declared.
+    const http_low_fd_ratchet_filter = "recovers descriptors after cancellation storms";
     const http_low_fd_ratchet_tests = b.addTest(.{
         .root_module = lib_test_mod,
         // Compile the shared HTTP module for declaration reachability, but
@@ -3863,6 +3937,9 @@ pub fn build(b: *std.Build) void {
             "unsupported transforms fail atomically instead of reporting success",
             "supported transform on a missing document remains a no-op without upsert",
             "io threaded applied callback observes published watermark outside runtime lock",
+            "io threaded wait observes worker-owned catch-up close",
+            "io threaded wait requests prompt worker catch-up close",
+            "io threaded wait observes failed worker-owned catch-up close",
         }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3950,6 +4027,7 @@ pub fn build(b: *std.Build) void {
         "data runtime repair queue links and removes debt in constant time",
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
         "data runtime raft status changes force immediate store status publication",
+        "data runtime reallocation request refreshes group status once per request",
         "data runtime replicated split policy is identity and phase aware",
         "data runtime structural changes preserve physical root generations",
         "data raft draining leader remains stable through membership expansion",
@@ -3969,7 +4047,7 @@ pub fn build(b: *std.Build) void {
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "idle cached runtime status stays fresh only for the published root generation",
         "runtime status disk usage cache is scoped to one root generation",
-        "runtime status disk scan retries only when maintenance invalidates its group",
+        "runtime status disk scan retries across a reallocation fence and group invalidation remains scoped",
         "data runtime stamps one producer generation on every reported group",
         "data runtime live writer source follows raft apply ownership",
         "placement topology promotes cutover-ready learners to voters",
@@ -4639,7 +4717,6 @@ pub fn build(b: *std.Build) void {
         "api http server surfaces structured torn-state conflicts when txn record is corrupted",
         "api http server serves transaction session cleanup route",
         "api http server serves table metadata list and detail",
-        "api http server exposes storage status and asynchronous maintenance jobs",
         "api http server serves runtime schema debug on table and index detail",
         "api http server serves table index metadata routes",
         "api runtime status upsert keeps one authoritative observation per group",
@@ -4731,11 +4808,24 @@ pub fn build(b: *std.Build) void {
         "httpx antfly scan honors optional body and documented bad requests",
         "httpx multi batch route uses the batch commit hook and public response contract",
         "httpx stable transaction commit durably hands off recovery before acknowledgement",
+        "httpx shared registrar keeps root probes and rejects removed data aliases",
+        "httpx storage maintenance routes call typed operations directly",
+        "httpx antfly routes require auth and enforce admin middleware",
+        "request context observes cancellation before deadline",
+        "admission reservation releases exactly once",
+        "probe operations distinguish health from readiness",
+        "unsupported maintenance operations fail before transport adaptation",
+        "storage maintenance typed operations run without an HTTP request",
         "httpx owned response preserves retryable JSON metadata",
         "httpx query admission rejects saturated queries without blocking control routes",
         "httpx query admission releases a cancelled query slot",
-        "httpx rejects pipelined H1 query work when disconnect ownership is ambiguous",
-        "httpx production path sheds 128 abandoned queries and preserves control recovery",
+        "httpx query admission treats zero capacity as unlimited",
+        "httpx write admission rejects saturated table mutations",
+        "httpx inference connection uses the configured shared admission owner",
+        "local inference connection admission is owned exactly once by its target",
+        "httpx inference connection preserves upstream retry guidance",
+        "request admission bounds positive capacity and preserves unlimited mode",
+        "shared application admission covers MCP query and write operations",
         "compiled stored filters honor canonical JSON pointer fields and escapes",
         "jsonDocMatchesPatternFilter supports stored structured filters",
         "stored term filters preserve JSON scalar kinds",
@@ -4786,6 +4876,7 @@ pub fn build(b: *std.Build) void {
     const lib_api_auth_default_filters = [_][]const u8{
         "api http server requires auth on public routes when enabled",
         "continuous HA rejects non-replicated public mutations before handlers",
+        "HA mutation middleware fails closed for unregistered HTTP methods",
         "continuous HA freezes pre-existing restore workers and resumption",
         "continuous HA allows a configured RemoteApply batch write",
         "api http server document scan requires table read permission",
@@ -4795,8 +4886,8 @@ pub fn build(b: *std.Build) void {
         "api http server returns retryable not leader when cluster backup read barrier times out",
         "api http server cluster backup succeeds after load balanced metadata timeout retry",
         "api http server does not advertise a retry after cluster backup side effects begin",
-        "api http server dispatches HA admin and internal executors",
-        "api http server requires exact HA bearer token for internal replication routes",
+        "typed HA route operation dispatches admin and internal executors",
+        "typed HA route operation requires exact bearer token for internal replication routes",
         "api http server forbids non-admin secret access when auth is enabled",
         "api http server query builder requires table read permission when auth is enabled",
         "api http server restricts runtime schema debug to admins when auth is enabled",
@@ -4891,6 +4982,7 @@ pub fn build(b: *std.Build) void {
             "connection cache remains valid across every allocation failure",
             "build response exposes embedded inference as a local connection",
             "inference connection operations are allowlisted",
+            "inference admission ownership uses explicit connection identity",
             "inference connection URLs require an HTTP origin",
             "build response reports mock connected and types filter",
             "build response reports configured external io connections",
@@ -5113,8 +5205,7 @@ pub fn build(b: *std.Build) void {
             "distributed join rejects doc identity rebuild before right-table fanout",
             "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
             "internal worker doc identity exchange audit covers every boundary",
-            "internal group join routes map doc identity mismatch to conflict",
-            "internal group read routes map doc identity mismatch to conflict",
+            "typed internal HTTP errors preserve doc identity conflict semantics",
             "api http client preserves group doc identity conflicts",
             "aggregation context rejects non-current identity generation",
             "aggregation full-result rerun can reuse snapped result identity generation",
@@ -5136,8 +5227,6 @@ pub fn build(b: *std.Build) void {
             "api http server maps retrieval agent doc identity mismatch to unavailable",
             "api http server query builder maps doc identity mismatch to unavailable",
             "api http server surfaces structured doc identity conflicts for transaction commits",
-            "internal group vector worker rejects unsupported identity generation",
-            "internal group graph expand rejects unsupported identity generation",
             "distributed graph expand request preserves algebraic semiring planning flag",
             "batch identity metadata delete observes buffered resurrection state",
             "identity validation accepts missing canonical rows but rejects conflicts",
@@ -5298,13 +5387,11 @@ pub fn build(b: *std.Build) void {
             "db transaction recovery runtime resolves table-group participants through distributed txn resolver",
             "bound stable single-group transaction retry does not reapply transforms",
             "bound single-group batch reports prepared intent conflicts",
-            "internal group write routes map shard doc identity mismatch to conflict",
             "api http client preserves group doc identity conflicts",
             "api http client preserves public batch retry safety classifications",
             "api http client forwards bounded raft batch routing context without allocation",
             "api http client rejects unsupported routed batch protocol without legacy replay",
             "api http client requires explicit not-proposed marker and tracks delivery phase",
-            "internal group write route dispatches bounded raft forwarding context",
             "raft batch aggregation makes failures after an accepted group non-retryable",
             "stateless batch retries are bounded and exclude explicit OCC",
             "provisioned stateless batch retries definite aborts to the production bound",
@@ -5387,7 +5474,9 @@ pub fn build(b: *std.Build) void {
             "api http client forwards internal query controls and maps remote timeout",
             "api http client preserves remote storage read contention",
             "api http client preserves storage read contention across group read endpoints",
-            "internal group read routes preserve retryable resident storage failures",
+            "typed internal group reads preserve retryable resident storage failures",
+            "typed routed batch preserves forwarding cancellation and identity conflicts",
+            "typed internal query workers preserve identity generation validation",
             "remote shard query phases propagate deadline and request cancellation",
             "provisioned table read cache has a finite worker ceiling",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
@@ -5423,6 +5512,7 @@ pub fn build(b: *std.Build) void {
             "public table batch handler preserves ambiguous write outcomes",
             "public table batch handler maps HA write gate errors",
             "public table batch handler returns concise dense repair backpressure",
+            "public table api carries borrowed cancellation into batch execution",
             "public create index exposes retryable storage descriptor exhaustion",
             "public table query handler maps doc identity unavailable errors",
             "public table query handler preserves retryable failure status",
@@ -5513,6 +5603,9 @@ pub fn build(b: *std.Build) void {
             "api http server join planner uses complete fresh local stats before metadata publication",
             "external embeddings index readiness does not require table doc coverage",
             "api http server preserves public query availability errors",
+            "api http maps missing physical index only for rebuilding lifecycle",
+            "api http missing index classification requires active rebuild evidence",
+            "api http lifecycle classification preserves catching-up writer beside fresh read snapshot",
             "remote rebuild quarantine preserves its source and index failure",
             "api http server create index waits for exact target config projection",
         },
@@ -5558,6 +5651,8 @@ pub fn build(b: *std.Build) void {
             "provisioned table write request queues structural reconcile ahead of later writes",
             "structural reconcile reservation defers metadata group refresh without blocking admitted work",
             "queued structural reconcile reserves write admission before its worker starts",
+            "queued index catch-up does not reserve table write admission",
+            "index reconciliation request enqueues a catalog-deleted target without create admission",
             "structural reconcile retry backoff is bounded",
             "structural reconcile productive quantum yields immediately while blocked work backs off",
             "structural reconcile retries a transient worker failure",
@@ -5579,6 +5674,14 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up allocation failure preserves bounded retry",
             "standby HA replay reconciles managed indexes without opening the public write gate",
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
+            "db managed vector admission captures writes while durable repair is pending",
+            "db managed algebraic admission builds and reopens an isolated generation",
+            "db algebraic generation build yields and resumes from its durable source cursor",
+            "db forced algebraic repair persists an operator generation intent before execution",
+            "db algebraic post-commit activation crash recovers through generation repair",
+            "table provisioner admits algebraic index on a non-empty table through generation repair",
+            "target index reconciliation never mutates sibling indexes",
+            "target index reconciliation retires orphaned inline enrichments after deletion retry",
             "managed db open modes never drain resolver backfill on raft apply",
             "replica root reconcile enqueues newly admitted managed full text repair",
             "managed repair visibility edges retire cached readers and runtime status",
@@ -5777,7 +5880,8 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_logic_default_filters = [_][]const u8{
         "metadata reconciler",
         "transition state",
-        "metadata server module compiles",
+        "metadata server ",
+        "metadata admin mux ",
         "metadata merge request validation rejects incompatible doc identity namespaces",
         "metadata split request validation rejects stale doc identity namespace",
         "transition actions",
@@ -6236,13 +6340,7 @@ pub fn build(b: *std.Build) void {
             "standalone inference middleware reuses public API authentication",
             "standalone CORS middleware enforces dynamic configuration",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",
-            "standalone runtime registers internal group routes explicitly",
-            "standalone runtime registers mcp routes before antfarm catch-all",
-            "standalone runtime registers A2A routes before antfarm catch-all",
-            "standalone runtime registers ARD routes before antfarm catch-all",
             "standalone runtime parses experimental flag",
-            "standalone bridge shared adapter preserves protocol headers and absent body",
-            "standalone protocol bridge releases converted request headers",
             "standalone runtime antfarm path guards keep api routes reserved",
             "standalone startup checkpoint readiness requires applied and safe-read progress",
             "parse cli accepts config path",
@@ -6255,7 +6353,7 @@ pub fn build(b: *std.Build) void {
             "standalone HA standby replication flags require upstream and slot",
             "standalone HA string classifier distinguishes missing padded and valid values",
             "standalone HA runtime rejects ambiguous role flags",
-            "standalone HA roles freeze startup-local mutation producers",
+            "standalone continuous HA mutation guard follows role lifecycle",
             "antfly config uses cli override before common config",
             "standalone public api caps keep alive request reuse",
             "standalone public api body limit matches common http listener",
@@ -6267,13 +6365,14 @@ pub fn build(b: *std.Build) void {
             "durable session limits bound count and encoded record size",
             "common config rejects removed top-level storage backend fields",
             "common config parses bounded transaction session policy",
-            "standalone public listener lease is exclusive and immediately reusable",
             "parse cli accepts inference budget overrides",
             "standalone kernel JIT mode precedence is CLI then environment then config",
             "inference config falls back to common config",
             "standalone prompt cache detaches resource observer before owner teardown",
             "inference admission bridge charges combined native residency to resource manager",
             "standalone inference keep alive parses compound durations and zero",
+            "standalone linked inference ABI validates the supported function-table prefix",
+            "standalone local inference lifetime distinguishes deadline from upstream cancellation",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
@@ -6323,6 +6422,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_generating_tests.step);
     unit_test_step.dependOn(&run_lib_embeddings_tests.step);
     unit_test_step.dependOn(&run_lib_vectorindex_tests.step);
+    unit_test_step.dependOn(&run_vector_cancellation_tests.step);
     unit_test_step.dependOn(&run_lib_chunking_tests.step);
     unit_test_step.dependOn(&run_lib_generating_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_tests.step);
@@ -6331,6 +6431,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_httpx_transport_regression_tests.step);
+    unit_test_step.dependOn(&run_api_http_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_casbin_tests.step);
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);
     unit_test_step.dependOn(&run_embedded_tests.step);
@@ -7120,6 +7221,11 @@ pub fn build(b: *std.Build) void {
         &.{"metadata.reconciler."},
         &.{
             "metadata.service.",
+            "metadata.admin_read_operations.",
+            "metadata.admin_mutation_operations.",
+            "metadata.extension_operations.",
+            "metadata.node_operations.",
+            "metadata.table_operations.",
             "metadata.http_client.",
             "metadata.http_routes.",
             "metadata.http_server.",
@@ -7169,9 +7275,13 @@ pub fn build(b: *std.Build) void {
     const unit_metadata_shard_max_rss = [_]usize{
         5 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
+        // The core shard now compiles the contextual public router and its
+        // compatibility manifest; Debug codegen peaks above 5 GiB on macOS.
+        6 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
-        5 * 1024 * 1024 * 1024,
-        5 * 1024 * 1024 * 1024,
+        // The server shard compiles the public API kernel and listener stack;
+        // Debug codegen currently peaks around 6.4 GB on aarch64 macOS.
+        7 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
         7 * 1024 * 1024 * 1024,
@@ -9040,12 +9150,19 @@ pub fn build(b: *std.Build) void {
                 // Claims conservatively cover clean production ReleaseFast
                 // peaks measured for both aarch64-linux-musl and explicit
                 // aarch64-macos (including Metal and Accelerate). They are
-                // scheduling reservations, not hard process limits. A 20 GiB
+                // scheduling reservations, not hard process limits. A 24 GiB
                 // budget can overlap all four units while a smaller cgroup
                 // automatically schedules only the subset that fits.
-                .api_kernel => 4 * 1024 * 1024 * 1024,
-                .distributed => 8 * 1024 * 1024 * 1024,
-                .inference => 5 * 1024 * 1024 * 1024,
+                // aarch64-macOS includes platform framework codegen and peaks
+                // just above 4 GiB; Linux CI retains the tighter reservation.
+                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 5 else 4) * 1024 * 1024 * 1024,
+                // Clean aarch64-macOS ReleaseFast codegen peaks around
+                // 10.9 GB with the platform frameworks enabled. Keep the
+                // tighter Linux reservation, where CI remains below 8 GiB.
+                .distributed => @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024,
+                // Debug codegen currently peaks around 6.7 GB on aarch64
+                // macOS; reserve headroom for mode- and target-dependent IR.
+                .inference => 7 * 1024 * 1024 * 1024,
                 .cli => 2 * 1024 * 1024 * 1024,
             },
         });

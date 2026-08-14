@@ -66,6 +66,10 @@ pub const LocalTableRuntimeStatus = struct {
     // deliberately separate from metadata.status_generation, which identifies
     // externally published store snapshots.
     cache_observation_generation: u64 = 0,
+    // Identifies the filesystem observation that produced disk_bytes. Disk
+    // usage has a separate causal lifetime from DB/runtime facts: a cached or
+    // startup status can still carry a freshly scanned, authoritative size.
+    disk_observation_generation: u64 = 0,
     metadata: RuntimeStatusMetadata = .{},
     disk_bytes: u64 = 0,
     disk_bytes_known: bool = false,
@@ -82,6 +86,7 @@ pub const LocalTableRuntimeStatus = struct {
         return .{
             .group_id = self.group_id,
             .cache_observation_generation = self.cache_observation_generation,
+            .disk_observation_generation = self.disk_observation_generation,
             .metadata = self.metadata,
             .disk_bytes = self.disk_bytes,
             .disk_bytes_known = self.disk_bytes_known,
@@ -2980,6 +2985,7 @@ test "table runtime snapshot cache preserves previous snapshots when replace pre
 
             publishRefreshForTest(&cache, refresh) catch |err| switch (err) {
                 error.OutOfMemory => {},
+                else => return err,
             };
 
             var docs = (try cache.snapshot(alloc, "docs")).?;

@@ -69,6 +69,38 @@ and relation edges. Optional source and target types qualify a relation label.
 `options.resolver` merges equivalent mentions across the input batch while
 preserving one response object per input and relation provenance.
 
+## Classification extraction
+
+Classification accepts either an NLI classifier or a classification-capable
+extractor. Each named taxonomy owns its NLI hypothesis template because one
+request may contain taxonomies with different semantics.
+
+```json
+{
+  "model": "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
+  "inputs": [
+    {"id": "review-1", "content": "I love this product!"}
+  ],
+  "schema": {
+    "classifications": [
+      {
+        "name": "sentiment",
+        "labels": ["positive", "negative", "neutral"],
+        "multi_label": false,
+        "hypothesis_template": "This review expresses {} sentiment.",
+        "top_k": 1
+      }
+    ]
+  },
+  "options": {"include_confidence": true, "threshold": 0.2}
+}
+```
+
+Single-label taxonomies return the highest-ranked label by default, or up to
+`top_k` labels when it is supplied. Multi-label taxonomies ignore `top_k` and
+return every label whose score meets `options.threshold`. Classifier models are
+listed with the other extraction-capable models under `models.extractors`.
+
 ## Response envelope
 
 Responses preserve input order and copy each optional input `id`.

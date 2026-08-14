@@ -3759,6 +3759,13 @@ fn replicationCutoverRetirementCleared(
 const transition_magic = "afmd1";
 const runtime_status_record_version: u16 = 12;
 const group_status_record_version: u16 = 4;
+// Store records predate framing and are read by mixed-version metadata
+// replicas. Keep the existing prefix byte-for-byte compatible and put new
+// optional state in a self-identifying trailer that older readers ignore.
+const store_record_extension_magic = "afsx1";
+const store_record_extension_version: u16 = 1;
+const reallocation_request_extension_magic = "afrr1";
+const reallocation_request_extension_version: u16 = 1;
 
 const TransitionTag = enum(u8) {
     initialize_metadata_incarnation = 45,
@@ -4518,6 +4525,32 @@ fn appendStoreRecord(
     try appendInt(alloc, out, u32, @intCast(record.runtime_statuses.len));
     for (record.runtime_statuses) |runtime_status| try appendRuntimeGroupStatusRecord(alloc, out, runtime_status);
     try out.append(alloc, if (record.drain_requested) 1 else 0);
+    try appendStoreRecordExtensions(alloc, out, record);
+}
+
+fn appendStoreRecordExtensions(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    record: metadata.StoreRecord,
+) !void {
+    var observation_count: u32 = 0;
+    for (record.group_statuses) |status| {
+        if (status.observed_reallocation_request_id != 0) observation_count += 1;
+    }
+    if (observation_count == 0) return;
+
+    try out.appendSlice(alloc, store_record_extension_magic);
+    try appendInt(alloc, out, u16, store_record_extension_version);
+    try appendInt(alloc, out, u32, observation_count);
+    for (record.group_statuses, 0..) |status, status_index| {
+        if (status.observed_reallocation_request_id == 0) continue;
+        // Group reports are intentionally permitted to contain duplicate group
+        // IDs so reconciliation can treat the report as ambiguous and fail
+        // closed. Address the extension by position so that ambiguity remains
+        // representable in the committed command instead of making apply fail.
+        try appendInt(alloc, out, u32, @intCast(status_index));
+        try appendInt(alloc, out, u128, status.observed_reallocation_request_id);
+    }
 }
 
 fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !metadata.StoreRecord {
@@ -4583,6 +4616,7 @@ fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !
         pos.* += 1;
         break :blk value;
     } else false;
+    try readStoreRecordExtensions(encoded, pos, group_statuses);
     return .{
         .store_id = store_id,
         .node_id = node_id,
@@ -4603,6 +4637,38 @@ fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !
         .group_statuses = group_statuses,
         .runtime_statuses = runtime_statuses,
     };
+}
+
+fn readStoreRecordExtensions(
+    encoded: []const u8,
+    pos: *usize,
+    group_statuses: []metadata.GroupStatusReport,
+) !void {
+    if (pos.* == encoded.len) return;
+    if (pos.* + store_record_extension_magic.len > encoded.len or
+        !std.mem.eql(
+            u8,
+            encoded[pos.* .. pos.* + store_record_extension_magic.len],
+            store_record_extension_magic,
+        ))
+    {
+        return error.InvalidMetadataTransitionEncoding;
+    }
+    pos.* += store_record_extension_magic.len;
+
+    const version = try readInt(encoded, pos, u16);
+    if (version != store_record_extension_version) return error.InvalidMetadataTransitionEncoding;
+    const observation_count = try readInt(encoded, pos, u32);
+    var observation_index: u32 = 0;
+    while (observation_index < observation_count) : (observation_index += 1) {
+        const status_index = try readInt(encoded, pos, u32);
+        const request_id = try readInt(encoded, pos, u128);
+        if (request_id == 0 or status_index >= group_statuses.len) return error.InvalidMetadataTransitionEncoding;
+        const status = &group_statuses[status_index];
+        if (status.observed_reallocation_request_id != 0) return error.InvalidMetadataTransitionEncoding;
+        status.observed_reallocation_request_id = request_id;
+    }
+    if (pos.* != encoded.len) return error.InvalidMetadataTransitionEncoding;
 }
 
 fn appendRuntimeGroupStatusRecord(
@@ -5580,6 +5646,13 @@ fn appendReallocationRequestRecord(
     if (!metadata.isValidReallocationRequest(record)) return error.InvalidMetadataRecord;
     try appendInt(alloc, out, u128, record.request_id);
     try appendInt(alloc, out, u64, record.requested_at_ms);
+    if (record.barrier_protocol_version == 0) return;
+    try out.appendSlice(alloc, reallocation_request_extension_magic);
+    try appendInt(alloc, out, u16, reallocation_request_extension_version);
+    try appendInt(alloc, out, u16, record.barrier_protocol_version);
+    try out.appendSlice(alloc, &record.metadata_incarnation.?);
+    try appendInt(alloc, out, u32, record.protected_metadata_member_count);
+    try out.appendSlice(alloc, &record.protected_metadata_membership_fingerprint);
 }
 
 fn readTableRecord(
@@ -6408,10 +6481,37 @@ fn readReallocationRequestRecord(
     encoded: []const u8,
     pos: *usize,
 ) !metadata.ReallocationRequestRecord {
-    const record: metadata.ReallocationRequestRecord = .{
+    var record: metadata.ReallocationRequestRecord = .{
         .request_id = try readInt(encoded, pos, u128),
         .requested_at_ms = try readInt(encoded, pos, u64),
     };
+    if (pos.* < encoded.len) {
+        if (pos.* + reallocation_request_extension_magic.len > encoded.len or
+            !std.mem.eql(
+                u8,
+                encoded[pos.* .. pos.* + reallocation_request_extension_magic.len],
+                reallocation_request_extension_magic,
+            ))
+        {
+            return error.InvalidMetadataRecord;
+        }
+        pos.* += reallocation_request_extension_magic.len;
+        const version = try readInt(encoded, pos, u16);
+        if (version != reallocation_request_extension_version) return error.InvalidMetadataRecord;
+        record.barrier_protocol_version = try readInt(encoded, pos, u16);
+        if (pos.* + @sizeOf(metadata.MetadataClusterIncarnation) > encoded.len) return error.InvalidMetadataRecord;
+        var incarnation: metadata.MetadataClusterIncarnation = undefined;
+        @memcpy(&incarnation, encoded[pos.*..][0..incarnation.len]);
+        pos.* += incarnation.len;
+        record.metadata_incarnation = incarnation;
+        record.protected_metadata_member_count = try readInt(encoded, pos, u32);
+        if (pos.* + record.protected_metadata_membership_fingerprint.len > encoded.len) return error.InvalidMetadataRecord;
+        @memcpy(
+            &record.protected_metadata_membership_fingerprint,
+            encoded[pos.*..][0..record.protected_metadata_membership_fingerprint.len],
+        );
+        pos.* += record.protected_metadata_membership_fingerprint.len;
+    }
     if (!metadata.isValidReallocationRequest(record)) return error.InvalidMetadataRecord;
     return record;
 }
@@ -8793,10 +8893,16 @@ test "metadata schema progress transition command round-trips" {
 }
 
 test "metadata reallocation request transition command round-trips" {
+    const protected_members = [_]u64{ 1, 2, 3 };
+    const fingerprint = metadata.reallocation_request.membershipFingerprint(&protected_members);
     const encoded = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_reallocation_request = .{
             .request_id = 17,
             .requested_at_ms = 42_000,
+            .barrier_protocol_version = metadata.reallocation_request.barrier_protocol_version,
+            .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+            .protected_metadata_member_count = protected_members.len,
+            .protected_metadata_membership_fingerprint = fingerprint,
         },
     });
     defer std.testing.allocator.free(encoded);
@@ -8808,6 +8914,10 @@ test "metadata reallocation request transition command round-trips" {
         .upsert_reallocation_request => |record| {
             try std.testing.expectEqual(@as(u128, 17), record.request_id);
             try std.testing.expectEqual(@as(u64, 42_000), record.requested_at_ms);
+            try std.testing.expectEqual(metadata.reallocation_request.barrier_protocol_version, record.barrier_protocol_version);
+            try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", &record.metadata_incarnation.?);
+            try std.testing.expectEqual(@as(u32, 3), record.protected_metadata_member_count);
+            try std.testing.expectEqualSlices(u8, &fingerprint, &record.protected_metadata_membership_fingerprint);
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
@@ -8828,6 +8938,18 @@ test "metadata reallocation request transition command round-trips" {
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
+}
+
+test "metadata reallocation request decoder accepts the legacy unfenced record" {
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendInt(std.testing.allocator, &encoded, u128, 17);
+    try appendInt(std.testing.allocator, &encoded, u64, 42_000);
+    var pos: usize = 0;
+    const record = try readReallocationRequestRecord(encoded.items, &pos);
+    try std.testing.expectEqual(encoded.items.len, pos);
+    try std.testing.expectEqual(@as(u16, 0), record.barrier_protocol_version);
+    try std.testing.expect(record.metadata_incarnation == null);
 }
 
 test "metadata extension lifecycle transition command round-trips" {
@@ -9611,6 +9733,7 @@ test "metadata raft apply store transition codec preserves exact raft voter iden
         .raft_membership_index = 87,
         .disk_bytes = 4096,
         .disk_bytes_known = true,
+        .observed_reallocation_request_id = 0x123456789abcdef00123456789abcdef,
         .local_leader = true,
         .local_voter = true,
         .voter_count = 3,
@@ -9639,8 +9762,44 @@ test "metadata raft apply store transition codec preserves exact raft voter iden
     try std.testing.expectEqual(@as(u64, 91), statuses[0].raft_applied_index);
     try std.testing.expectEqual(@as(u64, 12), statuses[0].raft_term);
     try std.testing.expectEqual(@as(u64, 87), statuses[0].raft_membership_index);
+    try std.testing.expectEqual(
+        @as(u128, 0x123456789abcdef00123456789abcdef),
+        statuses[0].observed_reallocation_request_id,
+    );
     try std.testing.expectEqual(@as(u16, 3), statuses[0].voter_count);
     try std.testing.expectEqualSlices(u8, &fingerprint, &statuses[0].voter_set_fingerprint);
+}
+
+test "metadata raft apply store transition codec preserves duplicate group observations by position" {
+    var group_statuses = [_]metadata.GroupStatusReport{
+        .{
+            .group_id = 5101,
+            .observed_reallocation_request_id = 0x1111,
+        },
+        .{
+            .group_id = 5101,
+            .observed_reallocation_request_id = 0x2222,
+        },
+    };
+    const encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_store = .{
+            .store_id = 101,
+            .node_id = 101,
+            .role = "data",
+            .group_statuses = group_statuses[0..],
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)) orelse
+        return error.InvalidMetadataTransitionEncoding;
+    defer decoded.deinit(std.testing.allocator);
+    const statuses = decoded.upsert_store.group_statuses;
+    try std.testing.expectEqual(@as(usize, 2), statuses.len);
+    try std.testing.expectEqual(@as(u64, 5101), statuses[0].group_id);
+    try std.testing.expectEqual(@as(u64, 5101), statuses[1].group_id);
+    try std.testing.expectEqual(@as(u128, 0x1111), statuses[0].observed_reallocation_request_id);
+    try std.testing.expectEqual(@as(u128, 0x2222), statuses[1].observed_reallocation_request_id);
 }
 
 test "metadata raft apply store projects placement intents from committed entries" {

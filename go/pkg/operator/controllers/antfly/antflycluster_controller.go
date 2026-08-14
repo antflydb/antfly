@@ -3600,8 +3600,13 @@ func (r *AntflyClusterReconciler) buildMetadataClusterConfig(cluster *antflyv1.A
 		if i > 1 {
 			config.WriteString(", ")
 		}
-		fmt.Fprintf(&config, `"%d": "http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d"`,
-			i, cluster.Name, i-1, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataRaft.Port)
+		fmt.Fprintf(
+			&config,
+			`"%d": {"raft_url":"http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d","orchestration_url":"http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d"}`,
+			i,
+			cluster.Name, i-1, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataRaft.Port,
+			cluster.Name, i-1, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port,
+		)
 	}
 	config.WriteString(" }")
 	return config.String()

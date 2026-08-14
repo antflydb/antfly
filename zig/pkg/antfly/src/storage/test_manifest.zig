@@ -114,6 +114,7 @@ comptime {
     _ = @import("ha/http_admin.zig");
     _ = @import("ha/http_client.zig");
     _ = @import("ha/http_internal.zig");
+    _ = @import("ha/http_operation.zig");
     _ = @import("ha/http_replication_client.zig");
     _ = @import("ha/kubernetes_lease_watchdog.zig");
     _ = @import("ha/lifecycle_receipt_inventory_test.zig");

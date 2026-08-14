@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const runtime_callback_abi = @import("../../runtime_callback_abi.zig");
+const CancellationToken = @import("../cancellation.zig").CancellationToken;
 
 pub const metadata_not_leader_header = "X-Antfly-Metadata-Not-Leader";
 pub const metadata_not_leader_value = "true";
@@ -33,6 +34,8 @@ pub const RequestCancellation = struct {
     /// Optional listener-owned signal (for example an H2 RST_STREAM). It is
     /// borrowed for the request lifetime and complements local cancellation.
     borrowed: ?*const std.atomic.Value(bool) = null,
+    borrowed_context: ?*const anyopaque = null,
+    borrowed_is_cancelled: ?*const fn (*const anyopaque) bool = null,
 
     pub fn cancel(self: *RequestCancellation) void {
         self.cancelled.store(true, .release);
@@ -40,13 +43,39 @@ pub const RequestCancellation = struct {
 
     pub fn isCancelled(self: *const RequestCancellation) bool {
         return self.cancelled.load(.acquire) or
-            (self.borrowed != null and self.borrowed.?.load(.acquire));
+            (self.borrowed != null and self.borrowed.?.load(.acquire)) or
+            self.isBorrowedCallbackCancelled();
+    }
+
+    fn isBorrowedCallbackCancelled(self: *const RequestCancellation) bool {
+        const context = self.borrowed_context orelse return false;
+        const callback = self.borrowed_is_cancelled orelse return false;
+        return callback(context);
     }
 
     /// The listener installs at most one cancellation source per transport:
     /// H2 borrows the stream signal, while H1 uses the local socket watcher.
     pub fn signal(self: *const RequestCancellation) *const std.atomic.Value(bool) {
         return self.borrowed orelse &self.cancelled;
+    }
+
+    pub fn token(self: *const RequestCancellation) CancellationToken {
+        return .{
+            .ptr = self,
+            .is_cancelled_fn = struct {
+                fn call(raw: *const anyopaque) bool {
+                    const cancellation: *const RequestCancellation = @ptrCast(@alignCast(raw));
+                    return cancellation.isCancelled();
+                }
+            }.call,
+        };
+    }
+
+    pub fn fromToken(token_value: CancellationToken) RequestCancellation {
+        return .{
+            .borrowed_context = token_value.ptr,
+            .borrowed_is_cancelled = token_value.is_cancelled_fn,
+        };
     }
 };
 
@@ -56,6 +85,12 @@ test "RequestCancellation observes a borrowed listener signal" {
     try std.testing.expect(!cancellation.isCancelled());
     listener_signal.store(true, .release);
     try std.testing.expect(cancellation.isCancelled());
+}
+
+test "RequestCancellation safely ignores incomplete semantic tokens" {
+    var state = false;
+    const cancellation = RequestCancellation.fromToken(.{ .ptr = &state });
+    try std.testing.expect(!cancellation.isCancelled());
 }
 
 pub const HttpRequest = struct {

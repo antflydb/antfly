@@ -13,12 +13,21 @@
 // limitations.
 
 const std = @import("std");
+const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
 const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const runtime_status = @import("../api/runtime_status.zig");
+const api_http_test_runtime = if (@import("builtin").is_test) @import("../api/http_test_runtime.zig") else struct {};
+
+fn executeApiHttpxTestRequest(
+    api: *antfly.public_api.http_server.ApiHttpServer,
+    req: antfly.raft.transport.http_common.HttpRequest,
+) !antfly.raft.transport.http_common.HttpResponse {
+    return api_http_test_runtime.executeOnce(std.testing.allocator, api, req);
+}
 
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
@@ -686,12 +695,196 @@ fn publicApiListenerConfig(bind_host: []const u8, bind_port: u16) antfly.raft.tr
     };
 }
 
+fn publicApiHttpxConfig(
+    cfg: antfly.raft.transport.StdHttpListenerConfig,
+    http_runtime: ?*httpx.HttpRuntime,
+) httpx.ServerConfig {
+    const max_connections: u32 = if (cfg.max_connection_threads == 0)
+        public_api_max_connection_threads
+    else
+        cfg.max_connection_threads;
+    const max_request_tasks: u32 = if (cfg.max_active_requests == 0)
+        @min(max_connections, public_api_max_active_requests)
+    else
+        cfg.max_active_requests;
+    return (httpx.ServerConfig{
+        .host = cfg.bind_host,
+        .port = cfg.bind_port,
+        .max_body_size = cfg.max_request_bytes,
+        .header_read_timeout_ms = cfg.header_read_timeout_ms,
+        .body_read_timeout_ms = cfg.body_read_timeout_ms,
+        .response_write_timeout_ms = cfg.header_read_timeout_ms,
+        .request_body_buffer_budget_bytes = cfg.max_request_bytes * @as(usize, max_request_tasks),
+        .max_h1_inflight_bodies = max_request_tasks,
+        .max_connections = max_connections,
+        .max_request_tasks = max_request_tasks,
+        .accept_error_backoff_initial_ms = cfg.accept_error_backoff_initial_ms,
+        .accept_error_backoff_max_ms = cfg.accept_error_backoff_max_ms,
+        .reuse_address = cfg.reuse_address,
+        .http_runtime = http_runtime,
+    }).normalized();
+}
+
+/// Structured owner for the data role's public HTTP transport. The handler
+/// registers the generated and contextual `httpx` route families explicitly;
+/// unknown paths use the router's native 404 behavior with no global fallback.
+const DataPublicHttpRuntime = struct {
+    alloc: std.mem.Allocator,
+    api_server: *antfly.public_api.kernel_bridge.ApiHttpServer,
+    handler: antfly.public_api.kernel_bridge.HttpxHandler,
+    server: httpx.Server,
+    listener_task: httpx.ListenerTask,
+    api_lane_lease: backend_runtime_mod.BackendRuntime.ApiLaneLease,
+
+    const RuntimeStats = struct {
+        max_connection_threads: u32,
+        active_connection_threads: usize,
+        peak_connection_threads: usize,
+        max_active_requests: usize,
+        active_requests: usize,
+        peak_active_requests: usize,
+        rejected_requests_total: u64,
+        max_active_writes: usize,
+        active_writes: usize,
+        peak_active_writes: usize,
+        rejected_writes_total: u64,
+        accept_errors_total: u64,
+        connection_dispatch_rejections_total: u64,
+        request_dispatch_rejections_total: u64,
+        h2_stream_dispatch_rejections_total: u64,
+        request_cancellations_total: u64,
+        listener_capacity: usize,
+        active_listener_leases: usize,
+        connection_capacity: usize,
+        reserved_connection_capacity: usize,
+        request_task_capacity: usize,
+        reserved_request_task_capacity: usize,
+        cancellation_watcher_start_failures_total: u64,
+        peer_observer_failures_total: u64,
+        deadline_observer_failures_total: u64,
+        deadline_expirations_total: u64,
+        peer_disconnects_total: u64,
+        active_peer_observers: usize,
+        active_deadline_observers: usize,
+    };
+
+    fn start(
+        alloc: std.mem.Allocator,
+        backend_runtime: *backend_runtime_mod.BackendRuntime,
+        http_runtime: *httpx.HttpRuntime,
+        cfg: antfly.raft.transport.StdHttpListenerConfig,
+        api_server: *antfly.public_api.kernel_bridge.ApiHttpServer,
+    ) !*DataPublicHttpRuntime {
+        var api_lane_lease = try backend_runtime.acquireApiLane();
+        errdefer api_lane_lease.release();
+        const runtime = try alloc.create(DataPublicHttpRuntime);
+        errdefer alloc.destroy(runtime);
+        runtime.* = .{
+            .alloc = alloc,
+            .api_server = api_server,
+            .handler = try antfly.public_api.kernel_bridge.createHandler(api_server),
+            .server = httpx.Server.initWithConfig(
+                alloc,
+                api_lane_lease.io(),
+                publicApiHttpxConfig(cfg, http_runtime),
+            ),
+            .listener_task = undefined,
+            .api_lane_lease = api_lane_lease,
+        };
+        errdefer antfly.public_api.kernel_bridge.deinitHandler(&runtime.handler);
+        errdefer runtime.server.deinit();
+
+        try runtime.handler.initRuntime(alloc);
+        runtime.listener_task = httpx.ListenerTask.init(&runtime.server);
+        try runtime.handler.registerRoutes(&runtime.server);
+        try runtime.listener_task.start();
+        return runtime;
+    }
+
+    fn deinit(self: *DataPublicHttpRuntime) void {
+        self.deinitWithDeadline(antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    fn deinitWithDeadline(
+        self: *DataPublicHttpRuntime,
+        deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
+    ) void {
+        const alloc = self.alloc;
+        self.listener_task.shutdown(deadline.remainingMilliseconds());
+        self.listener_task.join() catch |err| {
+            std.log.err("data public listener failed during shutdown err={s}", .{@errorName(err)});
+        };
+        self.server.deinit();
+        antfly.public_api.kernel_bridge.deinitHandler(&self.handler);
+        self.api_lane_lease.release();
+        alloc.destroy(self);
+    }
+
+    fn baseUri(self: *DataPublicHttpRuntime, alloc: std.mem.Allocator) ![]u8 {
+        const address = self.server.boundAddress() orelse return error.NotListening;
+        return try std.fmt.allocPrint(alloc, "http://{f}", .{address});
+    }
+
+    fn runtimeStats(self: *const DataPublicHttpRuntime) RuntimeStats {
+        const transport = self.server.runtimeStats();
+        const http_runtime = self.server.httpRuntimeStats();
+        const application = antfly.public_api.kernel_bridge.handlerStats(&self.handler);
+        return .{
+            // Preserve the established metric schema during the transport
+            // migration; these now describe bounded connections, not OS
+            // handoff threads.
+            .max_connection_threads = transport.max_connections,
+            .active_connection_threads = transport.active_connections,
+            .peak_connection_threads = transport.peak_active_connections,
+            .max_active_requests = application.query_capacity,
+            .active_requests = application.query_in_flight,
+            .peak_active_requests = application.query_peak_in_flight,
+            .rejected_requests_total = application.query_rejected_total,
+            .max_active_writes = application.write_capacity,
+            .active_writes = application.write_in_flight,
+            .peak_active_writes = application.write_peak_in_flight,
+            .rejected_writes_total = application.write_rejected_total,
+            .accept_errors_total = transport.accept_errors_total,
+            .connection_dispatch_rejections_total = transport.connection_dispatch_rejections_total,
+            .request_dispatch_rejections_total = transport.request_dispatch_rejections_total,
+            .h2_stream_dispatch_rejections_total = transport.h2_stream_dispatch_rejections_total,
+            .request_cancellations_total = transport.request_cancellations_total,
+            .listener_capacity = http_runtime.listener_capacity,
+            .active_listener_leases = http_runtime.active_listener_leases,
+            .connection_capacity = http_runtime.connection_capacity,
+            .reserved_connection_capacity = http_runtime.reserved_connection_capacity,
+            .request_task_capacity = http_runtime.request_capacity,
+            .reserved_request_task_capacity = http_runtime.reserved_request_capacity,
+            .cancellation_watcher_start_failures_total = http_runtime.h1_cancellation_registration_failures_total,
+            .peer_observer_failures_total = http_runtime.h1_cancellation_observer_failures_total,
+            .deadline_observer_failures_total = 0,
+            .deadline_expirations_total = transport.connection_timeouts_total,
+            .peer_disconnects_total = http_runtime.h1_hard_disconnect_cancellations_total,
+            .active_peer_observers = http_runtime.active_h1_cancellation_observers,
+            .active_deadline_observers = 0,
+        };
+    }
+
+    fn runtimeFailure(self: *const DataPublicHttpRuntime) ?anyerror {
+        return self.listener_task.runtimeFailure();
+    }
+
+    fn healthy(self: *const DataPublicHttpRuntime) bool {
+        return self.server.httpRuntimeStats().healthy;
+    }
+};
+
 test "data public API listener uses public API request body limit" {
     const cfg = publicApiListenerConfig("127.0.0.1", 8080);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
     try std.testing.expect(cfg.serve_in_connection_threads);
     try std.testing.expectEqual(public_api_max_connection_threads, cfg.max_connection_threads);
     try std.testing.expectEqual(public_api_max_active_requests, cfg.max_active_requests);
+
+    const server_config = publicApiHttpxConfig(cfg, null);
+    try std.testing.expectEqual(public_api_max_connection_threads, server_config.max_connections);
+    try std.testing.expectEqual(public_api_max_active_requests, server_config.max_request_tasks);
+    try std.testing.expectEqual(public_api_max_active_requests, server_config.max_h1_inflight_bodies);
 }
 
 const DataDescriptorFactory = struct {
@@ -1022,6 +1215,7 @@ fn batchRequiresDocumentDbApply(req: antfly.db.types.BatchRequest) bool {
 pub const HealthSource = struct {
     data_server: *DataServer,
     raft_progress: ?*const antfly.raft.ManagedProgressDriver = null,
+    supervisor: ?*const antfly.common.runtime_lifecycle.RuntimeSupervisor = null,
     lsm_maintenance_metrics_mutex: std.atomic.Mutex = .unlocked,
     lsm_maintenance_metrics_stats: lsm_backend_mod.Backend.MaintenanceStats = .{},
     lsm_maintenance_metrics_built_at_ns: u64 = 0,
@@ -1052,8 +1246,10 @@ pub const HealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
-        return self.data_server.http_server != null and
+        return (self.supervisor == null or self.supervisor.?.currentState() == .ready) and
+            self.data_server.http_server != null and
             self.data_server.listener != null and
+            self.data_server.publicListenerHealthy() and
             (self.raft_progress == null or self.raft_progress.?.isHealthy());
     }
 
@@ -1074,7 +1270,11 @@ pub const HealthSource = struct {
             http_server.requestStats()
         else
             antfly.public_api.ApiHttpServer.RequestStats{};
-        const listener_stats = if (self.data_server.listener) |*listener|
+        const inference_admission_stats = if (self.data_server.http_server) |*http_server|
+            http_server.inferenceAdmissionStats()
+        else
+            null;
+        const listener_stats = if (self.data_server.listener) |listener|
             listener.runtimeStats()
         else
             null;
@@ -1085,6 +1285,25 @@ pub const HealthSource = struct {
             "Whether the data server process is running (1 = yes)",
             1,
         );
+        if (self.supervisor) |supervisor| {
+            try health_metrics.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(supervisor.currentState()));
+            try health_metrics.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(supervisor.token().isCancelled()));
+        }
+        if (self.data_server.backend_runtime) |backend_runtime| {
+            const lanes = backend_runtime.laneStats();
+            try health_metrics.appendPromMetric(writer, "antfly_executor_api_active_leases", "gauge", "Active API executor lifetime leases", lanes.api_active_leases);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_api_peak_leases", "gauge", "Peak API executor lifetime leases", lanes.api_peak_leases);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_api_acquisitions_total", "counter", "Successful API executor lease acquisitions", lanes.api_acquisitions_total);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_api_rejections_total", "counter", "API executor lease acquisitions rejected during shutdown", lanes.api_rejections_total);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_inference_active_leases", "gauge", "Active inference executor lifetime leases", lanes.inference_active_leases);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_inference_peak_leases", "gauge", "Peak inference executor lifetime leases", lanes.inference_peak_leases);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_inference_acquisitions_total", "counter", "Successful inference executor lease acquisitions", lanes.inference_acquisitions_total);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_inference_rejections_total", "counter", "Inference executor lease acquisitions rejected during shutdown", lanes.inference_rejections_total);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_control_active_leases", "gauge", "Active control executor lifetime leases", lanes.control_active_leases);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_control_peak_leases", "gauge", "Peak control executor lifetime leases", lanes.control_peak_leases);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_control_acquisitions_total", "counter", "Successful control executor lease acquisitions", lanes.control_acquisitions_total);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_control_rejections_total", "counter", "Control executor lease acquisitions rejected during shutdown", lanes.control_rejections_total);
+        }
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_completions_total", "counter", "Raft snapshot compactions published", raft_metrics.runtime_snapshot_compaction_completions);
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_failures_total", "counter", "Raft snapshot compaction build or publication failures", raft_metrics.runtime_snapshot_compaction_failures);
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_candidates", "gauge", "Raft groups currently queued for snapshot compaction", raft_metrics.runtime_snapshot_compaction_candidates);
@@ -1094,17 +1313,39 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_http_connection_thread_limit", "gauge", "Maximum public HTTP connection handoff threads", http.max_connection_threads);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_connection_threads", "gauge", "Currently active public HTTP connection handoff threads", http.active_connection_threads);
             try health_metrics.appendPromMetric(writer, "antfly_http_peak_connection_threads", "gauge", "Peak public HTTP connection handoff threads since process start", http.peak_connection_threads);
-            try health_metrics.appendPromMetric(writer, "antfly_query_capacity", "gauge", "Maximum concurrent expensive public queries", http.max_active_requests);
-            try health_metrics.appendPromMetric(writer, "antfly_query_in_flight", "gauge", "Currently executing expensive public queries", http.active_requests);
-            try health_metrics.appendPromMetric(writer, "antfly_query_peak_in_flight", "gauge", "Peak concurrent expensive public queries since process start", http.peak_active_requests);
-            try health_metrics.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public queries rejected by admission control", http.rejected_requests_total);
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, .{
+                .capacity = http.max_active_requests,
+                .in_flight = http.active_requests,
+                .peak_in_flight = http.peak_active_requests,
+                .rejected_total = http.rejected_requests_total,
+            });
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, .{
+                .capacity = http.max_active_writes,
+                .in_flight = http.active_writes,
+                .peak_in_flight = http.peak_active_writes,
+                .rejected_total = http.rejected_writes_total,
+            });
+            if (inference_admission_stats) |inference| {
+                try antfly.common.request_admission.appendPrometheusMetrics(writer, .inference, inference);
+            }
             try health_metrics.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_connection_dispatch_rejections_total", "counter", "Accepted public HTTP connections closed because concurrent execution was unavailable", http.connection_dispatch_rejections_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_request_dispatch_rejections_total", "counter", "HTTP requests rejected before application execution because listener or runtime request capacity was unavailable", http.request_dispatch_rejections_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_h2_stream_dispatch_rejections_total", "counter", "HTTP/2 streams reset before application execution because bounded handler execution was unavailable", http.h2_stream_dispatch_rejections_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_request_cancellations_total", "counter", "Public HTTP requests terminated by application cancellation", http.request_cancellations_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_listener_capacity", "gauge", "Maximum concurrent long-lived HTTP listeners", http.listener_capacity);
+            try health_metrics.appendPromMetric(writer, "antfly_http_active_listener_leases", "gauge", "Long-lived HTTP listeners currently owned by the shared runtime", http.active_listener_leases);
+            try health_metrics.appendPromMetric(writer, "antfly_http_transport_connection_capacity", "gauge", "Shared HTTP transport connection-task capacity", http.connection_capacity);
+            try health_metrics.appendPromMetric(writer, "antfly_http_transport_reserved_connections", "gauge", "HTTP transport connection-task capacity reserved by live listeners", http.reserved_connection_capacity);
+            try health_metrics.appendPromMetric(writer, "antfly_http_request_task_capacity", "gauge", "Shared HTTP application request-task capacity", http.request_task_capacity);
+            try health_metrics.appendPromMetric(writer, "antfly_http_request_task_reserved", "gauge", "HTTP request-task capacity reserved by live listeners", http.reserved_request_task_capacity);
             try health_metrics.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests cancelled because peer observation could not be scheduled", http.cancellation_watcher_start_failures_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public requests cancelled after transport cancellation observation failed", http.peer_observer_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_deadline_observer_failures_total", "counter", "Public requests closed because deadline observation could not be scheduled", http.deadline_observer_failures_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_deadline_expirations_total", "counter", "Public request sockets closed after header or body deadlines", http.deadline_expirations_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_deadline_observers", "gauge", "Public request sockets currently watched for header or body deadlines", http.active_deadline_observers);
-            try health_metrics.appendPromMetric(writer, "antfly_http_peer_disconnects_total", "counter", "Public request peer disconnects propagated to cancellation", http.peer_disconnects_total);
-            try health_metrics.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "Public request sockets currently watched for disconnect", http.active_peer_observers);
+            try health_metrics.appendPromMetric(writer, "antfly_http_hard_disconnect_cancellations_total", "counter", "Public requests cancelled after a hard transport failure", http.peer_disconnects_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "Public request sockets registered for hard-disconnect observation", http.active_peer_observers);
         }
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_hits_total", "counter", "Query embedding cache hits", api_request_stats.query_embedding_cache.hits);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_misses_total", "counter", "Query embedding cache producer misses", api_request_stats.query_embedding_cache.misses);
@@ -2276,11 +2517,17 @@ test "data server rejects replicated transition admission after owner shutdown" 
 
 const RuntimeStatusDiskUsageCacheEntry = struct {
     disk_bytes: u64 = 0,
+    observation_generation: u64 = 0,
     checked_at_ns: u64 = 0,
     lsm_root_generation: u64 = 0,
     storage_change_token: u64 = 0,
     invalidation_generation: u64 = 0,
     valid: bool = false,
+};
+
+const RuntimeStatusDiskUsageObservation = struct {
+    disk_bytes: u64,
+    observation_generation: u64,
 };
 
 const RuntimeStatusDiskUsageScanner = struct {
@@ -3223,7 +3470,7 @@ test "runtime status disk usage cache is scoped to one root generation and group
     try std.testing.expectEqual(@as(u64, 800), server.runtime_status_disk_usage_cache.get(8).?.disk_bytes);
 }
 
-test "runtime status disk scan retries only when maintenance invalidates its group" {
+test "runtime status disk scan retries across a reallocation fence and group invalidation remains scoped" {
     const ControlledScanner = struct {
         entered: std.atomic.Value(bool) = .init(false),
         release: std.atomic.Value(bool) = .init(false),
@@ -3247,7 +3494,7 @@ test "runtime status disk scan retries only when maintenance invalidates its gro
     const ScanThread = struct {
         server: *DataServer,
         scanner: RuntimeStatusDiskUsageScanner,
-        result: ?u64 = null,
+        result: ?RuntimeStatusDiskUsageObservation = null,
 
         fn run(self: *@This()) void {
             self.result = self.server.runtimeStatusDiskUsageBytesBestEffortWithScanner(
@@ -3289,13 +3536,31 @@ test "runtime status disk scan retries only when maintenance invalidates its gro
     const thread = try std.Thread.spawn(.{}, ScanThread.run, .{&scan_thread});
     while (!controlled.entered.load(.acquire)) std.Thread.yield() catch {};
 
-    // This models a completed flush/compaction publishing a new storage view
-    // while the status scan still observes the old directory contents.
-    server.invalidateRuntimeStatusDiskUsageCacheForGroup(7);
+    // A request arriving during the scan fences its observation and
+    // invalidates the entry. Only the retry may acknowledge the request.
+    server.observeReallocationRequest(.{ .request_id = 44, .requested_at_ms = 55 });
     controlled.release.store(true, .release);
     thread.join();
 
-    try std.testing.expectEqual(@as(?u64, 222), scan_thread.result);
+    try std.testing.expectEqual(@as(u64, 222), scan_thread.result.?.disk_bytes);
+    try std.testing.expect(
+        scan_thread.result.?.observation_generation >
+            server.currentReallocationObservationRequirement().?.disk_observation_fence,
+    );
+    var stale_runtime_with_fresh_disk = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7,
+        .disk_bytes = scan_thread.result.?.disk_bytes,
+        .disk_bytes_known = true,
+        .disk_observation_generation = scan_thread.result.?.observation_generation,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .stale },
+        .stats = .{},
+    };
+    defer stale_runtime_with_fresh_disk.deinit(alloc);
+    var report = antfly.metadata.table_manager.GroupStatusReport{ .group_id = 7 };
+    server.annotateRuntimeReallocationObservation(&report, stale_runtime_with_fresh_disk);
+    try std.testing.expect(report.disk_bytes_known);
+    try std.testing.expectEqual(@as(u64, 222), report.disk_bytes);
+    try std.testing.expectEqual(@as(u128, 44), report.observed_reallocation_request_id);
     try std.testing.expectEqual(@as(u32, 2), controlled.calls.load(.acquire));
     const cached = server.runtime_status_disk_usage_cache.get(7).?;
     try std.testing.expect(cached.valid);
@@ -3314,7 +3579,7 @@ test "runtime status disk scan retries only when maintenance invalidates its gro
     controlled.release.store(true, .release);
     unrelated_thread.join();
 
-    try std.testing.expectEqual(@as(?u64, 111), unrelated_scan_thread.result);
+    try std.testing.expectEqual(@as(u64, 111), unrelated_scan_thread.result.?.disk_bytes);
     try std.testing.expectEqual(@as(u32, 1), controlled.calls.load(.acquire));
 }
 
@@ -3869,6 +4134,9 @@ pub const DataServer = struct {
     last_data_raft_reconciled_metadata_epoch: ?u64 = null,
     last_data_raft_storage_ownership_fingerprint: ?u64 = null,
     last_data_raft_status_fingerprint: ?u64 = null,
+    reallocation_request_observation_mutex: std.atomic.Mutex = .unlocked,
+    last_observed_reallocation_request_id: ?u128 = null,
+    reallocation_disk_observation_fence: u64 = 0,
     provision_ticks: usize = 0,
     last_provision_fingerprint: ?u64 = null,
     last_provision_metadata_epoch: ?u64 = null,
@@ -3990,9 +4258,11 @@ pub const DataServer = struct {
     provisioned_index_repair_routes: IndexRepairRoutingIndex = .{},
     provisioned_index_repair_last_fallback_at_ms: std.atomic.Value(u64) = .init(0),
     runtime_status_dirty: std.atomic.Value(bool) = .init(true),
+    runtime_status_force_refresh: std.atomic.Value(bool) = .init(false),
     runtime_status_last_refresh_at_ms: std.atomic.Value(u64) = .init(0),
     runtime_status_disk_usage_cache_mutex: std.atomic.Mutex = .unlocked,
     runtime_status_disk_usage_cache: std.AutoHashMapUnmanaged(u64, RuntimeStatusDiskUsageCacheEntry) = .empty,
+    runtime_status_disk_observation_generation: std.atomic.Value(u64) = .init(1),
     // Detect an invalidation racing a directory scan before it can publish a
     // stale result. Per-group cache entries remain independently reusable.
     runtime_status_disk_usage_invalidation_generation: std.atomic.Value(u64) = .init(1),
@@ -4016,6 +4286,9 @@ pub const DataServer = struct {
     http_server: ?antfly.public_api.ApiHttpServer = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     ha_cfg: DataServerHAConfig = .{},
+    /// Immutable startup role used by lock-free ingress policy snapshots.
+    /// Mutable HA context fields remain protected by `ha_state_mutex`.
+    ha_ingress_started_as_standby: bool = false,
     ha_state_mutex: std.atomic.Mutex = .unlocked,
     /// Global primary mutation/capture ordering point. All DB/catalog writers
     /// share this instance through their HA mirror configuration.
@@ -4043,8 +4316,11 @@ pub const DataServer = struct {
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
+    /// Process-role HTTP transport services are distinct from storage/API
+    /// executor lanes and may be shared by every httpx listener in this role.
+    owned_http_runtime: ?*httpx.HttpRuntime = null,
     listener_cfg: antfly.raft.transport.std_http_listener.StdHttpListenerConfig,
-    listener: ?antfly.raft.transport.std_http_listener.StdHttpListener = null,
+    listener: ?*DataPublicHttpRuntime = null,
     query_io_impl: ?std.Io.Threaded = null,
     lsm_maintenance_thread: ?std.Thread = null,
     lsm_maintenance_stop: std.atomic.Value(bool) = .init(false),
@@ -4248,6 +4524,7 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
+            .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
@@ -4285,6 +4562,7 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
+            .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
@@ -4322,6 +4600,7 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
+            .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
@@ -4362,6 +4641,7 @@ pub const DataServer = struct {
         api_server_cfg.backend_runtime = self.backend_runtime;
         api_server_cfg.resource_manager = &self.provisioned_storage.resource_manager;
         self.configureHAPublicGateState();
+        api_server_cfg.ha_mutation_policy_source = self.haMutationPolicySource();
         self.attachHaExecutors(&api_server_cfg);
         if (self.query_io_impl == null) {
             self.query_io_impl = std.Io.Threaded.init(self.alloc, .{
@@ -4742,7 +5022,7 @@ pub const DataServer = struct {
             self.ha_internal_server = antfly.ha.http_internal.Server.initWithOptions(platform.allocator.processAllocator(std.heap.smp_allocator), handle, .{
                 .state_mutex = &self.ha_state_mutex,
             });
-            self.api_server_cfg.ha_internal_executor = self.ha_internal_server.?.executor();
+            self.api_server_cfg.ha_internal_executor = self.ha_internal_server.?.operationExecutor();
         }
         if (self.http_server) |*server| {
             server.setHAInternalExecutor(self.api_server_cfg.ha_internal_executor);
@@ -4866,6 +5146,32 @@ pub const DataServer = struct {
             .state = &self.ha_public_gate_state,
         } };
         return null;
+    }
+
+    fn haMutationPolicySource(self: *const DataServer) antfly.public_api.http_server.HAMutationPolicySource {
+        return .{
+            .ptr = self,
+            .snapshot_fn = haMutationPolicySnapshotCallback,
+        };
+    }
+
+    fn haMutationPolicySnapshotCallback(ptr: *const anyopaque) antfly.public_api.http_server.HAMutationPolicySnapshot {
+        const self: *const DataServer = @ptrCast(@alignCast(ptr));
+        const configured = antfly.public_api.http_server.HAMutationPolicySnapshot{
+            .failover_safe_mutations_only = self.api_server_cfg.ha_failover_safe_mutations_only,
+            .remote_apply_mutations_enabled = self.api_server_cfg.ha_remote_apply_mutations_enabled,
+        };
+        if (!configured.failover_safe_mutations_only) return configured;
+
+        // A node started as a standby must remain fail-closed until promotion
+        // has atomically opened its promoted Primary and published that role.
+        // Once promoted it is the sole authority for the new timeline; its
+        // next continuous-HA topology is established by a fresh seed and
+        // runtime configuration rather than the obsolete standby role.
+        if (self.ha_ingress_started_as_standby and self.ha_public_gate_state.currentRole() == .primary) {
+            return .{};
+        }
+        return configured;
     }
 
     fn haPrimaryMirror(self: *DataServer) ?antfly.db.HAAsyncEffectMirror {
@@ -5532,7 +5838,7 @@ pub const DataServer = struct {
                         .replication_failures_total = haStandbyReplicationFailuresTotalCallback,
                     },
                 });
-                api_server_cfg.ha_admin_executor = self.ha_admin_server.?.executor();
+                api_server_cfg.ha_admin_executor = self.ha_admin_server.?.operationExecutor();
             }
         }
         if (api_server_cfg.ha_internal_executor == null) {
@@ -5541,7 +5847,7 @@ pub const DataServer = struct {
                 self.ha_internal_server = antfly.ha.http_internal.Server.initWithOptions(platform.allocator.processAllocator(std.heap.smp_allocator), handle, .{
                     .state_mutex = &self.ha_state_mutex,
                 });
-                api_server_cfg.ha_internal_executor = self.ha_internal_server.?.executor();
+                api_server_cfg.ha_internal_executor = self.ha_internal_server.?.operationExecutor();
             }
         }
     }
@@ -5583,33 +5889,16 @@ pub const DataServer = struct {
             self.data_raft_base_uri = try raft.baseUri(self.alloc);
         }
         if (self.listener == null) {
-            // ApiHttpServer owns responses with its request allocator. Keep the
-            // listener on that exact allocator identity; using smp_allocator
-            // here while the API uses c_allocator causes cross-allocator frees.
-            const request_alloc = self.http_server.?.alloc;
-            self.listener = if (self.backend_runtime) |runtime|
-                if (runtime.apiIoImpl()) |io_impl|
-                    antfly.raft.transport.std_http_listener.StdHttpListener.initShared(
-                        request_alloc,
-                        self.listener_cfg,
-                        self.http_server.?.executor(),
-                        io_impl,
-                    )
-                else
-                    antfly.raft.transport.std_http_listener.StdHttpListener.init(
-                        request_alloc,
-                        self.listener_cfg,
-                        self.http_server.?.executor(),
-                    )
-            else
-                antfly.raft.transport.std_http_listener.StdHttpListener.init(
-                    request_alloc,
-                    self.listener_cfg,
-                    self.http_server.?.executor(),
-                );
+            const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+            const http_runtime = try self.ensureHttpRuntime();
+            self.listener = try DataPublicHttpRuntime.start(
+                self.alloc,
+                runtime,
+                http_runtime,
+                self.listener_cfg,
+                &self.http_server.?,
+            );
         }
-        self.listener.?.setStreamingExecutor(self.http_server.?.streamingExecutor());
-        try self.listener.?.start();
         if (self.store_registration != null) {
             self.store_status_dirty.store(true, .release);
         }
@@ -5841,6 +6130,15 @@ pub const DataServer = struct {
     /// state is still alive, and only then release the remaining DataServer
     /// resources. Repeated calls are harmless.
     pub fn quiesceBackgroundWork(self: *DataServer) void {
+        self.quiesceBackgroundWorkWithDeadline(
+            antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000),
+        );
+    }
+
+    pub fn quiesceBackgroundWorkWithDeadline(
+        self: *DataServer,
+        deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
+    ) void {
         if (self.background_work_quiesced) return;
         self.background_work_quiesced = true;
         self.unregisterMetadataLocalProviders();
@@ -5855,8 +6153,13 @@ pub const DataServer = struct {
         self.stopProvisionedIndexRepair();
         self.stopReplicatedTransitionActions();
         self.clearProvisionedStartupCatchUpTarget();
-        if (self.listener) |*listener| listener.deinit();
+        if (self.listener) |listener| listener.deinitWithDeadline(deadline);
         self.listener = null;
+        if (self.owned_http_runtime) |http_runtime| {
+            http_runtime.deinit();
+            self.alloc.destroy(http_runtime);
+            self.owned_http_runtime = null;
+        }
         if (self.http_server) |*http_server| http_server.deinit();
         self.http_server = null;
         _ = self.read_source.withAntflyProvider(null);
@@ -5867,7 +6170,22 @@ pub const DataServer = struct {
     }
 
     pub fn deinit(self: *DataServer) void {
-        self.quiesceBackgroundWork();
+        self.deinitWithDeadline(antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    pub fn publicListenerFailure(self: *const DataServer) ?anyerror {
+        return if (self.listener) |listener| listener.runtimeFailure() else null;
+    }
+
+    pub fn publicListenerHealthy(self: *const DataServer) bool {
+        return if (self.listener) |listener| listener.healthy() else false;
+    }
+
+    pub fn deinitWithDeadline(
+        self: *DataServer,
+        deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
+    ) void {
+        self.quiesceBackgroundWorkWithDeadline(deadline);
         if (self.ha_admin_server) |*server| server.deinit();
         if (self.ha_promoted_primary) |*primary| primary.close();
         if (self.ha_standby_replication_http_executor) |*executor| executor.deinit();
@@ -5926,6 +6244,20 @@ pub const DataServer = struct {
         self.owned_backend_runtime = null;
         self.backend_runtime = null;
         self.query_io_impl = null;
+    }
+
+    fn ensureHttpRuntime(self: *DataServer) !*httpx.HttpRuntime {
+        if (self.owned_http_runtime) |runtime| return runtime;
+        const runtime = try self.alloc.create(httpx.HttpRuntime);
+        errdefer self.alloc.destroy(runtime);
+        const listener_config = publicApiHttpxConfig(self.listener_cfg, null);
+        runtime.* = httpx.HttpRuntime.init(self.alloc, .{
+            .max_active_h1_requests = listener_config.max_connections,
+            .max_active_connections = @as(usize, listener_config.max_connections) +| health_metrics.max_connections,
+            .max_active_requests = @as(usize, listener_config.max_request_tasks) +| health_metrics.max_connections,
+        });
+        self.owned_http_runtime = runtime;
+        return runtime;
     }
 
     fn ensureBackendRuntime(self: *DataServer) !*backend_runtime_mod.BackendRuntime {
@@ -6304,10 +6636,10 @@ pub const DataServer = struct {
         };
     }
 
-    fn routedRaftBatchWriter(self: *DataServer) antfly.public_api.http_internal_group_write_routes.RoutedRaftBatchWriter {
+    fn routedRaftBatchWriter(self: *DataServer) antfly.public_api.internal_group_operations.RoutedRaftBatchWriter {
         return .{
             .ptr = self,
-            .write = localRaftBatchGroupForwarded,
+            .write_fn = localRaftBatchGroupForwarded,
         };
     }
 
@@ -6407,9 +6739,10 @@ pub const DataServer = struct {
         table_name: []const u8,
         req: antfly.db.types.BatchRequest,
         forwarding: antfly.public_api.internal_batch_forwarding.Context,
-        cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
+        cancellation_token: antfly.public_api.operation.CancellationToken,
     ) !?void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+        var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(cancellation_token);
         const leader_wait_ns = dataRaftForwardedLeaderWaitNs(forwarding);
         if (leader_wait_ns == 0) return error.LeaderUnavailable;
         try self.proposeRaftBatchGroupWithLeaderWait(
@@ -6421,7 +6754,7 @@ pub const DataServer = struct {
                 .refresh_metadata = false,
                 .campaign_allowed = forwarding.campaign_allowed,
                 .forwards_remaining = forwarding.forwards_remaining,
-                .cancellation = cancellation,
+                .cancellation = if (cancellation_token.ptr != null) &cancellation else null,
             },
             leader_wait_ns,
         );
@@ -7322,6 +7655,108 @@ pub const DataServer = struct {
         // to leader merely by overlaying current routing fields.
         self.invalidateLocalGroupStatusCache();
         self.markStoreStatusDirtyImmediate();
+    }
+
+    fn observeReallocationRequest(
+        self: *DataServer,
+        request: ?antfly.metadata.ReallocationRequestRecord,
+    ) void {
+        const request_id = if (request) |record| record.request_id else null;
+        const changed = changed: {
+            lockAtomic(&self.reallocation_request_observation_mutex);
+            defer self.reallocation_request_observation_mutex.unlock();
+            if (request_id == null) {
+                self.last_observed_reallocation_request_id = null;
+                self.reallocation_disk_observation_fence = 0;
+                break :changed false;
+            }
+            if (self.last_observed_reallocation_request_id != null and
+                self.last_observed_reallocation_request_id.? == request_id.?)
+            {
+                break :changed false;
+            }
+            self.reallocation_disk_observation_fence = self.runtime_status_disk_observation_generation.load(.seq_cst);
+            self.last_observed_reallocation_request_id = request_id;
+            break :changed true;
+        };
+        if (!changed) return;
+        // A forced split/merge scan must be based on observations produced
+        // after its durable request. Refresh exactly once per request instead
+        // of coupling operator latency to the normal 60-second cache TTL.
+        self.invalidateLocalGroupStatusCache();
+        self.invalidateAllRuntimeStatusDiskUsageCacheEntries();
+        self.runtime_status_dirty.store(true, .release);
+        self.runtime_status_force_refresh.store(true, .release);
+        self.markStoreStatusDirtyImmediate();
+    }
+
+    const ReallocationObservationRequirement = struct {
+        request_id: u128,
+        disk_observation_fence: u64,
+    };
+
+    fn currentReallocationObservationRequirement(self: *DataServer) ?ReallocationObservationRequirement {
+        lockAtomic(&self.reallocation_request_observation_mutex);
+        defer self.reallocation_request_observation_mutex.unlock();
+        return .{
+            .request_id = self.last_observed_reallocation_request_id orelse return null,
+            .disk_observation_fence = self.reallocation_disk_observation_fence,
+        };
+    }
+
+    fn annotateFreshReallocationObservation(
+        self: *DataServer,
+        report: *antfly.metadata.table_manager.GroupStatusReport,
+        observed_requirement: ?ReallocationObservationRequirement,
+    ) void {
+        if (!report.disk_bytes_known) return;
+        const observed = observed_requirement orelse return;
+        const current = self.currentReallocationObservationRequirement() orelse return;
+        if (current.request_id != observed.request_id or
+            current.disk_observation_fence != observed.disk_observation_fence)
+        {
+            return;
+        }
+        report.observed_reallocation_request_id = observed.request_id;
+    }
+
+    fn annotateRuntimeReallocationObservation(
+        self: *DataServer,
+        report: *antfly.metadata.table_manager.GroupStatusReport,
+        status: runtime_status.LocalTableRuntimeStatus,
+    ) void {
+        if (!status.disk_bytes_known) return;
+        const requirement = self.currentReallocationObservationRequirement() orelse return;
+        if (status.disk_observation_generation <= requirement.disk_observation_fence) return;
+        // Disk usage is independently authoritative from the rest of the
+        // runtime snapshot. Promote only that observed fact so a startup or
+        // transition owner can remain exclusive while autoscaling receives
+        // its post-request size measurement.
+        report.disk_bytes = status.disk_bytes;
+        report.disk_bytes_known = true;
+        report.observed_reallocation_request_id = requirement.request_id;
+    }
+
+    fn overlayRuntimeReallocationObservations(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        reports: []antfly.metadata.table_manager.GroupStatusReport,
+        tables: []const antfly.metadata.table_manager.TableRecord,
+        ranges: []const antfly.metadata.table_manager.RangeRecord,
+    ) !void {
+        if (self.currentReallocationObservationRequirement() == null) return;
+        for (reports) |*report| {
+            const range = findRangeByGroupId(ranges, report.group_id) orelse continue;
+            const table = findTableById(tables, range.table_id) orelse continue;
+            const cached = try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(
+                alloc,
+                table.name,
+                report.group_id,
+            );
+            var status = cached orelse continue;
+            defer status.deinit(alloc);
+            self.annotateRuntimeReallocationObservation(report, status);
+        }
     }
 
     fn markRuntimeStatusDirty(
@@ -9381,7 +9816,7 @@ pub const DataServer = struct {
                         var runtime_status_owned = runtime_cached;
                         defer runtime_status_owned.deinit(alloc);
                         const cached_group = try self.snapshotCachedLocalGroupStatusReport(alloc, group_id, generation, fingerprint, true);
-                        try reports.append(alloc, collectLocalGroupStatusFromRuntimeStatus(
+                        var report = collectLocalGroupStatusFromRuntimeStatus(
                             runtime_status_owned,
                             cached_group,
                             group_id,
@@ -9393,7 +9828,9 @@ pub const DataServer = struct {
                             merge_transitions,
                             split_observations,
                             merge_observations,
-                        ));
+                        );
+                        self.annotateRuntimeReallocationObservation(&report, runtime_status_owned);
+                        try reports.append(alloc, report);
                         continue;
                     }
 
@@ -9490,7 +9927,12 @@ pub const DataServer = struct {
                         return err;
                     };
                     defer db.close();
-                    const report = collectLocalGroupStatusFromDb(
+                    // Capture the request before reading the DB. A request
+                    // arriving during this scan must trigger another scan;
+                    // the already-running read cannot prove it observed work
+                    // causally after that request.
+                    const reallocation_requirement = self.currentReallocationObservationRequirement();
+                    var report = collectLocalGroupStatusFromDb(
                         alloc,
                         &db,
                         db_path,
@@ -9518,6 +9960,7 @@ pub const DataServer = struct {
                         ));
                         continue;
                     };
+                    self.annotateFreshReallocationObservation(&report, reallocation_requirement);
                     try reports.append(alloc, report);
                     continue;
                 }
@@ -9542,7 +9985,8 @@ pub const DataServer = struct {
                 continue;
             }
 
-            const report = collectLocalGroupStatus(
+            const reallocation_requirement = self.currentReallocationObservationRequirement();
+            var report = collectLocalGroupStatus(
                 alloc,
                 db_path,
                 group_id,
@@ -9560,9 +10004,9 @@ pub const DataServer = struct {
                 merge_transitions,
                 split_observations,
                 merge_observations,
-            ) catch |err| blk: {
+            ) catch |err| {
                 if (!isTransientStatusDbConflict(err)) return err;
-                break :blk collectLocalGroupStatusWithoutDb(
+                try reports.append(alloc, collectLocalGroupStatusWithoutDb(
                     group_id,
                     group_leadership_source,
                     group_membership_source,
@@ -9572,8 +10016,10 @@ pub const DataServer = struct {
                     merge_transitions,
                     split_observations,
                     merge_observations,
-                );
+                ));
+                continue;
             };
+            self.annotateFreshReallocationObservation(&report, reallocation_requirement);
             try reports.append(alloc, report);
         }
 
@@ -9727,12 +10173,19 @@ pub const DataServer = struct {
             self.group_membership_source,
         );
         defer freeGroupStatusesOwned(self.alloc, group_statuses);
+        try self.overlayRuntimeReallocationObservations(
+            self.alloc,
+            group_statuses,
+            snapshot.tables,
+            snapshot.ranges,
+        );
         self.annotateLocalPlacementStatus(
             group_statuses,
             snapshot.placement_intents,
             registration.node_id,
             registration.store_id,
         );
+        retainCurrentReallocationRequestObservations(group_statuses, snapshot.reallocation_request);
         const runtime_statuses = try self.collectStoreRuntimeStatusReports(
             self.alloc,
             local_group_ids,
@@ -9825,6 +10278,7 @@ pub const DataServer = struct {
     }
 
     fn syncDataRaftFromSnapshot(self: *DataServer, snapshot: *const antfly.metadata_api.AdminSnapshot) !void {
+        self.observeReallocationRequest(snapshot.reallocation_request);
         const raft = self.data_raft orelse return;
         const factory = self.data_raft_factory orelse return;
         const registration = self.store_registration orelse return;
@@ -10266,9 +10720,10 @@ pub const DataServer = struct {
         if (group_id == 0) return;
         const db_path = antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, group_id) catch return;
         defer self.alloc.free(db_path);
-        if (self.runtimeStatusDiskUsageBytesBestEffort(group_id, db_path, status.*)) |disk_bytes| {
-            status.disk_bytes = disk_bytes;
+        if (self.runtimeStatusDiskUsageBytesBestEffort(group_id, db_path, status.*)) |observation| {
+            status.disk_bytes = observation.disk_bytes;
             status.disk_bytes_known = true;
+            status.disk_observation_generation = observation.observation_generation;
         }
         if (status.created_at_millis == 0) {
             if (db) |ptr| {
@@ -10282,7 +10737,7 @@ pub const DataServer = struct {
         group_id: u64,
         db_path: []const u8,
         status: runtime_status.LocalTableRuntimeStatus,
-    ) ?u64 {
+    ) ?RuntimeStatusDiskUsageObservation {
         return self.runtimeStatusDiskUsageBytesBestEffortWithScanner(group_id, db_path, status, .directory());
     }
 
@@ -10292,7 +10747,7 @@ pub const DataServer = struct {
         db_path: []const u8,
         status: runtime_status.LocalTableRuntimeStatus,
         scanner: RuntimeStatusDiskUsageScanner,
-    ) ?u64 {
+    ) ?RuntimeStatusDiskUsageObservation {
         const active = runtimeStatusHasActiveBackgroundWork(status);
         const lsm_root_generation = if (status.metadata.lsm_root_generation != 0)
             status.metadata.lsm_root_generation
@@ -10316,13 +10771,21 @@ pub const DataServer = struct {
                 status.stats.doc_count,
                 status.stats.storage_change_token,
             )) {
-                const disk_bytes = state.value_ptr.disk_bytes;
+                const observation = RuntimeStatusDiskUsageObservation{
+                    .disk_bytes = state.value_ptr.disk_bytes,
+                    .observation_generation = state.value_ptr.observation_generation,
+                };
                 self.runtime_status_disk_usage_cache_mutex.unlock();
-                return disk_bytes;
+                return observation;
             }
             self.runtime_status_disk_usage_cache_mutex.unlock();
 
             if (active and status.stats.doc_count == 0) return null;
+            // Take the generation before scanning. A request that arrives
+            // during the scan fences this generation and invalidates the
+            // cache entry, so the retry below is the first observation that
+            // may acknowledge that request.
+            const observation_generation = self.runtime_status_disk_observation_generation.fetchAdd(1, .seq_cst) +| 1;
             const disk_bytes = scanner.scan(self.alloc, db_path) catch return null;
 
             lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
@@ -10339,6 +10802,7 @@ pub const DataServer = struct {
             }
             current.* = .{
                 .disk_bytes = disk_bytes,
+                .observation_generation = observation_generation,
                 .checked_at_ns = now_ns,
                 .lsm_root_generation = lsm_root_generation,
                 .storage_change_token = status.stats.storage_change_token,
@@ -10346,7 +10810,10 @@ pub const DataServer = struct {
                 .valid = true,
             };
             self.runtime_status_disk_usage_cache_mutex.unlock();
-            return disk_bytes;
+            return .{
+                .disk_bytes = disk_bytes,
+                .observation_generation = observation_generation,
+            };
         }
         return null;
     }
@@ -11581,7 +12048,11 @@ pub const DataServer = struct {
 
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         const last_at_ms = self.runtime_status_last_refresh_at_ms.load(.monotonic);
-        if (last_at_ms != 0 and now_ms -| last_at_ms < runtime_status_refresh_interval_ms) return;
+        if (!self.runtime_status_force_refresh.load(.acquire) and
+            last_at_ms != 0 and now_ms -| last_at_ms < runtime_status_refresh_interval_ms)
+        {
+            return;
+        }
         try self.requestRuntimeStatusRefresh();
     }
 
@@ -11919,8 +12390,12 @@ pub const DataServer = struct {
         // A lifecycle notification that arrives after this exchange must remain
         // set for the next pass; never overwrite it with false at completion.
         _ = self.runtime_status_dirty.swap(false, .acq_rel);
+        const forced_refresh = self.runtime_status_force_refresh.swap(false, .acq_rel);
         var refresh_completed = false;
-        defer if (!refresh_completed) self.runtime_status_dirty.store(true, .release);
+        defer if (!refresh_completed) {
+            self.runtime_status_dirty.store(true, .release);
+            if (forced_refresh) self.runtime_status_force_refresh.store(true, .release);
+        };
         var stats: RuntimeStatusRefreshStats = .{};
         var budget: RuntimeStatusRefreshBudget = .{ .max_db_opens = max_db_opens };
         var pending_runtime_work = false;
@@ -12987,6 +13462,7 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
+            .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
@@ -14161,6 +14637,7 @@ fn remoteGroupReadyForTableLifecycle(
 fn cloneAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: antfly.metadata_api.AdminSnapshot) !antfly.metadata_api.AdminSnapshot {
     return .{
         .status = snapshot.status,
+        .reallocation_request = snapshot.reallocation_request,
         .tables = try cloneTablesOwned(alloc, snapshot.tables),
         .ranges = try cloneRangesOwned(alloc, snapshot.ranges),
         .stores = try cloneStoresOwned(alloc, snapshot.stores),
@@ -14180,6 +14657,21 @@ fn cloneAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: antfly.metadata_a
         .merge_observations = try cloneMergeObservationsOwned(alloc, snapshot.merge_observations),
         .merged_group_statuses = try cloneMergedGroupStatusesOwned(alloc, snapshot.merged_group_statuses),
     };
+}
+
+fn retainCurrentReallocationRequestObservations(
+    statuses: []antfly.metadata.table_manager.GroupStatusReport,
+    request: ?antfly.metadata.ReallocationRequestRecord,
+) void {
+    for (statuses) |*status| {
+        const record = request orelse {
+            status.observed_reallocation_request_id = 0;
+            continue;
+        };
+        if (status.observed_reallocation_request_id != record.request_id) {
+            status.observed_reallocation_request_id = 0;
+        }
+    }
 }
 
 fn localGroupStatusFingerprint(
@@ -15791,6 +16283,8 @@ pub fn runFromIterator(
     argv0: []const u8,
     args: *std.process.Args.Iterator,
 ) !void {
+    var termination_signals = antfly.common.runtime_lifecycle.ProcessSignalScope.install();
+    defer termination_signals.deinit();
     const alloc = init.gpa;
     var cli = try parseCli(alloc, args);
     defer cli.deinit(alloc);
@@ -15798,6 +16292,8 @@ pub fn runFromIterator(
         printUsage(argv0);
         return;
     }
+    var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
+    defer supervisor.markStopped();
     const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
         cli.raft_tick_ms,
         cli.control_tick_ms,
@@ -15821,6 +16317,10 @@ pub fn runFromIterator(
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
+    antfly.common.config.Config.validateServerTlsConfig(if (loaded_config) |*cfg| cfg.tls else null) catch |err| {
+        std.log.err("data startup rejected configured tls: built-in server TLS is unsupported; terminate TLS at a trusted reverse proxy", .{});
+        return err;
+    };
 
     var remote_content_runtime: antfly.common.remote_content_runtime.Runtime = undefined;
     var remote_content_runtime_initialized = false;
@@ -15922,6 +16422,9 @@ pub fn runFromIterator(
         .api_server_cfg = .{
             .auth_enabled = effective_auth_enabled,
             .experimental = cli.experimental,
+            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
+            .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
             .ard_base_url = cli.ard_base_url,
@@ -15936,7 +16439,7 @@ pub fn runFromIterator(
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
     }, metadata_api_urls.urls);
-    defer data_server.deinit();
+    defer data_server.deinitWithDeadline(supervisor.deadline());
     try data_server.start();
 
     const base_uri = try data_server.baseUri(alloc);
@@ -15957,37 +16460,50 @@ pub fn runFromIterator(
     var data_health = HealthSource{
         .data_server = &data_server,
         .raft_progress = if (data_server.data_raft != null) &raft_progress else null,
+        .supervisor = &supervisor,
     };
     const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
     const health_port = if (health_enabled)
         cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
     else
         null;
-    const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
+    var control_lane_lease = try data_server.backend_runtime.?.acquireControlLane();
+    defer control_lane_lease.release();
+    const health_server = try antfly.common.health_server.HealthServer.startIfConfiguredOnHostWithRuntime(
         alloc,
+        control_lane_lease.io(),
         "data",
+        null,
         health_port,
         data_health.readiness(),
         data_health.metricsWriter(),
+        try data_server.ensureHttpRuntime(),
     );
-    defer if (health_server) |hs| hs.deinit();
+    defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
 
-    while (true) {
-        if (data_server.data_raft != null) try raft_progress.check();
+    try supervisor.publishReady();
+    while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
+        if (data_server.publicListenerFailure()) |err| return supervisor.fail("data", "public-http", err);
+        if (health_server) |hs| if (hs.runtimeFailure()) |err| return supervisor.fail("health", "http", err);
+        if (data_server.data_raft != null) raft_progress.check() catch |err| {
+            return supervisor.fail("data", "raft-progress", err);
+        };
         data_server.runControlRoundOnly() catch |err| {
             // Report the fatal round error before deferred listener shutdown.
             // A shutdown failure must not hide the storage/Raft error that
             // caused this process to leave its serving loop.
             std.log.err("data server round failed err={s}", .{@errorName(err)});
-            return err;
+            return supervisor.fail("data", "control-round", err);
         };
         if (data_server.data_raft != null) {
-            try raft_progress.waitForFailureOrTimeout(runtime_cadence.control_tick_ns);
+            raft_progress.waitForFailureOrTimeout(runtime_cadence.control_tick_ns) catch |err| {
+                return supervisor.fail("data", "raft-progress", err);
+            };
         } else {
-            try init.io.sleep(
+            init.io.sleep(
                 std.Io.Duration.fromNanoseconds(runtime_cadence.control_tick_ns),
                 .awake,
-            );
+            ) catch |err| return supervisor.fail("data", "control-wait", err);
         }
     }
 }
@@ -17524,6 +18040,166 @@ test "data runtime raft status changes force immediate store status publication"
     server.observeDataRaftStatusFingerprint(12);
     try std.testing.expect(server.store_status_dirty.load(.acquire));
     try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks.load(.acquire));
+}
+
+test "data runtime reallocation request refreshes group status once per request" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-reallocation-status-refresh", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root_dir);
+
+    var server: DataServer = .{
+        .alloc = std.testing.allocator,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(std.testing.allocator),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    const initial_generation = server.local_group_status_generation.load(.acquire);
+    try server.storeCachedLocalGroupStatuses(initial_generation, 99, &.{});
+    server.store_status_dirty.store(false, .release);
+    server.store_status_ticks.store(0, .release);
+
+    const request: antfly.metadata.ReallocationRequestRecord = .{
+        .request_id = 123,
+        .requested_at_ms = 456,
+    };
+    const pre_request_token = try server.provisioned_storage.runtime_status_cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
+        try server.provisioned_storage.runtime_status_cache.publishGroup(pre_request_token, "docs", .{
+            .group_id = 1,
+            .disk_bytes = 50,
+            .disk_bytes_known = true,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{},
+        }),
+    );
+    server.observeReallocationRequest(request);
+    const request_generation = server.local_group_status_generation.load(.acquire);
+    try std.testing.expectEqual(initial_generation + 1, request_generation);
+    try std.testing.expect(server.localGroupStatusCacheStale(@intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms))));
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
+    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks.load(.acquire));
+    try std.testing.expect(server.runtime_status_dirty.load(.acquire));
+    try std.testing.expect(server.runtime_status_force_refresh.swap(false, .acq_rel));
+
+    server.store_status_dirty.store(false, .release);
+    server.store_status_ticks.store(0, .release);
+    server.runtime_status_dirty.store(false, .release);
+    server.observeReallocationRequest(request);
+    try std.testing.expectEqual(request_generation, server.local_group_status_generation.load(.acquire));
+    try std.testing.expect(!server.store_status_dirty.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.store_status_ticks.load(.acquire));
+    try std.testing.expect(!server.runtime_status_dirty.load(.acquire));
+    try std.testing.expect(!server.runtime_status_force_refresh.load(.acquire));
+
+    server.observeReallocationRequest(null);
+    try std.testing.expectEqual(request_generation, server.local_group_status_generation.load(.acquire));
+
+    server.observeReallocationRequest(request);
+    const straddled_publication_token = try server.provisioned_storage.runtime_status_cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
+        try server.provisioned_storage.runtime_status_cache.publishGroup(straddled_publication_token, "docs", .{
+            .group_id = 1,
+            .disk_observation_generation = 1,
+            .disk_bytes = 100,
+            .disk_bytes_known = true,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{},
+        }),
+    );
+    var straddled_runtime = (try server.provisioned_storage.runtime_status_cache.snapshotGroupStatus(
+        std.testing.allocator,
+        "docs",
+        1,
+    )).?;
+    defer straddled_runtime.deinit(std.testing.allocator);
+    var straddled_report = antfly.metadata.table_manager.GroupStatusReport{ .group_id = 1, .disk_bytes_known = true };
+    server.annotateRuntimeReallocationObservation(&straddled_report, straddled_runtime);
+    try std.testing.expectEqual(@as(u128, 0), straddled_report.observed_reallocation_request_id);
+
+    var stale_runtime = (try server.provisioned_storage.runtime_status_cache.snapshotGroupStatus(
+        std.testing.allocator,
+        "docs",
+        1,
+    )).?;
+    defer stale_runtime.deinit(std.testing.allocator);
+    var stale_report = antfly.metadata.table_manager.GroupStatusReport{ .group_id = 1, .disk_bytes_known = true };
+    server.annotateRuntimeReallocationObservation(&stale_report, stale_runtime);
+    try std.testing.expectEqual(@as(u128, 0), stale_report.observed_reallocation_request_id);
+
+    const recycled_token = try server.provisioned_storage.runtime_status_cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
+        try server.provisioned_storage.runtime_status_cache.publishGroup(recycled_token, "docs", stale_runtime),
+    );
+    var recycled_runtime = (try server.provisioned_storage.runtime_status_cache.snapshotGroupStatus(
+        std.testing.allocator,
+        "docs",
+        1,
+    )).?;
+    defer recycled_runtime.deinit(std.testing.allocator);
+    var recycled_report = antfly.metadata.table_manager.GroupStatusReport{ .group_id = 1, .disk_bytes_known = true };
+    server.annotateRuntimeReallocationObservation(&recycled_report, recycled_runtime);
+    try std.testing.expectEqual(@as(u128, 0), recycled_report.observed_reallocation_request_id);
+
+    const post_request_token = try server.provisioned_storage.runtime_status_cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
+        try server.provisioned_storage.runtime_status_cache.publishGroup(post_request_token, "docs", .{
+            .group_id = 1,
+            .disk_observation_generation = 2,
+            .disk_bytes = 200,
+            .disk_bytes_known = true,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{},
+        }),
+    );
+    var fresh_runtime = (try server.provisioned_storage.runtime_status_cache.snapshotGroupStatus(
+        std.testing.allocator,
+        "docs",
+        1,
+    )).?;
+    defer fresh_runtime.deinit(std.testing.allocator);
+    var fresh_report = antfly.metadata.table_manager.GroupStatusReport{ .group_id = 1, .disk_bytes_known = true };
+    server.annotateRuntimeReallocationObservation(&fresh_report, fresh_runtime);
+    try std.testing.expectEqual(@as(u128, 123), fresh_report.observed_reallocation_request_id);
+
+    var statuses = [_]antfly.metadata.table_manager.GroupStatusReport{fresh_report};
+    retainCurrentReallocationRequestObservations(&statuses, null);
+    try std.testing.expectEqual(@as(u128, 0), statuses[0].observed_reallocation_request_id);
+
+    server.observeReallocationRequest(null);
+    const before_request_scan = server.currentReallocationObservationRequirement();
+    server.observeReallocationRequest(.{
+        .request_id = 456,
+        .requested_at_ms = 789,
+    });
+    var overlapping_scan_report = antfly.metadata.table_manager.GroupStatusReport{
+        .group_id = 1,
+        .disk_bytes_known = true,
+    };
+    server.annotateFreshReallocationObservation(&overlapping_scan_report, before_request_scan);
+    try std.testing.expectEqual(@as(u128, 0), overlapping_scan_report.observed_reallocation_request_id);
+
+    const after_request_scan = server.currentReallocationObservationRequirement();
+    server.annotateFreshReallocationObservation(&overlapping_scan_report, after_request_scan);
+    try std.testing.expectEqual(@as(u128, 456), overlapping_scan_report.observed_reallocation_request_id);
 }
 
 test "data runtime local split fallback preserves source identity namespace" {
@@ -23179,7 +23855,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
     try server.initApiServer();
 
-    var status_resp = try server.http_server.?.handle(.{ .method = .GET, .uri = antfly.public_api.http_routes.Routes.status });
+    var status_resp = try executeApiHttpxTestRequest(&server.http_server.?, .{ .method = .GET, .uri = antfly.public_api.http_routes.Routes.status });
     defer status_resp.deinit(server.http_server.?.alloc);
 
     const items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
@@ -23933,25 +24609,24 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expect(server.ha_internal_server != null);
     try std.testing.expect(server.haOwnerJobCanRun(.compaction_publish));
 
-    var admin_unauthorized = try server.http_server.?.handle(.{
+    var admin_unauthorized = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.admin.routes.ha_primary_status,
     });
     defer admin_unauthorized.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 401), admin_unauthorized.status);
 
-    var admin_resp = try server.http_server.?.handle(.{
+    var admin_resp = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.admin.routes.ha_primary_status,
         .authorization = "Bearer runtime-secret-token",
     });
     defer admin_resp.deinit(server.http_server.?.alloc);
-    try std.testing.expect(admin_resp.owner_allocator != null);
     try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, admin_resp.body, "\"current_lsn\"") != null);
 
     const capture_body = "{\"slot_name\":\"standby-capture\",\"generation\":\"seed-standby-capture-3\",\"topology_id\":\"topology-a\",\"topology_generation\":7,\"node_id\":\"standby-a\",\"target_pvc_name\":\"standby-a-data\",\"target_pvc_uid\":\"pvc-uid-7\"}";
-    var capture_resp = try server.http_server.?.handle(.{
+    var capture_resp = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .POST,
         .uri = antfly.admin.routes.ha_base_backups_capture,
         .authorization = "Bearer runtime-secret-token",
@@ -24085,7 +24760,7 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expect(!captured_slot.active);
     try std.testing.expect(!captured_slot.reseed_required);
 
-    var capture_retry = try server.http_server.?.handle(.{
+    var capture_retry = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .POST,
         .uri = antfly.admin.routes.ha_base_backups_capture,
         .authorization = "Bearer runtime-secret-token",
@@ -24360,7 +25035,7 @@ test "data server wires configured HA executors into API server" {
         capture_binding,
     ));
 
-    var internal_resp = try server.http_server.?.handle(.{
+    var internal_resp = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.internal.routes.ha_replication_identify,
         .authorization = "Bearer runtime-secret-token",
@@ -25045,7 +25720,7 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
     }
     try source_gate.check();
 
-    var fence_response = try server.http_server.?.handle(.{
+    var fence_response = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .POST,
         .uri = antfly.admin.routes.ha_fence,
         .authorization = "Bearer runtime-secret-token",
@@ -25417,7 +26092,7 @@ test "data server pulls and applies HA standby replication through internal HTTP
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
 
-    var admin_status = try server.http_server.?.handle(.{
+    var admin_status = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.admin.routes.ha_standby_status,
         .authorization = "Bearer runtime-secret-token",
@@ -25747,6 +26422,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
         .replica_root_dir = replica_root,
         .api_server_cfg = .{
             .admin_bearer_token = "runtime-secret-token",
+            .ha_failover_safe_mutations_only = true,
         },
         .ha = .{
             .admin_context = .{
@@ -25767,10 +26443,11 @@ test "data server HA state change synchronously adopts promotion and rewires liv
 
     const public_read_gate_before = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
     const public_write_gate_before = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+    try std.testing.expect(server.http_server.?.haMutationPolicy().failover_safe_mutations_only);
     try std.testing.expectError(error.HAReadRequiresPrimary, public_read_gate_before.check(.stale));
     try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate_before.check());
 
-    var before = try server.http_server.?.handle(.{
+    var before = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.internal.routes.ha_replication_identify,
         .authorization = "Bearer runtime-secret-token",
@@ -25788,6 +26465,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     try std.testing.expect(server.ha_admin_server.?.auth.state_mutex == &server.ha_state_mutex);
     try std.testing.expect(server.ha_admin_server.?.auth.primary_fence_barrier == &server.ha_mutation_barrier);
     try std.testing.expect(server.ha_internal_server.?.state_mutex == &server.ha_state_mutex);
+    try std.testing.expect(!server.http_server.?.haMutationPolicy().failover_safe_mutations_only);
     const public_read_gate_after = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
     const public_write_gate_after = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
     try std.testing.expect(std.meta.eql(public_read_gate_before, public_read_gate_after));
@@ -25795,7 +26473,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     try public_read_gate_before.check(.stale);
     try public_write_gate_before.check();
 
-    var write_check = try server.http_server.?.handle(.{
+    var write_check = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .POST,
         .uri = antfly.admin.routes.ha_write_check,
         .authorization = "Bearer runtime-secret-token",
@@ -25808,7 +26486,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     try std.testing.expect(std.mem.indexOf(u8, write_check.body, "\"action\":\"open_promoted_primary\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_check.body, "\"promotion_handoff\"") != null);
 
-    var owner_job_check = try server.http_server.?.handle(.{
+    var owner_job_check = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .POST,
         .uri = antfly.admin.routes.ha_owner_job_check,
         .authorization = "Bearer runtime-secret-token",
@@ -25820,7 +26498,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     try std.testing.expect(std.mem.indexOf(u8, owner_job_check.body, "\"role\":\"promoted_standby\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, owner_job_check.body, "\"action\":\"open_promoted_primary\"") != null);
 
-    var internal_resp = try server.http_server.?.handle(.{
+    var internal_resp = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.internal.routes.ha_replication_identify,
         .authorization = "Bearer runtime-secret-token",
@@ -26351,7 +27029,7 @@ test "data runtime records and backs off HA standby replication round failures" 
     try std.testing.expect(!server.haStandbyReplicationRetryDue(next_attempt_ns - 1));
     try std.testing.expect(server.haStandbyReplicationRetryDue(next_attempt_ns));
 
-    var admin_status = try server.http_server.?.handle(.{
+    var admin_status = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.admin.routes.ha_standby_status,
         .authorization = "Bearer runtime-secret-token",
@@ -26517,7 +27195,7 @@ test "data runtime records HA standby apply failures without stopping run round"
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
 
-    var admin_status = try server.http_server.?.handle(.{
+    var admin_status = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .GET,
         .uri = antfly.admin.routes.ha_standby_status,
         .authorization = "Bearer runtime-secret-token",

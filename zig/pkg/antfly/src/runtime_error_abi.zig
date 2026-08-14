@@ -285,6 +285,9 @@ pub const Detail = enum(c_int) {
     // append-only so independently generated archives retain wire stability.
     queue_full,
     resource_limit_exceeded,
+    body_too_large,
+    body_capacity_exceeded,
+    body_read_failed,
 };
 
 pub const Status = extern struct {
@@ -480,6 +483,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.BackupMaintenanceQueueFull => status(.retryable, .backup_maintenance_queue_full),
         error.QueueFull => status(.retryable, .queue_full),
         error.ResourceLimitExceeded => status(.unavailable, .resource_limit_exceeded),
+        error.BodyTooLarge => status(.invalid_argument, .body_too_large),
+        error.BodyCapacityExceeded => status(.retryable, .body_capacity_exceeded),
+        error.BodyReadFailed => status(.unavailable, .body_read_failed),
         error.BackupMaintenanceUnavailable => status(.unavailable, .backup_maintenance_unavailable),
         error.ConnectionNotFound => status(.not_found, .connection_not_found),
         error.EmbedRequestFailed => status(.unavailable, .embed_request_failed),
@@ -831,6 +837,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .user_exists => "UserExists",
         .queue_full => "QueueFull",
         .resource_limit_exceeded => "ResourceLimitExceeded",
+        .body_too_large => "BodyTooLarge",
+        .body_capacity_exceeded => "BodyCapacityExceeded",
+        .body_read_failed => "BodyReadFailed",
     };
 }
 

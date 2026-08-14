@@ -9,11 +9,12 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.inference_config_model_strategies import InferenceConfigModelStrategies
+    from ..models.inference_admission_config import InferenceAdmissionConfig
     from ..models.inference_content_security_config import InferenceContentSecurityConfig
     from ..models.inference_credentials import InferenceCredentials
     from ..models.inference_model_ref import InferenceModelRef
     from ..models.inference_prompt_cache_config import InferencePromptCacheConfig
+    from ..models.inference_runtime_config_model_strategies import InferenceRuntimeConfigModelStrategies
     from ..models.inferenceschemas_config import InferenceschemasConfig
 
 
@@ -25,6 +26,11 @@ class InferenceConfig:
     """
     Attributes:
         api_url (str): URL of the Antfly inference embedding/chunking service Example: http://localhost:8080.
+        max_concurrent_requests (int | Unset): Deprecated compatibility alias for
+            `admission.inference.max_concurrent_requests`. New configurations
+            should use the process-level admission setting. If both spellings
+            are supplied, they must have the same value.
+             Example: 32.
         api_key (str | Unset): API key used when calling an authenticated shared Antfly inference API.
         models_dir (str | Unset): Base directory containing model subdirectories. Antfly inference auto-discovers models
             from:
@@ -62,19 +68,6 @@ class InferenceConfig:
         backend_priority (list[str] | Unset): Legacy compatibility field. The current Zig inference runtime selects a
             backend from model metadata, explicit preload settings, and compiled capabilities;
             configuring this list has no effect.
-        max_concurrent_requests (int | Unset): Maximum concurrent weighted inference admission units in the Zig runtime.
-            Request body size, generation workload, and image byte/count reservations
-            can consume more than one unit. Read and image-extraction admission reserves the
-            effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per
-            two images. A positive capacity also clamps each such request's downloaded-image
-            ceiling to 16 MiB times this value. Set to 0 disables both admission accounting
-            and that capacity-derived clamp.
-            When a positive limit is exhausted, new requests are rejected immediately
-            with 503 Service Unavailable and Retry-After: 1; they are not retained in
-            an in-process queue. Set to 0 only as an operational escape hatch for
-            trusted testing environments; unlimited admission is not recommended for
-            production native generation. Use a positive production limit. The default is 32.
-             Default: 32. Example: 32.
         max_queue_size (int | Unset): Legacy Go-runtime queue setting. The current Zig runtime does not retain
             excess inference requests in memory and ignores this field.
         request_timeout (str | Unset): Legacy Go-runtime queue/request timeout. The current Zig runtime ignores
@@ -88,8 +81,8 @@ class InferenceConfig:
             'quantization': 'q4_k'}].
         max_memory_mb (int | Unset): Legacy compatibility field. The current Zig runtime uses explicit host,
             backend, combined, KV, and scratch budgets instead and ignores this field.
-        model_strategies (InferenceConfigModelStrategies | Unset): Per-model loading strategy overrides. Maps model
-            names to their loading strategy.
+        model_strategies (InferenceRuntimeConfigModelStrategies | Unset): Per-model loading strategy overrides. Maps
+            model names to their loading strategy.
             Models not in this map load on demand. keep_alive controls their idle
             eviction; setting it to "0" disables idle eviction but does not preload or pin them.
 
@@ -107,9 +100,11 @@ class InferenceConfig:
              Default: True.
         log (InferenceschemasConfig | Unset): Legacy inference-local logging configuration. The current unified Zig
             runtime ignores it; configure the top-level `log` object instead.
+        admission (InferenceAdmissionConfig | Unset): Process-local foreground request admission settings.
     """
 
     api_url: str
+    max_concurrent_requests: int | Unset = UNSET
     api_key: str | Unset = UNSET
     models_dir: str | Unset = UNSET
     ml_dir: str | Unset = UNSET
@@ -120,18 +115,20 @@ class InferenceConfig:
     pool_size: int | Unset = UNSET
     prompt_cache: InferencePromptCacheConfig | Unset = UNSET
     backend_priority: list[str] | Unset = UNSET
-    max_concurrent_requests: int | Unset = 32
     max_queue_size: int | Unset = UNSET
     request_timeout: str | Unset = UNSET
     preload: list[InferenceModelRef] | Unset = UNSET
     max_memory_mb: int | Unset = UNSET
-    model_strategies: InferenceConfigModelStrategies | Unset = UNSET
+    model_strategies: InferenceRuntimeConfigModelStrategies | Unset = UNSET
     allow_downloads: bool | Unset = True
     log: InferenceschemasConfig | Unset = UNSET
+    admission: InferenceAdmissionConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         api_url = self.api_url
+
+        max_concurrent_requests = self.max_concurrent_requests
 
         api_key = self.api_key
 
@@ -161,8 +158,6 @@ class InferenceConfig:
         if not isinstance(self.backend_priority, Unset):
             backend_priority = self.backend_priority
 
-        max_concurrent_requests = self.max_concurrent_requests
-
         max_queue_size = self.max_queue_size
 
         request_timeout = self.request_timeout
@@ -186,6 +181,10 @@ class InferenceConfig:
         if not isinstance(self.log, Unset):
             log = self.log.to_dict()
 
+        admission: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.admission, Unset):
+            admission = self.admission.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -193,6 +192,8 @@ class InferenceConfig:
                 "api_url": api_url,
             }
         )
+        if max_concurrent_requests is not UNSET:
+            field_dict["max_concurrent_requests"] = max_concurrent_requests
         if api_key is not UNSET:
             field_dict["api_key"] = api_key
         if models_dir is not UNSET:
@@ -213,8 +214,6 @@ class InferenceConfig:
             field_dict["prompt_cache"] = prompt_cache
         if backend_priority is not UNSET:
             field_dict["backend_priority"] = backend_priority
-        if max_concurrent_requests is not UNSET:
-            field_dict["max_concurrent_requests"] = max_concurrent_requests
         if max_queue_size is not UNSET:
             field_dict["max_queue_size"] = max_queue_size
         if request_timeout is not UNSET:
@@ -229,20 +228,25 @@ class InferenceConfig:
             field_dict["allow_downloads"] = allow_downloads
         if log is not UNSET:
             field_dict["log"] = log
+        if admission is not UNSET:
+            field_dict["admission"] = admission
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inference_config_model_strategies import InferenceConfigModelStrategies
+        from ..models.inference_admission_config import InferenceAdmissionConfig
         from ..models.inference_content_security_config import InferenceContentSecurityConfig
         from ..models.inference_credentials import InferenceCredentials
         from ..models.inference_model_ref import InferenceModelRef
         from ..models.inference_prompt_cache_config import InferencePromptCacheConfig
+        from ..models.inference_runtime_config_model_strategies import InferenceRuntimeConfigModelStrategies
         from ..models.inferenceschemas_config import InferenceschemasConfig
 
         d = dict(src_dict)
         api_url = d.pop("api_url")
+
+        max_concurrent_requests = d.pop("max_concurrent_requests", UNSET)
 
         api_key = d.pop("api_key", UNSET)
 
@@ -279,8 +283,6 @@ class InferenceConfig:
 
         backend_priority = cast(list[str], d.pop("backend_priority", UNSET))
 
-        max_concurrent_requests = d.pop("max_concurrent_requests", UNSET)
-
         max_queue_size = d.pop("max_queue_size", UNSET)
 
         request_timeout = d.pop("request_timeout", UNSET)
@@ -297,11 +299,11 @@ class InferenceConfig:
         max_memory_mb = d.pop("max_memory_mb", UNSET)
 
         _model_strategies = d.pop("model_strategies", UNSET)
-        model_strategies: InferenceConfigModelStrategies | Unset
+        model_strategies: InferenceRuntimeConfigModelStrategies | Unset
         if isinstance(_model_strategies, Unset):
             model_strategies = UNSET
         else:
-            model_strategies = InferenceConfigModelStrategies.from_dict(_model_strategies)
+            model_strategies = InferenceRuntimeConfigModelStrategies.from_dict(_model_strategies)
 
         allow_downloads = d.pop("allow_downloads", UNSET)
 
@@ -312,8 +314,16 @@ class InferenceConfig:
         else:
             log = InferenceschemasConfig.from_dict(_log)
 
+        _admission = d.pop("admission", UNSET)
+        admission: InferenceAdmissionConfig | Unset
+        if isinstance(_admission, Unset):
+            admission = UNSET
+        else:
+            admission = InferenceAdmissionConfig.from_dict(_admission)
+
         inference_config = cls(
             api_url=api_url,
+            max_concurrent_requests=max_concurrent_requests,
             api_key=api_key,
             models_dir=models_dir,
             ml_dir=ml_dir,
@@ -324,7 +334,6 @@ class InferenceConfig:
             pool_size=pool_size,
             prompt_cache=prompt_cache,
             backend_priority=backend_priority,
-            max_concurrent_requests=max_concurrent_requests,
             max_queue_size=max_queue_size,
             request_timeout=request_timeout,
             preload=preload,
@@ -332,6 +341,7 @@ class InferenceConfig:
             model_strategies=model_strategies,
             allow_downloads=allow_downloads,
             log=log,
+            admission=admission,
         )
 
         inference_config.additional_properties = d

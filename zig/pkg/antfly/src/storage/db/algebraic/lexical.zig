@@ -200,7 +200,9 @@ pub const DictionaryIdentity = struct {
     pub fn registryKeyAlloc(self: DictionaryIdentity, alloc: std.mem.Allocator) ![]u8 {
         const identity_key = try self.keyAlloc(alloc);
         defer alloc.free(identity_key);
-        return try token.canonicalTupleAlloc(alloc, &.{ "dictionary_registry:v1", identity_key });
+        // The generation namespace is a separate component so retirement can
+        // delete registry ownership with a bounded, namespace-local scan.
+        return try token.canonicalTupleAlloc(alloc, &.{ "dictionary_registry:v1", self.scope, identity_key });
     }
 };
 
@@ -431,8 +433,9 @@ test "dictionary registry entry records one physical owner per identity" {
     var decoded = try RegistryEntry.decodeAlloc(alloc, encoded);
     defer decoded.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), registry_parts.len);
+    try std.testing.expectEqual(@as(usize, 3), registry_parts.len);
     try std.testing.expectEqualStrings("dictionary_registry:v1", registry_parts[0]);
+    try std.testing.expectEqualStrings(access_path.dictionary.scope, registry_parts[1]);
     try std.testing.expectEqualStrings("fulltext:body:default", decoded.owner);
     try std.testing.expectEqual(DictionaryLayoutKind.fst_postings, decoded.layout);
     try std.testing.expectEqualStrings("ready", decoded.state);

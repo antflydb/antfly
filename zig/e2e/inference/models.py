@@ -284,7 +284,6 @@ DEFAULT_MODEL_BY_PATH = {
     "/ai/v1/rerank": ("mixedbread-ai/mxbai-rerank-base-v1", "rerankers"),
     "/ai/v1/generate": (DEFAULT_GENERATOR_MODEL, "generators"),
     "/ai/v1/chat/completions": (DEFAULT_GENERATOR_MODEL, "generators"),
-    "/ai/v1/classify": ("cross-encoder/nli-distilroberta-base", "classifiers"),
     "/ai/v1/extract": (DEFAULT_EXTRACTOR_MODEL, "extractors"),
     "/ai/v1/read": ("antflydb/florence-2-base", "readers"),
     "/ai/v1/transcribe": ("openai/whisper-tiny", "transcribers"),

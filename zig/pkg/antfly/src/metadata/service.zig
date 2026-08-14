@@ -19,6 +19,7 @@ const common_secrets = @import("../common/secrets.zig");
 const metadata_mod = @import("domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
+const metadata_http_client = @import("http_client.zig");
 const raft_engine = @import("raft_engine");
 const metadata_control_loop = @import("control_loop.zig");
 const metadata_reconcile_lease = @import("reconcile_lease.zig");
@@ -59,6 +60,7 @@ const metadata_run_round_trace_max_phases: usize = 32;
 const linearizable_metadata_read_prefix = "metadata:linearizable-read:";
 const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const linearizable_metadata_read_retry_ns: u64 = 50 * std.time.ns_per_ms;
+const reallocation_protocol_probe_timeout_ns: u64 = 5 * std.time.ns_per_s;
 
 fn logMetadataRunRoundPhase(name: []const u8, elapsed_ns: u64) void {
     if (elapsed_ns > metadata_run_round_slow_phase_threshold_ns) {
@@ -431,7 +433,85 @@ pub const MetadataServiceConfig = struct {
     observe_local_replica_root: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*common_secrets.FileStore = null,
+    reallocation_protocol_peers: []const ReallocationProtocolPeer = &.{},
 };
+
+pub const ReallocationProtocolPeer = struct {
+    node_id: u64,
+    orchestration_url: ?[]const u8 = null,
+};
+
+fn findReallocationProtocolPeer(peers: []const ReallocationProtocolPeer, node_id: u64) ?ReallocationProtocolPeer {
+    for (peers) |peer| {
+        if (peer.node_id == node_id) return peer;
+    }
+    return null;
+}
+
+fn collectReallocationBarrierNodeIds(
+    alloc: std.mem.Allocator,
+    conf_state: raft_engine.core.ConfState,
+    configured_peers: []const ReallocationProtocolPeer,
+) ![]u64 {
+    var required = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer required.deinit(alloc);
+
+    const membership_sets = [_][]const u64{
+        conf_state.voters,
+        conf_state.voters_outgoing,
+        conf_state.learners,
+        conf_state.learners_next,
+    };
+    for (membership_sets) |node_ids| {
+        for (node_ids) |node_id| try required.put(alloc, node_id, {});
+    }
+    // The configured peer set is the target membership for this process.
+    // Probing it as well as the currently applied ConfState prevents a
+    // compatible request from racing a configured learner admission and later
+    // being exposed to an older leader after promotion.
+    for (configured_peers) |peer| try required.put(alloc, peer.node_id, {});
+
+    const node_ids = try alloc.alloc(u64, required.count());
+    var index: usize = 0;
+    var it = required.keyIterator();
+    while (it.next()) |node_id| : (index += 1) node_ids[index] = node_id.*;
+    std.mem.sort(u64, node_ids, {}, std.sort.asc(u64));
+    return node_ids;
+}
+
+const ReallocationBarrierContract = struct {
+    metadata_incarnation: metadata_mod.MetadataClusterIncarnation,
+    protected_metadata_member_count: u32,
+    protected_metadata_membership_fingerprint: metadata_reallocation_request.MembershipFingerprint,
+};
+
+fn reallocationBarrierContract(
+    incarnation: metadata_mod.MetadataClusterIncarnation,
+    sorted_node_ids: []const u64,
+) !ReallocationBarrierContract {
+    if (!metadata_mod.incarnation.isValid(incarnation) or sorted_node_ids.len == 0) {
+        return error.ReallocationProtocolUpgradeRequired;
+    }
+    return .{
+        .metadata_incarnation = incarnation,
+        .protected_metadata_member_count = std.math.cast(u32, sorted_node_ids.len) orelse
+            return error.ReallocationProtocolUpgradeRequired,
+        .protected_metadata_membership_fingerprint = metadata_reallocation_request.membershipFingerprint(sorted_node_ids),
+    };
+}
+
+fn reallocationBarrierStatusCompatible(
+    peer_status: MetadataStatus,
+    metadata_group_id: u64,
+    node_id: u64,
+    incarnation: metadata_mod.MetadataClusterIncarnation,
+) bool {
+    const peer_incarnation = peer_status.metadata_incarnation orelse return false;
+    return peer_status.metadata_group_id == metadata_group_id and
+        peer_status.metadata_raft_local_node_id == node_id and
+        std.mem.eql(u8, &peer_incarnation, &incarnation) and
+        peer_status.reallocation_barrier_protocol_version >= metadata_reallocation_request.barrier_protocol_version;
+}
 
 pub const MetadataServiceDeps = struct {
     host: raft_managed_host.ManagedHostDeps = .{},
@@ -2124,11 +2204,33 @@ pub const MetadataService = struct {
     }
 
     pub fn requestReallocation(self: *MetadataService, requested_at_ms: u64) !void {
+        const raft_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse
+            return error.ReallocationProtocolUpgradeRequired;
+        const local_node_id = self.raft.host.host.cfg.local_node_id;
+        const required_node_ids = try collectReallocationBarrierNodeIds(
+            self.alloc,
+            raft_status.conf_state,
+            &.{},
+        );
+        defer if (required_node_ids.len > 0) self.alloc.free(required_node_ids);
+        // The non-HTTP service has no authenticated orchestration channel for
+        // remote capability probes. Keep it safe for its single-node use and
+        // require the HTTP service for multi-node request admission.
+        if (required_node_ids.len != 1 or required_node_ids[0] != local_node_id) {
+            return error.ReallocationProtocolUpgradeRequired;
+        }
+        const incarnation = (try self.metadataIncarnation()) orelse
+            return error.ReallocationProtocolUpgradeRequired;
+        const barrier = try reallocationBarrierContract(incarnation, required_node_ids);
         const runtime = try self.ensureBackendRuntime();
         const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse std.Options.debug_io);
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
             .request_id = request_id,
             .requested_at_ms = requested_at_ms,
+            .barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
+            .metadata_incarnation = barrier.metadata_incarnation,
+            .protected_metadata_member_count = barrier.protected_metadata_member_count,
+            .protected_metadata_membership_fingerprint = barrier.protected_metadata_membership_fingerprint,
         } });
     }
 
@@ -3112,6 +3214,7 @@ pub const MetadataHttpService = struct {
     metadata_group_id: u64,
     replica_root_dir: ?[]const u8,
     observe_local_replica_root: bool,
+    reallocation_protocol_peers: []const ReallocationProtocolPeer,
     store_status_ticks: usize,
     projection_epoch: std.atomic.Value(u64) = .init(1),
     catalog_epoch: std.atomic.Value(u64) = .init(1),
@@ -3216,6 +3319,7 @@ pub const MetadataHttpService = struct {
             .metadata_group_id = metadata_group_id,
             .replica_root_dir = host_cfg.http.host.replica_root_dir,
             .observe_local_replica_root = cfg.observe_local_replica_root,
+            .reallocation_protocol_peers = cfg.reallocation_protocol_peers,
             .store_status_ticks = 0,
             .local_placement_epoch = null,
             .last_local_placement_refresh_at_ms = 0,
@@ -3833,12 +3937,82 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn requestReallocation(self: *MetadataHttpService, requested_at_ms: u64) !void {
+        const barrier = try self.ensureReallocationBarrierProtocolReady();
         const runtime = try self.ensureBackendRuntime();
         const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse std.Options.debug_io);
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
             .request_id = request_id,
             .requested_at_ms = requested_at_ms,
+            .barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
+            .metadata_incarnation = barrier.metadata_incarnation,
+            .protected_metadata_member_count = barrier.protected_metadata_member_count,
+            .protected_metadata_membership_fingerprint = barrier.protected_metadata_membership_fingerprint,
         } });
+    }
+
+    fn ensureReallocationBarrierProtocolReady(self: *MetadataHttpService) !ReallocationBarrierContract {
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
+            return error.ReallocationProtocolUpgradeRequired;
+        const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
+        if (std.mem.indexOfScalar(u64, raft_status.conf_state.voters, local_node_id) == null and
+            std.mem.indexOfScalar(u64, raft_status.conf_state.voters_outgoing, local_node_id) == null)
+        {
+            return error.ReallocationProtocolUpgradeRequired;
+        }
+        const incarnation = (try self.metadataIncarnation()) orelse
+            return error.ReallocationProtocolUpgradeRequired;
+        var client = metadata_http_client.MetadataHttpClient.init(
+            self.alloc,
+            self.raft.host.http_host.request_executor,
+        );
+        const probe_budget = metadata_http_client.RequestBudget{
+            .deadline_ns = platform_time.monotonicNs() +| reallocation_protocol_probe_timeout_ns,
+        };
+
+        const required_node_ids = try collectReallocationBarrierNodeIds(
+            self.alloc,
+            raft_status.conf_state,
+            self.reallocation_protocol_peers,
+        );
+        defer if (required_node_ids.len > 0) self.alloc.free(required_node_ids);
+        for (required_node_ids) |node_id| {
+            try self.requireReallocationBarrierPeer(&client, probe_budget, local_node_id, node_id, incarnation);
+        }
+        return try reallocationBarrierContract(incarnation, required_node_ids);
+    }
+
+    fn requireReallocationBarrierPeer(
+        self: *MetadataHttpService,
+        client: *metadata_http_client.MetadataHttpClient,
+        probe_budget: metadata_http_client.RequestBudget,
+        local_node_id: u64,
+        node_id: u64,
+        incarnation: metadata_mod.MetadataClusterIncarnation,
+    ) !void {
+        if (node_id == local_node_id) return;
+        const peer = findReallocationProtocolPeer(self.reallocation_protocol_peers, node_id) orelse {
+            std.log.warn("reallocation barrier blocked: metadata member {d} is not in the configured peer set", .{node_id});
+            return error.ReallocationProtocolUpgradeRequired;
+        };
+        const orchestration_url = peer.orchestration_url orelse {
+            std.log.warn("reallocation barrier blocked: metadata member {d} has no orchestration URL", .{node_id});
+            return error.ReallocationProtocolUpgradeRequired;
+        };
+        if (orchestration_url.len == 0) {
+            std.log.warn("reallocation barrier blocked: metadata member {d} has an empty orchestration URL", .{node_id});
+            return error.ReallocationProtocolUpgradeRequired;
+        }
+        const peer_status = client.fetchStatusWithBudget(orchestration_url, probe_budget) catch |err| {
+            std.log.warn("reallocation barrier blocked: metadata member {d} capability probe failed: {s}", .{ node_id, @errorName(err) });
+            return error.ReallocationProtocolUpgradeRequired;
+        };
+        if (!reallocationBarrierStatusCompatible(peer_status, self.metadata_group_id, node_id, incarnation)) {
+            std.log.warn(
+                "reallocation barrier blocked: metadata voter {d} reports node={d} group={d} protocol={d}",
+                .{ node_id, peer_status.metadata_raft_local_node_id, peer_status.metadata_group_id, peer_status.reallocation_barrier_protocol_version },
+            );
+            return error.ReallocationProtocolUpgradeRequired;
+        }
     }
 
     pub fn clearReallocationRequest(self: *MetadataHttpService, expected_request_id: u128) !void {
@@ -4189,6 +4363,7 @@ pub const MetadataHttpService = struct {
     fn fallbackStatus(self: *MetadataHttpService) MetadataStatus {
         return .{
             .metadata_group_id = self.metadata_group_id,
+            .reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
             .metadata_epoch = self.lifecycle_signal.currentEpoch(),
             .metrics = self.metrics(),
         };
@@ -4491,6 +4666,7 @@ pub const MetadataHttpService = struct {
             const catalog = try self.catalogValidationSnapshotLocked();
             const core = try self.projectedCoreSnapshotLocked();
             const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            snapshot.reallocation_request = try store.getReallocationRequest(self.metadata_group_id);
             snapshot.tables = try cloneProjectedTablesOwned(self.alloc, catalog.tables);
             snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, catalog.ranges);
             snapshot.nodes = try store.listNodes(self.alloc, self.metadata_group_id);
@@ -5517,6 +5693,51 @@ fn cdcLocalMetadataLeader(service: anytype) bool {
     service.lockRuntime();
     defer service.unlockRuntime();
     return service.raft.host.http_host.host.isLocalLeader(service.metadata_group_id);
+}
+
+test "metadata service reallocation barrier requires a current protocol from the exact metadata voter" {
+    const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+    const legacy_status = MetadataStatus{
+        .metadata_group_id = 42,
+        .metadata_incarnation = incarnation,
+        .metadata_raft_local_node_id = 7,
+        .metrics = .{},
+    };
+    try std.testing.expect(!reallocationBarrierStatusCompatible(legacy_status, 42, 7, incarnation));
+
+    var current_status = legacy_status;
+    current_status.reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version;
+    try std.testing.expect(reallocationBarrierStatusCompatible(current_status, 42, 7, incarnation));
+    try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 43, 7, incarnation));
+    try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 42, 8, incarnation));
+    try std.testing.expect(!reallocationBarrierStatusCompatible(
+        current_status,
+        42,
+        7,
+        "fedcba9876543210fedcba9876543210".*,
+    ));
+    current_status.metadata_incarnation = null;
+    try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 42, 7, incarnation));
+}
+
+test "metadata service reallocation barrier covers configured and transitional members" {
+    const configured_peers = [_]ReallocationProtocolPeer{
+        .{ .node_id = 2, .orchestration_url = "http://127.0.0.1:12378" },
+        .{ .node_id = 6 },
+    };
+    const conf_state = raft_engine.core.ConfState{
+        .voters = @constCast((&[_]u64{ 1, 2 })[0..]),
+        .voters_outgoing = @constCast((&[_]u64{ 2, 3 })[0..]),
+        .learners = @constCast((&[_]u64{4})[0..]),
+        .learners_next = @constCast((&[_]u64{5})[0..]),
+    };
+    const required = try collectReallocationBarrierNodeIds(
+        std.testing.allocator,
+        conf_state,
+        &configured_peers,
+    );
+    defer std.testing.allocator.free(required);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4, 5, 6 }, required);
 }
 
 fn shutdownCdcRuntimeJobs(service: anytype) void {
@@ -8423,6 +8644,7 @@ pub fn snapshotStatusWithOptions(
 
     return .{
         .metadata_group_id = metadata_group_id,
+        .reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
         .metadata_incarnation = metadata_incarnation,
         .metadata_raft_local_node_id = metadata_raft.local_node_id,
         .metadata_raft_role = metadata_raft.role,
@@ -9739,6 +9961,12 @@ test "metadata service reports store status without losing placement attributes"
     });
     try svc.runRound();
 
+    var group_statuses = [_]metadata_table_manager.GroupStatusReport{.{
+        .group_id = 4201,
+        .disk_bytes = 4096,
+        .disk_bytes_known = true,
+        .updated_at_millis = 1_700_000_000_000,
+    }};
     try svc.reportStoreStatus(.{
         .store_id = 11,
         .live = false,
@@ -9750,6 +9978,25 @@ test "metadata service reports store status without losing placement attributes"
         .write_load = 130,
         .active_backfills = 2,
         .backfill_progress_millis = 375,
+        .group_statuses = group_statuses[0..],
+    });
+    try svc.runRound();
+
+    // The acknowledgement itself must be enough to publish another store
+    // record even when all coalesced status and capacity fields are unchanged.
+    group_statuses[0].observed_reallocation_request_id = 0x123456789abcdef00123456789abcdef;
+    try svc.reportStoreStatus(.{
+        .store_id = 11,
+        .live = false,
+        .health_class = "degraded",
+        .capacity_bytes = 2048,
+        .available_bytes = 0,
+        .lease_pressure = 92,
+        .read_load = 210,
+        .write_load = 130,
+        .active_backfills = 2,
+        .backfill_progress_millis = 375,
+        .group_statuses = group_statuses[0..],
     });
     try svc.runRound();
 
@@ -9770,6 +10017,11 @@ test "metadata service reports store status without losing placement attributes"
     try std.testing.expectEqual(@as(u32, 130), projected[0].write_load);
     try std.testing.expectEqual(@as(u32, 2), projected[0].active_backfills);
     try std.testing.expectEqual(@as(u16, 375), projected[0].backfill_progress_millis);
+    try std.testing.expectEqual(@as(usize, 1), projected[0].group_statuses.len);
+    try std.testing.expectEqual(
+        @as(u128, 0x123456789abcdef00123456789abcdef),
+        projected[0].group_statuses[0].observed_reallocation_request_id,
+    );
 
     const status = try svc.status();
     try std.testing.expectEqual(@as(usize, 1), status.backfill_stores);
@@ -9970,7 +10222,7 @@ test "metadata service persists and clears reallocation requests" {
         .bootstrap_mode = .empty,
     });
     try svc.campaignMetadataGroup();
-    try svc.runRound();
+    try runServiceRoundsUntilMetadataReady(&svc);
 
     try svc.requestReallocation(77_000);
     try svc.runRound();
@@ -9978,6 +10230,17 @@ test "metadata service persists and clears reallocation requests" {
     try std.testing.expect(requested != null);
     try std.testing.expect(requested.?.request_id != 0);
     try std.testing.expectEqual(@as(u64, 77_000), requested.?.requested_at_ms);
+    try std.testing.expectEqual(metadata_reallocation_request.barrier_protocol_version, requested.?.barrier_protocol_version);
+    try std.testing.expectEqual(try svc.metadataIncarnation(), requested.?.metadata_incarnation);
+    try std.testing.expectEqual(@as(u32, 1), requested.?.protected_metadata_member_count);
+    try std.testing.expectEqualSlices(
+        u8,
+        &metadata_reallocation_request.membershipFingerprint(&.{1}),
+        &requested.?.protected_metadata_membership_fingerprint,
+    );
+    var requested_snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&requested_snapshot);
+    try std.testing.expectEqual(requested, requested_snapshot.reallocation_request);
 
     var stale_plan = metadata_reconciler.ReconciliationPlan.empty();
     stale_plan.clear_reallocation_request = requested.?.request_id;
@@ -12070,6 +12333,23 @@ test "metadata http service catalog cache is independent from volatile projectio
     defer svc.freeProjectedTables(std.testing.allocator, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
     try std.testing.expectEqual(catalog_epoch_after, svc.catalog_validation_cache.catalog_epoch);
+
+    var incarnation_rounds: usize = 0;
+    while (try svc.metadataIncarnation() == null and incarnation_rounds < 32) : (incarnation_rounds += 1) {
+        try svc.runRound();
+    }
+    try std.testing.expect(try svc.metadataIncarnation() != null);
+    try svc.requestReallocation(77_000);
+    try svc.runRound();
+    var admin_snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&admin_snapshot);
+    try std.testing.expect(admin_snapshot.reallocation_request != null);
+    try std.testing.expectEqual(@as(u64, 77_000), admin_snapshot.reallocation_request.?.requested_at_ms);
+    try std.testing.expectEqual(
+        metadata_reallocation_request.barrier_protocol_version,
+        admin_snapshot.reallocation_request.?.barrier_protocol_version,
+    );
+    try std.testing.expectEqual(try svc.metadataIncarnation(), admin_snapshot.reallocation_request.?.metadata_incarnation);
 }
 
 test "metadata http service linearizable read waits for leader discovery" {

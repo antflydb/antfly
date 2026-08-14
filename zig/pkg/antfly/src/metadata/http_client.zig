@@ -78,6 +78,14 @@ pub const MetadataHttpClient = struct {
         return try self.getJsonValue(metadata_api.MetadataStatus, base_uri, routes.Routes.status);
     }
 
+    pub fn fetchStatusWithBudget(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: RequestBudget,
+    ) !metadata_api.MetadataStatus {
+        return try self.getJsonValueWithBudget(metadata_api.MetadataStatus, base_uri, routes.Routes.status, budget);
+    }
+
     pub fn fetchHead(self: *MetadataHttpClient, base_uri: []const u8) !metadata_api.MetadataHead {
         return try self.fetchHeadWithBudget(base_uri, null);
     }
@@ -171,7 +179,19 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn triggerReallocate(self: *MetadataHttpClient, base_uri: []const u8) !void {
-        try self.postNoContent(base_uri, routes.Routes.internal_reallocate, "");
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_reallocate_v2);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeWithRetry(.{
+            .method = .POST,
+            .uri = uri,
+            .body = "",
+            .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
+        });
+        defer resp.deinit(self.alloc);
+        if (resp.status == 503) return error.ReallocationProtocolUpgradeRequired;
+        try mapStatus(resp.status, null, null, null);
     }
 
     pub fn upsertNode(
@@ -538,10 +558,6 @@ pub const MetadataHttpClient = struct {
         return try std.json.parseFromSliceLeaky(T, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
     }
 
-    fn postNoContent(self: *MetadataHttpClient, base_uri: []const u8, path: []const u8, body: []const u8) !void {
-        try self.requestWithBody(base_uri, .POST, path, body, null, null, null);
-    }
-
     fn requestWithBody(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -713,6 +729,34 @@ fn nodeStatusRouteForBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     });
 }
 
+test "metadata http client uses the versioned reallocation route and maps upgrade gating" {
+    const UpgradeRequiredExecutor = struct {
+        fn executor(_: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_reallocate_v2));
+            return .{
+                .status = 503,
+                .content_type = try alloc.dupe(u8, "text/plain"),
+                .body = try alloc.dupe(u8, "metadata voter upgrade required"),
+            };
+        }
+    };
+
+    var executor = UpgradeRequiredExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(
+        error.ReallocationProtocolUpgradeRequired,
+        client.triggerReallocate("http://127.0.0.1:9000"),
+    );
+}
+
 test "metadata http client retries transient connection close on fetch status" {
     const FlakyExecutor = struct {
         attempts: usize = 0,
@@ -780,6 +824,7 @@ test "metadata http client retries bounded timeout on fetch status" {
     var client = MetadataHttpClient.init(std.testing.allocator, timeout_executor.executor());
     const status = try client.fetchStatus("http://127.0.0.1:9000");
     try std.testing.expectEqual(@as(u64, 88), status.metadata_group_id);
+    try std.testing.expectEqual(@as(u16, 0), status.reallocation_barrier_protocol_version);
     try std.testing.expectEqual(@as(usize, 2), timeout_executor.attempts);
 }
 
@@ -982,9 +1027,9 @@ test "metadata http client percent-encodes artifact enrichment path components" 
 }
 
 test "metadata http client round-trips server endpoints" {
+    const httpx = @import("httpx");
     const metadata_http_server = @import("http_server.zig");
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 
     const FakeSource = struct {
         reallocate_count: usize = 0,
@@ -1222,11 +1267,27 @@ test "metadata http client round-trips server endpoints" {
 
     var source = FakeSource{};
     var server = metadata_http_server.MetadataHttpServer.init(std.heap.page_allocator, .{}, source.iface());
-    var listener = std_http_listener.StdHttpListener.init(std.heap.page_allocator, .{}, server.executor());
+    var server_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer server_io.deinit();
+    var listener = httpx.Server.initWithConfig(std.heap.page_allocator, server_io.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
     defer listener.deinit();
-    try listener.start();
+    try server.registerRoutes(&listener);
+    try listener.bind();
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn listen(http_server: *httpx.Server) void {
+            http_server.listen() catch |err| std.debug.panic("metadata httpx test listener failed: {s}", .{@errorName(err)});
+        }
+    }.listen, .{&listener});
+    defer {
+        listener.stop();
+        listener_thread.join();
+    }
 
-    const base_uri = try listener.baseUri(std.heap.page_allocator);
+    const address = listener.boundAddress() orelse return error.AddressNotAvailable;
+    const base_uri = try std.fmt.allocPrint(std.heap.page_allocator, "http://127.0.0.1:{d}", .{address.ip4.port});
     defer std.heap.page_allocator.free(base_uri);
 
     var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
@@ -1258,6 +1319,8 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectEqual(@as(usize, 1), active.value.merge.len);
 
     try client.triggerReallocate(base_uri);
+    try std.testing.expectError(error.UnsupportedOperation, client.restoreExtensions(base_uri, "{}"));
+    try std.testing.expectError(error.UnsupportedOperation, client.enableExtension(base_uri, "memoryaf"));
     try client.createTable(base_uri, "docs", "{\"description\":\"docs table\"}");
     try client.updateSchema(base_uri, "docs", "{\"kind\":\"demo\"}");
     try client.createIndex(base_uri, "docs", "embed_idx", "{\"type\":\"managed_embeddings\"}");

@@ -148,6 +148,7 @@ fn groupStatusEqual(
         lhs.empty == rhs.empty and
         lhs.created_at_millis == rhs.created_at_millis and
         timestampMillisCoalesced(lhs.updated_at_millis, rhs.updated_at_millis) and
+        lhs.observed_reallocation_request_id == rhs.observed_reallocation_request_id and
         lhs.local_leader == rhs.local_leader and
         lhs.local_voter == rhs.local_voter and
         lhs.voter_count == rhs.voter_count and
@@ -474,6 +475,12 @@ test "store observer coalesces status heartbeat timestamps" {
         .group_statuses = fresh_groups[0..],
     };
     try std.testing.expect(!observationChangesRecord(existing, observation));
+
+    // Causal acknowledgements are state transitions, not heartbeats. They
+    // must bypass timestamp coalescing even when every storage fact is stable.
+    fresh_groups[0].observed_reallocation_request_id = 0x1234;
+    try std.testing.expect(observationChangesRecord(existing, observation));
+    fresh_groups[0].observed_reallocation_request_id = 0;
 
     observation.group_statuses = stale_groups[0..];
     try std.testing.expect(observationChangesRecord(existing, observation));

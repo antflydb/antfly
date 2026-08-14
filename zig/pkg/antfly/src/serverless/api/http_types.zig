@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const cancellation_mod = @import("../../common/cancellation.zig");
 const http_routes = @import("http_routes.zig");
 
 const Allocator = std.mem.Allocator;
@@ -21,12 +22,20 @@ pub const HttpRequest = struct {
     method: http_routes.HttpMethod,
     path: []const u8,
     body: []const u8 = "",
+    /// Borrowed from the listener and valid only while `handle` is running.
+    /// Application work must not retain this callback beyond the request.
+    cancellation: cancellation_mod.CancellationToken = .none,
+
+    pub fn ensureActive(self: HttpRequest) !void {
+        return self.cancellation.check();
+    }
 };
 
 pub const HttpResponse = struct {
     status: u16,
     content_type: []u8,
     body: []u8,
+    retry_after_seconds: ?u32 = null,
 
     pub fn deinit(self: *HttpResponse, alloc: Allocator) void {
         alloc.free(self.content_type);

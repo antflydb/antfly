@@ -60,7 +60,6 @@ pub const Routes = struct {
     pub const extension_disable_suffix = "/disable";
     pub const extension_objects_suffix = "/objects";
     pub const extension_config_suffix = "/config";
-    pub const agent_card_legacy = "/.well-known/agent.json";
     pub const agent_card = "/.well-known/agent-card.json";
     pub const backup = "/backup";
     pub const restore = "/restore";
@@ -434,6 +433,28 @@ pub const Routes = struct {
         txn_id: []const u8,
         savepoint_id: u64,
     };
+
+    pub const InferenceConnectionInvocation = struct {
+        connection_id: []const u8,
+        operation: []const u8,
+    };
+
+    pub fn matchInferenceConnectionInvocation(path: []const u8) ?InferenceConnectionInvocation {
+        const prefix = connections ++ "/";
+        if (!std.mem.startsWith(u8, path, prefix)) return null;
+        const rest = path[prefix.len..];
+        const marker = "/inference/";
+        const marker_index = std.mem.indexOf(u8, rest, marker) orelse return null;
+        const connection_id = rest[0..marker_index];
+        const operation = rest[marker_index + marker.len ..];
+        if (connection_id.len == 0 or operation.len == 0 or
+            std.mem.indexOfScalar(u8, connection_id, '/') != null or
+            std.mem.indexOfScalar(u8, operation, '/') != null)
+        {
+            return null;
+        }
+        return .{ .connection_id = connection_id, .operation = operation };
+    }
 
     pub fn matchTableLookup(path: []const u8) ?TableLookup {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;

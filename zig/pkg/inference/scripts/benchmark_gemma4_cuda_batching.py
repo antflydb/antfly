@@ -154,7 +154,7 @@ class Server:
             json.dumps(
                 {
                     "models_dir": str(self.args.models_dir),
-                    "max_concurrent_requests": 32,
+                    "admission": {"inference": {"max_concurrent_requests": 32}},
                     "generation_batching": {
                         "mode": self.mode,
                         "max_step_items": self.args.max_step_items,

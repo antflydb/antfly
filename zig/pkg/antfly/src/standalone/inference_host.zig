@@ -15,19 +15,20 @@
 //! Embedded inference lifecycle and provider adapters. This module is compiled
 //! once in the inference archive and used directly only by non-linked tests.
 
-const builtin = @import("builtin");
 const std = @import("std");
 const httpx = @import("httpx");
 const antfly = @import("inference_host_root.zig");
 const inference = @import("inference_server");
 const inference_bridge = @import("inference_bridge.zig");
 const http_abi = @import("../runtime_http_abi.zig");
-
-extern fn antfly_distributed_inference_httpx_register(context: *const inference_bridge.RouteContext) callconv(.c) inference_bridge.Status;
+const platform_sync = @import("antfly_platform").sync;
+const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const inference_api = @import("inference_api");
 
 pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
-    io_impl: std.Io.Threaded,
+    /// Host-owned interface protected by standalone's inference-lane lease.
+    io: std.Io,
     node: inference.server.Node,
     warm_models: ResolvedWarmModels,
     content_security: ?std.json.Parsed(antfly.common.config.Config.ContentSecurityConfig),
@@ -37,6 +38,10 @@ pub const LinkedInferenceState = struct {
     owned_ml_dir: ?[]u8,
     resource_budget: ?inference_bridge.ResourceBudget = null,
     routes: std.ArrayListUnmanaged(*RouteState) = .empty,
+    route_manifest: std.ArrayListUnmanaged(inference_bridge.RouteManifestEntry) = .empty,
+    route_validator: httpx.Router,
+    route_manifest_mutex: std.atomic.Mutex = .unlocked,
+    route_manifest_ready: bool = false,
 };
 
 const InferenceRuntimeConfig = struct {
@@ -60,6 +65,30 @@ const ProviderResponseState = struct {
     alloc: std.mem.Allocator,
     json: []u8,
 };
+
+test "standalone linked inference ABI validates the supported function-table prefix" {
+    try std.testing.expect(inference_bridge.validContext(
+        inference_bridge.RouteManifestContext,
+        inference_bridge.abi_version,
+        @sizeOf(inference_bridge.RouteManifestContext),
+    ));
+    try std.testing.expect(!inference_bridge.validContext(
+        inference_bridge.RouteManifestContext,
+        inference_bridge.abi_version - 1,
+        @sizeOf(inference_bridge.RouteManifestContext),
+    ));
+
+    var table: inference_bridge.FunctionTable = undefined;
+    table.abi_version = inference_bridge.abi_version;
+    table.struct_size = @sizeOf(inference_bridge.FunctionTable);
+    table.capabilities = inference_bridge.Capability.provider;
+    try std.testing.expect(inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
+    try std.testing.expect(!inference_bridge.validFunctionTable(&table, inference_bridge.Capability.route_manifest));
+    table.struct_size = inference_bridge.requiredFunctionTableSize(inference_bridge.Capability.provider).? - 1;
+    try std.testing.expect(!inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
+    table.struct_size = inference_bridge.requiredFunctionTableSize(inference_bridge.Capability.provider).?;
+    try std.testing.expect(inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
+}
 
 const ModelTextsRequest = struct {
     model: []const u8,
@@ -193,6 +222,7 @@ test "standalone inference keep alive parses compound durations and zero" {
 pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*anyopaque {
     const data_dir = context.data_dir_ptr[0..context.data_dir_len];
     const alloc = std.heap.c_allocator;
+    const io = try context.executor.get();
 
     var content_security = if (context.content_security_json.slice()) |json|
         try std.json.parseFromSlice(antfly.common.config.Config.ContentSecurityConfig, alloc, json, .{ .ignore_unknown_fields = true })
@@ -254,7 +284,7 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
 
     state.* = .{
         .alloc = alloc,
-        .io_impl = std.Io.Threaded.init(alloc, .{}),
+        .io = io,
         .node = undefined,
         .warm_models = warm_models,
         .content_security = content_security,
@@ -262,16 +292,21 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
         .runtime_config = runtime_config,
         .owned_models_dir = owned_models_dir,
         .owned_ml_dir = owned_ml_dir,
+        .route_validator = httpx.Router.init(alloc),
     };
-    errdefer state.io_impl.deinit();
+    errdefer state.route_validator.deinit();
     state.node = try inference.server.Node.init(alloc, node_config);
-    state.node.attachIo(state.io_impl.io());
+    state.node.attachIo(state.io);
     return state;
 }
 
 pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContext) !void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
-    if (context.resource_budget.abi_version != inference_bridge.abi_version)
+    if (!inference_bridge.validContext(
+        inference_bridge.ResourceBudget,
+        context.resource_budget.abi_version,
+        context.resource_budget.struct_size,
+    ))
         return error.UnsupportedVersion;
     state.resource_budget = context.resource_budget.*;
     state.node.configureAdmissionResourceBudget(inferenceAdmissionResourceBudget(state));
@@ -299,7 +334,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             var parsed = try std.json.parseFromSlice(ModelTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
             const result = if (operation == .embed_dense_texts_with_context)
-                try state.node.embedDenseTextsDirectWithContext(state.alloc, state.io_impl.io(), deadline_ns, parsed.value.model, parsed.value.texts)
+                try state.node.embedDenseTextsDirectWithContext(state.alloc, state.io, deadline_ns, parsed.value.model, parsed.value.texts)
             else
                 try state.node.embedDenseTextsDirect(state.alloc, parsed.value.model, parsed.value.texts);
             defer {
@@ -326,7 +361,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 alloc,
                 parsed.value.model,
                 parsed.value.parts,
-                state.io_impl.io(),
+                state.io,
                 if (operation == .embed_dense_parts_with_context) deadline_ns else null,
             );
             defer {
@@ -386,7 +421,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             break :blk try std.json.Stringify.valueAlloc(alloc, result.json, .{});
         },
         .list_models_json => blk: {
-            const result = try state.node.listModelsJsonAlloc(alloc, state.io_impl.io());
+            const result = try state.node.listModelsJsonAlloc(alloc, state.io);
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
@@ -405,66 +440,165 @@ pub fn linkedInferenceDestroyProviderResponse(handle: *anyopaque) void {
     alloc.destroy(response);
 }
 
-pub fn linkedInferenceRegisterRoutes(context: *const inference_bridge.RoutesContext) !void {
-    const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
-    var registrar = BoundaryServer{
-        .owner = state,
-        .registrar_handle = context.registrar_handle,
-    };
+pub fn linkedInferenceRegisterRoutesOn(handle: *anyopaque, server: *httpx.Server) !void {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    var registrar = DirectServer{ .owner = state, .server = server };
     try state.node.registerRoutesOn(inference.server.public_api_prefix, &registrar);
     try state.node.registerAiRoutesOn(inference.server.ai_api_prefix, &registrar);
 }
 
-const BoundaryServer = struct {
-    owner: *LinkedInferenceState,
-    registrar_handle: *anyopaque,
+pub fn linkedInferenceRouteManifest(context: *const inference_bridge.RouteManifestContext) !void {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
+    platform_sync.lockYielding(&state.route_manifest_mutex);
+    defer state.route_manifest_mutex.unlock();
+    if (!state.route_manifest_ready) {
+        const routes_start = state.routes.items.len;
+        const manifest_start = state.route_manifest.items.len;
+        var manifest = ManifestServer{ .owner = state };
+        state.node.registerRoutesOn(inference.server.public_api_prefix, &manifest) catch |err| {
+            rollbackRouteManifest(state, routes_start, manifest_start);
+            return err;
+        };
+        state.node.registerAiRoutesOn(inference.server.ai_api_prefix, &manifest) catch |err| {
+            rollbackRouteManifest(state, routes_start, manifest_start);
+            return err;
+        };
+        state.route_manifest_ready = true;
+    }
+    context.out_entries.* = if (state.route_manifest.items.len == 0) null else state.route_manifest.items.ptr;
+    context.out_len.* = state.route_manifest.items.len;
+}
 
-    fn register(self: *const BoundaryServer, method: http_abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
+fn rollbackRouteManifest(state: *LinkedInferenceState, routes_start: usize, manifest_start: usize) void {
+    for (state.routes.items[routes_start..]) |route| state.alloc.destroy(route);
+    state.routes.shrinkRetainingCapacity(routes_start);
+    state.route_manifest.shrinkRetainingCapacity(manifest_start);
+    state.route_validator.deinit();
+    state.route_validator = httpx.Router.init(state.alloc);
+}
+
+const ManifestServer = struct {
+    owner: *LinkedInferenceState,
+
+    fn register(self: *const ManifestServer, method: http_abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
+        const metadata = routeMetadata(method, path);
+        self.owner.route_validator.add(switch (method) {
+            .get => .GET,
+            .post => .POST,
+            .put => .PUT,
+            .delete => .DELETE,
+        }, path, handler) catch |err| {
+            std.log.err("linked inference route manifest rejected method={s} path={s} err={}", .{
+                @tagName(method),
+                path,
+                err,
+            });
+            return err;
+        };
         const route = try self.owner.alloc.create(RouteState);
         errdefer self.owner.alloc.destroy(route);
         route.* = .{ .owner = self.owner, .handler = handler };
         try self.owner.routes.append(self.owner.alloc, route);
         errdefer _ = self.owner.routes.pop();
-        if (comptime builtin.is_test) {
-            const server: *httpx.Server = @ptrCast(@alignCast(self.registrar_handle));
-            try server.routeWithData(switch (method) {
-                .get => .GET,
-                .post => .POST,
-                .put => .PUT,
-                .delete => .DELETE,
-            }, path, localInferenceHttpHandler, route);
-        } else {
-            const status = antfly_distributed_inference_httpx_register(&.{
-                .abi_version = inference_bridge.abi_version,
-                .registrar_handle = self.registrar_handle,
-                .route_handle = route,
-                .method = method,
-                .path = http_abi.Bytes.init(path),
-            });
-            if (!status.isOk()) return inference_bridge.errorFromStatus(status);
-        }
+        try self.owner.route_manifest.append(self.owner.alloc, .{
+            .route_handle = route,
+            .method = method,
+            .path = http_abi.Bytes.init(path),
+            .request_body = metadata.request_body,
+            .streaming_response = @intFromBool(metadata.streaming_response),
+        });
     }
 
-    pub fn get(self: *const BoundaryServer, comptime path: []const u8, handler: httpx.Handler) !void {
+    pub fn get(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
         try self.register(.get, path, handler);
     }
 
-    pub fn post(self: *const BoundaryServer, comptime path: []const u8, handler: httpx.Handler) !void {
+    pub fn post(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
         try self.register(.post, path, handler);
     }
 
-    pub fn put(self: *const BoundaryServer, comptime path: []const u8, handler: httpx.Handler) !void {
+    pub fn put(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
         try self.register(.put, path, handler);
     }
 
-    pub fn delete(self: *const BoundaryServer, comptime path: []const u8, handler: httpx.Handler) !void {
+    pub fn delete(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.delete, path, handler);
+    }
+};
+
+const RouteMetadata = struct {
+    request_body: http_abi.RequestBodyMode,
+    streaming_response: bool,
+};
+
+fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
+    const method_name = switch (method) {
+        .get => "GET",
+        .post => "POST",
+        .put => "PUT",
+        .delete => "DELETE",
+    };
+    const relative_path = if (std.mem.startsWith(u8, path, inference.server.public_api_prefix))
+        path[inference.server.public_api_prefix.len..]
+    else if (std.mem.startsWith(u8, path, inference.server.ai_api_prefix))
+        path[inference.server.ai_api_prefix.len..]
+    else
+        path;
+    for (inference_api.server.routes) |route| {
+        if (std.mem.eql(u8, route.method, method_name) and std.mem.eql(u8, route.path, relative_path)) {
+            return .{
+                .request_body = switch (route.request_body) {
+                    .none => .none,
+                    .buffered => .buffered,
+                },
+                .streaming_response = route.streaming_response,
+            };
+        }
+    }
+    return .{
+        .request_body = if (method == .get) .none else .buffered,
+        .streaming_response = false,
+    };
+}
+
+const DirectServer = struct {
+    owner: *LinkedInferenceState,
+    server: *httpx.Server,
+
+    fn register(self: *const DirectServer, method: http_abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
+        const route = try self.owner.alloc.create(RouteState);
+        errdefer self.owner.alloc.destroy(route);
+        route.* = .{ .owner = self.owner, .handler = handler };
+        try self.owner.routes.append(self.owner.alloc, route);
+        errdefer _ = self.owner.routes.pop();
+        try self.server.routeWithData(switch (method) {
+            .get => .GET,
+            .post => .POST,
+            .put => .PUT,
+            .delete => .DELETE,
+        }, path, localInferenceHttpHandler, route);
+    }
+
+    pub fn get(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.get, path, handler);
+    }
+
+    pub fn post(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.post, path, handler);
+    }
+
+    pub fn put(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.put, path, handler);
+    }
+
+    pub fn delete(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
         try self.register(.delete, path, handler);
     }
 };
 
 fn localInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     const route: *RouteState = @ptrCast(@alignCast(context.route_data orelse return error.InferenceRouteUnavailable));
-    return route.handler(context);
+    return route.handler.invoke(context);
 }
 
 pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleContext) !void {
@@ -497,10 +631,11 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
         params[i] = .{ .name = param.name.slice(), .value = param.value.slice() };
     }
 
-    var http_context = httpx.Context.init(alloc, state.io_impl.io(), &http_request);
+    var http_context = httpx.Context.init(alloc, state.io, &http_request);
     defer http_context.deinit();
     http_context.params = params;
-    var response = try route.handler(&http_context);
+    runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
+    var response = try route.handler.invoke(&http_context);
     errdefer response.deinit();
 
     const response_state = try alloc.create(HttpResponseState);
@@ -533,6 +668,27 @@ pub fn linkedInferenceDestroyHttpResponse(handle: *anyopaque) void {
     alloc.destroy(state);
 }
 
+pub fn linkedInferenceTryAcquireRequest(handle: *anyopaque) bool {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    return state.node.tryAcquireRequestSlot();
+}
+
+pub fn linkedInferenceReleaseRequest(handle: *anyopaque) void {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    state.node.releaseRequestSlot();
+}
+
+pub fn linkedInferenceRequestAdmissionStats(handle: *anyopaque) inference_bridge.RequestAdmissionStats {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    const stats = state.node.inference_admission.stats();
+    return .{
+        .capacity = stats.capacity_requests,
+        .in_flight = stats.in_flight_requests,
+        .peak_in_flight = stats.peak_in_flight_requests,
+        .rejected_total = stats.rejected_requests_total,
+    };
+}
+
 pub fn linkedInferenceDestroy(handle: *anyopaque) void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
     const alloc = state.alloc;
@@ -540,32 +696,15 @@ pub fn linkedInferenceDestroy(handle: *anyopaque) void {
     state.node.deinit();
     for (state.routes.items) |route| alloc.destroy(route);
     state.routes.deinit(alloc);
+    state.route_manifest.deinit(alloc);
+    state.route_validator.deinit();
     state.warm_models.deinit(alloc);
     if (state.content_security) |*parsed| parsed.deinit();
     if (state.s3_credentials) |*parsed| parsed.deinit();
     state.runtime_config.deinit();
     if (state.owned_models_dir) |path| alloc.free(path);
     if (state.owned_ml_dir) |path| alloc.free(path);
-    state.io_impl.deinit();
     alloc.destroy(state);
-}
-
-fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_embedder.AntflyProvider {
-    return .{
-        .ptr = node,
-        .embed_dense_texts = localAntflyEmbedDenseTexts,
-        .embed_dense_texts_with_context = localAntflyEmbedDenseTextsWithContext,
-        .embed_sparse_texts = localAntflyEmbedSparseTexts,
-        .embed_dense_parts = localAntflyEmbedDenseParts,
-        .embed_dense_parts_with_context = localAntflyEmbedDensePartsWithContext,
-        .rerank_texts = localAntflyRerankTexts,
-        .generate_text = localAntflyGenerateText,
-        .generate_messages = localAntflyGenerateMessages,
-        .read_images = localAntflyReadImages,
-        .transcribe_audio = localAntflyTranscribeAudio,
-        .extract = localAntflyExtract,
-        .list_models_json = localAntflyListModelsJson,
-    };
 }
 
 fn promptCacheResourceUsageObserver(state: *LinkedInferenceState) inference.runtime.kv.prompt_cache.ResourceUsageObserver {
@@ -693,13 +832,6 @@ fn releaseTokenizerCacheBytes(context: *anyopaque, bytes: usize) void {
     budget.release_tokenizer_cache(budget.context, bytes);
 }
 
-fn localAntflyListModelsJson(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    return try node.listModelsJsonAlloc(alloc, io_impl.io());
-}
-
 fn localAntflyEmbedDenseTexts(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
@@ -719,17 +851,6 @@ fn localAntflyEmbedDenseTextsWithContext(
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     return try node.embedDenseTextsDirectWithContext(alloc, context.io, context.deadline_ns, model, texts);
-}
-
-fn localAntflyEmbedDenseParts(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    parts: []const antfly.template.ContentPart,
-) anyerror![][]f32 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    return try localAntflyEmbedDensePartsWithExecutionContext(ptr, alloc, model, parts, io_impl.io(), null);
 }
 
 fn localAntflyEmbedDensePartsWithExecutionContext(

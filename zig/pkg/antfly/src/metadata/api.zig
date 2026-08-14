@@ -22,11 +22,14 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const raft_service = @import("../raft/service.zig");
 const transition_state = @import("transition_state.zig");
 const metadata_incarnation = @import("incarnation.zig");
+const reallocation_request = @import("reallocation_request.zig");
 
 pub const MetadataClusterIncarnation = metadata_incarnation.MetadataClusterIncarnation;
 
 pub const MetadataStatus = struct {
     metadata_group_id: u64,
+    /// Zero means the peer predates the causal reallocation barrier.
+    reallocation_barrier_protocol_version: u16 = 0,
     metadata_incarnation: ?MetadataClusterIncarnation = null,
     metadata_epoch: u64 = 0,
     metadata_raft_local_node_id: u64 = 0,
@@ -142,6 +145,7 @@ pub const ReplicationSourceActionHint = struct {
 
 pub const AdminSnapshot = struct {
     status: MetadataStatus,
+    reallocation_request: ?reallocation_request.ReallocationRequestRecord = null,
     tables: []table_manager.TableRecord,
     ranges: []table_manager.RangeRecord,
     nodes: []table_manager.NodeRecord = &.{},
@@ -526,6 +530,9 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
         .merge_transitions = &.{},
     };
     errdefer freeSnapshot(alloc, source, &snapshot);
+    if (@hasDecl(SourceDeclType, "getProjectedReallocationRequest")) {
+        snapshot.reallocation_request = try source.getProjectedReallocationRequest();
+    }
     snapshot.tables = try source.listProjectedTables(alloc);
     snapshot.ranges = try source.listProjectedRanges(alloc);
     if (@hasDecl(SourceDeclType, "listProjectedNodes")) {

@@ -1,4 +1,6 @@
 import {
+  Alert,
+  AlertDescription,
   DashboardPage,
   DashboardPageDescription,
   DashboardPageHeader,
@@ -6,17 +8,20 @@ import {
 } from "@antfly/design-system";
 import type { IndexConfig } from "@antfly/sdk";
 import type React from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { TableSchema } from "../api";
 import TableSchemaForm from "../components/schema-builder/TableSchemaForm";
 import { useApi } from "../hooks/use-api-config";
 import { useTable } from "../hooks/use-table";
+import { buildCreateTableRequest, createTableErrorMessage } from "../lib/create-table";
 
 const CreateTablePage: React.FC = () => {
   const theme = localStorage.getItem("theme") || "light";
   const navigate = useNavigate();
   const api = useApi();
   const { refreshTables, setSelectedTable } = useTable();
+  const [createError, setCreateError] = useState<string | null>(null);
 
   const handleCreateTable = async (data: {
     name: string;
@@ -24,14 +29,9 @@ const CreateTablePage: React.FC = () => {
     num_shards: number;
     indexes: IndexConfig[];
   }) => {
+    setCreateError(null);
     try {
-      const requestBody = {
-        num_shards: data.num_shards,
-        schema: {
-          version: 0,
-          ...data.schema,
-        },
-      };
+      const requestBody = buildCreateTableRequest(data.num_shards, data.schema);
       await api.tables.create(data.name, requestBody);
       for (const index of data.indexes) {
         await api.indexes.create(data.name, index);
@@ -41,6 +41,7 @@ const CreateTablePage: React.FC = () => {
       navigate("/");
     } catch (error) {
       console.error("Failed to create table:", error);
+      setCreateError(createTableErrorMessage(error));
     }
   };
 
@@ -56,6 +57,11 @@ const CreateTablePage: React.FC = () => {
           </div>
         </DashboardPageHeader>
       </div>
+      {createError && (
+        <Alert variant="destructive" className="mb-4">
+          <AlertDescription>{createError}</AlertDescription>
+        </Alert>
+      )}
       <TableSchemaForm onSubmit={handleCreateTable} theme={theme} />
     </DashboardPage>
   );

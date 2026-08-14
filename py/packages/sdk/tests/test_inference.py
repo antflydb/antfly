@@ -128,7 +128,8 @@ def test_generate_stream_returns_typed_507_and_requires_done() -> None:
             list(chunks)
 
 
-def test_generate_returns_typed_capacity_error() -> None:
+@pytest.mark.parametrize("reason", ["inference_capacity", "inference_admission", "request_queue"])
+def test_generate_returns_typed_capacity_error(reason: str) -> None:
     client = AntflyClient("http://test")
     install_transport(
         client,
@@ -138,7 +139,7 @@ def test_generate_returns_typed_capacity_error() -> None:
                 json={
                     "error": "MODEL_RESOURCE_BUSY",
                     "message": "model resources are temporarily busy",
-                    "reason": "inference_capacity",
+                    "reason": reason,
                     "retryable": True,
                     "retry_after_ms": 1000,
                 },
@@ -150,7 +151,7 @@ def test_generate_returns_typed_capacity_error() -> None:
         client.generate(generation_request())
     assert exc_info.value.status_code == 503
     assert exc_info.value.code == "MODEL_RESOURCE_BUSY"
-    assert exc_info.value.reason == "inference_capacity"
+    assert exc_info.value.reason == reason
     assert exc_info.value.retry_after_ms == 1000
     assert exc_info.value.retryable is True
 

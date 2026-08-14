@@ -17,11 +17,6 @@ pub fn parseChunkTextBody(allocator: std.mem.Allocator, body: []const u8) !std.j
     return std.json.parseFromSlice(types.ChunkRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Parse the JSON request body for classifyText.
-pub fn parseClassifyTextBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ClassifyRequest) {
-    return std.json.parseFromSlice(types.ClassifyRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
 /// Parse the JSON request body for generateEmbeddings.
 pub fn parseGenerateEmbeddingsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.EmbedRequest) {
     return std.json.parseFromSlice(types.EmbedRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -78,29 +73,32 @@ pub fn parseTranscribeAudioBody(allocator: std.mem.Allocator, body: []const u8) 
 }
 
 /// Route metadata for all operations.
+pub const RequestBodyMode = enum { none, buffered };
+
 pub const Route = struct {
     method: []const u8,
     path: []const u8,
     operation_id: []const u8,
+    request_body: RequestBodyMode,
+    streaming_response: bool,
 };
 
 pub const routes = [_]Route{
-    .{ .method = "POST", .path = "/chat/completions", .operation_id = "chatCompletions" },
-    .{ .method = "POST", .path = "/chunk", .operation_id = "chunkText" },
-    .{ .method = "POST", .path = "/classify", .operation_id = "classifyText" },
-    .{ .method = "POST", .path = "/embed", .operation_id = "generateEmbeddings" },
-    .{ .method = "POST", .path = "/embeddings", .operation_id = "createEmbedding" },
-    .{ .method = "POST", .path = "/extract", .operation_id = "extract" },
-    .{ .method = "POST", .path = "/generate", .operation_id = "generateContent" },
-    .{ .method = "POST", .path = "/generate/batch", .operation_id = "generateBatchContent" },
-    .{ .method = "GET", .path = "/models", .operation_id = "listModels" },
-    .{ .method = "POST", .path = "/predict", .operation_id = "predict" },
-    .{ .method = "GET", .path = "/predictors", .operation_id = "listPredictors" },
-    .{ .method = "POST", .path = "/read", .operation_id = "readImages" },
-    .{ .method = "POST", .path = "/rerank", .operation_id = "rerankPrompts" },
-    .{ .method = "POST", .path = "/rerank_multimodal", .operation_id = "rerankMultimodalPrompts" },
-    .{ .method = "POST", .path = "/rewrite", .operation_id = "rewriteText" },
-    .{ .method = "POST", .path = "/transcribe", .operation_id = "transcribeAudio" },
+    .{ .method = "POST", .path = "/chat/completions", .operation_id = "chatCompletions", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "POST", .path = "/chunk", .operation_id = "chunkText", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/embed", .operation_id = "generateEmbeddings", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/embeddings", .operation_id = "createEmbedding", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/extract", .operation_id = "extract", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/generate", .operation_id = "generateContent", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "POST", .path = "/generate/batch", .operation_id = "generateBatchContent", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/models", .operation_id = "listModels", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/predict", .operation_id = "predict", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/predictors", .operation_id = "listPredictors", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/read", .operation_id = "readImages", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/rerank", .operation_id = "rerankPrompts", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/rerank_multimodal", .operation_id = "rerankMultimodalPrompts", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/rewrite", .operation_id = "rewriteText", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/transcribe", .operation_id = "transcribeAudio", .request_body = .buffered, .streaming_response = false },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -116,7 +114,6 @@ pub fn ServerRouter(comptime Impl: type) type {
     comptime {
         if (!@hasDecl(Impl, "chatCompletions")) @compileError("ServerRouter: Impl missing required method 'chatCompletions'");
         if (!@hasDecl(Impl, "chunkText")) @compileError("ServerRouter: Impl missing required method 'chunkText'");
-        if (!@hasDecl(Impl, "classifyText")) @compileError("ServerRouter: Impl missing required method 'classifyText'");
         if (!@hasDecl(Impl, "generateEmbeddings")) @compileError("ServerRouter: Impl missing required method 'generateEmbeddings'");
         if (!@hasDecl(Impl, "createEmbedding")) @compileError("ServerRouter: Impl missing required method 'createEmbedding'");
         if (!@hasDecl(Impl, "extract")) @compileError("ServerRouter: Impl missing required method 'extract'");
@@ -133,144 +130,118 @@ pub fn ServerRouter(comptime Impl: type) type {
     }
 
     return struct {
-        var active_impl: ?*Impl = null;
-
         impl: *Impl,
 
         pub fn init(impl: *Impl) @This() {
             return .{ .impl = impl };
         }
 
-        /// Register all routes on the server and activate the impl.
+        /// Register all routes on the server with explicit instance context.
         pub fn register(self: *const @This(), server: anytype) !void {
-            active_impl = self.impl;
-            try server.post("/chat/completions", chatCompletions);
-            try server.post("/chunk", chunkText);
-            try server.post("/classify", classifyText);
-            try server.post("/embed", generateEmbeddings);
-            try server.post("/embeddings", createEmbedding);
-            try server.post("/extract", extract);
-            try server.post("/generate", generateContent);
-            try server.post("/generate/batch", generateBatchContent);
-            try server.get("/models", listModels);
-            try server.post("/predict", predict);
-            try server.get("/predictors", listPredictors);
-            try server.post("/read", readImages);
-            try server.post("/rerank", rerankPrompts);
-            try server.post("/rerank_multimodal", rerankMultimodalPrompts);
-            try server.post("/rewrite", rewriteText);
-            try server.post("/transcribe", transcribeAudio);
+            try server.post("/chat/completions", httpx.Handler.bind(self.impl, chatCompletions));
+            try server.post("/chunk", httpx.Handler.bind(self.impl, chunkText));
+            try server.post("/embed", httpx.Handler.bind(self.impl, generateEmbeddings));
+            try server.post("/embeddings", httpx.Handler.bind(self.impl, createEmbedding));
+            try server.post("/extract", httpx.Handler.bind(self.impl, extract));
+            try server.post("/generate", httpx.Handler.bind(self.impl, generateContent));
+            try server.post("/generate/batch", httpx.Handler.bind(self.impl, generateBatchContent));
+            try server.get("/models", httpx.Handler.bind(self.impl, listModels));
+            try server.post("/predict", httpx.Handler.bind(self.impl, predict));
+            try server.get("/predictors", httpx.Handler.bind(self.impl, listPredictors));
+            try server.post("/read", httpx.Handler.bind(self.impl, readImages));
+            try server.post("/rerank", httpx.Handler.bind(self.impl, rerankPrompts));
+            try server.post("/rerank_multimodal", httpx.Handler.bind(self.impl, rerankMultimodalPrompts));
+            try server.post("/rewrite", httpx.Handler.bind(self.impl, rewriteText));
+            try server.post("/transcribe", httpx.Handler.bind(self.impl, transcribeAudio));
         }
 
         /// OpenAI Chat Completions endpoint
         /// POST /chat/completions
-        fn chatCompletions(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn chatCompletions(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.chatCompletions(ctx);
         }
 
         /// Chunk text into smaller segments
         /// POST /chunk
-        fn chunkText(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn chunkText(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.chunkText(ctx);
-        }
-
-        /// Classify text against candidate labels
-        /// POST /classify
-        fn classifyText(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.classifyText(ctx);
         }
 
         /// Create embeddings (alias of `/embeddings`)
         /// POST /embed
-        fn generateEmbeddings(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn generateEmbeddings(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.generateEmbeddings(ctx);
         }
 
         /// Create embeddings (OpenAI-compatible)
         /// POST /embeddings
-        fn createEmbedding(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn createEmbedding(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.createEmbedding(ctx);
         }
 
         /// Extract entities, relations, classifications, and structures
         /// POST /extract
-        fn extract(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn extract(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.extract(ctx);
         }
 
         /// Generate text using LLM (OpenAI-compatible)
         /// POST /generate
-        fn generateContent(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn generateContent(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.generateContent(ctx);
         }
 
         /// Generate text for a synchronous batch of requests
         /// POST /generate/batch
-        fn generateBatchContent(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn generateBatchContent(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.generateBatchContent(ctx);
         }
 
         /// List available models
         /// GET /models
-        fn listModels(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listModels(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.listModels(ctx);
         }
 
         /// Run a traditional ML predictor
         /// POST /predict
-        fn predict(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn predict(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.predict(ctx);
         }
 
         /// List Traditional ML predictors
         /// GET /predictors
-        fn listPredictors(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn listPredictors(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.listPredictors(ctx);
         }
 
         /// Read text from images (OCR/document understanding)
         /// POST /read
-        fn readImages(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn readImages(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.readImages(ctx);
         }
 
         /// Rerank prompts by relevance
         /// POST /rerank
-        fn rerankPrompts(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn rerankPrompts(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.rerankPrompts(ctx);
         }
 
         /// Rerank multimodal documents by relevance
         /// POST /rerank_multimodal
-        fn rerankMultimodalPrompts(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn rerankMultimodalPrompts(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.rerankMultimodalPrompts(ctx);
         }
 
         /// Rewrite text using Seq2Seq models
         /// POST /rewrite
-        fn rewriteText(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn rewriteText(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.rewriteText(ctx);
         }
 
         /// Transcribe audio to text (speech-to-text)
         /// POST /transcribe
-        fn transcribeAudio(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        fn transcribeAudio(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.transcribeAudio(ctx);
         }
     };
@@ -280,7 +251,6 @@ pub fn ServerRouter(comptime Impl: type) type {
 //
 //   fn chatCompletions(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn chunkText(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn classifyText(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn generateEmbeddings(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createEmbedding(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn extract(self: *Impl, ctx: *httpx.Context) !httpx.Response

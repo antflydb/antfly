@@ -96,6 +96,32 @@ pub const PlacementProvider = struct {
     }
 };
 
+/// Optional durable policy boundary for consensus membership. Returning false
+/// defers the proposal without mutating the desired intent, allowing the
+/// policy owner to release the fence and resume normal reconciliation later.
+pub const MembershipChangePermit = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        allows: *const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            voter_node_ids: []const u64,
+            learner_node_ids: []const u64,
+        ) bool,
+    };
+
+    pub fn allows(self: MembershipChangePermit, intent: PlacementIntent) bool {
+        return self.vtable.allows(
+            self.ptr,
+            intent.record.group_id,
+            intent.peer_node_ids,
+            intent.learner_node_ids,
+        );
+    }
+};
+
 pub const MemoryPlacementProvider = struct {
     alloc: std.mem.Allocator,
     intents: std.ArrayListUnmanaged(PlacementIntent) = .empty,
@@ -360,6 +386,7 @@ pub const Reconciler = struct {
     alloc: std.mem.Allocator,
     host: *host_mod.Host,
     provider: PlacementProvider,
+    membership_change_permit: ?MembershipChangePermit = null,
     last_intent_hashes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
 
     pub fn deinit(self: *Reconciler) void {
@@ -465,6 +492,9 @@ pub const Reconciler = struct {
         // the committed joint configuration first; the next reconcile round will
         // calculate any remaining delta from the resulting stable voter set.
         if (status.conf_state.voters_outgoing.len > 0) {
+            if (self.membership_change_permit) |permit| {
+                if (!permit.allows(intent)) return false;
+            }
             self.host.proposeConfChangeV2(intent.record.group_id, .{}) catch |err| return switch (err) {
                 error.PendingConfChange,
                 error.NotInJointState,
@@ -493,6 +523,9 @@ pub const Reconciler = struct {
         );
         defer self.alloc.free(changes);
         if (changes.len == 0) return false;
+        if (self.membership_change_permit) |permit| {
+            if (!permit.allows(intent)) return false;
+        }
 
         self.host.proposeConfChangeV2(intent.record.group_id, .{ .changes = changes }) catch |err| return switch (err) {
             error.PendingConfChange,
