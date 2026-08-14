@@ -257,6 +257,9 @@ fn runTextEncoderLayersTensor(
     defer allocator.free(attn_mask);
     @memset(attn_mask, 1);
 
+    var frame_active = try beginFlorenceMetalFrame(cb, .prefill);
+    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+
     var buf: [256]u8 = undefined;
     for (0..config.encoder_layers) |layer| {
         if (debug_cuda_session) std.log.info("florence: text encoder layer start {d}", .{layer});
@@ -271,6 +274,13 @@ fn runTextEncoderLayersTensor(
             logDebugStatsTensor(cb, allocator, label, hidden);
         }
         if (debug_cuda_session) std.log.info("florence: text encoder layer done {d}", .{layer});
+    }
+
+    if (frame_active) {
+        const submit_start = nowNs();
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        frame_active = false;
+        if (profile) logFlorenceProfile("text_encoder_frame_submit", submit_start);
     }
 
     hidden_owned = false;
@@ -491,6 +501,9 @@ pub fn decoderForwardIncrementalBatchStepFinalHiddenTensor(
     if (cache.self.preallocated and new_len > cache.self.capacity) return error.InvalidInputShape;
     const active_mask_len = std.math.mul(usize, batch, new_len) catch return error.InvalidInputShape;
     if (active_mask_len > cache.self_mask.len) return error.InvalidInputShape;
+
+    var frame_active = try beginFlorenceMetalFrame(cb, .decode);
+    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
     var hidden = try applyDecoderEmbeddingsAt(cb, allocator, config, token_ids, batch, 1, old_len);
     var hidden_live = true;
     errdefer if (hidden_live) cb.free(hidden);
@@ -525,6 +538,11 @@ pub fn decoderForwardIncrementalBatchStepFinalHiddenTensor(
         const normed = try cb.layerNorm(hidden, ln_w, ln_b, config.d_model, 1e-5);
         cb.free(hidden);
         hidden = normed;
+    }
+
+    if (frame_active) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        frame_active = false;
     }
 
     hidden_live = false;
@@ -574,6 +592,49 @@ pub fn decoderFusedTokenFromFinalHiddenTensor(
     suppress_tokens: []const i32,
 ) !?CT {
     return try cb.linearNoBiasArgmaxLastRowSuppressTensor(hidden, try lmHeadWeight(cb), 1, config.d_model, config.vocab_size, suppress_tokens);
+}
+
+/// Keeps the Florence LM head and suppressed argmax in one Metal frame, then
+/// returns only the selected token to the host. This avoids materializing and
+/// synchronizing the full vocabulary logits between two command buffers.
+pub fn decoderFusedTokenIdFromFinalHiddenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    suppress_tokens: []const i32,
+) !?u32 {
+    if (!platform.env.getenvBool("TERMITE_FLORENCE2_METAL_FUSED_LM_HEAD")) return null;
+    var frame_active = try beginFlorenceMetalFrame(cb, .decode);
+    if (!frame_active) return null;
+    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+
+    const token_ids = (try cb.linearNoBiasArgmaxRowsSuppress(
+        hidden,
+        try lmHeadWeight(cb),
+        1,
+        config.d_model,
+        config.vocab_size,
+        suppress_tokens,
+        allocator,
+    )) orelse {
+        try cb.decoderRuntimeCancelFrame();
+        frame_active = false;
+        return null;
+    };
+    defer allocator.free(token_ids);
+
+    // The Metal argmax consume path submits and closes the producer frame.
+    // Treat a still-active frame as an unsupported fused path instead of
+    // reading a token before the queued LM head has completed.
+    if (cb.decoderRuntimeHasActiveFrame()) {
+        try cb.decoderRuntimeCancelFrame();
+        frame_active = false;
+        return null;
+    }
+    frame_active = false;
+    if (token_ids.len != 1) return error.InvalidTensorShape;
+    return token_ids[0];
 }
 
 pub fn decoderFinalLogitsBiasIsZero(
@@ -663,6 +724,8 @@ pub fn buildDecoderCrossCache(
 
     const d_model = config.d_model;
     const enc_total = batch * enc_seq;
+    var frame_active = try beginFlorenceMetalFrame(cb, .prefill);
+    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
     var buf: [256]u8 = undefined;
     for (0..config.decoder_layers) |layer| {
         const k_weights = try decoderLinearWeights(cb, layer, "encoder_attn.k_proj", &buf);
@@ -671,6 +734,11 @@ pub fn buildDecoderCrossCache(
         keys[layer] = kv.first;
         values[layer] = kv.second;
         filled += 1;
+    }
+
+    if (frame_active) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        frame_active = false;
     }
 
     return .{ .keys = keys, .values = values };
@@ -800,13 +868,25 @@ fn visionEncoderForward(
             var hidden_owned = true;
             errdefer if (hidden_owned) cb.free(hidden);
 
+            var stage_frame_active = if (florenceMetalStageFramesEnabled())
+                try beginFlorenceMetalFrame(cb, .prefill)
+            else
+                false;
+            errdefer if (stage_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+
             for (0..depth) |layer| {
                 if (debug_cuda_session) std.log.info("florence: stage {d} davit layer {d} start", .{ stage, layer });
                 const layer_start = nowNs();
-                const next = try daViTBlock(cb, allocator, config, hidden, batch, stage_h, stage_w, stage, layer);
+                const next = try daViTBlockFramed(cb, allocator, config, hidden, batch, stage_h, stage_w, stage, layer);
                 if (profile) logFlorenceProfileStageLayer("vision_stage_davit_layer", stage, layer, layer_start);
                 hidden = next;
                 if (debug_cuda_session) std.log.info("florence: stage {d} davit layer {d} done", .{ stage, layer });
+            }
+            if (stage_frame_active) {
+                const submit_start = nowNs();
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                stage_frame_active = false;
+                if (profile) logFlorenceProfileStage("vision_stage_frame_submit", stage, submit_start);
             }
 
             if (stage + 1 == Config.stage_count) {
@@ -938,13 +1018,25 @@ fn visionEncoderForwardTensorTail(
         var hidden_owned = true;
         errdefer if (hidden_owned) cb.free(hidden);
 
+        var stage_frame_active = if (florenceMetalStageFramesEnabled())
+            try beginFlorenceMetalFrame(cb, .prefill)
+        else
+            false;
+        errdefer if (stage_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+
         for (0..depth) |layer| {
             if (debug_cuda_session) std.log.info("florence: stage {d} davit layer {d} start", .{ stage, layer });
             const layer_start = nowNs();
-            const next = try daViTBlock(cb, allocator, config, hidden, batch, stage_h, stage_w, stage, layer);
+            const next = try daViTBlockFramed(cb, allocator, config, hidden, batch, stage_h, stage_w, stage, layer);
             if (profile) logFlorenceProfileStageLayer("vision_stage_davit_layer", stage, layer, layer_start);
             hidden = next;
             if (debug_cuda_session) std.log.info("florence: stage {d} davit layer {d} done", .{ stage, layer });
+        }
+        if (stage_frame_active) {
+            const submit_start = nowNs();
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            stage_frame_active = false;
+            if (profile) logFlorenceProfileStage("vision_stage_frame_submit", stage, submit_start);
         }
 
         if (stage + 1 == Config.stage_count) {
@@ -1517,6 +1609,29 @@ fn daViTBlock(
     return hidden;
 }
 
+fn daViTBlockFramed(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input: CT,
+    batch: usize,
+    height: usize,
+    width: usize,
+    stage: usize,
+    layer: usize,
+) !CT {
+    var frame_active = try beginFlorenceMetalFrame(cb, .prefill);
+    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+
+    const output = try daViTBlock(cb, allocator, config, input, batch, height, width, stage, layer);
+    errdefer cb.free(output);
+    if (frame_active) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        frame_active = false;
+    }
+    return output;
+}
+
 fn spatialBlock(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1534,21 +1649,25 @@ fn spatialBlock(
     var op_start = nowNs();
     var next = try residualDepthwiseConv(cb, allocator, hidden, batch, height, width, dim, stage, layer, "spatial_block.conv1");
     if (profile) logFlorenceProfileStageLayerOp("vision_spatial_conv1", stage, layer, op_start);
+    try profileFlorenceVisionOpFrameBoundary(cb, "vision_spatial_conv1_gpu", stage, layer, op_start);
     cb.free(hidden);
     hidden = next;
     op_start = nowNs();
     next = try residualWindowAttention(cb, allocator, hidden, batch, height, width, dim, config.num_heads[stage], config.window_size, stage, layer);
     if (profile) logFlorenceProfileStageLayerOp("vision_spatial_window_attn", stage, layer, op_start);
+    try profileFlorenceVisionOpFrameBoundary(cb, "vision_spatial_window_attn_gpu", stage, layer, op_start);
     cb.free(hidden);
     hidden = next;
     op_start = nowNs();
     next = try residualDepthwiseConv(cb, allocator, hidden, batch, height, width, dim, stage, layer, "spatial_block.conv2");
     if (profile) logFlorenceProfileStageLayerOp("vision_spatial_conv2", stage, layer, op_start);
+    try profileFlorenceVisionOpFrameBoundary(cb, "vision_spatial_conv2_gpu", stage, layer, op_start);
     cb.free(hidden);
     hidden = next;
     op_start = nowNs();
     next = try residualMlp(cb, allocator, hidden, batch, height * width, dim, dim * 4, stage, layer, "spatial_block.ffn");
     if (profile) logFlorenceProfileStageLayerOp("vision_spatial_mlp", stage, layer, op_start);
+    try profileFlorenceVisionOpFrameBoundary(cb, "vision_spatial_mlp_gpu", stage, layer, op_start);
     cb.free(hidden);
     hidden = next;
     return hidden;
@@ -1571,21 +1690,25 @@ fn channelBlock(
     var op_start = nowNs();
     var next = try residualDepthwiseConv(cb, allocator, hidden, batch, height, width, dim, stage, layer, "channel_block.conv1");
     if (profile) logFlorenceProfileStageLayerOp("vision_channel_conv1", stage, layer, op_start);
+    try profileFlorenceVisionOpFrameBoundary(cb, "vision_channel_conv1_gpu", stage, layer, op_start);
     cb.free(hidden);
     hidden = next;
     op_start = nowNs();
     next = try residualChannelAttention(cb, allocator, hidden, batch, height * width, dim, config.num_groups[stage], stage, layer);
     if (profile) logFlorenceProfileStageLayerOp("vision_channel_attn", stage, layer, op_start);
+    try profileFlorenceVisionOpFrameBoundary(cb, "vision_channel_attn_gpu", stage, layer, op_start);
     cb.free(hidden);
     hidden = next;
     op_start = nowNs();
     next = try residualDepthwiseConv(cb, allocator, hidden, batch, height, width, dim, stage, layer, "channel_block.conv2");
     if (profile) logFlorenceProfileStageLayerOp("vision_channel_conv2", stage, layer, op_start);
+    try profileFlorenceVisionOpFrameBoundary(cb, "vision_channel_conv2_gpu", stage, layer, op_start);
     cb.free(hidden);
     hidden = next;
     op_start = nowNs();
     next = try residualMlp(cb, allocator, hidden, batch, height * width, dim, dim * 4, stage, layer, "channel_block.ffn");
     if (profile) logFlorenceProfileStageLayerOp("vision_channel_mlp", stage, layer, op_start);
+    try profileFlorenceVisionOpFrameBoundary(cb, "vision_channel_mlp_gpu", stage, layer, op_start);
     cb.free(hidden);
     hidden = next;
     return hidden;
@@ -2367,6 +2490,7 @@ fn decoderBlockIncrementalCached(
     const num_heads = config.decoder_attention_heads;
     const head_dim = config.decoderHeadDim();
     const ffn_dim = config.decoder_ffn_dim;
+    var profile_stage_start = if (florenceDecoderStageFrameProfilingEnabled(cb)) nowNs() else 0;
 
     const q_self_weights = try decoderLinearWeights(cb, layer, "self_attn.q_proj", buf);
     const k_self_weights = try decoderLinearWeights(cb, layer, "self_attn.k_proj", buf);
@@ -2389,6 +2513,7 @@ fn decoderBlockIncrementalCached(
     const ln0_b = try decoderLayerWeight(cb, layer, "self_attn_layer_norm.bias", buf);
     const self_normed = try cb.layerNorm(self_res, ln0_w, ln0_b, d_model, 1e-5);
     cb.free(self_res);
+    profile_stage_start = try profileFlorenceDecoderStageFrameBoundary(cb, "decoder_self", layer, profile_stage_start);
 
     const q_cross = try decoderLinearProj(cb, self_normed, layer, "encoder_attn.q_proj", batch, d_model, d_model, buf);
     defer cb.free(q_cross);
@@ -2403,6 +2528,7 @@ fn decoderBlockIncrementalCached(
     const ln1_b = try decoderLayerWeight(cb, layer, "encoder_attn_layer_norm.bias", buf);
     const cross_normed = try cb.layerNorm(cross_res, ln1_w, ln1_b, d_model, 1e-5);
     cb.free(cross_res);
+    profile_stage_start = try profileFlorenceDecoderStageFrameBoundary(cb, "decoder_cross", layer, profile_stage_start);
 
     const fc1_weights = try decoderLinearWeights(cb, layer, "fc1", buf);
     const activated = if (try cb.linearGelu(cross_normed, fc1_weights.weight, fc1_weights.bias, batch, d_model, ffn_dim)) |fused|
@@ -2428,6 +2554,7 @@ fn decoderBlockIncrementalCached(
     const ln2_b = try decoderLayerWeight(cb, layer, "final_layer_norm.bias", buf);
     const result = try cb.layerNorm(ffn_res, ln2_w, ln2_b, d_model, 1e-5);
     cb.free(ffn_res);
+    _ = try profileFlorenceDecoderStageFrameBoundary(cb, "decoder_ffn", layer, profile_stage_start);
     return result;
 }
 
@@ -3202,6 +3329,86 @@ fn transposeMatrix(allocator: std.mem.Allocator, input: []const f32, rows: usize
 
 fn readProfileEnabled() bool {
     return platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE");
+}
+
+fn florenceMetalFramesEnabled() bool {
+    return !platform.env.getenvBool("TERMITE_FLORENCE2_METAL_DISABLE_FRAMES");
+}
+
+fn florenceMetalStageFramesEnabled() bool {
+    return !platform.env.getenvBool("TERMITE_FLORENCE2_METAL_DISABLE_STAGE_FRAMES");
+}
+
+fn beginFlorenceMetalFrame(cb: *const ComputeBackend, regime: ops.DecoderRuntimeFrameRegime) !bool {
+    if (cb.kind() != .metal or !florenceMetalFramesEnabled() or debugStatsEnabled() or cb.decoderRuntimeHasActiveFrame()) return false;
+    const active = try cb.decoderRuntimeBeginFrame();
+    if (!active) return false;
+    errdefer cb.decoderRuntimeCancelFrame() catch {};
+    try cb.decoderRuntimeSetActiveFrameRegime(regime);
+    return true;
+}
+
+fn florenceDecoderStageFrameProfilingEnabled(cb: *const ComputeBackend) bool {
+    return cb.kind() == .metal and
+        readProfileEnabled() and
+        platform.env.getenvBool("TERMITE_FLORENCE2_METAL_PROFILE_DECODER_STAGE_FRAMES");
+}
+
+fn florenceVisionOpFrameProfilingEnabled(cb: *const ComputeBackend) bool {
+    return cb.kind() == .metal and
+        readProfileEnabled() and
+        platform.env.getenvBool("TERMITE_FLORENCE2_METAL_PROFILE_VISION_OP_FRAMES");
+}
+
+fn profileFlorenceVisionOpFrameBoundary(
+    cb: *const ComputeBackend,
+    phase: []const u8,
+    stage: usize,
+    layer: usize,
+    start_ns: u64,
+) !void {
+    if (!florenceVisionOpFrameProfilingEnabled(cb)) return;
+    if (!cb.decoderRuntimeHasActiveFrame()) return error.UnsupportedOperation;
+    const gpu_before = cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos;
+    try cb.decoderRuntimeSubmitAndWaitFrame();
+    const gpu_after = cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos;
+    const gpu_ns = gpu_after -| gpu_before;
+    std.log.info(
+        "florence-profile phase={s} stage={d} layer={d} elapsed_ms={d:.3} gpu_ms={d:.3}",
+        .{
+            phase,
+            stage,
+            layer,
+            nsToMs(nowNs() - start_ns),
+            @as(f64, @floatFromInt(gpu_ns)) / @as(f64, std.time.ns_per_ms),
+        },
+    );
+    if (!try beginFlorenceMetalFrame(cb, .prefill)) return error.UnsupportedOperation;
+}
+
+fn profileFlorenceDecoderStageFrameBoundary(
+    cb: *const ComputeBackend,
+    phase: []const u8,
+    layer: usize,
+    start_ns: u64,
+) !u64 {
+    if (!florenceDecoderStageFrameProfilingEnabled(cb)) return start_ns;
+    if (!cb.decoderRuntimeHasActiveFrame()) return error.UnsupportedOperation;
+    const gpu_before = cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos;
+    try cb.decoderRuntimeSubmitAndWaitFrame();
+    const gpu_after = cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos;
+    const gpu_ns = gpu_after -| gpu_before;
+    std.log.info(
+        "florence-profile phase={s} layer={d} elapsed_ms={d:.3} gpu_ms={d:.3}",
+        .{
+            phase,
+            layer,
+            nsToMs(nowNs() - start_ns),
+            @as(f64, @floatFromInt(gpu_ns)) / @as(f64, std.time.ns_per_ms),
+        },
+    );
+    if (!try beginFlorenceMetalFrame(cb, .decode)) return error.UnsupportedOperation;
+    return nowNs();
 }
 
 fn debugStatsEnabled() bool {

@@ -29522,7 +29522,11 @@ test "metal native decoderRuntimeApplyLinear q4_k device rows match reference" {
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
 
-    const rows: usize = 9;
+    // Sixty-five rows is the first Florence high-row Q4_K MM bucket. The
+    // default route still exercises the handwritten kernel; setting
+    // TERMITE_FLORENCE2_METAL_Q4_K_MM exercises the register-tiled candidate
+    // against the same host oracle.
+    const rows: usize = 65;
     const in_dim: usize = 2048;
     const out_dim: usize = 23;
     const q4k_values_per_block: usize = 256;
@@ -29580,6 +29584,7 @@ test "metal native decoderRuntimeApplyLinear q4_k device rows match reference" {
     var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ @intCast(rows), @intCast(in_dim) });
     defer input.deinit();
 
+    const generated_before = runtimeMemorySnapshot(runtime);
     var output = (try decoderRuntimeApplyLinear(&provider, .{
         .slot = 0,
         .input = input,
@@ -29587,6 +29592,21 @@ test "metal native decoderRuntimeApplyLinear q4_k device rows match reference" {
         .out_dim = out_dim,
     })) orelse return error.UnexpectedNull;
     defer output.deinit();
+    const generated_after = runtimeMemorySnapshot(runtime);
+    if (getenvBool("TERMITE_FLORENCE2_METAL_Q4_K_MM") and !getenvBool("TERMITE_FLORENCE2_METAL_DISABLE_Q4_K_MM")) {
+        try std.testing.expectEqual(
+            quant_matmul.generatedQuantDispatchCount(
+                &generated_before.antfly_generated_dispatch_counts,
+                .q4_k,
+                .none,
+            ) + 1,
+            quant_matmul.generatedQuantDispatchCount(
+                &generated_after.antfly_generated_dispatch_counts,
+                .q4_k,
+                .none,
+            ),
+        );
+    }
 
     var weight_host: [out_dim * in_dim]f32 = undefined;
     try quant_codec.dequantizeToFloat32(.{ .known = .Q4_K }, &weight_raw, &weight_host);
@@ -36684,6 +36704,15 @@ test "metal native decoder runtime batched multi-row argmax matches per-row" {
     var frame_tokens: [rows]u32 = undefined;
     try std.testing.expect(try argmaxLogitsRowsSuppressDeviceConsumeActiveFrame(&provider, logits_tensor, 0, dim, &suppress, frame_tokens[0..rows]));
     for (0..rows) |row| try std.testing.expectEqual(@as(u32, @intCast((maxima[row] + 11) % dim)), frame_tokens[row]);
+    try std.testing.expect(!hasActiveFrame(runtime));
+
+    // A producer may have closed its ordinary encoder without opening a
+    // planned scope. The consuming argmax must append a tail encoder to that
+    // same active command buffer instead of flushing and restoring the frame.
+    try beginFrame(runtime);
+    var unplanned_frame_tokens: [rows]u32 = undefined;
+    try std.testing.expect(try argmaxLogitsRowsSuppressDeviceConsumeActiveFrame(&provider, logits_tensor, 0, dim, &suppress, unplanned_frame_tokens[0..rows]));
+    for (0..rows) |row| try std.testing.expectEqual(@as(u32, @intCast((maxima[row] + 11) % dim)), unplanned_frame_tokens[row]);
     try std.testing.expect(!hasActiveFrame(runtime));
 }
 

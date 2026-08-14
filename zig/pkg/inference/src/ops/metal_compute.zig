@@ -23937,7 +23937,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const logits = try linearNoBiasOp(ctx, input, weight, rows, in_dim, out_dim);
         const trace_linear_done_at = if (trace) monotonicNowNs() else 0;
         defer freeOp(ctx, logits);
-        const choices = try argmaxRowsSuppressOp(ctx, logits, 0, rows, out_dim, suppress_token_ids, allocator);
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const choices = if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime))
+            (try decoderRuntimeArgmaxRowsSuppressOp(ctx, logits, 0, rows, out_dim, suppress_token_ids, allocator)) orelse return null
+        else
+            try argmaxRowsSuppressOp(ctx, logits, 0, rows, out_dim, suppress_token_ids, allocator);
         if (trace) {
             const trace_argmax_done_at = monotonicNowNs();
             std.debug.print(
