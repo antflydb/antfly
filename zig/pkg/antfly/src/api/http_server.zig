@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const kernel_abi = @import("kernel_abi.zig");
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
@@ -23922,28 +23923,37 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_query_request\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_table\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_indexes\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"sample_documents\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_mcp_capabilities\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"queryRequest\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "Raw Antfly QueryRequest body") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"fullTextSearchField\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"full_text_search\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"hierarchy\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"result_mode\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"children\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"required\":[\"fields\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"oneOf\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"inclusiveFrom\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"boolean\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"required\":[\"tableName\",\"backupId\",\"location\",\"connection\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"format\":{\"type\":\"string\",\"enum\":[\"native\",\"portable\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"inserts\":{\"type\":\"object\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"transforms\":{\"type\":\"array\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"syncLevel\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "Compatibility alias for inserts") != null);
+    var parsed_tools = try mcp.testing.parseToolsListResponse(alloc, tools_resp.body);
+    defer parsed_tools.deinit();
+    const listed_tools = parsed_tools.value.result.tools;
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "describe_query_request") != null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "describe_table") != null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "describe_indexes") != null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "describe_mcp_capabilities") != null);
+
+    const query_tool = mcp.testing.findTool(listed_tools, "query") orelse return error.TestExpectedEqual;
+    const query_properties = query_tool.inputSchema.object.get("properties") orelse return error.TestExpectedEqual;
+    const query_request_schema = query_properties.object.get("queryRequest") orelse return error.TestExpectedEqual;
+    const query_request_description = query_request_schema.object.get("description") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.startsWith(u8, query_request_description.string, "Raw Antfly QueryRequest body"));
+    try std.testing.expect(query_properties.object.get("fullTextSearchField") != null);
+    try std.testing.expect(query_properties.object.get("full_text_search") != null);
+    const query_request_properties = query_request_schema.object.get("properties") orelse return error.TestExpectedEqual;
+    try std.testing.expect(query_request_properties.object.get("full_text_search") != null);
+    const hierarchy_schema = query_request_properties.object.get("hierarchy") orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_query_hierarchy_schema.json"), hierarchy_schema);
+
+    const sample_tool = mcp.testing.findTool(listed_tools, "sample_documents") orelse return error.TestExpectedEqual;
+    const sample_properties = sample_tool.inputSchema.object.get("properties") orelse return error.TestExpectedEqual;
+    const inclusive_from_schema = sample_properties.object.get("inclusiveFrom") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("boolean", inclusive_from_schema.object.get("type").?.string);
+
+    const backup_tool = mcp.testing.findTool(listed_tools, "backup") orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_backup_input_schema.json"), backup_tool.inputSchema);
+    const restore_tool = mcp.testing.findTool(listed_tools, "restore") orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_restore_input_schema.json"), restore_tool.inputSchema);
+    const batch_tool = mcp.testing.findTool(listed_tools, "batch") orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_batch_input_schema.json"), batch_tool.inputSchema);
 
     var batch_resp = try server.handle(.{
         .method = .POST,

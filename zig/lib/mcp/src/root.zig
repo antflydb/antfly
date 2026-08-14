@@ -14,6 +14,12 @@
 
 const std = @import("std");
 
+pub const testing = @import("testing.zig");
+
+test {
+    _ = testing;
+}
+
 pub const protocol_version = "2025-06-18";
 pub const session_id_header = "Mcp-Session-Id";
 pub const protocol_version_header = "Mcp-Protocol-Version";
@@ -613,7 +619,11 @@ test "mcp handles initialize and tool call" {
     ;
     const list_resp = (try server.handleJsonRpc(alloc, list_body)).?;
     defer alloc.free(list_resp);
-    try std.testing.expect(std.mem.indexOf(u8, list_resp, "\"name\":\"echo\"") != null);
+    var parsed_tools = try testing.parseToolsListResponse(alloc, list_resp);
+    defer parsed_tools.deinit();
+    const echo_tool = testing.findTool(parsed_tools.value.result.tools, "echo") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("Echo text", echo_tool.description);
+    try std.testing.expectEqualStrings("object", echo_tool.inputSchema.object.get("type").?.string);
 
     const call_body =
         \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hello"}}}
