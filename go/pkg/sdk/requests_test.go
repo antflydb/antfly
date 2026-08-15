@@ -145,6 +145,43 @@ func TestQueryHitDistanceDistinguishesPerfectDenseMatchFromAbsent(t *testing.T) 
 	}
 }
 
+func TestQueryHitHierarchyPreservesPresentZeroMetadata(t *testing.T) {
+	var hit Hit
+	if err := json.Unmarshal([]byte(`{
+		"_id":"chunk:0","_score":1,
+		"hierarchy":{
+			"level":"chunk",
+			"artifact":{
+				"name":"body","kind":"chunk","chunk_id":0,
+				"source":{"name":"body","kind":"chunk","chunk_id":0}
+			},
+			"evidence":{"decision":"reject","confidence":0}
+		}
+	}`), &hit); err != nil {
+		t.Fatal(err)
+	}
+	if hit.Hierarchy.Artifact.ChunkId == nil || *hit.Hierarchy.Artifact.ChunkId != 0 {
+		t.Fatalf("present artifact chunk ID lost: %#v", hit.Hierarchy.Artifact.ChunkId)
+	}
+	if hit.Hierarchy.Artifact.Source.ChunkId == nil || *hit.Hierarchy.Artifact.Source.ChunkId != 0 {
+		t.Fatalf("present source chunk ID lost: %#v", hit.Hierarchy.Artifact.Source.ChunkId)
+	}
+	if hit.Hierarchy.Evidence.Confidence == nil || *hit.Hierarchy.Evidence.Confidence != 0 {
+		t.Fatalf("present zero confidence lost: %#v", hit.Hierarchy.Evidence.Confidence)
+	}
+
+	body, err := json.Marshal(hit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Count(body, []byte(`"chunk_id":0`)) != 2 {
+		t.Fatalf("present zero chunk IDs omitted during marshal: %s", body)
+	}
+	if !bytes.Contains(body, []byte(`"confidence":0`)) {
+		t.Fatalf("present zero confidence omitted during marshal: %s", body)
+	}
+}
+
 func TestQueryRequestMarshalPreservesJoin(t *testing.T) {
 	body, err := json.Marshal(QueryRequest{
 		Table: "files",

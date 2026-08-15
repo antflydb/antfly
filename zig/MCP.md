@@ -2,8 +2,8 @@
 
 ## Current State
 
-This repo now has a reusable MCP protocol core under `go/pkg/antfly/lib/mcp`, plus Antfly-specific HTTP adapters in
-`pkg/antfly/src/api/protocol_adapters.zig`.
+This repo has a reusable MCP protocol core under `zig/lib/mcp`, plus Antfly-specific HTTP adapters in
+`zig/pkg/antfly/src/api/protocol_adapters.zig`.
 
 The implementation intentionally keeps the protocol library independent of Antfly OpenAPI/generated types. Antfly tools
 are registered at the product layer and delegate back through existing HTTP/API paths so auth, permission checks,
@@ -12,20 +12,17 @@ request validation, table/query behavior, backup/restore behavior, and agent beh
 A2A and native bounded-agent behavior are documented in `A2A.md`. This file keeps only the MCP surface and the explicit
 handoff points where MCP clients should call native agents or A2A skills.
 
-## Go Parity Context
+## Architecture
 
-The Go implementation uses mature protocol SDKs:
-
-- MCP is mounted with `github.com/modelcontextprotocol/go-sdk/mcp.NewStreamableHTTPHandler` in `go/pkg/antfly/src/mcp/mcp.go`. That
-  SDK provides streamable HTTP sessions, `Mcp-Session-Id`, DELETE close, SSE reconnect behavior, and `Last-Event-ID`
-  resumability. The Antfly Go product code exposes streamable HTTP; the SDK also supports stdio, but there is no
-  Antfly-specific stdio server command wired in the Go tree.
-- MCP tool schemas in Go are derived by the MCP SDK from typed argument structs and `json`/`mcp` tags in
-  `go/pkg/antfly/src/mcp/mcp.go`, not handwritten JSON strings.
+The Zig protocol core owns JSON-RPC framing, MCP sessions, transport behavior, tool registration, result encoding, and
+protocol test helpers. It has no dependency on Antfly OpenAPI or storage types. The Antfly adapter owns authentication,
+permission filtering, product tool definitions, and delegation through the same application operations used by HTTP.
+Substantial structured tool inputs are derived selectively from the public OpenAPI contract; simple and dynamic tool
+schemas remain in the runtime registry.
 
 ## Implemented
 
-- `go/pkg/antfly/lib/mcp`
+- `zig/lib/mcp`
   - JSON-RPC 2.0 request/response handling.
   - MCP `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`.
   - Tool registry API with `Server`, `Tool`, `ToolHandler`, and `CallToolResult`.
@@ -206,8 +203,8 @@ The standalone protocol tests also cover parse errors, invalid params, unknown M
   initialize responses, validates inbound `Mcp-Session-Id` headers for streamable HTTP requests, and closes sessions
   via `DELETE /mcp/v1`. GET streams emit event IDs and honor `Last-Event-ID`, but historical event replay is not
   implemented yet.
-- MCP has a line-oriented stdio JSON-RPC dispatcher in `go/pkg/antfly/lib/mcp`; the product CLI does not yet expose a long-running
-  stdio server mode. This is also not exposed by Antfly's Go product code, even though the Go SDK supports it.
+- MCP has a line-oriented stdio JSON-RPC dispatcher in `zig/lib/mcp`; the product CLI does not yet expose a long-running
+  stdio server mode.
 - The Antfly adapters now live in `protocol_adapters.zig`. MCP-specific adapter code can move to a dedicated module if
   the surface grows.
 - Protocol structs are intentionally minimal. Dynamic `std.json.Value` remains the extension path for evolving MCP
@@ -227,7 +224,7 @@ registered outside the libraries.
 The next durability improvements should be:
 
 1. Add MCP historical event replay if clients need more than cursor-aware stream continuation.
-2. Expose the `go/pkg/antfly/lib/mcp` stdio dispatcher through a product CLI/server mode if local agent hosts need it.
+2. Expose the `zig/lib/mcp` stdio dispatcher through a product CLI/server mode if local agent hosts need it.
 3. Broaden adapter failure mapping and tool schema stability tests.
 4. Extend OpenAPI-derived compact schema fragments selectively when another MCP tool has a substantial structured
    request; keep simple scalar tools and runtime permission filtering in the Zig registry.

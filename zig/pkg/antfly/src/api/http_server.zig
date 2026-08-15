@@ -22099,6 +22099,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     defer describe_indexes_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), describe_indexes_resp.status);
     try mcp.testing.expectToolStructuredSubset(alloc, describe_indexes_resp.body, "{\"indexes\":[{\"config\":{\"name\":\"full_text_index_v0\"}}]}");
+    try mcp.testing.expectToolJsonRepresentationsEqual(alloc, describe_indexes_resp.body);
 
     var list_indexes_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -22110,6 +22111,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     defer list_indexes_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), list_indexes_resp.status);
     try mcp.testing.expectToolStructuredSubset(alloc, list_indexes_resp.body, "{\"indexes\":[{\"config\":{\"name\":\"full_text_index_v0\"}}]}");
+    try mcp.testing.expectToolJsonRepresentationsEqual(alloc, list_indexes_resp.body);
 
     var sample_documents_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,

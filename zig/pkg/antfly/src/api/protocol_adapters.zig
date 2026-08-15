@@ -435,12 +435,12 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
 
         fn listIndexes(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
-            var result = try ctx.executeOperation(alloc, .{ .list_indexes = .{ .table_name = table_name } });
+            const result = try ctx.executeOperation(alloc, .{ .list_indexes = .{ .table_name = table_name } });
             if (result.structured) |structured| {
                 if (structured == .array) {
                     var wrapped = std.json.ObjectMap.empty;
                     try wrapped.put(alloc, "indexes", structured);
-                    result.structured = .{ .object = wrapped };
+                    return try mcp.jsonToolResultAlloc(alloc, .{ .object = wrapped });
                 }
             }
             return result;

@@ -128,6 +128,16 @@ pub fn expectToolStructuredSubset(
     try ant_json.testing.expectSubsetJsonValue(alloc, expected_structured_json, structured);
 }
 
+/// Assert that a JSON-valued MCP result exposes one canonical value through
+/// both TextContent and structuredContent.
+pub fn expectToolJsonRepresentationsEqual(alloc: std.mem.Allocator, body: []const u8) !void {
+    var response = try parseToolCallResponse(alloc, body);
+    defer response.deinit();
+    const text_content = findTextContent(response.value.result.content) orelse return error.TestExpectedEqual;
+    const structured = response.value.result.structuredContent orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectEqualJsonValue(alloc, text_content, structured);
+}
+
 test "MCP testing parses tools list responses and finds tools by name" {
     const alloc = std.testing.allocator;
     var parsed = try parseToolsListResponse(
@@ -163,4 +173,9 @@ test "MCP testing validates JSON-RPC results, errors, and tool content structura
     defer call.deinit();
     try std.testing.expectEqualStrings("hello", findTextContent(call.value.result.content).?);
     try ant_json.testing.expectEqualJsonValue(alloc, "{\"ok\":true}", call.value.result.structuredContent.?);
+
+    try expectToolJsonRepresentationsEqual(
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"ok\\\":true}\"}],\"structuredContent\":{\"ok\":true}}}",
+    );
 }

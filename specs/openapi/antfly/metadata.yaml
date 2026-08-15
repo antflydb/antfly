@@ -7263,6 +7263,7 @@ components:
         chunk_id:
           type: integer
           format: uint32
+          x-go-type-skip-optional-pointer: false
         unit_id:
           type: string
 
@@ -7279,6 +7280,7 @@ components:
         chunk_id:
           type: integer
           format: uint32
+          x-go-type-skip-optional-pointer: false
         unit_id:
           type: string
         source:
@@ -7342,6 +7344,7 @@ components:
           type: number
           format: float
           x-go-type: float64
+          x-go-type-skip-optional-pointer: false
         source_artifact:
           type: string
         source_artifact_key:
