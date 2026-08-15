@@ -21509,27 +21509,11 @@ pub const DB = struct {
         {
             return;
         }
+        if (!types.canonicalHierarchyExecutionWithinBudget(req)) return error.InvalidQueryRequest;
 
         for (result.hits) |*group_hit| {
             const parent_filter = [_][]const u8{group_hit.id};
-            var match_req = req;
-            match_req.return_mode = .chunk;
-            match_req.max_chunks_per_parent = 0;
-            match_req.hierarchy_grouped_matches = false;
-            match_req.offset = 0;
-            match_req.limit = req.max_chunks_per_parent;
-            match_req.fields = req.hierarchy_match_fields;
-            match_req.include_all_fields = req.hierarchy_match_include_all_fields;
-            match_req.include_stored = match_req.include_all_fields or
-                match_req.fields.len > 0 or
-                match_req.reranker != null;
-            match_req.filter_doc_ids = &parent_filter;
-            match_req.filter_doc_ids_positive = true;
-            match_req.graph_queries = &.{};
-            match_req.expand_strategy = null;
-            match_req.aggregations_json = "";
-            match_req.count_only = false;
-            match_req.profile = false;
+            const match_req = canonicalGroupedMatchRequest(req, &parent_filter);
 
             var matches = try self.searchLockedWithExecutionContextImpl(alloc, match_req, exec_ctx, false);
             defer matches.deinit();
@@ -21552,6 +21536,35 @@ pub const DB = struct {
             if (group_hit.chunk_hits.len > 0) alloc.free(group_hit.chunk_hits);
             group_hit.chunk_hits = nested_matches;
         }
+    }
+
+    fn canonicalGroupedMatchRequest(
+        req: types.SearchRequest,
+        parent_filter: []const []const u8,
+    ) types.SearchRequest {
+        var match_req = req;
+        match_req.return_mode = .chunk;
+        match_req.max_chunks_per_parent = 0;
+        match_req.hierarchy_grouped_matches = false;
+        match_req.offset = 0;
+        match_req.limit = req.max_chunks_per_parent;
+        // Top-level cursors page source groups. They must never be applied to
+        // independently ranked descendants within each group.
+        match_req.search_after = &.{};
+        match_req.search_before = &.{};
+        match_req.fields = req.hierarchy_match_fields;
+        match_req.include_all_fields = req.hierarchy_match_include_all_fields;
+        match_req.include_stored = match_req.include_all_fields or
+            match_req.fields.len > 0 or
+            match_req.reranker != null;
+        match_req.filter_doc_ids = parent_filter;
+        match_req.filter_doc_ids_positive = true;
+        match_req.graph_queries = &.{};
+        match_req.expand_strategy = null;
+        match_req.aggregations_json = "";
+        match_req.count_only = false;
+        match_req.profile = false;
+        return match_req;
     }
 
     fn chunkHitFromSearchHitAlloc(alloc: Allocator, hit: types.SearchHit) !types.ChunkHit {
@@ -56975,6 +56988,26 @@ test "db chunked generated dense and sparse embeddings search as parent results"
         try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, ordinal), sparse_result.hits[0].doc_ordinal);
     }
 
+    var sparse_grouped = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = sparse_query.indices,
+            .values = sparse_query.values,
+            .k = 3,
+        } },
+        .return_mode = .parent_with_chunks,
+        .max_chunks_per_parent = 1,
+        .hierarchy_grouped_matches = true,
+        .hierarchy_match_fields = &.{},
+        .hierarchy_match_include_all_fields = false,
+        .limit = 1,
+        .include_stored = false,
+    });
+    defer sparse_grouped.deinit();
+    try std.testing.expectEqual(@as(usize, 1), sparse_grouped.hits.len);
+    try std.testing.expectEqualStrings("doc:a", sparse_grouped.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 1), sparse_grouped.hits[0].chunk_hits.len);
+
     const doc_a_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
     defer alloc.free(doc_a_store_key);
     {
@@ -60291,6 +60324,41 @@ test "db getArtifact loads stored chunk artifacts by public id" {
     try std.testing.expect(std.mem.indexOf(u8, artifact.value, "\"body\":\"abcdefgh\"") != null);
 }
 
+test "canonical grouped match requests isolate nested pagination and work" {
+    const cursor_values = [_]std.json.Value{.{ .string = "source-cursor" }};
+    const match_fields = [_][]const u8{"text"};
+    const parent_filter = [_][]const u8{"doc:a"};
+    const req: types.SearchRequest = .{
+        .return_mode = .parent_with_chunks,
+        .max_chunks_per_parent = 7,
+        .hierarchy_grouped_matches = true,
+        .hierarchy_match_fields = &match_fields,
+        .hierarchy_match_include_all_fields = false,
+        .offset = 12,
+        .limit = 4,
+        .search_after = &cursor_values,
+        .search_before = &cursor_values,
+        .count_only = true,
+        .profile = true,
+    };
+
+    const nested = DB.canonicalGroupedMatchRequest(req, &parent_filter);
+    try std.testing.expectEqual(types.ReturnMode.chunk, nested.return_mode);
+    try std.testing.expectEqual(@as(u32, 0), nested.offset);
+    try std.testing.expectEqual(@as(u32, 7), nested.limit);
+    try std.testing.expectEqual(@as(usize, 0), nested.search_after.len);
+    try std.testing.expectEqual(@as(usize, 0), nested.search_before.len);
+    try std.testing.expectEqualStrings("doc:a", nested.filter_doc_ids[0]);
+    try std.testing.expect(nested.filter_doc_ids_positive);
+    try std.testing.expect(!nested.count_only);
+    try std.testing.expect(!nested.profile);
+    try std.testing.expect(types.canonicalHierarchyExecutionWithinBudget(req));
+
+    var oversized = req;
+    oversized.limit = types.max_canonical_hierarchy_groups + 1;
+    try std.testing.expect(!types.canonicalHierarchyExecutionWithinBudget(oversized));
+}
+
 test "db full-text chunk parent paging applies after grouping" {
     const alloc = std.testing.allocator;
 
@@ -60321,7 +60389,7 @@ test "db full-text chunk parent paging applies after grouping" {
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"body\":\"alpha alpha alpha alpha\"}" },
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha\"}" },
             .{ .key = "doc:b", .value = "{\"body\":\"alpha\"}" },
         },
         .sync_level = .full_index,
@@ -60339,6 +60407,24 @@ test "db full-text chunk parent paging applies after grouping" {
     try std.testing.expectEqual(@as(u32, 2), result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+
+    var canonical_grouped = try db.search(alloc, .{
+        .index_name = "ft_chunks",
+        .full_text = .{ .term = .{ .field = "body", .term = "alpha" } },
+        .return_mode = .parent_with_chunks,
+        .max_chunks_per_parent = 2,
+        .hierarchy_grouped_matches = true,
+        .hierarchy_match_fields = &.{},
+        .hierarchy_match_include_all_fields = false,
+        .include_stored = false,
+        .limit = 2,
+    });
+    defer canonical_grouped.deinit();
+    try std.testing.expectEqual(@as(usize, 2), canonical_grouped.hits.len);
+    try std.testing.expectEqualStrings("doc:a", canonical_grouped.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 2), canonical_grouped.hits[0].chunk_hits.len);
+    try std.testing.expectEqualStrings("doc:b", canonical_grouped.hits[1].id);
+    try std.testing.expectEqual(@as(usize, 1), canonical_grouped.hits[1].chunk_hits.len);
 }
 
 test "db dense chunk consumer supports parent and parent_with_chunks modes" {

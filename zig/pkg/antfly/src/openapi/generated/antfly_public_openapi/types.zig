@@ -1542,7 +1542,7 @@ pub const HierarchyMatchHit = struct {
 };
 
 pub const HierarchyMatches = struct {
-    /// Maximum matching descendant hits attached to each group, independent of the top-level query limit. Matches follow the effective query order, and the group score is the score of its best matching descendant. The maximum bounds nested response growth. Group selection uses an adaptive candidate window, then each returned group is expanded with a separately bounded query, so a group with fewer matches never forces a global exhaustive scan.
+    /// Maximum matching descendant hits attached to each group, independent of the top-level query limit. Matches follow the effective query order, and the group score is the score of its best matching descendant. The maximum bounds nested response growth. Group selection uses an adaptive candidate window, then each returned group is expanded with a separately bounded query, so a group with fewer matches never forces a global exhaustive scan. To bound execution as well as response growth, grouped queries accept at most 100 top-level groups and 1,000 requested matches across the complete result page.
     limit: ?i64 = null,
     /// Fields to include in each nested match. This projection is required because grouped and matching records commonly have different schemas. Use an empty array to return match identity and hierarchy metadata without stored fields.
     fields: []const []const u8,
@@ -2262,7 +2262,7 @@ pub const QueryRequest = struct {
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
-    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
+    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
@@ -2709,7 +2709,7 @@ pub const RetrievalQueryRequest = struct {
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
-    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
+    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,

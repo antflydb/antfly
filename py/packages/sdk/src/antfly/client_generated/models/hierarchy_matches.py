@@ -22,7 +22,9 @@ class HierarchyMatches:
             the group score is the score of its best matching descendant. The maximum
             bounds nested response growth. Group selection uses an adaptive candidate
             window, then each returned group is expanded with a separately bounded query,
-            so a group with fewer matches never forces a global exhaustive scan.
+            so a group with fewer matches never forces a global exhaustive scan. To bound
+            execution as well as response growth, grouped queries accept at most 100
+            top-level groups and 1,000 requested matches across the complete result page.
              Default: 3.
     """
 

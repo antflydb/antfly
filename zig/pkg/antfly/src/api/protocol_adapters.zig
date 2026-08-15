@@ -498,7 +498,9 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             if (jsonValueArg(args, "queryRequest")) |query_request| {
                 if (query_request != .object) return mcpError(alloc, "queryRequest must be an object");
                 if (hasNonRawQueryArg(args)) return mcpError(alloc, "queryRequest cannot be combined with shorthand query arguments");
-                if (query_request.object.get("table") != null) return mcpError(alloc, "queryRequest.table is not allowed; use tableName");
+                if (query_request.object.get("table")) |table| {
+                    if (table != .null) return mcpError(alloc, "queryRequest.table is not allowed; use tableName");
+                }
 
                 return try ctx.executeOperation(alloc, .{ .query = .{
                     .table_name = table_name,
@@ -1654,6 +1656,10 @@ fn hasNonRawQueryArg(args: std.json.Value) bool {
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         if (std.mem.eql(u8, key, "tableName") or std.mem.eql(u8, key, "queryRequest")) continue;
+        // Generated SDKs commonly serialize unset optional properties as null.
+        // Raw mode treats those values as absent while still rejecting an
+        // actual shorthand value that could make request precedence ambiguous.
+        if (entry.value_ptr.* == .null) continue;
         return true;
     }
     return false;

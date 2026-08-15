@@ -13030,7 +13030,11 @@ components:
 
             window, then each returned group is expanded with a separately bounded query,
 
-            so a group with fewer matches never forces a global exhaustive scan.
+            so a group with fewer matches never forces a global exhaustive scan. To bound
+
+            execution as well as response growth, grouped queries accept at most 100
+
+            top-level groups and 1,000 requested matches across the complete result page.
         fields:
           type: array
           items:
@@ -13407,6 +13411,10 @@ components:
             This does not limit nested matches attached through hierarchy.group_by.matches;
 
             use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
+
+            Queries using hierarchy.group_by.matches are limited to 100 top-level groups
+
+            and a groups-times-matches execution budget of 1,000.
           example: 20
         offset:
           type: integer

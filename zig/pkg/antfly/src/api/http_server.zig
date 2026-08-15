@@ -22224,6 +22224,17 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expectEqual(@as(u16, 200), raw_query_request_resp.status);
     try mcp.testing.expectToolStructuredSubset(alloc, raw_query_request_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
 
+    var nullable_raw_query_request_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"queryRequest\":{\"table\":null,\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"},\"limit\":5},\"semanticSearch\":null,\"fields\":null,\"limit\":null}}}",
+    });
+    defer nullable_raw_query_request_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), nullable_raw_query_request_resp.status);
+    try mcp.testing.expectToolStructuredSubset(alloc, nullable_raw_query_request_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
+
     // Some MCP clients ignore structuredContent. Verify the compatibility
     // TextContent block independently carries the complete query response.
     var parsed_mcp = try mcp.testing.parseToolCallResponse(alloc, raw_query_request_resp.body);

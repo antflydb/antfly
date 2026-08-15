@@ -189,6 +189,8 @@ class QueryRequest:
             parameter.
             This does not limit nested matches attached through hierarchy.group_by.matches;
             use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
+            Queries using hierarchy.group_by.matches are limited to 100 top-level groups
+            and a groups-times-matches execution budget of 1,000.
              Example: 20.
         offset (int | Unset): Number of results to skip for pagination. Supported for text-backed,
             match_all, and filter-only requests. Not supported for semantic_search

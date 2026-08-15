@@ -12825,7 +12825,10 @@ fn searchDenseInternal(
     const page_candidate_window = pagingCandidateWindow(paging);
     const score_order_k = scoreOrderCandidateWindowK(dense.k, paging);
     const effort = resolvedSearchEffort(req.search_effort);
-    const resolved_search_width = resolveSearchWidth(dense.k, effort, index_stats);
+    // Paging and nested hierarchy expansion can request a wider result window
+    // than the query's original k. Recall calibration must cover the effective
+    // score-ordered window passed to the vector index.
+    const resolved_search_width = resolveSearchWidth(score_order_k, effort, index_stats);
     const resolved_epsilon = resolveSearchEpsilon(effort);
     profile.resolved_search_width = resolved_search_width;
     profile.resolved_epsilon = resolved_epsilon;

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const antfly = @import("antfly_storage_root");
+const vector_mod = @import("antfly_vector").vector;
 const capi = @import("types.zig");
 const search_wire = @import("search_wire.zig");
 
@@ -2657,7 +2658,7 @@ fn resolveDenseHitsFromProfiled(
             (try entry.index.getMetadata(hit.vector_id)) orelse return error.Internal;
         resolved[i] = .{
             .id = id,
-            .score = antfly.vector.similarityFromDistance(hit.distance, entry.metric),
+            .score = vector_mod.similarityFromDistance(hit.distance, entry.metric),
         };
         resolved_count += 1;
     }

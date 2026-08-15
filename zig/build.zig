@@ -2377,6 +2377,7 @@ pub fn build(b: *std.Build) void {
         .pic = true,
     });
     capi_mod.addImport("antfly_storage_root", capi_root_mod);
+    capi_mod.addImport("antfly_vector", vector_mod);
     capi_mod.addImport("structlog", structlog_mod);
 
     // The public C ABI and executable reuse the distributed PIC storage

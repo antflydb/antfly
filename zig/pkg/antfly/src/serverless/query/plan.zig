@@ -73,12 +73,44 @@ pub fn parseSearchPlanAlloc(
     if (queryBodyHasForbiddenDocIdentityControlFields(parsed.value.object)) return error.InvalidQueryRequest;
 
     if (public_search_request_mod.looksLikePublicSearchRequest(parsed.value)) {
+        try validateSupportedPublicSearchFields(parsed.value.object);
         var public_parsed = parseOwnedPublicQueryRequestAlloc(alloc, body) catch return error.InvalidQueryRequest;
         defer public_parsed.deinit();
         return try parsePublicSearchPlanAlloc(alloc, public_parsed.value, published_search_sources);
     }
 
     return try parseLegacySearchPlanAlloc(alloc, body, published_search_sources);
+}
+
+/// Serverless published-segment search implements a deliberately smaller
+/// QueryRequest surface than the canonical DB executor. Keep this allowlist
+/// fail-closed so adding a generated API field can never make serverless
+/// silently accept and ignore it. Null optionals are treated as absent for SDK
+/// compatibility.
+fn validateSupportedPublicSearchFields(object: std.json.ObjectMap) !void {
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* == .null) continue;
+        const key = entry.key_ptr.*;
+        const supported = std.mem.eql(u8, key, "table") or
+            std.mem.eql(u8, key, "query") or
+            std.mem.eql(u8, key, "full_text_search") or
+            std.mem.eql(u8, key, "semantic_search") or
+            std.mem.eql(u8, key, "embedding_template") or
+            std.mem.eql(u8, key, "indexes") or
+            std.mem.eql(u8, key, "filter_prefix") or
+            std.mem.eql(u8, key, "filter_query") or
+            std.mem.eql(u8, key, "exclusion_query") or
+            std.mem.eql(u8, key, "aggregations") or
+            std.mem.eql(u8, key, "embeddings") or
+            std.mem.eql(u8, key, "search_effort") or
+            std.mem.eql(u8, key, "fields") or
+            std.mem.eql(u8, key, "limit") or
+            std.mem.eql(u8, key, "offset") or
+            std.mem.eql(u8, key, "count") or
+            std.mem.eql(u8, key, "profile");
+        if (!supported) return error.UnsupportedQueryRequest;
+    }
 }
 
 fn queryBodyHasForbiddenDocIdentityControlFields(object: std.json.ObjectMap) bool {
@@ -113,24 +145,6 @@ fn parsePublicSearchPlanAlloc(
     query_request: metadata_openapi.QueryRequest,
     published_search_sources: search_sources.PublishedSearchSources,
 ) !SearchPlan {
-    if (query_request.analyses != null or
-        query_request.order_by != null or
-        query_request.search_after != null or
-        query_request.search_before != null or
-        query_request.document_renderer != null or
-        query_request.join != null or
-        query_request.foreign_sources != null or
-        query_request.merge_config != null or
-        query_request.pruner != null or
-        query_request.reranker != null or
-        query_request.graph_searches != null or
-        query_request.expand_strategy != null or
-        query_request.distance_over != null or
-        query_request.distance_under != null)
-    {
-        return error.UnsupportedQueryRequest;
-    }
-
     var text_clauses = try public_search_request_mod.parseTextClausesAlloc(alloc, query_request);
     defer text_clauses.deinit(alloc);
 
@@ -615,6 +629,31 @@ test "serverless search plan rejects public exact sort controls" {
         "{\"search_before\":[\"2025-12-31T23:59:59Z\",\"doc:0\"]}",
         sources,
     ));
+}
+
+test "serverless search plan fails closed for unsupported public fields" {
+    const alloc = std.testing.allocator;
+    const sources = search_sources.defaultPublishedSearchSources();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"full_text_search\":{\"query\":\"body:alpha\"},\"hierarchy\":{\"group_by\":{\"level\":\"source\"}}}",
+        sources,
+    ));
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"full_text_search\":{\"query\":\"body:alpha\"},\"future_query_option\":true}",
+        sources,
+    ));
+
+    // SDKs may serialize unset optionals as null; those remain equivalent to
+    // omission even when the non-null feature is unsupported by serverless.
+    var plan = try parseSearchPlanAlloc(
+        alloc,
+        "{\"full_text_search\":{\"query\":\"body:alpha\"},\"hierarchy\":null}",
+        sources,
+    );
+    defer plan.deinit(alloc);
 }
 
 test "serverless graph plans reject internal doc identity controls" {

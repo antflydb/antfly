@@ -6022,7 +6022,9 @@ export interface components {
              *     the group score is the score of its best matching descendant. The maximum
              *     bounds nested response growth. Group selection uses an adaptive candidate
              *     window, then each returned group is expanded with a separately bounded query,
-             *     so a group with fewer matches never forces a global exhaustive scan.
+             *     so a group with fewer matches never forces a global exhaustive scan. To bound
+             *     execution as well as response growth, grouped queries accept at most 100
+             *     top-level groups and 1,000 requested matches across the complete result page.
              * @default 3
              */
             limit?: number;
@@ -6288,6 +6290,8 @@ export interface components {
              * @description Maximum number of top-level results to return. For semantic_search, this is the topk parameter.
              *     This does not limit nested matches attached through hierarchy.group_by.matches;
              *     use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
+             *     Queries using hierarchy.group_by.matches are limited to 100 top-level groups
+             *     and a groups-times-matches execution budget of 1,000.
              * @example 20
              */
             limit?: number;

@@ -2388,6 +2388,7 @@ pub fn parseQueryRequestWithDeadline(
     try applyCommonSearchRequestOptions(alloc, request, &req);
     req.execution_deadline_ns = execution_deadline_ns;
     try applyPublicHierarchyControls(alloc, effective_body, &req);
+    try validateCanonicalHierarchyExecutionBudget(req);
     req.distributed_text_stats = try parseDistributedTextStatsAlloc(alloc, effective_body);
     try parseInternalDocIdConstraintsAlloc(alloc, effective_body, &req);
     try ensureQueryDeadline(execution_deadline_ns);
@@ -9409,6 +9410,10 @@ fn applyPublicHierarchyControls(
     }
 }
 
+fn validateCanonicalHierarchyExecutionBudget(req: db_mod.types.SearchRequest) !void {
+    if (!db_mod.types.canonicalHierarchyExecutionWithinBudget(req)) return error.InvalidQueryRequest;
+}
+
 fn removeInternalShardFields(object: *std.json.ObjectMap) void {
     const internal_fields = [_][]const u8{
         "_distributed_text_stats",
@@ -10900,6 +10905,33 @@ test "api query contract validates canonical hierarchy controls" {
     defer bounded_grouped.deinit(alloc);
     try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, bounded_grouped.req.return_mode);
     try std.testing.expectEqual(@as(u32, 2), bounded_grouped.req.max_chunks_per_parent);
+
+    const too_many_groups =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "limit": 101,
+        \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":1,"fields":["text"]}}}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", too_many_groups));
+
+    const too_much_grouped_work =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "limit": 100,
+        \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":11,"fields":["text"]}}}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", too_much_grouped_work));
+
+    const unbounded_group_page =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "limit": 0,
+        \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":1,"fields":["text"]}}}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", unbounded_group_page));
 
     const oversized_grouped_matches =
         \\{
