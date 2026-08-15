@@ -2372,21 +2372,7 @@ fn validateRequestModelIdentifier(raw: []const u8) !void {
     const identifier = if (colon) |index| value[0..index] else value;
     if (colon) |index| {
         const variant = value[index + 1 ..];
-        if (variant.len == 0 or
-            std.mem.indexOfScalar(u8, variant, '/') != null or
-            variant.len > 256)
-        {
-            return error.InvalidModelIdentifier;
-        }
-        var variant_components = std.mem.splitScalar(u8, variant, ':');
-        while (variant_components.next()) |component| {
-            if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) {
-                return error.InvalidModelIdentifier;
-            }
-            for (component) |byte| {
-                if (byte < 0x20 or byte == 0x7f) return error.InvalidModelIdentifier;
-            }
-        }
+        if (!registry_mod.modelVariantIsSafe(variant)) return error.InvalidModelIdentifier;
     }
 
     var components = std.mem.splitScalar(u8, identifier, '/');
@@ -2493,7 +2479,7 @@ test "loaded model listing uses model directories and safe relative identifiers"
     try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/srv/models/owner/model:q4") == null);
 }
 
-test "loaded model listing hides managed variant cache leaves" {
+test "loaded model listing preserves managed variant identity without exposing cache leaves" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2523,7 +2509,7 @@ test "loaded model listing hides managed variant cache leaves" {
         model_dir,
     )).?;
     defer allocator.free(identifier);
-    try std.testing.expectEqualStrings("owner/model", identifier);
+    try std.testing.expectEqualStrings("owner/model:gguf:Q4_K_M", identifier);
 }
 
 const RequestModelResolutionErrorKind = enum { invalid, missing, internal };
