@@ -2267,11 +2267,12 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
         const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
         const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
         const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
+        const zero_shot_classification = if (maybe_manifest) |*man| manifestSupportsZeroShotClassification(man) else false;
 
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
             if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
-            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities)) {
+            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities, zero_shot_classification)) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -2294,7 +2295,14 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
         const model_task = @tagName(model.manifest.model_type);
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
-            if (taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) {
+            if (taskMatchesModelListing(
+                task,
+                model_task,
+                model.manifest.gliner_model_type,
+                model.manifest.tasks,
+                model.manifest.capabilities,
+                manifestSupportsZeroShotClassification(&model.manifest),
+            )) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -2331,11 +2339,12 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
         const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
         const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
         const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
+        const zero_shot_classification = if (maybe_manifest) |*man| manifestSupportsZeroShotClassification(man) else false;
 
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
             if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
-            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities)) {
+            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities, zero_shot_classification)) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -10046,6 +10055,7 @@ pub const Node = struct {
                 manifest.gliner_model_type,
                 manifest.tasks,
                 manifest.capabilities,
+                manifestSupportsZeroShotClassification(&manifest),
             );
             const compatibility_summary = self.compatibilitySummaryForDir(a, entry.path) catch CompatibilitySummary{
                 .level = .unknown,
@@ -10203,7 +10213,14 @@ pub const Node = struct {
                 const inputs = listing.manifest.inputs;
                 const has_visual = listing.manifest.visual_model_path != null or listing.manifest.visual_projection_path != null;
                 const has_audio = listing.manifest.audio_model_path != null or listing.manifest.audio_projection_path != null;
-                if (!taskMatchesModelListing(task, listing.kind, gliner_model_type, tasks, capabilities)) continue;
+                if (!taskMatchesModelListing(
+                    task,
+                    listing.kind,
+                    gliner_model_type,
+                    tasks,
+                    capabilities,
+                    manifestSupportsZeroShotClassification(&listing.manifest),
+                )) continue;
                 const listed = try listed_model_names.getOrPut(a, entry.name);
                 if (listed.found_existing) continue;
 
@@ -10252,7 +10269,14 @@ pub const Node = struct {
             for (loaded_listings.items) |listing| {
                 const model = listing.model;
                 const model_task = @tagName(model.manifest.model_type);
-                if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
+                if (!taskMatchesModelListing(
+                    task,
+                    model_task,
+                    model.manifest.gliner_model_type,
+                    model.manifest.tasks,
+                    model.manifest.capabilities,
+                    manifestSupportsZeroShotClassification(&model.manifest),
+                )) continue;
                 const listed = try listed_model_names.getOrPut(a, listing.identifier);
                 if (listed.found_existing) continue;
 
@@ -10577,7 +10601,7 @@ fn appendExtractionClassificationBatch(
     for (results, 0..) |items, input_index| {
         var appended: usize = 0;
         for (items) |item| {
-            if (item.score < threshold) continue;
+            if (multi_label and item.score < threshold) continue;
             if (!multi_label and appended >= top_k) break;
             try lists[input_index].append(allocator, .{
                 .name = schema.name,
@@ -11668,14 +11692,21 @@ test "OpenAI model listing deduplicates multi-task models" {
     );
 }
 
-fn taskMatchesModelListing(task: []const u8, model_kind: []const u8, gliner_model_type: []const u8, tasks: []const []const u8, capabilities: []const []const u8) bool {
+fn taskMatchesModelListing(
+    task: []const u8,
+    model_kind: []const u8,
+    gliner_model_type: []const u8,
+    tasks: []const []const u8,
+    capabilities: []const []const u8,
+    zero_shot_classification: bool,
+) bool {
     // Classification is a public extraction capability. Keep `classifier` as
     // an internal pipeline kind without making its cache bucket a public API.
     if (std.mem.eql(u8, task, "classifiers")) return false;
     if (std.mem.eql(u8, task, "extractors") and
         model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification"))
     {
-        return true;
+        return !std.mem.eql(u8, model_kind, "classifier") or zero_shot_classification;
     }
     if (tasks.len > 0) {
         const singular_task: ?[]const u8 = if (std.mem.eql(u8, task, "embedders"))
@@ -14134,16 +14165,17 @@ test "prompt cache stays disabled while CUDA continuous batching releases the mo
 }
 
 test "taskMatchesModelListing exposes extraction-capable models only as extractors" {
-    try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "", &.{}, &.{}));
-    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "", &.{}, &.{"extraction"}));
-    try std.testing.expect(taskMatchesModelListing("extractors", "reader", "", &.{}, &.{"extraction"}));
-    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{}, &.{"labels"}));
-    try std.testing.expect(taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}));
-    try std.testing.expect(!taskMatchesModelListing("classifiers", "classifier", "", &.{"classify"}, &.{}));
-    try std.testing.expect(!taskMatchesModelListing("classifiers", "recognizer", "gliner2", &.{}, &.{"classification"}));
+    try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "", &.{}, &.{}, false));
+    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "", &.{}, &.{"extraction"}, false));
+    try std.testing.expect(taskMatchesModelListing("extractors", "reader", "", &.{}, &.{"extraction"}, false));
+    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{}, &.{"labels"}, true));
+    try std.testing.expect(taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}, true));
+    try std.testing.expect(!taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}, false));
+    try std.testing.expect(!taskMatchesModelListing("classifiers", "classifier", "", &.{"classify"}, &.{}, true));
+    try std.testing.expect(!taskMatchesModelListing("classifiers", "recognizer", "gliner2", &.{}, &.{"classification"}, true));
 }
 
-test "classification extraction applies top-k only to single-label taxonomies" {
+test "classification extraction applies top-k to single-label and threshold to multi-label taxonomies" {
     const Result = struct { label: []const u8, score: f32 };
     const row = [_]Result{
         .{ .label = "first", .score = 0.9 },
@@ -14158,7 +14190,7 @@ test "classification extraction applies top-k only to single-label taxonomies" {
         std.testing.allocator,
         &single_lists,
         .{ .name = "topic", .labels = &.{ "first", "second", "third" }, .top_k = 2 },
-        .{ .threshold = 0.5, .include_confidence = true },
+        .{ .threshold = 0.95, .include_confidence = true },
         &batch,
     );
     try std.testing.expectEqual(@as(usize, 2), single_lists[0].items.len);
@@ -14184,9 +14216,9 @@ test "NLI entailment labels are detected case-insensitively" {
 }
 
 test "taskMatchesModelListing prefers explicit tasks when present" {
-    try std.testing.expect(taskMatchesModelListing("generators", "generator", "", &.{"generate"}, &.{}));
-    try std.testing.expect(taskMatchesModelListing("extractors", "generator", "", &.{"extract"}, &.{}));
-    try std.testing.expect(!taskMatchesModelListing("extractors", "generator", "", &.{"generate"}, &.{"extraction"}));
+    try std.testing.expect(taskMatchesModelListing("generators", "generator", "", &.{"generate"}, &.{}, false));
+    try std.testing.expect(taskMatchesModelListing("extractors", "generator", "", &.{"extract"}, &.{}, false));
+    try std.testing.expect(!taskMatchesModelListing("extractors", "generator", "", &.{"generate"}, &.{"extraction"}, false));
 }
 
 test "generate backend selection keeps compiled mode explicit" {
