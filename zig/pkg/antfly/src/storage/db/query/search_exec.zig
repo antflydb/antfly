@@ -11693,6 +11693,10 @@ pub fn searchTextQuery(
             candidate_limit >= full_candidate_limit or
             (result.total_hits_relation == .exact and result.total_hits <= candidate_limit);
         const candidate_ceiling_reached = candidate_limit >= candidate_ceiling;
+        const candidate_tail_score: ?f32 = if (result.hits.len > 0)
+            result.hits[result.hits.len - 1].score
+        else
+            null;
 
         const hits_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         var hits = try alloc.alloc(types.SearchHit, result.hits.len);
@@ -11768,17 +11772,32 @@ pub fn searchTextQuery(
         if (collect_score_timing) postprocess_ns += platform_time.monotonicNs() - postprocess_start_ns;
 
         const visible_candidate_count: u32 = @intCast(@min(out.hits.len, @as(usize, std.math.maxInt(u32))));
+        const grouped_page_is_stable = group_chunk_parents and groupedResultHasStableRequestedPage(
+            paging,
+            out,
+            candidate_tail_score,
+            candidates_exhausted,
+        );
         if (group_chunk_parents and
             !grouped_requires_full_window and
             !candidates_exhausted and
             !candidate_ceiling_reached and
-            !groupedResultHasRequestedPage(effective_req, out))
+            !grouped_page_is_stable)
         {
             out.deinit();
             const grown_limit = growAdaptiveCandidateWindow(candidate_limit, candidate_ceiling, requested_visible_end);
             if (grown_limit == candidate_limit) return error.InvalidQueryRequest;
             candidate_limit = grown_limit;
             continue;
+        }
+        if (group_chunk_parents and !grouped_requires_full_window) {
+            try enforceGroupedPageBoundaryAtCandidateCeiling(
+                paging,
+                out,
+                candidate_tail_score,
+                candidates_exhausted,
+                candidate_ceiling_reached,
+            );
         }
         if (adaptive_late_visibility and !candidates_exhausted and !candidate_ceiling_reached and visible_candidate_count < requested_visible_end) {
             out.deinit();
@@ -13082,6 +13101,10 @@ fn searchDenseInternal(
 
         const raw_hits = results.getHits();
         profile.raw_hit_count = @intCast(raw_hits.len);
+        const candidate_tail_score: ?f32 = if (raw_hits.len > 0)
+            vector_mod.similarityFromDistance(raw_hits[raw_hits.len - 1].distance, entry.metric)
+        else
+            null;
         const candidate_window_incomplete = candidateWindowIncomplete(hbc_effective_k, bounded_full_candidate_count);
         const candidate_ceiling_reached = candidate_window >= candidate_ceiling;
         if (!candidate_window_incomplete and exhaustive_broad_live_window) {
@@ -13171,7 +13194,12 @@ fn searchDenseInternal(
         errdefer result.deinit();
 
         const visible_candidate_count: u32 = @intCast(@min(result.hits.len, @as(usize, std.math.maxInt(u32))));
-        const needs_more_grouped_candidates = group_chunk_parents and !groupedResultHasRequestedPage(req, result);
+        const needs_more_grouped_candidates = group_chunk_parents and !groupedResultHasStableRequestedPage(
+            paging,
+            result,
+            candidate_tail_score,
+            !candidate_window_incomplete,
+        );
         const needs_more_visible_candidates = unresolved_stored_filters and visible_candidate_count < page_candidate_window;
         if (full_candidate_window and
             candidate_window_incomplete and
@@ -13183,6 +13211,15 @@ fn searchDenseInternal(
             if (grown_window == candidate_window) return error.InvalidQueryRequest;
             candidate_window = grown_window;
             continue;
+        }
+        if (group_chunk_parents) {
+            try enforceGroupedPageBoundaryAtCandidateCeiling(
+                paging,
+                result,
+                candidate_tail_score,
+                !candidate_window_incomplete,
+                candidate_ceiling_reached,
+            );
         }
         if (candidate_window_incomplete) result.total_hits_relation = .gte;
         if (full_candidate_window) {
@@ -13369,16 +13406,54 @@ fn candidateWindowIncomplete(candidate_window: u32, bounded_full_candidate_count
     return candidate_window < bounded_full_candidate_count;
 }
 
-/// Return whether adaptive collection has discovered the requested page of
-/// groups. Nested `max_chunks_per_parent` is an output cap, not a fill target:
-/// a group may legitimately have fewer matching descendants, and requiring
-/// every group to reach the cap would force collection to exhaust the index.
-fn groupedResultHasRequestedPage(req: types.SearchRequest, result: types.SearchResult) bool {
-    if (req.limit == 0) return true;
+/// Return whether adaptive collection has discovered the requested component
+/// page of groups. Nested `max_chunks_per_parent` is an output cap, not a fill
+/// target: a group may legitimately have fewer matching descendants, and
+/// requiring every group to reach the cap would force collection to exhaust
+/// the index.
+fn groupedResultHasRequestedPage(paging: ComponentPaging, result: types.SearchResult) bool {
+    if (paging.limit == 0) return true;
     const available: u32 = @intCast(@min(result.hits.len, @as(usize, std.math.maxInt(u32))));
-    const start = @min(req.offset, available);
-    const end = @min(start +| req.limit, available);
-    return end - start == req.limit;
+    const start = @min(paging.offset, available);
+    const end = @min(start +| paging.limit, available);
+    return end - start == paging.limit;
+}
+
+/// Prove that unseen candidates cannot change the requested grouped page.
+/// Raw text/vector streams use implementation-specific tie breakers, while
+/// grouped source hits use their public IDs. A full-looking page is therefore
+/// not stable until the raw candidate score has moved strictly below its last
+/// visible group, or until the candidate stream is exhausted.
+fn groupedResultHasStableRequestedPage(
+    paging: ComponentPaging,
+    result: types.SearchResult,
+    candidate_tail_score: ?f32,
+    candidates_exhausted: bool,
+) bool {
+    if (!groupedResultHasRequestedPage(paging, result)) return false;
+    if (candidates_exhausted or paging.limit == 0) return true;
+
+    const boundary_index: usize = @intCast((paging.offset +| paging.limit) - 1);
+    if (boundary_index >= result.hits.len) return false;
+    const boundary_score = result.hits[boundary_index].score orelse return false;
+    const tail_score = candidate_tail_score orelse return false;
+    return tail_score < boundary_score;
+}
+
+/// A bounded adaptive query may return an explicitly inexact short page, but
+/// it must never return a full page whose deterministic public-ID tie order is
+/// still unknown. Fail closed when the safety budget prevents that proof.
+fn enforceGroupedPageBoundaryAtCandidateCeiling(
+    paging: ComponentPaging,
+    result: types.SearchResult,
+    candidate_tail_score: ?f32,
+    candidates_exhausted: bool,
+    candidate_ceiling_reached: bool,
+) !void {
+    if (!candidate_ceiling_reached or candidates_exhausted) return;
+    if (!groupedResultHasRequestedPage(paging, result)) return;
+    if (groupedResultHasStableRequestedPage(paging, result, candidate_tail_score, false)) return;
+    return error.QueryCandidateBudgetExceeded;
 }
 
 test "adaptive candidate window covers requested offset page and grows bounded" {
@@ -13420,8 +13495,8 @@ test "grouped result page satisfaction treats nested match count as a maximum" {
         .{ .id = @constCast("chunk-3") },
     };
     var hits = [_]types.SearchHit{
-        .{ .id = @constCast("source-1"), .chunk_hits = &first_chunks },
-        .{ .id = @constCast("source-2"), .chunk_hits = &second_chunks },
+        .{ .id = @constCast("source-1"), .score = 2, .chunk_hits = &first_chunks },
+        .{ .id = @constCast("source-2"), .score = 1, .chunk_hits = &second_chunks },
     };
     const result = types.SearchResult{
         .alloc = std.testing.allocator,
@@ -13429,10 +13504,24 @@ test "grouped result page satisfaction treats nested match count as a maximum" {
         .total_hits = 2,
         .graph_results = &.{},
     };
-    try std.testing.expect(groupedResultHasRequestedPage(.{ .limit = 2, .return_mode = .parent }, result));
-    try std.testing.expect(groupedResultHasRequestedPage(.{ .limit = 2, .return_mode = .parent_with_chunks, .max_chunks_per_parent = 2 }, result));
-    try std.testing.expect(groupedResultHasRequestedPage(.{ .limit = 1, .return_mode = .parent_with_chunks, .max_chunks_per_parent = 2 }, result));
-    try std.testing.expect(!groupedResultHasRequestedPage(.{ .offset = 1, .limit = 2, .return_mode = .parent }, result));
+    try std.testing.expect(groupedResultHasRequestedPage(.{ .offset = 0, .limit = 2 }, result));
+    try std.testing.expect(groupedResultHasRequestedPage(.{ .offset = 0, .limit = 1 }, result));
+    try std.testing.expect(!groupedResultHasRequestedPage(.{ .offset = 1, .limit = 2 }, result));
+
+    try std.testing.expect(groupedResultHasStableRequestedPage(.{ .offset = 0, .limit = 2 }, result, 0.5, false));
+    try std.testing.expect(!groupedResultHasStableRequestedPage(.{ .offset = 0, .limit = 2 }, result, 1, false));
+    try std.testing.expect(groupedResultHasStableRequestedPage(.{ .offset = 0, .limit = 2 }, result, 1, true));
+    try std.testing.expect(!groupedResultHasStableRequestedPage(.{ .offset = 1, .limit = 2 }, result, 0.5, false));
+
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, enforceGroupedPageBoundaryAtCandidateCeiling(
+        .{ .offset = 0, .limit = 2 },
+        result,
+        1,
+        false,
+        true,
+    ));
+    try enforceGroupedPageBoundaryAtCandidateCeiling(.{ .offset = 0, .limit = 2 }, result, 0.5, false, true);
+    try enforceGroupedPageBoundaryAtCandidateCeiling(.{ .offset = 0, .limit = 2 }, result, 1, true, true);
 }
 
 fn exactScoreNativeDenseFilter(
@@ -14313,6 +14402,10 @@ pub fn searchSparse(
         const window_relation = scoreOrderWindowTotalHitsRelation(effective_k, bounded_sparse_candidate_count, raw_hits.len);
         const candidate_window_incomplete = window_relation == .gte;
         const candidate_ceiling_reached = candidate_window >= candidate_ceiling;
+        const candidate_tail_score: ?f32 = if (raw_hits.len > 0)
+            raw_hits[raw_hits.len - 1].score
+        else
+            null;
         const start: u32 = if (full_candidate_window) 0 else @min(paging.offset, @as(u32, @intCast(raw_hits.len)));
         const end: u32 = if (full_candidate_window) @intCast(raw_hits.len) else @min(start +| paging.limit, @as(u32, @intCast(raw_hits.len)));
 
@@ -14378,7 +14471,12 @@ pub fn searchSparse(
         errdefer result.deinit();
 
         const visible_candidate_count: u32 = @intCast(@min(result.hits.len, @as(usize, std.math.maxInt(u32))));
-        const needs_more_grouped_candidates = group_chunk_parents and !groupedResultHasRequestedPage(req, result);
+        const needs_more_grouped_candidates = group_chunk_parents and !groupedResultHasStableRequestedPage(
+            paging,
+            result,
+            candidate_tail_score,
+            !candidate_window_incomplete,
+        );
         const needs_more_visible_candidates = unresolved_stored_filters and visible_candidate_count < pagingCandidateWindow(paging);
         if (full_candidate_window and
             candidate_window_incomplete and
@@ -14390,6 +14488,15 @@ pub fn searchSparse(
             if (grown_window == candidate_window) return error.InvalidQueryRequest;
             candidate_window = grown_window;
             continue;
+        }
+        if (group_chunk_parents) {
+            try enforceGroupedPageBoundaryAtCandidateCeiling(
+                paging,
+                result,
+                candidate_tail_score,
+                !candidate_window_incomplete,
+                candidate_ceiling_reached,
+            );
         }
         if (candidate_window_incomplete) result.total_hits_relation = .gte;
         if (full_candidate_window) {
