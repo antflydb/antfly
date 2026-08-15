@@ -6862,6 +6862,12 @@ test "httpx query admission treats zero capacity as unlimited" {
 
 test "httpx production path sheds 128 abandoned queries and preserves control recovery" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+    // This test deliberately pushes four waves through a 32-connection
+    // listener while other Zig test binaries may be saturating the CI host.
+    // Keep the 1 ms poll interval responsive locally, but allow enough wall
+    // time for every accepted socket to reach admission under bounded runner
+    // scheduling before asserting exact request accounting.
+    const convergence_poll_attempts = 30_000;
 
     const BlockingReads = struct {
         started: std.atomic.Value(u32) = .init(0),
@@ -6959,7 +6965,7 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
         slot.* = client;
     }
 
-    for (0..10_000) |_| {
+    for (0..convergence_poll_attempts) |_| {
         const admission = api_server.queryAdmissionStats();
         if (admission.in_flight == 8 and admission.rejected_total == 120) break;
         var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
@@ -6973,7 +6979,7 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
     // Cancellation observation is universal, so rejected requests may still
     // be unwinding briefly after admission reaches its steady state. Wait
     // until only the eight deliberately blocked requests remain.
-    for (0..10_000) |_| {
+    for (0..convergence_poll_attempts) |_| {
         if (e2e_server.server.httpRuntimeStats().active_h1_cancellation_observers == 8) break;
         var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
         _ = std.posix.system.nanosleep(&delay, &delay);
@@ -7010,7 +7016,7 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
         }
         slot.* = null;
     }
-    for (0..10_000) |_| {
+    for (0..convergence_poll_attempts) |_| {
         const admission = api_server.queryAdmissionStats();
         const runtime = e2e_server.server.httpRuntimeStats();
         if (admission.in_flight == 0 and runtime.active_h1_cancellation_observers == 0 and reads.cancelled.load(.acquire) == 8) break;
