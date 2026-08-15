@@ -6020,8 +6020,9 @@ export interface components {
              * @description Maximum matching descendant hits attached to each group, independent of
              *     the top-level query limit. Matches follow the effective query order, and
              *     the group score is the score of its best matching descendant. The maximum
-             *     bounds nested response growth; grouped collection uses an adaptive candidate
-             *     window and stops once the requested group page is satisfied.
+             *     bounds nested response growth. Group selection uses an adaptive candidate
+             *     window, then each returned group is expanded with a separately bounded query,
+             *     so a group with fewer matches never forces a global exhaustive scan.
              * @default 3
              */
             limit?: number;

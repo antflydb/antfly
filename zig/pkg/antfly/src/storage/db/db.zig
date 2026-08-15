@@ -21407,25 +21407,37 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
+        return try self.searchLockedWithExecutionContextImpl(alloc, req, exec_ctx, true);
+    }
+
+    fn searchLockedWithExecutionContextImpl(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        exec_ctx: types.ExecutionContext,
+        externalize_artifact_ids: bool,
+    ) !types.SearchResult {
         const execution_req = directSingleVectorRequest(req) orelse req;
-        if (searchRequestRequiresComposedSearch(execution_req)) {
-            var composed = try self.searchComposed(alloc, execution_req, exec_ctx);
+        const selection_req = canonicalGroupedMatchSelectionRequest(execution_req);
+        if (searchRequestRequiresComposedSearch(selection_req)) {
+            var composed = try self.searchComposed(alloc, selection_req, exec_ctx);
             errdefer composed.deinit();
-            try externalizeSearchResultArtifactIds(alloc, &composed);
+            try self.populateCanonicalGroupedMatches(alloc, execution_req, exec_ctx, &composed);
+            if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &composed);
             return composed;
         }
 
-        const has_primary = execution_req.full_text != null or execution_req.dense != null or execution_req.sparse != null or !db_query_search.isDefaultMatchAll(execution_req.query) or execution_req.graph_queries.len == 0;
+        const has_primary = selection_req.full_text != null or selection_req.dense != null or selection_req.sparse != null or !db_query_search.isDefaultMatchAll(selection_req.query) or selection_req.graph_queries.len == 0;
 
-        var base = if (!has_primary and execution_req.graph_queries.len > 0)
+        var base = if (!has_primary and selection_req.graph_queries.len > 0)
             try db_query_search.emptySearchResult(alloc)
-        else if (execution_req.full_text) |text|
-            try self.searchTextQuery(alloc, execution_req, text)
-        else if (execution_req.dense) |dense|
-            try self.searchDense(alloc, execution_req, dense)
-        else if (execution_req.sparse) |sparse|
-            try self.searchSparse(alloc, execution_req, sparse)
-        else switch (execution_req.query) {
+        else if (selection_req.full_text) |text|
+            try self.searchTextQuery(alloc, selection_req, text)
+        else if (selection_req.dense) |dense|
+            try self.searchDense(alloc, selection_req, dense)
+        else if (selection_req.sparse) |sparse|
+            try self.searchSparse(alloc, selection_req, sparse)
+        else switch (selection_req.query) {
             .match_none,
             .match_all,
             .phrase,
@@ -21446,22 +21458,114 @@ pub const DB = struct {
             .prefix,
             .wildcard,
             .regexp,
-            => try self.searchText(alloc, execution_req),
-            .dense_knn => |dense| try self.searchDense(alloc, execution_req, dense),
-            .sparse_knn => |sparse| try self.searchSparse(alloc, execution_req, sparse),
-            .graph => |graph| try self.searchGraph(alloc, execution_req, graph, null),
+            => try self.searchText(alloc, selection_req),
+            .dense_knn => |dense| try self.searchDense(alloc, selection_req, dense),
+            .sparse_knn => |sparse| try self.searchSparse(alloc, selection_req, sparse),
+            .graph => |graph| try self.searchGraph(alloc, selection_req, graph, null),
         };
         errdefer base.deinit();
+        try self.populateCanonicalGroupedMatches(alloc, execution_req, exec_ctx, &base);
 
         if (execution_req.graph_queries.len == 0) {
-            try externalizeSearchResultArtifactIds(alloc, &base);
+            if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &base);
             return base;
         }
 
         base.graph_results = try self.executeGraphQueries(alloc, execution_req, execution_req.graph_queries, base.hits, base.total_hits);
         try self.applyGraphExpandStrategy(alloc, &base, execution_req.expand_strategy);
-        try externalizeSearchResultArtifactIds(alloc, &base);
+        if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &base);
         return base;
+    }
+
+    /// Canonical hierarchy grouping uses a collapse-and-expand execution plan:
+    /// the primary query selects the requested source-group page, and a second
+    /// bounded query per returned source obtains that group's exact top
+    /// matches. This prevents a source with fewer than the requested maximum
+    /// from forcing the primary query to exhaust the global candidate set.
+    fn canonicalGroupedMatchSelectionRequest(req: types.SearchRequest) types.SearchRequest {
+        if (!req.hierarchy_grouped_matches or
+            req.return_mode != .parent_with_chunks or
+            req.max_chunks_per_parent == 0)
+        {
+            return req;
+        }
+        var selection = req;
+        selection.return_mode = .parent;
+        selection.max_chunks_per_parent = 0;
+        return selection;
+    }
+
+    fn populateCanonicalGroupedMatches(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        exec_ctx: types.ExecutionContext,
+        result: *types.SearchResult,
+    ) anyerror!void {
+        if (!req.hierarchy_grouped_matches or
+            req.return_mode != .parent_with_chunks or
+            req.max_chunks_per_parent == 0 or
+            result.hits.len == 0)
+        {
+            return;
+        }
+
+        for (result.hits) |*group_hit| {
+            const parent_filter = [_][]const u8{group_hit.id};
+            var match_req = req;
+            match_req.return_mode = .chunk;
+            match_req.max_chunks_per_parent = 0;
+            match_req.hierarchy_grouped_matches = false;
+            match_req.offset = 0;
+            match_req.limit = req.max_chunks_per_parent;
+            match_req.fields = req.hierarchy_match_fields;
+            match_req.include_all_fields = req.hierarchy_match_include_all_fields;
+            match_req.include_stored = match_req.include_all_fields or
+                match_req.fields.len > 0 or
+                match_req.reranker != null;
+            match_req.filter_doc_ids = &parent_filter;
+            match_req.filter_doc_ids_positive = true;
+            match_req.graph_queries = &.{};
+            match_req.expand_strategy = null;
+            match_req.aggregations_json = "";
+            match_req.count_only = false;
+            match_req.profile = false;
+
+            var matches = try self.searchLockedWithExecutionContextImpl(alloc, match_req, exec_ctx, false);
+            defer matches.deinit();
+
+            const nested_matches: []types.ChunkHit = if (matches.hits.len == 0)
+                &.{}
+            else
+                try alloc.alloc(types.ChunkHit, matches.hits.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (nested_matches[0..initialized]) |*match| match.deinit(alloc);
+                if (nested_matches.len > 0) alloc.free(nested_matches);
+            }
+            for (matches.hits, 0..) |match, i| {
+                nested_matches[i] = try chunkHitFromSearchHitAlloc(alloc, match);
+                initialized += 1;
+            }
+
+            for (group_hit.chunk_hits) |*match| match.deinit(alloc);
+            if (group_hit.chunk_hits.len > 0) alloc.free(group_hit.chunk_hits);
+            group_hit.chunk_hits = nested_matches;
+        }
+    }
+
+    fn chunkHitFromSearchHitAlloc(alloc: Allocator, hit: types.SearchHit) !types.ChunkHit {
+        var out = types.ChunkHit{
+            .id = try alloc.dupe(u8, hit.id),
+            .score = hit.score,
+            .distance = hit.distance,
+        };
+        errdefer out.deinit(alloc);
+        out.stored_data = if (hit.stored_data) |data| try alloc.dupe(u8, data) else null;
+        out.ancestor_source_data = if (hit.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
+        out.ancestor_unit_data = if (hit.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null;
+        out.artifact_ref = if (hit.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
+        return out;
     }
 
     fn searchRequestRequiresComposedSearch(req: types.SearchRequest) bool {
@@ -60345,6 +60449,22 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     try std.testing.expectEqualStrings("doc:a", parent_with_chunks.hits[0].id);
     try std.testing.expectEqual(@as(usize, 1), parent_with_chunks.hits[0].chunk_hits.len);
     try std.testing.expectEqualStrings(top_chunk_id, parent_with_chunks.hits[0].chunk_hits[0].id);
+
+    var canonical_grouped = try waitForSearchResult(alloc, &db, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .parent_with_chunks,
+        .max_chunks_per_parent = 2,
+        .hierarchy_grouped_matches = true,
+        .hierarchy_match_fields = &.{},
+        .hierarchy_match_include_all_fields = false,
+        .include_stored = false,
+    }, 1);
+    defer canonical_grouped.deinit();
+    try std.testing.expectEqual(@as(u32, 1), canonical_grouped.total_hits);
+    try std.testing.expectEqualStrings("doc:a", canonical_grouped.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 2), canonical_grouped.hits[0].chunk_hits.len);
+    try std.testing.expectEqualStrings(top_chunk_id, canonical_grouped.hits[0].chunk_hits[0].id);
 
     const doc_a_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
     defer alloc.free(doc_a_store_key);

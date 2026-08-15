@@ -11763,7 +11763,7 @@ pub fn searchTextQuery(
             !grouped_requires_full_window and
             !candidates_exhausted and
             !candidate_ceiling_reached and
-            !groupedResultPageSatisfied(effective_req, out))
+            !groupedResultHasRequestedPage(effective_req, out))
         {
             out.deinit();
             const grown_limit = growAdaptiveCandidateWindow(candidate_limit, candidate_ceiling, requested_visible_end);
@@ -13106,7 +13106,7 @@ fn searchDenseInternal(
         errdefer result.deinit();
 
         const visible_candidate_count: u32 = @intCast(@min(result.hits.len, @as(usize, std.math.maxInt(u32))));
-        const needs_more_grouped_candidates = group_chunk_parents and !groupedResultPageSatisfied(req, result);
+        const needs_more_grouped_candidates = group_chunk_parents and !groupedResultHasRequestedPage(req, result);
         const needs_more_visible_candidates = unresolved_stored_filters and visible_candidate_count < page_candidate_window;
         if (full_candidate_window and
             candidate_window_incomplete and
@@ -13304,17 +13304,16 @@ fn candidateWindowIncomplete(candidate_window: u32, bounded_full_candidate_count
     return candidate_window < bounded_full_candidate_count;
 }
 
-fn groupedResultPageSatisfied(req: types.SearchRequest, result: types.SearchResult) bool {
+/// Return whether adaptive collection has discovered the requested page of
+/// groups. Nested `max_chunks_per_parent` is an output cap, not a fill target:
+/// a group may legitimately have fewer matching descendants, and requiring
+/// every group to reach the cap would force collection to exhaust the index.
+fn groupedResultHasRequestedPage(req: types.SearchRequest, result: types.SearchResult) bool {
     if (req.limit == 0) return true;
     const available: u32 = @intCast(@min(result.hits.len, @as(usize, std.math.maxInt(u32))));
     const start = @min(req.offset, available);
     const end = @min(start +| req.limit, available);
-    if (end - start < req.limit) return false;
-    if (req.return_mode != .parent_with_chunks or req.max_chunks_per_parent == 0) return true;
-    for (result.hits[@intCast(start)..@intCast(end)]) |hit| {
-        if (hit.chunk_hits.len < req.max_chunks_per_parent) return false;
-    }
-    return true;
+    return end - start == req.limit;
 }
 
 test "adaptive candidate window covers requested offset page and grows bounded" {
@@ -13335,7 +13334,7 @@ test "adaptive candidate window covers requested offset page and grows bounded" 
     try std.testing.expectEqual(@as(u32, 7), initialAdaptiveCandidateWindow(7, paging));
 }
 
-test "grouped result satisfaction includes page and requested nested matches" {
+test "grouped result page satisfaction treats nested match count as a maximum" {
     var first_chunks = [_]types.ChunkHit{
         .{ .id = @constCast("chunk-1") },
         .{ .id = @constCast("chunk-2") },
@@ -13353,10 +13352,10 @@ test "grouped result satisfaction includes page and requested nested matches" {
         .total_hits = 2,
         .graph_results = &.{},
     };
-    try std.testing.expect(groupedResultPageSatisfied(.{ .limit = 2, .return_mode = .parent }, result));
-    try std.testing.expect(!groupedResultPageSatisfied(.{ .limit = 2, .return_mode = .parent_with_chunks, .max_chunks_per_parent = 2 }, result));
-    try std.testing.expect(groupedResultPageSatisfied(.{ .limit = 1, .return_mode = .parent_with_chunks, .max_chunks_per_parent = 2 }, result));
-    try std.testing.expect(!groupedResultPageSatisfied(.{ .offset = 1, .limit = 2, .return_mode = .parent }, result));
+    try std.testing.expect(groupedResultHasRequestedPage(.{ .limit = 2, .return_mode = .parent }, result));
+    try std.testing.expect(groupedResultHasRequestedPage(.{ .limit = 2, .return_mode = .parent_with_chunks, .max_chunks_per_parent = 2 }, result));
+    try std.testing.expect(groupedResultHasRequestedPage(.{ .limit = 1, .return_mode = .parent_with_chunks, .max_chunks_per_parent = 2 }, result));
+    try std.testing.expect(!groupedResultHasRequestedPage(.{ .offset = 1, .limit = 2, .return_mode = .parent }, result));
 }
 
 fn exactScoreNativeDenseFilter(
@@ -14302,7 +14301,7 @@ pub fn searchSparse(
         errdefer result.deinit();
 
         const visible_candidate_count: u32 = @intCast(@min(result.hits.len, @as(usize, std.math.maxInt(u32))));
-        const needs_more_grouped_candidates = group_chunk_parents and !groupedResultPageSatisfied(req, result);
+        const needs_more_grouped_candidates = group_chunk_parents and !groupedResultHasRequestedPage(req, result);
         const needs_more_visible_candidates = unresolved_stored_filters and visible_candidate_count < pagingCandidateWindow(paging);
         if (full_candidate_window and
             candidate_window_incomplete and

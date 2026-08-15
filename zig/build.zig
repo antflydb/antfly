@@ -4317,7 +4317,7 @@ pub fn build(b: *std.Build) void {
     const lib_db_query_default_filters = [_][]const u8{
         "grouped candidate budget parses disabled and fallback values",
         "adaptive candidate window covers requested offset page and grows bounded",
-        "grouped result satisfaction includes page and requested nested matches",
+        "grouped result page satisfaction treats nested match count as a maximum",
         "storage.db.db.test.db full-text",
         "storage.db.db.test.db dense ",
         "storage.db.db.test.db sparse ",

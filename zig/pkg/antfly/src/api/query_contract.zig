@@ -2260,7 +2260,7 @@ fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBod
     return .{
         .has_internal_shard_fields = objectHasInternalShardField(parsed.value.object),
         .has_public_doc_filter_bindings = parsed.value.object.get("with") != null,
-        .has_public_hierarchy_controls = parsed.value.object.get("hierarchy") != null,
+        .has_public_hierarchy_controls = objectHasNonNullField(parsed.value.object, "hierarchy"),
         .has_query_timeout = parsed.value.object.get("timeout_ms") != null,
     };
 }
@@ -9196,11 +9196,16 @@ fn objectHasInternalShardField(object: std.json.ObjectMap) bool {
     return false;
 }
 
+fn objectHasNonNullField(object: std.json.ObjectMap, name: []const u8) bool {
+    const value = object.get(name) orelse return false;
+    return value != .null;
+}
+
 fn queryBodyHasPublicHierarchyControls(alloc: std.mem.Allocator, body: []const u8) !bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
-    return parsed.value.object.get("hierarchy") != null;
+    return objectHasNonNullField(parsed.value.object, "hierarchy");
 }
 
 fn applyPublicHierarchyControls(
@@ -10927,6 +10932,20 @@ test "api query contract validates canonical hierarchy controls" {
     try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, empty_direct.req.return_mode);
     try std.testing.expect(!empty_direct.req.hierarchy_include_source);
     try std.testing.expect(!empty_direct.req.hierarchy_include_unit);
+
+    // Generated SDK request models serialize unset optional fields as null.
+    // A null hierarchy remains equivalent to omission and preserves the
+    // default result shape; only an object selects the hierarchy contract.
+    const null_hierarchy =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": null
+        \\}
+    ;
+    var null_default = try parseQueryRequest(alloc, null, "docs", null_hierarchy);
+    defer null_default.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.parent, null_default.req.return_mode);
+    try std.testing.expect(!null_default.req.hierarchy_grouped_matches);
 }
 
 test "api query contract keeps generated schema strict when with is present" {
