@@ -23,15 +23,14 @@ class QueryHit:
 
     Attributes:
         field_id (str): ID of the record.
-        field_score (float): Relevance score of the hit.
+        field_score (float): Relevance score of the hit, normalized so higher values always rank first.
+        field_distance (float | Unset): Raw vector distance for direct dense-vector hits; lower values are better.
+            For a source group ranked by dense descendants, this is the distance of
+            the best matching descendant that supplied the group score. Omitted for
+            non-dense and fused results.
         field_index_scores (QueryHitIndexScores | Unset): Scores partitioned by index when using RRF search.
         field_source (QueryHitSource | Unset):
-        hierarchy (QueryHitHierarchy | Unset): Stable ancestry envelope for derived document hierarchy hits. Present
-            when
-            the hit is a derived unit/chunk/embedding artifact or when a source-level
-            rollup includes child chunks. Standard fields include `level`,
-            `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
-            `ancestors` with response-local or requested DB-backed source/unit context when available.
+        hierarchy (QueryHitHierarchy | Unset):
         field_sort (list[Any] | Unset): Sort key values for this hit. Pass as search_after or search_before
             to paginate to the next/previous page. Values preserve their JSON
             types. Present for ordered result pages, including cursor-only
@@ -40,6 +39,7 @@ class QueryHit:
 
     field_id: str
     field_score: float
+    field_distance: float | Unset = UNSET
     field_index_scores: QueryHitIndexScores | Unset = UNSET
     field_source: QueryHitSource | Unset = UNSET
     hierarchy: QueryHitHierarchy | Unset = UNSET
@@ -50,6 +50,8 @@ class QueryHit:
         field_id = self.field_id
 
         field_score = self.field_score
+
+        field_distance = self.field_distance
 
         field_index_scores: dict[str, Any] | Unset = UNSET
         if not isinstance(self.field_index_scores, Unset):
@@ -75,6 +77,8 @@ class QueryHit:
                 "_score": field_score,
             }
         )
+        if field_distance is not UNSET:
+            field_dict["_distance"] = field_distance
         if field_index_scores is not UNSET:
             field_dict["_index_scores"] = field_index_scores
         if field_source is not UNSET:
@@ -96,6 +100,8 @@ class QueryHit:
         field_id = d.pop("_id")
 
         field_score = d.pop("_score")
+
+        field_distance = d.pop("_distance", UNSET)
 
         _field_index_scores = d.pop("_index_scores", UNSET)
         field_index_scores: QueryHitIndexScores | Unset
@@ -123,6 +129,7 @@ class QueryHit:
         query_hit = cls(
             field_id=field_id,
             field_score=field_score,
+            field_distance=field_distance,
             field_index_scores=field_index_scores,
             field_source=field_source,
             hierarchy=hierarchy,

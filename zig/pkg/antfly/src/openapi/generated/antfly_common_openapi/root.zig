@@ -22,6 +22,7 @@ pub const InferenceConnectionConfig = types.InferenceConnectionConfig;
 pub const InferenceConnectionVariant = types.InferenceConnectionVariant;
 pub const LiteStorageConfig = types.LiteStorageConfig;
 pub const LocalStorageConfig = types.LocalStorageConfig;
+pub const McpConfig = types.McpConfig;
 pub const MetadataInfo = types.MetadataInfo;
 pub const NamedChainLink = types.NamedChainLink;
 pub const ObjectStorageConfig = types.ObjectStorageConfig;

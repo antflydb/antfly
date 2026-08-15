@@ -34,6 +34,14 @@ The Python SDK now exposes transform operators with stable semantic enum names
 (`SET`, `SET_ON_INSERT`, `UNSET`, `INC`, `ADD_TO_SET`, and `MAX`). Positional
 `VALUE_n` names are not part of the 0.2 API.
 
+Dense-query `_score` values now follow the same relevance convention as text,
+sparse, hybrid, and Elasticsearch-style search results: higher values rank
+first. Code that previously treated dense `_score` as a lower-is-better vector
+distance must use the new optional `_distance` field instead. `_distance`
+retains the raw metric-specific distance for direct dense hits. On a source
+group ranked by dense descendants it is the distance of the best descendant
+that supplied the group score. It is omitted for non-dense and fused results.
+
 ### [0.1.1] - 2026-03-31
 
 #### Highlights

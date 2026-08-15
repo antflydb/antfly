@@ -1284,6 +1284,14 @@ pub const SearchRequest = struct {
     max_chunks_per_parent: u32 = 0,
     hierarchy_include_source: bool = false,
     hierarchy_include_unit: bool = false,
+    hierarchy_omit_implicit_source_ancestor_document: bool = false,
+    hierarchy_match_fields: []const []const u8 = &.{},
+    hierarchy_match_include_all_fields: bool = true,
+    hierarchy_grouped_matches: bool = false,
+    hierarchy_source_fields: []const []const u8 = &.{},
+    hierarchy_source_include_all_fields: bool = true,
+    hierarchy_unit_fields: []const []const u8 = &.{},
+    hierarchy_unit_include_all_fields: bool = true,
     fields: []const []const u8 = &.{},
     order_by: []const SortField = &.{},
     search_after: []const std.json.Value = &.{},
@@ -1323,6 +1331,82 @@ pub const SearchRequest = struct {
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
 };
+
+pub const max_canonical_hierarchy_groups: u32 = 100;
+pub const max_canonical_hierarchy_matches_per_group: u32 = 100;
+pub const max_canonical_hierarchy_total_matches: u32 = 1000;
+
+pub fn canonicalHierarchyExecutionWithinBudget(req: SearchRequest) bool {
+    if (!req.hierarchy_grouped_matches) return true;
+    if (req.limit == 0 or req.limit > max_canonical_hierarchy_groups) return false;
+    if (req.max_chunks_per_parent == 0 or
+        req.max_chunks_per_parent > max_canonical_hierarchy_matches_per_group)
+    {
+        return false;
+    }
+    return @as(u64, req.limit) * @as(u64, req.max_chunks_per_parent) <=
+        max_canonical_hierarchy_total_matches;
+}
+
+/// Return the first phase of a canonical grouped hierarchy query. Distributed
+/// coordinators use this request on every shard, merge the global group page,
+/// and only then issue one bounded expansion for those selected groups.
+pub fn canonicalGroupedMatchSelectionRequest(req: SearchRequest) SearchRequest {
+    if (!req.hierarchy_grouped_matches or
+        req.return_mode != .parent_with_chunks or
+        req.max_chunks_per_parent == 0)
+    {
+        return req;
+    }
+    var selection = req;
+    selection.return_mode = .parent;
+    selection.max_chunks_per_parent = 0;
+    selection.hierarchy_grouped_matches = false;
+    return selection;
+}
+
+/// Build a bounded grouped-match request. `parent_filter` may contain one
+/// source for local expansion or the complete globally selected page for a
+/// distributed batch expansion.
+pub fn canonicalGroupedMatchExpansionRequest(
+    req: SearchRequest,
+    parent_filter: []const []const u8,
+) SearchRequest {
+    var match_req = req;
+    match_req.offset = 0;
+    match_req.limit = @intCast(parent_filter.len);
+    // Top-level cursors page source groups. They must never be applied to the
+    // independently ranked descendants within the selected groups.
+    match_req.search_after = &.{};
+    match_req.search_before = &.{};
+    match_req.filter_doc_ids = parent_filter;
+    match_req.filter_doc_ids_positive = true;
+    match_req.graph_queries = &.{};
+    match_req.expand_strategy = null;
+    match_req.aggregations_json = "";
+    match_req.count_only = false;
+    match_req.profile = false;
+    return match_req;
+}
+
+/// Build the exact per-source descendant query used by a storage shard after
+/// its source groups have been selected.
+pub fn canonicalGroupedMatchDescendantRequest(
+    req: SearchRequest,
+    parent_filter: []const []const u8,
+) SearchRequest {
+    var match_req = canonicalGroupedMatchExpansionRequest(req, parent_filter);
+    match_req.return_mode = .chunk;
+    match_req.max_chunks_per_parent = 0;
+    match_req.hierarchy_grouped_matches = false;
+    match_req.limit = req.max_chunks_per_parent;
+    match_req.fields = req.hierarchy_match_fields;
+    match_req.include_all_fields = req.hierarchy_match_include_all_fields;
+    match_req.include_stored = match_req.include_all_fields or
+        match_req.fields.len > 0 or
+        match_req.reranker != null;
+    return match_req;
+}
 
 pub const GraphTableReadAuthorization = struct {
     allowed: bool,
@@ -1416,7 +1500,11 @@ pub const SearchHit = struct {
     source_table: ?[]u8 = null,
     doc_ordinal: ?u32 = null,
     native_text_doc_id: ?u32 = null,
+    /// Higher-is-better relevance score used by every public query path.
     score: ?f32 = null,
+    /// Metric-native dense-vector distance. Lower values are better. This is
+    /// retained separately so score ordering never depends on the metric.
+    distance: ?f32 = null,
     index_scores: []fusion_mod.IndexScore = &.{},
     sort_values: []std.json.Value = &.{},
     stored_data: ?[]u8 = null,
@@ -1441,6 +1529,7 @@ pub const SearchHit = struct {
         cloned.doc_ordinal = self.doc_ordinal;
         cloned.native_text_doc_id = self.native_text_doc_id;
         cloned.score = self.score;
+        cloned.distance = self.distance;
         cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
         cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
@@ -1606,6 +1695,7 @@ pub fn freeIndexScores(alloc: Allocator, scores: []fusion_mod.IndexScore) void {
 pub const ChunkHit = struct {
     id: []u8,
     score: ?f32 = null,
+    distance: ?f32 = null,
     stored_data: ?[]u8 = null,
     ancestor_source_data: ?[]u8 = null,
     ancestor_unit_data: ?[]u8 = null,
@@ -1615,6 +1705,7 @@ pub const ChunkHit = struct {
         return .{
             .id = try alloc.dupe(u8, self.id),
             .score = self.score,
+            .distance = self.distance,
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
             .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
             .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
@@ -1711,12 +1802,21 @@ pub const SortProfile = struct {
     sort_rejection_field: SortProfileField = .{},
 };
 
+pub const ShardIdentityReadGeneration = struct {
+    group_id: u64,
+    generation: u64,
+};
+
 pub const SearchResult = struct {
     alloc: Allocator,
     hits: []SearchHit,
     total_hits: u32,
     total_hits_relation: TotalHitsRelation = .exact,
     identity_read_generation: ?u64 = null,
+    /// Snapshot vector for a distributed result. Shard generations are
+    /// independent, so a multi-shard replay must use these tokens rather than
+    /// relying on `identity_read_generation` being globally common.
+    shard_identity_read_generations: []ShardIdentityReadGeneration = &.{},
     sort_profile: ?SortProfile = null,
     graph_results: []GraphSearchResult = &.{},
 
@@ -1725,6 +1825,7 @@ pub const SearchResult = struct {
         if (self.hits.len > 0) self.alloc.free(self.hits);
         for (self.graph_results) |*graph_result| graph_result.deinit(self.alloc);
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
+        if (self.shard_identity_read_generations.len > 0) self.alloc.free(self.shard_identity_read_generations);
         self.* = undefined;
     }
 };

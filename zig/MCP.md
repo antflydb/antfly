@@ -2,8 +2,8 @@
 
 ## Current State
 
-This repo now has a reusable MCP protocol core under `go/pkg/antfly/lib/mcp`, plus Antfly-specific HTTP adapters in
-`pkg/antfly/src/api/protocol_adapters.zig`.
+This repo has a reusable MCP protocol core under `zig/lib/mcp`, plus Antfly-specific HTTP adapters in
+`zig/pkg/antfly/src/api/protocol_adapters.zig`.
 
 The implementation intentionally keeps the protocol library independent of Antfly OpenAPI/generated types. Antfly tools
 are registered at the product layer and delegate back through existing HTTP/API paths so auth, permission checks,
@@ -12,20 +12,17 @@ request validation, table/query behavior, backup/restore behavior, and agent beh
 A2A and native bounded-agent behavior are documented in `A2A.md`. This file keeps only the MCP surface and the explicit
 handoff points where MCP clients should call native agents or A2A skills.
 
-## Go Parity Context
+## Architecture
 
-The Go implementation uses mature protocol SDKs:
-
-- MCP is mounted with `github.com/modelcontextprotocol/go-sdk/mcp.NewStreamableHTTPHandler` in `go/pkg/antfly/src/mcp/mcp.go`. That
-  SDK provides streamable HTTP sessions, `Mcp-Session-Id`, DELETE close, SSE reconnect behavior, and `Last-Event-ID`
-  resumability. The Antfly Go product code exposes streamable HTTP; the SDK also supports stdio, but there is no
-  Antfly-specific stdio server command wired in the Go tree.
-- MCP tool schemas in Go are derived by the MCP SDK from typed argument structs and `json`/`mcp` tags in
-  `go/pkg/antfly/src/mcp/mcp.go`, not handwritten JSON strings.
+The Zig protocol core owns JSON-RPC framing, MCP sessions, transport behavior, tool registration, result encoding, and
+protocol test helpers. It has no dependency on Antfly OpenAPI or storage types. The Antfly adapter owns authentication,
+permission filtering, product tool definitions, and delegation through the same application operations used by HTTP.
+Substantial structured tool inputs are derived selectively from the public OpenAPI contract; simple and dynamic tool
+schemas remain in the runtime registry.
 
 ## Implemented
 
-- `go/pkg/antfly/lib/mcp`
+- `zig/lib/mcp`
   - JSON-RPC 2.0 request/response handling.
   - MCP `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`.
   - Tool registry API with `Server`, `Tool`, `ToolHandler`, and `CallToolResult`.
@@ -95,7 +92,7 @@ Example raw QueryRequest call:
 
 The raw `queryRequest` path is intentionally generic. It can carry the OpenAPI `QueryRequest` fields such as `query`,
 `full_text_search`, `filter_query`, `exclusion_query`, `semantic_search`, `embedding_template`, `indexes`,
-`embeddings`, `fields`, `limit`, `offset`, `order_by`, `search_after`, `search_before`, `distance_under`,
+`embeddings`, `fields`, `hierarchy`, `limit`, `offset`, `order_by`, `search_after`, `search_before`, `distance_under`,
 `distance_over`, `search_effort`, `merge_config`, `count`, `profile`, `reranker`, `aggregations`, `graph_searches`,
 `expand_strategy`, `document_renderer`, `pruner`, `join`, and `foreign_sources`.
 
@@ -107,6 +104,68 @@ Raw mode rules:
   precedence rules would otherwise drift from the REST/OpenAPI contract.
 - `queryRequest.table` is rejected on table-scoped MCP calls. Use `tableName` instead.
 - The raw object is validated by the same `/tables/{tableName}/query` path as direct REST calls.
+
+For hierarchical document retrieval, `limit` controls top-level hits; it does not limit child values expanded from a
+source document. Prefer direct matches when the records selected by an index are the evidence an agent needs:
+
+```json
+{
+  "tableName": "document_search_import",
+  "queryRequest": {
+    "semantic_search": "How does Antfly index documents?",
+    "indexes": ["document_vectors"],
+    "hierarchy": {
+      "ancestors": {
+        "source": {"fields": ["title", "url"]}
+      }
+    },
+    "fields": ["text"],
+    "limit": 5
+  }
+}
+```
+
+When a caller needs source groups with matching descendants attached, use the independently bounded `group_by.matches`
+projection:
+
+```json
+{
+  "tableName": "document_search_import",
+  "queryRequest": {
+    "semantic_search": "How does Antfly index documents?",
+    "indexes": ["document_vectors"],
+    "fields": ["title", "url"],
+    "hierarchy": {
+      "group_by": {
+        "level": "source",
+        "matches": {"limit": 3, "fields": ["text"]}
+      }
+    },
+    "limit": 5
+  }
+}
+```
+
+The presence of `hierarchy` selects the canonical contract. Without `group_by`, including for `hierarchy: {}`, Antfly
+returns direct index matches; `ancestors` only adds projected context and never changes result cardinality.
+`group_by.level` currently supports `source`; its nested `matches` retain their actual `hierarchy.level`, so the response
+is not tied to chunks. Every match or ancestor projection must specify `fields`; use an empty array when only hierarchy
+identity is needed. Omitting `group_by.matches.limit` defaults it to three, and the server rejects values above 100 before
+executing the query. Nested matches follow the effective query order and each group carries its best match score.
+
+For source-level groups, an explicit top-level `fields` projection is required so grouping can never implicitly hydrate a
+complete source document (including its stored `_chunks` array). Use `fields: []` when only source identity is needed. A
+source ancestor projection would duplicate the grouping-level document and is rejected. A unit ancestor projection may be
+combined with source grouping when nested matches need intermediate unit context.
+
+The legacy hierarchy controls remain accepted for existing callers, but they cannot be mixed with `group_by` or
+`ancestors`. They are intentionally omitted from MCP discovery so new integrations see only the canonical controls.
+MCP callers should not request
+`_chunks.*`, which expands the stored child array and can create an oversized response. Antfly returns an actionable tool error
+instead of sending a serialized tool result larger than its MCP compatibility budget. The server default is 96 KiB,
+including TextContent and structuredContent; deployments with known client limits can change
+`mcp.max_tool_result_bytes` in the Antfly configuration, or set it to zero to disable the guard.
+Nonzero budgets must be at least 512 bytes, which leaves room for the actionable overflow result itself.
 
 The full OpenAPI schema is not inlined into every `tools/list` response because the schema is large and references
 recursive query/reranker/graph/join definitions. The `query.queryRequest` input schema stays permissive with compact
@@ -129,6 +188,10 @@ without needing to scrape broad list responses:
   `inclusiveFrom`, and `fields` arguments. It is for schema/content inspection, not agentic retrieval planning.
 - `describe_mcp_capabilities` returns MCP transport/session capabilities, deterministic tool categories, raw
   `queryRequest` support, shorthand query args, and native-agent query-builder handoff guidance.
+- `backup` and `restore` require the same `connection` as their REST request contracts; `backup` also exposes the
+  optional `format` selector.
+- `batch` exposes the REST request capabilities as `inserts`, `deletes`, `transforms`, and `syncLevel`. The older
+  `writes` spelling remains a compatibility alias for `inserts`, but the two cannot be combined.
 
 These tools route through the same HTTP handlers as REST calls where possible. That keeps auth, permission checks,
 validation, and error behavior aligned with the product API.
@@ -139,12 +202,11 @@ validation, and error behavior aligned with the product API.
 - `zig build raft-transport-test`
 - `zig build lib-api-auth-test`
 - `zig build root-test -- --test-filter "api http server serves fielded full-text search through mcp tools"`
-- `go test ./src/mcp`
 
 The API auth test bucket includes HTTP-level coverage for MCP initialize. It also covers MCP session response headers
 and MCP GET event-stream endpoint framing.
 
-The standalone protocol tests also cover parse errors, invalid params, and unknown MCP tools.
+The standalone protocol tests also cover parse errors, invalid params, unknown MCP tools, and oversized tool results.
 
 ## Known Gaps
 
@@ -152,16 +214,18 @@ The standalone protocol tests also cover parse errors, invalid params, and unkno
   initialize responses, validates inbound `Mcp-Session-Id` headers for streamable HTTP requests, and closes sessions
   via `DELETE /mcp/v1`. GET streams emit event IDs and honor `Last-Event-ID`, but historical event replay is not
   implemented yet.
-- MCP has a line-oriented stdio JSON-RPC dispatcher in `go/pkg/antfly/lib/mcp`; the product CLI does not yet expose a long-running
-  stdio server mode. This is also not exposed by Antfly's Go product code, even though the Go SDK supports it.
+- MCP has a line-oriented stdio JSON-RPC dispatcher in `zig/lib/mcp`; the product CLI does not yet expose a long-running
+  stdio server mode.
 - The Antfly adapters now live in `protocol_adapters.zig`. MCP-specific adapter code can move to a dedicated module if
   the surface grows.
 - Protocol structs are intentionally minimal. Dynamic `std.json.Value` remains the extension path for evolving MCP
   fields and tool payloads.
-- MCP schemas are generated from Antfly MCP tool descriptors and cover the current Go-parity tool arguments. They are
-  not yet derived from generated OpenAPI or Zig request structs. The raw `queryRequest` field deliberately uses a
-  permissive schema plus the `describe_query_request` helper to avoid inlining the full recursive OpenAPI query schema
-  into every MCP `tools/list` response.
+- Simple MCP schemas are generated from Antfly MCP tool descriptors. Compact schemas for hierarchy, backup, restore,
+  and batch are generated from their canonical OpenAPI components by `scripts/generate_mcp_schema_fragments.py`.
+  The generator resolves local references, removes verbose API-only annotations from complete tool inputs, applies
+  the MCP camelCase argument overlay, and emits self-contained JSON Schema for Zig to embed at compile time.
+- The raw `queryRequest` field deliberately uses a permissive top-level schema plus the `describe_query_request`
+  helper to avoid inlining the full recursive OpenAPI query schema into every MCP `tools/list` response.
 
 ## Long-Term Direction
 
@@ -171,11 +235,7 @@ registered outside the libraries.
 The next durability improvements should be:
 
 1. Add MCP historical event replay if clients need more than cursor-aware stream continuation.
-2. Expose the `go/pkg/antfly/lib/mcp` stdio dispatcher through a product CLI/server mode if local agent hosts need it.
-3. Broaden adapter failure mapping, tool schema stability tests, and cross-language MCP parity tests.
-4. Consider deriving MCP tool schemas from generated OpenAPI or Zig request structs if the tool surface continues to
-   expand.
-
-For Go product parity, the only remaining behavior difference worth tracking is MCP historical replay after
-`Last-Event-ID`. The other items above are product extensions or maintainability improvements, not missing behavior in
-the current Antfly Go MCP mount.
+2. Expose the `zig/lib/mcp` stdio dispatcher through a product CLI/server mode if local agent hosts need it.
+3. Broaden adapter failure mapping and tool schema stability tests.
+4. Extend OpenAPI-derived compact schema fragments selectively when another MCP tool has a substantial structured
+   request; keep simple scalar tools and runtime permission filtering in the Zig registry.

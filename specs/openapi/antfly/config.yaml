@@ -26,6 +26,8 @@ components:
           example: 4200
         admission:
           $ref: "#/components/schemas/AdmissionConfig"
+        mcp:
+          $ref: "#/components/schemas/McpConfig"
         storage:
           $ref: "#/components/schemas/StorageConfig"
         transaction_sessions:
@@ -789,6 +791,29 @@ components:
           $ref: "#/components/schemas/WriteAdmissionConfig"
         inference:
           $ref: "#/components/schemas/InferenceAdmissionConfig"
+
+    McpConfig:
+      type: object
+      additionalProperties: false
+      description: Model Context Protocol transport compatibility settings.
+      properties:
+        max_tool_result_bytes:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          not:
+            minimum: 1
+            maximum: 511
+          default: 98304
+          example: 98304
+          x-go-type-skip-optional-pointer: false
+          description: |
+            Maximum serialized MCP `tools/call` result size, including both
+            TextContent and structuredContent. Results above the limit are
+            replaced with an actionable MCP tool error. The default is 96 KiB,
+            leaving envelope headroom beneath common 100 KiB connector limits.
+            Nonzero values must be at least 512 bytes so the replacement error
+            itself fits. Set to 0 to disable the compatibility guard.
 
     QueryAdmissionConfig:
       type: object

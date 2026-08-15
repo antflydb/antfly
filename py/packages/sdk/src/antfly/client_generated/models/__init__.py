@@ -287,6 +287,23 @@ from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
 from .ground_truth import GroundTruth
+from .hierarchy_ancestor import HierarchyAncestor
+from .hierarchy_ancestor_document import HierarchyAncestorDocument
+from .hierarchy_ancestors import HierarchyAncestors
+from .hierarchy_artifact import HierarchyArtifact
+from .hierarchy_artifact_kind import HierarchyArtifactKind
+from .hierarchy_artifact_source import HierarchyArtifactSource
+from .hierarchy_artifact_source_kind import HierarchyArtifactSourceKind
+from .hierarchy_evidence import HierarchyEvidence
+from .hierarchy_evidence_canonical import HierarchyEvidenceCanonical
+from .hierarchy_evidence_mention import HierarchyEvidenceMention
+from .hierarchy_group_by import HierarchyGroupBy
+from .hierarchy_group_by_level import HierarchyGroupByLevel
+from .hierarchy_match_context import HierarchyMatchContext
+from .hierarchy_match_hit import HierarchyMatchHit
+from .hierarchy_match_hit_source import HierarchyMatchHitSource
+from .hierarchy_matches import HierarchyMatches
+from .hierarchy_projection import HierarchyProjection
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
@@ -539,11 +556,10 @@ from .query_builder_request_example_documents_item import QueryBuilderRequestExa
 from .query_builder_result import QueryBuilderResult
 from .query_builder_result_plan import QueryBuilderResultPlan
 from .query_builder_result_query import QueryBuilderResultQuery
+from .query_hierarchy import QueryHierarchy
 from .query_hit import QueryHit
 from .query_hit_hierarchy import QueryHitHierarchy
 from .query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
-from .query_hit_hierarchy_artifact import QueryHitHierarchyArtifact
-from .query_hit_hierarchy_chunks_item import QueryHitHierarchyChunksItem
 from .query_hit_hierarchy_level import QueryHitHierarchyLevel
 from .query_hit_index_scores import QueryHitIndexScores
 from .query_hit_source import QueryHitSource
@@ -1014,6 +1030,23 @@ __all__ = (
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
     "GroundTruth",
+    "HierarchyAncestor",
+    "HierarchyAncestorDocument",
+    "HierarchyAncestors",
+    "HierarchyArtifact",
+    "HierarchyArtifactKind",
+    "HierarchyArtifactSource",
+    "HierarchyArtifactSourceKind",
+    "HierarchyEvidence",
+    "HierarchyEvidenceCanonical",
+    "HierarchyEvidenceMention",
+    "HierarchyGroupBy",
+    "HierarchyGroupByLevel",
+    "HierarchyMatchContext",
+    "HierarchyMatches",
+    "HierarchyMatchHit",
+    "HierarchyMatchHitSource",
+    "HierarchyProjection",
     "ImageURL",
     "ImageURLContentPart",
     "ImageURLContentPartType",
@@ -1264,11 +1297,10 @@ __all__ = (
     "QueryBuilderResult",
     "QueryBuilderResultPlan",
     "QueryBuilderResultQuery",
+    "QueryHierarchy",
     "QueryHit",
     "QueryHitHierarchy",
     "QueryHitHierarchyAncestors",
-    "QueryHitHierarchyArtifact",
-    "QueryHitHierarchyChunksItem",
     "QueryHitHierarchyLevel",
     "QueryHitIndexScores",
     "QueryHits",

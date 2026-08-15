@@ -122,6 +122,7 @@ pub const Config = struct {
     /// Port for the health/metrics server. Defaults to 4200.
     health_port: ?i64 = null,
     admission: ?AdmissionConfig = null,
+    mcp: ?McpConfig = null,
     storage: ?StorageConfig = null,
     transaction_sessions: ?TransactionSessionConfig = null,
     metadata: ?MetadataInfo = null,
@@ -436,6 +437,12 @@ pub const LiteStorageConfig = struct {
 pub const LocalStorageConfig = struct {
     /// Root directory for all antfly data storage. Defaults to 'antflydb'.
     base_dir: ?[]const u8 = null,
+};
+
+/// Model Context Protocol transport compatibility settings.
+pub const McpConfig = struct {
+    /// Maximum serialized MCP `tools/call` result size, including both TextContent and structuredContent. Results above the limit are replaced with an actionable MCP tool error. The default is 96 KiB, leaving envelope headroom beneath common 100 KiB connector limits. Nonzero values must be at least 512 bytes so the replacement error itself fits. Set to 0 to disable the compatibility guard.
+    max_tool_result_bytes: ?i64 = null,
 };
 
 pub const MetadataInfo = struct {

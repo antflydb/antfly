@@ -79,6 +79,15 @@ type BatchResult struct {
 	} `json:"failed,omitempty"`
 }
 
+type HierarchyAncestors = oapi.HierarchyAncestors
+type HierarchyGroupBy = oapi.HierarchyGroupBy
+type HierarchyGroupByLevel = oapi.HierarchyGroupByLevel
+type HierarchyMatches = oapi.HierarchyMatches
+type HierarchyProjection = oapi.HierarchyProjection
+type QueryHierarchy = oapi.QueryHierarchy
+
+const HierarchyGroupByLevelSource = oapi.HierarchyGroupByLevelSource
+
 // QueryRequest represents a query request with strongly-typed query fields.
 // This is the SDK-friendly version of oapi.QueryRequest with Query types instead of json.RawMessage.
 type QueryRequest struct {
@@ -161,6 +170,10 @@ type QueryRequest struct {
 	// Results can reference search results using node selectors like $full_text_results.
 	GraphSearches map[string]GraphQuery `json:"graph_searches,omitempty"`
 
+	// Hierarchy controls top-level result shape, bounded child hits, and projected ancestors.
+	// A non-nil empty object selects direct index matches without ancestor hydration.
+	Hierarchy *QueryHierarchy `json:"hierarchy,omitempty"`
+
 	// Join configuration for joining data from another table.
 	// Supports inner, left, and right joins with automatic strategy selection.
 	Join JoinClause `json:"join"`
@@ -185,7 +198,7 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		DistanceUnder:    q.DistanceUnder,
 		Embeddings:       q.Embeddings,
 		Aggregations:     q.Aggregations,
-		Fields:           q.Fields,
+		Fields:           nil,
 		FilterPrefix:     q.FilterPrefix,
 		Indexes:          q.Indexes,
 		Limit:            q.Limit,
@@ -199,7 +212,14 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		SemanticSearch:   q.SemanticSearch,
 		DocumentRenderer: q.DocumentRenderer,
 		GraphSearches:    q.GraphSearches,
+		Hierarchy:        q.Hierarchy,
 		ForeignSources:   q.ForeignSources,
+	}
+	// Preserve the distinction between an omitted projection and an explicitly
+	// empty identity-only projection. The generated OpenAPI type uses a pointer
+	// for this optional array so [] remains present on the wire.
+	if q.Fields != nil {
+		oapiReq.Fields = &q.Fields
 	}
 	if !reflect.ValueOf(q.Join).IsZero() {
 		oapiReq.Join = q.Join
@@ -258,7 +278,10 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	q.DistanceUnder = oapiReq.DistanceUnder
 	q.Embeddings = oapiReq.Embeddings
 	q.Aggregations = oapiReq.Aggregations
-	q.Fields = oapiReq.Fields
+	q.Fields = nil
+	if oapiReq.Fields != nil {
+		q.Fields = *oapiReq.Fields
+	}
 	q.FilterPrefix = oapiReq.FilterPrefix
 	q.Indexes = oapiReq.Indexes
 	q.Limit = oapiReq.Limit
@@ -272,6 +295,7 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	q.SemanticSearch = oapiReq.SemanticSearch
 	q.DocumentRenderer = oapiReq.DocumentRenderer
 	q.GraphSearches = oapiReq.GraphSearches
+	q.Hierarchy = oapiReq.Hierarchy
 	q.Join = oapiReq.Join
 	q.ForeignSources = oapiReq.ForeignSources
 
