@@ -3152,6 +3152,7 @@ pub fn encodeQueryResponses(
     };
 
     return .{
+        .identity_read_generation = result.identity_read_generation orelse req.identity_read_generation,
         // OpenAPI optional response fields are absent unless populated; they
         // are not nullable. Keeping nulls out also preserves the compact wire
         // shape now that hierarchy is represented by generated response types.

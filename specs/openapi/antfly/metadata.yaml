@@ -6490,6 +6490,7 @@ components:
             lower-level vector search overrides are provided internally.
           example: 0.5
         fields:
+          x-go-type-skip-optional-pointer: false
           type: array
           description: |
             List of fields to include in the results. If not specified, all fields are returned.

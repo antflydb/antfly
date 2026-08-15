@@ -341,18 +341,57 @@ def compact_query_request_schema(schemas: dict[str, Any]) -> dict[str, Any]:
             )
     # The REST schema permits a global-query table property. The MCP tool is
     # table-scoped, so its raw body must use the outer tableName exactly once.
-    result.setdefault("allOf", []).append({"not": {"required": ["table"]}})
+    result.setdefault("allOf", []).append({"not": property_has_non_null_value("table")})
     return result
+
+
+def nullable_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Allow generated clients to serialize an omitted optional as JSON null."""
+    schema_type = schema.get("type")
+    if schema_type == "object" and any(
+        keyword in schema for keyword in ("not", "allOf", "anyOf", "oneOf")
+    ):
+        # Object-only keywords such as `required` are vacuously valid for null,
+        # which can invert a top-level `not`. Keep the complete object contract
+        # in its own branch instead of only widening `type`.
+        result: dict[str, Any] = {"anyOf": [schema, {"type": "null"}]}
+        if "description" in schema:
+            result["description"] = schema["description"]
+        return result
+    if isinstance(schema_type, str):
+        schema["type"] = [schema_type, "null"]
+        return schema
+    if isinstance(schema_type, list):
+        if "null" not in schema_type:
+            schema["type"] = [*schema_type, "null"]
+        return schema
+    return {"anyOf": [schema, {"type": "null"}]}
+
+
+def property_has_non_null_value(name: str) -> dict[str, Any]:
+    """Match an object property only when it is present and not JSON null."""
+    return {
+        "required": [name],
+        "properties": {name: {"not": {"type": "null"}}},
+    }
 
 
 def mcp_query_input_schema(schemas: dict[str, Any]) -> dict[str, Any]:
     properties: dict[str, Any] = {
         "tableName": {"type": "string"},
-        "queryRequest": compact_query_request_schema(schemas),
-        **copy.deepcopy(MCP_QUERY_SHORTHAND_PROPERTIES),
+        "queryRequest": nullable_schema(compact_query_request_schema(schemas)),
+        **{
+            name: nullable_schema(copy.deepcopy(schema))
+            for name, schema in MCP_QUERY_SHORTHAND_PROPERTIES.items()
+        },
     }
     conflicting_pairs = [
-        {"required": ["queryRequest", shorthand]}
+        {
+            "allOf": [
+                property_has_non_null_value("queryRequest"),
+                property_has_non_null_value(shorthand),
+            ]
+        }
         for shorthand in MCP_QUERY_SHORTHAND_PROPERTIES
     ]
     return {

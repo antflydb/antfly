@@ -16,12 +16,14 @@ name = "antfly-zig-scripts"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "jsonschema" },
     { name = "openapi-spec-validator" },
     { name = "pyyaml" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "jsonschema", specifier = ">=4.26.0" },
     { name = "openapi-spec-validator", specifier = ">=0.7.2" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]

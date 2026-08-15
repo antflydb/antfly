@@ -22001,9 +22001,10 @@ test "api http server serves fielded full-text search through mcp tools" {
     const query_request_schema = query_properties.object.get("queryRequest") orelse return error.TestExpectedEqual;
     const query_request_description = query_request_schema.object.get("description") orelse return error.TestExpectedEqual;
     try std.testing.expect(std.mem.startsWith(u8, query_request_description.string, "Raw Antfly QueryRequest body"));
+    const query_request_contract_schema = query_request_schema.object.get("anyOf").?.array.items[0];
     try std.testing.expect(query_properties.object.get("fullTextSearchField") != null);
     try std.testing.expect(query_properties.object.get("full_text_search") != null);
-    const query_request_properties = query_request_schema.object.get("properties") orelse return error.TestExpectedEqual;
+    const query_request_properties = query_request_contract_schema.object.get("properties") orelse return error.TestExpectedEqual;
     try std.testing.expect(query_request_properties.object.get("full_text_search") != null);
     const hierarchy_schema = query_request_properties.object.get("hierarchy") orelse return error.TestExpectedEqual;
     try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_query_hierarchy_schema.json"), hierarchy_schema);
@@ -22035,7 +22036,7 @@ test "api http server serves fielded full-text search through mcp tools" {
         }
     }
     try std.testing.expect(found_source_group_projection_constraint);
-    const query_request_not = query_request_schema.object.get("not") orelse return error.TestExpectedEqual;
+    const query_request_not = query_request_contract_schema.object.get("not") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 2), query_request_not.object.get("allOf").?.array.items.len);
     const query_tool_not = query_tool.inputSchema.object.get("not") orelse return error.TestExpectedEqual;
     try std.testing.expect(query_tool_not.object.get("anyOf").?.array.items.len > 0);

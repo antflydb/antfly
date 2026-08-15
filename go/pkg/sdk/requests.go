@@ -198,7 +198,7 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		DistanceUnder:    q.DistanceUnder,
 		Embeddings:       q.Embeddings,
 		Aggregations:     q.Aggregations,
-		Fields:           q.Fields,
+		Fields:           nil,
 		FilterPrefix:     q.FilterPrefix,
 		Indexes:          q.Indexes,
 		Limit:            q.Limit,
@@ -214,6 +214,12 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		GraphSearches:    q.GraphSearches,
 		Hierarchy:        q.Hierarchy,
 		ForeignSources:   q.ForeignSources,
+	}
+	// Preserve the distinction between an omitted projection and an explicitly
+	// empty identity-only projection. The generated OpenAPI type uses a pointer
+	// for this optional array so [] remains present on the wire.
+	if q.Fields != nil {
+		oapiReq.Fields = &q.Fields
 	}
 	if !reflect.ValueOf(q.Join).IsZero() {
 		oapiReq.Join = q.Join
@@ -272,7 +278,10 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	q.DistanceUnder = oapiReq.DistanceUnder
 	q.Embeddings = oapiReq.Embeddings
 	q.Aggregations = oapiReq.Aggregations
-	q.Fields = oapiReq.Fields
+	q.Fields = nil
+	if oapiReq.Fields != nil {
+		q.Fields = *oapiReq.Fields
+	}
 	q.FilterPrefix = oapiReq.FilterPrefix
 	q.Indexes = oapiReq.Indexes
 	q.Limit = oapiReq.Limit

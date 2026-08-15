@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import json
 import unittest
 
 import yaml
+from jsonschema import Draft202012Validator
 
 from scripts import generate_mcp_schema_fragments as generator
 
@@ -75,7 +77,10 @@ class McpSchemaFragmentTests(unittest.TestCase):
             generated["not"]["allOf"][0]["properties"]["hierarchy"]["required"],
         )
         self.assertEqual(["fields"], generated["not"]["allOf"][1]["not"]["required"])
-        self.assertIn({"not": {"required": ["table"]}}, generated["allOf"])
+        self.assertIn(
+            {"not": generator.property_has_non_null_value("table")},
+            generated["allOf"],
+        )
 
     def test_query_tool_schema_expresses_raw_shorthand_exclusivity(self) -> None:
         with generator.SPEC.open(encoding="utf-8") as handle:
@@ -86,14 +91,44 @@ class McpSchemaFragmentTests(unittest.TestCase):
 
         self.assertFalse(generated["additionalProperties"])
         self.assertIn(
-            {"required": ["queryRequest", "semanticSearch"]},
-            conflicts,
-        )
-        self.assertIn(
-            {"required": ["queryRequest", "full_text_search"]},
+            {
+                "allOf": [
+                    generator.property_has_non_null_value("queryRequest"),
+                    generator.property_has_non_null_value("semanticSearch"),
+                ]
+            },
             conflicts,
         )
         self.assertNotIn("default", generated["properties"]["limit"])
+
+    def test_query_tool_schema_accepts_null_optionals_but_rejects_real_mode_conflicts(self) -> None:
+        with generator.SPEC.open(encoding="utf-8") as handle:
+            schemas = yaml.safe_load(handle)["components"]["schemas"]
+
+        validator = Draft202012Validator(generator.mcp_query_input_schema(schemas))
+        raw_with_generated_nulls = {
+            "tableName": "docs",
+            "queryRequest": {
+                "table": None,
+                "full_text_search": {"match": "hello", "field": "body"},
+                "limit": 5,
+            },
+            "semanticSearch": None,
+            "fields": None,
+            "limit": None,
+        }
+        self.assertEqual([], list(validator.iter_errors(raw_with_generated_nulls)))
+
+        conflicting = copy.deepcopy(raw_with_generated_nulls)
+        conflicting["semanticSearch"] = "hello"
+        self.assertNotEqual([], list(validator.iter_errors(conflicting)))
+
+        shorthand_with_null_raw = {
+            "tableName": "docs",
+            "queryRequest": None,
+            "semanticSearch": "hello",
+        }
+        self.assertEqual([], list(validator.iter_errors(shorthand_with_null_raw)))
 
 
 if __name__ == "__main__":

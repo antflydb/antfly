@@ -17,7 +17,12 @@
 const std = @import("std");
 
 pub const QueryResponse = struct {
+    /// Internal group-query response header used to carry the storage snapshot
+    /// selected by the shard. This stays outside the public query JSON contract.
+    pub const identity_read_generation_header = "X-Antfly-Identity-Read-Generation";
+
     json: []u8,
+    identity_read_generation: ?u64 = null,
 
     pub fn deinit(self: *QueryResponse, alloc: std.mem.Allocator) void {
         alloc.free(self.json);

@@ -1802,12 +1802,21 @@ pub const SortProfile = struct {
     sort_rejection_field: SortProfileField = .{},
 };
 
+pub const ShardIdentityReadGeneration = struct {
+    group_id: u64,
+    generation: u64,
+};
+
 pub const SearchResult = struct {
     alloc: Allocator,
     hits: []SearchHit,
     total_hits: u32,
     total_hits_relation: TotalHitsRelation = .exact,
     identity_read_generation: ?u64 = null,
+    /// Snapshot vector for a distributed result. Shard generations are
+    /// independent, so a multi-shard replay must use these tokens rather than
+    /// relying on `identity_read_generation` being globally common.
+    shard_identity_read_generations: []ShardIdentityReadGeneration = &.{},
     sort_profile: ?SortProfile = null,
     graph_results: []GraphSearchResult = &.{},
 
@@ -1816,6 +1825,7 @@ pub const SearchResult = struct {
         if (self.hits.len > 0) self.alloc.free(self.hits);
         for (self.graph_results) |*graph_result| graph_result.deinit(self.alloc);
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
+        if (self.shard_identity_read_generations.len > 0) self.alloc.free(self.shard_identity_read_generations);
         self.* = undefined;
     }
 };

@@ -5495,6 +5495,8 @@ pub fn build(b: *std.Build) void {
             "aggregation completeness requires exact total relation",
             "distributed grouped hierarchy expands only the globally merged page",
             "hosted distributed grouped hierarchy expands the globally selected shard page",
+            "parseRemoteSearchResult preserves grouped hierarchy matches",
+            "remote query returns the shard-selected identity generation",
             "api http client forwards internal query controls and maps remote timeout",
             "api http client preserves remote storage read contention",
             "api http client preserves storage read contention across group read endpoints",

@@ -1648,6 +1648,11 @@ pub const AntflyApiHandler = struct {
         const response = try std.json.parseFromSliceLeaky(metadata_openapi.QueryResponses, arena_impl.allocator(), result.json, .{
             .allocate = .alloc_always,
         });
+        if (result.identity_read_generation) |generation| {
+            var buf: [32]u8 = undefined;
+            const value = try std.fmt.bufPrint(&buf, "{d}", .{generation});
+            try ctx.setHeader(query_api.QueryResponse.identity_read_generation_header, value);
+        }
         return ctx.json(response);
     }
 

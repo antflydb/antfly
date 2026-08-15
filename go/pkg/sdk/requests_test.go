@@ -60,6 +60,22 @@ func TestQueryRequestMarshalPreservesHierarchyGrouping(t *testing.T) {
 	}
 }
 
+func TestQueryRequestMarshalPreservesIdentityOnlyHierarchyGrouping(t *testing.T) {
+	body, err := json.Marshal(QueryRequest{
+		Hierarchy: &QueryHierarchy{
+			GroupBy: &HierarchyGroupBy{Level: HierarchyGroupByLevelSource},
+		},
+		Fields: []string{},
+		Limit:  5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"fields":[]`)) {
+		t.Fatalf("identity-only group projection missing from request: %s", body)
+	}
+}
+
 func TestQueryRequestMarshalPreservesIdentityOnlyHierarchyProjection(t *testing.T) {
 	body, err := json.Marshal(QueryRequest{
 		Hierarchy: &QueryHierarchy{

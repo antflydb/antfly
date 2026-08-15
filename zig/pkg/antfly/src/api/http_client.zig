@@ -29,6 +29,7 @@ const table_writes_api = @import("table_writes.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const transactions_api = @import("transactions.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const query_response = @import("query_response.zig");
 
 const transition_control_rpc_timeout_ms: u32 = 5_000;
 
@@ -84,6 +85,7 @@ pub const RepairCancelStateResponse = struct {
 
 pub const QueryResponse = struct {
     content_type: ?[]u8 = null,
+    identity_read_generation: ?u64 = null,
     body: []u8,
 
     pub fn deinit(self: *QueryResponse, alloc: std.mem.Allocator) void {
@@ -667,7 +669,10 @@ pub const ApiHttpClient = struct {
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
-        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+        return .{
+            .identity_read_generation = try parseIdentityReadGenerationHeader(resp),
+            .body = try self.alloc.dupe(u8, resp.body),
+        };
     }
 
     pub fn fetchGroupQueryPreflight(
@@ -2896,6 +2901,11 @@ fn remoteStorageReadUnavailableError(body: []const u8) anyerror {
         return error.StorageReadTemporarilyUnavailable;
     }
     return error.UnexpectedHttpStatus;
+}
+
+fn parseIdentityReadGenerationHeader(resp: http_common.HttpResponse) !?u64 {
+    const value = resp.header(query_response.QueryResponse.identity_read_generation_header) orelse return null;
+    return std.fmt.parseUnsigned(u64, value, 10) catch error.InvalidRemoteResponse;
 }
 
 test "api http client preserves remote transaction decision conflicts" {
