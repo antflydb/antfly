@@ -24,7 +24,9 @@ class QueryHit:
     Attributes:
         field_id (str): ID of the record.
         field_score (float): Relevance score of the hit, normalized so higher values always rank first.
-        field_distance (float | Unset): Raw vector distance for dense-vector hits; lower values are better. Omitted for
+        field_distance (float | Unset): Raw vector distance for direct dense-vector hits; lower values are better.
+            For a source group ranked by dense descendants, this is the distance of
+            the best matching descendant that supplied the group score. Omitted for
             non-dense and fused results.
         field_index_scores (QueryHitIndexScores | Unset): Scores partitioned by index when using RRF search.
         field_source (QueryHitSource | Unset):

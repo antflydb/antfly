@@ -6838,7 +6838,7 @@ pub const QueryHit = struct {
     _id: []const u8,
     /// Relevance score of the hit, normalized so higher values always rank first.
     _score: f32,
-    /// Raw vector distance for dense-vector hits; lower values are better. Omitted for non-dense and fused results.
+    /// Raw vector distance for direct dense-vector hits; lower values are better. For a source group ranked by dense descendants, this is the distance of the best matching descendant that supplied the group score. Omitted for non-dense and fused results.
     _distance: ?f32 = null,
     /// Scores partitioned by index when using RRF search.
     _index_scores: ?std.json.Value = null,

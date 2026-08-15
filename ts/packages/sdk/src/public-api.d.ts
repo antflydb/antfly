@@ -7103,7 +7103,10 @@ export interface components {
             _score: number;
             /**
              * Format: float
-             * @description Raw vector distance for dense-vector hits; lower values are better. Omitted for non-dense and fused results.
+             * @description Raw vector distance for direct dense-vector hits; lower values are better.
+             *     For a source group ranked by dense descendants, this is the distance of
+             *     the best matching descendant that supplied the group score. Omitted for
+             *     non-dense and fused results.
              */
             _distance?: number;
             /** @description Scores partitioned by index when using RRF search. */

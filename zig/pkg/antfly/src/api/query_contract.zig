@@ -3193,9 +3193,17 @@ fn searchHitHierarchyOpenApiValue(
     hit: db_mod.types.SearchHit,
 ) !?metadata_openapi.QueryHitHierarchy {
     const value = (try searchHitHierarchyJsonValue(alloc, req, hit)) orelse return null;
-    return try std.json.parseFromValueLeaky(metadata_openapi.QueryHitHierarchy, alloc, value, .{
-        .ignore_unknown_fields = true,
-    });
+    return try parseSearchHitHierarchyOpenApiValue(alloc, value);
+}
+
+fn parseSearchHitHierarchyOpenApiValue(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !metadata_openapi.QueryHitHierarchy {
+    // This conversion is also the boundary between the hand-built runtime
+    // envelope and its public schema. Keep it strict so a newly emitted field
+    // cannot silently disappear from the API and generated SDKs.
+    return try std.json.parseFromValueLeaky(metadata_openapi.QueryHitHierarchy, alloc, value, .{});
 }
 
 fn validateOpenApiHitSortTuple(req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !void {
@@ -4306,6 +4314,22 @@ test "query hit exposes relevance score and raw vector distance separately" {
     });
     try std.testing.expectEqual(@as(f32, 0.8), hit._score);
     try std.testing.expectEqual(@as(f32, 0.25), hit._distance.?);
+}
+
+test "query hierarchy response conversion rejects schema drift" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"level\":\"source\",\"unmodeled_field\":true}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectError(
+        error.UnknownField,
+        parseSearchHitHierarchyOpenApiValue(alloc, parsed.value),
+    );
 }
 
 pub fn parseAggregationRequestsJson(

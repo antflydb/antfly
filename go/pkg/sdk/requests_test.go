@@ -108,7 +108,7 @@ func TestQueryHitUnmarshalUsesTypedHierarchy(t *testing.T) {
 	if hit.Hierarchy.Level != QueryHitHierarchyLevelSource {
 		t.Fatalf("unexpected hierarchy level: %q", hit.Hierarchy.Level)
 	}
-	if hit.Distance != 0.2 {
+	if hit.Distance == nil || *hit.Distance != 0.2 {
 		t.Fatalf("unexpected raw vector distance: %v", hit.Distance)
 	}
 	if len(hit.Hierarchy.Matches) != 1 || hit.Hierarchy.Matches[0].ID != "chunk:1" {
@@ -116,6 +116,32 @@ func TestQueryHitUnmarshalUsesTypedHierarchy(t *testing.T) {
 	}
 	if hit.Hierarchy.Evidence.LocalId != "e0" {
 		t.Fatalf("unexpected typed hierarchy evidence: %#v", hit.Hierarchy.Evidence)
+	}
+}
+
+func TestQueryHitDistanceDistinguishesPerfectDenseMatchFromAbsent(t *testing.T) {
+	var perfectDense Hit
+	if err := json.Unmarshal([]byte(`{"_id":"doc:dense","_score":1,"_distance":0}`), &perfectDense); err != nil {
+		t.Fatal(err)
+	}
+	if perfectDense.Distance == nil || *perfectDense.Distance != 0 {
+		t.Fatalf("perfect dense-match distance lost: %#v", perfectDense.Distance)
+	}
+
+	var nonDense Hit
+	if err := json.Unmarshal([]byte(`{"_id":"doc:text","_score":1}`), &nonDense); err != nil {
+		t.Fatal(err)
+	}
+	if nonDense.Distance != nil {
+		t.Fatalf("absent distance became present: %#v", nonDense.Distance)
+	}
+
+	body, err := json.Marshal(perfectDense)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"_distance":0`)) {
+		t.Fatalf("perfect dense-match distance omitted during marshal: %s", body)
 	}
 }
 

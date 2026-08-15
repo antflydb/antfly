@@ -14559,6 +14559,7 @@ components:
           format: float
           x-go-type: float64
           x-go-name: distance
+          x-go-type-skip-optional-pointer: false
           description: Raw vector distance when this hit came directly from a dense-vector search; lower
             values are better.
         _source:
@@ -14619,7 +14620,14 @@ components:
           format: float
           x-go-type: float64
           x-go-name: distance
-          description: Raw vector distance for dense-vector hits; lower values are better. Omitted for
+          x-go-type-skip-optional-pointer: false
+          description: >
+            Raw vector distance for direct dense-vector hits; lower values are better.
+
+            For a source group ranked by dense descendants, this is the distance of
+
+            the best matching descendant that supplied the group score. Omitted for
+
             non-dense and fused results.
         _index_scores:
           type: object
