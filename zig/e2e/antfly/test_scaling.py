@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import time
@@ -31,6 +32,7 @@ import requests
 
 from conftest import (
     DEFAULT_ANTFLY_BIN,
+    LoopbackPortReservations,
     REPO_ROOT,
     _read_log_tail,
     antfly_public_api_url,
@@ -64,6 +66,27 @@ class _ClusterStartupDeadline:
         if remaining <= 0.0:
             raise RuntimeError("multi-node cluster startup deadline expired")
         time.sleep(min(duration_s, remaining))
+
+
+def test_loopback_port_reservations_hold_ports_until_release():
+    reservations = LoopbackPortReservations()
+    ports = [reservations.reserve() for _ in range(16)]
+
+    try:
+        assert len(set(ports)) == len(ports)
+        for port in ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+                with pytest.raises(OSError):
+                    contender.bind(("127.0.0.1", port))
+
+        assert all(find_free_port() not in ports for _ in range(64))
+
+        released_port = ports.pop()
+        reservations.release(released_port)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+            contender.bind(("127.0.0.1", released_port))
+    finally:
+        reservations.close()
 
 
 def _metadata_admin_url(stateful_api) -> str:
@@ -387,16 +410,9 @@ class MultiNodeScalingCluster:
         self.startup_deadline = (
             _ClusterStartupDeadline(startup_deadline_at) if startup_deadline_at is not None else None
         )
-
-        self.metadata_nodes = [
-            {
-                "id": node_id,
-                "raft_port": find_free_port(),
-                "api_port": find_free_port(),
-            }
-            for node_id in range(1, 4)
-        ]
-        self.data_nodes = [self._new_data_node(node_id) for node_id in range(101, 101 + initial_data_node_count)]
+        self.port_reservations = LoopbackPortReservations(self.host)
+        self.metadata_nodes: list[dict[str, int]] = []
+        self.data_nodes: list[dict[str, int]] = []
         self.config_path = self.root / "antfly.json"
         self.metadata_procs: list[subprocess.Popen[str]] = []
         self.data_procs: list[subprocess.Popen[str]] = []
@@ -404,8 +420,20 @@ class MultiNodeScalingCluster:
         self.log_files: list[Any] = []
         self.log_paths: list[Path] = []
 
-        self._write_config()
         try:
+            self.metadata_nodes = [
+                {
+                    "id": node_id,
+                    "raft_port": self.port_reservations.reserve(),
+                    "api_port": self.port_reservations.reserve(),
+                }
+                for node_id in range(1, 4)
+            ]
+            self.data_nodes = [
+                self._new_data_node(node_id)
+                for node_id in range(101, 101 + initial_data_node_count)
+            ]
+            self._write_config()
             self._start()
         except BaseException:
             self.stop()
@@ -445,8 +473,8 @@ class MultiNodeScalingCluster:
         return {
             "id": node_id,
             "store_id": node_id,
-            "api_port": find_free_port(),
-            "raft_port": find_free_port(),
+            "api_port": self.port_reservations.reserve(),
+            "raft_port": self.port_reservations.reserve(),
         }
 
     def _write_config(self) -> None:
@@ -489,11 +517,10 @@ class MultiNodeScalingCluster:
                 str(self.config_path),
                 "--id",
                 str(node["id"]),
-                "--health-port",
-                # This listener is not addressed by the test. Let the kernel
-                # choose its port atomically so it cannot consume a port that
-                # was preselected for a later metadata/data listener.
-                "0",
+                # This fixture probes the metadata admin listener directly and
+                # does not need a second health listener competing for ports.
+                "--health",
+                "false",
                 "--raft-tick-ms",
                 "25",
                 "--control-tick-ms",
@@ -505,6 +532,7 @@ class MultiNodeScalingCluster:
                 "--snapshot-root-dir",
                 str(self.root / f"metadata-{node['id']}-snapshots"),
             ]
+            self.port_reservations.release(node["raft_port"], node["api_port"])
             self.metadata_procs.append(
                 subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=REPO_ROOT)
             )
@@ -564,13 +592,10 @@ class MultiNodeScalingCluster:
             str(node["id"]),
             "--store-id",
             str(node["store_id"]),
-            "--health-port",
-            # The test probes the public listener's root /healthz endpoint;
-            # the dedicated health listener only needs to start successfully.
-            # Port zero avoids the find-free-port/child-bind race and prevents
-            # collisions with ports reserved earlier for dynamically added
-            # data nodes.
-            "0",
+            # The public listener provides the /healthz route used by this
+            # fixture, so an additional health listener is unnecessary.
+            "--health",
+            "false",
             "--raft-tick-ms",
             "25",
             "--control-tick-ms",
@@ -580,6 +605,7 @@ class MultiNodeScalingCluster:
             "--replica-catalog-path",
             str(self.root / f"data-{node['id']}-catalog.txt"),
         ]
+        self.port_reservations.release(node["api_port"], node["raft_port"])
         proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=REPO_ROOT)
         self.data_procs.append(proc)
         self.data_proc_by_node_id[int(node["id"])] = proc
@@ -1020,6 +1046,7 @@ class MultiNodeScalingCluster:
             print(f"failed to preserve scaling diagnostics: {exc!r}")
 
     def stop(self, *, timeout_s: float = 10.0, test_failed: bool = False) -> None:
+        self.port_reservations.close()
         if test_failed:
             self.preserve_failure_diagnostics()
         procs = [proc for proc in [*self.data_procs, *self.metadata_procs] if proc.poll() is None]

@@ -145,6 +145,48 @@ def find_free_port() -> int:
         return sock.getsockname()[1]
 
 
+class LoopbackPortReservations:
+    """Hold kernel-assigned ports until a child process is ready to bind them.
+
+    `find_free_port()` is appropriate when its caller binds immediately. Cluster
+    fixtures often need several advertised ports before writing configuration or
+    starting children; closing every probe socket makes those port numbers
+    available for reuse in the meantime. This pool keeps each socket bound, which
+    both guarantees uniqueness within the fixture and prevents unrelated
+    port-zero listeners from claiming a later child's advertised port.
+    """
+
+    def __init__(self, host: str = "127.0.0.1") -> None:
+        self.host = host
+        self._sockets: dict[int, socket.socket] = {}
+
+    def reserve(self) -> int:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind((self.host, 0))
+            port = int(sock.getsockname()[1])
+            if port in self._sockets:
+                raise RuntimeError(f"kernel returned duplicate reserved port {port}")
+            self._sockets[port] = sock
+            return port
+        except BaseException:
+            sock.close()
+            raise
+
+    def release(self, *ports: int) -> None:
+        for port in ports:
+            sock = self._sockets.pop(port, None)
+            if sock is None:
+                raise RuntimeError(f"port {port} is not reserved")
+            sock.close()
+
+    def close(self) -> None:
+        sockets = list(self._sockets.values())
+        self._sockets.clear()
+        for sock in sockets:
+            sock.close()
+
+
 def wait_for_server(
     url: str,
     timeout: float = float(os.environ.get("ANTFLY_E2E_SERVER_START_TIMEOUT_S", "30.0")),
