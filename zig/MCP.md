@@ -157,7 +157,7 @@ MCP callers should not request
 `_chunks.*`, which expands the stored child array and can create an oversized response. Antfly returns an actionable tool error
 instead of sending a serialized tool result larger than its MCP compatibility budget. The server default is 96 KiB,
 including TextContent and structuredContent; deployments with known client limits can change
-`ApiHttpServerConfig.mcp_max_tool_result_bytes`, or set it to zero to disable the guard.
+`mcp.max_tool_result_bytes` in the Antfly configuration, or set it to zero to disable the guard.
 
 The full OpenAPI schema is not inlined into every `tools/list` response because the schema is large and references
 recursive query/reranker/graph/join definitions. The `query.queryRequest` input schema stays permissive with compact

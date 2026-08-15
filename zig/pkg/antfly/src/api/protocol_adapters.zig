@@ -522,18 +522,12 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
 
         fn describeQueryRequest(_: *@This(), alloc: std.mem.Allocator) !mcp.CallToolResult {
             const structured = try std.json.parseFromSliceLeaky(std.json.Value, alloc, query_request_description_json, .{});
-            return .{
-                .text = try alloc.dupe(u8, "Antfly QueryRequest schema summary for query.queryRequest"),
-                .structured = structured,
-            };
+            return try mcp.jsonToolResultAlloc(alloc, structured);
         }
 
         fn describeMcpCapabilities(_: *@This(), alloc: std.mem.Allocator) !mcp.CallToolResult {
             const structured = try std.json.parseFromSliceLeaky(std.json.Value, alloc, mcp_capabilities_description_json, .{});
-            return .{
-                .text = try alloc.dupe(u8, "Antfly MCP capabilities"),
-                .structured = structured,
-            };
+            return try mcp.jsonToolResultAlloc(alloc, structured);
         }
 
         fn backupRestore(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, operation: []const u8) !mcp.CallToolResult {

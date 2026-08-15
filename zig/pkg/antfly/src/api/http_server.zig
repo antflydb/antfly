@@ -653,7 +653,7 @@ pub const ApiHttpServerConfig = struct {
     /// Maximum serialized MCP tools/call result size. Zero disables the guard.
     /// The conservative default leaves headroom beneath 100 KiB connector
     /// limits after the JSON-RPC response envelope is added.
-    mcp_max_tool_result_bytes: usize = 96 * 1024,
+    mcp_max_tool_result_bytes: usize = common_config.default_mcp_max_tool_result_bytes,
     /// Node-local public database-query admission capacity. Zero is unlimited.
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
     /// Node-local foreground data-mutation admission capacity. Zero is unlimited.
@@ -22158,6 +22158,14 @@ test "api http server serves fielded full-text search through mcp tools" {
         describe_capabilities_resp.body,
         "{\"query_builder\":\"Use the A2A query-builder skill for agentic natural-language query planning. MCP stays focused on deterministic database tools and raw QueryRequest execution.\",\"query\":{\"raw_query_request\":true}}",
     );
+    var parsed_capabilities = try mcp.testing.parseToolCallResponse(alloc, describe_capabilities_resp.body);
+    defer parsed_capabilities.deinit();
+    const capabilities_text = mcp.testing.findTextContent(parsed_capabilities.value.result.content) orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"query\":{\"raw_query_request\":true},\"tools\":{\"schema_helpers\":[\"describe_query_request\",\"describe_mcp_capabilities\"]}}",
+        capabilities_text,
+    );
 
     var wrong_field_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -22266,6 +22274,12 @@ test "api http server serves fielded full-text search through mcp tools" {
         alloc,
         "{\"openapi_schema\":\"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest\",\"mcp_usage\":{\"raw_body_argument\":\"queryRequest\"},\"examples\":{\"fielded_full_text\":{\"fields\":[\"title\",\"body\"]},\"match_retrieval\":{\"hierarchy\":{\"ancestors\":{\"source\":{\"fields\":[\"title\",\"url\"]}}}}}}",
         query_description,
+    );
+    const query_description_text = mcp.testing.findTextContent(parsed_description.value.result.content) orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"openapi_schema\":\"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest\",\"mcp_usage\":{\"raw_body_argument\":\"queryRequest\"}}",
+        query_description_text,
     );
     const rules = query_description.object.get("mcp_usage").?.object.get("rules").?.array.items;
     var found_chunks_guidance = false;

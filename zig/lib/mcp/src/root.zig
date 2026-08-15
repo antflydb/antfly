@@ -36,6 +36,16 @@ pub const CallToolResult = struct {
     structured: ?std.json.Value = null,
 };
 
+/// Build a compatibility-safe JSON tool result. MCP clients are allowed to
+/// consume either TextContent or structuredContent, so useful JSON must be
+/// complete in both representations.
+pub fn jsonToolResultAlloc(alloc: std.mem.Allocator, value: std.json.Value) !CallToolResult {
+    return .{
+        .text = try stringifyValue(alloc, value),
+        .structured = value,
+    };
+}
+
 pub const ToolHandler = struct {
     ptr: *anyopaque,
     call_fn: *const fn (*anyopaque, std.mem.Allocator, std.json.Value) anyerror!CallToolResult,
@@ -635,6 +645,29 @@ test "mcp handles initialize and tool call" {
     try std.testing.expectEqualStrings("hello", testing.findTextContent(parsed_call.value.result.content).?);
     try std.testing.expect(parsed_call.value.result.structuredContent.? == .object);
     try std.testing.expectEqual(true, parsed_call.value.result.structuredContent.?.object.get("ok").?.bool);
+}
+
+test "mcp JSON tool results carry the complete value in text and structured content" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const value = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        "{\"hits\":[{\"_source\":{\"text\":\"hello\"}}]}",
+        .{},
+    );
+    const result = try jsonToolResultAlloc(arena, value);
+    try std.testing.expect(result.structured != null);
+
+    var parsed_text = try std.json.parseFromSlice(std.json.Value, alloc, result.text, .{});
+    defer parsed_text.deinit();
+    try std.testing.expectEqualStrings(
+        "hello",
+        parsed_text.value.object.get("hits").?.array.items[0].object.get("_source").?.object.get("text").?.string,
+    );
 }
 
 test "mcp replaces oversized tool results with a text error" {
