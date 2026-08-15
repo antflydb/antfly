@@ -73,7 +73,7 @@ openapi-generate: mcp-schema-fragments-generate
 openapi-check: mcp-schema-fragments-check
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py --compare openapi.yaml
 	$(OPENAPI_ZIG_BUILD) regen-openapi
-	test -z "$$(git status --porcelain -- ../openapi.yaml pkg/antfly/src/api/generated/mcp_query_hierarchy_schema.json pkg/antfly/src/openapi/generated pkg/inference/src/api/generated)"
+	test -z "$$(git status --porcelain -- ../openapi.yaml pkg/antfly/src/api/generated/mcp_query_hierarchy_schema.json pkg/antfly/src/api/generated/mcp_query_input_schema.json pkg/antfly/src/openapi/generated pkg/inference/src/api/generated)"
 
 mcp-schema-fragments-generate:
 	$(SCRIPTS_PY) ../scripts/generate_mcp_schema_fragments.py

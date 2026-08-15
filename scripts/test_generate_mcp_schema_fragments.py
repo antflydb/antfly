@@ -58,6 +58,43 @@ class McpSchemaFragmentTests(unittest.TestCase):
             )
         )
 
+    def test_compact_query_request_keeps_cross_field_constraints(self) -> None:
+        with generator.SPEC.open(encoding="utf-8") as handle:
+            schemas = yaml.safe_load(handle)["components"]["schemas"]
+
+        generated = generator.compact_query_request_schema(schemas)
+
+        self.assertNotIn("table", generated["properties"])
+        self.assertIn("hierarchy", generated["properties"])
+        self.assertEqual(
+            ["hierarchy"],
+            generated["not"]["allOf"][0]["required"],
+        )
+        self.assertEqual(
+            ["group_by"],
+            generated["not"]["allOf"][0]["properties"]["hierarchy"]["required"],
+        )
+        self.assertEqual(["fields"], generated["not"]["allOf"][1]["not"]["required"])
+        self.assertIn({"not": {"required": ["table"]}}, generated["allOf"])
+
+    def test_query_tool_schema_expresses_raw_shorthand_exclusivity(self) -> None:
+        with generator.SPEC.open(encoding="utf-8") as handle:
+            schemas = yaml.safe_load(handle)["components"]["schemas"]
+
+        generated = generator.mcp_query_input_schema(schemas)
+        conflicts = generated["not"]["anyOf"]
+
+        self.assertFalse(generated["additionalProperties"])
+        self.assertIn(
+            {"required": ["queryRequest", "semanticSearch"]},
+            conflicts,
+        )
+        self.assertIn(
+            {"required": ["queryRequest", "full_text_search"]},
+            conflicts,
+        )
+        self.assertNotIn("default", generated["properties"]["limit"])
+
 
 if __name__ == "__main__":
     unittest.main()

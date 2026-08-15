@@ -171,6 +171,39 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
 }
 
+fn mcpSampleDocumentsJsonAlloc(alloc: std.mem.Allocator, ndjson: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"documents\":[");
+    var lines = std.mem.splitScalar(u8, ndjson, '\n');
+    var count: usize = 0;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidScanResponse;
+        if (count != 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, line);
+        count += 1;
+    }
+    try out.appendSlice(alloc, "]}");
+    return try out.toOwnedSlice(alloc);
+}
+
+test "MCP document samples convert multiple NDJSON rows to one JSON value" {
+    const alloc = std.testing.allocator;
+    const body = try mcpSampleDocumentsJsonAlloc(
+        alloc,
+        "{\"_id\":\"doc:a\",\"body\":\"hello\"}\n{\"_id\":\"doc:b\",\"body\":\"world\"}\n",
+    );
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"documents\":[{\"_id\":\"doc:a\",\"body\":\"hello\"},{\"_id\":\"doc:b\",\"body\":\"world\"}]}",
+        body,
+    );
+}
+
 const TestSseEvent = struct {
     event: []const u8,
     data: []const u8,
@@ -10035,7 +10068,8 @@ pub const ApiHttpServer = struct {
             try self.filterScanResultByRowFilter(self.alloc, source, request.table_name, result.ndjson, value)
         else
             try self.alloc.dupe(u8, result.ndjson);
-        return contextual_operations.bytes("application/x-ndjson", body);
+        defer self.alloc.free(body);
+        return contextual_operations.json(try mcpSampleDocumentsJsonAlloc(self.alloc, body), false);
     }
 
     pub fn handlePublicTableQueryWithContentType(
@@ -21876,7 +21910,10 @@ test "api http server serves fielded full-text search through mcp tools" {
     }
     try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
     try db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"hello\"}" }},
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"hello\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"body\":\"world\"}" },
+        },
         .sync_level = .full_index,
     });
 
@@ -21959,6 +21996,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(mcp.testing.findTool(listed_tools, "describe_mcp_capabilities") != null);
 
     const query_tool = mcp.testing.findTool(listed_tools, "query") orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_query_input_schema.json"), query_tool.inputSchema);
     const query_properties = query_tool.inputSchema.object.get("properties") orelse return error.TestExpectedEqual;
     const query_request_schema = query_properties.object.get("queryRequest") orelse return error.TestExpectedEqual;
     const query_request_description = query_request_schema.object.get("description") orelse return error.TestExpectedEqual;
@@ -21997,11 +22035,18 @@ test "api http server serves fielded full-text search through mcp tools" {
         }
     }
     try std.testing.expect(found_source_group_projection_constraint);
+    const query_request_not = query_request_schema.object.get("not") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 2), query_request_not.object.get("allOf").?.array.items.len);
+    const query_tool_not = query_tool.inputSchema.object.get("not") orelse return error.TestExpectedEqual;
+    try std.testing.expect(query_tool_not.object.get("anyOf").?.array.items.len > 0);
 
     const sample_tool = mcp.testing.findTool(listed_tools, "sample_documents") orelse return error.TestExpectedEqual;
     const sample_properties = sample_tool.inputSchema.object.get("properties") orelse return error.TestExpectedEqual;
     const inclusive_from_schema = sample_properties.object.get("inclusiveFrom") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("boolean", inclusive_from_schema.object.get("type").?.string);
+    const sample_limit_schema = sample_properties.object.get("limit") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(i64, 1), sample_limit_schema.object.get("minimum").?.integer);
+    try std.testing.expectEqual(@as(i64, 100), sample_limit_schema.object.get("maximum").?.integer);
 
     const backup_tool = mcp.testing.findTool(listed_tools, "backup") orelse return error.TestExpectedEqual;
     try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_backup_input_schema.json"), backup_tool.inputSchema);
@@ -22136,11 +22181,16 @@ test "api http server serves fielded full-text search through mcp tools" {
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
         .content_type = "application/json",
-        .body = "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"sample_documents\",\"arguments\":{\"tableName\":\"docs\",\"fields\":[\"title\",\"body\"],\"limit\":1,\"inclusiveFrom\":true}}}",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"sample_documents\",\"arguments\":{\"tableName\":\"docs\",\"fields\":[\"title\",\"body\"],\"limit\":2,\"inclusiveFrom\":true}}}",
     });
     defer sample_documents_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), sample_documents_resp.status);
-    try mcp.testing.expectToolStructuredSubset(alloc, sample_documents_resp.body, "{\"_id\":\"doc:a\",\"body\":\"hello\"}");
+    try mcp.testing.expectToolStructuredSubset(
+        alloc,
+        sample_documents_resp.body,
+        "{\"documents\":[{\"_id\":\"doc:a\",\"body\":\"hello\"},{\"_id\":\"doc:b\",\"body\":\"world\"}]}",
+    );
+    try mcp.testing.expectToolJsonRepresentationsEqual(alloc, sample_documents_resp.body);
 
     var sample_documents_zero_limit_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,

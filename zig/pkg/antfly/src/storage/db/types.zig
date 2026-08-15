@@ -1348,6 +1348,66 @@ pub fn canonicalHierarchyExecutionWithinBudget(req: SearchRequest) bool {
         max_canonical_hierarchy_total_matches;
 }
 
+/// Return the first phase of a canonical grouped hierarchy query. Distributed
+/// coordinators use this request on every shard, merge the global group page,
+/// and only then issue one bounded expansion for those selected groups.
+pub fn canonicalGroupedMatchSelectionRequest(req: SearchRequest) SearchRequest {
+    if (!req.hierarchy_grouped_matches or
+        req.return_mode != .parent_with_chunks or
+        req.max_chunks_per_parent == 0)
+    {
+        return req;
+    }
+    var selection = req;
+    selection.return_mode = .parent;
+    selection.max_chunks_per_parent = 0;
+    selection.hierarchy_grouped_matches = false;
+    return selection;
+}
+
+/// Build a bounded grouped-match request. `parent_filter` may contain one
+/// source for local expansion or the complete globally selected page for a
+/// distributed batch expansion.
+pub fn canonicalGroupedMatchExpansionRequest(
+    req: SearchRequest,
+    parent_filter: []const []const u8,
+) SearchRequest {
+    var match_req = req;
+    match_req.offset = 0;
+    match_req.limit = @intCast(parent_filter.len);
+    // Top-level cursors page source groups. They must never be applied to the
+    // independently ranked descendants within the selected groups.
+    match_req.search_after = &.{};
+    match_req.search_before = &.{};
+    match_req.filter_doc_ids = parent_filter;
+    match_req.filter_doc_ids_positive = true;
+    match_req.graph_queries = &.{};
+    match_req.expand_strategy = null;
+    match_req.aggregations_json = "";
+    match_req.count_only = false;
+    match_req.profile = false;
+    return match_req;
+}
+
+/// Build the exact per-source descendant query used by a storage shard after
+/// its source groups have been selected.
+pub fn canonicalGroupedMatchDescendantRequest(
+    req: SearchRequest,
+    parent_filter: []const []const u8,
+) SearchRequest {
+    var match_req = canonicalGroupedMatchExpansionRequest(req, parent_filter);
+    match_req.return_mode = .chunk;
+    match_req.max_chunks_per_parent = 0;
+    match_req.hierarchy_grouped_matches = false;
+    match_req.limit = req.max_chunks_per_parent;
+    match_req.fields = req.hierarchy_match_fields;
+    match_req.include_all_fields = req.hierarchy_match_include_all_fields;
+    match_req.include_stored = match_req.include_all_fields or
+        match_req.fields.len > 0 or
+        match_req.reranker != null;
+    return match_req;
+}
+
 pub const GraphTableReadAuthorization = struct {
     allowed: bool,
     /// Owned by this value when non-null.

@@ -80,20 +80,10 @@ const McpToolFieldSpec = struct {
     schema_json: ?[]const u8 = null,
 };
 
-const full_text_search_schema_json =
-    \\{"oneOf":[{"type":"string"},{"type":"object","additionalProperties":true}],"description":"Full-text query string shorthand, or the generic full_text_search query object accepted by the REST API"}
-;
-
-const query_hierarchy_schema_json = @embedFile("generated/mcp_query_hierarchy_schema.json");
+const query_input_schema_json = @embedFile("generated/mcp_query_input_schema.json");
 const backup_input_schema_json = @embedFile("generated/mcp_backup_input_schema.json");
 const restore_input_schema_json = @embedFile("generated/mcp_restore_input_schema.json");
 const batch_input_schema_json = @embedFile("generated/mcp_batch_input_schema.json");
-
-const query_request_schema_json =
-    \\{"type":"object","additionalProperties":true,"description":"Raw Antfly QueryRequest body for POST /tables/{tableName}/query. Use this to access the full OpenAPI query contract. Mutually exclusive with query shorthand arguments.","properties":{"query":{"type":"object","additionalProperties":true},"full_text_search":{"type":"object","additionalProperties":true},"filter_query":{"type":"object","additionalProperties":true},"exclusion_query":{"type":"object","additionalProperties":true},"semantic_search":{"type":"string"},"embedding_template":{"type":"string"},"indexes":{"type":"array","items":{"type":"string"}},"embeddings":{"type":"object","additionalProperties":true},"fields":{"type":"array","items":{"type":"string"}},"hierarchy":
-++ query_hierarchy_schema_json ++
-    \\,"limit":{"type":"integer"},"offset":{"type":"integer"},"timeout_ms":{"type":"integer","minimum":0},"order_by":{"type":"array"},"search_after":{"type":"array","items":{}},"search_before":{"type":"array","items":{}},"filter_prefix":{"type":"string"},"distance_under":{"type":"number"},"distance_over":{"type":"number"},"search_effort":{"type":"number"},"merge_config":{"type":"object","additionalProperties":true},"count":{"type":"boolean"},"profile":{"type":"boolean"},"reranker":{"type":"object","additionalProperties":true},"aggregations":{"type":"object","additionalProperties":true},"graph_searches":{"type":"object","additionalProperties":true},"expand_strategy":{"type":"string"},"document_renderer":{"type":"string"},"pruner":{"type":"object","additionalProperties":true},"join":{"type":"object","additionalProperties":true},"foreign_sources":{"type":"object","additionalProperties":true}}}
-;
 
 const query_request_description_json =
     \\{
@@ -222,12 +212,12 @@ const mcp_tool_specs = [_]McpToolSpec{
     .{
         .kind = .sample_documents,
         .name = "sample_documents",
-        .description = "Return a bounded NDJSON sample from a table using the table lookup/scan route",
+        .description = "Return a bounded JSON document sample from a table using the table lookup/scan route",
         .permission = .read,
         .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "limit", .schema_type = .integer, .default_json = "5" },
+            .{ .name = "limit", .schema_type = .integer, .schema_json = "{\"type\":\"integer\",\"minimum\":1,\"maximum\":100,\"default\":5}" },
             .{ .name = "from", .schema_type = .string },
             .{ .name = "to", .schema_type = .string },
             .{ .name = "inclusiveFrom", .schema_type = .boolean, .description = "Set to true to include the from key." },
@@ -240,19 +230,7 @@ const mcp_tool_specs = [_]McpToolSpec{
         .description = "Run an Antfly table query. For hierarchical documents, retrieve focused direct matches with explicit fields and projected ancestors; never expand _chunks.* through MCP.",
         .permission = .read,
         .table_argument = "tableName",
-        .fields = &.{
-            .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "queryRequest", .schema_type = .object, .schema_json = query_request_schema_json },
-            .{ .name = "fullTextSearch", .schema_type = .object, .schema_json = full_text_search_schema_json },
-            .{ .name = "full_text_search", .schema_type = .object, .description = "Generic REST-shaped full_text_search query object" },
-            .{ .name = "fullTextSearchField", .schema_type = .string, .description = "Field to search when fullTextSearch is a string shorthand, for example content" },
-            .{ .name = "semanticSearch", .schema_type = .string },
-            .{ .name = "fields", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
-            .{ .name = "limit", .schema_type = .integer, .default_json = "10" },
-            .{ .name = "orderBy", .schema_type = .array },
-            .{ .name = "indexes", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
-            .{ .name = "filterPrefix", .schema_type = .string },
-        },
+        .input_schema_json = query_input_schema_json,
     },
     .{
         .kind = .describe_query_request,

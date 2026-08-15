@@ -58,6 +58,80 @@ FRAGMENTS = (
     ),
 )
 
+QUERY_REQUEST_PROPERTIES = (
+    "query",
+    "full_text_search",
+    "filter_query",
+    "exclusion_query",
+    "semantic_search",
+    "embedding_template",
+    "indexes",
+    "embeddings",
+    "fields",
+    "hierarchy",
+    "limit",
+    "offset",
+    "timeout_ms",
+    "order_by",
+    "search_after",
+    "search_before",
+    "filter_prefix",
+    "distance_under",
+    "distance_over",
+    "search_effort",
+    "merge_config",
+    "count",
+    "profile",
+    "reranker",
+    "aggregations",
+    "graph_searches",
+    "expand_strategy",
+    "document_renderer",
+    "pruner",
+    "join",
+    "foreign_sources",
+)
+
+# These recursive or polymorphic API types are intentionally advertised as
+# open objects in MCP discovery. Their authoritative details remain in the
+# OpenAPI contract and describe_query_request; inlining them makes tools/list
+# too large for the clients this projection is designed to support.
+QUERY_REQUEST_OPEN_OBJECT_PROPERTIES = {
+    "query",
+    "full_text_search",
+    "filter_query",
+    "exclusion_query",
+    "embeddings",
+    "merge_config",
+    "reranker",
+    "aggregations",
+    "graph_searches",
+    "pruner",
+    "join",
+    "foreign_sources",
+}
+
+MCP_QUERY_SHORTHAND_PROPERTIES: dict[str, dict[str, Any]] = {
+    "fullTextSearch": {
+        "oneOf": [{"type": "string"}, {"type": "object", "additionalProperties": True}],
+        "description": "Full-text query string shorthand, or a generic full_text_search object.",
+    },
+    "full_text_search": {"type": "object", "additionalProperties": True},
+    "fullTextSearchField": {
+        "type": "string",
+        "description": "Field to search when fullTextSearch is a string shorthand.",
+    },
+    "semanticSearch": {"type": "string"},
+    "fields": {"type": "array", "items": {"type": "string"}},
+    # Do not publish a JSON Schema default here: clients that materialize
+    # defaults would combine it with queryRequest and violate raw-mode
+    # exclusivity. The runtime still defaults shorthand calls to ten.
+    "limit": {"type": "integer", "description": "Maximum results; defaults to 10 in shorthand mode."},
+    "orderBy": {"type": "array"},
+    "indexes": {"type": "array", "items": {"type": "string"}},
+    "filterPrefix": {"type": "string"},
+}
+
 
 def resolve_local_refs(value: Any, schemas: dict[str, Any]) -> Any:
     if isinstance(value, list):
@@ -224,6 +298,81 @@ def generated_content(fragment: Fragment, schemas: dict[str, Any]) -> str:
     return json.dumps(schema, separators=(",", ":"), ensure_ascii=False) + "\n"
 
 
+def compact_query_request_schema(schemas: dict[str, Any]) -> dict[str, Any]:
+    """Build the bounded MCP discovery view of the public QueryRequest.
+
+    Property validation and cross-field constraints come from OpenAPI. Large
+    recursive query subtrees stay open so this view remains safe for MCP
+    clients with small tools/list budgets.
+    """
+    component = schemas["QueryRequest"]
+    source_properties = component["properties"]
+    properties: dict[str, Any] = {}
+    for name in QUERY_REQUEST_PROPERTIES:
+        if name in QUERY_REQUEST_OPEN_OBJECT_PROPERTIES:
+            properties[name] = {"type": "object", "additionalProperties": True}
+            continue
+        if name == "order_by":
+            properties[name] = {"type": "array"}
+            continue
+        value = strip_vendor_extensions(resolve_local_refs(source_properties[name], schemas))
+        if name == "hierarchy":
+            removed = deprecated_property_names(value)
+            value = without_deprecated_properties(value)
+            value = without_constraints_referencing_properties(value, removed)
+        else:
+            value = strip_annotations(value)
+        properties[name] = value
+
+    result: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": True,
+        "description": (
+            "Raw Antfly QueryRequest body for POST /tables/{tableName}/query. "
+            "Use this to access the full OpenAPI query contract. Mutually exclusive "
+            "with query shorthand arguments."
+        ),
+        "properties": properties,
+    }
+    for keyword in ("not", "allOf", "anyOf", "oneOf"):
+        if keyword in component:
+            result[keyword] = strip_annotations(
+                strip_vendor_extensions(resolve_local_refs(component[keyword], schemas))
+            )
+    # The REST schema permits a global-query table property. The MCP tool is
+    # table-scoped, so its raw body must use the outer tableName exactly once.
+    result.setdefault("allOf", []).append({"not": {"required": ["table"]}})
+    return result
+
+
+def mcp_query_input_schema(schemas: dict[str, Any]) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "tableName": {"type": "string"},
+        "queryRequest": compact_query_request_schema(schemas),
+        **copy.deepcopy(MCP_QUERY_SHORTHAND_PROPERTIES),
+    }
+    conflicting_pairs = [
+        {"required": ["queryRequest", shorthand]}
+        for shorthand in MCP_QUERY_SHORTHAND_PROPERTIES
+    ]
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["tableName"],
+        "properties": properties,
+        "not": {"anyOf": conflicting_pairs},
+    }
+
+
+def custom_generated_contents(schemas: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    return (
+        (
+            "mcp_query_input_schema.json",
+            json.dumps(mcp_query_input_schema(schemas), separators=(",", ":"), ensure_ascii=False) + "\n",
+        ),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
@@ -237,6 +386,16 @@ def main() -> int:
     for fragment in FRAGMENTS:
         output = OUTPUT_DIR / fragment.output
         expected = generated_content(fragment, schemas)
+        if args.check:
+            actual = output.read_text(encoding="utf-8") if output.exists() else ""
+            if actual != expected:
+                stale.append(output.relative_to(ROOT))
+            continue
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(expected, encoding="utf-8")
+
+    for filename, expected in custom_generated_contents(schemas):
+        output = OUTPUT_DIR / filename
         if args.check:
             actual = output.read_text(encoding="utf-8") if output.exists() else ""
             if actual != expected:

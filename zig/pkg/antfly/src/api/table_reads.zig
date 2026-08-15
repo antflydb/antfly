@@ -4812,8 +4812,12 @@ fn distributedSearchShardLimit(req: db_mod.types.SearchRequest) u32 {
 fn distributedSearchShardRequest(
     req: db_mod.types.SearchRequest,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats,
+    expand_selected_groups: bool,
 ) db_mod.types.SearchRequest {
-    var copy = req;
+    var copy = if (expand_selected_groups)
+        req
+    else
+        db_mod.types.canonicalGroupedMatchSelectionRequest(req);
     copy.offset = 0;
     copy.limit = distributedSearchShardLimit(req);
     copy.distributed_text_stats = distributed_text_stats;
@@ -4839,7 +4843,7 @@ test "distributed query shard request preserves sorted cursor contract" {
         .offset = 50,
         .limit = 25,
         .distributed_text_stats = &.{},
-    }, stats[0..]);
+    }, stats[0..], false);
 
     try std.testing.expectEqual(@as(u32, 0), cursor_shard_req.offset);
     try std.testing.expectEqual(@as(u32, 25), cursor_shard_req.limit);
@@ -4862,7 +4866,7 @@ test "distributed query shard request preserves sorted cursor contract" {
         .offset = 50,
         .limit = 25,
         .distributed_text_stats = &.{},
-    }, stats[0..]);
+    }, stats[0..], false);
 
     try std.testing.expectEqual(@as(u32, 0), before_shard_req.offset);
     try std.testing.expectEqual(@as(u32, 25), before_shard_req.limit);
@@ -4877,11 +4881,88 @@ test "distributed query shard request preserves sorted cursor contract" {
         .order_by = order_by[0..],
         .offset = 50,
         .limit = 25,
-    }, &.{});
+    }, &.{}, false);
     try std.testing.expectEqual(@as(u32, 0), offset_shard_req.offset);
     try std.testing.expectEqual(@as(u32, 75), offset_shard_req.limit);
     try std.testing.expectEqual(@as(usize, 0), offset_shard_req.search_after.len);
     try std.testing.expectEqual(@as(usize, 0), offset_shard_req.search_before.len);
+
+    const grouped_shard_req = distributedSearchShardRequest(.{
+        .return_mode = .parent_with_chunks,
+        .hierarchy_grouped_matches = true,
+        .max_chunks_per_parent = 100,
+        .offset = 20,
+        .limit = 10,
+    }, &.{}, false);
+    try std.testing.expectEqual(@as(u32, 30), grouped_shard_req.limit);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.parent, grouped_shard_req.return_mode);
+    try std.testing.expect(!grouped_shard_req.hierarchy_grouped_matches);
+    try std.testing.expectEqual(@as(u32, 0), grouped_shard_req.max_chunks_per_parent);
+
+    const expansion_shard_req = distributedSearchShardRequest(.{
+        .return_mode = .parent_with_chunks,
+        .hierarchy_grouped_matches = true,
+        .max_chunks_per_parent = 100,
+        .limit = 10,
+    }, &.{}, true);
+    try std.testing.expect(expansion_shard_req.hierarchy_grouped_matches);
+    try std.testing.expectEqual(@as(u32, 100), expansion_shard_req.max_chunks_per_parent);
+}
+
+test "distributed grouped hierarchy expands only the globally merged page" {
+    const alloc = std.testing.allocator;
+    var selected_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    selected_hits[0] = .{ .id = try alloc.dupe(u8, "source:c") };
+    selected_hits[1] = .{ .id = try alloc.dupe(u8, "source:d") };
+    var selected = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = selected_hits,
+        .total_hits = 40,
+    };
+    defer selected.deinit();
+
+    const req: db_mod.types.SearchRequest = .{
+        .return_mode = .parent_with_chunks,
+        .hierarchy_grouped_matches = true,
+        .max_chunks_per_parent = 5,
+        .offset = 20,
+        .limit = 10,
+    };
+    const expansion = try canonicalGroupedMatchExpansionPlanAlloc(alloc, req, selected);
+    defer alloc.free(expansion.parent_ids);
+    try std.testing.expectEqual(@as(u32, 0), expansion.request.offset);
+    try std.testing.expectEqual(@as(u32, 2), expansion.request.limit);
+    try std.testing.expectEqual(@as(usize, 2), expansion.request.filter_doc_ids.len);
+    try std.testing.expectEqualStrings("source:c", expansion.request.filter_doc_ids[0]);
+    try std.testing.expectEqualStrings("source:d", expansion.request.filter_doc_ids[1]);
+    try std.testing.expect(db_mod.types.canonicalHierarchyExecutionWithinBudget(expansion.request));
+
+    var expanded_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    const d_matches = try alloc.alloc(db_mod.types.ChunkHit, 1);
+    d_matches[0] = .{ .id = try alloc.dupe(u8, "source:d#chunk:0") };
+    expanded_hits[0] = .{
+        .id = try alloc.dupe(u8, "source:d"),
+        .chunk_hits = d_matches,
+    };
+    const c_matches = try alloc.alloc(db_mod.types.ChunkHit, 1);
+    c_matches[0] = .{ .id = try alloc.dupe(u8, "source:c#chunk:0") };
+    expanded_hits[1] = .{
+        .id = try alloc.dupe(u8, "source:c"),
+        .chunk_hits = c_matches,
+    };
+    var expanded = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = expanded_hits,
+        .total_hits = 2,
+    };
+    defer expanded.deinit();
+
+    applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded);
+    try std.testing.expectEqual(@as(usize, 1), selected.hits[0].chunk_hits.len);
+    try std.testing.expectEqualStrings("source:c#chunk:0", selected.hits[0].chunk_hits[0].id);
+    try std.testing.expectEqualStrings("source:d#chunk:0", selected.hits[1].chunk_hits[0].id);
+    try std.testing.expectEqual(@as(usize, 0), expanded.hits[0].chunk_hits.len);
+    try std.testing.expectEqual(@as(usize, 0), expanded.hits[1].chunk_hits.len);
 }
 
 fn queryMergeRuntimeSchemaAlloc(
@@ -5552,6 +5633,38 @@ fn graphHydrateOnPreparedDb(
     };
 }
 
+fn canonicalGroupedMatchExpansionPlanAlloc(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    result: db_mod.types.SearchResult,
+) !struct { request: db_mod.types.SearchRequest, parent_ids: []const []const u8 } {
+    const parent_ids = try alloc.alloc([]const u8, result.hits.len);
+    for (result.hits, 0..) |hit, i| parent_ids[i] = hit.id;
+    return .{
+        .request = db_mod.types.canonicalGroupedMatchExpansionRequest(req, parent_ids),
+        .parent_ids = parent_ids,
+    };
+}
+
+fn applyCanonicalGroupedMatchExpansion(
+    alloc: std.mem.Allocator,
+    selected: *db_mod.types.SearchResult,
+    expanded: *db_mod.types.SearchResult,
+) void {
+    for (selected.hits) |*selected_hit| {
+        for (selected_hit.chunk_hits) |*match| match.deinit(alloc);
+        if (selected_hit.chunk_hits.len > 0) alloc.free(selected_hit.chunk_hits);
+        selected_hit.chunk_hits = &.{};
+
+        for (expanded.hits) |*expanded_hit| {
+            if (!std.mem.eql(u8, selected_hit.id, expanded_hit.id)) continue;
+            selected_hit.chunk_hits = expanded_hit.chunk_hits;
+            expanded_hit.chunk_hits = &.{};
+            break;
+        }
+    }
+}
+
 fn queryProvisionedAcrossGroups(
     self: *ProvisionedTableReadSource,
     alloc: std.mem.Allocator,
@@ -5560,11 +5673,54 @@ fn queryProvisionedAcrossGroups(
     table_name: []const u8,
     consistency: raft_mod.ReadConsistency,
 ) !db_mod.types.SearchResult {
+    if (!db_mod.types.canonicalHierarchyExecutionWithinBudget(req)) return error.InvalidQueryRequest;
+    var selected = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, req, table_name, consistency, false);
+    errdefer selected.deinit();
+    if (!req.hierarchy_grouped_matches or selected.hits.len == 0) return selected;
+
+    const expansion = try canonicalGroupedMatchExpansionPlanAlloc(alloc, req, selected);
+    defer alloc.free(expansion.parent_ids);
+    var expanded = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, expansion.request, table_name, consistency, true);
+    defer expanded.deinit();
+    applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded);
+    return selected;
+}
+
+fn queryHostedAcrossGroups(
+    self: *HostedProvisionedTableReadSource,
+    alloc: std.mem.Allocator,
+    group_ids: []const u64,
+    req: db_mod.types.SearchRequest,
+    table_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !db_mod.types.SearchResult {
+    if (!db_mod.types.canonicalHierarchyExecutionWithinBudget(req)) return error.InvalidQueryRequest;
+    var selected = try queryHostedAcrossGroupsPhase(self, alloc, group_ids, req, table_name, consistency, false);
+    errdefer selected.deinit();
+    if (!req.hierarchy_grouped_matches or selected.hits.len == 0) return selected;
+
+    const expansion = try canonicalGroupedMatchExpansionPlanAlloc(alloc, req, selected);
+    defer alloc.free(expansion.parent_ids);
+    var expanded = try queryHostedAcrossGroupsPhase(self, alloc, group_ids, expansion.request, table_name, consistency, true);
+    defer expanded.deinit();
+    applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded);
+    return selected;
+}
+
+fn queryProvisionedAcrossGroupsPhase(
+    self: *ProvisionedTableReadSource,
+    alloc: std.mem.Allocator,
+    group_ids: []const u64,
+    req: db_mod.types.SearchRequest,
+    table_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    expand_selected_groups: bool,
+) !db_mod.types.SearchResult {
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
     const distributed_text_stats = try collectProvisionedSearchRequestTextStats(self, alloc, group_ids, req, table_name);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
-    const shard_req = distributedSearchShardRequest(req, distributed_text_stats);
+    const shard_req = distributedSearchShardRequest(req, distributed_text_stats, expand_selected_groups);
 
     const plan = planQueryFanout(self.io_impl, group_ids.len, req);
     recordFanoutPlan(.query, plan);
@@ -5587,20 +5743,21 @@ fn queryProvisionedAcrossGroups(
     return try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results[0..initialized], req.offset, req.limit);
 }
 
-fn queryHostedAcrossGroups(
+fn queryHostedAcrossGroupsPhase(
     self: *HostedProvisionedTableReadSource,
     alloc: std.mem.Allocator,
     group_ids: []const u64,
     req: db_mod.types.SearchRequest,
     table_name: []const u8,
     consistency: raft_mod.ReadConsistency,
+    expand_selected_groups: bool,
 ) !db_mod.types.SearchResult {
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
     try rejectHostedRemoteResolvedDocFilter(self, alloc, group_ids, table_name, req, consistency);
     const distributed_text_stats = try collectHostedSearchRequestTextStats(self, alloc, group_ids, req, table_name, consistency);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
-    const shard_req = distributedSearchShardRequest(req, distributed_text_stats);
+    const shard_req = distributedSearchShardRequest(req, distributed_text_stats, expand_selected_groups);
 
     const plan = planQueryFanout(self.io_impl, group_ids.len, req);
     recordFanoutPlan(.query, plan);

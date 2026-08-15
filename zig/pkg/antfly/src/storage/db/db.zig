@@ -21422,7 +21422,7 @@ pub const DB = struct {
         externalize_artifact_ids: bool,
     ) !types.SearchResult {
         const execution_req = directSingleVectorRequest(req) orelse req;
-        const selection_req = canonicalGroupedMatchSelectionRequest(execution_req);
+        const selection_req = types.canonicalGroupedMatchSelectionRequest(execution_req);
         if (searchRequestRequiresComposedSearch(selection_req)) {
             var composed = try self.searchComposed(alloc, selection_req, exec_ctx);
             errdefer composed.deinit();
@@ -21486,19 +21486,6 @@ pub const DB = struct {
     /// bounded query per returned source obtains that group's exact top
     /// matches. This prevents a source with fewer than the requested maximum
     /// from forcing the primary query to exhaust the global candidate set.
-    fn canonicalGroupedMatchSelectionRequest(req: types.SearchRequest) types.SearchRequest {
-        if (!req.hierarchy_grouped_matches or
-            req.return_mode != .parent_with_chunks or
-            req.max_chunks_per_parent == 0)
-        {
-            return req;
-        }
-        var selection = req;
-        selection.return_mode = .parent;
-        selection.max_chunks_per_parent = 0;
-        return selection;
-    }
-
     fn populateCanonicalGroupedMatches(
         self: *DB,
         alloc: Allocator,
@@ -21515,7 +21502,7 @@ pub const DB = struct {
         }
         for (result.hits) |*group_hit| {
             const parent_filter = [_][]const u8{group_hit.id};
-            const match_req = canonicalGroupedMatchRequest(req, &parent_filter);
+            const match_req = types.canonicalGroupedMatchDescendantRequest(req, &parent_filter);
 
             var matches = try self.searchLockedWithExecutionContextImpl(alloc, match_req, exec_ctx, false);
             defer matches.deinit();
@@ -21538,35 +21525,6 @@ pub const DB = struct {
             if (group_hit.chunk_hits.len > 0) alloc.free(group_hit.chunk_hits);
             group_hit.chunk_hits = nested_matches;
         }
-    }
-
-    fn canonicalGroupedMatchRequest(
-        req: types.SearchRequest,
-        parent_filter: []const []const u8,
-    ) types.SearchRequest {
-        var match_req = req;
-        match_req.return_mode = .chunk;
-        match_req.max_chunks_per_parent = 0;
-        match_req.hierarchy_grouped_matches = false;
-        match_req.offset = 0;
-        match_req.limit = req.max_chunks_per_parent;
-        // Top-level cursors page source groups. They must never be applied to
-        // independently ranked descendants within each group.
-        match_req.search_after = &.{};
-        match_req.search_before = &.{};
-        match_req.fields = req.hierarchy_match_fields;
-        match_req.include_all_fields = req.hierarchy_match_include_all_fields;
-        match_req.include_stored = match_req.include_all_fields or
-            match_req.fields.len > 0 or
-            match_req.reranker != null;
-        match_req.filter_doc_ids = parent_filter;
-        match_req.filter_doc_ids_positive = true;
-        match_req.graph_queries = &.{};
-        match_req.expand_strategy = null;
-        match_req.aggregations_json = "";
-        match_req.count_only = false;
-        match_req.profile = false;
-        return match_req;
     }
 
     fn chunkHitFromSearchHitAlloc(alloc: Allocator, hit: types.SearchHit) !types.ChunkHit {
@@ -60344,7 +60302,7 @@ test "canonical grouped match requests isolate nested pagination and work" {
         .profile = true,
     };
 
-    const nested = DB.canonicalGroupedMatchRequest(req, &parent_filter);
+    const nested = types.canonicalGroupedMatchDescendantRequest(req, &parent_filter);
     try std.testing.expectEqual(types.ReturnMode.chunk, nested.return_mode);
     try std.testing.expectEqual(@as(u32, 0), nested.offset);
     try std.testing.expectEqual(@as(u32, 7), nested.limit);
