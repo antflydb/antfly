@@ -172,7 +172,9 @@ class QueryRequest:
             lower-level vector search overrides are provided internally.
              Default: 0.5. Example: 0.5.
         fields (list[str] | Unset): List of fields to include in the results. If not specified, all fields are returned.
-            Use to reduce response size and improve performance.
+            Use to reduce response size and improve performance. This field is required when
+            hierarchy.group_by is present so a grouped query cannot accidentally hydrate an
+            entire source document. Use an empty array for identity-only source groups.
              Example: ['title', 'url', 'summary', 'created_at'].
         hierarchy (QueryHierarchy | Unset): Returns direct index matches with optional projected ancestor context, or
             groups

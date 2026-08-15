@@ -36,8 +36,6 @@ const algebraic_law = db_mod.algebraic.law;
 const algebraic_lexical = db_mod.algebraic.lexical;
 const public_query_max_tree_depth: usize = 64;
 const public_query_max_tree_nodes: usize = 16 * 1024;
-const max_canonical_hierarchy_matches_per_group: u32 = 100;
-
 pub const QueryResponse = @import("query_response.zig").QueryResponse;
 
 pub const testing = if (builtin.is_test) struct {
@@ -9319,7 +9317,9 @@ fn applyPublicHierarchyControls(
                         const matches_value = matches_entry.value_ptr.*;
                         if (std.mem.eql(u8, matches_key, "limit")) {
                             req.max_chunks_per_parent = try parseOptionalU32Json(matches_value, req.max_chunks_per_parent);
-                            if (req.max_chunks_per_parent == 0 or req.max_chunks_per_parent > max_canonical_hierarchy_matches_per_group) {
+                            if (req.max_chunks_per_parent == 0 or
+                                req.max_chunks_per_parent > db_mod.types.max_canonical_hierarchy_matches_per_group)
+                            {
                                 return error.InvalidQueryRequest;
                             }
                         } else if (std.mem.eql(u8, matches_key, "fields")) {
@@ -9371,6 +9371,11 @@ fn applyPublicHierarchyControls(
 
     if (has_new_controls) {
         if (group_by_set) {
+            // Group hits hydrate source documents, which may contain large
+            // stored child materializations. Require an explicit projection
+            // so canonical grouping cannot accidentally recreate the
+            // unbounded `_chunks.*` response shape it is intended to avoid.
+            if (!objectHasNonNullField(parsed.value.object, "fields")) return error.InvalidQueryRequest;
             // A source group already carries its projected source document in
             // the top-level hit. Repeating it on the group and every nested
             // match defeats the bounded hierarchy response contract.
@@ -10807,6 +10812,7 @@ test "api query contract parses public hierarchy controls" {
     const grouped_only_body =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": [],
         \\  "hierarchy": {"group_by":{"level":"source"}}
         \\}
     ;
@@ -10829,6 +10835,7 @@ test "api query contract validates canonical hierarchy controls" {
     const unsupported_group_level =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": [],
         \\  "hierarchy": {"group_by":{"level":"unit","matches":{"fields":[]}}}
         \\}
     ;
@@ -10837,6 +10844,7 @@ test "api query contract validates canonical hierarchy controls" {
     const missing_group_level =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": [],
         \\  "hierarchy": {"group_by":{"matches":{"fields":["text"]}}}
         \\}
     ;
@@ -10845,6 +10853,7 @@ test "api query contract validates canonical hierarchy controls" {
     const unknown_group_field =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": [],
         \\  "hierarchy": {"group_by":{"level":"source","sort":[]}}
         \\}
     ;
@@ -10853,6 +10862,7 @@ test "api query contract validates canonical hierarchy controls" {
     const composable_group_and_unit_ancestor =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": [],
         \\  "hierarchy": {"group_by":{"level":"source","matches":{"fields":["text"]}},"ancestors":{"unit":{"fields":["page"]}}}
         \\}
     ;
@@ -10866,6 +10876,7 @@ test "api query contract validates canonical hierarchy controls" {
     const redundant_group_source_ancestor =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": [],
         \\  "hierarchy": {"group_by":{"level":"source","matches":{"fields":["text"]}},"ancestors":{"source":{"fields":["title"]}}}
         \\}
     ;
@@ -10874,6 +10885,7 @@ test "api query contract validates canonical hierarchy controls" {
     const mixed_contract_generations =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": [],
         \\  "hierarchy": {"group_by":{"level":"source"},"include":["chunk"]}
         \\}
     ;
@@ -10882,10 +10894,19 @@ test "api query contract validates canonical hierarchy controls" {
     const missing_match_fields =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": [],
         \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":2}}}
         \\}
     ;
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", missing_match_fields));
+
+    const missing_group_projection =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"group_by":{"level":"source","matches":{"fields":["text"]}}}
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", missing_group_projection));
 
     const missing_ancestor_fields =
         \\{
@@ -10898,6 +10919,7 @@ test "api query contract validates canonical hierarchy controls" {
     const bounded_grouped_matches =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": [],
         \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":2,"fields":["text"]}}}
         \\}
     ;
@@ -10909,6 +10931,7 @@ test "api query contract validates canonical hierarchy controls" {
     const too_many_groups =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": [],
         \\  "limit": 101,
         \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":1,"fields":["text"]}}}
         \\}
@@ -10918,6 +10941,7 @@ test "api query contract validates canonical hierarchy controls" {
     const too_much_grouped_work =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": [],
         \\  "limit": 100,
         \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":11,"fields":["text"]}}}
         \\}
@@ -10927,6 +10951,7 @@ test "api query contract validates canonical hierarchy controls" {
     const unbounded_group_page =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": [],
         \\  "limit": 0,
         \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":1,"fields":["text"]}}}
         \\}
@@ -10936,6 +10961,7 @@ test "api query contract validates canonical hierarchy controls" {
     const oversized_grouped_matches =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "fields": [],
         \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":101,"fields":["text"]}}}
         \\}
     ;

@@ -6276,7 +6276,9 @@ export interface components {
             search_effort?: number;
             /**
              * @description List of fields to include in the results. If not specified, all fields are returned.
-             *     Use to reduce response size and improve performance.
+             *     Use to reduce response size and improve performance. This field is required when
+             *     hierarchy.group_by is present so a grouped query cannot accidentally hydrate an
+             *     entire source document. Use an empty array for identity-only source groups.
              * @example [
              *       "title",
              *       "url",

@@ -637,7 +637,7 @@ test "serverless search plan fails closed for unsupported public fields" {
 
     try std.testing.expectError(error.UnsupportedQueryRequest, parseSearchPlanAlloc(
         alloc,
-        "{\"full_text_search\":{\"query\":\"body:alpha\"},\"hierarchy\":{\"group_by\":{\"level\":\"source\"}}}",
+        "{\"full_text_search\":{\"query\":\"body:alpha\"},\"fields\":[],\"hierarchy\":{\"group_by\":{\"level\":\"source\"}}}",
         sources,
     ));
     try std.testing.expectError(error.UnsupportedQueryRequest, parseSearchPlanAlloc(

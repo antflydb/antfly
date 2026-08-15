@@ -1333,11 +1333,17 @@ pub const SearchRequest = struct {
 };
 
 pub const max_canonical_hierarchy_groups: u32 = 100;
+pub const max_canonical_hierarchy_matches_per_group: u32 = 100;
 pub const max_canonical_hierarchy_total_matches: u32 = 1000;
 
 pub fn canonicalHierarchyExecutionWithinBudget(req: SearchRequest) bool {
     if (!req.hierarchy_grouped_matches) return true;
     if (req.limit == 0 or req.limit > max_canonical_hierarchy_groups) return false;
+    if (req.max_chunks_per_parent == 0 or
+        req.max_chunks_per_parent > max_canonical_hierarchy_matches_per_group)
+    {
+        return false;
+    }
     return @as(u64, req.limit) * @as(u64, req.max_chunks_per_parent) <=
         max_canonical_hierarchy_total_matches;
 }

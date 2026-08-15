@@ -129,10 +129,19 @@ When a caller needs source groups with matching descendants attached, use the in
 projection:
 
 ```json
-"hierarchy": {
-  "group_by": {
-    "level": "source",
-    "matches": {"limit": 3, "fields": ["text"]}
+{
+  "tableName": "document_search_import",
+  "queryRequest": {
+    "semantic_search": "How does Antfly index documents?",
+    "indexes": ["document_vectors"],
+    "fields": ["title", "url"],
+    "hierarchy": {
+      "group_by": {
+        "level": "source",
+        "matches": {"limit": 3, "fields": ["text"]}
+      }
+    },
+    "limit": 5
   }
 }
 ```
@@ -144,9 +153,10 @@ is not tied to chunks. Every match or ancestor projection must specify `fields`;
 identity is needed. Omitting `group_by.matches.limit` defaults it to three, and the server rejects values above 100 before
 executing the query. Nested matches follow the effective query order and each group carries its best match score.
 
-For source-level groups, select source fields with the top-level `fields` projection. A source ancestor projection would
-duplicate the grouping-level document and is rejected. A unit ancestor projection may be combined with source grouping
-when nested matches need intermediate unit context.
+For source-level groups, an explicit top-level `fields` projection is required so grouping can never implicitly hydrate a
+complete source document (including its stored `_chunks` array). Use `fields: []` when only source identity is needed. A
+source ancestor projection would duplicate the grouping-level document and is rejected. A unit ancestor projection may be
+combined with source grouping when nested matches need intermediate unit context.
 
 The legacy hierarchy controls remain accepted for existing callers, but they cannot be mixed with `group_by` or
 `ancestors`. They are intentionally omitted from MCP discovery so new integrations see only the canonical controls.

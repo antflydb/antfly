@@ -1647,7 +1647,11 @@ fn jsonBoolArg(value: std.json.Value, key: []const u8) ?bool {
 
 fn jsonValueArg(value: std.json.Value, key: []const u8) ?std.json.Value {
     if (value != .object) return null;
-    return value.object.get(key);
+    const raw = value.object.get(key) orelse return null;
+    // MCP clients and generated SDKs commonly serialize unset optionals as
+    // JSON null. Treat that exactly like omission across every tool instead
+    // of making each handler grow its own compatibility exception.
+    return if (raw == .null) null else raw;
 }
 
 fn hasNonRawQueryArg(args: std.json.Value) bool {

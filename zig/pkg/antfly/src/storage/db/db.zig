@@ -21407,6 +21407,10 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
+        // Validate canonical collapse-and-expand work before executing the
+        // primary selection query. This protects direct storage callers and
+        // internal worker envelopes in addition to the public API boundary.
+        if (!types.canonicalHierarchyExecutionWithinBudget(req)) return error.InvalidQueryRequest;
         return try self.searchLockedWithExecutionContextImpl(alloc, req, exec_ctx, true);
     }
 
@@ -21509,8 +21513,6 @@ pub const DB = struct {
         {
             return;
         }
-        if (!types.canonicalHierarchyExecutionWithinBudget(req)) return error.InvalidQueryRequest;
-
         for (result.hits) |*group_hit| {
             const parent_filter = [_][]const u8{group_hit.id};
             const match_req = canonicalGroupedMatchRequest(req, &parent_filter);
@@ -60357,6 +60359,14 @@ test "canonical grouped match requests isolate nested pagination and work" {
     var oversized = req;
     oversized.limit = types.max_canonical_hierarchy_groups + 1;
     try std.testing.expect(!types.canonicalHierarchyExecutionWithinBudget(oversized));
+
+    var zero_matches = req;
+    zero_matches.max_chunks_per_parent = 0;
+    try std.testing.expect(!types.canonicalHierarchyExecutionWithinBudget(zero_matches));
+
+    var too_many_matches = req;
+    too_many_matches.max_chunks_per_parent = types.max_canonical_hierarchy_matches_per_group + 1;
+    try std.testing.expect(!types.canonicalHierarchyExecutionWithinBudget(too_many_matches));
 }
 
 test "db full-text chunk parent paging applies after grouping" {

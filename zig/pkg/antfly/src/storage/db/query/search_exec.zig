@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const aggregations_mod = @import("../aggregations.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
+const artifact_ids = @import("../artifact_ids.zig");
 const runtime_schema_mod = @import("../../schema.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
@@ -11662,6 +11663,14 @@ pub fn searchTextQuery(
             postprocess_req.offset = 0;
             postprocess_req.limit = candidate_limit;
         }
+        // Explicit document-ID constraints have already been resolved against
+        // this exact text snapshot and enforced by its native collector. Do
+        // not apply them a second time to derived artifact hit IDs in the
+        // stored-pattern layer, where source and artifact IDs intentionally
+        // use different representations of the same document.
+        postprocess_req.filter_doc_ids = &.{};
+        postprocess_req.filter_doc_ids_positive = false;
+        postprocess_req.exclude_doc_ids = &.{};
 
         const execute_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         var result = if (effective_req.count_only)
@@ -12004,7 +12013,7 @@ fn textDocNumsForDocIdsAlloc(
                     if (deleted.contains(local_doc)) continue;
                 }
                 const stored = (try seg.reader.storedDoc(local_doc)) orelse continue;
-                if (!doc_id_set.contains(stored.id)) continue;
+                if (!(try storedDocumentMatchesPublicDocIdFilterAlloc(alloc, stored.id, &doc_id_set))) continue;
                 const doc_num = doc_offset + local_doc;
                 const gop = try doc_num_set.getOrPut(alloc, doc_num);
                 if (gop.found_existing) continue;
@@ -12014,6 +12023,30 @@ fn textDocNumsForDocIdsAlloc(
         doc_offset += seg.reader.doc_count;
     }
     return try out.toOwnedSlice(alloc);
+}
+
+/// A public document-id filter targets both the primary document and records
+/// derived from it. Chunk-backed text indexes store canonical artifact IDs, so
+/// exact ID comparison alone would make a source-level filter silently empty.
+/// Keep artifact identity decoding here at the shared text-ID boundary rather
+/// than teaching hierarchy grouping about a particular index representation.
+fn storedDocumentMatchesPublicDocIdFilterAlloc(
+    alloc: Allocator,
+    stored_id: []const u8,
+    doc_ids: *const BorrowedDocIdSet,
+) !bool {
+    if (doc_ids.contains(stored_id)) return true;
+    if (try artifact_ids.decodeArtifactRefAlloc(alloc, stored_id)) |decoded| {
+        var artifact_ref = decoded;
+        defer artifact_ref.deinit(alloc);
+        return doc_ids.contains(artifact_ref.document_id);
+    }
+    if (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, stored_id)) |decoded| {
+        var artifact_ref = decoded;
+        defer artifact_ref.deinit(alloc);
+        return doc_ids.contains(artifact_ref.document_id);
+    }
+    return false;
 }
 
 test "text doc id conversion checks deadline while scanning" {
@@ -12033,6 +12066,34 @@ test "text doc id conversion checks deadline while scanning" {
     try std.testing.expectError(error.Timeout, textDocNumsForDocIdsAlloc(alloc, .{
         .execution_deadline_ns = 0,
     }, snapshot, &.{"doc:a"}));
+}
+
+test "text doc id conversion resolves source ids to derived artifacts" {
+    const alloc = std.testing.allocator;
+
+    const artifact_id = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, .{
+        .document_id = @constCast("doc:a"),
+        .name = @constCast("body_chunks_v1"),
+        .kind = .chunk,
+        .chunk_id = 0,
+    });
+    defer alloc.free(artifact_id);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc(artifact_id, "{\"text\":\"alpha\"}");
+    try seg_writer.addStoredDoc("doc:b", "{\"text\":\"beta\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const mapped = try textDocNumsForDocIdsAlloc(alloc, .{}, snapshot, &.{"doc:a"});
+    defer alloc.free(mapped);
+    try std.testing.expectEqualSlices(u32, &.{0}, mapped);
 }
 
 pub fn collectSearchRequestTextStats(
@@ -12825,12 +12886,7 @@ fn searchDenseInternal(
     const page_candidate_window = pagingCandidateWindow(paging);
     const score_order_k = scoreOrderCandidateWindowK(dense.k, paging);
     const effort = resolvedSearchEffort(req.search_effort);
-    // Paging and nested hierarchy expansion can request a wider result window
-    // than the query's original k. Recall calibration must cover the effective
-    // score-ordered window passed to the vector index.
-    const resolved_search_width = resolveSearchWidth(score_order_k, effort, index_stats);
     const resolved_epsilon = resolveSearchEpsilon(effort);
-    profile.resolved_search_width = resolved_search_width;
     profile.resolved_epsilon = resolved_epsilon;
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or req.profile;
@@ -12893,6 +12949,12 @@ fn searchDenseInternal(
         var score_exactness = SortPlanExactness.approximate;
         var projected_source_profile = ProjectedSourceLoadProfile{};
         const hbc_effective_k: u32 = if (full_candidate_window) candidate_window else score_order_k;
+        // Adaptive hierarchy grouping can grow k well beyond the original
+        // query page. Calibrate recall for the window actually sent to HBC on
+        // every iteration; otherwise a larger k repeatedly searches the same
+        // too-small leaf budget and can miss additional source groups.
+        const resolved_search_width = resolveSearchWidth(hbc_effective_k, effort, index_stats);
+        profile.resolved_search_width = resolved_search_width;
         const exhaustive_broad_live_window = !full_candidate_window and
             native_constraints.broad_live_exclude_ids.len > 0 and
             hbc_effective_k >= bounded_full_candidate_count;
@@ -13335,6 +13397,18 @@ test "adaptive candidate window covers requested offset page and grows bounded" 
     try std.testing.expect(candidateWindowIncomplete(1025, 2000));
     try std.testing.expect(!candidateWindowIncomplete(2000, 2000));
     try std.testing.expectEqual(@as(u32, 7), initialAdaptiveCandidateWindow(7, paging));
+
+    // Group collection starts with an overfetch window and may grow it again.
+    // Search width must be resolved from each effective HBC k, not the much
+    // smaller user-visible page size.
+    const stats = testIndexStats(1_000_000, 17_591, 128);
+    const initial_k = initialAdaptiveCandidateWindow(10_000, .{ .offset = 0, .limit = 1 });
+    const grown_k = growAdaptiveCandidateWindow(initial_k, 10_000, 1);
+    const page_width = resolveSearchWidth(1, 0.0, stats);
+    const initial_width = resolveSearchWidth(initial_k, 0.0, stats);
+    const grown_width = resolveSearchWidth(grown_k, 0.0, stats);
+    try std.testing.expect(page_width < initial_width);
+    try std.testing.expect(initial_width < grown_width);
 }
 
 test "grouped result page satisfaction treats nested match count as a maximum" {

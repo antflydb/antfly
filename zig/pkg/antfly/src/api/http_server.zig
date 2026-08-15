@@ -22039,6 +22039,24 @@ test "api http server serves fielded full-text search through mcp tools" {
     defer ambiguous_batch_resp.deinit(std.testing.allocator);
     try mcp.testing.expectToolResultTextContains(alloc, ambiguous_batch_resp.body, true, "inserts and writes cannot be combined");
 
+    // SDKs and MCP clients commonly serialize unset optionals as JSON null.
+    // Null canonical arguments must remain equivalent to omission so aliases
+    // and defaults continue to work.
+    var nullable_batch_alias_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"tableName\":\"docs\",\"inserts\":null,\"writes\":{\"doc:c\":{\"title\":\"gamma\",\"body\":\"nullable alias\"}},\"transforms\":null,\"syncLevel\":null}}}",
+    });
+    defer nullable_batch_alias_resp.deinit(std.testing.allocator);
+    var parsed_nullable_batch = try mcp.testing.parseToolCallResponse(alloc, nullable_batch_alias_resp.body);
+    defer parsed_nullable_batch.deinit();
+    try std.testing.expect(!parsed_nullable_batch.value.result.isError);
+    var nullable_alias_inserted = (try db.lookup(alloc, "doc:c", .{})) orelse return error.TestExpectedEqual;
+    defer nullable_alias_inserted.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, nullable_alias_inserted.json, "nullable alias") != null);
+
     var missing_backup_connection_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
@@ -22190,6 +22208,17 @@ test "api http server serves fielded full-text search through mcp tools" {
     defer query_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), query_resp.status);
     try mcp.testing.expectToolStructuredSubset(alloc, query_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
+
+    var nullable_query_request_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":51,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"queryRequest\":null,\"fullTextSearch\":\"hello\",\"fullTextSearchField\":\"body\",\"fields\":[\"title\",\"body\"],\"limit\":5}}}",
+    });
+    defer nullable_query_request_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), nullable_query_request_resp.status);
+    try mcp.testing.expectToolStructuredSubset(alloc, nullable_query_request_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
 
     var query_object_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
