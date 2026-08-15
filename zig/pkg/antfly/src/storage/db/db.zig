@@ -68778,6 +68778,13 @@ test "db algebraic generation build yields and resumes from its durable source c
         }
     };
     var yield_token: u8 = 0;
+    const resume_options = types.ArtifactRepairRunOptions{
+        // This test covers durable cursor yield/resume, not the production
+        // activation pause SLA. Give contended CI hosts enough headroom so an
+        // activation timeout cannot arm retry backoff between immediate test
+        // attempts and masquerade as a failure to resume the saved cursor.
+        .max_activation_pause_ms = 5_000,
+    };
     var repair_id: u128 = 0;
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -68794,9 +68801,9 @@ test "db algebraic generation build yields and resumes from its durable source c
             .sync_level = .write,
         });
         repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
-        const first = try db.advanceIndexRepairIntent(alloc, repair_id, .{
-            .yield_check = .{ .ptr = &yield_token, .is_requested = Yield.requested },
-        });
+        var yield_options = resume_options;
+        yield_options.yield_check = .{ .ptr = &yield_token, .is_requested = Yield.requested };
+        const first = try db.advanceIndexRepairIntent(alloc, repair_id, yield_options);
         try std.testing.expect(first.attempted);
         try std.testing.expect(first.busy);
         try std.testing.expect(!first.repaired);
@@ -68828,7 +68835,7 @@ test "db algebraic generation build yields and resumes from its durable source c
     try std.testing.expectEqual(repair_id, (try reopened.indexRepairIdForIndex(alloc, cfg.name)).?);
     var repaired = false;
     for (0..16) |_| {
-        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, resume_options);
         if (step.repaired) {
             repaired = true;
             break;
