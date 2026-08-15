@@ -7,10 +7,8 @@ SCRIPTS_PY ?= uv run --project scripts --locked python
 # ====================================================================================
 # Use Go 1.26 with SIMD experiment enabled for hardware SIMD acceleration
 GO := GOWORK=off GOEXPERIMENT=simd go
-ANTFLY_GO_MODULE := ./go/pkg/antfly
-# Go modules outside of the Antfly product module
-GO_SUBMODULES := \
-	./go/e2e \
+GO_MODULES := \
+	./go/pkg/antflylite \
 	./go/pkg/sdk \
 	./go/pkg/proxy \
 	./go/pkg/libaf \
@@ -21,8 +19,7 @@ GO_SUBMODULES := \
 	./go/pkg/evalaf/plugins/antfly \
 	./go/pkg/genkit/antfly \
 	./go/pkg/genkit/openrouter \
-	./go/pkg/memoryaf \
-	./go/pkg/termite
+	./go/pkg/memoryaf
 
 # ====================================================================================
 # General Commands
@@ -34,13 +31,12 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  build              Build the Zig antfly binary"
-	@echo "  build-go           Build the legacy Go antfly binary"
 	@echo "  build-antfarm      Build the antfarm frontend (React admin UI)"
 	@echo "  build-docs         Join OpenAPI specifications"
-	@echo "  generate           Generate Zig OpenAPI modules, Go code, client SDKs, and website documentation"
-	@echo "  lint               Run golangci-lint with auto-fix"
-	@echo "  tidy               Run go mod tidy across root and Go submodules"
-	@echo "  tidy-check         Verify go.mod/go.sum are tidy across root and Go submodules"
+	@echo "  generate           Generate Zig OpenAPI modules and client SDKs"
+	@echo "  lint               Run linters across retained Go modules and TypeScript"
+	@echo "  tidy               Run go mod tidy across retained Go modules"
+	@echo "  tidy-check         Verify retained Go modules are tidy"
 	@echo "  zig-build          Build the migrated Zig runtime"
 	@echo "  zig-test           Run the migrated Zig test aggregate"
 	@echo "  zig-generate       Regenerate migrated Zig generated sources"
@@ -48,20 +44,7 @@ help:
 	@echo "  zig-generated-check  Verify migrated Zig generated sources"
 	@echo "  install-git-hooks  Configure Git to use the repository hooks in .githooks/"
 	@echo "  update-deps        Update Go dependencies"
-	@echo "  sim-validate       Run simulator-focused validation"
-	@echo "  sim-validate-repo  Run broader repo validation including go test ./..."
-	@echo "  sim-soak           Run simulator soak scenarios"
-	@echo ""
-	@echo "E2E Testing Commands:"
-	@echo "  e2e                Run e2e tests with ONNX+XLA (downloads deps on first run)"
-	@echo "                     Options: E2E_TEST=TestName E2E_TIMEOUT=60m"
-	@echo "  e2e-deps           Download ONNX Runtime and PJRT for e2e tests"
-	@echo ""
-	@echo "ML Backend Commands:"
-	@echo "  build-omni         Build antfly with ONNX + XLA backends (omni)"
-	@echo ""
-	@echo "Omni Cross-Compilation (for goreleaser):"
-	@echo "  download-omni-deps     Download ONNX Runtime and PJRT to antfly root"
+	@echo "  download-omni-deps Download ONNX Runtime and PJRT archives"
 	@echo ""
 	@echo "TLA+ Verification Commands:"
 	@echo "  tla-tools          Download TLA+ tools (tla2tools.jar, CommunityModules)"
@@ -87,7 +70,7 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-go build-docs generate lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm sim-validate sim-validate-repo sim-soak
+.PHONY: build build-docs generate lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm
 .PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
@@ -95,24 +78,20 @@ build-antfarm: build-antfarm-main
 build-antfarm-main:
 	@echo "Building antfarm frontend..."
 	cd ts && pnpm install && pnpm --filter antfarm... build
-	@echo "Copying dist files to go/pkg/antfly/src/metadata/antfarm..."
-	rm -rf go/pkg/antfly/src/metadata/antfarm/*
-	cp -r ts/apps/antfarm/dist/* go/pkg/antfly/src/metadata/antfarm/
+	@echo "Copying dist files to zig/pkg/antfly/antfarm..."
+	rm -rf zig/pkg/antfly/antfarm/*
+	cp -r ts/apps/antfarm/dist/* zig/pkg/antfly/antfarm/
 
 build: build-antfarm
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
 	cp zig/zig-out/bin/antfly ./antfly
-
-build-go: build-antfarm generate
-	(cd $(ANTFLY_GO_MODULE) && $(GO) build -tags "afrelease" -ldflags="-s -w" -o ../../../antfly ./cmd)
 
 build-docs:
 	uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
 
 generate: build-docs tidy
 	$(MAKE) zig-openapi-generate
-	(cd $(ANTFLY_GO_MODULE) && $(GO) generate ./...)
-	@for mod in $(GO_SUBMODULES); do \
+	@for mod in $(GO_MODULES); do \
 		echo "==> Generating in $$mod"; \
 		(cd $$mod && $(GO) generate ./...) || exit 1; \
 	done
@@ -159,10 +138,7 @@ zig-tla-check:
 	$(ZIG_MAKE) tla-check
 
 lint:
-	$(GO) run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -fix -test ./...
-	$(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run --fix ./...
-	$(GO) run github.com/Antonboom/testifylint@latest --fix ./...
-	@for mod in $(GO_SUBMODULES); do \
+	@for mod in $(GO_MODULES); do \
 		echo "==> Linting $$mod"; \
 		(cd $$mod && $(GO) run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -fix -test ./...) && \
 		(cd $$mod && $(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run --fix ./...) && \
@@ -170,24 +146,12 @@ lint:
 	done
 	cd ts && pnpm run lint
 
-sim-validate:
-	(cd $(ANTFLY_GO_MODULE) && $(GO) run ./cmd/sim -action validate -scope sim)
-
-sim-validate-repo:
-	(cd $(ANTFLY_GO_MODULE) && $(GO) run ./cmd/sim -action validate -scope repo)
-
-sim-soak:
-	(cd $(ANTFLY_GO_MODULE) && $(GO) run ./cmd/sim -action soak -json)
-
 
 # ====================================================================================
-# Omni Dependencies Download (for goreleaser CGO cross-compilation)
+# Native Runtime Dependency Downloads
 # ====================================================================================
 #
-# Downloads ONNX Runtime and PJRT libraries needed for goreleaser omni builds.
-# Run this before: goreleaser release --snapshot --clean
-#
-# Downloads to ./onnxruntime and ./pjrt by default.
+# Downloads ONNX Runtime and PJRT libraries for native-runtime development.
 # Uses stamp files to skip if already downloaded.
 
 ONNXRUNTIME_ROOT ?= $(CURDIR)/onnxruntime
@@ -221,15 +185,13 @@ force-download-omni-deps: ## Force re-download of ONNX Runtime and PJRT.
 	$(MAKE) download-omni-deps
 
 tidy:
-	(cd $(ANTFLY_GO_MODULE) && $(GO) mod tidy)
-	@for mod in $(GO_SUBMODULES); do \
+	@for mod in $(GO_MODULES); do \
 		echo "==> Tidying $$mod"; \
 		(cd $$mod && $(GO) mod tidy) || exit 1; \
 	done
 
 tidy-check:
-	(cd $(ANTFLY_GO_MODULE) && $(GO) mod tidy -diff)
-	@for mod in $(GO_SUBMODULES); do \
+	@for mod in $(GO_MODULES); do \
 		echo "==> Checking tidy in $$mod"; \
 		(cd $$mod && $(GO) mod tidy -diff) || exit 1; \
 	done
@@ -239,8 +201,7 @@ install-git-hooks:
 	@echo "Configured Git hooks path to .githooks/"
 
 update-deps:
-	$(GO) get -u ./...
-	@for mod in $(GO_SUBMODULES); do \
+	@for mod in $(GO_MODULES); do \
 		echo "==> Updating deps in $$mod"; \
 		(cd $$mod && $(GO) get -u ./...) || exit 1; \
 	done
@@ -248,128 +209,37 @@ update-deps:
 
 
 # ====================================================================================
-# ML Backend Build Targets
-# ====================================================================================
-# Build Antfly with various ML backend configurations
-
-.PHONY: build-omni
-
-build-omni: download-omni-deps
-	@echo "Building antfly with ONNX + XLA backends (omni)..."
-	@echo "Platform: $(E2E_PLATFORM)"
-	export ONNXRUNTIME_ROOT=$(ONNXRUNTIME_ROOT) && \
-	export PJRT_ROOT=$(PJRT_ROOT) && \
-	export CGO_ENABLED=1 && \
-	export LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LIBRARY_PATH && \
-	export LD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
-	export DYLD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
-	(cd $(ANTFLY_GO_MODULE) && $(GO) build -tags="onnx,ORT,xla,XLA" -ldflags="-s -w" -o ../../../antfly ./cmd)
-
-
-# ====================================================================================
-# E2E Testing Commands
-# ====================================================================================
-# End-to-end tests for docsaf that require ONNX/XLA backends and ML models
-
-# Detect OS and architecture for library paths
-UNAME_S := $(shell uname -s)
-UNAME_M := $(shell uname -m)
-ifeq ($(UNAME_S),Darwin)
-    ifeq ($(UNAME_M),arm64)
-        E2E_PLATFORM := darwin-arm64
-    else
-        E2E_PLATFORM := darwin-amd64
-    endif
-else
-    ifeq ($(UNAME_M),aarch64)
-        E2E_PLATFORM := linux-arm64
-    else
-        E2E_PLATFORM := linux-amd64
-    endif
-endif
-
-.PHONY: e2e e2e-deps
-
-# E2E test configuration
-E2E_TEST ?=
-E2E_TIMEOUT ?= 60m
-E2E_MEMLIMIT ?= 16GiB
-
-e2e-deps: download-omni-deps
-
-e2e: e2e-deps
-	@echo "Running E2E tests with ONNX+XLA build (Antfly inference provider)..."
-	@echo "This will download models on first run (embedder, chunker, reranker, generator)."
-	@echo "Platform: $(E2E_PLATFORM)"
-ifdef E2E_TEST
-	@echo "Test: $(E2E_TEST)"
-endif
-	@echo "Timeout: $(E2E_TIMEOUT)"
-	@echo "Memory limit: $(E2E_MEMLIMIT)"
-	export ONNXRUNTIME_ROOT=$(ONNXRUNTIME_ROOT) && \
-	export PJRT_ROOT=$(PJRT_ROOT) && \
-	export CGO_ENABLED=1 && \
-	export GOMEMLIMIT=$(E2E_MEMLIMIT) && \
-	export LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LIBRARY_PATH && \
-	export LD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
-	export DYLD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
-	export RUN_EVAL_TESTS=true && \
-	export E2E_PROVIDER=antfly && \
-	cd go/e2e && $(GO) test -v -tags="onnx,ORT,xla,XLA" -timeout $(E2E_TIMEOUT) $(if $(E2E_TEST),-run '$(E2E_TEST)') ./...
-
-
-# ====================================================================================
 # TLA+ Verification Commands
 # ====================================================================================
-
-GOMODCACHE := $(shell $(GO) env GOMODCACHE 2>/dev/null)
-RAFT_TLA := $(GOMODCACHE)/go.etcd.io/raft/v3@v3.6.0/tla
 
 .PHONY: tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-trace-raft tla-trace-txn
 
 tla-tools:
-	@bash scripts/tla-tools.sh
+	$(ZIG_MAKE) tla-tools
 
-tla-check: tla-check-txn tla-check-split tla-check-snap
+tla-check:
+	$(ZIG_MAKE) tla-check
 
-tla-check-txn: tla-tools
-	@echo "==> Model checking transaction spec..."
-	source scripts/tla-tools.sh && \
-	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
-	  -config specs/tla/AntflyTransaction.cfg specs/tla/MC.tla \
-	  -workers auto -deadlock
+tla-check-txn:
+	$(ZIG_MAKE) tla-check-txn
 
-tla-check-split: tla-tools
-	@echo "==> Model checking shard split spec..."
-	source scripts/tla-tools.sh && \
-	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
-	  -config specs/tla/AntflyShardSplit.cfg specs/tla/ShardSplitMC.tla \
-	  -workers auto -deadlock
+tla-check-split:
+	$(ZIG_MAKE) tla-check-split
 
-tla-check-snap: tla-tools
-	@echo "==> Model checking snapshot transfer spec (safety only, ~90s)..."
-	source scripts/tla-tools.sh && \
-	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
-	  -config specs/tla/AntflySnapshotTransfer-safety.cfg specs/tla/SnapshotTransferMC.tla \
-	  -workers auto -deadlock
+tla-check-snap:
+	$(ZIG_MAKE) tla-check-snap
 
 tla-trace-raft: tla-tools
 ifndef TRACE_FILES
 	$(error TRACE_FILES is required. Example: make tla-trace-raft TRACE_FILES=/tmp/raft-trace.ndjson)
 endif
-	@bash scripts/tla-validate-trace.sh -S \
-	  -s "$(RAFT_TLA)/Traceetcdraft.tla" \
-	  -c "$(RAFT_TLA)/Traceetcdraft.cfg" \
-	  $(TRACE_FILES)
+	$(ZIG_MAKE) tla-trace-raft TRACE_FILES="$(TRACE_FILES)"
 
 tla-trace-txn: tla-tools
 ifndef TRACE_FILES
 	$(error TRACE_FILES is required. Example: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson)
 endif
-	@bash scripts/tla-validate-trace.sh -S \
-	  -s specs/tla/TraceAntflyTransaction.tla \
-	  -c specs/tla/TraceAntflyTransaction.cfg \
-	  $(TRACE_FILES)
+	$(ZIG_MAKE) tla-trace-txn TRACE_FILES="$(TRACE_FILES)"
 
 
 # ====================================================================================
@@ -413,7 +283,9 @@ minikube-status:
 minikube-restart: minikube-delete minikube-start
 
 build-minikube:
-	minikube image build --profile=minikube -t localhost:5000/antfly:latest .
+	docker pull ghcr.io/antflydb/antfly:latest
+	docker tag ghcr.io/antflydb/antfly:latest antfly:latest
+	minikube image load --profile=minikube antfly:latest
 
 show-ingress:
 	@echo "Fetching Ingress IP..."
@@ -448,9 +320,7 @@ show-ingress:
 # Operator Commands
 # ====================================================================================
 
-.PHONY: operator-build operator-test operator-docker-build operator-lint \
-        inference-runtime-build inference-runtime-test inference-runtime-lint \
-        sdk-test sdk-lint
+.PHONY: operator-build operator-test operator-docker-build operator-lint sdk-test sdk-lint
 
 operator-build: ## Build the antfly-operator binary
 	(cd ./go/pkg/operator && $(MAKE) build)
@@ -463,15 +333,6 @@ operator-lint: ## Run linter on antfly-operator
 
 operator-docker-build: ## Build antfly-operator Docker image
 	docker build -t antfly-operator:latest -f ./go/pkg/operator/Dockerfile .
-
-inference-runtime-build: ## Build the Go inference runtime module
-	(cd $(GO_INFERENCE_RUNTIME_MODULE) && $(GO) build ./...)
-
-inference-runtime-test: ## Run Go inference runtime tests
-	(cd $(GO_INFERENCE_RUNTIME_MODULE) && $(GO) test ./...)
-
-inference-runtime-lint: ## Run Go inference runtime linter
-	(cd $(GO_INFERENCE_RUNTIME_MODULE) && $(GO) vet ./...)
 
 sdk-test: ## Run SDK tests
 	(cd ./go/pkg/sdk && $(GO) test ./...)

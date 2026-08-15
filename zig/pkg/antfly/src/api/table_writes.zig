@@ -12827,6 +12827,17 @@ pub const ProvisionedTableWriteSource = struct {
         try enforceHAWriteGateOptional(self.ha_write_gate);
         if (group_ids.len == 0) return null;
 
+        // A durable index repair owns group admission while it advances one
+        // bounded build slice. Publish cancellation before waiting for the
+        // table-wide structural barrier so dropping a table cannot sit behind
+        // corpus work until the request itself times out.
+        for (group_ids) |group_id| {
+            self.notifyLocalIndexRepairDebt(table_name, group_id, .cancel);
+        }
+        defer for (group_ids) |group_id| {
+            self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
+        };
+
         self.beginLocalStructuralMutation(table_name);
         var structural_mutation_active = true;
         var local_db_mutex_held = true;
@@ -12856,6 +12867,9 @@ pub const ProvisionedTableWriteSource = struct {
         }
         self.finishLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
         structural_mutation_active = false;
+        for (group_ids) |group_id| {
+            self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
+        }
         self.notifyLocalChange(table_name, .structural);
     }
 
@@ -18327,7 +18341,7 @@ fn catchUpManagedIndexCreate(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     index_name: []const u8,
-    delegate_durable_generation_repair: bool,
+    delegate_background_repair: bool,
 ) !ManagedIndexCreateCatchUp {
     // Managed full-text admission persists a generation-repair intent instead
     // of rebuilding the existing corpus inline with catalog mutation. A data
@@ -18340,11 +18354,11 @@ fn catchUpManagedIndexCreate(
         .index_name = index_name,
         .limit = 1,
     }, .{
-        .defer_durable_index_repair_execution = delegate_durable_generation_repair,
+        .defer_durable_index_repair_execution = delegate_background_repair,
     });
     defer generation_repair.deinit(alloc);
     if (generation_repair.debt_remaining) {
-        return if (delegate_durable_generation_repair) .delegated else .retry;
+        return if (delegate_background_repair) .delegated else .retry;
     }
 
     const requires_enrichment_replay = try db.core.indexRequiresEnrichmentReplay(index_name);
@@ -18354,6 +18368,12 @@ fn catchUpManagedIndexCreate(
         } else {
             _ = try seedManagedIndexReplayFromStoredDocsIfNeeded(alloc, db, index_name);
         }
+        // A provisioned owner has a resident asynchronous enrichment runtime.
+        // Once its durable replay records are posted, structural reconciliation
+        // must release group admission instead of synchronously draining a
+        // provider that may be rate limited or unavailable. Direct/embedded
+        // sources keep the synchronous readiness barrier below.
+        if (delegate_background_repair) return .complete;
     }
 
     try db.runUntilIdle();
@@ -18412,6 +18432,93 @@ test "managed structural catch-up delegates durable generation repair without re
         if (std.mem.eql(u8, item.name, "full_text_index_v1")) break item;
     } else return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 0), index.doc_count);
+}
+
+test "managed structural catch-up leaves pending enrichment with the asynchronous owner" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/managed-structural-enrichment-delegation",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    const FakeEmbeddingProvider = struct {
+        var allow_requests: std.atomic.Value(bool) = .init(false);
+        var rate_limited_count: std.atomic.Value(u32) = .init(0);
+
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, arena: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            if (!allow_requests.load(.acquire)) {
+                _ = rate_limited_count.fetchAdd(1, .monotonic);
+                return .{
+                    .status = 429,
+                    .content_type = try arena.dupe(u8, "application/json"),
+                    .body = try arena.dupe(u8, "{\"error\":{\"message\":\"rate limited\",\"type\":\"rate_limit_exceeded\"}}"),
+                };
+            }
+            return .{
+                .status = 200,
+                .content_type = try arena.dupe(u8, "application/json"),
+                .body = try arena.dupe(u8, "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[1,0,0]}],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}"),
+            };
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, FakeEmbeddingProvider.executor());
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+    const indexes_json = try std.fmt.allocPrint(alloc,
+        \\{{"semantic_idx":{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"openai","model":"test-embed","url":"{s}"}}}}}}
+    , .{base_uri});
+    defer alloc.free(indexes_json);
+
+    FakeEmbeddingProvider.allow_requests.store(false, .release);
+    FakeEmbeddingProvider.rate_limited_count.store(0, .monotonic);
+    var db = try openManagedDbWithIndexesJsonAndCacheMode(
+        alloc,
+        path,
+        indexes_json,
+        null,
+        null,
+        0,
+        null,
+        .default,
+    );
+    defer {
+        FakeEmbeddingProvider.allow_requests.store(true, .release);
+        db.close();
+    }
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+
+    var attempts: usize = 0;
+    while (attempts < 100 and FakeEmbeddingProvider.rate_limited_count.load(.monotonic) == 0) : (attempts += 1) {
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(FakeEmbeddingProvider.rate_limited_count.load(.monotonic) > 0);
+
+    try std.testing.expectEqual(
+        ManagedIndexCreateCatchUp.complete,
+        try catchUpManagedIndexCreate(alloc, &db, "semantic_idx", true),
+    );
+    const enrichment = db.enrichment_runtime orelse return error.MissingStartupEnrichmentRuntime;
+    const stats = enrichment.stats();
+    try std.testing.expect(stats.applied_sequence < stats.target_sequence);
 }
 
 const ManagedIndexReplayPosition = struct {
@@ -37397,6 +37504,94 @@ test "provisioned group apply releases source mutex and retires readers opened d
     var result = (try post_commit.db.lookup(alloc, "doc:a", .{})).?;
     defer result.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
+}
+
+test "provisioned table write source drop table cancels index repair before structural admission" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-drop-table-cancels-repair", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    const DebtProbe = struct {
+        io: std.Io,
+        cancel_seen: std.Io.Event = .unset,
+        remove_seen: std.Io.Event = .unset,
+        clear_seen: std.Io.Event = .unset,
+        invalid_sequence: std.Io.Event = .unset,
+
+        fn onDebt(
+            ptr: *anyopaque,
+            table_name: []const u8,
+            group_id: u64,
+            action: ProvisionedTableWriteSource.LocalIndexRepairDebtAction,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, table_name, "docs") or group_id != 7001) {
+                self.invalid_sequence.set(self.io);
+                return;
+            }
+            switch (action) {
+                .cancel => self.cancel_seen.set(self.io),
+                .remove => {
+                    if (!self.cancel_seen.isSet()) self.invalid_sequence.set(self.io);
+                    self.remove_seen.set(self.io);
+                },
+                .clear_cancel => {
+                    if (!self.remove_seen.isSet()) self.invalid_sequence.set(self.io);
+                    self.clear_seen.set(self.io);
+                },
+                else => self.invalid_sequence.set(self.io),
+            }
+        }
+    };
+
+    const DropWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", &.{7001}) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    var probe = DebtProbe{ .io = io };
+    source.setLocalIndexRepairDebtHook(.{ .ptr = &probe, .on_change = DebtProbe.onDebt });
+
+    // Model a repair slice that already owns the group. Drop must publish its
+    // cancellation fence before it waits for this activity to drain.
+    source.beginGroupOperation("docs", 7001);
+    var group_operation_active = true;
+
+    var worker = DropWorker{ .source = &source };
+    var future = try io.concurrent(DropWorker.run, .{&worker});
+    var future_pending = true;
+    defer if (future_pending) {
+        if (group_operation_active) source.endGroupOperation("docs", 7001);
+        _ = future.await(io);
+    };
+    probe.cancel_seen.waitUncancelable(io);
+    try std.testing.expect(!probe.remove_seen.isSet());
+
+    source.endGroupOperation("docs", 7001);
+    group_operation_active = false;
+    _ = future.await(io);
+    future_pending = false;
+    if (worker.err) |err| return err;
+
+    try std.testing.expect(probe.remove_seen.isSet());
+    try std.testing.expect(probe.clear_seen.isSet());
+    try std.testing.expect(!probe.invalid_sequence.isSet());
 }
 
 test "provisioned table write source drop table does not hold local db mutex during background delete" {

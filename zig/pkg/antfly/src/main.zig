@@ -15,6 +15,7 @@
 const std = @import("std");
 const structlog = @import("structlog");
 const build_options = @import("build_options");
+const completion = @import("completion.zig");
 const runtime_bridge = @import("runtime_bridge.zig");
 
 const antfly_cloud_binary = "antfly-cloud";
@@ -50,48 +51,40 @@ fn mainImpl(init: std.process.Init) !void {
         return;
     };
 
-    if (std.mem.eql(u8, subcommand, "--help") or std.mem.eql(u8, subcommand, "-h") or std.mem.eql(u8, subcommand, "help")) {
+    if (std.mem.eql(u8, subcommand, "--help") or std.mem.eql(u8, subcommand, "-h")) {
         printUsage(argv0);
         return;
     }
-    if (std.mem.eql(u8, subcommand, "--version") or std.mem.eql(u8, subcommand, "version")) {
+    if (std.mem.eql(u8, subcommand, "--version")) {
         printVersion();
         return;
     }
 
-    // Server-side subcommands dispatch into independently generated runtime
-    // units through the narrow internal ABI.
-    if (std.mem.eql(u8, subcommand, "data")) return runRuntimeUnit(.data, subcommand, init, &args);
-    if (std.mem.eql(u8, subcommand, "ha")) return runRuntimeUnit(.ha, subcommand, init, &args);
-    if (std.mem.eql(u8, subcommand, "inference")) return runRuntimeUnit(.inference, subcommand, init, &args);
-    // Lite serve embeds the standalone runtime, so keep the entire Lite
-    // command in that codegen unit instead of pulling it into the CLI.
-    if (std.mem.eql(u8, subcommand, "lite")) return runRuntimeUnit(.standalone, subcommand, init, &args);
-    if (std.mem.eql(u8, subcommand, "metadata")) return runRuntimeUnit(.metadata, subcommand, init, &args);
-    if (std.mem.eql(u8, subcommand, "serverless")) return runRuntimeUnit(.serverless, subcommand, init, &args);
-    if (isStandaloneSubcommand(subcommand)) return runRuntimeUnit(.standalone, subcommand, init, &args);
-
-    if (std.mem.eql(u8, subcommand, "cloud")) {
-        const code = try runAntflyCloud(init.gpa, init.io, &args);
-        std.process.exit(code);
-    }
-
-    // CLI client subcommands — these talk to a remote Antfly server via HTTP
-    const cli_commands = [_][]const u8{
-        "table",    "index",  "artifact", "query",
-        "lookup",   "load",   "insert",   "delete",
-        "agents",   "backup", "restore",  "auth",
-        "internal",
+    const command = completion.findCommand(subcommand) orelse {
+        std.debug.print("unknown subcommand: {s}\n", .{subcommand});
+        printUsage(argv0);
+        return error.InvalidArguments;
     };
-    for (cli_commands) |cli_cmd| {
-        if (std.mem.eql(u8, subcommand, cli_cmd)) {
-            return runRuntimeUnit(.cli, subcommand, init, &args);
-        }
-    }
 
-    std.debug.print("unknown subcommand: {s}\n", .{subcommand});
-    printUsage(argv0);
-    return error.InvalidArguments;
+    // Server-side subcommands dispatch into independently generated runtime
+    // units through the narrow internal ABI. Lite uses standalone because its
+    // serve command embeds that runtime.
+    switch (command.route) {
+        .cli => return runRuntimeUnit(.cli, subcommand, init, &args),
+        .data => return runRuntimeUnit(.data, subcommand, init, &args),
+        .ha => return runRuntimeUnit(.ha, subcommand, init, &args),
+        .inference => return runRuntimeUnit(.inference, subcommand, init, &args),
+        .metadata => return runRuntimeUnit(.metadata, subcommand, init, &args),
+        .serverless => return runRuntimeUnit(.serverless, subcommand, init, &args),
+        .standalone => return runRuntimeUnit(.standalone, subcommand, init, &args),
+        .cloud => {
+            const code = try runAntflyCloud(init.gpa, init.io, &args);
+            std.process.exit(code);
+        },
+        .completion => return runCompletion(init.io, &args),
+        .help => printUsage(argv0),
+        .version => printVersion(),
+    }
 }
 
 const RuntimeRole = enum { cli, data, ha, inference, metadata, serverless, standalone };
@@ -143,7 +136,8 @@ fn runRuntimeUnit(
 }
 
 fn isStandaloneSubcommand(subcommand: []const u8) bool {
-    return std.mem.eql(u8, subcommand, "standalone") or std.mem.eql(u8, subcommand, "swarm");
+    const command = completion.findCommand(subcommand) orelse return false;
+    return command.route == .standalone;
 }
 
 test "legacy swarm subcommand selects the standalone runtime" {
@@ -203,6 +197,23 @@ fn printMissingAntflyCloud() void {
     , .{antfly_cloud_binary});
 }
 
+fn runCompletion(io: std.Io, args: *std.process.Args.Iterator) !void {
+    const shell_name = args.next() orelse {
+        std.debug.print("usage: antfly completion <bash|zsh|fish>\n", .{});
+        return error.InvalidArguments;
+    };
+    if (args.next() != null) return error.InvalidArguments;
+
+    const shell = completion.Shell.parse(shell_name) catch {
+        std.debug.print("unsupported shell: {s}; expected bash, zsh, or fish\n", .{shell_name});
+        return error.InvalidArguments;
+    };
+    var buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &buffer);
+    try completion.write(shell, &stdout_writer.interface);
+    try stdout_writer.flush();
+}
+
 fn printUsage(argv0: []const u8) void {
     std.debug.print(
         \\usage: {s} <subcommand> [options]
@@ -231,6 +242,7 @@ fn printUsage(argv0: []const u8) void {
         \\  auth           Manage data-plane users, roles, permissions, row filters, and API keys
         \\  internal       Internal cluster management
         \\  cloud          Delegate to the separate Antfly Cloud CLI
+        \\  completion     Generate shell completions (bash, zsh, fish)
         \\
     , .{argv0});
 }

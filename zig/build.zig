@@ -320,6 +320,7 @@ fn addDelegatedInferenceOptions(
     onnx_root: []const u8,
     enable_cuda: bool,
     cuda_artifacts: []const u8,
+    enable_pjrt: bool,
     enable_system_blas: bool,
     blas_root: ?[]const u8,
 ) void {
@@ -331,6 +332,7 @@ fn addDelegatedInferenceOptions(
     }
     run.addArg(if (enable_cuda) "-Dcuda=true" else "-Dcuda=false");
     run.addArg(b.fmt("-Dcuda-artifacts={s}", .{cuda_artifacts}));
+    run.addArg(if (enable_pjrt) "-Dpjrt=true" else "-Dpjrt=false");
     run.addArg(if (enable_system_blas) "-Dsystem-blas=true" else "-Dsystem-blas=false");
     if (enable_system_blas) {
         if (blas_root) |root| run.addArg(b.fmt("-Dblas-root={s}", .{root}));
@@ -351,6 +353,7 @@ fn addDelegatedInferenceBuildSteps(
     onnx_root: []const u8,
     enable_cuda: bool,
     cuda_artifacts: []const u8,
+    enable_pjrt: bool,
     enable_system_blas: bool,
     blas_root: ?[]const u8,
 ) DelegatedInferenceBuildSteps {
@@ -359,7 +362,7 @@ fn addDelegatedInferenceBuildSteps(
     for (inference_delegated_steps) |step_name| {
         const delegated = addDelegatedPackageStep(b, "inference", "pkg/inference", step_name, "pkg/inference");
         const run = delegated.run;
-        addDelegatedInferenceOptions(b, run, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
+        addDelegatedInferenceOptions(b, run, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_pjrt, enable_system_blas, blas_root);
         forwardBuildArgs(b, run);
         if (std.mem.eql(u8, step_name, "test")) {
             test_step = delegated.step;
@@ -1259,50 +1262,55 @@ pub fn build(b: *std.Build) void {
     if (!link_libc and lmdb_backend == .c) {
         @panic("-Dlink-libc=false requires -Dlmdb_backend=zig");
     }
-    const termite_onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime support for embedded inference");
-    const termite_enable_onnx = if (link_libc)
-        termite_onnx_option orelse false
+    const inference_onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime support for embedded inference");
+    const inference_enable_onnx = if (link_libc)
+        inference_onnx_option orelse false
     else
         false;
-    const termite_onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root for embedded inference");
-    const termite_onnx_root = termite_onnx_root_opt orelse defaultInferenceOnnxRoot(b, target);
-    const termite_enable_metal = if (link_libc)
+    const inference_onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root for embedded inference");
+    const inference_onnx_root = inference_onnx_root_opt orelse defaultInferenceOnnxRoot(b, target);
+    const inference_enable_metal = if (link_libc)
         b.option(bool, "metal", "Enable Apple Metal kernels for embedded inference") orelse (target.result.os.tag == .macos)
     else
         false;
-    const termite_enable_cuda = b.option(bool, "cuda", "Enable CUDA inference support through the NVIDIA Driver API") orelse false;
-    const termite_cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: fatbin SASS+PTX, portable PTX, or sm89 cubin") orelse "fatbin";
-    if (!std.mem.eql(u8, termite_cuda_artifacts, "portable") and !std.mem.eql(u8, termite_cuda_artifacts, "fatbin") and !std.mem.eql(u8, termite_cuda_artifacts, "sm89")) {
+    const inference_enable_cuda = b.option(bool, "cuda", "Enable CUDA inference support through the NVIDIA Driver API") orelse false;
+    const inference_cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: fatbin SASS+PTX, portable PTX, or sm89 cubin") orelse "fatbin";
+    if (!std.mem.eql(u8, inference_cuda_artifacts, "portable") and !std.mem.eql(u8, inference_cuda_artifacts, "fatbin") and !std.mem.eql(u8, inference_cuda_artifacts, "sm89")) {
         @panic("invalid -Dcuda-artifacts (expected portable, fatbin, or sm89)");
     }
-    const termite_blas_root_opt = b.option([]const u8, "blas-root", "Path to system BLAS root with include/ and lib/ for non-macOS native acceleration");
-    const termite_system_blas_available = link_libc and (target.result.os.tag == .macos or termite_blas_root_opt != null);
-    const termite_enable_system_blas = if (link_libc)
-        b.option(bool, "system-blas", "Enable system BLAS acceleration for native CPU math") orelse termite_system_blas_available
+    const inference_enable_pjrt = if (link_libc)
+        b.option(bool, "pjrt", "Enable PJRT inference support through runtime-loaded plugins") orelse false
     else
         false;
-    const termite_blas_root = if (termite_enable_system_blas and target.result.os.tag != .macos)
-        termite_blas_root_opt
+    const inference_blas_root_opt = b.option([]const u8, "blas-root", "Path to system BLAS root with include/ and lib/ for non-macOS native acceleration");
+    const inference_system_blas_available = link_libc and (target.result.os.tag == .macos or inference_blas_root_opt != null);
+    const inference_enable_system_blas = if (link_libc)
+        b.option(bool, "system-blas", "Enable system BLAS acceleration for native CPU math") orelse inference_system_blas_available
+    else
+        false;
+    const inference_blas_root = if (inference_enable_system_blas and target.result.os.tag != .macos)
+        inference_blas_root_opt
     else
         null;
     const antfly_version = b.option([]const u8, "antfly-version", "Antfly version string") orelse "dev";
     const lite_local_inference_runtime = b.option(bool, "lite-local-inference-runtime", "Advertise an embedded local inference runtime in Antfly Lite status") orelse false;
-    if (termite_enable_onnx) {
-        const termite_onnx_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{termite_onnx_root})) and
-            pathExists(b, b.fmt("{s}/lib", .{termite_onnx_root}));
-        if (!termite_onnx_available) {
+    if (inference_enable_onnx) {
+        const inference_onnx_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{inference_onnx_root})) and
+            pathExists(b, b.fmt("{s}/lib", .{inference_onnx_root}));
+        if (!inference_onnx_available) {
             @panic("-Donnx=true requires an ONNX Runtime install; pass -Donnx-root=<path>");
         }
     }
     const delegated_inference_steps = addDelegatedInferenceBuildSteps(
         b,
-        termite_enable_metal,
-        termite_enable_onnx,
-        termite_onnx_root,
-        termite_enable_cuda,
-        termite_cuda_artifacts,
-        termite_enable_system_blas,
-        termite_blas_root,
+        inference_enable_metal,
+        inference_enable_onnx,
+        inference_onnx_root,
+        inference_enable_cuda,
+        inference_cuda_artifacts,
+        inference_enable_pjrt,
+        inference_enable_system_blas,
+        inference_blas_root,
     );
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
@@ -1623,7 +1631,7 @@ pub fn build(b: *std.Build) void {
     const openai_api_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "openai_api", antfly_generated_root ++ "/openai_api", httpx_mod);
 
     // --- Inference backend detection (must precede module creation) ---
-    const termite_ffmpeg_paths = if (link_libc) detectFfmpegPaths(b, target) else null;
+    const inference_ffmpeg_paths = if (link_libc) detectFfmpegPaths(b, target) else null;
     const image_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
         .target = target,
@@ -1665,43 +1673,43 @@ pub fn build(b: *std.Build) void {
     wasm_pdf_mod.addImport("antfly_font", wasm_font_mod);
 
     const sentencepiece_proto_mod = addLocalSentencePieceProtoModule(b, protobuf_dep);
-    const termite_jinja_mod = b.createModule(.{
+    const inference_jinja_mod = b.createModule(.{
         .root_source_file = b.path("lib/jinja/src/jinja.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const termite_ml_mod = b.createModule(.{
+    const inference_ml_mod = b.createModule(.{
         .root_source_file = b.path("lib/ml/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    termite_ml_mod.addImport("antfly_platform", platform_mod);
+    inference_ml_mod.addImport("antfly_platform", platform_mod);
     const ml_tabular_mod = b.addModule("ml_tabular", .{
         .root_source_file = b.path("lib/ml/tabular/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const termite_onnx_graph_mod = b.addModule("termite_onnx_graph", .{
+    const inference_onnx_graph_mod = b.addModule("inference_onnx_graph", .{
         .root_source_file = b.path("lib/onnx/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    termite_onnx_graph_mod.addImport("protobuf", protobuf_mod);
-    termite_onnx_graph_mod.addImport("ml", termite_ml_mod);
-    termite_onnx_graph_mod.addImport("structlog", structlog_mod);
-    const termite_pjrt_xla_proto_mod = b.createModule(.{
+    inference_onnx_graph_mod.addImport("protobuf", protobuf_mod);
+    inference_onnx_graph_mod.addImport("ml", inference_ml_mod);
+    inference_onnx_graph_mod.addImport("structlog", structlog_mod);
+    const inference_pjrt_xla_proto_mod = b.createModule(.{
         .root_source_file = b.path("lib/pjrt/proto/xla_proto_stub.zig"),
         .target = target,
         .optimize = optimize,
     });
-    termite_pjrt_xla_proto_mod.addImport("protobuf", protobuf_mod);
-    const termite_pjrt_mod = b.createModule(.{
+    inference_pjrt_xla_proto_mod.addImport("protobuf", protobuf_mod);
+    const inference_pjrt_mod = b.createModule(.{
         .root_source_file = b.path("lib/pjrt/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    termite_pjrt_mod.addImport("protobuf", protobuf_mod);
-    termite_pjrt_mod.addImport("xla_proto", termite_pjrt_xla_proto_mod);
+    inference_pjrt_mod.addImport("protobuf", protobuf_mod);
+    inference_pjrt_mod.addImport("xla_proto", inference_pjrt_xla_proto_mod);
 
     const inference_graph = inference_runtime_build.create(.{
         .b = b,
@@ -1712,17 +1720,17 @@ pub fn build(b: *std.Build) void {
             .shared_lib_root = "",
         },
         .backend = .{
-            .enable_onnx = termite_enable_onnx,
-            .onnx_root = termite_onnx_root,
-            .enable_metal = termite_enable_metal,
-            .enable_cuda = termite_enable_cuda,
-            .cuda_artifacts = termite_cuda_artifacts,
-            .enable_pjrt = false,
+            .enable_onnx = inference_enable_onnx,
+            .onnx_root = inference_onnx_root,
+            .enable_metal = inference_enable_metal,
+            .enable_cuda = inference_enable_cuda,
+            .cuda_artifacts = inference_cuda_artifacts,
+            .enable_pjrt = inference_enable_pjrt,
             .enable_native = true,
-            .enable_system_blas = termite_enable_system_blas,
-            .blas_root = termite_blas_root,
-            .enable_ffmpeg_audio = termite_ffmpeg_paths != null,
-            .ffmpeg_paths = if (termite_ffmpeg_paths) |paths| .{
+            .enable_system_blas = inference_enable_system_blas,
+            .blas_root = inference_blas_root,
+            .enable_ffmpeg_audio = inference_ffmpeg_paths != null,
+            .ffmpeg_paths = if (inference_ffmpeg_paths) |paths| .{
                 .include_dir = paths.include_dir,
                 .lib_dir = paths.lib_dir,
             } else null,
@@ -1743,13 +1751,13 @@ pub fn build(b: *std.Build) void {
             .image = image_mod,
             .prometheus = prometheus_mod,
             .structlog = structlog_mod,
-            .jinja = termite_jinja_mod,
+            .jinja = inference_jinja_mod,
             .protobuf = protobuf_mod,
             .sentencepiece_proto = sentencepiece_proto_mod,
-            .ml = termite_ml_mod,
+            .ml = inference_ml_mod,
             .ml_tabular = ml_tabular_mod,
-            .onnx_graph = termite_onnx_graph_mod,
-            .pjrt = termite_pjrt_mod,
+            .onnx_graph = inference_onnx_graph_mod,
+            .pjrt = inference_pjrt_mod,
             .generating_openapi = generating_openapi_mod,
             .extraction_openapi = extraction_openapi_mod,
             .extracting = extracting_mod,
@@ -2539,7 +2547,7 @@ pub fn build(b: *std.Build) void {
     lib_ml_tabular_test_step.dependOn(&run_lib_ml_tabular_tests.step);
 
     const lib_onnx_tests = b.addTest(.{
-        .root_module = termite_onnx_graph_mod,
+        .root_module = inference_onnx_graph_mod,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -5648,6 +5656,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table transition waiter queues ahead of later readers",
             "provisioned table write source read request permits replicated apply activity",
             "provisioned table group operation waiter queues ahead of later readers",
+            "provisioned table write source drop table cancels index repair before structural admission",
             "provisioned table write request queues structural reconcile ahead of later writes",
             "structural reconcile reservation defers metadata group refresh without blocking admitted work",
             "queued structural reconcile reserves write admission before its worker starts",
@@ -5674,6 +5683,7 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up allocation failure preserves bounded retry",
             "standby HA replay reconciles managed indexes without opening the public write gate",
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
+            "managed structural catch-up leaves pending enrichment with the asynchronous owner",
             "db managed vector admission captures writes while durable repair is pending",
             "db managed algebraic admission builds and reopens an isolated generation",
             "db algebraic generation build yields and resumes from its durable source cursor",
@@ -6226,7 +6236,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     lib_audio_xiph_conformance.root_module.addImport("build_options", inference_build_options_mod);
-    if (termite_ffmpeg_paths) |ffmpeg_paths| {
+    if (inference_ffmpeg_paths) |ffmpeg_paths| {
         lib_audio_xiph_conformance.root_module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
     }
     lib_audio_xiph_conformance.root_module.link_libc = true;
@@ -6240,18 +6250,18 @@ pub fn build(b: *std.Build) void {
         }),
     });
     lib_audio_misc_conformance.root_module.addImport("build_options", inference_build_options_mod);
-    if (termite_ffmpeg_paths) |ffmpeg_paths| {
+    if (inference_ffmpeg_paths) |ffmpeg_paths| {
         lib_audio_misc_conformance.root_module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
     }
     lib_audio_misc_conformance.root_module.link_libc = true;
 
     const fetch_lib_audio_xiph_conformance = b.addRunArtifact(lib_audio_xiph_conformance);
     fetch_lib_audio_xiph_conformance.addArg("fetch");
-    fetch_lib_audio_xiph_conformance.addArg("/tmp/termite-audio-xiph-corpora");
+    fetch_lib_audio_xiph_conformance.addArg("/tmp/audio-xiph-corpora");
 
     const fetch_lib_audio_misc_conformance = b.addRunArtifact(lib_audio_misc_conformance);
     fetch_lib_audio_misc_conformance.addArg("fetch");
-    fetch_lib_audio_misc_conformance.addArg("/tmp/termite-audio-misc-corpora");
+    fetch_lib_audio_misc_conformance.addArg("/tmp/audio-misc-corpora");
 
     const lib_audio_conformance_fetch_step = b.step("lib-audio-conformance-fetch", "Fetch the lib/audio external conformance fixtures");
     lib_audio_conformance_fetch_step.dependOn(&fetch_lib_audio_xiph_conformance.step);
@@ -6259,22 +6269,22 @@ pub fn build(b: *std.Build) void {
 
     const fetch_lib_audio_xiph_conformance_quiet = b.addRunArtifact(lib_audio_xiph_conformance);
     fetch_lib_audio_xiph_conformance_quiet.addArg("fetch");
-    fetch_lib_audio_xiph_conformance_quiet.addArg("/tmp/termite-audio-xiph-corpora");
+    fetch_lib_audio_xiph_conformance_quiet.addArg("/tmp/audio-xiph-corpora");
     const fetch_lib_audio_xiph_conformance_quiet_step = expectQuietSuccess(fetch_lib_audio_xiph_conformance_quiet);
 
     const fetch_lib_audio_misc_conformance_quiet = b.addRunArtifact(lib_audio_misc_conformance);
     fetch_lib_audio_misc_conformance_quiet.addArg("fetch");
-    fetch_lib_audio_misc_conformance_quiet.addArg("/tmp/termite-audio-misc-corpora");
+    fetch_lib_audio_misc_conformance_quiet.addArg("/tmp/audio-misc-corpora");
     const fetch_lib_audio_misc_conformance_quiet_step = expectQuietSuccess(fetch_lib_audio_misc_conformance_quiet);
 
     const run_lib_audio_xiph_conformance = b.addRunArtifact(lib_audio_xiph_conformance);
     run_lib_audio_xiph_conformance.addArg("run");
-    run_lib_audio_xiph_conformance.addArg("/tmp/termite-audio-xiph-corpora");
+    run_lib_audio_xiph_conformance.addArg("/tmp/audio-xiph-corpora");
     run_lib_audio_xiph_conformance.addArg("--no-fetch");
 
     const run_lib_audio_misc_conformance = b.addRunArtifact(lib_audio_misc_conformance);
     run_lib_audio_misc_conformance.addArg("run");
-    run_lib_audio_misc_conformance.addArg("/tmp/termite-audio-misc-corpora");
+    run_lib_audio_misc_conformance.addArg("/tmp/audio-misc-corpora");
     run_lib_audio_misc_conformance.addArg("--no-fetch");
 
     const lib_audio_conformance_run_step = b.step("lib-audio-conformance-run", "Run lib/audio conformance suites without fetching fixtures");
@@ -6283,13 +6293,13 @@ pub fn build(b: *std.Build) void {
 
     const run_lib_audio_xiph_conformance_after_fetch = b.addRunArtifact(lib_audio_xiph_conformance);
     run_lib_audio_xiph_conformance_after_fetch.addArg("run");
-    run_lib_audio_xiph_conformance_after_fetch.addArg("/tmp/termite-audio-xiph-corpora");
+    run_lib_audio_xiph_conformance_after_fetch.addArg("/tmp/audio-xiph-corpora");
     run_lib_audio_xiph_conformance_after_fetch.addArg("--no-fetch");
     run_lib_audio_xiph_conformance_after_fetch.step.dependOn(&fetch_lib_audio_xiph_conformance.step);
 
     const run_lib_audio_misc_conformance_after_fetch = b.addRunArtifact(lib_audio_misc_conformance);
     run_lib_audio_misc_conformance_after_fetch.addArg("run");
-    run_lib_audio_misc_conformance_after_fetch.addArg("/tmp/termite-audio-misc-corpora");
+    run_lib_audio_misc_conformance_after_fetch.addArg("/tmp/audio-misc-corpora");
     run_lib_audio_misc_conformance_after_fetch.addArg("--no-fetch");
     run_lib_audio_misc_conformance_after_fetch.step.dependOn(&fetch_lib_audio_misc_conformance.step);
 
@@ -6299,14 +6309,14 @@ pub fn build(b: *std.Build) void {
 
     const run_lib_audio_xiph_conformance_after_fetch_quiet = b.addRunArtifact(lib_audio_xiph_conformance);
     run_lib_audio_xiph_conformance_after_fetch_quiet.addArg("run");
-    run_lib_audio_xiph_conformance_after_fetch_quiet.addArg("/tmp/termite-audio-xiph-corpora");
+    run_lib_audio_xiph_conformance_after_fetch_quiet.addArg("/tmp/audio-xiph-corpora");
     run_lib_audio_xiph_conformance_after_fetch_quiet.addArg("--no-fetch");
     run_lib_audio_xiph_conformance_after_fetch_quiet.step.dependOn(fetch_lib_audio_xiph_conformance_quiet_step);
     const run_lib_audio_xiph_conformance_after_fetch_quiet_step = expectQuietSuccess(run_lib_audio_xiph_conformance_after_fetch_quiet);
 
     const run_lib_audio_misc_conformance_after_fetch_quiet = b.addRunArtifact(lib_audio_misc_conformance);
     run_lib_audio_misc_conformance_after_fetch_quiet.addArg("run");
-    run_lib_audio_misc_conformance_after_fetch_quiet.addArg("/tmp/termite-audio-misc-corpora");
+    run_lib_audio_misc_conformance_after_fetch_quiet.addArg("/tmp/audio-misc-corpora");
     run_lib_audio_misc_conformance_after_fetch_quiet.addArg("--no-fetch");
     run_lib_audio_misc_conformance_after_fetch_quiet.step.dependOn(fetch_lib_audio_misc_conformance_quiet_step);
     const run_lib_audio_misc_conformance_after_fetch_quiet_step = expectQuietSuccess(run_lib_audio_misc_conformance_after_fetch_quiet);
@@ -9271,7 +9281,7 @@ pub fn build(b: *std.Build) void {
 
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
     const install_antfarm_assets = b.addInstallDirectory(.{
-        .source_dir = b.path("../go/pkg/antfly/src/metadata/antfarm"),
+        .source_dir = b.path("pkg/antfly/antfarm"),
         .install_dir = .prefix,
         .install_subdir = "share/antfly/antfarm",
     });

@@ -43,7 +43,7 @@ named `<cluster-name>-inference` in the same namespace and owned by the
 
 If `spec.inference.image` is omitted, the operator uses the configured
 `--inference-antfly-image` value for Inference pods. The binary default is
-`ghcr.io/antflydb/antfly:omni`. Override it during deployment if that image is
+`ghcr.io/antflydb/antfly:latest`. Override it during deployment if that image is
 unavailable in your environment. The image must provide the `/antfly inference`
 runtime contract.
 

@@ -407,7 +407,7 @@ import (
     "log"
 
     "github.com/antflydb/antfly/go/pkg/docsaf"
-    "github.com/antflydb/antfly/antfly-go/libaf/s3"
+    "github.com/antflydb/antfly/go/pkg/libaf/s3"
 )
 
 func main() {

@@ -1,8 +1,6 @@
 services:
   antfly:
-    build:
-      context: ../..
-      dockerfile: go/Dockerfile
+    image: ghcr.io/antflydb/antfly:latest
     command: ["standalone"]
     ports:
       - "8080:8080" # Public API port
