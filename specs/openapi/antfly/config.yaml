@@ -801,6 +801,9 @@ components:
           type: integer
           minimum: 0
           maximum: 4294967295
+          not:
+            minimum: 1
+            maximum: 511
           default: 98304
           example: 98304
           x-go-type-skip-optional-pointer: false

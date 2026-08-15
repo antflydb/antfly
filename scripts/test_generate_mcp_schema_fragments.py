@@ -23,6 +23,17 @@ from scripts import generate_mcp_schema_fragments as generator
 
 
 class McpSchemaFragmentTests(unittest.TestCase):
+    def test_mcp_result_budget_schema_matches_runtime_zero_or_minimum(self) -> None:
+        config_spec = generator.ROOT / "specs/openapi/antfly/config.yaml"
+        with config_spec.open(encoding="utf-8") as handle:
+            schema = yaml.safe_load(handle)["components"]["schemas"]["McpConfig"]["properties"]["max_tool_result_bytes"]
+
+        validator = Draft202012Validator(schema)
+        for valid in (0, 512, 98_304, 4_294_967_295):
+            self.assertEqual([], list(validator.iter_errors(valid)), valid)
+        for invalid in (-1, 1, 511, 4_294_967_296):
+            self.assertNotEqual([], list(validator.iter_errors(invalid)), invalid)
+
     def test_deprecated_constraints_are_removed_without_dropping_canonical_constraints(self) -> None:
         schema = {
             "type": "object",
