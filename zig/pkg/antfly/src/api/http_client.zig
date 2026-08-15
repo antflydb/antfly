@@ -1321,7 +1321,10 @@ pub const ApiHttpClient = struct {
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
-        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+        return .{
+            .identity_read_generation = try parseIdentityReadGenerationHeader(resp),
+            .body = try self.alloc.dupe(u8, resp.body),
+        };
     }
 
     pub fn fetchBatch(

@@ -8034,7 +8034,10 @@ fn parseGraphQuery(
         .return_aliases = return_aliases,
         .include_documents = query.include_documents orelse false,
         .fields = fields,
-        .include_all_fields = false,
+        // `include_documents` without a field projection means the full
+        // document. An explicitly supplied `fields` array remains a
+        // projection, including the intentional empty-array case.
+        .include_all_fields = query.fields == null,
     };
 }
 

@@ -1145,6 +1145,19 @@ test "query parser accepts graph pattern searches" {
     try std.testing.expectEqual(@as(usize, 2), owned.req.graph_queries[0].query.pattern.len);
     try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries[0].query.return_aliases.len);
     try std.testing.expect(owned.req.graph_queries[0].query.include_documents);
+    try std.testing.expect(owned.req.graph_queries[0].query.include_all_fields);
+}
+
+test "query parser treats explicit graph document fields as a projection" {
+    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"graph_searches":{"pattern_walk":{"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"pattern":[{"alias":"a"}],"include_documents":true,"fields":["title"]}},"limit":10}
+    );
+    defer owned.deinit(std.testing.allocator);
+
+    const graph_query = owned.req.graph_queries[0].query;
+    try std.testing.expect(!graph_query.include_all_fields);
+    try std.testing.expectEqual(@as(usize, 1), graph_query.fields.len);
+    try std.testing.expectEqualStrings("title", graph_query.fields[0]);
 }
 
 test "query parser rejects semantic search offsets" {
