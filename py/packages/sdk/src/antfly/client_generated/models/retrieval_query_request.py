@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from ..models.phrase_query import PhraseQuery
     from ..models.prefix_query import PrefixQuery
     from ..models.pruner import Pruner
+    from ..models.query_hierarchy import QueryHierarchy
     from ..models.query_request_aggregations import QueryRequestAggregations
     from ..models.query_request_embeddings import QueryRequestEmbeddings
     from ..models.query_request_foreign_sources import QueryRequestForeignSources
@@ -138,6 +139,10 @@ class RetrievalQueryRequest:
                 results.
                 Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration.
 
+                When `hierarchy.group_by` is present, aggregations operate on the complete
+                set of top-level grouped source documents. Nested `group_by.matches` are
+                bounded evidence projections and are not counted as aggregation rows.
+
                 Supports metric aggregations (sum, avg, min, max, count, stats, cardinality),
                 bucketing aggregations (terms, range, date_range, histogram, date_histogram),
                 geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms).
@@ -177,10 +182,27 @@ class RetrievalQueryRequest:
                 lower-level vector search overrides are provided internally.
                  Default: 0.5. Example: 0.5.
             fields (list[str] | Unset): List of fields to include in the results. If not specified, all fields are returned.
-                Use to reduce response size and improve performance.
+                Use to reduce response size and improve performance. This field is required when
+                hierarchy.group_by is present so a grouped query cannot accidentally hydrate an
+                entire source document. Use an empty array for identity-only source groups.
                  Example: ['title', 'url', 'summary', 'created_at'].
-            limit (int | Unset): Maximum number of results to return. For semantic_search, this is the topk parameter.
-                Default varies by query type (typically 10).
+            hierarchy (QueryHierarchy | Unset): Returns direct index matches with optional projected ancestor context, or
+                groups
+                those matches at a hierarchy level through `group_by`. A group's nested `matches`
+                projection is independently bounded and defaults to three hits while the top-level
+                `limit` continues to control the number of groups.
+
+                Ancestor and nested-match field projections are always explicit to keep response
+                size predictable. The presence of this object selects the canonical contract:
+                without `group_by`, including when the object is empty, direct index matches are
+                returned. `ancestors` only controls projected context and never changes result
+                cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+            limit (int | Unset): Maximum number of top-level results to return. For semantic_search, this is the topk
+                parameter.
+                This does not limit nested matches attached through hierarchy.group_by.matches;
+                use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
+                Queries using hierarchy.group_by.matches are limited to 100 top-level groups
+                and a groups-times-matches execution budget of 1,000.
                  Example: 20.
             offset (int | Unset): Number of results to skip for pagination. Supported for text-backed,
                 match_all, and filter-only requests. Not supported for semantic_search
@@ -427,6 +449,7 @@ class RetrievalQueryRequest:
     embeddings: QueryRequestEmbeddings | Unset = UNSET
     search_effort: float | Unset = 0.5
     fields: list[str] | Unset = UNSET
+    hierarchy: QueryHierarchy | Unset = UNSET
     limit: int | Unset = UNSET
     offset: int | Unset = UNSET
     timeout_ms: int | Unset = UNSET
@@ -674,6 +697,10 @@ class RetrievalQueryRequest:
         if not isinstance(self.fields, Unset):
             fields = self.fields
 
+        hierarchy: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.hierarchy, Unset):
+            hierarchy = self.hierarchy.to_dict()
+
         limit = self.limit
 
         offset = self.offset
@@ -770,6 +797,8 @@ class RetrievalQueryRequest:
             field_dict["search_effort"] = search_effort
         if fields is not UNSET:
             field_dict["fields"] = fields
+        if hierarchy is not UNSET:
+            field_dict["hierarchy"] = hierarchy
         if limit is not UNSET:
             field_dict["limit"] = limit
         if offset is not UNSET:
@@ -840,6 +869,7 @@ class RetrievalQueryRequest:
         from ..models.phrase_query import PhraseQuery
         from ..models.prefix_query import PrefixQuery
         from ..models.pruner import Pruner
+        from ..models.query_hierarchy import QueryHierarchy
         from ..models.query_request_aggregations import QueryRequestAggregations
         from ..models.query_request_embeddings import QueryRequestEmbeddings
         from ..models.query_request_foreign_sources import QueryRequestForeignSources
@@ -1613,6 +1643,13 @@ class RetrievalQueryRequest:
 
         fields = cast(list[str], d.pop("fields", UNSET))
 
+        _hierarchy = d.pop("hierarchy", UNSET)
+        hierarchy: QueryHierarchy | Unset
+        if isinstance(_hierarchy, Unset):
+            hierarchy = UNSET
+        else:
+            hierarchy = QueryHierarchy.from_dict(_hierarchy)
+
         limit = d.pop("limit", UNSET)
 
         offset = d.pop("offset", UNSET)
@@ -1719,6 +1756,7 @@ class RetrievalQueryRequest:
             embeddings=embeddings,
             search_effort=search_effort,
             fields=fields,
+            hierarchy=hierarchy,
             limit=limit,
             offset=offset,
             timeout_ms=timeout_ms,

@@ -38,6 +38,8 @@ pub const default_health_port: u16 = 4200;
 pub const default_query_max_concurrent_requests: u32 = 32;
 pub const default_write_max_concurrent_requests: u32 = 16;
 pub const default_inference_max_concurrent_requests: u32 = 32;
+pub const default_mcp_max_tool_result_bytes: u32 = 96 * 1024;
+pub const minimum_mcp_max_tool_result_bytes: u32 = 512;
 pub const local_inference_connection_id = "local-inference";
 
 pub const DeploymentMode = enum {
@@ -68,6 +70,7 @@ pub const Config = struct {
     tls: ?TlsConfig = null,
     cors: ?CorsConfig = null,
     admission: AdmissionConfig = .{},
+    mcp: McpConfig = .{},
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
     transaction_sessions: TransactionSessionConfig = .{},
@@ -86,6 +89,11 @@ pub const Config = struct {
         query: RequestAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
         write: RequestAdmissionConfig = .{ .max_concurrent_requests = default_write_max_concurrent_requests },
         inference: RequestAdmissionConfig = .{ .max_concurrent_requests = default_inference_max_concurrent_requests },
+    };
+
+    pub const McpConfig = struct {
+        /// Zero disables the serialized MCP tool-result compatibility guard.
+        max_tool_result_bytes: u32 = default_mcp_max_tool_result_bytes,
     };
 
     pub const MetadataConfig = struct {
@@ -643,6 +651,20 @@ pub const Config = struct {
         {
             return error.InvalidConfig;
         }
+        var mcp_max_tool_result_bytes = default_mcp_max_tool_result_bytes;
+        if (root.get("mcp")) |mcp_value| {
+            try validateObjectMemberFields(root, "mcp", &.{"max_tool_result_bytes"});
+            const mcp_object = switch (mcp_value) {
+                .object => |object| object,
+                else => return error.InvalidConfig,
+            };
+            mcp_max_tool_result_bytes = try optionalU32Field(mcp_object, "max_tool_result_bytes") orelse default_mcp_max_tool_result_bytes;
+            if (mcp_max_tool_result_bytes != 0 and
+                mcp_max_tool_result_bytes < minimum_mcp_max_tool_result_bytes)
+            {
+                return error.InvalidConfig;
+            }
+        }
 
         var validated = std.json.parseFromValue(common_openapi.Config, alloc, parsed_tree.value, .{
             .allocate = .alloc_always,
@@ -731,6 +753,7 @@ pub const Config = struct {
                     legacy_inference_max_concurrent_requests orelse
                     default_inference_max_concurrent_requests },
             },
+            .mcp = .{ .max_tool_result_bytes = mcp_max_tool_result_bytes },
             .metadata = try parseMetadataConfig(
                 alloc,
                 root,
@@ -3120,6 +3143,7 @@ test "common config parses minimal config with admission defaults" {
     try std.testing.expectEqual(default_query_max_concurrent_requests, cfg.admission.query.max_concurrent_requests);
     try std.testing.expectEqual(default_write_max_concurrent_requests, cfg.admission.write.max_concurrent_requests);
     try std.testing.expectEqual(default_inference_max_concurrent_requests, cfg.admission.inference.max_concurrent_requests);
+    try std.testing.expectEqual(default_mcp_max_tool_result_bytes, cfg.mcp.max_tool_result_bytes);
     try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
     try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
@@ -3133,6 +3157,34 @@ test "common config parses minimal config with admission defaults" {
     try std.testing.expectEqual(@as(usize, 512), cfg.inference.prompt_cache.max_bytes_mb);
     try std.testing.expectEqual(@as(usize, 64), cfg.inference.prompt_cache.min_tokens);
     try std.testing.expectEqual(@as(u64, 300_000), cfg.inference.prompt_cache.ttl_ms);
+}
+
+test "common config parses MCP tool result compatibility budget" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"mcp":{"max_tool_result_bytes":131072}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 128 * 1024), cfg.mcp.max_tool_result_bytes);
+
+    var disabled = try Config.parseFromSlice(std.testing.allocator,
+        \\{"mcp":{"max_tool_result_bytes":0}}
+    );
+    defer disabled.deinit();
+    try std.testing.expectEqual(@as(u32, 0), disabled.mcp.max_tool_result_bytes);
+
+    var minimum = try Config.parseFromSlice(std.testing.allocator,
+        \\{"mcp":{"max_tool_result_bytes":512}}
+    );
+    defer minimum.deinit();
+    try std.testing.expectEqual(minimum_mcp_max_tool_result_bytes, minimum.mcp.max_tool_result_bytes);
+
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{"mcp":{"max_tool_result_bytes":511}}
+    ));
+
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{"mcp":{"unknown":1}}
+    ));
 }
 
 test "common config parses opt-in radix prompt cache mode" {

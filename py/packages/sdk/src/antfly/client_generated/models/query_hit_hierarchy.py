@@ -4,15 +4,15 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 
 from ..models.query_hit_hierarchy_level import QueryHitHierarchyLevel
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.hierarchy_artifact import HierarchyArtifact
+    from ..models.hierarchy_evidence import HierarchyEvidence
+    from ..models.hierarchy_match_hit import HierarchyMatchHit
     from ..models.query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
-    from ..models.query_hit_hierarchy_artifact import QueryHitHierarchyArtifact
-    from ..models.query_hit_hierarchy_chunks_item import QueryHitHierarchyChunksItem
 
 
 T = TypeVar("T", bound="QueryHitHierarchy")
@@ -20,31 +20,27 @@ T = TypeVar("T", bound="QueryHitHierarchy")
 
 @_attrs_define
 class QueryHitHierarchy:
-    """Stable ancestry envelope for derived document hierarchy hits. Present when
-    the hit is a derived unit/chunk/embedding artifact or when a source-level
-    rollup includes child chunks. Standard fields include `level`,
-    `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
-    `ancestors` with response-local or requested DB-backed source/unit context when available.
-
-        Attributes:
-            level (QueryHitHierarchyLevel | Unset): Hierarchy level represented by this hit.
-            parent_doc_key (str | Unset): Source document key that owns this derived hit.
-            parent_unit_id (str | Unset): Unit identifier when the hit is attached to a document unit.
-            artifact (QueryHitHierarchyArtifact | Unset): Artifact identity with `name`, `kind`, and optional `unit_id` or
-                `chunk_id`.
-            ancestors (QueryHitHierarchyAncestors | Unset): Ancestor context. Includes `source.id` for derived hits,
-                `source.document` for materialized source rollups or requested source hydration, and `unit.document` for direct
-                unit hits or requested unit hydration when the unit payload is present.
-            chunks (list[QueryHitHierarchyChunksItem] | Unset): Child chunk hits included for source-level rollups.
+    """
+    Attributes:
+        level (QueryHitHierarchyLevel | Unset):
+        parent_doc_key (str | Unset): Source document key that owns this derived hit.
+        parent_unit_id (str | Unset): Unit identifier when the hit is attached to a document unit.
+        artifact (HierarchyArtifact | Unset):
+        ancestors (QueryHitHierarchyAncestors | Unset):
+        evidence (HierarchyEvidence | Unset):
+        matches (list[HierarchyMatchHit] | Unset): Matching descendant hits attached by the canonical hierarchy.group_by
+            request.
+        chunks (list[HierarchyMatchHit] | Unset): Legacy child chunk hits included for source-level rollups.
     """
 
     level: QueryHitHierarchyLevel | Unset = UNSET
     parent_doc_key: str | Unset = UNSET
     parent_unit_id: str | Unset = UNSET
-    artifact: QueryHitHierarchyArtifact | Unset = UNSET
+    artifact: HierarchyArtifact | Unset = UNSET
     ancestors: QueryHitHierarchyAncestors | Unset = UNSET
-    chunks: list[QueryHitHierarchyChunksItem] | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+    evidence: HierarchyEvidence | Unset = UNSET
+    matches: list[HierarchyMatchHit] | Unset = UNSET
+    chunks: list[HierarchyMatchHit] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         level: str | Unset = UNSET
@@ -63,6 +59,17 @@ class QueryHitHierarchy:
         if not isinstance(self.ancestors, Unset):
             ancestors = self.ancestors.to_dict()
 
+        evidence: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.evidence, Unset):
+            evidence = self.evidence.to_dict()
+
+        matches: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.matches, Unset):
+            matches = []
+            for matches_item_data in self.matches:
+                matches_item = matches_item_data.to_dict()
+                matches.append(matches_item)
+
         chunks: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.chunks, Unset):
             chunks = []
@@ -71,7 +78,7 @@ class QueryHitHierarchy:
                 chunks.append(chunks_item)
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update({})
         if level is not UNSET:
             field_dict["level"] = level
@@ -83,6 +90,10 @@ class QueryHitHierarchy:
             field_dict["artifact"] = artifact
         if ancestors is not UNSET:
             field_dict["ancestors"] = ancestors
+        if evidence is not UNSET:
+            field_dict["evidence"] = evidence
+        if matches is not UNSET:
+            field_dict["matches"] = matches
         if chunks is not UNSET:
             field_dict["chunks"] = chunks
 
@@ -90,9 +101,10 @@ class QueryHitHierarchy:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.hierarchy_artifact import HierarchyArtifact
+        from ..models.hierarchy_evidence import HierarchyEvidence
+        from ..models.hierarchy_match_hit import HierarchyMatchHit
         from ..models.query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
-        from ..models.query_hit_hierarchy_artifact import QueryHitHierarchyArtifact
-        from ..models.query_hit_hierarchy_chunks_item import QueryHitHierarchyChunksItem
 
         d = dict(src_dict)
         _level = d.pop("level", UNSET)
@@ -107,11 +119,11 @@ class QueryHitHierarchy:
         parent_unit_id = d.pop("parent_unit_id", UNSET)
 
         _artifact = d.pop("artifact", UNSET)
-        artifact: QueryHitHierarchyArtifact | Unset
+        artifact: HierarchyArtifact | Unset
         if isinstance(_artifact, Unset):
             artifact = UNSET
         else:
-            artifact = QueryHitHierarchyArtifact.from_dict(_artifact)
+            artifact = HierarchyArtifact.from_dict(_artifact)
 
         _ancestors = d.pop("ancestors", UNSET)
         ancestors: QueryHitHierarchyAncestors | Unset
@@ -120,12 +132,28 @@ class QueryHitHierarchy:
         else:
             ancestors = QueryHitHierarchyAncestors.from_dict(_ancestors)
 
+        _evidence = d.pop("evidence", UNSET)
+        evidence: HierarchyEvidence | Unset
+        if isinstance(_evidence, Unset):
+            evidence = UNSET
+        else:
+            evidence = HierarchyEvidence.from_dict(_evidence)
+
+        _matches = d.pop("matches", UNSET)
+        matches: list[HierarchyMatchHit] | Unset = UNSET
+        if _matches is not UNSET:
+            matches = []
+            for matches_item_data in _matches:
+                matches_item = HierarchyMatchHit.from_dict(matches_item_data)
+
+                matches.append(matches_item)
+
         _chunks = d.pop("chunks", UNSET)
-        chunks: list[QueryHitHierarchyChunksItem] | Unset = UNSET
+        chunks: list[HierarchyMatchHit] | Unset = UNSET
         if _chunks is not UNSET:
             chunks = []
             for chunks_item_data in _chunks:
-                chunks_item = QueryHitHierarchyChunksItem.from_dict(chunks_item_data)
+                chunks_item = HierarchyMatchHit.from_dict(chunks_item_data)
 
                 chunks.append(chunks_item)
 
@@ -135,24 +163,9 @@ class QueryHitHierarchy:
             parent_unit_id=parent_unit_id,
             artifact=artifact,
             ancestors=ancestors,
+            evidence=evidence,
+            matches=matches,
             chunks=chunks,
         )
 
-        query_hit_hierarchy.additional_properties = d
         return query_hit_hierarchy
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

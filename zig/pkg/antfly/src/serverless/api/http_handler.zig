@@ -1723,6 +1723,7 @@ pub const HttpHandler = struct {
             out_hits[idx] = .{
                 .id = try alloc.dupe(u8, hit.doc_id),
                 .score = @as(f32, @floatFromInt(hit.score)) / 1000.0,
+                .distance = hit.distance,
                 .stored_data = try normalizeServerlessAggregationStoredDataAlloc(alloc, body),
             };
             initialized_hits += 1;
@@ -5989,6 +5990,7 @@ fn allocDbSearchHitsAlloc(
         out_hits[idx] = .{
             .id = try alloc.dupe(u8, hit.doc_id),
             .score = @as(f32, @floatFromInt(hit.score)) / 1000.0,
+            .distance = hit.distance,
             .stored_data = try alloc.dupe(u8, hit.body),
         };
         initialized_hits += 1;
@@ -6026,6 +6028,7 @@ fn allocQueryHitsAlloc(
             else
                 try alloc.dupe(u8, hit.body),
             .score = hit.score,
+            .distance = hit.distance,
         };
         initialized_hits += 1;
     }

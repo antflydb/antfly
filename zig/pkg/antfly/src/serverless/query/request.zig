@@ -162,6 +162,7 @@ pub const SearchHit = struct {
     doc_id: []u8,
     body: []u8,
     score: u32,
+    distance: ?f32 = null,
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.doc_id);

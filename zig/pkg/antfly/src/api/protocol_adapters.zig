@@ -23,6 +23,7 @@ const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
 
 const max_mcp_sample_documents_limit: i64 = 100;
+const mcp_tool_result_too_large_text = "Antfly produced more data than this MCP client can safely consume. Reduce limit and fields, avoid _chunks.*, or return direct matches with an explicit queryRequest.hierarchy object and bounded ancestor projections.";
 
 const McpToolKind = enum {
     create_table,
@@ -50,6 +51,7 @@ const McpToolSpec = struct {
     permission: McpToolPermission,
     table_argument: ?[]const u8 = null,
     wildcard_table: bool = false,
+    input_schema_json: ?[]const u8 = null,
     fields: []const McpToolFieldSpec = &.{},
 };
 
@@ -78,16 +80,42 @@ const McpToolFieldSpec = struct {
     schema_json: ?[]const u8 = null,
 };
 
-const full_text_search_schema_json =
-    \\{"oneOf":[{"type":"string"},{"type":"object","additionalProperties":true}],"description":"Full-text query string shorthand, or the generic full_text_search query object accepted by the REST API"}
-;
-
-const query_request_schema_json =
-    \\{"type":"object","additionalProperties":true,"description":"Raw Antfly QueryRequest body for POST /tables/{tableName}/query. Use this to access the full OpenAPI query contract. Mutually exclusive with query shorthand arguments.","properties":{"query":{"type":"object","additionalProperties":true},"full_text_search":{"type":"object","additionalProperties":true},"filter_query":{"type":"object","additionalProperties":true},"exclusion_query":{"type":"object","additionalProperties":true},"semantic_search":{"type":"string"},"embedding_template":{"type":"string"},"indexes":{"type":"array","items":{"type":"string"}},"embeddings":{"type":"object","additionalProperties":true},"fields":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"},"offset":{"type":"integer"},"timeout_ms":{"type":"integer","minimum":0},"order_by":{"type":"array"},"search_after":{"type":"array","items":{}},"search_before":{"type":"array","items":{}},"filter_prefix":{"type":"string"},"distance_under":{"type":"number"},"distance_over":{"type":"number"},"search_effort":{"type":"number"},"merge_config":{"type":"object","additionalProperties":true},"count":{"type":"boolean"},"profile":{"type":"boolean"},"reranker":{"type":"object","additionalProperties":true},"aggregations":{"type":"object","additionalProperties":true},"graph_searches":{"type":"object","additionalProperties":true},"expand_strategy":{"type":"string"},"document_renderer":{"type":"string"},"pruner":{"type":"object","additionalProperties":true},"join":{"type":"object","additionalProperties":true},"foreign_sources":{"type":"object","additionalProperties":true}}}
-;
+const query_input_schema_json = @embedFile("generated/mcp_query_input_schema.json");
+const backup_input_schema_json = @embedFile("generated/mcp_backup_input_schema.json");
+const restore_input_schema_json = @embedFile("generated/mcp_restore_input_schema.json");
+const batch_input_schema_json = @embedFile("generated/mcp_batch_input_schema.json");
 
 const query_request_description_json =
-    \\{"openapi_schema":"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest","query_ast_schema":"specs/openapi/antfly/query.yaml#/components/schemas/Query","mcp_usage":{"tool":"query","path_table_argument":"tableName","raw_body_argument":"queryRequest","rules":["queryRequest is forwarded unchanged as the POST /tables/{tableName}/query body.","queryRequest is mutually exclusive with shorthand query arguments such as fullTextSearch, semanticSearch, fields, limit, orderBy, indexes, and filterPrefix.","queryRequest.table is rejected because tableName selects the table-scoped route.","Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema.","Structured filter_query.geo_bbox accepts field, min_lat, min_lon, max_lat, and max_lon; min_lon greater than max_lon represents an antimeridian-wrapped box."]},"top_level_fields":["query","full_text_search","semantic_search","embedding_template","indexes","filter_prefix","filter_query","exclusion_query","aggregations","embeddings","search_effort","fields","limit","offset","timeout_ms","order_by","search_after","search_before","distance_under","distance_over","merge_config","count","profile","reranker","analyses","graph_searches","expand_strategy","document_renderer","pruner","join","foreign_sources"],"examples":{"fielded_full_text":{"full_text_search":{"match":"hello","field":"body"},"fields":["title","body"],"limit":5,"timeout_ms":5000},"hybrid":{"full_text_search":{"match":"raft","field":"body"},"semantic_search":"raft snapshot architecture","indexes":["body_embedding"],"merge_config":{"strategy":"rrf"},"fields":["title","body"],"limit":20,"profile":true},"filtered":{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"filter":[{"term":{"path":"/tenant","value":"acme"}}]}},"fields":["title","url"],"limit":10},"geo_bbox_filter":{"filter_query":{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}},"limit":10}}}
+    \\{
+    \\  "openapi_schema": "specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest",
+    \\  "query_ast_schema": "specs/openapi/antfly/query.yaml#/components/schemas/Query",
+    \\  "mcp_usage": {
+    \\    "tool": "query",
+    \\    "path_table_argument": "tableName",
+    \\    "raw_body_argument": "queryRequest",
+    \\    "rules": [
+    \\      "queryRequest is forwarded unchanged as the POST /tables/{tableName}/query body.",
+    \\      "queryRequest is mutually exclusive with shorthand query arguments such as fullTextSearch, semanticSearch, fields, limit, orderBy, indexes, and filterPrefix.",
+    \\      "queryRequest.table is rejected because tableName selects the table-scoped route.",
+    \\      "Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema.",
+    \\      "For hierarchical documents, the presence of hierarchy selects direct matches unless group_by is present; ancestors only controls projected context.",
+    \\      "Use hierarchy.group_by.level=source with bounded group_by.matches for grouped source results; nested matches default to three, cannot exceed 100, and top-level limit does not bound them.",
+    \\      "Aggregations on hierarchy.group_by queries operate on the complete top-level source-group set; nested matches are evidence and are not aggregation rows.",
+    \\      "For source groups, project source fields with top-level fields; hierarchy.ancestors.source is rejected because it would duplicate the grouping-level document.",
+    \\      "Never request _chunks.* through MCP because it can expand every child stored on a matched source.",
+    \\      "Structured filter_query.geo_bbox accepts field, min_lat, min_lon, max_lat, and max_lon; min_lon greater than max_lon represents an antimeridian-wrapped box."
+    \\    ]
+    \\  },
+    \\  "top_level_fields": ["query", "full_text_search", "semantic_search", "embedding_template", "indexes", "filter_prefix", "filter_query", "exclusion_query", "aggregations", "embeddings", "search_effort", "fields", "hierarchy", "limit", "offset", "timeout_ms", "order_by", "search_after", "search_before", "distance_under", "distance_over", "merge_config", "count", "profile", "reranker", "analyses", "graph_searches", "expand_strategy", "document_renderer", "pruner", "join", "foreign_sources"],
+    \\  "examples": {
+    \\    "fielded_full_text": {"full_text_search":{"match":"hello","field":"body"},"fields":["title","body"],"limit":5,"timeout_ms":5000},
+    \\    "match_retrieval": {"semantic_search":"How does Antfly index documents?","indexes":["document_vectors"],"hierarchy":{"ancestors":{"source":{"fields":["title","url"]}}},"fields":["text"],"limit":5},
+    \\    "source_with_matches": {"semantic_search":"Antfly indexing","indexes":["document_vectors"],"hierarchy":{"group_by":{"level":"source","matches":{"limit":3,"fields":["text"]}}},"fields":["title","url"],"limit":5},
+    \\    "hybrid": {"full_text_search":{"match":"raft","field":"body"},"semantic_search":"raft snapshot architecture","indexes":["body_embedding"],"merge_config":{"strategy":"rrf"},"fields":["title","body"],"limit":20,"profile":true},
+    \\    "filtered": {"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"filter":[{"term":{"path":"/tenant","value":"acme"}}]}},"fields":["title","url"],"limit":10},
+    \\    "geo_bbox_filter": {"filter_query":{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}},"limit":10}
+    \\  }
+    \\}
 ;
 
 const mcp_capabilities_description_json =
@@ -185,12 +213,12 @@ const mcp_tool_specs = [_]McpToolSpec{
     .{
         .kind = .sample_documents,
         .name = "sample_documents",
-        .description = "Return a bounded NDJSON sample from a table using the table lookup/scan route",
+        .description = "Return a bounded JSON document sample from a table using the table lookup/scan route",
         .permission = .read,
         .table_argument = "tableName",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "limit", .schema_type = .integer, .default_json = "5" },
+            .{ .name = "limit", .schema_type = .integer, .schema_json = "{\"type\":\"integer\",\"minimum\":1,\"maximum\":100,\"default\":5}" },
             .{ .name = "from", .schema_type = .string },
             .{ .name = "to", .schema_type = .string },
             .{ .name = "inclusiveFrom", .schema_type = .boolean, .description = "Set to true to include the from key." },
@@ -200,22 +228,10 @@ const mcp_tool_specs = [_]McpToolSpec{
     .{
         .kind = .query,
         .name = "query",
-        .description = "Run an Antfly table query",
+        .description = "Run an Antfly table query. For hierarchical documents, retrieve focused direct matches with explicit fields and projected ancestors; never expand _chunks.* through MCP.",
         .permission = .read,
         .table_argument = "tableName",
-        .fields = &.{
-            .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "queryRequest", .schema_type = .object, .schema_json = query_request_schema_json },
-            .{ .name = "fullTextSearch", .schema_type = .object, .schema_json = full_text_search_schema_json },
-            .{ .name = "full_text_search", .schema_type = .object, .description = "Generic REST-shaped full_text_search query object" },
-            .{ .name = "fullTextSearchField", .schema_type = .string, .description = "Field to search when fullTextSearch is a string shorthand, for example content" },
-            .{ .name = "semanticSearch", .schema_type = .string },
-            .{ .name = "fields", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
-            .{ .name = "limit", .schema_type = .integer, .default_json = "10" },
-            .{ .name = "orderBy", .schema_type = .array },
-            .{ .name = "indexes", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
-            .{ .name = "filterPrefix", .schema_type = .string },
-        },
+        .input_schema_json = query_input_schema_json,
     },
     .{
         .kind = .describe_query_request,
@@ -235,11 +251,7 @@ const mcp_tool_specs = [_]McpToolSpec{
         .description = "Backup an Antfly table",
         .permission = .admin,
         .table_argument = "tableName",
-        .fields = &.{
-            .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "backupId", .schema_type = .string, .required = true },
-            .{ .name = "location", .schema_type = .string, .required = true },
-        },
+        .input_schema_json = backup_input_schema_json,
     },
     .{
         .kind = .restore,
@@ -247,23 +259,15 @@ const mcp_tool_specs = [_]McpToolSpec{
         .description = "Restore an Antfly table",
         .permission = .admin,
         .table_argument = "tableName",
-        .fields = &.{
-            .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "backupId", .schema_type = .string, .required = true },
-            .{ .name = "location", .schema_type = .string, .required = true },
-        },
+        .input_schema_json = restore_input_schema_json,
     },
     .{
         .kind = .batch,
         .name = "batch",
-        .description = "Insert and delete documents in an Antfly table",
+        .description = "Insert, delete, or atomically transform documents in an Antfly table",
         .permission = .write,
         .table_argument = "tableName",
-        .fields = &.{
-            .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "writes", .schema_type = .object },
-            .{ .name = "deletes", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
-        },
+        .input_schema_json = batch_input_schema_json,
     },
 };
 
@@ -410,12 +414,12 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
 
         fn listIndexes(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
-            var result = try ctx.executeOperation(alloc, .{ .list_indexes = .{ .table_name = table_name } });
+            const result = try ctx.executeOperation(alloc, .{ .list_indexes = .{ .table_name = table_name } });
             if (result.structured) |structured| {
                 if (structured == .array) {
                     var wrapped = std.json.ObjectMap.empty;
                     try wrapped.put(alloc, "indexes", structured);
-                    result.structured = .{ .object = wrapped };
+                    return try mcp.jsonToolResultAlloc(alloc, .{ .object = wrapped });
                 }
             }
             return result;
@@ -473,7 +477,9 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             if (jsonValueArg(args, "queryRequest")) |query_request| {
                 if (query_request != .object) return mcpError(alloc, "queryRequest must be an object");
                 if (hasNonRawQueryArg(args)) return mcpError(alloc, "queryRequest cannot be combined with shorthand query arguments");
-                if (query_request.object.get("table") != null) return mcpError(alloc, "queryRequest.table is not allowed; use tableName");
+                if (query_request.object.get("table")) |table| {
+                    if (table != .null) return mcpError(alloc, "queryRequest.table is not allowed; use tableName");
+                }
 
                 return try ctx.executeOperation(alloc, .{ .query = .{
                     .table_name = table_name,
@@ -497,27 +503,26 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
 
         fn describeQueryRequest(_: *@This(), alloc: std.mem.Allocator) !mcp.CallToolResult {
             const structured = try std.json.parseFromSliceLeaky(std.json.Value, alloc, query_request_description_json, .{});
-            return .{
-                .text = try alloc.dupe(u8, "Antfly QueryRequest schema summary for query.queryRequest"),
-                .structured = structured,
-            };
+            return try mcp.jsonToolResultAlloc(alloc, structured);
         }
 
         fn describeMcpCapabilities(_: *@This(), alloc: std.mem.Allocator) !mcp.CallToolResult {
             const structured = try std.json.parseFromSliceLeaky(std.json.Value, alloc, mcp_capabilities_description_json, .{});
-            return .{
-                .text = try alloc.dupe(u8, "Antfly MCP capabilities"),
-                .structured = structured,
-            };
+            return try mcp.jsonToolResultAlloc(alloc, structured);
         }
 
         fn backupRestore(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, operation: []const u8) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             const backup_id = jsonStringArg(args, "backupId") orelse return mcpError(alloc, "missing backupId");
             const location = jsonStringArg(args, "location") orelse return mcpError(alloc, "missing location");
+            const connection = jsonStringArg(args, "connection") orelse return mcpError(alloc, "missing connection");
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "backup_id", .{ .string = backup_id });
             try body.put(alloc, "location", .{ .string = location });
+            try body.put(alloc, "connection", .{ .string = connection });
+            if (std.mem.eql(u8, operation, "backup")) {
+                if (jsonStringArg(args, "format")) |format| try body.put(alloc, "format", .{ .string = format });
+            }
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
             return if (std.mem.eql(u8, operation, "backup"))
                 try ctx.executeOperation(alloc, .{ .backup = .{ .table_name = table_name, .body = body_json } })
@@ -528,8 +533,13 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         fn batch(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             var body = std.json.ObjectMap.empty;
-            if (jsonValueArg(args, "writes")) |writes| try body.put(alloc, "inserts", writes);
+            const inserts = jsonValueArg(args, "inserts");
+            const writes = jsonValueArg(args, "writes");
+            if (inserts != null and writes != null) return mcpError(alloc, "inserts and writes cannot be combined");
+            if (inserts orelse writes) |value| try body.put(alloc, "inserts", value);
             if (jsonValueArg(args, "deletes")) |deletes| try body.put(alloc, "deletes", deletes);
+            if (jsonValueArg(args, "transforms")) |transforms| try body.put(alloc, "transforms", transforms);
+            if (jsonStringArg(args, "syncLevel")) |sync_level| try body.put(alloc, "sync_level", .{ .string = sync_level });
             return try ctx.executeOperation(alloc, .{ .batch = .{
                 .table_name = table_name,
                 .body = try stringifyJsonValue(alloc, .{ .object = body }),
@@ -635,6 +645,8 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
     var protocol_server = mcp.Server{
         .implementation = .{ .name = "antfly", .version = "1.0.0" },
         .session_store = server_ptr.mcp_sessions.iface(),
+        .max_tool_result_bytes = server_ptr.cfg.mcp_max_tool_result_bytes,
+        .tool_result_too_large_text = mcp_tool_result_too_large_text,
     };
     defer protocol_server.deinit(server_ptr.alloc);
     if (extension_name_filter == null) {
@@ -1267,6 +1279,10 @@ fn cloneValidMcpInputSchemaJson(alloc: std.mem.Allocator, schema_json: []const u
 }
 
 fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {
+    if (spec.input_schema_json) |schema_json| {
+        return (try cloneValidMcpInputSchemaJson(alloc, schema_json)) orelse error.InvalidMcpInputSchema;
+    }
+
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
@@ -1610,7 +1626,11 @@ fn jsonBoolArg(value: std.json.Value, key: []const u8) ?bool {
 
 fn jsonValueArg(value: std.json.Value, key: []const u8) ?std.json.Value {
     if (value != .object) return null;
-    return value.object.get(key);
+    const raw = value.object.get(key) orelse return null;
+    // MCP clients and generated SDKs commonly serialize unset optionals as
+    // JSON null. Treat that exactly like omission across every tool instead
+    // of making each handler grow its own compatibility exception.
+    return if (raw == .null) null else raw;
 }
 
 fn hasNonRawQueryArg(args: std.json.Value) bool {
@@ -1619,6 +1639,10 @@ fn hasNonRawQueryArg(args: std.json.Value) bool {
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         if (std.mem.eql(u8, key, "tableName") or std.mem.eql(u8, key, "queryRequest")) continue;
+        // Generated SDKs commonly serialize unset optional properties as null.
+        // Raw mode treats those values as absent while still rejecting an
+        // actual shorthand value that could make request precedence ambiguous.
+        if (entry.value_ptr.* == .null) continue;
         return true;
     }
     return false;

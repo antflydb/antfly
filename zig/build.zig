@@ -1564,11 +1564,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    mcp_mod.addImport("antfly-json", json_mod);
     const a2a_mod = b.addModule("antfly_a2a", .{
         .root_source_file = b.path("lib/a2a/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    a2a_mod.addImport("antfly-json", json_mod);
     const matcher_mod = b.addModule("antfly_matcher", .{
         .root_source_file = b.path("lib/matcher/src/mod.zig"),
         .target = target,
@@ -2375,6 +2377,7 @@ pub fn build(b: *std.Build) void {
         .pic = true,
     });
     capi_mod.addImport("antfly_storage_root", capi_root_mod);
+    capi_mod.addImport("antfly_vector", vector_mod);
     capi_mod.addImport("structlog", structlog_mod);
 
     // The public C ABI and executable reuse the distributed PIC storage
@@ -4313,6 +4316,9 @@ pub fn build(b: *std.Build) void {
     lib_db_enrichment_merge_cutover_reopen_step.dependOn(&run_lib_db_enrichment_merge_cutover_reopen_tests.step);
 
     const lib_db_query_default_filters = [_][]const u8{
+        "grouped candidate budget parses disabled and fallback values",
+        "adaptive candidate window covers requested offset page and grows bounded",
+        "grouped result page satisfaction treats nested match count as a maximum",
         "storage.db.db.test.db full-text",
         "storage.db.db.test.db dense ",
         "storage.db.db.test.db sparse ",
@@ -4435,6 +4441,7 @@ pub fn build(b: *std.Build) void {
             "fuseNamedSets drops conflicting source hit ordinals",
             "applyGraphUnion deduplicates by ordinals when hit pages are complete",
             "applyGraphIntersection uses ordinals when hit pages are complete",
+            "reshapeChunkBackedResult uses the best descendant relevance score and distance",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4763,6 +4770,15 @@ pub fn build(b: *std.Build) void {
         "api http server retries interrupted metadata restore publication",
         "public API request body limit matches Go linear merge contract",
         "api query contract parses direct JSON-pointer path aliases",
+        "api query contract serializes derived hierarchy ancestry",
+        "api query contract serializes mention evidence hierarchy",
+        "api query contract validates canonical hierarchy controls",
+        "query max score preserves negative relevance scores",
+        "query hit exposes relevance score and raw vector distance separately",
+        "query merge orders pure dense results by descending relevance score",
+        "query parser accepts graph pattern searches",
+        "query parser treats explicit graph document fields as a projection",
+        "api http server serves fielded full-text search through mcp tools",
         "api query contract canonicalizes public Query filter roots and compositions",
         "api query contract accepts multi_match bool_prefix full text",
         "api query contract bounds public fuzzy integers without narrowing traps",
@@ -5135,6 +5151,7 @@ pub fn build(b: *std.Build) void {
             "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
             "distributed graph rejects doc identity rebuild before cross-range fanout",
             "distributed graph rejects unstamped result refs before cross-range fanout",
+            "api distributed graph preserves per-shard snapshots across result refs expansion and hydration",
             "distributed graph edge reader carries identity generation",
             "query merge preserves common identity read generation",
             "query merge applies distributed typed sort ordering and cursor paging",
@@ -5479,6 +5496,11 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
             "aggregation completeness requires exact total relation",
+            "distributed grouped hierarchy expands only the globally merged page",
+            "hosted distributed grouped hierarchy expands the globally selected shard page",
+            "parseRemoteSearchResult preserves grouped hierarchy matches",
+            "remote query returns the shard-selected identity generation",
+            "remote simple vector query uses vector worker route",
             "api http client forwards internal query controls and maps remote timeout",
             "api http client preserves remote storage read contention",
             "api http client preserves storage read contention across group read endpoints",
@@ -5568,6 +5590,19 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_api_docid_tests = addFilteredTestRunArtifact(b, lib_api_docid_tests);
+    const lib_api_graph_snapshot_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "api distributed graph preserves per-shard snapshots across result refs expansion and hydration",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_graph_snapshot_tests = addFilteredTestRunArtifact(b, lib_api_graph_snapshot_tests);
+    const lib_api_graph_snapshot_test_step = b.step("lib-api-graph-snapshot-test", "Run distributed graph snapshot-vector regression tests");
+    lib_api_graph_snapshot_test_step.dependOn(&run_lib_api_graph_snapshot_tests.step);
     const api_derived_coverage_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_derived_coverage_test_root.zig"),
         .target = target,

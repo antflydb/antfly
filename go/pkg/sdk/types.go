@@ -92,16 +92,27 @@ type (
 	SortField = oapi.SortField
 
 	// Query response types
-	QueryResponses         = oapi.QueryResponses
-	QueryResult            = oapi.QueryResult
-	Hits                   = oapi.QueryHits
-	QueryHitsTotal         = oapi.QueryHitsTotal
-	QueryHitsTotalRelation = oapi.QueryHitsTotalRelation
-	Hit                    = oapi.QueryHit
-	AggregationRequest     = oapi.AggregationRequest
-	AggregationOption      = oapi.AggregationBucket
-	AggregationResult      = oapi.AggregationResult
-	AggregationType        = oapi.AggregationType
+	QueryResponses              = oapi.QueryResponses
+	QueryResult                 = oapi.QueryResult
+	Hits                        = oapi.QueryHits
+	QueryHitsTotal              = oapi.QueryHitsTotal
+	QueryHitsTotalRelation      = oapi.QueryHitsTotalRelation
+	Hit                         = oapi.QueryHit
+	HierarchyAncestor           = oapi.HierarchyAncestor
+	HierarchyArtifact           = oapi.HierarchyArtifact
+	HierarchyArtifactKind       = oapi.HierarchyArtifactKind
+	HierarchyArtifactSource     = oapi.HierarchyArtifactSource
+	HierarchyArtifactSourceKind = oapi.HierarchyArtifactSourceKind
+	HierarchyEvidence           = oapi.HierarchyEvidence
+	HierarchyMatchContext       = oapi.HierarchyMatchContext
+	HierarchyMatchHit           = oapi.HierarchyMatchHit
+	QueryHitHierarchy           = oapi.QueryHitHierarchy
+	QueryHitHierarchyAncestors  = oapi.QueryHitHierarchyAncestors
+	QueryHitHierarchyLevel      = oapi.QueryHitHierarchyLevel
+	AggregationRequest          = oapi.AggregationRequest
+	AggregationOption           = oapi.AggregationBucket
+	AggregationResult           = oapi.AggregationResult
+	AggregationType             = oapi.AggregationType
 
 	// Embedding types
 	Embedding             = oapi.Embedding
@@ -271,6 +282,20 @@ type (
 const (
 	QueryHitsTotalRelationExact = oapi.QueryHitsTotalRelationExact
 	QueryHitsTotalRelationGte   = oapi.QueryHitsTotalRelationGte
+
+	HierarchyArtifactKindAsset           = oapi.HierarchyArtifactKindAsset
+	HierarchyArtifactKindChunk           = oapi.HierarchyArtifactKindChunk
+	HierarchyArtifactKindEmbedding       = oapi.HierarchyArtifactKindEmbedding
+	HierarchyArtifactSourceKindAsset     = oapi.HierarchyArtifactSourceKindAsset
+	HierarchyArtifactSourceKindChunk     = oapi.HierarchyArtifactSourceKindChunk
+	HierarchyArtifactSourceKindEmbedding = oapi.HierarchyArtifactSourceKindEmbedding
+
+	QueryHitHierarchyLevelArtifact  = oapi.QueryHitHierarchyLevelArtifact
+	QueryHitHierarchyLevelChunk     = oapi.QueryHitHierarchyLevelChunk
+	QueryHitHierarchyLevelEmbedding = oapi.QueryHitHierarchyLevelEmbedding
+	QueryHitHierarchyLevelMention   = oapi.QueryHitHierarchyLevelMention
+	QueryHitHierarchyLevelSource    = oapi.QueryHitHierarchyLevelSource
+	QueryHitHierarchyLevelUnit      = oapi.QueryHitHierarchyLevelUnit
 )
 
 // QueryHitsTotalValue returns the numeric value from total hit-count metadata.

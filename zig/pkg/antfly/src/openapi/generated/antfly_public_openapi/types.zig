@@ -1474,6 +1474,85 @@ pub const ForeignSource = struct {
     columns: ?[]const ForeignColumn = null,
 };
 
+pub const HierarchyAncestor = struct {
+    id: ?[]const u8 = null,
+    document: ?std.json.Value = null,
+    key: ?[]const u8 = null,
+    artifact_name: ?[]const u8 = null,
+    source_field: ?[]const u8 = null,
+    provenance: ?std.json.Value = null,
+};
+
+pub const HierarchyAncestors = struct {
+    source: ?HierarchyProjection = null,
+    unit: ?HierarchyProjection = null,
+};
+
+pub const HierarchyArtifact = struct {
+    name: []const u8,
+    kind: []const u8,
+    chunk_id: ?i64 = null,
+    unit_id: ?[]const u8 = null,
+    source: ?HierarchyArtifactSource = null,
+};
+
+pub const HierarchyArtifactSource = struct {
+    name: []const u8,
+    kind: []const u8,
+    chunk_id: ?i64 = null,
+    unit_id: ?[]const u8 = null,
+};
+
+pub const HierarchyEvidence = struct {
+    local_id: ?[]const u8 = null,
+    decision: ?[]const u8 = null,
+    confidence: ?f32 = null,
+    source_artifact: ?[]const u8 = null,
+    source_artifact_key: ?[]const u8 = null,
+    resolution_artifact: ?[]const u8 = null,
+    resolution_artifact_key: ?[]const u8 = null,
+    resolver: ?[]const u8 = null,
+    resolver_table: ?[]const u8 = null,
+    mention: ?std.json.Value = null,
+    canonical: ?std.json.Value = null,
+};
+
+pub const HierarchyGroupBy = struct {
+    /// Hierarchy level used to group the records matched by the targeted index.
+    level: []const u8,
+    matches: ?HierarchyMatches = null,
+};
+
+pub const HierarchyMatchContext = struct {
+    level: ?QueryHitHierarchyLevel = null,
+    parent_doc_key: ?[]const u8 = null,
+    parent_unit_id: ?[]const u8 = null,
+    artifact: ?HierarchyArtifact = null,
+    ancestors: ?QueryHitHierarchyAncestors = null,
+};
+
+pub const HierarchyMatchHit = struct {
+    _id: []const u8,
+    /// Relevance score, normalized so higher values always rank first.
+    _score: f32,
+    /// Raw vector distance when this hit came directly from a dense-vector search; lower values are better.
+    _distance: ?f32 = null,
+    _source: ?std.json.Value = null,
+    hierarchy: ?HierarchyMatchContext = null,
+};
+
+pub const HierarchyMatches = struct {
+    /// Maximum matching descendant hits attached to each group, independent of the top-level query limit. Matches follow the effective query order, and the group score is the score of its best matching descendant. The maximum bounds nested response growth. Group selection uses an adaptive candidate window, then each returned group is expanded with a separately bounded query, so a group with fewer matches never forces a global exhaustive scan. To bound execution as well as response growth, grouped queries accept at most 100 top-level groups and 1,000 requested matches across the complete result page.
+    limit: ?i64 = null,
+    /// Fields to include in each nested match. This projection is required because grouped and matching records commonly have different schemas. Use an empty array to return match identity and hierarchy metadata without stored fields.
+    fields: []const []const u8,
+};
+
+pub const HierarchyProjection = struct {
+    /// Fields to include from the hydrated hierarchy document. This projection is required whenever the ancestor is requested so hierarchy hydration cannot accidentally return an unbounded document. Use an empty array to return hierarchy identity without stored document fields.
+    fields: []const []const u8,
+};
+
 /// Explains why the agent stopped before completion. Present when status is "incomplete".
 pub const IncompleteDetails = struct {
     /// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue
@@ -2043,19 +2122,85 @@ pub const QueryBuilderResult = struct {
     warnings: ?[]const []const u8 = null,
 };
 
+/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+pub const QueryHierarchy = struct {
+    group_by: ?HierarchyGroupBy = null,
+    ancestors: ?HierarchyAncestors = null,
+};
+
 /// A single query result hit
 pub const QueryHit = struct {
     /// ID of the record.
     _id: []const u8,
-    /// Relevance score of the hit.
+    /// Relevance score of the hit, normalized so higher values always rank first.
     _score: f32,
+    /// Raw vector distance for direct dense-vector hits; lower values are better. For a source group ranked by dense descendants, this is the distance of the best matching descendant that supplied the group score. Omitted for non-dense and fused results.
+    _distance: ?f32 = null,
     /// Scores partitioned by index when using RRF search.
     _index_scores: ?std.json.Value = null,
     _source: ?std.json.Value = null,
-    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
-    hierarchy: ?std.json.Value = null,
+    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. Legacy rollup requests continue to use `chunks` instead of `matches`.
+    hierarchy: ?QueryHitHierarchy = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
     _sort: ?[]const std.json.Value = null,
+};
+
+pub const QueryHitHierarchy = struct {
+    /// Hierarchy level represented by this hit.
+    level: ?QueryHitHierarchyLevel = null,
+    /// Source document key that owns this derived hit.
+    parent_doc_key: ?[]const u8 = null,
+    /// Unit identifier when the hit is attached to a document unit.
+    parent_unit_id: ?[]const u8 = null,
+    artifact: ?HierarchyArtifact = null,
+    ancestors: ?QueryHitHierarchyAncestors = null,
+    evidence: ?HierarchyEvidence = null,
+    /// Matching descendant hits attached by the canonical hierarchy.group_by request.
+    matches: ?[]const HierarchyMatchHit = null,
+    /// Legacy child chunk hits included for source-level rollups.
+    chunks: ?[]const HierarchyMatchHit = null,
+};
+
+pub const QueryHitHierarchyAncestors = struct {
+    source: HierarchyAncestor,
+    unit: ?HierarchyAncestor = null,
+};
+
+pub const QueryHitHierarchyLevel = enum {
+    source,
+    unit,
+    chunk,
+    mention,
+    artifact,
+    embedding,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .source => "source",
+            .unit => "unit",
+            .chunk => "chunk",
+            .mention => "mention",
+            .artifact => "artifact",
+            .embedding => "embedding",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "source", .source },
+            .{ "unit", .unit },
+            .{ "chunk", .chunk },
+            .{ "mention", .mention },
+            .{ "artifact", .artifact },
+            .{ "embedding", .embedding },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// A list of query hits.
@@ -2063,7 +2208,7 @@ pub const QueryHits = struct {
     /// Total number of hits available and whether it is exact.
     total: ?QueryHitsTotal = null,
     hits: ?[]const QueryHit = null,
-    /// Maximum score of the results.
+    /// Best relevance score among the returned results. Scores are always higher-is-better.
     max_score: ?f32 = null,
 };
 
@@ -2108,15 +2253,16 @@ pub const QueryRequest = struct {
     filter_query: ?RawQuery = null,
     /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
     exclusion_query: ?RawQuery = null,
-    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
+    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. When `hierarchy.group_by` is present, aggregations operate on the complete set of top-level grouped source documents. Nested `group_by.matches` are bounded evidence projections and are not counted as aggregation rows. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
     aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
     /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
     /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
-    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
+    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire source document. Use an empty array for identity-only source groups.
     fields: ?[]const []const u8 = null,
-    /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
+    hierarchy: ?QueryHierarchy = null,
+    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
@@ -2554,15 +2700,16 @@ pub const RetrievalQueryRequest = struct {
     filter_query: ?RawQuery = null,
     /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
     exclusion_query: ?RawQuery = null,
-    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
+    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. When `hierarchy.group_by` is present, aggregations operate on the complete set of top-level grouped source documents. Nested `group_by.matches` are bounded evidence projections and are not counted as aggregation rows. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
     aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
     /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
     /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
-    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
+    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire source document. Use an empty array for identity-only source groups.
     fields: ?[]const []const u8 = null,
-    /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
+    hierarchy: ?QueryHierarchy = null,
+    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,

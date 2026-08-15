@@ -6180,8 +6180,114 @@ components:
       x-go-type: json.RawMessage
       description: A validated Antfly query retained as raw JSON by Go servers and clients.
 
+    HierarchyProjection:
+      type: object
+      additionalProperties: false
+      required: [fields]
+      properties:
+        fields:
+          type: array
+          items:
+            type: string
+          description: |
+            Fields to include from the hydrated hierarchy document. This projection is
+            required whenever the ancestor is requested so hierarchy hydration cannot
+            accidentally return an unbounded document. Use an empty array to return
+            hierarchy identity without stored document fields.
+
+    HierarchyMatches:
+      type: object
+      additionalProperties: false
+      required: [fields]
+      properties:
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 100
+          default: 3
+          description: |
+            Maximum matching descendant hits attached to each group, independent of
+            the top-level query limit. Matches follow the effective query order, and
+            the group score is the score of its best matching descendant. The maximum
+            bounds nested response growth. Group selection uses an adaptive candidate
+            window, then each returned group is expanded with a separately bounded query,
+            so a group with fewer matches never forces a global exhaustive scan. To bound
+            execution as well as response growth, grouped queries accept at most 100
+            top-level groups and 1,000 requested matches across the complete result page.
+        fields:
+          type: array
+          items:
+            type: string
+          description: |
+            Fields to include in each nested match. This projection is required because
+            grouped and matching records commonly have different schemas. Use an empty
+            array to return match identity and hierarchy metadata without stored fields.
+
+    HierarchyGroupBy:
+      type: object
+      additionalProperties: false
+      required: [level]
+      properties:
+        level:
+          type: string
+          enum: [source]
+          description: Hierarchy level used to group the records matched by the targeted index.
+        matches:
+          $ref: "#/components/schemas/HierarchyMatches"
+          x-go-type-skip-optional-pointer: false
+
+    HierarchyAncestors:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        source:
+          $ref: "#/components/schemas/HierarchyProjection"
+          x-go-type-skip-optional-pointer: false
+        unit:
+          $ref: "#/components/schemas/HierarchyProjection"
+          x-go-type-skip-optional-pointer: false
+
+    QueryHierarchy:
+      type: object
+      additionalProperties: false
+      description: |
+        Returns direct index matches with optional projected ancestor context, or groups
+        those matches at a hierarchy level through `group_by`. A group's nested `matches`
+        projection is independently bounded and defaults to three hits while the top-level
+        `limit` continues to control the number of groups.
+
+        Ancestor and nested-match field projections are always explicit to keep response
+        size predictable. The presence of this object selects the canonical contract:
+        without `group_by`, including when the object is empty, direct index matches are
+        returned. `ancestors` only controls projected context and never changes result
+        cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+      allOf:
+        - not:
+            description: A source-level group already carries source fields in the top-level hit.
+            required: [group_by, ancestors]
+            properties:
+              ancestors:
+                required: [source]
+      properties:
+        group_by:
+          $ref: "#/components/schemas/HierarchyGroupBy"
+          x-go-type-skip-optional-pointer: false
+        ancestors:
+          $ref: "#/components/schemas/HierarchyAncestors"
+          x-go-type-skip-optional-pointer: false
     QueryRequest: # Based on remoteindex.Query
       type: object
+      not:
+        description: Source-level grouping requires an explicit top-level field projection.
+        allOf:
+          - required: [hierarchy]
+            properties:
+              hierarchy:
+                required: [group_by]
+          - not:
+              required: [fields]
       properties:
         table:
           type: string
@@ -6330,6 +6436,10 @@ components:
             Aggregation requests for computing metrics and bucketing results.
             Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration.
 
+            When `hierarchy.group_by` is present, aggregations operate on the complete
+            set of top-level grouped source documents. Nested `group_by.matches` are
+            bounded evidence projections and are not counted as aggregation rows.
+
             Supports metric aggregations (sum, avg, min, max, count, stats, cardinality),
             bucketing aggregations (terms, range, date_range, histogram, date_histogram),
             geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms).
@@ -6380,18 +6490,27 @@ components:
             lower-level vector search overrides are provided internally.
           example: 0.5
         fields:
+          x-go-type-skip-optional-pointer: false
           type: array
           description: |
             List of fields to include in the results. If not specified, all fields are returned.
-            Use to reduce response size and improve performance.
+            Use to reduce response size and improve performance. This field is required when
+            hierarchy.group_by is present so a grouped query cannot accidentally hydrate an
+            entire source document. Use an empty array for identity-only source groups.
           items:
             type: string
           example: ["title", "url", "summary", "created_at"]
+        hierarchy:
+          $ref: "#/components/schemas/QueryHierarchy"
+          x-go-type-skip-optional-pointer: false
         limit:
           type: integer
           description: |
-            Maximum number of results to return. For semantic_search, this is the topk parameter.
-            Default varies by query type (typically 10).
+            Maximum number of top-level results to return. For semantic_search, this is the topk parameter.
+            This does not limit nested matches attached through hierarchy.group_by.matches;
+            use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
+            Queries using hierarchy.group_by.matches are limited to 100 top-level groups
+            and a groups-times-matches execution budget of 1,000.
           example: 20
         offset:
           type: integer
@@ -7152,6 +7271,179 @@ components:
             type: number
             format: float
             x-go-type: float64
+    HierarchyArtifactSource:
+      type: object
+      additionalProperties: false
+      required: [name, kind]
+      properties:
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [chunk, asset, embedding]
+        chunk_id:
+          type: integer
+          format: uint32
+          x-go-type-skip-optional-pointer: false
+        unit_id:
+          type: string
+
+    HierarchyArtifact:
+      type: object
+      additionalProperties: false
+      required: [name, kind]
+      properties:
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [chunk, asset, embedding]
+        chunk_id:
+          type: integer
+          format: uint32
+          x-go-type-skip-optional-pointer: false
+        unit_id:
+          type: string
+        source:
+          $ref: "#/components/schemas/HierarchyArtifactSource"
+
+    HierarchyAncestor:
+      type: object
+      additionalProperties: true
+      properties:
+        id:
+          type: string
+        document:
+          type: object
+          additionalProperties: true
+        key:
+          type: string
+        artifact_name:
+          type: string
+        source_field:
+          type: string
+        provenance: {}
+
+    QueryHitHierarchyAncestors:
+      type: object
+      additionalProperties: false
+      required: [source]
+      properties:
+        source:
+          $ref: "#/components/schemas/HierarchyAncestor"
+        unit:
+          $ref: "#/components/schemas/HierarchyAncestor"
+
+    QueryHitHierarchyLevel:
+      type: string
+      enum: [source, unit, chunk, mention, artifact, embedding]
+
+    HierarchyMatchContext:
+      type: object
+      additionalProperties: false
+      properties:
+        level:
+          $ref: "#/components/schemas/QueryHitHierarchyLevel"
+        parent_doc_key:
+          type: string
+        parent_unit_id:
+          type: string
+        artifact:
+          $ref: "#/components/schemas/HierarchyArtifact"
+        ancestors:
+          $ref: "#/components/schemas/QueryHitHierarchyAncestors"
+
+    HierarchyEvidence:
+      type: object
+      additionalProperties: false
+      properties:
+        local_id:
+          type: string
+        decision:
+          type: string
+        confidence:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-type-skip-optional-pointer: false
+        source_artifact:
+          type: string
+        source_artifact_key:
+          type: string
+        resolution_artifact:
+          type: string
+        resolution_artifact_key:
+          type: string
+        resolver:
+          type: string
+        resolver_table:
+          type: string
+        mention:
+          type: object
+          additionalProperties: true
+        canonical:
+          type: object
+          additionalProperties: true
+
+    HierarchyMatchHit:
+      type: object
+      additionalProperties: false
+      required: [_id, _score]
+      properties:
+        _id:
+          type: string
+          x-go-name: ID
+        _score:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-name: score
+          description: Relevance score, normalized so higher values always rank first.
+        _distance:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-name: distance
+          x-go-type-skip-optional-pointer: false
+          description: Raw vector distance when this hit came directly from a dense-vector search; lower values are better.
+        _source:
+          type: object
+          additionalProperties: true
+          x-go-name: source
+        hierarchy:
+          $ref: "#/components/schemas/HierarchyMatchContext"
+
+    QueryHitHierarchy:
+      type: object
+      additionalProperties: false
+      properties:
+        level:
+          $ref: "#/components/schemas/QueryHitHierarchyLevel"
+          description: Hierarchy level represented by this hit.
+        parent_doc_key:
+          type: string
+          description: Source document key that owns this derived hit.
+        parent_unit_id:
+          type: string
+          description: Unit identifier when the hit is attached to a document unit.
+        artifact:
+          $ref: "#/components/schemas/HierarchyArtifact"
+        ancestors:
+          $ref: "#/components/schemas/QueryHitHierarchyAncestors"
+        evidence:
+          $ref: "#/components/schemas/HierarchyEvidence"
+        matches:
+          type: array
+          description: Matching descendant hits attached by the canonical hierarchy.group_by request.
+          items:
+            $ref: "#/components/schemas/HierarchyMatchHit"
+        chunks:
+          type: array
+          deprecated: true
+          description: Legacy child chunk hits included for source-level rollups.
+          items:
+            $ref: "#/components/schemas/HierarchyMatchHit"
+
     QueryHit:
       type: object
       description: A single query result hit
@@ -7167,8 +7459,19 @@ components:
           type: number
           format: float
           x-go-type: float64
-          description: Relevance score of the hit.
+          description: Relevance score of the hit, normalized so higher values always rank first.
           x-go-name: score
+        _distance:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-name: distance
+          x-go-type-skip-optional-pointer: false
+          description: |
+            Raw vector distance for direct dense-vector hits; lower values are better.
+            For a source group ranked by dense descendants, this is the distance of
+            the best matching descendant that supplied the group score. Omitted for
+            non-dense and fused results.
         _index_scores:
           type: object # map[string]float64
           additionalProperties: true
@@ -7179,44 +7482,14 @@ components:
           additionalProperties: true # map[string]any for field values
           x-go-name: source
         hierarchy:
-          type: object
-          additionalProperties: true
+          $ref: "#/components/schemas/QueryHitHierarchy"
           description: |
             Stable ancestry envelope for derived document hierarchy hits. Present when
             the hit is a derived unit/chunk/embedding artifact or when a source-level
-            rollup includes child chunks. Standard fields include `level`,
-            `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
+            group includes nested matches. Standard fields include `level`,
+            `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and
             `ancestors` with response-local or requested DB-backed source/unit context when available.
-          properties:
-            level:
-              type: string
-              enum:
-                - source
-                - unit
-                - chunk
-                - artifact
-                - embedding
-              description: Hierarchy level represented by this hit.
-            parent_doc_key:
-              type: string
-              description: Source document key that owns this derived hit.
-            parent_unit_id:
-              type: string
-              description: Unit identifier when the hit is attached to a document unit.
-            artifact:
-              type: object
-              additionalProperties: true
-              description: Artifact identity with `name`, `kind`, and optional `unit_id` or `chunk_id`.
-            ancestors:
-              type: object
-              additionalProperties: true
-              description: Ancestor context. Includes `source.id` for derived hits, `source.document` for materialized source rollups or requested source hydration, and `unit.document` for direct unit hits or requested unit hydration when the unit payload is present.
-            chunks:
-              type: array
-              description: Child chunk hits included for source-level rollups.
-              items:
-                type: object
-                additionalProperties: true
+            Legacy rollup requests continue to use `chunks` instead of `matches`.
         _sort:
           type: array
           items: {}
@@ -7246,7 +7519,7 @@ components:
           type: number
           format: float
           x-go-type: float64
-          description: Maximum score of the results.
+          description: Best relevance score among the returned results. Scores are always higher-is-better.
     QueryHitsTotal:
       x-omitempty: false
       x-omitzero: false

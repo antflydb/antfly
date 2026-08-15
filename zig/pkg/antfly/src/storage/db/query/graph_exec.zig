@@ -657,6 +657,7 @@ pub fn cloneNamedSetAsResult(alloc: Allocator, set: NamedResultSet, include_stor
             .id = try alloc.dupe(u8, hit.id),
             .doc_ordinal = hit.doc_ordinal,
             .score = hit.score,
+            .distance = hit.distance,
             .stored_data = if (include_stored and hit.stored_data != null)
                 try alloc.dupe(u8, hit.stored_data.?)
             else
@@ -694,7 +695,6 @@ pub fn fuseNamedSets(
     for (named_sets, 0..) |set, i| {
         var ranked_hits = try alloc.alloc(fusion_mod.RankedHit, set.hits.len);
         errdefer alloc.free(ranked_hits);
-        const distance_ordered = fusionUsesDistanceScore(req, set.name);
         for (set.hits, 0..) |hit, j| {
             const ranked_doc_id = if (ordinal_complete) blk: {
                 const entry = try ordinalFusionEntryForHit(alloc, &ordinal_fusion_keys, &fusion_key_entries, hit);
@@ -713,7 +713,7 @@ pub fn fuseNamedSets(
             const raw_score = if (hit.score) |score| score else 0.0;
             ranked_hits[j] = .{
                 .doc_id = ranked_doc_id,
-                .score = if (distance_ordered) -raw_score else raw_score,
+                .score = raw_score,
             };
         }
         ranked_results[i] = .{
@@ -1819,16 +1819,6 @@ fn validateFusionWeights(weights: []const fusion_mod.NamedWeight, results: []con
         }
         if (!found) return error.InvalidQueryRequest;
     }
-}
-
-fn fusionUsesDistanceScore(req: types.SearchRequest, name: []const u8) bool {
-    if (std.mem.eql(u8, name, "$embeddings_results")) return req.dense != null;
-    if (std.mem.eql(u8, name, "dense")) return req.dense != null;
-    if (std.mem.startsWith(u8, name, "$aknn_results.")) return true;
-    for (req.dense_queries) |dense_query| {
-        if (std.mem.eql(u8, dense_query.name, name)) return true;
-    }
-    return false;
 }
 
 fn castOwnedKeysToConst(alloc: Allocator, keys: [][]u8) ![]const []const u8 {

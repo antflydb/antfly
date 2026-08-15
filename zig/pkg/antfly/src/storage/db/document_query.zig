@@ -52,7 +52,12 @@ pub fn projectLookupJsonValue(
 }
 
 fn projectValue(alloc: Allocator, root: std.json.Value, opts: types.LookupOptions) !std.json.Value {
-    if (opts.fields.len == 0) return try cloneJsonValue(alloc, root);
+    if (opts.fields.len == 0) {
+        return if (opts.include_all_fields)
+            try cloneJsonValue(alloc, root)
+        else
+            std.json.Value{ .object = std.json.ObjectMap.empty };
+    }
 
     var includes = std.ArrayListUnmanaged([]const u8).empty;
     defer includes.deinit(alloc);
@@ -413,6 +418,19 @@ test "document query lookupJson returns full document when include_all_fields" {
     defer result.deinit(alloc);
 
     try std.testing.expectEqualStrings(raw, result.json);
+}
+
+test "document query lookupJson returns no stored fields for an explicit empty projection" {
+    const alloc = std.testing.allocator;
+    const raw = "{\"title\":\"alpha\",\"body\":\"hello\"}";
+
+    var result = try lookupJson(alloc, raw, .{
+        .fields = &.{},
+        .include_all_fields = false,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqualStrings("{}", result.json);
 }
 
 test "document query lookupJson supports indexed array paths" {

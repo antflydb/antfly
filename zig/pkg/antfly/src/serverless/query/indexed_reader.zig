@@ -31,6 +31,12 @@ const vector_types = @import("antfly_vector").vector;
 const ScoredDoc = struct {
     doc_id: []const u8,
     score: u32,
+    distance: ?f32 = null,
+};
+
+const ScoredDocValue = struct {
+    score: u32,
+    distance: ?f32 = null,
 };
 
 const ScoredCluster = struct {
@@ -146,6 +152,7 @@ fn searchResolvedAllocWithStats(
             .doc_id = try alloc.dupe(u8, scored.doc_id),
             .body = try alloc.dupe(u8, body),
             .score = scored.score,
+            .distance = scored.distance,
         };
         initialized_hits += 1;
     }
@@ -446,6 +453,7 @@ fn applyTextFilterSetsAlloc(
         try filtered.append(alloc, .{
             .doc_id = try alloc.dupe(u8, hit.doc_id),
             .score = hit.score,
+            .distance = hit.distance,
         });
     }
     return try filtered.toOwnedSlice(alloc);
@@ -723,10 +731,12 @@ fn searchVectorSegmentAlloc(
         const entry = block[candidate.local_index];
         const similarity = similarityForQuery(effective_query, query_measure, entry.vector, vector_segment.metric);
         if (similarity <= 0) continue;
+        const distance = vector_types.distanceToQuery(effective_query, query_measure, entry.vector, vector_segment.metric);
         stats.exact_rerank_count += 1;
         try scored.append(alloc, .{
             .doc_id = try alloc.dupe(u8, entry.doc_id),
             .score = @intFromFloat(similarity * 1000.0),
+            .distance = distance,
         });
         std.mem.sort(ScoredDoc, scored.items, {}, lessScoredDoc);
         trimScoredDocsToNeeded(alloc, &scored, needed);
@@ -906,26 +916,28 @@ fn searchVectorArtifactAlloc(
         const entry = block[candidate.local_index];
         const similarity = similarityForQuery(effective_query, query_measure, entry.vector, header.metric);
         if (similarity <= 0) continue;
+        const distance = vector_types.distanceToQuery(effective_query, query_measure, entry.vector, header.metric);
         stats.exact_rerank_count += 1;
         try scored.append(alloc, .{
             .doc_id = try alloc.dupe(u8, entry.doc_id),
             .score = @intFromFloat(similarity * 1000.0),
+            .distance = distance,
         });
         std.mem.sort(ScoredDoc, scored.items, {}, lessScoredDoc);
         trimScoredDocsToNeeded(alloc, &scored, needed);
     }
-    var merged = std.StringArrayHashMapUnmanaged(u32).empty;
-    defer freeScoreMapU32(alloc, &merged);
+    var merged = std.StringArrayHashMapUnmanaged(ScoredDocValue).empty;
+    defer freeScoredDocValueMap(alloc, &merged);
     for (scored.items) |hit| {
         const gop = try merged.getOrPut(alloc, hit.doc_id);
         if (!gop.found_existing) {
             gop.key_ptr.* = try alloc.dupe(u8, hit.doc_id);
-            gop.value_ptr.* = hit.score;
-        } else if (hit.score > gop.value_ptr.*) {
-            gop.value_ptr.* = hit.score;
+            gop.value_ptr.* = .{ .score = hit.score, .distance = hit.distance };
+        } else if (hit.score > gop.value_ptr.score) {
+            gop.value_ptr.* = .{ .score = hit.score, .distance = hit.distance };
         }
     }
-    const merged_owned = try ownedScoredDocsFromMap(alloc, merged, 0, merged.count());
+    const merged_owned = try ownedScoredDocsFromValueMap(alloc, merged, 0, merged.count());
     defer alloc.free(merged_owned);
     return try clipScoredDocsAlloc(alloc, merged_owned, req.offset, req.limit, req.min_score);
 }
@@ -1267,15 +1279,7 @@ fn optimisticScoreCannotBeatFloor(
 ) bool {
     if (needed == 0 or scored.len < needed) return false;
     const optimistic_distance = @max(@as(f32, 0), candidate.distance - candidate.error_bound);
-    return scoreFromSimilarity(similarityFromDistance(optimistic_distance, metric)) <= scored[needed - 1].score;
-}
-
-fn similarityFromDistance(distance: f32, metric: vector_types.DistanceMetric) f32 {
-    return switch (metric) {
-        .l2_squared => 1.0 / (1.0 + distance),
-        .inner_product => -distance,
-        .cosine => 1.0 - distance,
-    };
+    return scoreFromSimilarity(vector_types.similarityFromDistance(optimistic_distance, metric)) <= scored[needed - 1].score;
 }
 
 fn scoreFromSimilarity(similarity: f32) u32 {
@@ -1321,7 +1325,7 @@ fn freeScoreMap(alloc: Allocator, merged: *std.StringArrayHashMapUnmanaged(f32))
     merged.deinit(alloc);
 }
 
-fn freeScoreMapU32(alloc: Allocator, merged: *std.StringArrayHashMapUnmanaged(u32)) void {
+fn freeScoredDocValueMap(alloc: Allocator, merged: *std.StringArrayHashMapUnmanaged(ScoredDocValue)) void {
     for (merged.keys()) |key| alloc.free(key);
     merged.deinit(alloc);
 }
@@ -1352,9 +1356,9 @@ fn ownedScoredDocsFromFloatMap(
     return out;
 }
 
-fn ownedScoredDocsFromMap(
+fn ownedScoredDocsFromValueMap(
     alloc: Allocator,
-    merged: std.StringArrayHashMapUnmanaged(u32),
+    merged: std.StringArrayHashMapUnmanaged(ScoredDocValue),
     offset: usize,
     limit: usize,
 ) ![]ScoredDoc {
@@ -1364,10 +1368,11 @@ fn ownedScoredDocsFromMap(
     errdefer {
         for (scored[0..initialized]) |hit| alloc.free(hit.doc_id);
     }
-    for (merged.keys(), merged.values(), 0..) |doc_id, score, idx| {
+    for (merged.keys(), merged.values(), 0..) |doc_id, value, idx| {
         scored[idx] = .{
             .doc_id = try alloc.dupe(u8, doc_id),
-            .score = score,
+            .score = value.score,
+            .distance = value.distance,
         };
         initialized += 1;
     }
@@ -1417,32 +1422,33 @@ fn freeScoredDocs(alloc: Allocator, hits: []ScoredDoc) void {
     alloc.free(hits);
 }
 
-test "indexed reader merges duplicate vector doc hits by best score" {
+test "serverless indexed reader merges duplicate vector doc hits by best score" {
     const alloc = std.testing.allocator;
-    var merged = std.StringArrayHashMapUnmanaged(u32).empty;
-    defer freeScoreMapU32(alloc, &merged);
+    var merged = std.StringArrayHashMapUnmanaged(ScoredDocValue).empty;
+    defer freeScoredDocValueMap(alloc, &merged);
 
     {
         const gop = try merged.getOrPut(alloc, "doc-a");
         gop.key_ptr.* = try alloc.dupe(u8, "doc-a");
-        gop.value_ptr.* = 400;
+        gop.value_ptr.* = .{ .score = 400, .distance = 0.6 };
     }
     {
         const gop = try merged.getOrPut(alloc, "doc-a");
         try std.testing.expect(gop.found_existing);
-        gop.value_ptr.* = @max(gop.value_ptr.*, 900);
+        if (900 > gop.value_ptr.score) gop.value_ptr.* = .{ .score = 900, .distance = 0.1 };
     }
     {
         const gop = try merged.getOrPut(alloc, "doc-b");
         gop.key_ptr.* = try alloc.dupe(u8, "doc-b");
-        gop.value_ptr.* = 700;
+        gop.value_ptr.* = .{ .score = 700, .distance = 0.3 };
     }
 
-    const merged_owned = try ownedScoredDocsFromMap(alloc, merged, 0, merged.count());
+    const merged_owned = try ownedScoredDocsFromValueMap(alloc, merged, 0, merged.count());
     defer freeScoredDocs(alloc, merged_owned);
     try std.testing.expectEqual(@as(usize, 2), merged_owned.len);
     try std.testing.expectEqualStrings("doc-a", merged_owned[0].doc_id);
     try std.testing.expectEqual(@as(u32, 900), merged_owned[0].score);
+    try std.testing.expectEqual(@as(?f32, 0.1), merged_owned[0].distance);
 }
 
 fn accumulateAnyTerms(
@@ -1696,7 +1702,7 @@ test "indexed reader honors min_score when clipping results" {
     try std.testing.expectEqualStrings("doc-a", out[0].doc_id);
 }
 
-test "indexed reader scores vector segment by cosine similarity" {
+test "serverless indexed reader scores vector segment by cosine similarity" {
     const alloc = std.testing.allocator;
     var quantizer = try vector_quantizer.RaBitQuantizer.init(alloc, 2, 42, vector_types.DistanceMetric.cosine);
     defer quantizer.deinit();
@@ -1765,7 +1771,7 @@ test "indexed reader scores vector segment by cosine similarity" {
     try std.testing.expectEqualStrings("doc-a", hits[0].doc_id);
 }
 
-test "indexed reader scores vector segment by inner product" {
+test "serverless indexed reader scores vector segment by inner product" {
     const alloc = std.testing.allocator;
     var quantizer = try vector_quantizer.RaBitQuantizer.init(alloc, 2, 42, vector_types.DistanceMetric.inner_product);
     defer quantizer.deinit();
@@ -1832,9 +1838,10 @@ test "indexed reader scores vector segment by inner product" {
     defer freeScoredDocs(alloc, hits);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqualStrings("doc-dot", hits[0].doc_id);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.0), hits[0].distance.?, 0.0001);
 }
 
-test "indexed reader scores vector segment by l2 distance" {
+test "serverless indexed reader scores vector segment by l2 distance" {
     const alloc = std.testing.allocator;
     var quantizer = try vector_quantizer.RaBitQuantizer.init(alloc, 2, 42, vector_types.DistanceMetric.l2_squared);
     defer quantizer.deinit();
@@ -1901,6 +1908,7 @@ test "indexed reader scores vector segment by l2 distance" {
     defer freeScoredDocs(alloc, hits);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqualStrings("doc-near", hits[0].doc_id);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.02), hits[0].distance.?, 0.0001);
 }
 
 test "indexed reader scores sparse segment by weighted postings" {

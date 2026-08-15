@@ -107,13 +107,13 @@ components:
       discriminator:
         propertyName: provider
         mapping:
-          exa: "#/components/schemas/ExaSearchConfig"
-          serper: "#/components/schemas/SerperSearchConfig"
-          tavily: "#/components/schemas/TavilySearchConfig"
-          brave: "#/components/schemas/BraveSearchConfig"
-          you: "#/components/schemas/YouSearchConfig"
-          linkup: "#/components/schemas/LinkupSearchConfig"
-          vertex: "#/components/schemas/VertexSearchConfig"
+          exa: "websearch.yaml#/components/schemas/ExaSearchConfig"
+          serper: "websearch.yaml#/components/schemas/SerperSearchConfig"
+          tavily: "websearch.yaml#/components/schemas/TavilySearchConfig"
+          brave: "websearch.yaml#/components/schemas/BraveSearchConfig"
+          you: "websearch.yaml#/components/schemas/YouSearchConfig"
+          linkup: "websearch.yaml#/components/schemas/LinkupSearchConfig"
+          vertex: "websearch.yaml#/components/schemas/VertexSearchConfig"
 
     ExaSearchConfig:
       type: object
