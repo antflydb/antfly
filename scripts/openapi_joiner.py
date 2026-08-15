@@ -44,13 +44,9 @@ PATH_REWRITES = {
     "eval.yaml": "specs/openapi/antfly/eval.yaml",
     "reranking.yaml": "specs/openapi/antfly/reranking.yaml",
     "query.yaml": "specs/openapi/antfly/query.yaml",
-    "../../../src/": "go/pkg/antfly/src/",
-    "../../../lib/": "go/pkg/antfly/lib/",
     "../../../": "",
     "../../antfly/": "",
     "../antfly/": "",
-    "../metadata/": "go/pkg/antfly/src/metadata/",
-    "../usermgr/": "go/pkg/antfly/src/usermgr/",
 }
 
 

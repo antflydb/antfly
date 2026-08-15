@@ -871,10 +871,14 @@ fn parseGenerateBackendSelection(
     mode_value: ?[]const u8,
     compiled_target_value: ?[]const u8,
 ) !GenerateBackendSelection {
-    const choice = if (backend_value) |value|
+    const requested_choice = if (backend_value) |value|
         modelBackendToNativeChoice(value)
     else
         native_backend_choice.Choice.auto;
+    const choice = native_backend_choice.withPreferredDefault(
+        requested_choice,
+        native_backend_choice.preferredChoiceFromEnv(),
+    );
     try native_backend_choice.validate(choice);
 
     var eager_mode_requested = false;
@@ -5982,7 +5986,7 @@ pub const Node = struct {
             const plugin_path = pjrt_plugin_path orelse
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
-                    .message = "xla backend requires TERMITE_XLA_PLUGIN or TERMITE_PJRT_PLUGIN",
+                    .message = "xla backend requires ANTFLY_INFERENCE_XLA_PLUGIN or ANTFLY_INFERENCE_PJRT_PLUGIN",
                 });
             pjrt_client = pjrt_lib.pjrt.Client.init(plugin_path) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });

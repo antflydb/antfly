@@ -85,7 +85,7 @@ var _ = BeforeSuite(func() {
 	err = (&InferencePoolReconciler{
 		Client:      mgr.GetClient(),
 		Scheme:      mgr.GetScheme(),
-		AntflyImage: "antfly/antfly:omni-test",
+		AntflyImage: "antfly/antfly:zig-test",
 		Recorder:    mgr.GetEventRecorder("inferencepool-controller"),
 	}).SetupWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())

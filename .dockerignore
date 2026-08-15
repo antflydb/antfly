@@ -22,7 +22,6 @@ e2e/
 
 # Local databases
 antflydb
-termitedb
 metadatadb
 
 # ML models and native libraries (not needed for pure-Go build)
@@ -30,14 +29,6 @@ models/
 onnxruntime/
 pjrt/
 examples/
-
-# Termite large artifacts (source is needed, but not models/binaries/native libs)
-termite/registry/
-termite/models/
-termite/onnxruntime/
-termite/pjrt/
-termite/bin/
-termite/e2e/
 
 # SDKs (not needed for server build)
 ts/
@@ -78,5 +69,5 @@ zig/deps/antfly-zig
 !zig/lib/pjrt/**
 !zig/pkg/antfly/src/data/
 !zig/pkg/antfly/src/data/**
-!zig/pkg/termite/src/models/
-!zig/pkg/termite/src/models/**
+!zig/pkg/inference/src/models/
+!zig/pkg/inference/src/models/**

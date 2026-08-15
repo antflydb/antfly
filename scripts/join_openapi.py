@@ -230,24 +230,12 @@ def configure_for_repo_contracts(module) -> None:
         "indexes.yaml",
         "specs/openapi/antfly/indexes.yaml",
     }
-    module.PATH_REWRITES = {
-        "../auth/api.yaml": "specs/openapi/auth/api.yaml",
-        "../shared/generating.yaml": "specs/openapi/shared/generating.yaml",
-        "schema.yaml": "specs/openapi/antfly/schema.yaml",
-        "indexes.yaml": "specs/openapi/antfly/indexes.yaml",
-        "sort.yaml": "specs/openapi/antfly/sort.yaml",
-        "generating.yaml": "specs/openapi/antfly/generating.yaml",
-        "eval.yaml": "specs/openapi/antfly/eval.yaml",
-        "reranking.yaml": "specs/openapi/antfly/reranking.yaml",
-        "query.yaml": "specs/openapi/antfly/query.yaml",
-        "../../../src/": "go/pkg/antfly/src/",
-        "../../../lib/": "go/pkg/antfly/lib/",
-        "../../../": "",
-        "../../": "",
-        "../metadata/": "go/pkg/antfly/src/metadata",
-        "../store/": "go/pkg/antfly/src/store",
-        "../usermgr/": "go/pkg/antfly/src/usermgr",
-    }
+    # Keep the shared joiner's rewrite rules as the single source of truth.
+    # This broader fallback is specific to the repository-level bundle and is
+    # intentionally appended after the shared rules so their narrower prefixes
+    # continue to win.
+    module.PATH_REWRITES = dict(module.PATH_REWRITES)
+    module.PATH_REWRITES["../../"] = ""
 
     def target_schema_name(source_path: Path, schema_name: str) -> str:
         if source_path.resolve() == module.GO_SCHEMA_SPEC and schema_name == "AntflyType":

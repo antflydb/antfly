@@ -1,7 +1,7 @@
 # Bundled Antfarm assets contain upstream template literals where trailing
 # spaces are semantically part of shader/diagram source. Do not make generated
 # bundles fail the repository whitespace gate.
-go/pkg/antfly/src/metadata/antfarm/assets/*.js whitespace=-trailing-space
+zig/pkg/antfly/antfarm/assets/*.js whitespace=-trailing-space
 
 # PDF fixtures are binary test assets; xref entries contain required padding.
 *.pdf binary

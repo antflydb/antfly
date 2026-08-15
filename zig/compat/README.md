@@ -1,15 +1,14 @@
 # Compatibility Corpus
 
-This directory holds the shared Go/Zig correctness corpus for the Antfly DB
-surface. The corpus is language-neutral by design.
+This directory holds the compatibility and regression corpus for the Antfly DB
+surface. The corpus remains language-neutral even though the active runner is
+the Zig runtime.
 
 ## Rules
 
 - The canonical corpus is plain files, not Go structs and not Gob.
-- `datadriven` is allowed as a Go runner frontend, but not as the shared data
-  format.
-- Each case must be runnable against both the Go backend and the Zig `storage/db`
-  package.
+- Keep runner-specific details out of the shared data format.
+- Each case must be runnable against the Zig `storage/db` package.
 - Outputs are compared after normalization, not by raw engine response payloads.
 
 ## Case Layout
@@ -116,7 +115,7 @@ Transaction expectations use:
 
 - `status`
 
-## Current Zig Limitations
+## Current Coverage
 
 - Full-text, dense-vector, and sparse-vector indexing are synchronous through
   `DB.batch()`.
@@ -130,14 +129,10 @@ Transaction expectations use:
   and timestamp/TTL visibility on the Zig side.
 - The shared corpus still does not cover split-aware behavior or distributed
   ownership/lease semantics.
-- The Go compat runner still does not support ordinary batch predicates and
-  still treats some chunk-return shaping as unsupported.
 
-## Runners
+## Runner
 
-- Zig runner: `~/bin/zig build compat`
-- Go runner: from the `antfly` repo root, run
-  `GOCACHE=/tmp/go-build go run ./cmd/compat-runner zig/compat/cases`
+From the `zig` directory, run `zig build compat`.
 
 ## HBC Isolate
 
@@ -146,16 +141,6 @@ benchmarks.
 
 - Zig isolate: from `antfly/zig`, run
   `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build hbc-isolate -- --storage-backend lsm --docs 8192 --dims 128 --queries 25 --repeats 10 --k 10`
-- Go isolate: from the `antfly` repo root, run
-  `GOCACHE=/tmp/go-build go run zig/compat/hbc_compare_go/main.go --docs 8192 --dims 128 --queries 25 --repeats 10 --k 10`
-
-The Go isolate is intentionally run from the `antfly` module root so it can
-reuse the main repo's `go.mod` / `go.sum` without introducing a second copy of
-the full dependency graph.
-
-There is also a standalone helper module in `compat/hbc_compare_go/` for
-isolated local runs if you explicitly want to execute it from `antfly/zig`
-instead.
 
 ## Dense Ingest Isolate
 

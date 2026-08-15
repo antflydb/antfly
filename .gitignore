@@ -17,7 +17,6 @@ models/*
 
 # main db dirs for antfly
 antflydb
-termitedb
 onnxruntime
 
 # ai
@@ -33,7 +32,6 @@ gosec_output.txt
 
 .DS_Store
 
-# Added by goreleaser init:
 dist/
 
 # Runtime libraries
@@ -50,10 +48,6 @@ testfile*
 wiki-articles*
 src/metadata/testdata/query_generation_*_results.json
 
-# e2e test results
-go/e2e/test_results/*.md
-go/e2e/models/
-
 # Python SDK local caches
 __pycache__/
 *.py[cod]
@@ -69,7 +63,6 @@ py/.venv/
 *.tar.gz
 *.tar.sz
 *.tar.zst
-go/e2e/backups/*.afb
 
 !antfly.json
 !antfly.go
@@ -77,9 +70,7 @@ go/e2e/backups/*.afb
 !antfly-genkit
 !evalaf/plugins/antfly
 !antfly-operator
-!src/metadata/antfarm/antfly-logo_icon-*.png
 !pkg/antfly-operator/manifests/crd/antfly.io_*.yaml
-!pkg/termite-operator/manifests/crd/antfly.io_*.yaml
 !.github/workflows/antfly-operator-container.yml
 !zig/lib/openapi/test/fixtures/*-metadata.json
 !zig/lib/pjrt/

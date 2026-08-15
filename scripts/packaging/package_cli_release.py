@@ -122,7 +122,7 @@ def copy_antfarm(repo_root: Path, extracted: Path) -> None:
     dst = extracted / "share" / "antfly" / "antfarm"
     if dst.exists():
         return
-    src = repo_root / "go" / "pkg" / "antfly" / "src" / "metadata" / "antfarm"
+    src = repo_root / "zig" / "pkg" / "antfly" / "antfarm"
     if not src.exists():
         raise SystemExit(f"missing Antfarm assets: {src}")
     dst.parent.mkdir(parents=True, exist_ok=True)

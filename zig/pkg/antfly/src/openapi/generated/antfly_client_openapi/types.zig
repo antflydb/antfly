@@ -3304,7 +3304,7 @@ pub const FailedOperation = struct {
     @"error": ?[]const u8 = null,
 };
 
-/// Configuration for URL content fetching. Uses go/pkg/antfly/lib/scraping for downloading and processing. Supports: - HTTP/HTTPS URLs with security validation - HTML pages (extracts readable text via go-readability) - PDF files (extracts text) - Images (returns as data URIs) - Plain text files - S3 URLs (requires s3_credentials) Security features (from go/pkg/antfly/lib/scraping.ContentSecurityConfig): - Allowed host whitelist - Private IP blocking (SSRF prevention) - Download size limits - Timeout controls
+/// Configuration for URL content fetching. Uses Antfly's content fetcher for downloading and processing. Supports: - HTTP/HTTPS URLs with security validation - HTML pages (extracts readable text via go-readability) - PDF files (extracts text) - Images (returns as data URIs) - Plain text files - S3 URLs (requires s3_credentials) Security features include: - Allowed host whitelist - Private IP blocking (SSRF prevention) - Download size limits - Timeout controls
 pub const FetchConfig = struct {
     /// S3 credentials for fetching S3 URLs. If not set, uses package-level defaults.
     s3_credentials: ?Credentials = null,

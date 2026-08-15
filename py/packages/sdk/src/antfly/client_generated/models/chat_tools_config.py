@@ -51,7 +51,7 @@ class ChatToolsConfig:
                 connection's configured capabilities or policy.
             fetch_config (FetchConfig | Unset): Configuration for URL content fetching.
 
-                Uses go/pkg/antfly/lib/scraping for downloading and processing. Supports:
+                Uses Antfly's content fetcher for downloading and processing. Supports:
                 - HTTP/HTTPS URLs with security validation
                 - HTML pages (extracts readable text via go-readability)
                 - PDF files (extracts text)
@@ -59,7 +59,7 @@ class ChatToolsConfig:
                 - Plain text files
                 - S3 URLs (requires s3_credentials)
 
-                Security features (from go/pkg/antfly/lib/scraping.ContentSecurityConfig):
+                Security features include:
                 - Allowed host whitelist
                 - Private IP blocking (SSRF prevention)
                 - Download size limits

@@ -15,7 +15,7 @@ pkg/
   inference/         Inference runtime, OpenAPI server, tools, web UI
   inference-client/  Zig inference client package
 
-go/pkg/antfly/lib/
+lib/
   audio/             Shared audio decode and PCM boundary
   image/             Shared image decode/encode/preprocess boundary
   raft/              Reusable raft library
@@ -44,7 +44,7 @@ testdata/            Shared checked-in fixture data
 
 Root-level Markdown files are design and operating notes for active AntflyDB
 areas. Library-specific design docs live next to their libraries, for example
-`go/pkg/antfly/lib/image/IMAGE.md` and `go/pkg/antfly/lib/audio/AUDIO.md`. Inference-specific design docs
+`lib/image/IMAGE.md` and `lib/audio/AUDIO.md`. Inference-specific design docs
 currently live under `pkg/inference/`.
 
 ## Build Requirements
@@ -170,7 +170,7 @@ pkg/inference/.debug/
 
 ## Development Notes
 
-- Prefer adding shared, reusable code under `go/pkg/antfly/lib/` and product-specific code
+- Prefer adding shared, reusable code under `lib/` and product-specific code
   under `pkg/antfly` or `pkg/inference`.
 - Keep package and library README files local when they explain how to use that
   component directly.

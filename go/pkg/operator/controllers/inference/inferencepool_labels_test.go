@@ -91,7 +91,7 @@ func TestInferencePoolPodTemplateLabelsUpdateWhenPoolLabelsChange(t *testing.T) 
 	reconciler := &InferencePoolReconciler{
 		Client:      client,
 		Scheme:      s,
-		AntflyImage: "antfly/antfly:omni-test",
+		AntflyImage: "antfly/antfly:zig-test",
 	}
 
 	g.Expect(reconciler.reconcileConfigMap(ctx, pool)).To(Succeed())

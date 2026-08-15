@@ -263,13 +263,15 @@ class L4ReleaseGateTest(unittest.TestCase):
             self.assertFalse(merged["long_e2e"]["passed"])
             self.assertIsNotNone(merged["long_e2e"]["parse_error"])
 
-    def test_release_publication_does_not_depend_on_unpublished_cuda_artifact(self) -> None:
+    def test_linux_release_publication_compiles_runtime_loaded_accelerators(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[4]
         release = (repo / ".github/workflows/antfly-release.yml").read_text(encoding="utf-8")
         archive_builder = (repo / "scripts/packaging/build_zig_release_archive.sh").read_text(encoding="utf-8")
         self.assertFalse((repo / ".github/workflows/cuda-gemma4-l4.yml").exists())
         self.assertNotIn("uses: ./.github/workflows/cuda-gemma4-l4.yml", release)
-        self.assertIn("-Dcuda=false", archive_builder)
+        self.assertIn("*-linux-*)", archive_builder)
+        self.assertIn('-Dcuda="$cuda"', archive_builder)
+        self.assertIn('-Dpjrt="$pjrt"', archive_builder)
         publish = release[release.index("  publish-release-assets:"):release.index("  package-cli-artifacts:")]
         self.assertNotIn("cuda-gemma4-release-gate", publish)
 
