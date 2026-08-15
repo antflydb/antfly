@@ -5151,6 +5151,7 @@ pub fn build(b: *std.Build) void {
             "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
             "distributed graph rejects doc identity rebuild before cross-range fanout",
             "distributed graph rejects unstamped result refs before cross-range fanout",
+            "api distributed graph preserves per-shard snapshots across result refs expansion and hydration",
             "distributed graph edge reader carries identity generation",
             "query merge preserves common identity read generation",
             "query merge applies distributed typed sort ordering and cursor paging",
@@ -5589,6 +5590,19 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_api_docid_tests = addFilteredTestRunArtifact(b, lib_api_docid_tests);
+    const lib_api_graph_snapshot_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "api distributed graph preserves per-shard snapshots across result refs expansion and hydration",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_graph_snapshot_tests = addFilteredTestRunArtifact(b, lib_api_graph_snapshot_tests);
+    const lib_api_graph_snapshot_test_step = b.step("lib-api-graph-snapshot-test", "Run distributed graph snapshot-vector regression tests");
+    lib_api_graph_snapshot_test_step.dependOn(&run_lib_api_graph_snapshot_tests.step);
     const api_derived_coverage_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_derived_coverage_test_root.zig"),
         .target = target,

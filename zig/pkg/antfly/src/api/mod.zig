@@ -314,6 +314,10 @@ test "api distributed graph hydrate carries identity generation and clears cross
     try distributed_graph.testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(std.testing.allocator);
 }
 
+test "api distributed graph preserves per-shard snapshots across result refs expansion and hydration" {
+    try distributed_graph.testPerShardSnapshotsAcrossGraphPhases(std.testing.allocator);
+}
+
 test "api distributed graph cross-table hydrate enforces target authorization" {
     try distributed_graph.testCrossTableHydrateAppliesTargetAuthorizationAndClearsOrdinals(std.testing.allocator);
 }

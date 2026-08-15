@@ -165,6 +165,7 @@ MCP callers should not request
 instead of sending a serialized tool result larger than its MCP compatibility budget. The server default is 96 KiB,
 including TextContent and structuredContent; deployments with known client limits can change
 `mcp.max_tool_result_bytes` in the Antfly configuration, or set it to zero to disable the guard.
+Nonzero budgets must be at least 512 bytes, which leaves room for the actionable overflow result itself.
 
 The full OpenAPI schema is not inlined into every `tools/list` response because the schema is large and references
 recursive query/reranker/graph/join definitions. The `query.queryRequest` input schema stays permissive with compact

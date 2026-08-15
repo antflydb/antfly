@@ -2914,7 +2914,6 @@ pub const ProvisionedTableReadSource = struct {
         const group_ids = prepared.group_ids;
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-        if (group_ids.len > 1) try distributed_graph.rejectUnstampedResultRefs(req);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, .stale) catch |err| switch (err) {
@@ -3042,7 +3041,6 @@ pub const ProvisionedTableReadSource = struct {
             if (group_ids.len == 0) return null;
             try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
             try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
-            if (group_ids.len > 1) try distributed_graph.rejectUnstampedResultRefs(req);
             const plan = planFanout(.preflight, self.io_impl, group_ids.len);
             recordFanoutPlan(.preflight, plan);
             const result = if (plan.parallel)
@@ -3924,7 +3922,6 @@ pub const HostedProvisionedTableReadSource = struct {
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-        if (group_ids.len > 1) try distributed_graph.rejectUnstampedResultRefs(req);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
@@ -4004,7 +4001,6 @@ pub const HostedProvisionedTableReadSource = struct {
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
         try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
-        if (group_ids.len > 1) try distributed_graph.rejectUnstampedResultRefs(req);
         const plan = planFanout(.preflight, self.io_impl, group_ids.len);
         recordFanoutPlan(.preflight, plan);
         if (plan.parallel) {

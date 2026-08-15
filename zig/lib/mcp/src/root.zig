@@ -459,6 +459,7 @@ pub const Server = struct {
             const result = self.toolsCallResult(alloc, params) catch |err| switch (err) {
                 error.UnknownTool => return try errorResponse(alloc, id, -32602, "unknown tool"),
                 error.InvalidParams => return try errorResponse(alloc, id, -32602, "invalid params"),
+                error.ToolResultBudgetTooSmall => return try errorResponse(alloc, id, -32603, "configured tool result budget is too small"),
                 else => return err,
             };
             return try successResponse(alloc, id, result);
@@ -526,10 +527,15 @@ pub const Server = struct {
             if (self.max_tool_result_bytes > 0) {
                 const encoded = try stringifyValue(alloc, result);
                 if (encoded.len > self.max_tool_result_bytes) {
-                    return try callToolResultValue(alloc, .{
+                    const replacement = try callToolResultValue(alloc, .{
                         .is_error = true,
                         .text = self.tool_result_too_large_text,
                     });
+                    const replacement_encoded = try stringifyValue(alloc, replacement);
+                    if (replacement_encoded.len > self.max_tool_result_bytes) {
+                        return error.ToolResultBudgetTooSmall;
+                    }
+                    return replacement;
                 }
             }
             return result;
@@ -708,6 +714,37 @@ test "mcp replaces oversized tool results with a text error" {
     try std.testing.expect(parsed.value.result.isError);
     try std.testing.expectEqualStrings("narrow the query", testing.findTextContent(parsed.value.result.content).?);
     try std.testing.expect(parsed.value.result.structuredContent == null);
+}
+
+test "mcp never returns a replacement above the tool result budget" {
+    const alloc = std.testing.allocator;
+
+    const Large = struct {
+        fn call(_: *anyopaque, _: std.mem.Allocator, _: std.json.Value) !CallToolResult {
+            return .{ .text = "a large successful tool result" };
+        }
+    };
+
+    var ctx: u8 = 0;
+    var server = Server{
+        .max_tool_result_bytes = 32,
+        .tool_result_too_large_text = "this replacement is also larger than the configured result budget",
+    };
+    defer server.deinit(alloc);
+    try server.addTool(alloc, .{
+        .name = "large",
+        .description = "Return a large result",
+        .handler = .{ .ptr = &ctx, .call_fn = Large.call },
+    });
+
+    const response = (try server.handleJsonRpc(alloc,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"large","arguments":{}}}
+    )).?;
+    defer alloc.free(response);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("result") == null);
+    try std.testing.expectEqual(@as(i64, -32603), parsed.value.object.get("error").?.object.get("code").?.integer);
 }
 
 test "mcp initialized notification has no response" {

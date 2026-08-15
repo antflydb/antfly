@@ -809,7 +809,8 @@ components:
             TextContent and structuredContent. Results above the limit are
             replaced with an actionable MCP tool error. The default is 96 KiB,
             leaving envelope headroom beneath common 100 KiB connector limits.
-            Set to 0 to disable the compatibility guard.
+            Nonzero values must be at least 512 bytes so the replacement error
+            itself fits. Set to 0 to disable the compatibility guard.
 
     QueryAdmissionConfig:
       type: object

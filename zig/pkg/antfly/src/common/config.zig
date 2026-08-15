@@ -39,6 +39,7 @@ pub const default_query_max_concurrent_requests: u32 = 32;
 pub const default_write_max_concurrent_requests: u32 = 16;
 pub const default_inference_max_concurrent_requests: u32 = 32;
 pub const default_mcp_max_tool_result_bytes: u32 = 96 * 1024;
+pub const minimum_mcp_max_tool_result_bytes: u32 = 512;
 pub const local_inference_connection_id = "local-inference";
 
 pub const DeploymentMode = enum {
@@ -658,6 +659,11 @@ pub const Config = struct {
                 else => return error.InvalidConfig,
             };
             mcp_max_tool_result_bytes = try optionalU32Field(mcp_object, "max_tool_result_bytes") orelse default_mcp_max_tool_result_bytes;
+            if (mcp_max_tool_result_bytes != 0 and
+                mcp_max_tool_result_bytes < minimum_mcp_max_tool_result_bytes)
+            {
+                return error.InvalidConfig;
+            }
         }
 
         var validated = std.json.parseFromValue(common_openapi.Config, alloc, parsed_tree.value, .{
@@ -3165,6 +3171,16 @@ test "common config parses MCP tool result compatibility budget" {
     );
     defer disabled.deinit();
     try std.testing.expectEqual(@as(u32, 0), disabled.mcp.max_tool_result_bytes);
+
+    var minimum = try Config.parseFromSlice(std.testing.allocator,
+        \\{"mcp":{"max_tool_result_bytes":512}}
+    );
+    defer minimum.deinit();
+    try std.testing.expectEqual(minimum_mcp_max_tool_result_bytes, minimum.mcp.max_tool_result_bytes);
+
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{"mcp":{"max_tool_result_bytes":511}}
+    ));
 
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
         \\{"mcp":{"unknown":1}}

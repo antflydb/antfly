@@ -441,7 +441,7 @@ pub const LocalStorageConfig = struct {
 
 /// Model Context Protocol transport compatibility settings.
 pub const McpConfig = struct {
-    /// Maximum serialized MCP `tools/call` result size, including both TextContent and structuredContent. Results above the limit are replaced with an actionable MCP tool error. The default is 96 KiB, leaving envelope headroom beneath common 100 KiB connector limits. Set to 0 to disable the compatibility guard.
+    /// Maximum serialized MCP `tools/call` result size, including both TextContent and structuredContent. Results above the limit are replaced with an actionable MCP tool error. The default is 96 KiB, leaving envelope headroom beneath common 100 KiB connector limits. Nonzero values must be at least 512 bytes so the replacement error itself fits. Set to 0 to disable the compatibility guard.
     max_tool_result_bytes: ?i64 = null,
 };
 

@@ -22384,7 +22384,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     }
     try std.testing.expect(found_chunks_guidance);
 
-    server.cfg.mcp_max_tool_result_bytes = 80;
+    server.cfg.mcp_max_tool_result_bytes = common_config.minimum_mcp_max_tool_result_bytes;
     var oversized_query_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
@@ -22399,6 +22399,15 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(parsed_oversized.value.result.structuredContent == null);
     const oversized_text = mcp.testing.findTextContent(parsed_oversized.value.result.content) orelse return error.TestExpectedEqual;
     try std.testing.expect(std.mem.indexOf(u8, oversized_text, "avoid _chunks.*") != null);
+    const raw_oversized = try std.json.parseFromSlice(std.json.Value, alloc, oversized_query_resp.body, .{});
+    defer raw_oversized.deinit();
+    const encoded_oversized_result = try std.json.Stringify.valueAlloc(
+        alloc,
+        raw_oversized.value.object.get("result").?,
+        .{},
+    );
+    defer alloc.free(encoded_oversized_result);
+    try std.testing.expect(encoded_oversized_result.len <= server.cfg.mcp_max_tool_result_bytes);
 }
 
 test "api http server serves table scan as ndjson" {
