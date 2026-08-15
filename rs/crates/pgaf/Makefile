@@ -25,7 +25,8 @@ test-e2e: start-antfly
 
 start-antfly:
 	@echo "Starting Antfly standalone..."
-	@cd $(ANTFLY_DIR) && GOEXPERIMENT=simd go run ./go/pkg/antfly/cmd standalone > /tmp/antfly-test.log 2>&1 &
+	@$(MAKE) -C $(ANTFLY_DIR)/zig build
+	@cd $(ANTFLY_DIR) && ./zig/zig-out/bin/antfly standalone > /tmp/antfly-test.log 2>&1 &
 	@echo "Waiting for Antfly to be ready..."
 	@for i in $$(seq 1 30); do \
 		curl -sf http://localhost:4200/healthz > /dev/null 2>&1 && { echo "Antfly is ready."; break; }; \

@@ -81,7 +81,7 @@ const tests = [_]common.TestSpec{
         .step_name = "test-gliner2-graph-cache",
         .root_source_file = "src/finetune_graph_cache_test_root.zig",
         .description = "Run GLiNER2 autodiff objective and graph-cache tests",
-        .imports = &.{ .antfly_platform, .build_options, .ml, .onnx_graph, .inference_internal, .inference_hf_tokenizer, .protobuf, .inference_linalg },
+        .imports = &.{ .antfly_platform, .build_options, .ml, .onnx_graph, .pjrt, .inference_internal, .inference_hf_tokenizer, .protobuf, .inference_linalg },
         .native_link = .default,
         .filters = &.{
             "GLiNER2 held-out eval uses eager device execution for Metal and CUDA",

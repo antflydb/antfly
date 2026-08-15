@@ -34,9 +34,21 @@ pub fn parse(value: []const u8) ?Choice {
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
-    if (std.mem.eql(u8, value, "xla")) return .xla;
+    if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .xla;
     if (std.mem.eql(u8, value, "webgpu")) return .webgpu;
     return null;
+}
+
+pub fn preferredChoiceFromEnv() Choice {
+    if (build_options.enable_wasm or !build_options.link_libc) return .auto;
+    const value = platform.env.getenv("ANTFLY_INFERENCE_PREFERRED_BACKEND") orelse
+        platform.env.getenv("TERMITE_PREFERRED_BACKEND") orelse
+        return .auto;
+    return parse(value) orelse .auto;
+}
+
+pub fn withPreferredDefault(requested: Choice, preferred: Choice) Choice {
+    return if (requested == .auto) preferred else requested;
 }
 
 pub fn validate(choice: Choice) !void {
@@ -109,7 +121,13 @@ pub fn pjrtPluginPathFromEnv(allocator: std.mem.Allocator) !?[:0]u8 {
 test "parse accepts explicit compiled backends" {
     try std.testing.expectEqual(Choice.onnx, parse("onnx").?);
     try std.testing.expectEqual(Choice.xla, parse("xla").?);
+    try std.testing.expectEqual(Choice.xla, parse("pjrt").?);
     try std.testing.expectEqual(Choice.webgpu, parse("webgpu").?);
+}
+
+test "preferred default only replaces auto choice" {
+    try std.testing.expectEqual(Choice.xla, withPreferredDefault(.auto, .xla));
+    try std.testing.expectEqual(Choice.cuda, withPreferredDefault(.cuda, .xla));
 }
 
 test "compiledPartitionBackend maps explicit compiled backends" {

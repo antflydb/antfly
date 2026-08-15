@@ -7,12 +7,12 @@ Antfly is a distributed search engine built on [etcd's raft library](https://git
 ## Quick Start
 
 ```bash
-# Start a single-node cluster with built-in ML inference
-cd go/pkg/antfly
-go run ./cmd standalone
+# Build and start a single-node cluster with built-in ML inference
+make build
+./antfly standalone
 
 # Or run with Docker
-docker run -p 8080:8080 ghcr.io/antflydb/antfly:omni
+docker run -p 8080:8080 ghcr.io/antflydb/antfly:latest
 ```
 
 That gives you the [Antfarm dashboard](ts/apps/antfarm) at `http://localhost:8080` — playgrounds for search, RAG, knowledge graphs, embeddings, reranking, and more.
@@ -22,8 +22,8 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 ## Features
 
 - **Hybrid search** — full-text (BM25), dense vectors, and [sparse vectors (SPLADE)](https://huggingface.co/naver/splade-cocondenser-ensembledistil), all in one query
-- **RAG agents** — built-in [retrieval-augmented generation](go/pkg/antfly/src/metadata/retrieval_agent.go) with streaming, multi-turn chat, tool calling (web search, graph traversal), and confidence scoring
-- **Graph indexes** — automatic [relationship extraction](go/pkg/antfly/src/store/db/indexes/graph_index.go) and graph traversal queries over your data
+- **RAG agents** — built-in [retrieval-augmented generation](zig/pkg/antfly/src/api/retrieval_agent.zig) with streaming, multi-turn chat, tool calling (web search, graph traversal), and confidence scoring
+- **Graph indexes** — automatic relationship extraction and [graph traversal](zig/pkg/antfly/src/graph) over your data
 - **Multimodal** — index and search [images, audio, and video](docs/guides/multimodal.mdx) with CLIP, CLAP, and vision-language models
 - **Reranking** — cross-encoder reranking with score-based pruning to cut the noise
 - **Aggregations** — stats (sum/min/max/avg) and terms facets for analytics
@@ -32,13 +32,12 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 - **S3 storage** — store data in [S3/MinIO/R2](docs/s3-storage.md) for big cost savings and way faster shard splits
 - **SIMD / SME acceleration** — vector operations use hardware intrinsics via [go-highway](https://github.com/ajroetker/go-highway) on x86 and ARM
 - **Distributed** — Raft consensus, automatic sharding and replication, horizontal scaling
-- **Enrichment pipelines** — [configurable pipelines](go/pkg/antfly/src/store/db/indexes/walenricher.go) per index for embeddings, summaries, graph edges, and custom computed fields
+- **Enrichment pipelines** — [configurable pipelines](zig/pkg/antfly/src/storage/db/enrichment) per index for embeddings, summaries, graph edges, and custom computed fields
 - **Bring your own models** — Ollama, OpenAI, Bedrock, Google, or run models locally with Antfly inference
-- **Auth** — built-in [user management](go/pkg/antfly/src/usermgr) with API keys, basic auth, and bearer tokens
+- **Auth** — built-in [user management](zig/pkg/antfly/src/usermgr) with API keys, basic auth, and bearer tokens
 - **Backup & restore** — to local disk or S3
 - **Kubernetes operator** — deploy and manage clusters with the [operator](go/pkg/operator)
-- **MCP server** — [Model Context Protocol](go/pkg/antfly/src/mcp) so LLMs can use Antfly as a tool
-- **A2A protocol** — [Agent-to-Agent](go/pkg/antfly/src/a2a) support for Google's A2A standard
+- **MCP and A2A protocols** — [protocol adapters](zig/pkg/antfly/src/api/protocol_adapters.zig) let agents and LLMs use Antfly directly
 - **Antfarm** — [web dashboard](ts/apps/antfarm) with playgrounds for search, RAG, knowledge graphs, embeddings, reranking, chunking, NER, OCR, and transcription
 
 ## Documentation
@@ -89,14 +88,14 @@ Antfly uses a multi-raft design with separate consensus groups:
 - **Metadata raft** — table schemas, shard assignments, cluster topology
 - **Storage rafts** — one per shard, handling data, indexes, and queries
 
-End-to-end [chaos tests](go/e2e/) — inspired by [Jepsen](https://jepsen.io/) — cover node crashes, leader failures, shard splits under load, and cluster scaling. These tests run real multi-node clusters and inject faults to verify that Raft consensus, transactions, and replication behave correctly under failure.
+End-to-end [chaos tests](zig/e2e/antfly) — inspired by [Jepsen](https://jepsen.io/) — cover node crashes, leader failures, shard splits under load, and cluster scaling. These tests run real multi-node clusters and inject faults to verify that Raft consensus, transactions, and replication behave correctly under failure.
 
-Critical distributed protocols are formally specified and model-checked with [TLA+](specs/tla):
+Critical distributed protocols are formally specified, model-checked, and trace-validated with [TLA+](zig/specs/tla):
 
-- [AntflyTransaction](specs/tla/AntflyTransaction.tla) — distributed transaction protocol
-- [occ-2pc](specs/tla/occ-2pc.tla) — optimistic concurrency control with two-phase commit
-- [AntflySnapshotTransfer](specs/tla/AntflySnapshotTransfer.tla) — Raft snapshot transfer
-- [AntflyShardSplit](specs/tla/AntflyShardSplit.tla) — shard split coordination
+- [AntflyTransaction](zig/specs/tla/AntflyTransaction.tla) — distributed transaction protocol
+- [occ-2pc](zig/specs/tla/occ-2pc.tla) — optimistic concurrency control with two-phase commit
+- [AntflySnapshotTransfer](zig/specs/tla/AntflySnapshotTransfer.tla) — Raft snapshot transfer
+- [AntflyShardSplit](zig/specs/tla/AntflyShardSplit.tla) — shard split coordination
 
 ## Community
 

@@ -76,6 +76,9 @@ class Antfly < Formula
     include.install Dir["include/*"] if Dir.exist?("include")
     lib.install Dir["lib/*"] if Dir.exist?("lib")
     (share/"antfly").install Dir["share/antfly/*"] if Dir.exist?("share/antfly")
+    bash_completion.install "completions/antfly.bash" => "antfly"
+    zsh_completion.install "completions/antfly.zsh" => "_antfly"
+    fish_completion.install "completions/antfly.fish"
   end
 
   service do
@@ -98,12 +101,8 @@ class Antfly < Formula
     <<~EOS
       antfly is now the native Zig runtime.
 
-      Existing data directories created by the Go/omni runtime are not opened
-      in place. Create a portable backup with the previous Go/omni runtime,
-      start the Zig runtime with a fresh data directory, then restore the backup.
-
-      The Go/omni runtime remains available as:
-        brew install antflydb/taps/antfly-go
+      Create and verify a portable backup before upgrading across storage-format
+      changes, and restore into a fresh data directory when rollback is needed.
 
       Start the local single-node service with:
         brew services start antflydb/taps/antfly

@@ -61,8 +61,8 @@ const standalone_session_max_record_bytes: usize = 16 * 1024 * 1024;
 const standalone_session_savepoint_limit: usize = 64;
 const antfarm_installed_asset_root = "../share/antfly/antfarm";
 const antfarm_asset_roots = [_][]const u8{
-    "src/metadata/antfarm",
-    "../src/metadata/antfarm",
+    "zig/pkg/antfly/antfarm",
+    "pkg/antfly/antfarm",
     "/usr/share/antfly/antfarm",
     "antfarm",
 };
