@@ -81,7 +81,19 @@ pub const SparseEmbeddingPipeline = struct {
         if (embedding_mod.textSessionBatchPlan(self.session, texts.len)) |plan| {
             return self.embedWithBatchPlan(texts, plan);
         }
-        return self.embedDirect(texts, texts.len);
+        return self.embedDirect(texts, texts.len) catch |err| switch (err) {
+            // Dynamic sparse outputs scale with batch * sequence * vocabulary.
+            // If the full batch cannot fit the configured request budget, keep
+            // the API batch contract by executing bounded single-row chunks.
+            error.ResourceLimitExceeded => if (texts.len > 1)
+                self.embedWithBatchPlan(texts, .{
+                    .batch_size = 1,
+                    .pad_final_batch = false,
+                })
+            else
+                err,
+            else => err,
+        };
     }
 
     /// Execute one backend batch while tokenizing only caller-provided rows.
@@ -772,6 +784,41 @@ test "sparse embedding batches dynamic native sessions and trims padded sequence
     try std.testing.expectEqual(@as(usize, 3), vectors.len);
 }
 
+test "sparse embedding preserves batch requests when full batch exceeds admission budget" {
+    const alloc = std.testing.allocator;
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    controller.configureSharedLimits(.{ .host_limit_bytes = 3000 });
+    var session_state = FakeDynamicBatchSparseSession{};
+    var session = session_state.session();
+    session.run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{
+            .host_limit_bytes = 3000,
+            .combined_limit_bytes = 3000,
+            .scratch_limit_bytes = 3000,
+        },
+        .static_workspace_bytes = 1,
+        .check_live_memory = false,
+    };
+    var tokenizer_state = FakeSparseTokenizer{};
+    var pipeline = SparseEmbeddingPipeline{
+        .allocator = alloc,
+        .session = session,
+        .tok = tokenizer_state.tokenizer(),
+        .config = .{ .max_length = 8, .top_k = 4 },
+    };
+
+    const vectors = try pipeline.embed(&.{ "a", "bb", "ccc" });
+    defer freeSparseVectorSlice(alloc, vectors);
+
+    try std.testing.expectEqual(@as(usize, 3), vectors.len);
+    try std.testing.expectEqual(@as(usize, 3), session_state.run_count);
+    try std.testing.expectEqual(@as(usize, 1), session_state.max_batch_seen);
+    try std.testing.expectEqual(@as(usize, 3), tokenizer_state.encode_count);
+}
+
 test "sparse embedding admission denial happens before tokenization" {
     const alloc = std.testing.allocator;
     const memory = @import("../runtime/tier/memory.zig");
@@ -805,6 +852,7 @@ const FakeDynamicBatchSparseSession = struct {
     run_count: usize = 0,
     last_batch: usize = 0,
     last_sequence: usize = 0,
+    max_batch_seen: usize = 0,
 
     fn session(self: *FakeDynamicBatchSparseSession) backends.Session {
         return .{
@@ -829,6 +877,7 @@ const FakeDynamicBatchSparseSession = struct {
         self.run_count += 1;
         self.last_batch = batch;
         self.last_sequence = sequence;
+        self.max_batch_seen = @max(self.max_batch_seen, batch);
 
         const logits = try allocator.alloc(f32, batch * 4);
         defer allocator.free(logits);

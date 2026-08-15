@@ -23846,6 +23846,27 @@ components:
         multi_label:
           type: boolean
           default: false
+          description: >
+            When false, return the highest-ranked labels up to `top_k` (one by
+
+            default). When true, return every label meeting `options.threshold`.
+        hypothesis_template:
+          type: string
+          default: This example is {}.
+          description: >
+            NLI hypothesis template for this named taxonomy. Use `{}` as the
+
+            candidate-label placeholder. Non-NLI extractors ignore this field.
+        top_k:
+          type: integer
+          minimum: 1
+          default: 1
+          description: >
+            Maximum labels returned for single-label classification. Ignored
+
+            when `multi_label` is true, where `options.threshold` controls the
+
+            returned set.
     ExtractionStructureField:
       oneOf:
         - type: string

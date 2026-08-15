@@ -58,6 +58,16 @@ def test_models_exposes_gliner2_as_extractor(api):
         assert "text" in inputs
 
 
+def test_models_exposes_nli_classifiers_as_extractors(api):
+    resp = api.models()
+    model = resp["extractors"].get("cross-encoder/nli-distilroberta-base")
+    if model is None:
+        pytest.skip("NLI classifier model is not available")
+    caps = model.get("capabilities", [])
+    assert {"classification", "zero_shot", "multi_label"}.issubset(caps)
+    assert "cross-encoder/nli-distilroberta-base" not in resp["classifiers"]
+
+
 def test_models_exposes_reader_inputs(api):
     resp = api.models()
     readers = resp.get("readers", {})

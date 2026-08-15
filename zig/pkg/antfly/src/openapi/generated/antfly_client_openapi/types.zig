@@ -3194,7 +3194,12 @@ pub const ExtractionClassification = struct {
 pub const ExtractionClassificationSchema = struct {
     name: []const u8,
     labels: []const []const u8,
+    /// When false, return the highest-ranked labels up to `top_k` (one by default). When true, return every label meeting `options.threshold`.
     multi_label: ?bool = null,
+    /// NLI hypothesis template for this named taxonomy. Use `{}` as the candidate-label placeholder. Non-NLI extractors ignore this field.
+    hypothesis_template: ?[]const u8 = null,
+    /// Maximum labels returned for single-label classification. Ignored when `multi_label` is true, where `options.threshold` controls the returned set.
+    top_k: ?i64 = null,
 };
 
 pub const ExtractionEntity = struct {

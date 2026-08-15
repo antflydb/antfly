@@ -995,7 +995,11 @@ describe("InferenceClient with mock fetch", () => {
         "gliner2-base-v1",
         ["This product is excellent."],
         ["positive", "negative"],
-        { multiLabel: true }
+        {
+          multiLabel: true,
+          hypothesisTemplate: "This review is {}.",
+          topK: 2,
+        }
       );
 
       expect(result).toEqual([
@@ -1017,6 +1021,8 @@ describe("InferenceClient with mock fetch", () => {
               name: "classification",
               labels: ["positive", "negative"],
               multi_label: true,
+              hypothesis_template: "This review is {}.",
+              top_k: 2,
             },
           ],
         },

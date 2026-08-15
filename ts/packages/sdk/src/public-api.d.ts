@@ -12955,8 +12955,25 @@ export interface components {
         ExtractionClassificationSchema: {
             name: string;
             labels: string[];
-            /** @default false */
+            /**
+             * @description When false, return the highest-ranked labels up to `top_k` (one by
+             *     default). When true, return every label meeting `options.threshold`.
+             * @default false
+             */
             multi_label?: boolean;
+            /**
+             * @description NLI hypothesis template for this named taxonomy. Use `{}` as the
+             *     candidate-label placeholder. Non-NLI extractors ignore this field.
+             * @default This example is {}.
+             */
+            hypothesis_template?: string;
+            /**
+             * @description Maximum labels returned for single-label classification. Ignored
+             *     when `multi_label` is true, where `options.threshold` controls the
+             *     returned set.
+             * @default 1
+             */
+            top_k?: number;
         };
         ExtractionStructureField: string | ({
             /** @enum {string} */

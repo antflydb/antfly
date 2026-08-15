@@ -889,8 +889,8 @@ jobs:
           test "$BUILD_RESULT" = "success"
           test "$TEST_RESULT" = "success"
 
-  e2e-full:
-    name: e2e-full
+  e2e-full-tests:
+    name: e2e-full / ${{ matrix.suite }}
     needs: changes
     if: |
       github.event_name == 'merge_group' ||
@@ -898,9 +898,13 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
-    timeout-minutes: 120
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [inference, antfly]
     env:
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}-${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
@@ -926,15 +930,15 @@ jobs:
 
       - name: Restore ARC cache dirs
         run: |
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}-${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache" "$UV_CACHE_DIR" "$HF_HOME"
-          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-antfly
+          mkdir -p "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-full-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
-          ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
-          ln -s /mnt/cache/antfly/zig/home-antfly ~/.antfly
+          ln -s "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" ~/.cache
+          ln -s "/mnt/cache/antfly/zig/home-antfly-full-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
@@ -947,17 +951,20 @@ jobs:
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
       - name: Set up Rust WASI target
+        if: matrix.suite == 'antfly'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip2
 
       - name: Build MemoryAF extension package
+        if: matrix.suite == 'antfly'
         run: cargo build --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
 
       - name: Build E2E binaries
         run: scripts/ci/zig-build-e2e-binaries.sh
 
       - name: Install Wasmtime C API
+        if: matrix.suite == 'antfly'
         env:
           WASMTIME_VERSION: v45.0.2
         run: |
@@ -979,8 +986,7 @@ jobs:
           echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Run Antfly inference full E2E
-        id: inference_full_e2e
-        continue-on-error: true
+        if: matrix.suite == 'inference'
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
@@ -999,12 +1005,8 @@ jobs:
           chmod +x ./zig-out/bin/antfly
           taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
 
-      # Run the non-inference suite second so large model imports see the
-      # runner's maximum available memory after the build has exited.
       - name: Run Antfly full E2E
-        id: antfly_full_e2e
-        if: always()
-        continue-on-error: true
+        if: matrix.suite == 'antfly'
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
@@ -1013,14 +1015,19 @@ jobs:
           chmod +x ./zig-out/bin/antfly
           taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q --continue-on-collection-errors e2e/antfly
 
-      - name: Report full E2E result
-        if: always()
+  e2e-full:
+    name: e2e-full
+    needs: [changes, e2e-full-tests]
+    if: |
+      always() &&
+      (github.event_name == 'merge_group' ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.schedule == '0 8 * * *')
+    runs-on: arc-antfly-standard
+    steps:
+      - name: Verify full E2E suites
         env:
-          ANTFLY_E2E_OUTCOME: ${{ steps.antfly_full_e2e.outcome }}
-          INFERENCE_E2E_OUTCOME: ${{ steps.inference_full_e2e.outcome }}
+          TEST_RESULT: ${{ needs.e2e-full-tests.result }}
         run: |
-          if [[ "$ANTFLY_E2E_OUTCOME" != "success" || "$INFERENCE_E2E_OUTCOME" != "success" ]]; then
-            echo "Antfly E2E: $ANTFLY_E2E_OUTCOME" >&2
-            echo "Inference E2E: $INFERENCE_E2E_OUTCOME" >&2
-            exit 1
-          fi
+          test "$TEST_RESULT" = "success"

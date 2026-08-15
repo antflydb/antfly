@@ -444,6 +444,8 @@ export class InferenceClient {
       multiLabel?: boolean;
       threshold?: number;
       includeConfidence?: boolean;
+      hypothesisTemplate?: string;
+      topK?: number;
     }
   ): Promise<ClassificationResult[]> {
     const response = await this.extractRaw({
@@ -455,6 +457,8 @@ export class InferenceClient {
             name: "classification",
             labels,
             multi_label: options?.multiLabel,
+            hypothesis_template: options?.hypothesisTemplate,
+            top_k: options?.topK,
           },
         ],
       },

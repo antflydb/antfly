@@ -2271,11 +2271,12 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
         const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
         const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
         const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
+        const zero_shot_classification = if (maybe_manifest) |*man| manifestSupportsZeroShotClassification(man) else false;
 
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
             if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
-            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities)) {
+            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities, zero_shot_classification)) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -2298,7 +2299,14 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
         const model_task = @tagName(model.manifest.model_type);
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
-            if (taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) {
+            if (taskMatchesModelListing(
+                task,
+                model_task,
+                model.manifest.gliner_model_type,
+                model.manifest.tasks,
+                model.manifest.capabilities,
+                manifestSupportsZeroShotClassification(&model.manifest),
+            )) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -2335,11 +2343,12 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
         const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
         const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
         const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
+        const zero_shot_classification = if (maybe_manifest) |*man| manifestSupportsZeroShotClassification(man) else false;
 
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
             if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
-            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities)) {
+            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities, zero_shot_classification)) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -2363,21 +2372,7 @@ fn validateRequestModelIdentifier(raw: []const u8) !void {
     const identifier = if (colon) |index| value[0..index] else value;
     if (colon) |index| {
         const variant = value[index + 1 ..];
-        if (variant.len == 0 or
-            std.mem.indexOfScalar(u8, variant, '/') != null or
-            variant.len > 256)
-        {
-            return error.InvalidModelIdentifier;
-        }
-        var variant_components = std.mem.splitScalar(u8, variant, ':');
-        while (variant_components.next()) |component| {
-            if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) {
-                return error.InvalidModelIdentifier;
-            }
-            for (component) |byte| {
-                if (byte < 0x20 or byte == 0x7f) return error.InvalidModelIdentifier;
-            }
-        }
+        if (!registry_mod.modelVariantIsSafe(variant)) return error.InvalidModelIdentifier;
     }
 
     var components = std.mem.splitScalar(u8, identifier, '/');
@@ -2437,6 +2432,29 @@ fn loadedModelRequestIdentifier(canonical_models_dir: []const u8, canonical_mode
     return identifier;
 }
 
+fn loadedModelRequestIdentifierAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    canonical_models_dir: []const u8,
+    canonical_model_dir: []const u8,
+) !?[]u8 {
+    const managed_identifier = registry_mod.managedModelRequestNameAlloc(
+        allocator,
+        io,
+        canonical_model_dir,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    };
+    if (managed_identifier) |identifier| return identifier;
+
+    const relative = loadedModelRequestIdentifier(
+        canonical_models_dir,
+        canonical_model_dir,
+    ) orelse return null;
+    return try allocator.dupe(u8, relative);
+}
+
 test "loaded model listing uses model directories and safe relative identifiers" {
     const discovered = [_]registry_mod.ModelEntry{.{
         .name = "owner/model",
@@ -2459,6 +2477,39 @@ test "loaded model listing uses model directories and safe relative identifiers"
     try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/tmp/private-model") == null);
     try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/srv/models/owner/model\nbackend=metal") == null);
     try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/srv/models/owner/model:q4") == null);
+}
+
+test "loaded model listing preserves managed variant identity without exposing cache leaves" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/owner/model--antfly-0123456789abcdef");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model--antfly-0123456789abcdef/model.gguf",
+        .data = "decoder",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model--antfly-0123456789abcdef/.antfly-download-complete.json",
+        .data =
+        \\{"version":2,"source":{"owner":"owner","name":"model","variant":"gguf:Q4_K_M"},"artifacts":[{"path":"model.gguf","size":7}]}
+        ,
+    });
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
+    defer allocator.free(models_dir);
+    const model_dir = try std.fs.path.join(allocator, &.{ models_dir, "owner", "model--antfly-0123456789abcdef" });
+    defer allocator.free(model_dir);
+
+    const identifier = (try loadedModelRequestIdentifierAlloc(
+        allocator,
+        io,
+        models_dir,
+        model_dir,
+    )).?;
+    defer allocator.free(identifier);
+    try std.testing.expectEqualStrings("owner/model:gguf:Q4_K_M", identifier);
 }
 
 const RequestModelResolutionErrorKind = enum { invalid, missing, internal };
@@ -9781,6 +9832,27 @@ pub const Node = struct {
         return self.extractEntitiesAndRelations(ctx, entity_request, direct_inputs.texts.items, has_relations);
     }
 
+    /// Resolve a public classification model by stable request ID before
+    /// consulting legacy task directories. The model manifest, not its cache
+    /// bucket, decides which classification pipeline runs.
+    fn resolveClassificationRequestModelPath(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model_name: []const u8,
+    ) ![]const u8 {
+        const lookup_scopes = [_]?[]const u8{ null, "classifiers", "extractors" };
+        for (lookup_scopes) |scope| {
+            if (self.resolveRequestModelPath(allocator, io, model_name, scope)) |path| {
+                return path;
+            } else |err| switch (requestModelResolutionErrorKind(err)) {
+                .missing => continue,
+                .invalid, .internal => return err,
+            }
+        }
+        return error.ModelNotFound;
+    }
+
     fn extractClassifications(
         self: *Node,
         ctx: *httpx.Context,
@@ -9792,7 +9864,7 @@ pub const Node = struct {
         self.metrics.incRequest("extract");
         defer self.metrics.decActive();
 
-        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, body.model, "extractors") catch |err|
+        const model_path = self.resolveClassificationRequestModelPath(ctx.allocator, ctx.io, body.model) catch |err|
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
@@ -9800,7 +9872,7 @@ pub const Node = struct {
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
-        if (!model.isGlinerModel() or !model.supportsClassification()) {
+        if (!model.supportsClassification()) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "model does not support classification extraction" });
         }
 
@@ -9810,29 +9882,56 @@ pub const Node = struct {
         const lists = try alloc.alloc(std.ArrayListUnmanaged(extraction_api.ExtractionClassification), texts.len);
         for (lists) |*list| list.* = .empty;
 
-        var pipeline = model.glinerPipeline(ctx.allocator);
         const schemas = body.schema.classifications orelse &.{};
         const options = body.options orelse extraction_api.ExtractionOptions{};
+        var prompt_tokens: usize = 0;
         for (schemas) |schema| {
             if (schema.name.len == 0 or schema.labels.len == 0) {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "classification name and labels are required" });
             }
-            const results = pipeline.classifyBatch(texts, schema.labels, .{
-                .threshold = options.threshold orelse 0.0,
-                .multi_label = schema.multi_label orelse false,
-                .top_k = if (schema.multi_label orelse false) 0 else 1,
-            }) catch |err| return inferenceFailureResponse(ctx, err);
-            defer {
-                for (results) |items| ctx.allocator.free(items);
-                ctx.allocator.free(results);
+            if (schema.top_k) |top_k| {
+                if (top_k < 1) {
+                    return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "classification top_k must be at least 1" });
+                }
             }
-            for (results, 0..) |items, input_index| {
-                for (items) |item| try lists[input_index].append(alloc, .{
-                    .name = schema.name,
-                    .label = item.label,
-                    .score = if (options.include_confidence orelse false) item.score else null,
+
+            if (model.isGlinerModel()) {
+                var pipeline = model.glinerPipeline(ctx.allocator);
+                const multi_label = schema.multi_label orelse false;
+                const results = pipeline.classifyBatch(texts, schema.labels, .{
+                    .threshold = options.threshold orelse 0.0,
+                    .multi_label = multi_label,
+                    .top_k = if (multi_label) 0 else @intCast(schema.top_k orelse 1),
+                }) catch |err| return inferenceFailureResponse(ctx, err);
+                defer freeClassificationBatch(ctx.allocator, results);
+                try appendExtractionClassificationBatch(alloc, lists, schema, options, results);
+                const schema_prompt_tokens =
+                    (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), texts) catch estimateTextsTokens(texts)) +
+                    (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), schema.labels) catch estimateTextsTokens(schema.labels));
+                prompt_tokens = std.math.add(usize, prompt_tokens, schema_prompt_tokens) catch
+                    return inferenceFailureResponse(ctx, error.ResourceLimitExceeded);
+                continue;
+            }
+
+            if (!manifestSupportsZeroShotClassification(&model.manifest)) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_MODEL",
+                    .message = "fixed-label classifiers do not accept request-defined labels",
                 });
             }
+            var pipeline = model.classificationPipeline(ctx.allocator, .{
+                .max_length = model.manifest.max_position_embeddings,
+                .hypothesis_template = schema.hypothesis_template orelse "This example is {}.",
+                .multi_label = schema.multi_label orelse false,
+                .entailment_index = nliEntailmentIndex(model.manifest.id2label),
+            });
+            var schema_prompt_tokens: usize = 0;
+            const results = pipeline.classifyBatchWithPromptTokens(texts, schema.labels, &schema_prompt_tokens) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            defer freeClassificationBatch(ctx.allocator, results);
+            try appendExtractionClassificationBatch(alloc, lists, schema, options, results);
+            prompt_tokens = std.math.add(usize, prompt_tokens, schema_prompt_tokens) catch
+                return inferenceFailureResponse(ctx, error.ResourceLimitExceeded);
         }
 
         const data = try alloc.alloc(extraction_api.ExtractionObject, texts.len);
@@ -9840,10 +9939,17 @@ pub const Node = struct {
             .id = body.inputs[index].id,
             .classifications = lists[index].items,
         };
+
+        var usage: std.json.ObjectMap = .empty;
+        try usage.ensureTotalCapacity(alloc, 3);
+        usage.putAssumeCapacity("prompt_tokens", .{ .integer = @intCast(prompt_tokens) });
+        usage.putAssumeCapacity("completion_tokens", .{ .integer = 0 });
+        usage.putAssumeCapacity("total_tokens", .{ .integer = @intCast(prompt_tokens) });
         return ctx.json(extraction_api.ExtractionResponse{
             .object = "extraction",
             .model = body.model,
             .data = data,
+            .usage = .{ .object = usage },
         });
     }
 
@@ -9934,6 +10040,7 @@ pub const Node = struct {
                 manifest.gliner_model_type,
                 manifest.tasks,
                 manifest.capabilities,
+                manifestSupportsZeroShotClassification(&manifest),
             );
             const compatibility_summary = self.compatibilitySummaryForDir(a, entry.path) catch CompatibilitySummary{
                 .level = .unknown,
@@ -9978,13 +10085,16 @@ pub const Node = struct {
         const LoadedListing = struct {
             model: *model_manager_mod.LoadedModel,
             canonical_model_dir: []u8,
-            identifier: []const u8,
+            identifier: []u8,
         };
         var loaded_listings = std.ArrayListUnmanaged(LoadedListing).empty;
         var selected_loaded_dirs = std.ArrayListUnmanaged([]const u8).empty;
         var canonical_discovered_dirs = std.ArrayListUnmanaged([]u8).empty;
         defer {
-            for (loaded_listings.items) |listing| a.free(listing.canonical_model_dir);
+            for (loaded_listings.items) |listing| {
+                a.free(listing.canonical_model_dir);
+                a.free(listing.identifier);
+            }
             for (canonical_discovered_dirs.items) |path| a.free(path);
             loaded_listings.deinit(a);
             selected_loaded_dirs.deinit(a);
@@ -10025,11 +10135,20 @@ pub const Node = struct {
                     a.free(canonical_model_dir);
                     continue;
                 }
-                const identifier = loadedModelRequestIdentifier(models_root, canonical_model_dir) orelse {
+                const identifier = loadedModelRequestIdentifierAlloc(
+                    a,
+                    io,
+                    models_root,
+                    canonical_model_dir,
+                ) catch |err| {
+                    a.free(canonical_model_dir);
+                    return err;
+                } orelse {
                     a.free(canonical_model_dir);
                     continue;
                 };
                 if (stringSliceContains(selected_loaded_dirs.items, canonical_model_dir)) {
+                    a.free(identifier);
                     a.free(canonical_model_dir);
                     continue;
                 }
@@ -10039,11 +10158,13 @@ pub const Node = struct {
                     .canonical_model_dir = canonical_model_dir,
                     .identifier = identifier,
                 }) catch |err| {
+                    a.free(identifier);
                     a.free(canonical_model_dir);
                     return err;
                 };
                 selected_loaded_dirs.append(a, canonical_model_dir) catch |err| {
                     loaded_listings.items.len -= 1;
+                    a.free(identifier);
                     a.free(canonical_model_dir);
                     return err;
                 };
@@ -10057,6 +10178,8 @@ pub const Node = struct {
             try body.appendSlice(a, "\":{");
 
             var model_count: usize = 0;
+            var listed_model_names = std.StringHashMapUnmanaged(void).empty;
+            defer listed_model_names.deinit(a);
 
             // Add built-in chunkers
             if (std.mem.eql(u8, task, "chunkers")) {
@@ -10075,7 +10198,16 @@ pub const Node = struct {
                 const inputs = listing.manifest.inputs;
                 const has_visual = listing.manifest.visual_model_path != null or listing.manifest.visual_projection_path != null;
                 const has_audio = listing.manifest.audio_model_path != null or listing.manifest.audio_projection_path != null;
-                if (!taskMatchesModelListing(task, listing.kind, gliner_model_type, tasks, capabilities)) continue;
+                if (!taskMatchesModelListing(
+                    task,
+                    listing.kind,
+                    gliner_model_type,
+                    tasks,
+                    capabilities,
+                    manifestSupportsZeroShotClassification(&listing.manifest),
+                )) continue;
+                const listed = try listed_model_names.getOrPut(a, entry.name);
+                if (listed.found_existing) continue;
 
                 if (model_count > 0) try body.append(a, ',');
                 try jsonEncodeString(&body, a, entry.name);
@@ -10091,6 +10223,7 @@ pub const Node = struct {
                     gliner_model_type,
                     capabilities,
                     inputs,
+                    manifestSupportsZeroShotClassification(&listing.manifest),
                     has_visual,
                     has_audio,
                     chat_template_failed,
@@ -10115,72 +10248,57 @@ pub const Node = struct {
                 model_count += 1;
             }
 
-            // Add loaded models not yet listed (loaded by path, not discovered by name)
-            {
-                self.model_manager.lockLoadedModels();
-                defer self.model_manager.unlockLoadedModels();
-                var loaded_paths_seen = std.ArrayListUnmanaged([]const u8).empty;
-                defer loaded_paths_seen.deinit(a);
-                var it = self.model_manager.loaded.iterator();
-                while (it.next()) |entry| {
-                    const model = entry.value_ptr.*;
-                    const model_task = @tagName(model.manifest.model_type);
-                    if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
+            // Add loaded models not currently visible to discovery. The
+            // snapshot keeps them alive, and each listing has already been
+            // canonicalized to a safe request identifier outside the lock.
+            for (loaded_listings.items) |listing| {
+                const model = listing.model;
+                const model_task = @tagName(model.manifest.model_type);
+                if (!taskMatchesModelListing(
+                    task,
+                    model_task,
+                    model.manifest.gliner_model_type,
+                    model.manifest.tasks,
+                    model.manifest.capabilities,
+                    manifestSupportsZeroShotClassification(&model.manifest),
+                )) continue;
+                const listed = try listed_model_names.getOrPut(a, listing.identifier);
+                if (listed.found_existing) continue;
 
-                    // Skip if already listed from discovery
-                    var already_listed = false;
-                    for (discovered) |d| {
-                        if (std.mem.eql(u8, d.path, model.model_dir)) {
-                            already_listed = true;
-                            break;
-                        }
-                    }
-                    if (!already_listed) {
-                        for (loaded_paths_seen.items) |path| {
-                            if (std.mem.eql(u8, path, model.model_dir)) {
-                                already_listed = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!already_listed) {
-                        try loaded_paths_seen.append(a, model.model_dir);
-                        if (model_count > 0) try body.append(a, ',');
-                        try jsonEncodeString(&body, a, model.model_dir);
-                        try body.append(a, ':');
-                        const loaded_compatibility = self.compatibilitySummaryForDir(a, model.model_dir) catch CompatibilitySummary{
-                            .level = .unknown,
-                            .code = .artifact_unreadable,
-                            .message = "model compatibility could not be determined",
-                        };
-                        try appendModelInfo(
-                            &body,
+                if (model_count > 0) try body.append(a, ',');
+                try jsonEncodeString(&body, a, listing.identifier);
+                try body.append(a, ':');
+                const loaded_compatibility = self.compatibilitySummaryForDir(a, listing.canonical_model_dir) catch CompatibilitySummary{
+                    .level = .unknown,
+                    .code = .artifact_unreadable,
+                    .message = "model compatibility could not be determined",
+                };
+                try appendModelInfo(
+                    &body,
+                    a,
+                    model_task,
+                    model.manifest.gliner_model_type,
+                    model.manifest.capabilities,
+                    model.manifest.inputs,
+                    manifestSupportsZeroShotClassification(&model.manifest),
+                    model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
+                    model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
+                    model.chat_template_failed,
+                    @tagName(loaded_compatibility.level),
+                );
+                if (isOpenAiListTask(task)) {
+                    const enabled = loaded_compatibility.level == .compatible or
+                        (loaded_compatibility.level == .unknown and self.config.allow_unknown_models);
+                    if (enabled) {
+                        try appendUniqueOpenAiModelEntry(
+                            &openai_data,
                             a,
-                            model_task,
-                            model.manifest.gliner_model_type,
-                            model.manifest.capabilities,
-                            model.manifest.inputs,
-                            model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
-                            model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
-                            model.chat_template_failed,
+                            &openai_models,
+                            &openai_data_count,
+                            listing.identifier,
+                            list_created,
                             @tagName(loaded_compatibility.level),
                         );
-                        if (isOpenAiListTask(task)) {
-                            const enabled = loaded_compatibility.level == .compatible or
-                                (loaded_compatibility.level == .unknown and self.config.allow_unknown_models);
-                            if (enabled) {
-                                try appendUniqueOpenAiModelEntry(
-                                    &openai_data,
-                                    a,
-                                    &openai_models,
-                                    &openai_data_count,
-                                    model.model_dir,
-                                    list_created,
-                                    @tagName(loaded_compatibility.level),
-                                );
-                            }
-                        }
-                        model_count += 1;
                     }
                 }
                 model_count += 1;
@@ -10433,6 +10551,52 @@ pub const Node = struct {
         });
     }
 };
+
+fn nliEntailmentIndex(id2label: ?[]const []const u8) ?usize {
+    const labels = id2label orelse return null;
+    for (labels, 0..) |label, index| {
+        if (std.ascii.eqlIgnoreCase(label, "entailment")) return index;
+    }
+    return null;
+}
+
+fn manifestSupportsZeroShotClassification(manifest: *const manifest_mod.ModelManifest) bool {
+    if (model_caps.hasCapability(manifest.capabilities, "zero_shot")) return true;
+    if (std.mem.eql(u8, manifest.gliner_model_type, "gliner2")) return true;
+    return manifest.model_type == .classifier and nliEntailmentIndex(manifest.id2label) != null;
+}
+
+fn freeClassificationBatch(allocator: std.mem.Allocator, results: anytype) void {
+    for (results) |items| allocator.free(items);
+    allocator.free(results);
+}
+
+fn appendExtractionClassificationBatch(
+    allocator: std.mem.Allocator,
+    lists: []std.ArrayListUnmanaged(extraction_api.ExtractionClassification),
+    schema: extraction_api.ExtractionClassificationSchema,
+    options: extraction_api.ExtractionOptions,
+    results: anytype,
+) !void {
+    if (results.len != lists.len) return error.InvalidExtractionResponse;
+    const multi_label = schema.multi_label orelse false;
+    const top_k = std.math.cast(usize, schema.top_k orelse 1) orelse return error.InvalidTopK;
+    const threshold = options.threshold orelse 0.0;
+
+    for (results, 0..) |items, input_index| {
+        var appended: usize = 0;
+        for (items) |item| {
+            if (multi_label and item.score < threshold) continue;
+            if (!multi_label and appended >= top_k) break;
+            try lists[input_index].append(allocator, .{
+                .name = schema.name,
+                .label = item.label,
+                .score = if (options.include_confidence orelse false) item.score else null,
+            });
+            appended += 1;
+        }
+    }
+}
 
 fn predictorTaskFromTabular(task: @import("ml_tabular").ir.TaskType) api.PredictorTask {
     return switch (task) {
@@ -11513,7 +11677,22 @@ test "OpenAI model listing deduplicates multi-task models" {
     );
 }
 
-fn taskMatchesModelListing(task: []const u8, model_kind: []const u8, gliner_model_type: []const u8, tasks: []const []const u8, capabilities: []const []const u8) bool {
+fn taskMatchesModelListing(
+    task: []const u8,
+    model_kind: []const u8,
+    gliner_model_type: []const u8,
+    tasks: []const []const u8,
+    capabilities: []const []const u8,
+    zero_shot_classification: bool,
+) bool {
+    // Classification is a public extraction capability. Keep `classifier` as
+    // an internal pipeline kind without making its cache bucket a public API.
+    if (std.mem.eql(u8, task, "classifiers")) return false;
+    if (std.mem.eql(u8, task, "extractors") and
+        model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification"))
+    {
+        return !std.mem.eql(u8, model_kind, "classifier") or zero_shot_classification;
+    }
     if (tasks.len > 0) {
         const singular_task: ?[]const u8 = if (std.mem.eql(u8, task, "embedders"))
             "embed"
@@ -11555,6 +11734,7 @@ fn appendModelInfo(
     gliner_model_type: []const u8,
     capabilities: []const []const u8,
     inputs: []const []const u8,
+    zero_shot_classification: bool,
     has_visual: bool,
     has_audio: bool,
     /// Set when the model shipped a chat template we could not parse. Without this the
@@ -11564,13 +11744,15 @@ fn appendModelInfo(
     compatibility_level: []const u8,
 ) !void {
     const inferred_classification = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification") and !model_caps.hasCapability(capabilities, "classification");
+    const inferred_zero_shot = zero_shot_classification and !model_caps.hasCapability(capabilities, "zero_shot");
+    const inferred_multi_label = zero_shot_classification and !model_caps.hasCapability(capabilities, "multi_label");
     const inferred_relations = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations") and !model_caps.hasCapability(capabilities, "relations");
     const inferred_extraction = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "extraction") and !model_caps.hasCapability(capabilities, "extraction");
     const has_known_inputs = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "text") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "image") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
 
-    if (capabilities.len == 0 and !inferred_classification and !inferred_relations and !inferred_extraction and !has_known_inputs) {
+    if (capabilities.len == 0 and !inferred_classification and !inferred_zero_shot and !inferred_multi_label and !inferred_relations and !inferred_extraction and !has_known_inputs) {
         if (!chat_template_failed and compatibility_level.len == 0) {
             try buf.appendSlice(allocator, "{}");
             return;
@@ -11596,6 +11778,16 @@ fn appendModelInfo(
     if (inferred_classification) {
         if (cap_index > 0) try buf.append(allocator, ',');
         try jsonEncodeString(buf, allocator, "classification");
+        cap_index += 1;
+    }
+    if (inferred_zero_shot) {
+        if (cap_index > 0) try buf.append(allocator, ',');
+        try jsonEncodeString(buf, allocator, "zero_shot");
+        cap_index += 1;
+    }
+    if (inferred_multi_label) {
+        if (cap_index > 0) try buf.append(allocator, ',');
+        try jsonEncodeString(buf, allocator, "multi_label");
         cap_index += 1;
     }
     if (inferred_relations) {
@@ -13958,17 +14150,60 @@ test "prompt cache stays disabled while CUDA continuous batching releases the mo
 }
 
 test "taskMatchesModelListing exposes extraction-capable models only as extractors" {
-    try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "", &.{}, &.{}));
-    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "", &.{}, &.{"extraction"}));
-    try std.testing.expect(taskMatchesModelListing("extractors", "reader", "", &.{}, &.{"extraction"}));
-    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{}, &.{"labels"}));
-    try std.testing.expect(!taskMatchesModelListing("classifiers", "recognizer", "gliner2", &.{}, &.{"classification"}));
+    try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "", &.{}, &.{}, false));
+    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "", &.{}, &.{"extraction"}, false));
+    try std.testing.expect(taskMatchesModelListing("extractors", "reader", "", &.{}, &.{"extraction"}, false));
+    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{}, &.{"labels"}, true));
+    try std.testing.expect(taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}, true));
+    try std.testing.expect(!taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}, false));
+    try std.testing.expect(!taskMatchesModelListing("classifiers", "classifier", "", &.{"classify"}, &.{}, true));
+    try std.testing.expect(!taskMatchesModelListing("classifiers", "recognizer", "gliner2", &.{}, &.{"classification"}, true));
+}
+
+test "classification extraction applies top-k to single-label and threshold to multi-label taxonomies" {
+    const Result = struct { label: []const u8, score: f32 };
+    const row = [_]Result{
+        .{ .label = "first", .score = 0.9 },
+        .{ .label = "second", .score = 0.7 },
+        .{ .label = "third", .score = 0.4 },
+    };
+    const batch = [_][]const Result{&row};
+
+    var single_lists = [_]std.ArrayListUnmanaged(extraction_api.ExtractionClassification){.empty};
+    defer single_lists[0].deinit(std.testing.allocator);
+    try appendExtractionClassificationBatch(
+        std.testing.allocator,
+        &single_lists,
+        .{ .name = "topic", .labels = &.{ "first", "second", "third" }, .top_k = 2 },
+        .{ .threshold = 0.95, .include_confidence = true },
+        &batch,
+    );
+    try std.testing.expectEqual(@as(usize, 2), single_lists[0].items.len);
+    try std.testing.expectEqualStrings("first", single_lists[0].items[0].label);
+    try std.testing.expectEqualStrings("second", single_lists[0].items[1].label);
+
+    var multi_lists = [_]std.ArrayListUnmanaged(extraction_api.ExtractionClassification){.empty};
+    defer multi_lists[0].deinit(std.testing.allocator);
+    try appendExtractionClassificationBatch(
+        std.testing.allocator,
+        &multi_lists,
+        .{ .name = "topic", .labels = &.{ "first", "second", "third" }, .multi_label = true, .top_k = 1 },
+        .{ .threshold = 0.5, .include_confidence = true },
+        &batch,
+    );
+    try std.testing.expectEqual(@as(usize, 2), multi_lists[0].items.len);
+}
+
+test "NLI entailment labels are detected case-insensitively" {
+    const labels = [_][]const u8{ "CONTRADICTION", "NEUTRAL", "ENTAILMENT" };
+    try std.testing.expectEqual(@as(?usize, 2), nliEntailmentIndex(&labels));
+    try std.testing.expectEqual(@as(?usize, null), nliEntailmentIndex(null));
 }
 
 test "taskMatchesModelListing prefers explicit tasks when present" {
-    try std.testing.expect(taskMatchesModelListing("generators", "generator", "", &.{"generate"}, &.{}));
-    try std.testing.expect(taskMatchesModelListing("extractors", "generator", "", &.{"extract"}, &.{}));
-    try std.testing.expect(!taskMatchesModelListing("extractors", "generator", "", &.{"generate"}, &.{"extraction"}));
+    try std.testing.expect(taskMatchesModelListing("generators", "generator", "", &.{"generate"}, &.{}, false));
+    try std.testing.expect(taskMatchesModelListing("extractors", "generator", "", &.{"extract"}, &.{}, false));
+    try std.testing.expect(!taskMatchesModelListing("extractors", "generator", "", &.{"generate"}, &.{"extraction"}, false));
 }
 
 test "generate backend selection keeps compiled mode explicit" {

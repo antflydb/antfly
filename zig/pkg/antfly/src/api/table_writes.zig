@@ -32806,7 +32806,9 @@ test "provisioned table write source restore repair completion retires cached ve
         try doc_identity.writeNamespaceToStore(db.core.store, identity_namespace);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
-            .sync_level = .write,
+            // This fixture exercises read-cache invalidation, not asynchronous
+            // indexing. Establish the indexed precondition explicitly.
+            .sync_level = .full_index,
         });
     }
 
@@ -33068,7 +33070,9 @@ test "provisioned table write source path invalidation clears shared vector read
         try doc_identity.writeNamespaceToStore(db.core.store, identity_namespace);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
-            .sync_level = .write,
+            // This fixture exercises read-cache invalidation, not asynchronous
+            // indexing. Establish the indexed precondition explicitly.
+            .sync_level = .full_index,
         });
     }
 
