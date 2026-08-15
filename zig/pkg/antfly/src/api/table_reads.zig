@@ -4672,6 +4672,8 @@ fn queryProvisionedAcrossGroupsParallel(
     req: db_mod.types.SearchRequest,
     table_name: []const u8,
     consistency: raft_mod.ReadConsistency,
+    required_identity_generations: ?[]const ?u64,
+    result_identity_generations: []?u64,
 ) !db_mod.types.SearchResult {
     const start_ns = platform_time.monotonicNs();
     const slots = try initSearchFanoutSlots(alloc, group_ids.len);
@@ -4685,8 +4687,11 @@ fn queryProvisionedAcrossGroupsParallel(
             table_name_inner: []const u8,
             shard_req_inner: *const db_mod.types.SearchRequest,
             consistency_inner: raft_mod.ReadConsistency,
+            required_identity_generation: ?u64,
         ) void {
             const arena = slot.arena.allocator();
+            var group_req = shard_req_inner.*;
+            if (required_identity_generation) |generation| group_req.identity_read_generation = generation;
             slot.result = queryHostedLocal(
                 source.resident_db,
                 source.cache,
@@ -4698,7 +4703,7 @@ fn queryProvisionedAcrossGroupsParallel(
                 source.visibleRootGeneration(group_id),
                 source.managedReadRuntimeConfig(),
                 table_name_inner,
-                shard_req_inner.*,
+                group_req,
                 consistency_inner,
             ) catch |err| {
                 slot.err = err;
@@ -4712,7 +4717,8 @@ fn queryProvisionedAcrossGroupsParallel(
         const end = @min(start + width, group_ids.len);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
-            group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, shard_req, consistency });
+            const required_generation = if (required_identity_generations) |generations| generations[i] else null;
+            group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, shard_req, consistency, required_generation });
         }
         group.await(io) catch {};
     }
@@ -4723,7 +4729,13 @@ fn queryProvisionedAcrossGroupsParallel(
 
     const shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     defer alloc.free(shard_results);
-    for (slots, 0..) |slot, i| shard_results[i] = slot.result.?;
+    for (slots, 0..) |slot, i| {
+        shard_results[i] = slot.result.?;
+        result_identity_generations[i] = shard_results[i].identity_read_generation;
+        if (required_identity_generations) |generations| {
+            if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;
+        }
+    }
     const merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, req.offset, req.limit);
     recordParallelFanout(.query, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
@@ -4739,6 +4751,8 @@ fn queryHostedAcrossGroupsParallel(
     req: db_mod.types.SearchRequest,
     table_name: []const u8,
     consistency: raft_mod.ReadConsistency,
+    required_identity_generations: ?[]const ?u64,
+    result_identity_generations: []?u64,
 ) !db_mod.types.SearchResult {
     const start_ns = platform_time.monotonicNs();
     const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency);
@@ -4756,8 +4770,11 @@ fn queryHostedAcrossGroupsParallel(
             table_name_inner: []const u8,
             shard_req_inner: *const db_mod.types.SearchRequest,
             consistency_inner: raft_mod.ReadConsistency,
+            required_identity_generation: ?u64,
         ) void {
             const arena = slot.arena.allocator();
+            var group_req = shard_req_inner.*;
+            if (required_identity_generation) |generation| group_req.identity_read_generation = generation;
             slot.result = switch (route) {
                 .local => queryHostedLocal(
                     null,
@@ -4770,10 +4787,10 @@ fn queryHostedAcrossGroupsParallel(
                     0,
                     .{ .backend_runtime = source.backend_runtime },
                     table_name_inner,
-                    shard_req_inner.*,
+                    group_req,
                     consistency_inner,
                 ),
-                .remote => |remote| queryRemote(source.executor, arena, remote.base_uri, group_id, table_name_inner, shard_req_inner.*),
+                .remote => |remote| queryRemote(source.executor, arena, remote.base_uri, group_id, table_name_inner, group_req),
             } catch |err| {
                 slot.err = err;
                 return;
@@ -4786,7 +4803,8 @@ fn queryHostedAcrossGroupsParallel(
         const end = @min(start + width, group_ids.len);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
-            group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, shard_req, consistency });
+            const required_generation = if (required_identity_generations) |generations| generations[i] else null;
+            group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, shard_req, consistency, required_generation });
         }
         group.await(io) catch {};
     }
@@ -4797,7 +4815,13 @@ fn queryHostedAcrossGroupsParallel(
 
     const shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     defer alloc.free(shard_results);
-    for (slots, 0..) |slot, i| shard_results[i] = slot.result.?;
+    for (slots, 0..) |slot, i| {
+        shard_results[i] = slot.result.?;
+        result_identity_generations[i] = shard_results[i].identity_read_generation;
+        if (required_identity_generations) |generations| {
+            if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;
+        }
+    }
     const merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, req.offset, req.limit);
     recordParallelFanout(.query, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
@@ -4822,6 +4846,20 @@ fn distributedSearchShardRequest(
     copy.limit = distributedSearchShardLimit(req);
     copy.distributed_text_stats = distributed_text_stats;
     return copy;
+}
+
+fn validateDistributedPhaseIdentityGenerations(
+    group_count: usize,
+    required_identity_generations: ?[]const ?u64,
+    result_identity_generations: []?u64,
+) !void {
+    if (result_identity_generations.len != group_count) return error.InvalidQueryRequest;
+    if (required_identity_generations) |generations| {
+        if (generations.len != group_count) return error.InvalidQueryRequest;
+        for (generations) |generation| {
+            if (generation == null) return error.UnsupportedQueryRequest;
+        }
+    }
 }
 
 test "distributed query shard request preserves sorted cursor contract" {
@@ -4918,6 +4956,7 @@ test "distributed grouped hierarchy expands only the globally merged page" {
         .alloc = alloc,
         .hits = selected_hits,
         .total_hits = 40,
+        .identity_read_generation = 77,
     };
     defer selected.deinit();
 
@@ -4935,6 +4974,7 @@ test "distributed grouped hierarchy expands only the globally merged page" {
     try std.testing.expectEqual(@as(usize, 2), expansion.request.filter_doc_ids.len);
     try std.testing.expectEqualStrings("source:c", expansion.request.filter_doc_ids[0]);
     try std.testing.expectEqualStrings("source:d", expansion.request.filter_doc_ids[1]);
+    try std.testing.expectEqual(@as(?u64, 77), expansion.request.identity_read_generation);
     try std.testing.expect(db_mod.types.canonicalHierarchyExecutionWithinBudget(expansion.request));
 
     var expanded_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
@@ -4963,6 +5003,227 @@ test "distributed grouped hierarchy expands only the globally merged page" {
     try std.testing.expectEqualStrings("source:d#chunk:0", selected.hits[1].chunk_hits[0].id);
     try std.testing.expectEqual(@as(usize, 0), expanded.hits[0].chunk_hits.len);
     try std.testing.expectEqual(@as(usize, 0), expanded.hits[1].chunk_hits.len);
+}
+
+test "hosted distributed grouped hierarchy expands the globally selected shard page" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-hosted-distributed-grouped-hierarchy";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const left_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(left_path);
+    const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7002);
+    defer alloc.free(right_path);
+
+    var deterministic = db_embedder.DeterministicDenseEmbedder{};
+    var left_db = try db_mod.DB.open(alloc, left_path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+        .enrichment = .{ .owner_id = "worker-left", .dense_embedder = deterministic.interface() },
+        .start_index_workers = false,
+    });
+    defer left_db.close();
+    var right_db = try db_mod.DB.open(alloc, right_path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
+        .enrichment = .{ .owner_id = "worker-right", .dense_embedder = deterministic.interface() },
+        .start_index_workers = false,
+    });
+    defer right_db.close();
+
+    for ([_]*db_mod.DB{ &left_db, &right_db }) |db| {
+        try db.addIndex(.{
+            .name = "ft_chunks",
+            .kind = .full_text,
+            .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
+        });
+        try db.addIndex(.{
+            .name = "dv_chunks",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":24,\"chunk_overlap\":0}}",
+        });
+    }
+    try left_db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"alpha alpha alpha alpha alpha alpha\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    try right_db.batch(.{
+        .writes = &.{
+            .{ .key = "zdoc:c", .value = "{\"body\":\"alpha alpha alpha\"}" },
+            .{ .key = "zdoc:d", .value = "{\"body\":\"alpha\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    // Advance only the right shard. Its non-matching row keeps the expected
+    // search page stable while proving that phase two uses per-shard tokens.
+    try right_db.batch(.{
+        .writes = &.{.{ .key = "zdoc:ignored", .value = "{\"body\":\"beta\"}" }},
+        .sync_level = .full_index,
+    });
+
+    const FakeCatalog = struct {
+        const statuses = [_]metadata_reconciler.MergedGroupStatus{
+            .{
+                .group_id = 7001,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7001,
+                    .namespace_range_id = 7001,
+                    .next_ordinal = 3,
+                    .allocated_ordinals = 2,
+                    .state_rows = 2,
+                    .live_ordinals = 2,
+                    .complete = true,
+                },
+            },
+            .{
+                .group_id = 7002,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7002,
+                    .namespace_range_id = 7002,
+                    .next_ordinal = 4,
+                    .allocated_ordinals = 3,
+                    .state_rows = 3,
+                    .live_ordinals = 3,
+                    .complete = true,
+                },
+            },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json =
+                    \\{"ft_chunks":{"name":"ft_chunks","type":"full_text","chunk_name":"body_chunks_v1"},"dv_chunks":{"name":"dv_chunks","type":"embeddings","field":"embedding","dimension":3}}
+                    ,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .range_id = 7001, .start_key = "", .end_key = "m" },
+                    .{ .group_id = 7002, .table_id = 7, .range_id = 7002, .start_key = "m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast(statuses[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn nodeStatus(_: *anyopaque, _: u64, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const ExecutorState = struct {
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var executor_state = ExecutorState{};
+    var hosted = HostedProvisionedTableReadSource.init(
+        path,
+        FakeCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+        FakeRouter.iface(),
+        executor_state.iface(),
+    );
+    _ = hosted.withIo(&io_impl);
+    const group_ids = [_]u64{ 7001, 7002 };
+    const selection_req: db_mod.types.SearchRequest = .{
+        .index_name = "ft_chunks",
+        .full_text = .{ .term = .{ .field = "body", .term = "alpha" } },
+        .return_mode = .parent,
+        .include_stored = false,
+        .offset = 1,
+        .limit = 2,
+    };
+    var selected = try queryHostedAcrossGroups(&hosted, alloc, &group_ids, selection_req, "docs", .stale);
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 2), selected.hits.len);
+
+    var grouped_req = selection_req;
+    grouped_req.return_mode = .parent_with_chunks;
+    grouped_req.hierarchy_grouped_matches = true;
+    grouped_req.max_chunks_per_parent = 2;
+    grouped_req.hierarchy_match_fields = &.{"body"};
+    grouped_req.hierarchy_match_include_all_fields = false;
+    var grouped = try queryHostedAcrossGroups(&hosted, alloc, &group_ids, grouped_req, "docs", .stale);
+    defer grouped.deinit();
+
+    try std.testing.expectEqual(selected.total_hits, grouped.total_hits);
+    try std.testing.expectEqual(selected.hits.len, grouped.hits.len);
+    // Shard generations are independent, so the merged result has no single
+    // generation even though the expansion is fenced to each selected shard.
+    try std.testing.expectEqual(@as(?u64, null), selected.identity_read_generation);
+    try std.testing.expectEqual(selected.identity_read_generation, grouped.identity_read_generation);
+    for (grouped.hits, selected.hits) |grouped_hit, selected_hit| {
+        try std.testing.expectEqualStrings(selected_hit.id, grouped_hit.id);
+        try std.testing.expect(grouped_hit.chunk_hits.len > 0);
+        try std.testing.expect(grouped_hit.chunk_hits.len <= grouped_req.max_chunks_per_parent);
+        for (grouped_hit.chunk_hits) |match| {
+            const artifact_ref = match.artifact_ref orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(grouped_hit.id, artifact_ref.document_id);
+            try std.testing.expect(match.stored_data != null);
+            try std.testing.expect(std.mem.indexOf(u8, match.stored_data.?, "\"body\"") != null);
+        }
+    }
 }
 
 fn queryMergeRuntimeSchemaAlloc(
@@ -5640,8 +5901,9 @@ fn canonicalGroupedMatchExpansionPlanAlloc(
 ) !struct { request: db_mod.types.SearchRequest, parent_ids: []const []const u8 } {
     const parent_ids = try alloc.alloc([]const u8, result.hits.len);
     for (result.hits, 0..) |hit, i| parent_ids[i] = hit.id;
+    const snapshot_req = requestWithResultIdentityGeneration(req, result);
     return .{
-        .request = db_mod.types.canonicalGroupedMatchExpansionRequest(req, parent_ids),
+        .request = db_mod.types.canonicalGroupedMatchExpansionRequest(snapshot_req, parent_ids),
         .parent_ids = parent_ids,
     };
 }
@@ -5674,13 +5936,23 @@ fn queryProvisionedAcrossGroups(
     consistency: raft_mod.ReadConsistency,
 ) !db_mod.types.SearchResult {
     if (!db_mod.types.canonicalHierarchyExecutionWithinBudget(req)) return error.InvalidQueryRequest;
-    var selected = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, req, table_name, consistency, false);
+    try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+    try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
+    const distributed_text_stats = try collectProvisionedSearchRequestTextStats(self, alloc, group_ids, req, table_name);
+    defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
+    const selected_generations = try alloc.alloc(?u64, group_ids.len);
+    defer alloc.free(selected_generations);
+    @memset(selected_generations, null);
+    var selected = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, req, table_name, consistency, distributed_text_stats, false, null, selected_generations);
     errdefer selected.deinit();
     if (!req.hierarchy_grouped_matches or selected.hits.len == 0) return selected;
 
     const expansion = try canonicalGroupedMatchExpansionPlanAlloc(alloc, req, selected);
     defer alloc.free(expansion.parent_ids);
-    var expanded = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, expansion.request, table_name, consistency, true);
+    const expanded_generations = try alloc.alloc(?u64, group_ids.len);
+    defer alloc.free(expanded_generations);
+    @memset(expanded_generations, null);
+    var expanded = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, expansion.request, table_name, consistency, distributed_text_stats, true, selected_generations, expanded_generations);
     defer expanded.deinit();
     applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded);
     return selected;
@@ -5695,13 +5967,24 @@ fn queryHostedAcrossGroups(
     consistency: raft_mod.ReadConsistency,
 ) !db_mod.types.SearchResult {
     if (!db_mod.types.canonicalHierarchyExecutionWithinBudget(req)) return error.InvalidQueryRequest;
-    var selected = try queryHostedAcrossGroupsPhase(self, alloc, group_ids, req, table_name, consistency, false);
+    try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+    try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
+    try rejectHostedRemoteResolvedDocFilter(self, alloc, group_ids, table_name, req, consistency);
+    const distributed_text_stats = try collectHostedSearchRequestTextStats(self, alloc, group_ids, req, table_name, consistency);
+    defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
+    const selected_generations = try alloc.alloc(?u64, group_ids.len);
+    defer alloc.free(selected_generations);
+    @memset(selected_generations, null);
+    var selected = try queryHostedAcrossGroupsPhase(self, alloc, group_ids, req, table_name, consistency, distributed_text_stats, false, null, selected_generations);
     errdefer selected.deinit();
     if (!req.hierarchy_grouped_matches or selected.hits.len == 0) return selected;
 
     const expansion = try canonicalGroupedMatchExpansionPlanAlloc(alloc, req, selected);
     defer alloc.free(expansion.parent_ids);
-    var expanded = try queryHostedAcrossGroupsPhase(self, alloc, group_ids, expansion.request, table_name, consistency, true);
+    const expanded_generations = try alloc.alloc(?u64, group_ids.len);
+    defer alloc.free(expanded_generations);
+    @memset(expanded_generations, null);
+    var expanded = try queryHostedAcrossGroupsPhase(self, alloc, group_ids, expansion.request, table_name, consistency, distributed_text_stats, true, selected_generations, expanded_generations);
     defer expanded.deinit();
     applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded);
     return selected;
@@ -5714,18 +5997,18 @@ fn queryProvisionedAcrossGroupsPhase(
     req: db_mod.types.SearchRequest,
     table_name: []const u8,
     consistency: raft_mod.ReadConsistency,
+    distributed_text_stats: []const distributed_stats_mod.TextFieldStats,
     expand_selected_groups: bool,
+    required_identity_generations: ?[]const ?u64,
+    result_identity_generations: []?u64,
 ) !db_mod.types.SearchResult {
-    try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-    try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
-    const distributed_text_stats = try collectProvisionedSearchRequestTextStats(self, alloc, group_ids, req, table_name);
-    defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
+    try validateDistributedPhaseIdentityGenerations(group_ids.len, required_identity_generations, result_identity_generations);
     const shard_req = distributedSearchShardRequest(req, distributed_text_stats, expand_selected_groups);
 
     const plan = planQueryFanout(self.io_impl, group_ids.len, req);
     recordFanoutPlan(.query, plan);
     if (plan.parallel) {
-        return try queryProvisionedAcrossGroupsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, &shard_req, req, table_name, consistency);
+        return try queryProvisionedAcrossGroupsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, &shard_req, req, table_name, consistency, required_identity_generations, result_identity_generations);
     }
     if (plan.reason == .no_io) recordParallelFanoutFallback(.query);
 
@@ -5737,8 +6020,14 @@ fn queryProvisionedAcrossGroupsPhase(
     }
 
     for (group_ids, 0..) |group_id, i| {
-        shard_results[i] = try queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, shard_req, consistency);
+        var group_req = shard_req;
+        if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
+        shard_results[i] = try queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, group_req, consistency);
         initialized += 1;
+        result_identity_generations[i] = shard_results[i].identity_read_generation;
+        if (required_identity_generations) |generations| {
+            if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;
+        }
     }
     return try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results[0..initialized], req.offset, req.limit);
 }
@@ -5750,19 +6039,18 @@ fn queryHostedAcrossGroupsPhase(
     req: db_mod.types.SearchRequest,
     table_name: []const u8,
     consistency: raft_mod.ReadConsistency,
+    distributed_text_stats: []const distributed_stats_mod.TextFieldStats,
     expand_selected_groups: bool,
+    required_identity_generations: ?[]const ?u64,
+    result_identity_generations: []?u64,
 ) !db_mod.types.SearchResult {
-    try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-    try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
-    try rejectHostedRemoteResolvedDocFilter(self, alloc, group_ids, table_name, req, consistency);
-    const distributed_text_stats = try collectHostedSearchRequestTextStats(self, alloc, group_ids, req, table_name, consistency);
-    defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
+    try validateDistributedPhaseIdentityGenerations(group_ids.len, required_identity_generations, result_identity_generations);
     const shard_req = distributedSearchShardRequest(req, distributed_text_stats, expand_selected_groups);
 
     const plan = planQueryFanout(self.io_impl, group_ids.len, req);
     recordFanoutPlan(.query, plan);
     if (plan.parallel) {
-        return try queryHostedAcrossGroupsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, &shard_req, req, table_name, consistency);
+        return try queryHostedAcrossGroupsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, &shard_req, req, table_name, consistency, required_identity_generations, result_identity_generations);
     }
     if (plan.reason == .no_io) recordParallelFanoutFallback(.query);
 
@@ -5774,13 +6062,19 @@ fn queryHostedAcrossGroupsPhase(
     }
 
     for (group_ids, 0..) |group_id, i| {
+        var group_req = shard_req;
+        if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         shard_results[i] = switch (route) {
-            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, shard_req, consistency),
-            .remote => |remote| try queryRemote(self.executor, alloc, remote.base_uri, group_id, table_name, shard_req),
+            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, group_req, consistency),
+            .remote => |remote| try queryRemote(self.executor, alloc, remote.base_uri, group_id, table_name, group_req),
         };
         initialized += 1;
+        result_identity_generations[i] = shard_results[i].identity_read_generation;
+        if (required_identity_generations) |generations| {
+            if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;
+        }
     }
     return try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results[0..initialized], req.offset, req.limit);
 }
@@ -7061,7 +7355,11 @@ fn queryHostedLocal(
 ) !db_mod.types.SearchResult {
     var detailed = try queryHostedLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency);
     defer detailed.releaseDb();
-    return detailed.result;
+    var result = detailed.result;
+    // The coordinator needs the generation the shard actually read, including
+    // when the caller did not supply one, to fence follow-up distributed phases.
+    result.identity_read_generation = detailed.request.identity_read_generation;
+    return result;
 }
 
 fn queryHostedLocalDetailed(
@@ -10387,7 +10685,12 @@ fn aggregationFullResultRequest(req: db_mod.types.SearchRequest, result: db_mod.
     full_req.order_by = &.{};
     full_req.search_after = &.{};
     full_req.search_before = &.{};
-    return full_req;
+    // Aggregations operate on the top-level result set. Canonical hierarchy
+    // matches are a bounded evidence projection attached to those groups, not
+    // additional aggregation rows. Disable nested expansion for the complete
+    // aggregation rerun so its internal full-result limit is not mistaken for
+    // a public groups-times-matches response budget.
+    return db_mod.types.canonicalGroupedMatchSelectionRequest(full_req);
 }
 
 test "aggregation completeness requires exact total relation" {
@@ -10455,6 +10758,25 @@ test "aggregation completeness requires exact total relation" {
     try std.testing.expectEqual(@as(usize, 0), full_req.order_by.len);
     try std.testing.expectEqual(@as(usize, 0), full_req.search_after.len);
     try std.testing.expectEqual(@as(usize, 0), full_req.search_before.len);
+
+    const grouped_full_req = try aggregationFullResultRequest(.{
+        .return_mode = .parent_with_chunks,
+        .hierarchy_grouped_matches = true,
+        .max_chunks_per_parent = 25,
+        .limit = 5,
+    }, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 200,
+        .total_hits_relation = .exact,
+        .identity_read_generation = 101,
+    }, "grouped-test");
+    try std.testing.expectEqual(@as(u32, 200), grouped_full_req.limit);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.parent, grouped_full_req.return_mode);
+    try std.testing.expect(!grouped_full_req.hierarchy_grouped_matches);
+    try std.testing.expectEqual(@as(u32, 0), grouped_full_req.max_chunks_per_parent);
+    try std.testing.expectEqual(@as(?u64, 101), grouped_full_req.identity_read_generation);
+    try std.testing.expect(db_mod.types.canonicalHierarchyExecutionWithinBudget(grouped_full_req));
 }
 
 fn applyBoundQueryAggregations(

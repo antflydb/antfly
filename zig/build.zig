@@ -5493,6 +5493,8 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
             "aggregation completeness requires exact total relation",
+            "distributed grouped hierarchy expands only the globally merged page",
+            "hosted distributed grouped hierarchy expands the globally selected shard page",
             "api http client forwards internal query controls and maps remote timeout",
             "api http client preserves remote storage read contention",
             "api http client preserves storage read contention across group read endpoints",

@@ -6224,6 +6224,10 @@ export interface components {
              * @description Aggregation requests for computing metrics and bucketing results.
              *     Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration.
              *
+             *     When `hierarchy.group_by` is present, aggregations operate on the complete
+             *     set of top-level grouped source documents. Nested `group_by.matches` are
+             *     bounded evidence projections and are not counted as aggregation rows.
+             *
              *     Supports metric aggregations (sum, avg, min, max, count, stats, cardinality),
              *     bucketing aggregations (terms, range, date_range, histogram, date_histogram),
              *     geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms).

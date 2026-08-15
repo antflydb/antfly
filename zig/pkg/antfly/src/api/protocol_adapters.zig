@@ -100,6 +100,7 @@ const query_request_description_json =
     \\      "Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema.",
     \\      "For hierarchical documents, the presence of hierarchy selects direct matches unless group_by is present; ancestors only controls projected context.",
     \\      "Use hierarchy.group_by.level=source with bounded group_by.matches for grouped source results; nested matches default to three, cannot exceed 100, and top-level limit does not bound them.",
+    \\      "Aggregations on hierarchy.group_by queries operate on the complete top-level source-group set; nested matches are evidence and are not aggregation rows.",
     \\      "For source groups, project source fields with top-level fields; hierarchy.ancestors.source is rejected because it would duplicate the grouping-level document.",
     \\      "Never request _chunks.* through MCP because it can expand every child stored on a matched source.",
     \\      "Structured filter_query.geo_bbox accepts field, min_lat, min_lon, max_lat, and max_lon; min_lon greater than max_lon represents an antimeridian-wrapped box."
