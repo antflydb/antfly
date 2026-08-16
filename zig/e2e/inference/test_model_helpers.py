@@ -369,6 +369,38 @@ def test_multimodal_model_selection_uses_shared_gemma_default(monkeypatch, tmp_p
     )
 
 
+def test_model_selection_returns_advertised_managed_variant(monkeypatch, tmp_path):
+    monkeypatch.delenv("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", raising=False)
+    monkeypatch.delenv("ANTFLY_INFERENCE_TOOL_MODEL", raising=False)
+    monkeypatch.delenv("ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL", raising=False)
+    monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
+
+    spec = models.spec_for_name(DEFAULT_GENERATOR_MODEL, "generators")
+    assert spec is not None
+    model_dir = models._model_path(spec)
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Gemma4ForConditionalGeneration"],
+                "vision_config": {},
+            }
+        )
+    )
+    (model_dir / "genai_config.json").write_text(
+        json.dumps({"tool_call_format": "functiongemma"})
+    )
+    advertised = {spec.listing_name}
+
+    assert models.default_generator_model_name(advertised) == spec.listing_name
+    monkeypatch.setenv(
+        "ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", DEFAULT_GENERATOR_MODEL
+    )
+    assert models.default_generator_model_name(advertised) == spec.listing_name
+    assert models.find_tool_model_name(advertised) == spec.listing_name
+    assert models.find_multimodal_generator_model_name(advertised) == spec.listing_name
+
+
 def test_explicit_large_generator_is_bootstrapped(monkeypatch):
     for env_name in (*models.GENERATOR_ENV_VARS, *models.READER_ENV_VARS):
         monkeypatch.delenv(env_name, raising=False)
