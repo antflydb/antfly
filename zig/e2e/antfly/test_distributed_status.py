@@ -27,11 +27,11 @@ import requests
 
 from conftest import (
     DEFAULT_ANTFLY_BIN,
+    LoopbackPortReservations,
     REPO_ROOT,
     _metadata_command,
     _read_log_tail,
     antfly_public_api_url,
-    find_free_port,
     maybe_preserve_tempdir,
     wait_for_server,
 )
@@ -61,8 +61,8 @@ def _data_command(
         host,
         "--raft-port",
         str(raft_port),
-        "--health-port",
-        str(find_free_port()),
+        "--health",
+        "false",
         "--metadata-api",
         metadata_admin_base_uri,
         "--node-id",
@@ -90,13 +90,14 @@ class SplitStatusCluster:
         self.host = "127.0.0.1"
         self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-status-e2e-")
         self.root = Path(self.tempdir.name)
+        self.port_reservations = LoopbackPortReservations(self.host)
 
-        self.metadata_port = find_free_port()
-        self.metadata_admin_port = find_free_port()
-        self.data_port = find_free_port()
-        self.data_raft_port = find_free_port()
-        self.api_port = find_free_port()
-        self.api_raft_port = find_free_port()
+        self.metadata_port = self.port_reservations.reserve()
+        self.metadata_admin_port = self.port_reservations.reserve()
+        self.data_port = self.port_reservations.reserve()
+        self.data_raft_port = self.port_reservations.reserve()
+        self.api_port = self.port_reservations.reserve()
+        self.api_raft_port = self.port_reservations.reserve()
 
         self.metadata_admin_url = f"http://{self.host}:{self.metadata_admin_port}"
         self.data_url = f"http://{self.host}:{self.data_port}"
@@ -128,6 +129,7 @@ class SplitStatusCluster:
             admin_port=self.metadata_admin_port,
             root=self.root,
         )
+        self.port_reservations.release(self.metadata_port, self.metadata_admin_port)
         self.metadata_proc = subprocess.Popen(
             metadata_command,
             stdout=self.metadata_log_file,
@@ -148,6 +150,7 @@ class SplitStatusCluster:
             store_id=2,
             store_role="data",
         )
+        self.port_reservations.release(self.data_port, self.data_raft_port)
         self.data_proc = subprocess.Popen(
             data_command,
             stdout=self.data_log_file,
@@ -168,6 +171,7 @@ class SplitStatusCluster:
             store_id=3,
             store_role="api",
         )
+        self.port_reservations.release(self.api_port, self.api_raft_port)
         self.api_proc = subprocess.Popen(
             api_command,
             stdout=self.api_log_file,
@@ -193,6 +197,7 @@ class SplitStatusCluster:
         return payload if isinstance(payload, dict) else {}
 
     def stop(self) -> None:
+        self.port_reservations.close()
         for proc in (self.api_proc, self.data_proc, self.metadata_proc):
             if proc is not None and proc.poll() is None:
                 proc.send_signal(signal.SIGTERM)

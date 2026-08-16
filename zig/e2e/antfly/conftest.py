@@ -160,15 +160,15 @@ class LoopbackPortReservations:
         self.host = host
         self._sockets: dict[int, socket.socket] = {}
 
-    def reserve(self) -> int:
+    def reserve(self, port: int = 0) -> int:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock.bind((self.host, 0))
-            port = int(sock.getsockname()[1])
-            if port in self._sockets:
-                raise RuntimeError(f"kernel returned duplicate reserved port {port}")
-            self._sockets[port] = sock
-            return port
+            sock.bind((self.host, port))
+            reserved_port = int(sock.getsockname()[1])
+            if reserved_port in self._sockets:
+                raise RuntimeError(f"kernel returned duplicate reserved port {reserved_port}")
+            self._sockets[reserved_port] = sock
+            return reserved_port
         except BaseException:
             sock.close()
             raise
@@ -179,6 +179,12 @@ class LoopbackPortReservations:
             if sock is None:
                 raise RuntimeError(f"port {port} is not reserved")
             sock.close()
+
+    def release_if_reserved(self, *ports: int) -> None:
+        for port in ports:
+            sock = self._sockets.pop(port, None)
+            if sock is not None:
+                sock.close()
 
     def close(self) -> None:
         sockets = list(self._sockets.values())
@@ -641,8 +647,8 @@ def _metadata_command(binary: str, *, host: str, raft_port: int, admin_port: int
         host,
         "--api-port",
         str(admin_port),
-        "--health-port",
-        str(find_free_port()),
+        "--health",
+        "false",
         "--data-dir",
         str(root),
         "--raft-tick-ms",
@@ -679,8 +685,8 @@ def _data_command(
         host,
         "--raft-port",
         str(raft_port),
-        "--health-port",
-        str(find_free_port()),
+        "--health",
+        "false",
         "--metadata-api",
         metadata_admin_base_uri,
         "--node-id",
@@ -707,6 +713,11 @@ class StatefulAntflyServer:
     def __init__(self, binary: str, host: str, port: int, *, auth_enabled: bool = False):
         self.binary = binary
         self.host = host
+        self.port_reservations = LoopbackPortReservations(host)
+        try:
+            self.port_reservations.reserve(port)
+        except OSError:
+            port = self.port_reservations.reserve()
         self.port = port
         self.auth_enabled = auth_enabled
         self.url = f"http://{host}:{port}"
@@ -721,11 +732,11 @@ class StatefulAntflyServer:
         self.data_log_path = self.root / "data.log"
         self.metadata_log_file = self.metadata_log_path.open("w")
         self.data_log_file = self.data_log_path.open("w")
-        metadata_port = find_free_port()
-        metadata_admin_port = find_free_port()
+        metadata_port = self.port_reservations.reserve()
+        metadata_admin_port = self.port_reservations.reserve()
         self.metadata_port = metadata_port
         self.metadata_admin_port = metadata_admin_port
-        self.data_raft_port = find_free_port()
+        self.data_raft_port = self.port_reservations.reserve()
         metadata_admin_url = f"http://{host}:{metadata_admin_port}"
         self.metadata_admin_url = metadata_admin_url
 
@@ -742,6 +753,7 @@ class StatefulAntflyServer:
             admin_port=self.metadata_admin_port,
             root=self.root,
         )
+        self.port_reservations.release_if_reserved(self.metadata_port, self.metadata_admin_port)
         self.metadata_proc = subprocess.Popen(
             metadata_command,
             stdout=self.metadata_log_file,
@@ -767,6 +779,7 @@ class StatefulAntflyServer:
             root=self.root,
             auth_enabled=self.auth_enabled,
         )
+        self.port_reservations.release_if_reserved(self.port, self.data_raft_port)
         self.data_proc = subprocess.Popen(
             data_command,
             stdout=self.data_log_file,
@@ -829,6 +842,7 @@ class StatefulAntflyServer:
         self._start_processes(truncate_logs=False)
 
     def stop(self, *, test_failed: bool = False) -> None:
+        self.port_reservations.close()
         self._stop_processes()
         self.data_log_file.close()
         self.metadata_log_file.close()

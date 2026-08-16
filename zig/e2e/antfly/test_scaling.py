@@ -46,6 +46,8 @@ from helpers import wait_until
 
 MULTI_SHARD_WRITE_ROUTE_TIMEOUT_S = 120.0
 DATA_NODE_REGISTRATION_TIMEOUT_S = 180.0
+DATA_NODE_BIND_ATTEMPTS = 3
+ADDRESS_IN_USE_LOG_MARKER = "listen address is already in use"
 
 
 class _ClusterStartupDeadline:
@@ -70,7 +72,9 @@ class _ClusterStartupDeadline:
 
 def test_loopback_port_reservations_hold_ports_until_release():
     reservations = LoopbackPortReservations()
-    ports = [reservations.reserve() for _ in range(16)]
+    explicit_port = find_free_port()
+    assert reservations.reserve(explicit_port) == explicit_port
+    ports = [explicit_port, *(reservations.reserve() for _ in range(16))]
 
     try:
         assert len(set(ports)) == len(ports)
@@ -82,7 +86,8 @@ def test_loopback_port_reservations_hold_ports_until_release():
         assert all(find_free_port() not in ports for _ in range(64))
 
         released_port = ports.pop()
-        reservations.release(released_port)
+        reservations.release_if_reserved(released_port)
+        reservations.release_if_reserved(released_port)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
             contender.bind(("127.0.0.1", released_port))
     finally:
@@ -417,6 +422,9 @@ class MultiNodeScalingCluster:
         self.metadata_procs: list[subprocess.Popen[str]] = []
         self.data_procs: list[subprocess.Popen[str]] = []
         self.data_proc_by_node_id: dict[int, subprocess.Popen[str]] = {}
+        self.data_start_attempts: dict[int, int] = {}
+        self.data_log_handles: dict[int, Any] = {}
+        self.data_log_paths: dict[int, Path] = {}
         self.log_files: list[Any] = []
         self.log_paths: list[Path] = []
 
@@ -574,7 +582,13 @@ class MultiNodeScalingCluster:
         self.startup_deadline.sleep(duration_s)
 
     def _start_data_node(self, node: dict[str, int]) -> None:
-        log = self._open_log(f"data-{node['id']}.log")
+        node_id = int(node["id"])
+        attempt = self.data_start_attempts.get(node_id, 0) + 1
+        self.data_start_attempts[node_id] = attempt
+        log_name = f"data-{node_id}.log" if attempt == 1 else f"data-{node_id}-attempt-{attempt}.log"
+        log = self._open_log(log_name)
+        self.data_log_handles[node_id] = log
+        self.data_log_paths[node_id] = self.root / log_name
         command = [
             self.binary,
             "data",
@@ -608,7 +622,24 @@ class MultiNodeScalingCluster:
         self.port_reservations.release(node["api_port"], node["raft_port"])
         proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=REPO_ROOT)
         self.data_procs.append(proc)
-        self.data_proc_by_node_id[int(node["id"])] = proc
+        self.data_proc_by_node_id[node_id] = proc
+
+    def _retry_data_node_after_bind_collision(self, node: dict[str, int]) -> bool:
+        node_id = int(node["id"])
+        attempts = self.data_start_attempts.get(node_id, 0)
+        log = self.data_log_handles.get(node_id)
+        log_path = self.data_log_paths.get(node_id)
+        if log is None or log_path is None or attempts >= DATA_NODE_BIND_ATTEMPTS:
+            return False
+
+        log.flush()
+        if ADDRESS_IN_USE_LOG_MARKER not in _read_log_tail(log_path):
+            return False
+
+        node["api_port"] = self.port_reservations.reserve()
+        node["raft_port"] = self.port_reservations.reserve()
+        self._start_data_node(node)
+        return True
 
     def add_data_node(self) -> dict[str, int]:
         node = self._new_data_node(max(int(existing["id"]) for existing in self.data_nodes) + 1)
@@ -649,6 +680,13 @@ class MultiNodeScalingCluster:
             for node_id, node in list(pending.items()):
                 proc = self.data_proc_by_node_id.get(node_id)
                 if proc is not None and proc.poll() is not None:
+                    if not public_api and self._retry_data_node_after_bind_collision(node):
+                        consecutive_successes[node_id] = 0
+                        last_probe[node_id] = (
+                            f"startup attempt {self.data_start_attempts[node_id] - 1} "
+                            "lost a listener-port race; retrying with new ports"
+                        )
+                        continue
                     raise RuntimeError(
                         f"{label} {node_id} exited before becoming ready rc={proc.returncode}\n"
                         f"{self.debug_logs()}"
@@ -1068,6 +1106,39 @@ class MultiNodeScalingCluster:
                 handle.close()
         if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
+
+
+def test_scaling_cluster_retries_data_node_after_bind_collision(tmp_path: Path):
+    class StubReservations:
+        def __init__(self) -> None:
+            self.ports = iter((41001, 41002))
+
+        def reserve(self) -> int:
+            return next(self.ports)
+
+    node = {"id": 103, "store_id": 103, "api_port": 40001, "raft_port": 40002}
+    log_path = tmp_path / "data-103.log"
+    log_path.write_text(
+        "antfly data: listen address is already in use (error.AddressInUse)\n",
+        encoding="utf-8",
+    )
+    log = log_path.open("a", encoding="utf-8")
+    cluster = object.__new__(MultiNodeScalingCluster)
+    cluster.data_start_attempts = {103: 1}
+    cluster.data_log_handles = {103: log}
+    cluster.data_log_paths = {103: log_path}
+    cluster.port_reservations = StubReservations()
+    restarted: list[dict[str, int]] = []
+    cluster._start_data_node = lambda retry_node: restarted.append(dict(retry_node))  # type: ignore[method-assign]
+
+    try:
+        assert cluster._retry_data_node_after_bind_collision(node) is True
+    finally:
+        log.close()
+
+    assert node["api_port"] == 41001
+    assert node["raft_port"] == 41002
+    assert restarted == [node]
 
 
 @pytest.fixture

@@ -34,9 +34,9 @@ import requests
 
 from conftest import (
     DEFAULT_ANTFLY_BIN,
+    LoopbackPortReservations,
     _read_log_tail,
     _standalone_stateful_command,
-    find_free_port,
     lookup_key_path,
     maybe_preserve_tempdir,
     resolve_binary_path,
@@ -79,8 +79,9 @@ class HAStandaloneNode:
         self.role = role
         self.node_id = node_id
         self.host = "127.0.0.1"
-        self.port = find_free_port()
-        self.health_port = find_free_port()
+        self.port_reservations = LoopbackPortReservations(self.host)
+        self.port = self.port_reservations.reserve()
+        self.health_port = self.port_reservations.reserve()
         self.url = f"http://{self.host}:{self.port}"
         self.log_path = self.root / f"{role}-{node_id}.log"
         self.log_file = self.log_path.open("a")
@@ -182,6 +183,7 @@ class HAStandaloneNode:
             assert self.admin_token is not None
             env[self.admin_token_env] = self.admin_token
 
+        self.port_reservations.release_if_reserved(self.port, self.health_port)
         self.proc = subprocess.Popen(
             command,
             stdout=self.log_file,
@@ -216,6 +218,7 @@ class HAStandaloneNode:
         self.start(enable_replication=enable_replication)
 
     def close(self) -> None:
+        self.port_reservations.close()
         self.stop()
         self.log_file.close()
 

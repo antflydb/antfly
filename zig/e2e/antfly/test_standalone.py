@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import socket
 import subprocess
 import tempfile
 import threading
@@ -31,7 +30,7 @@ from urllib.parse import quote
 import pytest
 import requests
 
-from conftest import antfly_public_api_url, inference_public_api_url
+from conftest import LoopbackPortReservations, antfly_public_api_url, inference_public_api_url
 from helpers import wait_until
 
 
@@ -62,12 +61,6 @@ def _env_int(name: str, default: int) -> int:
     if value is None or value == "":
         return default
     return int(value)
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _wait_for_server(url: str, timeout_s: float = 30.0, path: str = "/status") -> bool:
@@ -156,8 +149,9 @@ class EmbeddedInferenceStandaloneServer:
         self.model_name = model_name
         self.host = host
         self.inference_budget_mb = inference_budget_mb or {}
-        self.public_port = _find_free_port()
-        self.health_port = _find_free_port()
+        self.port_reservations = LoopbackPortReservations(host)
+        self.public_port = self.port_reservations.reserve()
+        self.health_port = self.port_reservations.reserve()
         self.public_url = f"http://{host}:{self.public_port}"
         self.url = antfly_public_api_url(self.public_url)
         self.health_url = f"http://{host}:{self.health_port}"
@@ -201,6 +195,7 @@ class EmbeddedInferenceStandaloneServer:
         ):
             if value > 0:
                 command.extend([flag_name, str(value)])
+        self.port_reservations.release(self.public_port, self.health_port)
         self.proc = subprocess.Popen(
             command,
             stdout=self.log_file,
@@ -221,6 +216,7 @@ class EmbeddedInferenceStandaloneServer:
         return _read_log_tail(self.log_path)
 
     def stop(self) -> None:
+        self.port_reservations.close()
         if self.proc is not None and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:

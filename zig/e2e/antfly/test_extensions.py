@@ -27,13 +27,13 @@ import requests
 
 from conftest import (
     DEFAULT_ANTFLY_BIN,
+    LoopbackPortReservations,
     REPO_ROOT,
     _data_command,
     _metadata_command,
     _read_log_tail,
     _write_remote_content_e2e_config,
     antfly_public_api_url,
-    find_free_port,
     maybe_preserve_tempdir,
     wait_for_server,
 )
@@ -62,10 +62,11 @@ class _ExtensionProcess:
         if not (self.package_store / "memoryaf" / "extension.json").exists():
             raise RuntimeError(f"memoryaf extension package not found under {self.package_store}")
 
-        self.public_port = find_free_port()
-        self.metadata_raft_port = find_free_port()
-        self.metadata_admin_port = find_free_port()
-        self.data_raft_port = find_free_port()
+        self.port_reservations = LoopbackPortReservations(self.host)
+        self.public_port = self.port_reservations.reserve()
+        self.metadata_raft_port = self.port_reservations.reserve()
+        self.metadata_admin_port = self.port_reservations.reserve()
+        self.data_raft_port = self.port_reservations.reserve()
         self.url = f"http://{self.host}:{self.public_port}"
         self.api_url = antfly_public_api_url(self.url, binary=binary)
         self.metadata_admin_url = f"http://{self.host}:{self.metadata_admin_port}"
@@ -115,6 +116,7 @@ class _ExtensionProcess:
             "--extension-package-store",
             str(self.package_store),
         ]
+        self.port_reservations.release(self.public_port)
         self.standalone_proc = subprocess.Popen(command, stdout=self.standalone_log_file, stderr=subprocess.STDOUT, cwd=self.root, env=env)
         if not wait_for_server(self.api_url):
             raise RuntimeError(f"standalone extension server failed to start\n{self.debug_logs()}")
@@ -129,6 +131,7 @@ class _ExtensionProcess:
             root=self.root,
         )
         metadata_command.extend(["--extension-package-store", str(self.package_store)])
+        self.port_reservations.release(self.metadata_raft_port, self.metadata_admin_port)
         self.metadata_proc = subprocess.Popen(
             metadata_command,
             stdout=self.metadata_log_file,
@@ -147,6 +150,7 @@ class _ExtensionProcess:
             metadata_admin_base_uri=self.metadata_admin_url,
             root=self.root,
         )
+        self.port_reservations.release(self.public_port, self.data_raft_port)
         self.data_proc = subprocess.Popen(
             data_command,
             stdout=self.data_log_file,
@@ -172,6 +176,7 @@ class _ExtensionProcess:
         )
 
     def stop(self) -> None:
+        self.port_reservations.close()
         for proc in (self.data_proc, self.metadata_proc, self.standalone_proc):
             if proc is not None and proc.poll() is None:
                 proc.send_signal(signal.SIGTERM)
