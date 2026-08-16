@@ -28,6 +28,13 @@ const max_transport_retries: usize = 1;
 const max_metadata_not_leader_retries: usize = 2;
 const default_request_timeout_ms: u32 = 5_000;
 
+const RetryPolicy = enum {
+    /// Preserve the metadata client's existing retry behavior.
+    replay_safe,
+    /// Retry only failures that prove the server did not admit the mutation.
+    at_most_once,
+};
+
 /// One monotonic budget shared by every transport and not-leader retry in a
 /// logical metadata operation. The cancellation pointer is borrowed only by
 /// synchronous request execution.
@@ -178,17 +185,20 @@ pub const MetadataHttpClient = struct {
         return try self.getJson(ActiveTransitionsResponse, base_uri, routes.Routes.active_transitions);
     }
 
+    /// Returns `error.ReallocationOutcomeUnknown` when transport fails after
+    /// admission may have occurred. Callers must observe metadata state before
+    /// deciding whether to submit a new reallocation generation.
     pub fn triggerReallocate(self: *MetadataHttpClient, base_uri: []const u8) !void {
         const uri = try join(self.alloc, base_uri, routes.Routes.internal_reallocate);
         defer self.alloc.free(uri);
 
-        var resp = try self.executeWithRetry(.{
+        var resp = try self.executeWithRetryPolicy(.{
             .method = .POST,
             .uri = uri,
             .body = "",
             .content_type = "application/json",
             .timeout_ms = default_request_timeout_ms,
-        });
+        }, null, .at_most_once);
         defer resp.deinit(self.alloc);
         if (resp.status == 503) return error.ReallocationProtocolUpgradeRequired;
         try mapStatus(resp.status, null, null, null);
@@ -638,22 +648,50 @@ pub const MetadataHttpClient = struct {
         req: http_common.HttpRequest,
         budget: ?RequestBudget,
     ) !http_common.HttpResponse {
+        return try self.executeWithRetryPolicy(req, budget, .replay_safe);
+    }
+
+    fn executeWithRetryPolicy(
+        self: *MetadataHttpClient,
+        req: http_common.HttpRequest,
+        budget: ?RequestBudget,
+        retry_policy: RetryPolicy,
+    ) !http_common.HttpResponse {
         var transport_attempt: usize = 0;
         var not_leader_attempt: usize = 0;
         while (true) {
             const controlled_req = try applyRequestBudget(req, budget);
             var resp = self.executor.execute(self.alloc, controlled_req) catch |err| switch (err) {
-                error.HttpConnectionClosing,
-                error.ConnectionResetByPeer,
-                error.ConnectionRefused,
-                error.BrokenPipe,
-                error.EndOfStream,
-                error.Timeout,
-                => {
+                // The operating system rejected the connection before an HTTP
+                // request could reach the metadata service, so retrying cannot
+                // create a second reallocation generation.
+                error.ConnectionRefused => {
                     if (transport_attempt >= max_transport_retries) return err;
                     transport_attempt += 1;
                     continue;
                 },
+                error.HttpConnectionClosing,
+                error.ConnectionResetByPeer,
+                error.BrokenPipe,
+                error.EndOfStream,
+                error.Timeout,
+                => {
+                    // These failures can arrive after the server admitted the
+                    // POST. Replaying a reallocation would replace its active
+                    // causal-barrier generation, so make the ambiguity explicit
+                    // and let the caller observe state before submitting again.
+                    if (retry_policy == .at_most_once) return error.ReallocationOutcomeUnknown;
+                    if (transport_attempt >= max_transport_retries) return err;
+                    transport_attempt += 1;
+                    continue;
+                },
+                // Preserve the established behavior for other metadata calls,
+                // while treating this response-less failure as ambiguous for
+                // the at-most-once reallocation mutation.
+                error.ConnectionTimedOut => if (retry_policy == .at_most_once)
+                    return error.ReallocationOutcomeUnknown
+                else
+                    return err,
                 else => return err,
             };
             if (!isMetadataNotLeaderResponse(resp)) return resp;
@@ -755,6 +793,71 @@ test "metadata http client uses the reallocation route and maps upgrade gating" 
         error.ReallocationProtocolUpgradeRequired,
         client.triggerReallocate("http://127.0.0.1:9000"),
     );
+}
+
+test "metadata http client does not replay reallocation after ambiguous transport failures" {
+    const AmbiguousExecutor = struct {
+        failure: anyerror,
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            self.attempts += 1;
+            return self.failure;
+        }
+    };
+
+    const failures = [_]anyerror{
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.ConnectionTimedOut,
+        error.Timeout,
+    };
+    for (failures) |failure| {
+        var executor = AmbiguousExecutor{ .failure = failure };
+        var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+        try std.testing.expectError(
+            error.ReallocationOutcomeUnknown,
+            client.triggerReallocate("http://127.0.0.1:9000"),
+        );
+        try std.testing.expectEqual(@as(usize, 1), executor.attempts);
+    }
+}
+
+test "metadata http client retries reallocation only before connection admission" {
+    const PreAdmissionExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            self.attempts += 1;
+            if (self.attempts == 1) return error.ConnectionRefused;
+            return .{ .status = 202 };
+        }
+    };
+
+    var executor = PreAdmissionExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try client.triggerReallocate("http://127.0.0.1:9000");
+    try std.testing.expectEqual(@as(usize, 2), executor.attempts);
 }
 
 test "metadata http client retries transient connection close on fetch status" {
