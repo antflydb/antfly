@@ -19,6 +19,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -31,10 +32,10 @@ from conftest import (
     _metadata_command,
     _read_log_tail,
     antfly_public_api_url,
-    find_free_port,
     maybe_preserve_tempdir,
     wait_for_server,
 )
+from port_reservations import LoopbackPortReservations
 from helpers import wait_until
 
 
@@ -61,8 +62,8 @@ def _data_command(
         host,
         "--raft-port",
         str(raft_port),
-        "--health-port",
-        str(find_free_port()),
+        "--health",
+        "false",
         "--metadata-api",
         metadata_admin_base_uri,
         "--node-id",
@@ -88,31 +89,40 @@ class SplitStatusCluster:
     def __init__(self, binary: str):
         self.binary = binary
         self.host = "127.0.0.1"
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-status-e2e-")
-        self.root = Path(self.tempdir.name)
+        with ExitStack() as setup:
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-status-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            self.root = Path(self.tempdir.name)
+            self.port_reservations = LoopbackPortReservations(self.host)
+            setup.callback(self.port_reservations.close)
 
-        self.metadata_port = find_free_port()
-        self.metadata_admin_port = find_free_port()
-        self.data_port = find_free_port()
-        self.data_raft_port = find_free_port()
-        self.api_port = find_free_port()
-        self.api_raft_port = find_free_port()
+            (
+                self.metadata_port,
+                self.metadata_admin_port,
+                self.data_port,
+                self.data_raft_port,
+                self.api_port,
+                self.api_raft_port,
+            ) = self.port_reservations.reserve_many(6)
 
-        self.metadata_admin_url = f"http://{self.host}:{self.metadata_admin_port}"
-        self.data_url = f"http://{self.host}:{self.data_port}"
-        self.data_api_url = antfly_public_api_url(self.data_url, binary=binary)
-        self.api_url = antfly_public_api_url(f"http://{self.host}:{self.api_port}", binary=binary)
+            self.metadata_admin_url = f"http://{self.host}:{self.metadata_admin_port}"
+            self.data_url = f"http://{self.host}:{self.data_port}"
+            self.data_api_url = antfly_public_api_url(self.data_url, binary=binary)
+            self.api_url = antfly_public_api_url(
+                f"http://{self.host}:{self.api_port}", binary=binary
+            )
 
-        self.metadata_log_path = self.root / "metadata.log"
-        self.data_log_path = self.root / "data-owner.log"
-        self.api_log_path = self.root / "api-node.log"
-        self.metadata_log_file = self.metadata_log_path.open("w")
-        self.data_log_file = self.data_log_path.open("w")
-        self.api_log_file = self.api_log_path.open("w")
+            self.metadata_log_path = self.root / "metadata.log"
+            self.data_log_path = self.root / "data-owner.log"
+            self.api_log_path = self.root / "api-node.log"
+            self.metadata_log_file = setup.enter_context(self.metadata_log_path.open("w"))
+            self.data_log_file = setup.enter_context(self.data_log_path.open("w"))
+            self.api_log_file = setup.enter_context(self.api_log_path.open("w"))
 
-        self.metadata_proc: subprocess.Popen[str] | None = None
-        self.data_proc: subprocess.Popen[str] | None = None
-        self.api_proc: subprocess.Popen[str] | None = None
+            self.metadata_proc: subprocess.Popen[str] | None = None
+            self.data_proc: subprocess.Popen[str] | None = None
+            self.api_proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
 
         try:
             self._start()
@@ -128,11 +138,14 @@ class SplitStatusCluster:
             admin_port=self.metadata_admin_port,
             root=self.root,
         )
-        self.metadata_proc = subprocess.Popen(
-            metadata_command,
-            stdout=self.metadata_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=REPO_ROOT,
+        self.metadata_proc = self.port_reservations.handoff_to(
+            (self.metadata_port, self.metadata_admin_port),
+            lambda: subprocess.Popen(
+                metadata_command,
+                stdout=self.metadata_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=REPO_ROOT,
+            ),
         )
         if not wait_for_server(self.metadata_admin_url, path="/metadata/v1/status"):
             raise RuntimeError(f"Metadata server failed to start\n{self.debug_logs()}")
@@ -148,11 +161,14 @@ class SplitStatusCluster:
             store_id=2,
             store_role="data",
         )
-        self.data_proc = subprocess.Popen(
-            data_command,
-            stdout=self.data_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=REPO_ROOT,
+        self.data_proc = self.port_reservations.handoff_to(
+            (self.data_port, self.data_raft_port),
+            lambda: subprocess.Popen(
+                data_command,
+                stdout=self.data_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=REPO_ROOT,
+            ),
         )
         if not wait_for_server(self.data_api_url):
             raise RuntimeError(f"Data owner failed to start\n{self.debug_logs()}")
@@ -168,11 +184,14 @@ class SplitStatusCluster:
             store_id=3,
             store_role="api",
         )
-        self.api_proc = subprocess.Popen(
-            api_command,
-            stdout=self.api_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=REPO_ROOT,
+        self.api_proc = self.port_reservations.handoff_to(
+            (self.api_port, self.api_raft_port),
+            lambda: subprocess.Popen(
+                api_command,
+                stdout=self.api_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=REPO_ROOT,
+            ),
         )
         if not wait_for_server(self.api_url):
             raise RuntimeError(f"API-only node failed to start\n{self.debug_logs()}")
@@ -193,6 +212,7 @@ class SplitStatusCluster:
         return payload if isinstance(payload, dict) else {}
 
     def stop(self) -> None:
+        self.port_reservations.close()
         for proc in (self.api_proc, self.data_proc, self.metadata_proc):
             if proc is not None and proc.poll() is None:
                 proc.send_signal(signal.SIGTERM)

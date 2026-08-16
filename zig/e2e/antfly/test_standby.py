@@ -26,6 +26,7 @@ import subprocess
 import tempfile
 import time
 import zlib
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -36,12 +37,12 @@ from conftest import (
     DEFAULT_ANTFLY_BIN,
     _read_log_tail,
     _standalone_stateful_command,
-    find_free_port,
     lookup_key_path,
     maybe_preserve_tempdir,
     resolve_binary_path,
     wait_for_server,
 )
+from port_reservations import LoopbackPortReservations
 
 
 HA_ADMIN_ROOT = "/admin/v1/ha"
@@ -79,11 +80,14 @@ class HAStandaloneNode:
         self.role = role
         self.node_id = node_id
         self.host = "127.0.0.1"
-        self.port = find_free_port()
-        self.health_port = find_free_port()
-        self.url = f"http://{self.host}:{self.port}"
-        self.log_path = self.root / f"{role}-{node_id}.log"
-        self.log_file = self.log_path.open("a")
+        with ExitStack() as setup:
+            self.port_reservations = LoopbackPortReservations(self.host)
+            setup.callback(self.port_reservations.close)
+            self.port, self.health_port = self.port_reservations.reserve_many(2)
+            self.url = f"http://{self.host}:{self.port}"
+            self.log_path = self.root / f"{role}-{node_id}.log"
+            self.log_file = setup.enter_context(self.log_path.open("a"))
+            setup.pop_all()
         self.cluster_id = cluster_id
         self.shard_id = shard_id
         self.table_id = table_id
@@ -111,7 +115,7 @@ class HAStandaloneNode:
     def start(self, *, enable_replication: bool = True) -> None:
         self.node_root.mkdir(parents=True, exist_ok=True)
         command = _standalone_stateful_command(self.binary, host=self.host, port=self.port, root=self.node_root)
-        command.extend(["--health-port", str(self.health_port)])
+        command.extend(["--health", "true", "--health-port", str(self.health_port)])
         if self.role == "primary":
             command.extend(
                 [
@@ -182,12 +186,15 @@ class HAStandaloneNode:
             assert self.admin_token is not None
             env[self.admin_token_env] = self.admin_token
 
-        self.proc = subprocess.Popen(
-            command,
-            stdout=self.log_file,
-            stderr=subprocess.STDOUT,
-            cwd=self.root,
-            env=env,
+        self.proc = self.port_reservations.handoff_to(
+            (self.port, self.health_port),
+            lambda: subprocess.Popen(
+                command,
+                stdout=self.log_file,
+                stderr=subprocess.STDOUT,
+                cwd=self.root,
+                env=env,
+            ),
         )
         if not wait_for_server(self.url, path="/readyz", timeout=30.0):
             logs = self.debug_logs()
@@ -199,7 +206,7 @@ class HAStandaloneNode:
         if self.ha_root.exists():
             shutil.rmtree(self.ha_root)
 
-    def stop(self) -> None:
+    def _stop_process(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:
@@ -209,6 +216,10 @@ class HAStandaloneNode:
                 self.proc.wait()
         self.proc = None
 
+    def stop(self) -> None:
+        self._stop_process()
+        self.port_reservations.ensure_reserved(self.port, self.health_port)
+
     def restart(self, *, enable_replication: bool = True) -> None:
         self.stop()
         self.log_file.close()
@@ -216,7 +227,8 @@ class HAStandaloneNode:
         self.start(enable_replication=enable_replication)
 
     def close(self) -> None:
-        self.stop()
+        self._stop_process()
+        self.port_reservations.close()
         self.log_file.close()
 
     def debug_logs(self) -> str:
@@ -308,35 +320,40 @@ class HAStandaloneNode:
 
 class HACluster:
     def __init__(self, binary: str):
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-ha-standby-e2e-")
-        self.root = Path(self.tempdir.name).resolve()
-        self.admin_token_env = "ANTFLY_HA_E2E_ADMIN_TOKEN"
-        self.admin_token = "ha-e2e-secret-token"
-        self.primary = HAStandaloneNode(
-            binary=binary,
-            root=self.root,
-            role="primary",
-            node_id="primary-a",
-            cluster_id=100,
-            timeline_id=1,
-            epoch=1,
-            sync_standby_name="standby-a",
-            admin_token_env=self.admin_token_env,
-            admin_token=self.admin_token,
-        )
-        self.standby = HAStandaloneNode(
-            binary=binary,
-            root=self.root,
-            role="standby",
-            node_id="standby-a",
-            cluster_id=100,
-            timeline_id=1,
-            epoch=1,
-            upstream_url=self.primary.url,
-            slot_name="standby-a",
-            admin_token_env=self.admin_token_env,
-            admin_token=self.admin_token,
-        )
+        with ExitStack() as setup:
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-ha-standby-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            self.root = Path(self.tempdir.name).resolve()
+            self.admin_token_env = "ANTFLY_HA_E2E_ADMIN_TOKEN"
+            self.admin_token = "ha-e2e-secret-token"
+            self.primary = HAStandaloneNode(
+                binary=binary,
+                root=self.root,
+                role="primary",
+                node_id="primary-a",
+                cluster_id=100,
+                timeline_id=1,
+                epoch=1,
+                sync_standby_name="standby-a",
+                admin_token_env=self.admin_token_env,
+                admin_token=self.admin_token,
+            )
+            setup.callback(self.primary.close)
+            self.standby = HAStandaloneNode(
+                binary=binary,
+                root=self.root,
+                role="standby",
+                node_id="standby-a",
+                cluster_id=100,
+                timeline_id=1,
+                epoch=1,
+                upstream_url=self.primary.url,
+                slot_name="standby-a",
+                admin_token_env=self.admin_token_env,
+                admin_token=self.admin_token,
+            )
+            setup.callback(self.standby.close)
+            setup.pop_all()
 
     def configure_table_identity(self, *, shard_id: int, table_id: int) -> None:
         for node in (self.primary, self.standby):
