@@ -421,6 +421,8 @@ def _write_remote_content_e2e_config(root: Path) -> Path:
 
 class AntflyServer:
     def __init__(self, binary: str, host: str, port: int):
+        self.port_reservations = LoopbackPortReservations(host)
+        port = self.port_reservations.reserve_requested(port)
         self.url = f"http://{host}:{port}"
         self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-e2e-")
         root = Path(self.tempdir.name)
@@ -438,7 +440,21 @@ class AntflyServer:
             }
         )
         command = _serverless_combined_command(binary, host=host, port=port, root=root)
-        self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT, env=env, cwd=REPO_ROOT)
+        self.proc: subprocess.Popen[str] | None = None
+        try:
+            self.proc = self.port_reservations.handoff_to(
+                (port,),
+                lambda: subprocess.Popen(
+                    command,
+                    stdout=self.log_file,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    cwd=REPO_ROOT,
+                ),
+            )
+        except BaseException:
+            self.stop()
+            raise
         if not wait_for_server(self.url):
             self.stop()
             out = _read_log_tail(self.log_path)
@@ -449,6 +465,7 @@ class AntflyServer:
         return _read_log_tail(self.log_path)
 
     def stop(self) -> None:
+        self.port_reservations.close()
         if self.proc and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:
@@ -465,6 +482,8 @@ class PublicAntflyServer:
     def __init__(self, binary: str, host: str, port: int):
         self.binary = binary
         self.host = host
+        self.port_reservations = LoopbackPortReservations(host)
+        port = self.port_reservations.reserve_requested(port)
         self.port = port
         self.url = f"http://{host}:{port}"
         self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-public-e2e-")
@@ -474,7 +493,20 @@ class PublicAntflyServer:
         self.log_path = root / "server.log"
         self.log_file = self.log_path.open("w")
         command = _legacy_stateful_command(binary, host=host, port=port, root=root)
-        self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT, cwd=root)
+        self.proc: subprocess.Popen[str] | None = None
+        try:
+            self.proc = self.port_reservations.handoff_to(
+                (port,),
+                lambda: subprocess.Popen(
+                    command,
+                    stdout=self.log_file,
+                    stderr=subprocess.STDOUT,
+                    cwd=root,
+                ),
+            )
+        except BaseException:
+            self.stop()
+            raise
         if not wait_for_server(self.url):
             self.stop()
             out = _read_log_tail(self.log_path)
@@ -484,7 +516,7 @@ class PublicAntflyServer:
         self.log_file.flush()
         return _read_log_tail(self.log_path)
 
-    def pause(self) -> None:
+    def _stop_process(self) -> None:
         if self.proc and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:
@@ -494,16 +526,29 @@ class PublicAntflyServer:
                 self.proc.wait()
         self.proc = None
 
+    def pause(self) -> None:
+        self._stop_process()
+        self.port_reservations.ensure_reserved(self.port)
+
     def resume(self) -> None:
         command = _legacy_stateful_command(self.binary, host=self.host, port=self.port, root=self.root)
-        self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT, cwd=self.root)
+        self.proc = self.port_reservations.handoff_to(
+            (self.port,),
+            lambda: subprocess.Popen(
+                command,
+                stdout=self.log_file,
+                stderr=subprocess.STDOUT,
+                cwd=self.root,
+            ),
+        )
         if not wait_for_server(self.url):
             out = _read_log_tail(self.log_path)
             self.stop()
             raise RuntimeError(f"Public API server failed to resume at {self.url}\n{out}")
 
     def stop(self, *, test_failed: bool = False) -> None:
-        self.pause()
+        self._stop_process()
+        self.port_reservations.close()
         self.log_file.close()
         if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
@@ -818,6 +863,8 @@ class StandaloneAntflyServer:
     def __init__(self, binary: str, host: str, port: int):
         self.binary = binary
         self.host = host
+        self.port_reservations = LoopbackPortReservations(host)
+        port = self.port_reservations.reserve_requested(port)
         self.port = port
         self.url = f"http://{host}:{port}"
         self.api_url = antfly_public_api_url(self.url, binary=binary)
@@ -827,13 +874,26 @@ class StandaloneAntflyServer:
         self.log_path = self.root / "server.log"
         self.log_file = self.log_path.open("w")
         self.proc: subprocess.Popen[str] | None = None
-        self._start_process(truncate_logs=False)
+        try:
+            self._start_process(truncate_logs=False)
+        except BaseException:
+            if not self.log_file.closed:
+                self.stop()
+            raise
 
     def _start_process(self, *, truncate_logs: bool) -> None:
         if truncate_logs:
             self.log_file = self.log_path.open("w")
         command = _standalone_stateful_command(self.binary, host=self.host, port=self.port, root=self.root)
-        self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT, cwd=self.root)
+        self.proc = self.port_reservations.handoff_to(
+            (self.port,),
+            lambda: subprocess.Popen(
+                command,
+                stdout=self.log_file,
+                stderr=subprocess.STDOUT,
+                cwd=self.root,
+            ),
+        )
         if not wait_for_server(self.api_url):
             self.stop()
             out = _read_log_tail(self.log_path)
@@ -866,19 +926,21 @@ class StandaloneAntflyServer:
         self.proc = None
 
     def restart(self) -> None:
-        self._stop_process()
+        self.pause()
         self.log_file.close()
         self.log_file = self.log_path.open("a")
         self._start_process(truncate_logs=False)
 
     def pause(self) -> None:
         self._stop_process()
+        self.port_reservations.ensure_reserved(self.port)
 
     def resume(self) -> None:
         self._start_process(truncate_logs=False)
 
     def stop(self, *, test_failed: bool = False) -> None:
         self._stop_process()
+        self.port_reservations.close()
         self.log_file.close()
         if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()

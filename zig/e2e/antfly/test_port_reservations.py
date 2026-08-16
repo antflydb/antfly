@@ -23,8 +23,14 @@ from typing import Any
 
 import pytest
 
-from conftest import StatefulAntflyServer
+from conftest import (
+    AntflyServer,
+    PublicAntflyServer,
+    StandaloneAntflyServer,
+    StatefulAntflyServer,
+)
 from port_reservations import LoopbackPortReservations, find_free_port
+from test_auth import StandaloneAuthServer
 
 
 def test_loopback_port_reservations_hold_ports_until_handoff():
@@ -129,6 +135,45 @@ def test_handoff_restores_leases_when_process_spawn_fails():
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
             with pytest.raises(OSError):
                 contender.bind(("127.0.0.1", port))
+
+
+@pytest.mark.parametrize(
+    "server_type",
+    (AntflyServer, PublicAntflyServer, StandaloneAntflyServer, StandaloneAuthServer),
+)
+def test_single_process_servers_release_requested_port_when_spawn_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    server_type: type,
+):
+    requested_port = find_free_port()
+
+    def fail_to_spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
+        raise OSError(errno.ENOEXEC, "cannot execute")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_to_spawn)
+    with pytest.raises(OSError) as exc_info:
+        server_type("/missing-antfly", "127.0.0.1", requested_port)
+    assert exc_info.value.errno == errno.ENOEXEC
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+        contender.bind(("127.0.0.1", requested_port))
+
+
+@pytest.mark.parametrize("server_type", (PublicAntflyServer, StandaloneAntflyServer))
+def test_single_process_pause_retains_listener_port(server_type: type):
+    server = object.__new__(server_type)
+    server.proc = None
+    server.port_reservations = LoopbackPortReservations()
+    server.port = server.port_reservations.reserve()
+    server.port_reservations.release(server.port)
+
+    try:
+        server.pause()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+            with pytest.raises(OSError):
+                contender.bind(("127.0.0.1", server.port))
+    finally:
+        server.port_reservations.close()
 
 
 def test_stateful_server_releases_requested_port_when_spawn_fails(monkeypatch: pytest.MonkeyPatch):

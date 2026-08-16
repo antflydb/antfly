@@ -40,7 +40,7 @@ from conftest import (
     resolve_binary_path,
     wait_for_server,
 )
-from port_reservations import find_free_port
+from port_reservations import LoopbackPortReservations, find_free_port
 
 AUTH_PUBLIC_API_ROOT = "/auth/v1"
 AUTH_STARTUP_TIMEOUT_SECONDS = 30.0
@@ -229,6 +229,8 @@ class AuthApi:
 
 class StandaloneAuthServer:
     def __init__(self, binary: str, host: str, port: int):
+        self.port_reservations = LoopbackPortReservations(host)
+        port = self.port_reservations.reserve_requested(port)
         self.url = f"http://{host}:{port}"
         self.api_url = antfly_public_api_url(self.url)
         self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-auth-e2e-")
@@ -238,12 +240,20 @@ class StandaloneAuthServer:
         self.log_file = self.log_path.open("w")
         command = _standalone_stateful_command(binary, host=host, port=port, root=root)
         command.extend(["--auth", "true"])
-        self.proc = subprocess.Popen(
-            command,
-            stdout=self.log_file,
-            stderr=subprocess.STDOUT,
-            cwd=root,
-        )
+        self.proc: subprocess.Popen[str] | None = None
+        try:
+            self.proc = self.port_reservations.handoff_to(
+                (port,),
+                lambda: subprocess.Popen(
+                    command,
+                    stdout=self.log_file,
+                    stderr=subprocess.STDOUT,
+                    cwd=root,
+                ),
+            )
+        except BaseException:
+            self.stop()
+            raise
         if not wait_for_server(self.api_url, allow_unauthorized=True):
             self.stop()
             out = _read_log_tail(self.log_path)
@@ -269,6 +279,7 @@ class StandaloneAuthServer:
         return ""
 
     def stop(self) -> None:
+        self.port_reservations.close()
         if self.proc and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:
