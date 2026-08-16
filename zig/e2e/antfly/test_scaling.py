@@ -1564,6 +1564,22 @@ def _wait_for_group_count(
     return group_ids
 
 
+def _request_reallocation(
+    cluster: MultiNodeScalingCluster,
+) -> bool:
+    """Submit at most one generation before read-only convergence polling.
+
+    A successful request replaces the active reallocation barrier generation. The
+    convergence poll must therefore observe that generation instead of submitting
+    another request every time it reads state.
+    """
+    try:
+        cluster.trigger_reallocate()
+    except (AssertionError, requests.RequestException):
+        return False
+    return True
+
+
 def _wait_node_owns_group(
     cluster: MultiNodeScalingCluster,
     table_name: str,
@@ -1571,9 +1587,11 @@ def _wait_node_owns_group(
     *,
     timeout_s: float = 90.0,
 ) -> dict[str, Any] | None:
+    if not _request_reallocation(cluster):
+        return None
+
     def owns_group() -> dict[str, Any] | None:
         try:
-            cluster.trigger_reallocate()
             group_ids = _table_group_ids(cluster, table_name)
         except (AssertionError, requests.RequestException):
             return None
@@ -1594,10 +1612,6 @@ def _wait_node_drained_for_groups(
     timeout_s: float = 90.0,
 ) -> dict[str, Any] | None:
     def drained_and_replaced() -> dict[str, Any] | None:
-        try:
-            cluster.trigger_reallocate()
-        except (AssertionError, requests.RequestException):
-            return None
         snapshots = _all_metadata_snapshots(cluster)
         if snapshots is None:
             return None
@@ -1639,14 +1653,6 @@ def _wait_node_shutdown_phase(
 
     def status_matches() -> dict[str, Any] | None:
         nonlocal last_status
-        # Shutdown convergence (drain debt clearing, then post-finalize cleanup to
-        # "not_found") is driven by the metadata reconcile loop. A reallocation
-        # request is a reconcile wake signal, so nudge it each poll to keep the loop
-        # advancing under load instead of waiting on the next unforced periodic pass.
-        try:
-            cluster.trigger_reallocate()
-        except (AssertionError, requests.RequestException):
-            pass
         try:
             response = requests.get(f"{cluster.metadata_urls[0]}/internal/v1/nodes/{node_id}/shutdown", timeout=10)
             response.raise_for_status()
