@@ -23,6 +23,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,32 @@ def _raise_for_metadata_mutation(response: requests.Response, *, operation: str)
     response.raise_for_status()
 
 
+def _submit_metadata_mutation_if_unobserved(
+    *,
+    observe: Callable[[], dict[str, Any] | None],
+    submit: Callable[[], None],
+) -> tuple[dict[str, Any] | None, str | None]:
+    observed = observe()
+    if observed is not None:
+        return observed, None
+
+    try:
+        submit()
+    except MetadataMutationRejected:
+        # A different actor may have established the desired state between our
+        # preflight read and this definitive rejection. Re-read once, but never
+        # retry the mutation or hide a rejection while the state is absent.
+        observed = observe()
+        if observed is not None:
+            return observed, None
+        raise
+    except requests.RequestException as exc:
+        # The request may have committed before its response was lost. Preserve
+        # the transport error while read-only convergence determines its outcome.
+        return None, repr(exc)
+    return None, None
+
+
 def test_metadata_mutation_response_distinguishes_rejection_from_ambiguity():
     for status in (409, 425, 429):
         rejected = requests.Response()
@@ -75,6 +102,67 @@ def test_metadata_mutation_response_distinguishes_rejection_from_ambiguity():
         ambiguous.status_code = status
         with pytest.raises(requests.HTTPError):
             _raise_for_metadata_mutation(ambiguous, operation="trigger reallocation")
+
+
+def test_metadata_mutation_submission_is_state_driven_and_at_most_once():
+    state: dict[str, Any] | None = {"ready": True}
+    submissions = 0
+
+    def observe() -> dict[str, Any] | None:
+        return state
+
+    def submit() -> None:
+        nonlocal submissions
+        submissions += 1
+
+    observed, error = _submit_metadata_mutation_if_unobserved(observe=observe, submit=submit)
+    assert observed == {"ready": True}
+    assert error is None
+    assert submissions == 0
+
+    state = None
+    observed, error = _submit_metadata_mutation_if_unobserved(observe=observe, submit=submit)
+    assert observed is None
+    assert error is None
+    assert submissions == 1
+
+    def reject_after_concurrent_completion() -> None:
+        nonlocal state, submissions
+        submissions += 1
+        state = {"ready": True}
+        raise MetadataMutationRejected("concurrent completion")
+
+    observed, error = _submit_metadata_mutation_if_unobserved(
+        observe=observe,
+        submit=reject_after_concurrent_completion,
+    )
+    assert observed == {"ready": True}
+    assert error is None
+    assert submissions == 2
+
+    state = None
+
+    def reject_without_completion() -> None:
+        nonlocal submissions
+        submissions += 1
+        raise MetadataMutationRejected("still rejected")
+
+    with pytest.raises(MetadataMutationRejected, match="still rejected"):
+        _submit_metadata_mutation_if_unobserved(
+            observe=observe,
+            submit=reject_without_completion,
+        )
+    assert submissions == 3
+
+    def lose_response() -> None:
+        nonlocal submissions
+        submissions += 1
+        raise requests.Timeout("response lost after submission")
+
+    observed, error = _submit_metadata_mutation_if_unobserved(observe=observe, submit=lose_response)
+    assert observed is None
+    assert error is not None and "response lost after submission" in error
+    assert submissions == 4
 
 
 class _ClusterStartupDeadline:
@@ -849,17 +937,19 @@ class MultiNodeScalingCluster:
         method: str,
         path: str,
         *,
+        operation: str,
         json_body: dict[str, Any] | None = None,
-    ) -> requests.Response:
+    ) -> None:
         """Issue one side-effecting request; callers resolve ambiguity by observing state."""
         if not self.metadata_urls:
             raise AssertionError("cluster has no metadata URLs")
-        return requests.request(
+        response = requests.request(
             method,
             f"{self.metadata_urls[0]}{path}",
             json=json_body,
             timeout=5,
         )
+        _raise_for_metadata_mutation(response, operation=operation)
 
     def metadata_snapshot_from(self, index: int) -> dict[str, Any]:
         response = requests.get(f"{self.metadata_urls[index]}/metadata/v1/admin/snapshot", timeout=10)
@@ -931,7 +1021,6 @@ class MultiNodeScalingCluster:
         )
 
     def request_node_shutdown(self, node_id: int, *, timeout_s: float = 30.0) -> None:
-        submission_error: str | None = None
         last_observation_error: str | None = None
 
         def intent_visible_on_all_metadata_nodes() -> dict[str, Any] | None:
@@ -957,20 +1046,16 @@ class MultiNodeScalingCluster:
                     return None
             return snapshots[0]
 
-        visible = intent_visible_on_all_metadata_nodes()
+        visible, submission_error = _submit_metadata_mutation_if_unobserved(
+            observe=intent_visible_on_all_metadata_nodes,
+            submit=lambda: self.metadata_mutation_once(
+                "PUT",
+                f"/internal/v1/nodes/{node_id}/shutdown",
+                operation=f"request shutdown for node {node_id}",
+                json_body={"type": "remove", "reason": "e2e"},
+            ),
+        )
         if visible is None:
-            try:
-                response = self.metadata_mutation_once(
-                    "PUT",
-                    f"/internal/v1/nodes/{node_id}/shutdown",
-                    json_body={"type": "remove", "reason": "e2e"},
-                )
-                _raise_for_metadata_mutation(response, operation=f"request shutdown for node {node_id}")
-            except requests.RequestException as exc:
-                # A timeout or disconnect can occur after admission. Never
-                # resubmit an ambiguous mutation; observe replicated state to
-                # determine whether it committed.
-                submission_error = repr(exc)
             visible = wait_until(intent_visible_on_all_metadata_nodes, timeout_s=timeout_s, interval_s=0.5)
 
         assert visible is not None, (
@@ -983,7 +1068,6 @@ class MultiNodeScalingCluster:
         )
 
     def finalize_node_shutdown(self, node_id: int, *, timeout_s: float = 30.0) -> None:
-        submission_error: str | None = None
         last_observation_error: str | None = None
 
         def finalized_visible_on_all_metadata_nodes() -> dict[str, Any] | None:
@@ -1003,15 +1087,15 @@ class MultiNodeScalingCluster:
                     return None
             return snapshots[0]
 
-        finalized = finalized_visible_on_all_metadata_nodes()
+        finalized, submission_error = _submit_metadata_mutation_if_unobserved(
+            observe=finalized_visible_on_all_metadata_nodes,
+            submit=lambda: self.metadata_mutation_once(
+                "DELETE",
+                f"/internal/v1/nodes/{node_id}",
+                operation=f"finalize shutdown for node {node_id}",
+            ),
+        )
         if finalized is None:
-            try:
-                response = self.metadata_mutation_once("DELETE", f"/internal/v1/nodes/{node_id}")
-                _raise_for_metadata_mutation(response, operation=f"finalize shutdown for node {node_id}")
-            except requests.RequestException as exc:
-                # As with shutdown admission, an absent response does not prove
-                # rejection. Resolve the outcome through read-only observation.
-                submission_error = repr(exc)
             finalized = wait_until(finalized_visible_on_all_metadata_nodes, timeout_s=timeout_s, interval_s=0.5)
 
         assert finalized is not None, (
@@ -1024,8 +1108,11 @@ class MultiNodeScalingCluster:
         )
 
     def trigger_reallocate(self) -> None:
-        response = self.metadata_mutation_once("POST", "/internal/v2/reallocate")
-        _raise_for_metadata_mutation(response, operation="trigger reallocation")
+        self.metadata_mutation_once(
+            "POST",
+            "/internal/v2/reallocate",
+            operation="trigger reallocation",
+        )
 
     def request_split(self, table_name: str, split_key: str) -> None:
         response = self.post_metadata(f"/internal/v1/tables/{table_name}/split", json_body={"split_key": split_key})
@@ -1257,7 +1344,10 @@ def _scaling_antfly_binary() -> str:
 
 
 def _table_group_ids(cluster: MultiNodeScalingCluster, table_name: str) -> set[int] | None:
-    snapshot = cluster.metadata_snapshot()
+    return _table_group_ids_from_snapshot(cluster.metadata_snapshot(), table_name)
+
+
+def _table_group_ids_from_snapshot(snapshot: dict[str, Any], table_name: str) -> set[int] | None:
     table_id = None
     for table in snapshot.get("tables", []):
         if isinstance(table, dict) and table.get("name") == table_name:
@@ -1308,7 +1398,10 @@ def _oversized_table_group_ids(
 
 
 def _placed_nodes_for_groups(cluster: MultiNodeScalingCluster, group_ids: set[int]) -> set[int]:
-    snapshot = cluster.metadata_snapshot()
+    return _placed_nodes_for_groups_from_snapshot(cluster.metadata_snapshot(), group_ids)
+
+
+def _placed_nodes_for_groups_from_snapshot(snapshot: dict[str, Any], group_ids: set[int]) -> set[int]:
     return {
         int(intent["record"]["local_node_id"])
         for intent in snapshot.get("placement_intents", [])
@@ -1625,27 +1718,26 @@ def _wait_node_owns_group(
     *,
     timeout_s: float = 90.0,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    submission_error: str | None = None
-    try:
-        # A successful request replaces the active barrier generation. Submit
-        # once, then let the convergence poll remain strictly read-only.
-        cluster.trigger_reallocate()
-    except requests.RequestException as exc:
-        # The request may have committed before its response was lost. Preserve
-        # the error for diagnostics while still observing the possible outcome.
-        submission_error = repr(exc)
-
     def owns_group() -> dict[str, Any] | None:
         try:
-            group_ids = _table_group_ids(cluster, table_name)
+            snapshot = cluster.metadata_snapshot()
         except (AssertionError, requests.RequestException):
             return None
+        group_ids = _table_group_ids_from_snapshot(snapshot, table_name)
         if not group_ids:
             return None
-        if node_id not in _placed_nodes_for_groups(cluster, group_ids):
+        if node_id not in _placed_nodes_for_groups_from_snapshot(snapshot, group_ids):
             return None
-        return cluster.metadata_snapshot()
+        return snapshot
 
+    assigned, submission_error = _submit_metadata_mutation_if_unobserved(
+        observe=owns_group,
+        # A successful request replaces the active barrier generation. Submit
+        # once only when placement is absent, then keep polling read-only.
+        submit=cluster.trigger_reallocate,
+    )
+    if assigned is not None:
+        return assigned, submission_error
     return wait_until(owns_group, timeout_s=timeout_s, interval_s=0.5), submission_error
 
 
