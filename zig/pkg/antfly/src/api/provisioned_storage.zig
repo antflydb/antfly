@@ -67,6 +67,12 @@ const MinSmartDenseRepairBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartDenseRepairBytes: u64 = 512 * 1024 * 1024;
 const MinSmartShardTransitionBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartShardTransitionBytes: u64 = 512 * 1024 * 1024;
+const MinSmartInferenceModelBytes: u64 = 1024 * 1024 * 1024;
+const MaxSmartInferenceModelBytes: u64 = 16 * 1024 * 1024 * 1024;
+const MinSmartInferenceKvBytes: u64 = 256 * 1024 * 1024;
+const MaxSmartInferenceKvBytes: u64 = 4 * 1024 * 1024 * 1024;
+const MinSmartInferenceScratchBytes: u64 = 256 * 1024 * 1024;
+const MaxSmartInferenceScratchBytes: u64 = 4 * 1024 * 1024 * 1024;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
@@ -158,6 +164,9 @@ fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     const algebraic_tensor_hard = adaptiveSliceHardLimit(total, 64, MinSmartAlgebraicTensorBytes, MaxSmartAlgebraicTensorBytes);
     const dense_repair_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseRepairBytes, MaxSmartDenseRepairBytes);
     const shard_transition_hard = adaptiveSliceHardLimit(total, 24, MinSmartShardTransitionBytes, MaxSmartShardTransitionBytes);
+    const inference_model_hard = adaptiveSliceHardLimit(total, 2, MinSmartInferenceModelBytes, MaxSmartInferenceModelBytes);
+    const inference_kv_hard = adaptiveSliceHardLimit(total, 8, MinSmartInferenceKvBytes, MaxSmartInferenceKvBytes);
+    const inference_scratch_hard = adaptiveSliceHardLimit(total, 8, MinSmartInferenceScratchBytes, MaxSmartInferenceScratchBytes);
 
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, lsm_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = resourceBudget(3, lsm_compaction_hard);
@@ -177,6 +186,11 @@ fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     options.budgets[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)] = resourceBudget(3, algebraic_tensor_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = resourceBudget(3, dense_repair_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.shard_transition_working_set)] = resourceBudget(3, shard_transition_hard);
+    // The embedded ModelManager still owns model-aware estimates and eviction,
+    // but its leases must fit finite node-owned physical-domain slices.
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.inference_model_residency)] = resourceBudget(3, inference_model_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.inference_kv_working_set)] = resourceBudget(3, inference_kv_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.inference_scratch_working_set)] = resourceBudget(3, inference_scratch_hard);
 
     return .{
         .options = options,
@@ -529,6 +543,9 @@ test "provisioned group storage derives all resource budgets" {
         resource_manager_mod.Slice.lite_native_link_cache,
         resource_manager_mod.Slice.dense_repair_working_set,
         resource_manager_mod.Slice.shard_transition_working_set,
+        resource_manager_mod.Slice.inference_model_residency,
+        resource_manager_mod.Slice.inference_kv_working_set,
+        resource_manager_mod.Slice.inference_scratch_working_set,
     }) |slice| {
         const stats = storage.resource_manager.sliceStats(slice);
         try std.testing.expect(stats.hard_limit_bytes > 0);

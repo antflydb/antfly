@@ -3249,6 +3249,14 @@ pub const WhisperAssetsHandle = struct {
     }
 };
 
+/// Declares who owns the process-wide physical memory budget. Direct inference
+/// uses its local admission controller. Embedded inference must attach the
+/// node ResourceManager bridge before any model can be loaded or served.
+pub const ResourceOwnership = enum {
+    local,
+    external_required,
+};
+
 pub const ModelManager = struct {
     const LoadedModelMap = std.StringHashMapUnmanaged(*LoadedModel);
 
@@ -3269,6 +3277,9 @@ pub const ModelManager = struct {
     admission: runtime.tier.memory.AdmissionController = .{},
     admission_enabled: bool = false,
     admission_limit_overrides: runtime.tier.memory.Limits = .{},
+    process_memory_limit_bytes: usize = 0,
+    resource_ownership: ResourceOwnership = .local,
+    external_resource_budget_attached: bool = false,
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
     loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
     /// Protects loaded-model maps and the in-flight registry. Expensive tokenizer,
@@ -3308,10 +3319,33 @@ pub const ModelManager = struct {
         self.serving_policy = policy;
         self.admission_enabled = true;
         self.admission.configureSharedLimits(
-            runtime.tier.memory.sharedAdmissionLimitsWithOverrides(
+            runtime.tier.memory.sharedAdmissionLimitsWithOverridesAndProcessLimit(
                 self.admission_limit_overrides,
+                self.process_memory_limit_bytes,
             ),
         );
+    }
+
+    pub fn configureResourceOwnership(
+        self: *ModelManager,
+        ownership: ResourceOwnership,
+    ) void {
+        std.debug.assert(self.loaded.count() == 0);
+        std.debug.assert(self.whisper_assets.count() == 0);
+        self.resource_ownership = ownership;
+    }
+
+    pub fn configureProcessMemoryLimit(self: *ModelManager, limit_bytes: usize) void {
+        std.debug.assert(self.loaded.count() == 0);
+        std.debug.assert(self.whisper_assets.count() == 0);
+        self.process_memory_limit_bytes = limit_bytes;
+        self.admission.configureProcessMemoryLimit(limit_bytes);
+    }
+
+    pub fn ensureResourceOwnerReady(self: *const ModelManager) !void {
+        if (self.resource_ownership == .external_required and
+            !self.external_resource_budget_attached)
+            return error.ExternalResourceManagerNotConfigured;
     }
 
     pub fn configureModelCache(
@@ -3357,7 +3391,10 @@ pub const ModelManager = struct {
         std.debug.assert(self.whisper_assets.count() == 0);
         self.admission_limit_overrides = overrides;
         self.admission.configureSharedLimits(
-            runtime.tier.memory.sharedAdmissionLimitsWithOverrides(overrides),
+            runtime.tier.memory.sharedAdmissionLimitsWithOverridesAndProcessLimit(
+                overrides,
+                self.process_memory_limit_bytes,
+            ),
         );
     }
 
@@ -3368,6 +3405,7 @@ pub const ModelManager = struct {
         std.debug.assert(self.loaded.count() == 0);
         std.debug.assert(self.whisper_assets.count() == 0);
         self.admission.configureResourceBudget(resource_budget);
+        self.external_resource_budget_attached = resource_budget != null;
     }
 
     pub fn configureForcedRunAdmissionDenialsForTesting(
@@ -3691,6 +3729,7 @@ pub const ModelManager = struct {
         limits: runtime.tier.memory.Limits,
         amounts: runtime.tier.memory.AdmissionAmounts,
     ) !runtime.tier.memory.AdmissionLease {
+        try self.ensureResourceOwnerReady();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
         return self.admission.tryAcquireWithPressure(
             backend_class,
@@ -3727,6 +3766,7 @@ pub const ModelManager = struct {
         self: *ModelManager,
         requests: []const runtime.tier.memory.AdmissionRequest,
     ) !runtime.tier.memory.AdmissionLease {
+        try self.ensureResourceOwnerReady();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
         return self.admission.tryAcquireRequestsWithPressure(
             requests,
@@ -4115,8 +4155,9 @@ pub const ModelManager = struct {
         self: *const ModelManager,
         backend_runtime: backends.BackendRuntime,
     ) runtime.tier.memory.Limits {
-        var limits = runtime.tier.memory.defaultLimitsForBackend(
+        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
             admissionBackendClassForRuntime(backend_runtime),
+            self.process_memory_limit_bytes,
         );
         const overrides = self.admission_limit_overrides;
         if (overrides.host_limit_bytes > 0) limits.host_limit_bytes = overrides.host_limit_bytes;
@@ -6303,6 +6344,30 @@ fn rememberPreferredLoadError(selected: *?anyerror, candidate: anyerror) void {
     if (loadErrorPriority(candidate) > loadErrorPriority(current)) {
         selected.* = candidate;
     }
+}
+
+test "external resource ownership fails closed until budget is attached" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer manager.deinit();
+
+    manager.configureResourceOwnership(.external_required);
+    try std.testing.expectError(
+        error.ExternalResourceManagerNotConfigured,
+        manager.ensureResourceOwnerReady(),
+    );
+
+    const Bridge = struct {
+        fn reserve(_: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) void {}
+    };
+    var context: u8 = 0;
+    manager.configureAdmissionResourceBudget(.{
+        .context = &context,
+        .try_reserve = Bridge.reserve,
+        .release = Bridge.release,
+    });
+    try manager.ensureResourceOwnerReady();
 }
 
 test "model loading preserves retryable admission errors across backend probes" {

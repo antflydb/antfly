@@ -20,7 +20,7 @@ const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version: u32 = 11;
+pub const abi_version: u32 = 12;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -75,6 +75,7 @@ pub const CreateContext = extern struct {
     combined_limit_bytes: usize,
     kv_limit_bytes: usize,
     scratch_limit_bytes: usize,
+    process_memory_limit_bytes: usize,
     preload_ptr: ?[*]const WarmModel,
     preload_len: usize,
     keep_alive: OptionalString,

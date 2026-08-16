@@ -652,6 +652,11 @@ pub const NodeConfig = struct {
     /// available to receive streaming request bodies.
     http_max_request_tasks: u32 = 64,
     pool_size: usize = 2,
+    /// Optional hard envelope for all memory charged to this process/container.
+    /// This is required when the runtime has no finite cgroup memory.max and
+    /// should normally match the orchestrator's process memory allocation.
+    process_memory_limit_bytes: usize = 0,
+    resource_ownership: model_manager_mod.ResourceOwnership = .local,
     generation_budget_overrides: BudgetOverrides = .{},
     generation_batching: GenerationBatchingConfig = .{},
     kernel_jit: graph_mod.kernel_jit.Config = .{},
@@ -2694,6 +2699,8 @@ pub const Node = struct {
             .inference_admission = inference_admission_mod.InferenceAdmission.init(config.max_concurrent_requests),
             .compatibility_cache = .empty,
         };
+        node.model_manager.configureResourceOwnership(config.resource_ownership);
+        node.model_manager.configureProcessMemoryLimit(config.process_memory_limit_bytes);
         node.model_manager.configureServingPolicy(.{
             .allow_unknown = config.allow_unknown_models,
         });
@@ -2708,6 +2715,12 @@ pub const Node = struct {
             .kv_limit_bytes = config.generation_budget_overrides.kv_limit_bytes,
             .scratch_limit_bytes = config.generation_budget_overrides.scratch_limit_bytes,
         });
+        if (!builtin.is_test) {
+            std.log.info(
+                "inference resource policy ownership={s} process_memory_limit_bytes={d}",
+                .{ @tagName(config.resource_ownership), config.process_memory_limit_bytes },
+            );
+        }
         node.model_manager.tokenizer_cache_config = config.tokenizer_cache;
         node.model_manager.tokenizer_parallel_bpe_config =
             config.tokenizer_parallel_bpe;
@@ -3477,6 +3490,7 @@ pub const Node = struct {
     /// any listener or request handler that can reach this Node.
     pub fn warmConfiguredModelsBeforeServing(self: *Node, allocator: std.mem.Allocator) !void {
         if (self.request_surfaces_published) return error.KernelJitStartupWindowClosed;
+        try self.model_manager.ensureResourceOwnerReady();
         // A retry must earn readiness again. Otherwise a failed second warm
         // could leave a stale successful latch and permit route publication.
         self.startup_preloads_materialized = false;
@@ -10472,6 +10486,7 @@ pub const Node = struct {
     }
 
     pub fn serve(self: *Node, allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !void {
+        try self.model_manager.ensureResourceOwnerReady();
         validateStandaloneBind(host, self.config.allow_insecure_public_bind) catch |err| {
             std.log.err(
                 "refusing non-loopback inference bind {s}:{d}: standalone inference has no built-in auth or TLS; pass --allow-insecure-public-bind only behind trusted network controls",

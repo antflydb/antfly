@@ -270,6 +270,8 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
             .scratch_limit_bytes = context.scratch_limit_bytes,
         },
         .preload = warm_models.items,
+        .process_memory_limit_bytes = context.process_memory_limit_bytes,
+        .resource_ownership = .external_required,
         .kernel_jit = runtime_config.value.kernel_jit,
         .prompt_cache = runtime_config.value.prompt_cache,
     };

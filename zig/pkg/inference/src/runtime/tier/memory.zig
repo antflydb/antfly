@@ -693,6 +693,10 @@ pub const AdmissionController = struct {
     admitted_by_backend: [backend_class_count]AdmissionAmounts =
         emptyAdmissionAmountsByBackend(),
     shared_limits: SharedAdmissionLimits = .{},
+    /// Optional hard envelope for the whole process/container. Unlike the
+    /// inference-owned ledgers, the live check charges current container usage,
+    /// including sibling processes and allocations outside inference.
+    process_memory_limit_bytes: usize = 0,
     resource_budget: ?AdmissionResourceBudget = null,
     /// Opt-in fault injection for live server regression tests. Production
     /// callers leave this at zero, so normal admission behavior is unchanged.
@@ -728,6 +732,16 @@ pub const AdmissionController = struct {
         defer self.mutex.unlock();
         std.debug.assert(std.meta.eql(self.admitted, AdmissionAmounts{}));
         self.shared_limits = shared_limits;
+    }
+
+    pub fn configureProcessMemoryLimit(
+        self: *AdmissionController,
+        limit_bytes: usize,
+    ) void {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        std.debug.assert(std.meta.eql(self.admitted, AdmissionAmounts{}));
+        self.process_memory_limit_bytes = limit_bytes;
     }
 
     pub fn configureResourceBudget(
@@ -1041,7 +1055,7 @@ pub const AdmissionController = struct {
         defer self.live_mutex.unlock();
 
         const info = if (self.live_pending_bytes == 0)
-            currentSystemMemoryInfo()
+            currentSystemMemoryInfoForLimit(self.process_memory_limit_bytes)
         else
             null;
         const starts_new_epoch = self.live_pending_bytes == 0;
@@ -1313,7 +1327,14 @@ fn checkLiveHostMemoryWithInfo(info: SystemMemoryInfo, incremental_bytes: usize)
 }
 
 pub fn defaultLimitsForBackend(backend: BackendClass) Limits {
-    if (currentSystemMemoryInfo()) |info| {
+    return defaultLimitsForBackendWithProcessLimit(backend, 0);
+}
+
+pub fn defaultLimitsForBackendWithProcessLimit(
+    backend: BackendClass,
+    process_memory_limit_bytes: usize,
+) Limits {
+    if (stableSystemMemoryInfoForLimit(process_memory_limit_bytes)) |info| {
         // Admission policy is stable for the lifetime of a machine configuration.
         // Current pressure is checked separately immediately before allocation.
         return deriveLimitsForBackend(backend, .{
@@ -1329,7 +1350,13 @@ pub fn defaultLimitsForBackend(backend: BackendClass) Limits {
 /// cap represents all memory available after the node's safety headroom and
 /// therefore also accommodates explicitly widened large-model floors.
 pub fn defaultSharedAdmissionLimits() SharedAdmissionLimits {
-    const defaults = if (currentSystemMemoryInfo()) |info| blk: {
+    return defaultSharedAdmissionLimitsWithProcessLimit(0);
+}
+
+pub fn defaultSharedAdmissionLimitsWithProcessLimit(
+    process_memory_limit_bytes: usize,
+) SharedAdmissionLimits {
+    const defaults = if (stableSystemMemoryInfoForLimit(process_memory_limit_bytes)) |info| blk: {
         const safe_pool = info.total_bytes -|
             @min(info.total_bytes, liveHostMemoryHeadroom(info.total_bytes));
         break :blk SharedAdmissionLimits{
@@ -1353,7 +1380,14 @@ pub fn defaultSharedAdmissionLimits() SharedAdmissionLimits {
 /// Node overrides are global policy for shared physical domains, while the
 /// remaining fields continue to constrain each CPU/GPU workload bucket.
 pub fn sharedAdmissionLimitsWithOverrides(overrides: Limits) SharedAdmissionLimits {
-    var limits = defaultSharedAdmissionLimits();
+    return sharedAdmissionLimitsWithOverridesAndProcessLimit(overrides, 0);
+}
+
+pub fn sharedAdmissionLimitsWithOverridesAndProcessLimit(
+    overrides: Limits,
+    process_memory_limit_bytes: usize,
+) SharedAdmissionLimits {
+    var limits = defaultSharedAdmissionLimitsWithProcessLimit(process_memory_limit_bytes);
     if (overrides.host_limit_bytes > 0)
         limits.host_limit_bytes = overrides.host_limit_bytes;
     if (builtin.os.tag == .macos and overrides.combined_limit_bytes > 0)
@@ -1385,6 +1419,49 @@ pub fn currentSystemMemoryInfo() ?SystemMemoryInfo {
         .macos => probeSystemMemoryInfoMacos(),
         .linux => probeSystemMemoryInfoLinux(),
         else => null,
+    };
+}
+
+/// Apply an operator-owned process/container envelope to the live memory view.
+/// On Linux the explicit limit is charged against raw leaf cgroup usage, so
+/// page cache, a test harness, and sibling processes remain visible even when
+/// memory.max itself is unlimited.
+pub fn currentSystemMemoryInfoForLimit(limit_bytes: usize) ?SystemMemoryInfo {
+    const detected = currentSystemMemoryInfo() orelse return null;
+    if (limit_bytes == 0) return detected;
+
+    const leaf_current = if (builtin.os.tag == .linux)
+        probeCgroupMemoryInfoLinux().leaf_current_bytes
+    else
+        null;
+    return applyProcessMemoryLimit(detected, limit_bytes, leaf_current);
+}
+
+fn applyProcessMemoryLimit(
+    detected: SystemMemoryInfo,
+    limit_bytes: usize,
+    leaf_current_bytes: ?usize,
+) SystemMemoryInfo {
+    const effective_limit = @min(detected.total_bytes, limit_bytes);
+    var available = @min(detected.available_bytes orelse effective_limit, effective_limit);
+    if (leaf_current_bytes) |current| {
+        available = @min(available, effective_limit -| @min(current, effective_limit));
+    }
+    return .{
+        .total_bytes = effective_limit,
+        .available_bytes = available,
+        .availability_basis = detected.availability_basis,
+    };
+}
+
+fn stableSystemMemoryInfoForLimit(limit_bytes: usize) ?SystemMemoryInfo {
+    const detected = currentSystemMemoryInfo() orelse return null;
+    if (limit_bytes == 0) return detected;
+    const effective_limit = @min(detected.total_bytes, limit_bytes);
+    return .{
+        .total_bytes = effective_limit,
+        .available_bytes = effective_limit,
+        .availability_basis = detected.availability_basis,
     };
 }
 
@@ -1525,6 +1602,9 @@ const CgroupMemoryInfo = struct {
     limit_bytes: ?usize = null,
     current_bytes: ?usize = null,
     available_bytes: ?usize = null,
+    /// Current usage at the process leaf, retained even when memory.max is
+    /// unlimited so an explicit process envelope can still be enforced.
+    leaf_current_bytes: ?usize = null,
 };
 
 const CgroupVersion = enum {
@@ -1792,6 +1872,8 @@ fn mergeCgroupMemoryInfo(
     result: *CgroupMemoryInfo,
     candidate: CgroupMemoryInfo,
 ) void {
+    if (candidate.leaf_current_bytes) |current|
+        result.leaf_current_bytes = current;
     if (candidate.limit_bytes) |limit| {
         if (result.limit_bytes == null or limit < result.limit_bytes.?) {
             result.limit_bytes = limit;
@@ -2020,6 +2102,7 @@ fn readCgroupHierarchy(
         );
         if (directory.len == leaf_directory_len) {
             result.leaf_present = limit != null or current != null;
+            result.info.leaf_current_bytes = current;
         }
         accumulateCgroupLevel(
             &result.info,
@@ -2637,6 +2720,31 @@ test "live memory headroom scales down for constrained containers" {
         .{ .total_bytes = gib(2), .available_bytes = gib(1) },
         mib(128),
     );
+}
+
+test "explicit process envelope charges raw leaf cgroup usage" {
+    const info = applyProcessMemoryLimit(
+        .{
+            .total_bytes = gib(64),
+            .available_bytes = gib(40),
+            .availability_basis = .mem_available,
+        },
+        gib(14),
+        gib(3),
+    );
+    try std.testing.expectEqual(gib(14), info.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(11)), info.available_bytes);
+
+    const saturated = applyProcessMemoryLimit(info, gib(14), gib(20));
+    try std.testing.expectEqual(@as(?usize, 0), saturated.available_bytes);
+
+    const clamped = applyProcessMemoryLimit(
+        .{ .total_bytes = gib(8), .available_bytes = gib(6) },
+        gib(14),
+        gib(2),
+    );
+    try std.testing.expectEqual(gib(8), clamped.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(6)), clamped.available_bytes);
 }
 
 test "Linux live admission admits the CI model under shared-host pressure" {

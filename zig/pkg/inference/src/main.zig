@@ -77,6 +77,7 @@ const RunConfig = struct {
     generation_batching: ?inference.server.GenerationBatchingConfig = null,
     kernel_jit: ?inference.graph.kernel_jit.Config = null,
     prompt_cache: ?PromptCacheConfig = null,
+    process_memory_budget_mb: ?usize = null,
 };
 
 fn resolvedMaxConcurrentRequests(cfg: RunConfig) !?u32 {
@@ -341,6 +342,7 @@ fn printRunUsage(usage_name: []const u8) void {
         \\  --config <path>                     JSON run configuration
         \\  --max-loaded-models <count>          Residency limit; 0 means unlimited
         \\  --max-concurrent-requests <count>    Request concurrency limit
+        \\  --process-memory-budget-mb <n>       Whole-process/container memory envelope
         \\  --preload-model <spec>               Warm a model at startup; repeatable
         \\  --allow-unknown-models               Allow models absent from the registry
         \\  -h, --help                           Show this help and exit
@@ -358,6 +360,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var config_path: ?[]const u8 = null;
     const max_loaded_models_override = try inference.run_options.parseMaxLoadedModelsOverride(args);
     var max_concurrent_requests_override: ?usize = null;
+    var process_memory_budget_mb_override: ?usize = null;
     var budget_overrides_mib = inference.runtime.tier.memory.BudgetOverridesMib{};
     var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
     var allow_insecure_public_bind = false;
@@ -388,6 +391,9 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--max-concurrent-requests") and i + 1 < args.len) {
             max_concurrent_requests_override = try parseAdmissionLimit(args[i + 1]);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--process-memory-budget-mb") and i + 1 < args.len) {
+            process_memory_budget_mb_override = try parseAdmissionLimit(args[i + 1]);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--host-budget-mb") and i + 1 < args.len) {
             budget_overrides_mib.host = try std.fmt.parseInt(usize, args[i + 1], 10);
@@ -451,6 +457,13 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     defer if (config_preload_models.len > 0) allocator.free(config_preload_models);
 
     const budget_override_limits = try budget_overrides_mib.toByteLimits();
+    const process_memory_budget_mb = process_memory_budget_mb_override orelse
+        platform.env.getenvUsize("ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB") orelse
+        if (loaded_cfg) |parsed| parsed.value.process_memory_budget_mb else null;
+    const process_memory_limit_bytes = if (process_memory_budget_mb) |value|
+        (try (inference.runtime.tier.memory.BudgetOverridesMib{ .host = value }).toByteLimits()).host_limit_bytes
+    else
+        0;
     var node_cfg = inference.server.NodeConfig{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
@@ -462,6 +475,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             .scratch_limit_bytes = budget_override_limits.scratch_limit_bytes,
         },
         .preload = preload_models.items,
+        .process_memory_limit_bytes = process_memory_limit_bytes,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
     };

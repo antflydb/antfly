@@ -112,6 +112,7 @@ const CliConfig = struct {
     inference_combined_budget_mb: usize = 0,
     inference_kv_budget_mb: usize = 0,
     inference_scratch_budget_mb: usize = 0,
+    inference_process_memory_budget_mb: usize = 0,
     inference_kernel_jit_mode: ?antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode = null,
     inference_preload_models: std.ArrayListUnmanaged(inference_bridge.WarmModel) = .empty,
     data_dir: ?[]const u8 = null,
@@ -1796,6 +1797,10 @@ pub fn runFromIterator(
         .combined_limit_bytes = mbToBytes(cli.inference_combined_budget_mb),
         .kv_limit_bytes = mbToBytes(cli.inference_kv_budget_mb),
         .scratch_limit_bytes = mbToBytes(cli.inference_scratch_budget_mb),
+        .process_memory_limit_bytes = mbToBytes(if (cli.inference_process_memory_budget_mb != 0)
+            cli.inference_process_memory_budget_mb
+        else
+            platform.env.getenvUsize("ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB") orelse 0),
         .preload_ptr = if (active_preload.len == 0) null else active_preload.ptr,
         .preload_len = active_preload.len,
         .keep_alive = inference_bridge.OptionalString.init(if (loaded_cfg) |cfg| cfg.inference.keep_alive else null),
@@ -3449,6 +3454,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.inference_scratch_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--inference-process-memory-budget-mb")) {
+            cfg.inference_process_memory_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--kernel-jit-mode")) {
             cfg.inference_kernel_jit_mode = std.meta.stringToEnum(
                 antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode,
@@ -4861,6 +4870,7 @@ fn printUsage() void {
         \\  --inference-combined-budget-mb <n>    Embedded inference native generation combined budget override
         \\  --inference-kv-budget-mb <n>          Embedded inference native generation KV cache budget override
         \\  --inference-scratch-budget-mb <n>     Embedded inference native generation scratch budget override
+        \\  --inference-process-memory-budget-mb <n> Whole-process/container memory envelope
         \\  --kernel-jit-mode <off|shadow|on|required> Embedded inference runtime JIT mode override
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm an embedded model before serving
         \\  --data-dir <path>                     Local Antfly data directory root
@@ -6643,6 +6653,8 @@ test "parse cli accepts inference budget overrides" {
         "2048",
         "--inference-scratch-budget-mb",
         "1024",
+        "--inference-process-memory-budget-mb",
+        "14000",
         "--kernel-jit-mode",
         "required",
     };
@@ -6654,6 +6666,7 @@ test "parse cli accepts inference budget overrides" {
     try std.testing.expectEqual(@as(usize, 16384), cfg.inference_combined_budget_mb);
     try std.testing.expectEqual(@as(usize, 2048), cfg.inference_kv_budget_mb);
     try std.testing.expectEqual(@as(usize, 1024), cfg.inference_scratch_budget_mb);
+    try std.testing.expectEqual(@as(usize, 14000), cfg.inference_process_memory_budget_mb);
     try std.testing.expectEqual(antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode.required, cfg.inference_kernel_jit_mode.?);
 }
 
