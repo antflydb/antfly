@@ -798,7 +798,7 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
         == {}
     )
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=10.0,
         interval_s=0.1,
     )
@@ -1009,8 +1009,8 @@ def test_stateful_drop_tables_with_pending_enrichment_preserves_unrelated_owner(
         for table_name in hot_tables:
             assert stateful_api.create_index(table_name, index_name, index_payload) == {}
             assert wait_until(
-                lambda table_name=table_name: ready_index_status(
-                    stateful_api.get_index(table_name, index_name)
+                lambda table_name=table_name: _ready_index(
+                    stateful_api, table_name, index_name, expected_docs=0
                 ),
                 timeout_s=30.0,
                 interval_s=0.1,
@@ -1228,7 +1228,7 @@ def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
         == {}
     )
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.25,
     )

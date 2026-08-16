@@ -1103,16 +1103,20 @@ const RaftTableApplyStateMachine = struct {
         }
     };
 
-    // Followers have no local waiter to consume rejected command outcomes.
-    // Keep enough recent entries for any leader-side waiter while bounding
-    // memory on replicas that observe a sustained stream of conflicts.
-    const max_retained_apply_failures: usize = 4096;
+    const ApplyOutcome = union(enum) {
+        succeeded,
+        failed: ExpectedApplyFailure,
+    };
 
     alloc: std.mem.Allocator,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
     applied_mutex: std.atomic.Mutex = .unlocked,
     applied_indexes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
-    apply_failures: std.AutoHashMapUnmanaged(ApplyFailureKey, ExpectedApplyFailure) = .empty,
+    // Only the proposing leader registers an outcome waiter. Followers retain
+    // no request-scoped state, and timed-out callers remove their own waiter.
+    // The map is therefore bounded by live synchronous proposals rather than
+    // by Raft history or an eviction policy that could lose an outcome.
+    apply_outcomes: std.AutoHashMapUnmanaged(ApplyFailureKey, ApplyOutcome) = .empty,
 
     fn init(
         alloc: std.mem.Allocator,
@@ -1131,7 +1135,7 @@ const RaftTableApplyStateMachine = struct {
     fn deinit(self: *RaftTableApplyStateMachine) void {
         self.write_source.deinit();
         self.applied_indexes.deinit(self.alloc);
-        self.apply_failures.deinit(self.alloc);
+        self.apply_outcomes.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -1175,27 +1179,45 @@ const RaftTableApplyStateMachine = struct {
         if (index > existing) try self.applied_indexes.put(self.alloc, group_id, index);
     }
 
+    fn registerApplyOutcomeWaiter(
+        self: *RaftTableApplyStateMachine,
+        group_id: u64,
+        index: u64,
+    ) !void {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        const key = ApplyFailureKey{ .group_id = group_id, .index = index };
+        const result = try self.apply_outcomes.getOrPut(self.alloc, key);
+        if (result.found_existing) return error.DuplicateRaftApplyOutcomeWaiter;
+        // Success is the default because applied-index publication proves the
+        // command completed. A deterministic rejection overwrites this result
+        // before that index becomes visible to the waiter.
+        result.value_ptr.* = .succeeded;
+    }
+
     fn recordApplyFailure(
         self: *RaftTableApplyStateMachine,
         group_id: u64,
         index: u64,
         failure: ExpectedApplyFailure,
-    ) !void {
+    ) void {
         lockAtomic(&self.applied_mutex);
         defer self.applied_mutex.unlock();
-        const key = ApplyFailureKey{ .group_id = group_id, .index = index };
-        if (!self.apply_failures.contains(key) and self.apply_failures.count() >= max_retained_apply_failures) {
-            var keys = self.apply_failures.keyIterator();
-            if (keys.next()) |stale_key| _ = self.apply_failures.fetchRemove(stale_key.*);
-        }
-        try self.apply_failures.put(self.alloc, key, failure);
+        const entry = self.apply_outcomes.getPtr(.{ .group_id = group_id, .index = index }) orelse return;
+        entry.* = .{ .failed = failure };
     }
 
-    fn takeApplyFailure(self: *RaftTableApplyStateMachine, group_id: u64, index: u64) ?ExpectedApplyFailure {
+    fn takeApplyOutcome(self: *RaftTableApplyStateMachine, group_id: u64, index: u64) ?ApplyOutcome {
         lockAtomic(&self.applied_mutex);
         defer self.applied_mutex.unlock();
-        const removed = self.apply_failures.fetchRemove(.{ .group_id = group_id, .index = index }) orelse return null;
+        const removed = self.apply_outcomes.fetchRemove(.{ .group_id = group_id, .index = index }) orelse return null;
         return removed.value;
+    }
+
+    fn cancelApplyOutcomeWaiter(self: *RaftTableApplyStateMachine, group_id: u64, index: u64) void {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        _ = self.apply_outcomes.remove(.{ .group_id = group_id, .index = index });
     }
 
     fn stateMachine(self: *RaftTableApplyStateMachine) raft_engine.runtime.storage_iface.StateMachine {
@@ -1243,7 +1265,7 @@ const RaftTableApplyStateMachine = struct {
                     // prepare at this log index and must continue applying;
                     // the proposing leader returns the result to the 2PC
                     // coordinator after observing the applied index.
-                    try self.recordApplyFailure(group_id, entry.index, failure);
+                    self.recordApplyFailure(group_id, entry.index, failure);
                     std.log.debug("data raft document apply rejected group_id={} index={} table={s} err={s}", .{
                         group_id,
                         entry.index,
@@ -6896,6 +6918,7 @@ pub const DataServer = struct {
             var local_status_missing = false;
             var local_status_is_voter = false;
             var retry_for_leader_preflight = false;
+            var outcome_waiter_index: ?u64 = null;
 
             {
                 lockAtomic(&self.data_raft_mutex);
@@ -6931,6 +6954,18 @@ pub const DataServer = struct {
                         };
                         target_index = target_index orelse accepted_index orelse
                             return error.RaftBatchWriteOutcomeUnknown;
+                        if (req.sync_level != .propose) {
+                            const index = target_index.?;
+                            const apply_sm = self.data_raft_apply orelse
+                                return error.RaftBatchWriteOutcomeUnknown;
+                            // Raft apply is driven under data_raft_mutex, so
+                            // registering here guarantees that even a
+                            // single-node commit cannot publish its outcome
+                            // before the waiter exists.
+                            apply_sm.registerApplyOutcomeWaiter(group_id, index) catch
+                                return error.RaftBatchWriteOutcomeUnknown;
+                            outcome_waiter_index = index;
+                        }
                     }
                 } else {
                     const status = raft.host.http_host.host.raftStatus(group_id);
@@ -6970,6 +7005,9 @@ pub const DataServer = struct {
             }
 
             if (target_index) |index| {
+                defer if (outcome_waiter_index) |waiter_index|
+                    if (self.data_raft_apply) |apply_sm|
+                        apply_sm.cancelApplyOutcomeWaiter(group_id, waiter_index);
                 if (req.sync_level != .propose) {
                     self.waitForLocalRaftBatchApply(group_id, index, deadline_ns) catch |err| {
                         std.log.warn("data raft batch outcome unknown after proposal group_id={} index={} phase=apply_wait err={s}", .{
@@ -6979,8 +7017,15 @@ pub const DataServer = struct {
                         });
                         return error.RaftBatchWriteOutcomeUnknown;
                     };
-                    if (self.data_raft_apply) |apply_sm|
-                        if (apply_sm.takeApplyFailure(group_id, index)) |failure| return failure.toError();
+                    const apply_sm = self.data_raft_apply orelse
+                        return error.RaftBatchWriteOutcomeUnknown;
+                    const outcome = apply_sm.takeApplyOutcome(group_id, index) orelse
+                        return error.RaftBatchWriteOutcomeUnknown;
+                    outcome_waiter_index = null;
+                    switch (outcome) {
+                        .succeeded => {},
+                        .failed => |failure| return failure.toError(),
+                    }
                 }
                 const sync_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 sync_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level) catch |err| {
@@ -17297,19 +17342,37 @@ test "data raft apply records transaction conflicts without stopping replica pro
         .transaction = .{ .prepare = .{ .txn_id = txn_b, .topology_epoch = 1 } },
     });
     defer alloc.free(prepare_b);
+    const write_c = try data_raft_batch.encode(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"after conflict\"}" }},
+    });
+    defer alloc.free(write_c);
     const entries = [_]raft_engine.core.Entry{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = prepare_a },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = prepare_b },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = write_c },
     };
 
+    try apply_sm.registerApplyOutcomeWaiter(group_id, 1);
+    try apply_sm.registerApplyOutcomeWaiter(group_id, 2);
+    try apply_sm.registerApplyOutcomeWaiter(group_id, 3);
+    // Outcome retention is tied to live waiters, not an arbitrary global cap.
+    // Heavy cross-group concurrency must not discard this proposal's result.
+    for (0..5000) |i| try apply_sm.registerApplyOutcomeWaiter(88, i + 1);
+    defer for (0..5000) |i| apply_sm.cancelApplyOutcomeWaiter(88, i + 1);
+
     try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entries, &.{});
-    try std.testing.expectEqual(@as(u64, 2), apply_sm.appliedIndex(group_id));
-    try std.testing.expect(apply_sm.takeApplyFailure(group_id, 1) == null);
-    const conflict = apply_sm.takeApplyFailure(group_id, 2) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(
-        RaftTableApplyStateMachine.ExpectedApplyFailure.intent_conflict,
-        conflict,
-    );
+    try std.testing.expectEqual(@as(u64, 3), apply_sm.appliedIndex(group_id));
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 1).?);
+    const conflict = apply_sm.takeApplyOutcome(group_id, 2) orelse return error.TestExpectedEqual;
+    switch (conflict) {
+        .failed => |failure| try std.testing.expectEqual(
+            RaftTableApplyStateMachine.ExpectedApplyFailure.intent_conflict,
+            failure,
+        ),
+        else => return error.TestExpectedEqual,
+    }
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 3).?);
+    try std.testing.expectEqual(@as(usize, 5000), apply_sm.apply_outcomes.count());
 }
 
 test "data server can register a store without enabling data raft" {
