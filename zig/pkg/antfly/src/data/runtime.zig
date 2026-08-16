@@ -17367,6 +17367,7 @@ test "data raft apply records transaction conflicts without stopping replica pro
     const txn_a: antfly.db.types.TxnId = .{0x0a} ** 16;
     const txn_b: antfly.db.types.TxnId = .{0x0b} ** 16;
     const txn_missing: antfly.db.types.TxnId = .{0x0c} ** 16;
+    const txn_version: antfly.db.types.TxnId = .{0x0d} ** 16;
     _ = try apply_sm.write_source.applyReplicatedBatchGroupLocal(alloc, group_id, "docs", .{
         .transaction = .{ .begin = .{
             .txn_id = txn_a,
@@ -17385,6 +17386,15 @@ test "data raft apply records transaction conflicts without stopping replica pro
             .participants = &participants,
         } },
     });
+    _ = try apply_sm.write_source.applyReplicatedBatchGroupLocal(alloc, group_id, "docs", .{
+        .transaction = .{ .begin = .{
+            .txn_id = txn_version,
+            .begin_timestamp = 102,
+            .created_at_ns = 102,
+            .topology_epoch = 1,
+            .participants = &participants,
+        } },
+    });
 
     const prepare_a = try data_raft_batch.encode(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -17396,6 +17406,12 @@ test "data raft apply records transaction conflicts without stopping replica pro
         .transaction = .{ .prepare = .{ .txn_id = txn_b, .topology_epoch = 1 } },
     });
     defer alloc.free(prepare_b);
+    const prepare_version = try data_raft_batch.encode(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:version", .value = "{\"title\":\"stale predicate\"}" }},
+        .predicates = &.{.{ .key = "doc:version", .expected_version = 1 }},
+        .transaction = .{ .prepare = .{ .txn_id = txn_version, .topology_epoch = 1 } },
+    });
+    defer alloc.free(prepare_version);
     const write_c = try data_raft_batch.encode(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"after conflict\"}" }},
     });
@@ -17425,11 +17441,12 @@ test "data raft apply records transaction conflicts without stopping replica pro
     const entries = [_]raft_engine.core.Entry{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = prepare_a },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = prepare_b },
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = write_c },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = conflicting_begin },
-        .{ .term = 1, .index = 5, .entry_type = .normal, .data = write_d },
-        .{ .term = 1, .index = 6, .entry_type = .normal, .data = missing_prepare },
-        .{ .term = 1, .index = 7, .entry_type = .normal, .data = write_e },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = prepare_version },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = write_c },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = conflicting_begin },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = write_d },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = missing_prepare },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = write_e },
     };
 
     try apply_sm.registerApplyOutcomeWaiter(group_id, 1, 1);
@@ -17439,13 +17456,14 @@ test "data raft apply records transaction conflicts without stopping replica pro
     try apply_sm.registerApplyOutcomeWaiter(group_id, 5, 1);
     try apply_sm.registerApplyOutcomeWaiter(group_id, 6, 1);
     try apply_sm.registerApplyOutcomeWaiter(group_id, 7, 1);
+    try apply_sm.registerApplyOutcomeWaiter(group_id, 8, 1);
     // Outcome retention is tied to live waiters, not an arbitrary global cap.
     // Heavy cross-group concurrency must not discard this proposal's result.
     for (0..5000) |i| try apply_sm.registerApplyOutcomeWaiter(88, i + 1, 1);
     defer for (0..5000) |i| apply_sm.cancelApplyOutcomeWaiter(88, i + 1);
 
     try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entries, &.{});
-    try std.testing.expectEqual(@as(u64, 7), apply_sm.appliedIndex(group_id));
+    try std.testing.expectEqual(@as(u64, 8), apply_sm.appliedIndex(group_id));
     try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 1).?);
     const conflict = apply_sm.takeApplyOutcome(group_id, 2) orelse return error.TestExpectedEqual;
     switch (conflict) {
@@ -17455,8 +17473,16 @@ test "data raft apply records transaction conflicts without stopping replica pro
         ),
         else => return error.TestExpectedEqual,
     }
-    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 3).?);
-    const decision_conflict = apply_sm.takeApplyOutcome(group_id, 4) orelse return error.TestExpectedEqual;
+    const version_conflict = apply_sm.takeApplyOutcome(group_id, 3) orelse return error.TestExpectedEqual;
+    switch (version_conflict) {
+        .failed => |failure| try std.testing.expectEqual(
+            RaftTableApplyStateMachine.ExpectedApplyFailure.version_conflict,
+            failure,
+        ),
+        else => return error.TestExpectedEqual,
+    }
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 4).?);
+    const decision_conflict = apply_sm.takeApplyOutcome(group_id, 5) orelse return error.TestExpectedEqual;
     switch (decision_conflict) {
         .failed => |failure| try std.testing.expectEqual(
             RaftTableApplyStateMachine.ExpectedApplyFailure.decision_conflict,
@@ -17464,8 +17490,8 @@ test "data raft apply records transaction conflicts without stopping replica pro
         ),
         else => return error.TestExpectedEqual,
     }
-    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 5).?);
-    const missing_transaction = apply_sm.takeApplyOutcome(group_id, 6) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 6).?);
+    const missing_transaction = apply_sm.takeApplyOutcome(group_id, 7) orelse return error.TestExpectedEqual;
     switch (missing_transaction) {
         .failed => |failure| try std.testing.expectEqual(
             RaftTableApplyStateMachine.ExpectedApplyFailure.txn_not_found,
@@ -17473,7 +17499,7 @@ test "data raft apply records transaction conflicts without stopping replica pro
         ),
         else => return error.TestExpectedEqual,
     }
-    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 7).?);
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 8).?);
     try std.testing.expectEqual(@as(usize, 5000), apply_sm.apply_outcomes.count());
 
     // Snapshot coverage advances local applied progress but cannot establish
@@ -17493,14 +17519,14 @@ test "data raft apply records transaction conflicts without stopping replica pro
     defer alloc.free(replacement_write);
     const replacement_entries = [_]raft_engine.core.Entry{.{
         .term = 2,
-        .index = 8,
+        .index = 9,
         .entry_type = .normal,
         .data = replacement_write,
     }};
-    try apply_sm.registerApplyOutcomeWaiter(group_id, 8, 1);
+    try apply_sm.registerApplyOutcomeWaiter(group_id, 9, 1);
     try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &replacement_entries, &.{});
-    try std.testing.expectEqual(@as(u64, 8), apply_sm.appliedIndex(group_id));
-    const replacement_outcome = apply_sm.takeApplyOutcome(group_id, 8) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 9), apply_sm.appliedIndex(group_id));
+    const replacement_outcome = apply_sm.takeApplyOutcome(group_id, 9) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(.unknown, replacement_outcome);
 }
 

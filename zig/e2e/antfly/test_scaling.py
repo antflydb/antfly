@@ -46,6 +46,35 @@ MULTI_SHARD_WRITE_ROUTE_TIMEOUT_S = 120.0
 DATA_NODE_REGISTRATION_TIMEOUT_S = 180.0
 DATA_NODE_BIND_ATTEMPTS = 3
 ADDRESS_IN_USE_LOG_MARKER = "listen address is already in use"
+AMBIGUOUS_METADATA_CLIENT_STATUSES = frozenset({408})
+
+
+class MetadataMutationRejected(AssertionError):
+    """The metadata service definitively rejected a side-effecting request."""
+
+
+def _raise_for_metadata_mutation(response: requests.Response, *, operation: str) -> None:
+    status = response.status_code
+    if 400 <= status < 500 and status not in AMBIGUOUS_METADATA_CLIENT_STATUSES:
+        detail = response.text.strip()[:512]
+        suffix = f": {detail}" if detail else ""
+        raise MetadataMutationRejected(f"{operation} rejected with HTTP {status}{suffix}")
+    response.raise_for_status()
+
+
+def test_metadata_mutation_response_distinguishes_rejection_from_ambiguity():
+    for status in (409, 425, 429):
+        rejected = requests.Response()
+        rejected.status_code = status
+        rejected._content = b"mutation rejected before admission"
+        with pytest.raises(MetadataMutationRejected, match=f"HTTP {status}"):
+            _raise_for_metadata_mutation(rejected, operation="finalize node shutdown")
+
+    for status in (408, 503):
+        ambiguous = requests.Response()
+        ambiguous.status_code = status
+        with pytest.raises(requests.HTTPError):
+            _raise_for_metadata_mutation(ambiguous, operation="trigger reallocation")
 
 
 class _ClusterStartupDeadline:
@@ -936,8 +965,8 @@ class MultiNodeScalingCluster:
                     f"/internal/v1/nodes/{node_id}/shutdown",
                     json_body={"type": "remove", "reason": "e2e"},
                 )
-                response.raise_for_status()
-            except (AssertionError, requests.RequestException) as exc:
+                _raise_for_metadata_mutation(response, operation=f"request shutdown for node {node_id}")
+            except requests.RequestException as exc:
                 # A timeout or disconnect can occur after admission. Never
                 # resubmit an ambiguous mutation; observe replicated state to
                 # determine whether it committed.
@@ -978,8 +1007,8 @@ class MultiNodeScalingCluster:
         if finalized is None:
             try:
                 response = self.metadata_mutation_once("DELETE", f"/internal/v1/nodes/{node_id}")
-                response.raise_for_status()
-            except (AssertionError, requests.RequestException) as exc:
+                _raise_for_metadata_mutation(response, operation=f"finalize shutdown for node {node_id}")
+            except requests.RequestException as exc:
                 # As with shutdown admission, an absent response does not prove
                 # rejection. Resolve the outcome through read-only observation.
                 submission_error = repr(exc)
@@ -996,7 +1025,7 @@ class MultiNodeScalingCluster:
 
     def trigger_reallocate(self) -> None:
         response = self.metadata_mutation_once("POST", "/internal/v2/reallocate")
-        response.raise_for_status()
+        _raise_for_metadata_mutation(response, operation="trigger reallocation")
 
     def request_split(self, table_name: str, split_key: str) -> None:
         response = self.post_metadata(f"/internal/v1/tables/{table_name}/split", json_body={"split_key": split_key})
@@ -1601,7 +1630,7 @@ def _wait_node_owns_group(
         # A successful request replaces the active barrier generation. Submit
         # once, then let the convergence poll remain strictly read-only.
         cluster.trigger_reallocate()
-    except (AssertionError, requests.RequestException) as exc:
+    except requests.RequestException as exc:
         # The request may have committed before its response was lost. Preserve
         # the error for diagnostics while still observing the possible outcome.
         submission_error = repr(exc)
