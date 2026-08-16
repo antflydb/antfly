@@ -19,6 +19,7 @@ from __future__ import annotations
 import errno
 import socket
 import subprocess
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -31,6 +32,7 @@ from conftest import (
 )
 from port_reservations import LoopbackPortReservations, find_free_port
 from test_auth import StandaloneAuthServer
+from test_standalone import EmbeddedInferenceStandaloneServer
 
 
 def test_loopback_port_reservations_hold_ports_until_handoff():
@@ -189,3 +191,34 @@ def test_stateful_server_releases_requested_port_when_spawn_fails(monkeypatch: p
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
         contender.bind(("127.0.0.1", requested_port))
+
+
+def test_embedded_inference_server_releases_listener_ports_when_spawn_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    with LoopbackPortReservations() as reservations:
+        public_port, health_port = reservations.reserve_many(2)
+
+    def reserve_listener_ports(
+        reservations: LoopbackPortReservations,
+        count: int,
+    ) -> tuple[int, ...]:
+        assert count == 2
+        return (
+            reservations.reserve(public_port),
+            reservations.reserve(health_port),
+        )
+
+    def fail_to_spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
+        raise OSError(errno.ENOEXEC, "cannot execute")
+
+    monkeypatch.setattr(LoopbackPortReservations, "reserve_many", reserve_listener_ports)
+    monkeypatch.setattr(subprocess, "Popen", fail_to_spawn)
+    with pytest.raises(OSError) as exc_info:
+        EmbeddedInferenceStandaloneServer("/missing-antfly", tmp_path, "test-model")
+    assert exc_info.value.errno == errno.ENOEXEC
+
+    for port in (public_port, health_port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+            contender.bind(("127.0.0.1", port))

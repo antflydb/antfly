@@ -161,7 +161,12 @@ class EmbeddedInferenceStandaloneServer:
         self.log_path = self.root / "server.log"
         self.log_file = self.log_path.open("w")
         self.proc: subprocess.Popen[str] | None = None
-        self._start()
+        try:
+            self._start()
+        except BaseException:
+            if not self.log_file.closed:
+                self.stop()
+            raise
 
     def _start(self) -> None:
         command = [
