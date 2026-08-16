@@ -815,6 +815,23 @@ class MultiNodeScalingCluster:
             raise last_error
         raise AssertionError("cluster has no metadata URLs")
 
+    def metadata_mutation_once(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+    ) -> requests.Response:
+        """Issue one side-effecting request; callers resolve ambiguity by observing state."""
+        if not self.metadata_urls:
+            raise AssertionError("cluster has no metadata URLs")
+        return requests.request(
+            method,
+            f"{self.metadata_urls[0]}{path}",
+            json=json_body,
+            timeout=5,
+        )
+
     def metadata_snapshot_from(self, index: int) -> dict[str, Any]:
         response = requests.get(f"{self.metadata_urls[index]}/metadata/v1/admin/snapshot", timeout=10)
         response.raise_for_status()
@@ -885,15 +902,17 @@ class MultiNodeScalingCluster:
         )
 
     def request_node_shutdown(self, node_id: int, *, timeout_s: float = 30.0) -> None:
-        last_error: str | None = None
+        submission_error: str | None = None
+        last_observation_error: str | None = None
 
         def intent_visible_on_all_metadata_nodes() -> dict[str, Any] | None:
-            nonlocal last_error
+            nonlocal last_observation_error
             try:
                 snapshots = [self.metadata_snapshot(index) for index in range(len(self.metadata_urls))]
             except (AssertionError, requests.RequestException) as exc:
-                last_error = repr(exc)
+                last_observation_error = repr(exc)
                 return None
+            last_observation_error = None
             for snapshot in snapshots:
                 nodes = [node for node in snapshot.get("nodes", []) if isinstance(node, dict)]
                 stores = [store for store in snapshot.get("stores", []) if isinstance(store, dict)]
@@ -909,37 +928,43 @@ class MultiNodeScalingCluster:
                     return None
             return snapshots[0]
 
-        def request_until_visible() -> dict[str, Any] | None:
-            nonlocal last_error
+        visible = intent_visible_on_all_metadata_nodes()
+        if visible is None:
             try:
-                response = self.put_metadata(
+                response = self.metadata_mutation_once(
+                    "PUT",
                     f"/internal/v1/nodes/{node_id}/shutdown",
                     json_body={"type": "remove", "reason": "e2e"},
                 )
                 response.raise_for_status()
             except (AssertionError, requests.RequestException) as exc:
-                last_error = repr(exc)
-                return None
-            return intent_visible_on_all_metadata_nodes()
+                # A timeout or disconnect can occur after admission. Never
+                # resubmit an ambiguous mutation; observe replicated state to
+                # determine whether it committed.
+                submission_error = repr(exc)
+            visible = wait_until(intent_visible_on_all_metadata_nodes, timeout_s=timeout_s, interval_s=0.5)
 
-        visible = wait_until(request_until_visible, timeout_s=timeout_s, interval_s=0.5)
         assert visible is not None, (
-            f"node shutdown intent did not become visible on all metadata nodes for {node_id}: {last_error}\n"
+            f"node shutdown intent did not become visible on all metadata nodes for {node_id}\n"
+            f"submission error: {submission_error}\n"
+            f"last observation error: {last_observation_error}\n"
             f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
             f"snapshot: {self.metadata_snapshot()}\n"
             f"{self.debug_logs()}"
         )
 
     def finalize_node_shutdown(self, node_id: int, *, timeout_s: float = 30.0) -> None:
-        last_error: str | None = None
+        submission_error: str | None = None
+        last_observation_error: str | None = None
 
         def finalized_visible_on_all_metadata_nodes() -> dict[str, Any] | None:
-            nonlocal last_error
+            nonlocal last_observation_error
             try:
                 snapshots = [self.metadata_snapshot(index) for index in range(len(self.metadata_urls))]
             except (AssertionError, requests.RequestException) as exc:
-                last_error = repr(exc)
+                last_observation_error = repr(exc)
                 return None
+            last_observation_error = None
             for snapshot in snapshots:
                 nodes = [node for node in snapshot.get("nodes", []) if isinstance(node, dict)]
                 stores = [store for store in snapshot.get("stores", []) if isinstance(store, dict)]
@@ -949,28 +974,28 @@ class MultiNodeScalingCluster:
                     return None
             return snapshots[0]
 
-        def finalize_until_visible() -> dict[str, Any] | None:
-            nonlocal last_error
-            if visible := finalized_visible_on_all_metadata_nodes():
-                return visible
+        finalized = finalized_visible_on_all_metadata_nodes()
+        if finalized is None:
             try:
-                response = self.delete_metadata(f"/internal/v1/nodes/{node_id}")
+                response = self.metadata_mutation_once("DELETE", f"/internal/v1/nodes/{node_id}")
                 response.raise_for_status()
             except (AssertionError, requests.RequestException) as exc:
-                last_error = repr(exc)
-                return None
-            return finalized_visible_on_all_metadata_nodes()
+                # As with shutdown admission, an absent response does not prove
+                # rejection. Resolve the outcome through read-only observation.
+                submission_error = repr(exc)
+            finalized = wait_until(finalized_visible_on_all_metadata_nodes, timeout_s=timeout_s, interval_s=0.5)
 
-        finalized = wait_until(finalize_until_visible, timeout_s=timeout_s, interval_s=0.5)
         assert finalized is not None, (
-            f"node shutdown finalization did not become visible on all metadata nodes for {node_id}: {last_error}\n"
+            f"node shutdown finalization did not become visible on all metadata nodes for {node_id}\n"
+            f"submission error: {submission_error}\n"
+            f"last observation error: {last_observation_error}\n"
             f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
             f"snapshot: {self.metadata_snapshot()}\n"
             f"{self.debug_logs()}"
         )
 
     def trigger_reallocate(self) -> None:
-        response = self.post_metadata("/internal/v2/reallocate")
+        response = self.metadata_mutation_once("POST", "/internal/v2/reallocate")
         response.raise_for_status()
 
     def request_split(self, table_name: str, split_key: str) -> None:
@@ -1564,31 +1589,22 @@ def _wait_for_group_count(
     return group_ids
 
 
-def _request_reallocation(
-    cluster: MultiNodeScalingCluster,
-) -> bool:
-    """Submit at most one generation before read-only convergence polling.
-
-    A successful request replaces the active reallocation barrier generation. The
-    convergence poll must therefore observe that generation instead of submitting
-    another request every time it reads state.
-    """
-    try:
-        cluster.trigger_reallocate()
-    except (AssertionError, requests.RequestException):
-        return False
-    return True
-
-
 def _wait_node_owns_group(
     cluster: MultiNodeScalingCluster,
     table_name: str,
     node_id: int,
     *,
     timeout_s: float = 90.0,
-) -> dict[str, Any] | None:
-    if not _request_reallocation(cluster):
-        return None
+) -> tuple[dict[str, Any] | None, str | None]:
+    submission_error: str | None = None
+    try:
+        # A successful request replaces the active barrier generation. Submit
+        # once, then let the convergence poll remain strictly read-only.
+        cluster.trigger_reallocate()
+    except (AssertionError, requests.RequestException) as exc:
+        # The request may have committed before its response was lost. Preserve
+        # the error for diagnostics while still observing the possible outcome.
+        submission_error = repr(exc)
 
     def owns_group() -> dict[str, Any] | None:
         try:
@@ -1601,7 +1617,7 @@ def _wait_node_owns_group(
             return None
         return cluster.metadata_snapshot()
 
-    return wait_until(owns_group, timeout_s=timeout_s, interval_s=0.5)
+    return wait_until(owns_group, timeout_s=timeout_s, interval_s=0.5), submission_error
 
 
 def _wait_node_drained_for_groups(
@@ -1778,10 +1794,11 @@ def test_autoscaling_adds_data_node_and_assigns_placements(
     )
 
     new_node = cluster.add_data_node()
-    assigned = _wait_node_owns_group(cluster, table_name, int(new_node["id"]))
+    assigned, reallocation_error = _wait_node_owns_group(cluster, table_name, int(new_node["id"]))
     assert assigned is not None, (
         "added data node did not receive any table placement\n"
         f"new_node: {new_node['id']}\n"
+        f"reallocation submission error: {reallocation_error}\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
         f"snapshot: {cluster.metadata_snapshot()}\n"
         f"{cluster.debug_logs()}"
@@ -1983,10 +2000,11 @@ def test_autoscaling_node_churn_keeps_reads_available(
     _assert_docs_readable(cluster, table_name, docs)
 
     replacement = cluster.add_data_node()
-    assigned = _wait_node_owns_group(cluster, table_name, int(replacement["id"]))
+    assigned, reallocation_error = _wait_node_owns_group(cluster, table_name, int(replacement["id"]))
     assert assigned is not None, (
         "replacement data node did not receive placement during churn\n"
         f"replacement: {replacement['id']}\n"
+        f"reallocation submission error: {reallocation_error}\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
         f"snapshot: {cluster.metadata_snapshot()}\n"
         f"{cluster.debug_logs()}"
