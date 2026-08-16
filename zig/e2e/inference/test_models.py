@@ -17,7 +17,7 @@
 import pytest
 
 from .helpers import make_text_png_uri, make_wav_b64
-from .models import DEFAULT_EXTRACTOR_MODEL
+from .models import DEFAULT_EXTRACTOR_MODEL, listed_model_name
 
 
 CLIPCLAP_MODEL = "antflydb/clipclap"
@@ -51,10 +51,11 @@ def test_models_has_openai_data_field(api):
 
 def test_models_exposes_gliner2_as_extractor(api):
     resp = api.models()
-    if DEFAULT_EXTRACTOR_MODEL in resp["extractors"]:
-        caps = resp["extractors"][DEFAULT_EXTRACTOR_MODEL].get("capabilities", [])
+    model_name = listed_model_name(set(resp["extractors"]), DEFAULT_EXTRACTOR_MODEL)
+    if model_name is not None:
+        caps = resp["extractors"][model_name].get("capabilities", [])
         assert "extraction" in caps
-        inputs = resp["extractors"][DEFAULT_EXTRACTOR_MODEL].get("inputs", [])
+        inputs = resp["extractors"][model_name].get("inputs", [])
         assert "text" in inputs
 
 
@@ -71,8 +72,9 @@ def test_models_exposes_nli_classifiers_as_extractors(api):
 def test_models_exposes_reader_inputs(api):
     resp = api.models()
     readers = resp.get("readers", {})
-    if "antflydb/florence-2-base" in readers:
-        assert "image" in readers["antflydb/florence-2-base"].get("inputs", [])
+    model_name = listed_model_name(set(readers), "antflydb/florence-2-base")
+    if model_name is not None:
+        assert "image" in readers[model_name].get("inputs", [])
 
 
 @pytest.mark.model_integration
@@ -80,7 +82,10 @@ def test_composite_model_eviction_churn_stays_healthy(api):
     """Audio-sidecar teardown and reader eviction must not corrupt the server."""
 
     listing = api.models()
-    if CLIPCLAP_MODEL not in listing.get("embedders", {}):
+    clipclap = listed_model_name(
+        set(listing.get("embedders", {})), CLIPCLAP_MODEL
+    )
+    if clipclap is None:
         pytest.skip(f"{CLIPCLAP_MODEL} is not available")
     reader = next(
         (name for name in listing.get("readers", {}) if "florence" in name.lower()),
@@ -100,7 +105,7 @@ def test_composite_model_eviction_churn_stays_healthy(api):
     # previous composite model. Repeating the transition catches stale sidecar
     # handles and allocator damage at the operation that introduced it.
     for _ in range(3):
-        embedded = api.embed(["a short silent audio clip", audio], model=CLIPCLAP_MODEL)
+        embedded = api.embed(["a short silent audio clip", audio], model=clipclap)
         assert len(embedded["data"]) == 2
         assert all(len(item["embedding"]) == 512 for item in embedded["data"])
 

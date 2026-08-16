@@ -169,7 +169,7 @@ def test_generate_response_format_json_object(api):
     resp = api.generate(
         [{"role": "user", "content": "Return a tiny JSON object"}],
         model=model,
-        max_tokens=64,
+        max_tokens=16,
         chat_template_kwargs={"enable_thinking": False},
         response_format={"type": "json_object"},
     )
