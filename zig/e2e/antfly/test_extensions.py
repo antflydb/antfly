@@ -19,6 +19,7 @@ import json
 import signal
 import subprocess
 import tempfile
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ from conftest import (
     _data_command,
     _metadata_command,
     _read_log_tail,
-    _write_remote_content_e2e_config,
+    _standalone_stateful_command,
     antfly_public_api_url,
     maybe_preserve_tempdir,
     wait_for_server,
@@ -56,42 +57,46 @@ class _ExtensionProcess:
         self.binary = binary
         self.mode = mode
         self.host = "127.0.0.1"
-        self.tempdir = tempfile.TemporaryDirectory(prefix=f"antfly-zig-extensions-{mode}-")
-        self.root = Path(self.tempdir.name)
         self.package_store = MEMORYAF_PACKAGE_STORE
         if not (self.package_store / "memoryaf" / "extension.json").exists():
             raise RuntimeError(f"memoryaf extension package not found under {self.package_store}")
         if mode not in {"standalone", "distributed"}:
             raise ValueError(mode)
 
-        self.port_reservations = LoopbackPortReservations(self.host)
-        self.public_port = self.port_reservations.reserve()
-        self.metadata_raft_port: int | None = None
-        self.metadata_admin_port: int | None = None
-        self.data_raft_port: int | None = None
-        if mode == "distributed":
-            (
-                self.metadata_raft_port,
-                self.metadata_admin_port,
-                self.data_raft_port,
-            ) = self.port_reservations.reserve_many(3)
-        self.url = f"http://{self.host}:{self.public_port}"
-        self.api_url = antfly_public_api_url(self.url, binary=binary)
-        self.metadata_admin_url = (
-            f"http://{self.host}:{self.metadata_admin_port}"
-            if self.metadata_admin_port is not None
-            else None
-        )
+        with ExitStack() as setup:
+            self.tempdir = tempfile.TemporaryDirectory(prefix=f"antfly-zig-extensions-{mode}-")
+            setup.callback(self.tempdir.cleanup)
+            self.root = Path(self.tempdir.name)
+            self.port_reservations = LoopbackPortReservations(self.host)
+            setup.callback(self.port_reservations.close)
+            self.public_port = self.port_reservations.reserve()
+            self.metadata_raft_port: int | None = None
+            self.metadata_admin_port: int | None = None
+            self.data_raft_port: int | None = None
+            if mode == "distributed":
+                (
+                    self.metadata_raft_port,
+                    self.metadata_admin_port,
+                    self.data_raft_port,
+                ) = self.port_reservations.reserve_many(3)
+            self.url = f"http://{self.host}:{self.public_port}"
+            self.api_url = antfly_public_api_url(self.url, binary=binary)
+            self.metadata_admin_url = (
+                f"http://{self.host}:{self.metadata_admin_port}"
+                if self.metadata_admin_port is not None
+                else None
+            )
 
-        self.standalone_log_path = self.root / "standalone.log"
-        self.metadata_log_path = self.root / "metadata.log"
-        self.data_log_path = self.root / "data.log"
-        self.standalone_log_file = self.standalone_log_path.open("w")
-        self.metadata_log_file = self.metadata_log_path.open("w")
-        self.data_log_file = self.data_log_path.open("w")
-        self.standalone_proc: subprocess.Popen[str] | None = None
-        self.metadata_proc: subprocess.Popen[str] | None = None
-        self.data_proc: subprocess.Popen[str] | None = None
+            self.standalone_log_path = self.root / "standalone.log"
+            self.metadata_log_path = self.root / "metadata.log"
+            self.data_log_path = self.root / "data.log"
+            self.standalone_log_file = setup.enter_context(self.standalone_log_path.open("w"))
+            self.metadata_log_file = setup.enter_context(self.metadata_log_path.open("w"))
+            self.data_log_file = setup.enter_context(self.data_log_path.open("w"))
+            self.standalone_proc: subprocess.Popen[str] | None = None
+            self.metadata_proc: subprocess.Popen[str] | None = None
+            self.data_proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
 
         try:
             if mode == "standalone":
@@ -104,28 +109,13 @@ class _ExtensionProcess:
 
     def _start_standalone(self) -> None:
         env = self._server_env()
-        command = [
+        command = _standalone_stateful_command(
             self.binary,
-            "standalone",
-            "--config",
-            str(_write_remote_content_e2e_config(self.root)),
-            "--host",
-            self.host,
-            "--port",
-            str(self.public_port),
-            "--data-dir",
-            str(self.root),
-            "--control-tick-ms",
-            "5",
-            "--replica-root-dir",
-            str(self.root / "replicas"),
-            "--replica-catalog-path",
-            str(self.root / "catalog.txt"),
-            "--snapshot-root-dir",
-            str(self.root / "snapshots"),
-            "--extension-package-store",
-            str(self.package_store),
-        ]
+            host=self.host,
+            port=self.public_port,
+            root=self.root,
+        )
+        command.extend(["--extension-package-store", str(self.package_store)])
         self.standalone_proc = self.port_reservations.handoff_to(
             (self.public_port,),
             lambda: subprocess.Popen(

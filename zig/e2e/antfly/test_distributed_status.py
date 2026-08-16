@@ -19,6 +19,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -88,34 +89,40 @@ class SplitStatusCluster:
     def __init__(self, binary: str):
         self.binary = binary
         self.host = "127.0.0.1"
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-status-e2e-")
-        self.root = Path(self.tempdir.name)
-        self.port_reservations = LoopbackPortReservations(self.host)
+        with ExitStack() as setup:
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-status-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            self.root = Path(self.tempdir.name)
+            self.port_reservations = LoopbackPortReservations(self.host)
+            setup.callback(self.port_reservations.close)
 
-        (
-            self.metadata_port,
-            self.metadata_admin_port,
-            self.data_port,
-            self.data_raft_port,
-            self.api_port,
-            self.api_raft_port,
-        ) = self.port_reservations.reserve_many(6)
+            (
+                self.metadata_port,
+                self.metadata_admin_port,
+                self.data_port,
+                self.data_raft_port,
+                self.api_port,
+                self.api_raft_port,
+            ) = self.port_reservations.reserve_many(6)
 
-        self.metadata_admin_url = f"http://{self.host}:{self.metadata_admin_port}"
-        self.data_url = f"http://{self.host}:{self.data_port}"
-        self.data_api_url = antfly_public_api_url(self.data_url, binary=binary)
-        self.api_url = antfly_public_api_url(f"http://{self.host}:{self.api_port}", binary=binary)
+            self.metadata_admin_url = f"http://{self.host}:{self.metadata_admin_port}"
+            self.data_url = f"http://{self.host}:{self.data_port}"
+            self.data_api_url = antfly_public_api_url(self.data_url, binary=binary)
+            self.api_url = antfly_public_api_url(
+                f"http://{self.host}:{self.api_port}", binary=binary
+            )
 
-        self.metadata_log_path = self.root / "metadata.log"
-        self.data_log_path = self.root / "data-owner.log"
-        self.api_log_path = self.root / "api-node.log"
-        self.metadata_log_file = self.metadata_log_path.open("w")
-        self.data_log_file = self.data_log_path.open("w")
-        self.api_log_file = self.api_log_path.open("w")
+            self.metadata_log_path = self.root / "metadata.log"
+            self.data_log_path = self.root / "data-owner.log"
+            self.api_log_path = self.root / "api-node.log"
+            self.metadata_log_file = setup.enter_context(self.metadata_log_path.open("w"))
+            self.data_log_file = setup.enter_context(self.data_log_path.open("w"))
+            self.api_log_file = setup.enter_context(self.api_log_path.open("w"))
 
-        self.metadata_proc: subprocess.Popen[str] | None = None
-        self.data_proc: subprocess.Popen[str] | None = None
-        self.api_proc: subprocess.Popen[str] | None = None
+            self.metadata_proc: subprocess.Popen[str] | None = None
+            self.data_proc: subprocess.Popen[str] | None = None
+            self.api_proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
 
         try:
             self._start()

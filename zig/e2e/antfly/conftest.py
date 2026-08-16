@@ -41,6 +41,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -421,26 +422,30 @@ def _write_remote_content_e2e_config(root: Path) -> Path:
 
 class AntflyServer:
     def __init__(self, binary: str, host: str, port: int):
-        self.port_reservations = LoopbackPortReservations(host)
-        port = self.port_reservations.reserve_requested(port)
-        self.url = f"http://{host}:{port}"
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-e2e-")
-        root = Path(self.tempdir.name)
-        self.log_path = root / "server.log"
-        self.log_file = self.log_path.open("w")
-        env = os.environ.copy()
-        env.update(
-            {
-                "ANTFLY_SERVERLESS_ARTIFACTS_URI": f"file://{root / 'artifacts'}",
-                "ANTFLY_SERVERLESS_MANIFESTS_URI": f"file://{root / 'manifests'}",
-                "ANTFLY_SERVERLESS_WAL_URI": f"file://{root / 'wal'}",
-                "ANTFLY_SERVERLESS_PROGRESS_URI": f"file://{root / 'progress'}",
-                "ANTFLY_SERVERLESS_CATALOG_URI": f"file://{root / 'catalog'}",
-                "ANTFLY_SERVERLESS_QUERY_CACHE_DIR": str(root / "cache"),
-            }
-        )
-        command = _serverless_combined_command(binary, host=host, port=port, root=root)
-        self.proc: subprocess.Popen[str] | None = None
+        with ExitStack() as setup:
+            self.port_reservations = LoopbackPortReservations(host)
+            setup.callback(self.port_reservations.close)
+            port = self.port_reservations.reserve_requested(port)
+            self.url = f"http://{host}:{port}"
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            root = Path(self.tempdir.name)
+            self.log_path = root / "server.log"
+            self.log_file = setup.enter_context(self.log_path.open("w"))
+            env = os.environ.copy()
+            env.update(
+                {
+                    "ANTFLY_SERVERLESS_ARTIFACTS_URI": f"file://{root / 'artifacts'}",
+                    "ANTFLY_SERVERLESS_MANIFESTS_URI": f"file://{root / 'manifests'}",
+                    "ANTFLY_SERVERLESS_WAL_URI": f"file://{root / 'wal'}",
+                    "ANTFLY_SERVERLESS_PROGRESS_URI": f"file://{root / 'progress'}",
+                    "ANTFLY_SERVERLESS_CATALOG_URI": f"file://{root / 'catalog'}",
+                    "ANTFLY_SERVERLESS_QUERY_CACHE_DIR": str(root / "cache"),
+                }
+            )
+            command = _serverless_combined_command(binary, host=host, port=port, root=root)
+            self.proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
         try:
             self.proc = self.port_reservations.handoff_to(
                 (port,),
@@ -482,18 +487,22 @@ class PublicAntflyServer:
     def __init__(self, binary: str, host: str, port: int):
         self.binary = binary
         self.host = host
-        self.port_reservations = LoopbackPortReservations(host)
-        port = self.port_reservations.reserve_requested(port)
-        self.port = port
-        self.url = f"http://{host}:{port}"
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-public-e2e-")
-        root = Path(self.tempdir.name)
-        self.root = root
-        self.replica_root = root / "replicas"
-        self.log_path = root / "server.log"
-        self.log_file = self.log_path.open("w")
-        command = _legacy_stateful_command(binary, host=host, port=port, root=root)
-        self.proc: subprocess.Popen[str] | None = None
+        with ExitStack() as setup:
+            self.port_reservations = LoopbackPortReservations(host)
+            setup.callback(self.port_reservations.close)
+            port = self.port_reservations.reserve_requested(port)
+            self.port = port
+            self.url = f"http://{host}:{port}"
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-public-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            root = Path(self.tempdir.name)
+            self.root = root
+            self.replica_root = root / "replicas"
+            self.log_path = root / "server.log"
+            self.log_file = setup.enter_context(self.log_path.open("w"))
+            command = _legacy_stateful_command(binary, host=host, port=port, root=root)
+            self.proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
         try:
             self.proc = self.port_reservations.handoff_to(
                 (port,),
@@ -619,6 +628,8 @@ def _standalone_stateful_command(binary: str, *, host: str, port: int, root: Pat
         str(root),
         "--control-tick-ms",
         "5",
+        "--health",
+        "false",
         "--replica-root-dir",
         str(root / "replicas"),
         "--replica-catalog-path",
@@ -706,30 +717,32 @@ class StatefulAntflyServer:
     def __init__(self, binary: str, host: str, port: int, *, auth_enabled: bool = False):
         self.binary = binary
         self.host = host
-        self.port_reservations = LoopbackPortReservations(host)
-        port = self.port_reservations.reserve_requested(port)
-        self.port = port
         self.auth_enabled = auth_enabled
-        self.url = f"http://{host}:{port}"
-        self.api_url = antfly_public_api_url(self.url, binary=binary)
         self.metadata_admin_url: str | None = None
         self.metadata_proc: subprocess.Popen[str] | None = None
         self.data_proc: subprocess.Popen[str] | None = None
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-stateful-e2e-")
-        self.root = Path(self.tempdir.name)
-        self.replica_root = self.root / "data-replicas"
-        self.metadata_log_path = self.root / "metadata.log"
-        self.data_log_path = self.root / "data.log"
-        self.metadata_log_file = self.metadata_log_path.open("w")
-        self.data_log_file = self.data_log_path.open("w")
-        metadata_port, metadata_admin_port, data_raft_port = (
-            self.port_reservations.reserve_many(3)
-        )
-        self.metadata_port = metadata_port
-        self.metadata_admin_port = metadata_admin_port
-        self.data_raft_port = data_raft_port
-        metadata_admin_url = f"http://{host}:{metadata_admin_port}"
-        self.metadata_admin_url = metadata_admin_url
+        with ExitStack() as setup:
+            self.port_reservations = LoopbackPortReservations(host)
+            setup.callback(self.port_reservations.close)
+            port = self.port_reservations.reserve_requested(port)
+            self.port = port
+            self.url = f"http://{host}:{port}"
+            self.api_url = antfly_public_api_url(self.url, binary=binary)
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-stateful-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            self.root = Path(self.tempdir.name)
+            self.replica_root = self.root / "data-replicas"
+            self.metadata_log_path = self.root / "metadata.log"
+            self.data_log_path = self.root / "data.log"
+            self.metadata_log_file = setup.enter_context(self.metadata_log_path.open("w"))
+            self.data_log_file = setup.enter_context(self.data_log_path.open("w"))
+            (
+                self.metadata_port,
+                self.metadata_admin_port,
+                self.data_raft_port,
+            ) = self.port_reservations.reserve_many(3)
+            self.metadata_admin_url = f"http://{host}:{self.metadata_admin_port}"
+            setup.pop_all()
 
         try:
             self._start_processes(truncate_logs=False)
@@ -863,17 +876,21 @@ class StandaloneAntflyServer:
     def __init__(self, binary: str, host: str, port: int):
         self.binary = binary
         self.host = host
-        self.port_reservations = LoopbackPortReservations(host)
-        port = self.port_reservations.reserve_requested(port)
-        self.port = port
-        self.url = f"http://{host}:{port}"
-        self.api_url = antfly_public_api_url(self.url, binary=binary)
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-standalone-e2e-")
-        self.root = Path(self.tempdir.name)
-        self.replica_root = self.root / "replicas"
-        self.log_path = self.root / "server.log"
-        self.log_file = self.log_path.open("w")
-        self.proc: subprocess.Popen[str] | None = None
+        with ExitStack() as setup:
+            self.port_reservations = LoopbackPortReservations(host)
+            setup.callback(self.port_reservations.close)
+            port = self.port_reservations.reserve_requested(port)
+            self.port = port
+            self.url = f"http://{host}:{port}"
+            self.api_url = antfly_public_api_url(self.url, binary=binary)
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-standalone-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            self.root = Path(self.tempdir.name)
+            self.replica_root = self.root / "replicas"
+            self.log_path = self.root / "server.log"
+            self.log_file = setup.enter_context(self.log_path.open("w"))
+            self.proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
         try:
             self._start_process(truncate_logs=False)
         except BaseException:

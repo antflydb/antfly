@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
@@ -229,18 +230,22 @@ class AuthApi:
 
 class StandaloneAuthServer:
     def __init__(self, binary: str, host: str, port: int):
-        self.port_reservations = LoopbackPortReservations(host)
-        port = self.port_reservations.reserve_requested(port)
-        self.url = f"http://{host}:{port}"
-        self.api_url = antfly_public_api_url(self.url)
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-auth-e2e-")
-        root = Path(self.tempdir.name)
-        self.root = root
-        self.log_path = root / "server.log"
-        self.log_file = self.log_path.open("w")
-        command = _standalone_stateful_command(binary, host=host, port=port, root=root)
-        command.extend(["--auth", "true"])
-        self.proc: subprocess.Popen[str] | None = None
+        with ExitStack() as setup:
+            self.port_reservations = LoopbackPortReservations(host)
+            setup.callback(self.port_reservations.close)
+            port = self.port_reservations.reserve_requested(port)
+            self.url = f"http://{host}:{port}"
+            self.api_url = antfly_public_api_url(self.url)
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-auth-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            root = Path(self.tempdir.name)
+            self.root = root
+            self.log_path = root / "server.log"
+            self.log_file = setup.enter_context(self.log_path.open("w"))
+            command = _standalone_stateful_command(binary, host=host, port=port, root=root)
+            command.extend(["--auth", "true"])
+            self.proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
         try:
             self.proc = self.port_reservations.handoff_to(
                 (port,),

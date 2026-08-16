@@ -23,6 +23,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -150,17 +151,21 @@ class EmbeddedInferenceStandaloneServer:
         self.model_name = model_name
         self.host = host
         self.inference_budget_mb = inference_budget_mb or {}
-        self.port_reservations = LoopbackPortReservations(host)
-        self.public_port, self.health_port = self.port_reservations.reserve_many(2)
-        self.public_url = f"http://{host}:{self.public_port}"
-        self.url = antfly_public_api_url(self.public_url)
-        self.health_url = f"http://{host}:{self.health_port}"
-        self.inference_api_url = inference_public_api_url(self.public_url)
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-standalone-e2e-")
-        self.root = Path(self.tempdir.name)
-        self.log_path = self.root / "server.log"
-        self.log_file = self.log_path.open("w")
-        self.proc: subprocess.Popen[str] | None = None
+        with ExitStack() as setup:
+            self.port_reservations = LoopbackPortReservations(host)
+            setup.callback(self.port_reservations.close)
+            self.public_port, self.health_port = self.port_reservations.reserve_many(2)
+            self.public_url = f"http://{host}:{self.public_port}"
+            self.url = antfly_public_api_url(self.public_url)
+            self.health_url = f"http://{host}:{self.health_port}"
+            self.inference_api_url = inference_public_api_url(self.public_url)
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-standalone-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            self.root = Path(self.tempdir.name)
+            self.log_path = self.root / "server.log"
+            self.log_file = setup.enter_context(self.log_path.open("w"))
+            self.proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
         try:
             self._start()
         except BaseException:

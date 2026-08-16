@@ -19,6 +19,7 @@ from __future__ import annotations
 import errno
 import socket
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ from conftest import (
     PublicAntflyServer,
     StandaloneAntflyServer,
     StatefulAntflyServer,
+    _standalone_stateful_command,
 )
 from port_reservations import LoopbackPortReservations, find_free_port
 from test_auth import StandaloneAuthServer
@@ -141,7 +143,12 @@ def test_handoff_restores_leases_when_process_spawn_fails():
 
 @pytest.mark.parametrize(
     "server_type",
-    (AntflyServer, PublicAntflyServer, StandaloneAntflyServer, StandaloneAuthServer),
+    (
+        AntflyServer,
+        PublicAntflyServer,
+        StandaloneAntflyServer,
+        StandaloneAuthServer,
+    ),
 )
 def test_single_process_servers_release_requested_port_when_spawn_fails(
     monkeypatch: pytest.MonkeyPatch,
@@ -197,28 +204,105 @@ def test_embedded_inference_server_releases_listener_ports_when_spawn_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
-    with LoopbackPortReservations() as reservations:
-        public_port, health_port = reservations.reserve_many(2)
+    listener_ports: tuple[int, ...] = ()
+    reserve_many = LoopbackPortReservations.reserve_many
 
-    def reserve_listener_ports(
+    def record_listener_ports(
         reservations: LoopbackPortReservations,
         count: int,
     ) -> tuple[int, ...]:
-        assert count == 2
-        return (
-            reservations.reserve(public_port),
-            reservations.reserve(health_port),
-        )
+        nonlocal listener_ports
+        listener_ports = reserve_many(reservations, count)
+        return listener_ports
 
     def fail_to_spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
         raise OSError(errno.ENOEXEC, "cannot execute")
 
-    monkeypatch.setattr(LoopbackPortReservations, "reserve_many", reserve_listener_ports)
+    monkeypatch.setattr(LoopbackPortReservations, "reserve_many", record_listener_ports)
     monkeypatch.setattr(subprocess, "Popen", fail_to_spawn)
     with pytest.raises(OSError) as exc_info:
         EmbeddedInferenceStandaloneServer("/missing-antfly", tmp_path, "test-model")
     assert exc_info.value.errno == errno.ENOEXEC
+    assert len(listener_ports) == 2
 
-    for port in (public_port, health_port):
+    for port in listener_ports:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+            contender.bind(("127.0.0.1", port))
+
+
+def test_standalone_fixture_command_disables_unused_health_listener(tmp_path: Path):
+    command = _standalone_stateful_command(
+        "/missing-antfly",
+        host="127.0.0.1",
+        port=40000,
+        root=tmp_path,
+    )
+
+    health_flag = command.index("--health")
+    assert command[health_flag + 1] == "false"
+
+
+@pytest.mark.parametrize(
+    "server_type",
+    (
+        AntflyServer,
+        PublicAntflyServer,
+        StandaloneAntflyServer,
+        StandaloneAuthServer,
+        StatefulAntflyServer,
+    ),
+)
+def test_single_process_servers_release_port_when_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    server_type: type,
+):
+    listener_ports: list[int] = []
+    reserve_requested = LoopbackPortReservations.reserve_requested
+
+    def record_listener_port(reservations: LoopbackPortReservations, port: int) -> int:
+        reserved_port = reserve_requested(reservations, port)
+        listener_ports.append(reserved_port)
+        return reserved_port
+
+    def fail_tempdir(*args: Any, **kwargs: Any):
+        raise OSError(errno.ENOSPC, "cannot create temporary directory")
+
+    monkeypatch.setattr(LoopbackPortReservations, "reserve_requested", record_listener_port)
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", fail_tempdir)
+    with pytest.raises(OSError) as exc_info:
+        server_type("/missing-antfly", "127.0.0.1", 0)
+    assert exc_info.value.errno == errno.ENOSPC
+    assert len(listener_ports) == 1
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+        contender.bind(("127.0.0.1", listener_ports[0]))
+
+
+def test_embedded_inference_server_releases_ports_when_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    listener_ports: tuple[int, ...] = ()
+    reserve_many = LoopbackPortReservations.reserve_many
+
+    def record_listener_ports(
+        reservations: LoopbackPortReservations,
+        count: int,
+    ) -> tuple[int, ...]:
+        nonlocal listener_ports
+        listener_ports = reserve_many(reservations, count)
+        return listener_ports
+
+    def fail_tempdir(*args: Any, **kwargs: Any):
+        raise OSError(errno.ENOSPC, "cannot create temporary directory")
+
+    monkeypatch.setattr(LoopbackPortReservations, "reserve_many", record_listener_ports)
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", fail_tempdir)
+    with pytest.raises(OSError) as exc_info:
+        EmbeddedInferenceStandaloneServer("/missing-antfly", tmp_path, "test-model")
+    assert exc_info.value.errno == errno.ENOSPC
+    assert len(listener_ports) == 2
+
+    for port in listener_ports:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
             contender.bind(("127.0.0.1", port))

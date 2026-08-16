@@ -23,6 +23,7 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
@@ -241,30 +242,43 @@ class MultiMetadataBackupCluster:
     def __init__(self, binary: str):
         self.binary = binary
         self.host = "127.0.0.1"
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-metadata-backup-e2e-")
-        self.root = Path(self.tempdir.name)
-        self.port_reservations = LoopbackPortReservations(self.host)
+        with ExitStack() as setup:
+            self.tempdir = tempfile.TemporaryDirectory(
+                prefix="antfly-zig-metadata-backup-e2e-"
+            )
+            setup.callback(self.tempdir.cleanup)
+            self.root = Path(self.tempdir.name)
+            self.port_reservations = LoopbackPortReservations(self.host)
+            setup.callback(self.port_reservations.close)
 
-        self.metadata_raft_ports = list(self.port_reservations.reserve_many(3))
-        self.metadata_admin_ports = list(self.port_reservations.reserve_many(3))
-        self.metadata_admin_urls = [f"http://{self.host}:{port}" for port in self.metadata_admin_ports]
-        self.metadata_public_urls = [
-            antfly_public_api_url(url, root=ANTFLY_PUBLIC_API_ROOT) for url in self.metadata_admin_urls
-        ]
-        self.data_port, self.data_raft_port = self.port_reservations.reserve_many(2)
-        self.data_url = f"http://{self.host}:{self.data_port}"
-        self.data_api_url = antfly_public_api_url(self.data_url, binary=binary)
+            self.metadata_raft_ports = list(self.port_reservations.reserve_many(3))
+            self.metadata_admin_ports = list(self.port_reservations.reserve_many(3))
+            self.metadata_admin_urls = [
+                f"http://{self.host}:{port}" for port in self.metadata_admin_ports
+            ]
+            self.metadata_public_urls = [
+                antfly_public_api_url(url, root=ANTFLY_PUBLIC_API_ROOT)
+                for url in self.metadata_admin_urls
+            ]
+            self.data_port, self.data_raft_port = self.port_reservations.reserve_many(2)
+            self.data_url = f"http://{self.host}:{self.data_port}"
+            self.data_api_url = antfly_public_api_url(self.data_url, binary=binary)
 
-        self.config_path = self.root / "antfly-metadata-cluster.json"
-        self._write_config()
+            self.config_path = self.root / "antfly-metadata-cluster.json"
+            self._write_config()
 
-        self.metadata_log_paths = [self.root / f"metadata-{node_id}.log" for node_id in range(1, 4)]
-        self.metadata_log_files = [path.open("w") for path in self.metadata_log_paths]
-        self.data_log_path = self.root / "data.log"
-        self.data_log_file = self.data_log_path.open("w")
+            self.metadata_log_paths = [
+                self.root / f"metadata-{node_id}.log" for node_id in range(1, 4)
+            ]
+            self.metadata_log_files = [
+                setup.enter_context(path.open("w")) for path in self.metadata_log_paths
+            ]
+            self.data_log_path = self.root / "data.log"
+            self.data_log_file = setup.enter_context(self.data_log_path.open("w"))
 
-        self.metadata_procs: list[subprocess.Popen[str]] = []
-        self.data_proc: subprocess.Popen[str] | None = None
+            self.metadata_procs: list[subprocess.Popen[str]] = []
+            self.data_proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
 
         try:
             self._start()
