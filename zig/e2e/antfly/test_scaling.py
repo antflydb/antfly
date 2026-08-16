@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -34,11 +35,13 @@ from conftest import (
     DEFAULT_ANTFLY_BIN,
     LoopbackPortReservations,
     REPO_ROOT,
+    StatefulAntflyServer,
     _read_log_tail,
     antfly_public_api_url,
     find_free_port,
     lookup_key_path,
     maybe_preserve_tempdir,
+    reserve_requested_port,
     wait_for_server,
 )
 from helpers import wait_until
@@ -47,6 +50,7 @@ from helpers import wait_until
 MULTI_SHARD_WRITE_ROUTE_TIMEOUT_S = 120.0
 DATA_NODE_REGISTRATION_TIMEOUT_S = 180.0
 DATA_NODE_BIND_ATTEMPTS = 3
+DATA_NODE_RETRY_PORT_ATTEMPTS = 64
 ADDRESS_IN_USE_LOG_MARKER = "listen address is already in use"
 
 
@@ -92,6 +96,44 @@ def test_loopback_port_reservations_hold_ports_until_release():
             contender.bind(("127.0.0.1", released_port))
     finally:
         reservations.close()
+
+
+def test_reserve_requested_port_only_falls_back_for_address_in_use():
+    class StubReservations:
+        def __init__(self, error: OSError) -> None:
+            self.error = error
+            self.calls: list[int] = []
+
+        def reserve(self, port: int = 0) -> int:
+            self.calls.append(port)
+            if port:
+                raise self.error
+            return 41000
+
+    address_in_use = StubReservations(OSError(errno.EADDRINUSE, "already in use"))
+    assert reserve_requested_port(address_in_use, 40000) == 41000
+    assert address_in_use.calls == [40000, 0]
+
+    permission_denied = StubReservations(OSError(errno.EACCES, "permission denied"))
+    with pytest.raises(OSError) as exc_info:
+        reserve_requested_port(permission_denied, 40000)
+    assert exc_info.value.errno == errno.EACCES
+    assert permission_denied.calls == [40000]
+
+
+def test_stateful_server_releases_requested_port_when_spawn_fails(monkeypatch: pytest.MonkeyPatch):
+    requested_port = find_free_port()
+
+    def fail_to_spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
+        raise OSError(errno.ENOEXEC, "cannot execute")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_to_spawn)
+    with pytest.raises(OSError) as exc_info:
+        StatefulAntflyServer("/missing-antfly", "127.0.0.1", requested_port)
+    assert exc_info.value.errno == errno.ENOEXEC
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+        contender.bind(("127.0.0.1", requested_port))
 
 
 def _metadata_admin_url(stateful_api) -> str:
@@ -636,10 +678,30 @@ class MultiNodeScalingCluster:
         if ADDRESS_IN_USE_LOG_MARKER not in _read_log_tail(log_path):
             return False
 
-        node["api_port"] = self.port_reservations.reserve()
-        node["raft_port"] = self.port_reservations.reserve()
+        configured_ports = {
+            int(configured_node[port_key])
+            for configured_node in [*self.metadata_nodes, *self.data_nodes]
+            for port_key in ("api_port", "raft_port")
+        }
+        api_port = self._reserve_retry_port(configured_ports)
+        try:
+            raft_port = self._reserve_retry_port(configured_ports)
+        except BaseException:
+            self.port_reservations.release(api_port)
+            raise
+        node["api_port"] = api_port
+        node["raft_port"] = raft_port
         self._start_data_node(node)
         return True
+
+    def _reserve_retry_port(self, configured_ports: set[int]) -> int:
+        for _ in range(DATA_NODE_RETRY_PORT_ATTEMPTS):
+            port = self.port_reservations.reserve()
+            if port not in configured_ports:
+                configured_ports.add(port)
+                return port
+            self.port_reservations.release(port)
+        raise RuntimeError("could not reserve a data-node retry port outside the cluster configuration")
 
     def add_data_node(self) -> dict[str, int]:
         node = self._new_data_node(max(int(existing["id"]) for existing in self.data_nodes) + 1)
@@ -1111,10 +1173,14 @@ class MultiNodeScalingCluster:
 def test_scaling_cluster_retries_data_node_after_bind_collision(tmp_path: Path):
     class StubReservations:
         def __init__(self) -> None:
-            self.ports = iter((41001, 41002))
+            self.ports = iter((40003, 41001, 41001, 41002))
+            self.released: list[int] = []
 
         def reserve(self) -> int:
             return next(self.ports)
+
+        def release(self, *ports: int) -> None:
+            self.released.extend(ports)
 
     node = {"id": 103, "store_id": 103, "api_port": 40001, "raft_port": 40002}
     log_path = tmp_path / "data-103.log"
@@ -1128,6 +1194,11 @@ def test_scaling_cluster_retries_data_node_after_bind_collision(tmp_path: Path):
     cluster.data_log_handles = {103: log}
     cluster.data_log_paths = {103: log_path}
     cluster.port_reservations = StubReservations()
+    cluster.metadata_nodes = [{"id": 1, "api_port": 30001, "raft_port": 30002}]
+    cluster.data_nodes = [
+        node,
+        {"id": 104, "store_id": 104, "api_port": 40003, "raft_port": 40004},
+    ]
     restarted: list[dict[str, int]] = []
     cluster._start_data_node = lambda retry_node: restarted.append(dict(retry_node))  # type: ignore[method-assign]
 
@@ -1138,6 +1209,7 @@ def test_scaling_cluster_retries_data_node_after_bind_collision(tmp_path: Path):
 
     assert node["api_port"] == 41001
     assert node["raft_port"] == 41002
+    assert cluster.port_reservations.released == [40003, 41001]
     assert restarted == [node]
 
 

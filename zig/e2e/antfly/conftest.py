@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -191,6 +192,16 @@ class LoopbackPortReservations:
         self._sockets.clear()
         for sock in sockets:
             sock.close()
+
+
+def reserve_requested_port(reservations: LoopbackPortReservations, port: int) -> int:
+    """Reserve a requested port, falling back only when another listener owns it."""
+    try:
+        return reservations.reserve(port)
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        return reservations.reserve()
 
 
 def wait_for_server(
@@ -714,10 +725,7 @@ class StatefulAntflyServer:
         self.binary = binary
         self.host = host
         self.port_reservations = LoopbackPortReservations(host)
-        try:
-            self.port_reservations.reserve(port)
-        except OSError:
-            port = self.port_reservations.reserve()
+        port = reserve_requested_port(self.port_reservations, port)
         self.port = port
         self.auth_enabled = auth_enabled
         self.url = f"http://{host}:{port}"
@@ -740,7 +748,15 @@ class StatefulAntflyServer:
         metadata_admin_url = f"http://{host}:{metadata_admin_port}"
         self.metadata_admin_url = metadata_admin_url
 
-        self._start_processes(truncate_logs=False)
+        try:
+            self._start_processes(truncate_logs=False)
+        except BaseException:
+            # Startup failures inside wait_for_server already call stop(). A
+            # direct Popen failure does not, so release every reservation and
+            # close the fixture's files before propagating the original error.
+            if not self.metadata_log_file.closed or not self.data_log_file.closed:
+                self.stop()
+            raise
 
     def _start_processes(self, *, truncate_logs: bool) -> None:
         if truncate_logs:
