@@ -179,7 +179,7 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn triggerReallocate(self: *MetadataHttpClient, base_uri: []const u8) !void {
-        const uri = try join(self.alloc, base_uri, routes.Routes.internal_reallocate_v2);
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_reallocate);
         defer self.alloc.free(uri);
 
         var resp = try self.executeWithRetry(.{
@@ -729,7 +729,7 @@ fn nodeStatusRouteForBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     });
 }
 
-test "metadata http client uses the versioned reallocation route and maps upgrade gating" {
+test "metadata http client uses the reallocation route and maps upgrade gating" {
     const UpgradeRequiredExecutor = struct {
         fn executor(_: *@This()) http_common.RequestExecutor {
             return .{
@@ -740,7 +740,7 @@ test "metadata http client uses the versioned reallocation route and maps upgrad
 
         fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_reallocate_v2));
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_reallocate));
             return .{
                 .status = 503,
                 .content_type = try alloc.dupe(u8, "text/plain"),

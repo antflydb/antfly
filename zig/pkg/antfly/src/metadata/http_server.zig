@@ -1101,7 +1101,6 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_reallocate, httpx.Handler.bind(self, metadataTriggerReallocate));
-        try server.post(routes.Routes.internal_reallocate_v2, httpx.Handler.bind(self, metadataTriggerReallocate));
         try server.post(routes.Routes.internal_schema_progress, httpx.Handler.bind(self, metadataUpsertSchemaProgress));
         try server.post(routes.Routes.internal_extension_restore, httpx.Handler.bind(self, metadataRestoreExtensions));
         const extension_path = routes.Routes.internal_extensions_prefix ++ ":extension_name";
@@ -2946,7 +2945,7 @@ test "metadata http server reports reallocation protocol upgrade gating" {
 
     var source = UpgradeGatedSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
-    var response = try server.executeTypedHandlerForTest(.POST, routes.Routes.internal_reallocate_v2, &.{}, MetadataHttpServer.metadataTriggerReallocate);
+    var response = try server.executeTypedHandlerForTest(.POST, routes.Routes.internal_reallocate, &.{}, MetadataHttpServer.metadataTriggerReallocate);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 503), response.status.code);
     try std.testing.expectEqualStrings("metadata voter upgrade required", response.body.?);

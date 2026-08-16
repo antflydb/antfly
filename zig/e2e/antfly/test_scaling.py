@@ -1110,7 +1110,7 @@ class MultiNodeScalingCluster:
     def trigger_reallocate(self) -> None:
         self.metadata_mutation_once(
             "POST",
-            "/internal/v2/reallocate",
+            "/internal/v1/reallocate",
             operation="trigger reallocation",
         )
 
