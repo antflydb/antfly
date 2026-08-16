@@ -891,7 +891,11 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
 
     assert stateful_api.create_index(table_name, index_name, index_payload) == {}
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        # A metadata snapshot can expose the index config before the table's
+        # shard topology and runtime observation arrive. Do not begin the
+        # rate-limit scenario from that config-only response: it has an empty
+        # shard_status and cannot prove that the managed worker is running.
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -1119,7 +1123,11 @@ def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrich
 
     assert stateful_api.create_index(table_name, index_name, index_payload) == {}
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        # A metadata snapshot can expose the index config before the table's
+        # shard topology and runtime observation arrive. Do not begin the
+        # rate-limit scenario from that config-only response: it has an empty
+        # shard_status and cannot prove that the managed worker is running.
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -1304,7 +1312,7 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
 
     assert stateful_api.create_index(table_name, index_name, index_payload) == {}
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -1404,7 +1412,7 @@ def test_stateful_managed_embeddings_provider_pacing_avoids_rate_limit_bursts(
 
     assert stateful_api.create_index(table_name, index_name, index_payload) == {}
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -1603,7 +1611,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
 
     assert stateful_api.create_index(table_name, index_name, index_payload) == {}
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )

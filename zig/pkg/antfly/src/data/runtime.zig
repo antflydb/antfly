@@ -1078,10 +1078,41 @@ test "data descriptor factory bootstraps pristine group from complete intent pee
 }
 
 const RaftTableApplyStateMachine = struct {
+    const ApplyFailureKey = struct {
+        group_id: u64,
+        index: u64,
+    };
+
+    const ExpectedApplyFailure = enum {
+        intent_conflict,
+        version_conflict,
+
+        fn fromError(err: anyerror) ?ExpectedApplyFailure {
+            return switch (err) {
+                error.IntentConflict => .intent_conflict,
+                error.VersionConflict => .version_conflict,
+                else => null,
+            };
+        }
+
+        fn toError(self: ExpectedApplyFailure) anyerror {
+            return switch (self) {
+                .intent_conflict => error.IntentConflict,
+                .version_conflict => error.VersionConflict,
+            };
+        }
+    };
+
+    // Followers have no local waiter to consume rejected command outcomes.
+    // Keep enough recent entries for any leader-side waiter while bounding
+    // memory on replicas that observe a sustained stream of conflicts.
+    const max_retained_apply_failures: usize = 4096;
+
     alloc: std.mem.Allocator,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
     applied_mutex: std.atomic.Mutex = .unlocked,
     applied_indexes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    apply_failures: std.AutoHashMapUnmanaged(ApplyFailureKey, ExpectedApplyFailure) = .empty,
 
     fn init(
         alloc: std.mem.Allocator,
@@ -1100,6 +1131,7 @@ const RaftTableApplyStateMachine = struct {
     fn deinit(self: *RaftTableApplyStateMachine) void {
         self.write_source.deinit();
         self.applied_indexes.deinit(self.alloc);
+        self.apply_failures.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -1143,6 +1175,29 @@ const RaftTableApplyStateMachine = struct {
         if (index > existing) try self.applied_indexes.put(self.alloc, group_id, index);
     }
 
+    fn recordApplyFailure(
+        self: *RaftTableApplyStateMachine,
+        group_id: u64,
+        index: u64,
+        failure: ExpectedApplyFailure,
+    ) !void {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        const key = ApplyFailureKey{ .group_id = group_id, .index = index };
+        if (!self.apply_failures.contains(key) and self.apply_failures.count() >= max_retained_apply_failures) {
+            var keys = self.apply_failures.keyIterator();
+            if (keys.next()) |stale_key| _ = self.apply_failures.fetchRemove(stale_key.*);
+        }
+        try self.apply_failures.put(self.alloc, key, failure);
+    }
+
+    fn takeApplyFailure(self: *RaftTableApplyStateMachine, group_id: u64, index: u64) ?ExpectedApplyFailure {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        const removed = self.apply_failures.fetchRemove(.{ .group_id = group_id, .index = index }) orelse return null;
+        return removed.value;
+    }
+
     fn stateMachine(self: *RaftTableApplyStateMachine) raft_engine.runtime.storage_iface.StateMachine {
         return .{
             .ptr = self,
@@ -1182,6 +1237,21 @@ const RaftTableApplyStateMachine = struct {
                 decoded.table_name,
                 decoded.batch.req,
             ) catch |err| {
+                if (ExpectedApplyFailure.fromError(err)) |failure| {
+                    // Transaction conflicts are deterministic command results,
+                    // not state-machine failures. Every replica rejects the
+                    // prepare at this log index and must continue applying;
+                    // the proposing leader returns the result to the 2PC
+                    // coordinator after observing the applied index.
+                    try self.recordApplyFailure(group_id, entry.index, failure);
+                    std.log.debug("data raft document apply rejected group_id={} index={} table={s} err={s}", .{
+                        group_id,
+                        entry.index,
+                        decoded.table_name,
+                        @errorName(err),
+                    });
+                    continue;
+                }
                 std.log.err("data raft document apply failed group_id={} index={} table={s} err={}", .{
                     group_id,
                     entry.index,
@@ -6909,6 +6979,8 @@ pub const DataServer = struct {
                         });
                         return error.RaftBatchWriteOutcomeUnknown;
                     };
+                    if (self.data_raft_apply) |apply_sm|
+                        if (apply_sm.takeApplyFailure(group_id, index)) |failure| return failure.toError();
                 }
                 const sync_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 sync_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level) catch |err| {
@@ -17142,6 +17214,102 @@ test "data raft source split lifecycle commands bypass document db apply" {
             .delta_sequence = 1,
         },
     }));
+}
+
+test "data raft apply records transaction conflicts without stopping replica progress" {
+    const alloc = std.testing.allocator;
+    const group_id: u64 = 77;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-raft-apply-conflict", .{tmp.sub_path});
+    defer alloc.free(replica_root);
+
+    const Catalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = group_id,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var apply_sm = RaftTableApplyStateMachine.init(alloc, replica_root, Catalog.iface(), null);
+    defer apply_sm.deinit();
+
+    const participant = try antfly.public_api.distributed_txn.participantIdForGroup(alloc, "docs", group_id);
+    defer alloc.free(participant);
+    const participants = [_][]const u8{participant};
+    const txn_a: antfly.db.types.TxnId = .{0x0a} ** 16;
+    const txn_b: antfly.db.types.TxnId = .{0x0b} ** 16;
+    _ = try apply_sm.write_source.applyReplicatedBatchGroupLocal(alloc, group_id, "docs", .{
+        .transaction = .{ .begin = .{
+            .txn_id = txn_a,
+            .begin_timestamp = 100,
+            .created_at_ns = 100,
+            .topology_epoch = 1,
+            .participants = &participants,
+        } },
+    });
+    _ = try apply_sm.write_source.applyReplicatedBatchGroupLocal(alloc, group_id, "docs", .{
+        .transaction = .{ .begin = .{
+            .txn_id = txn_b,
+            .begin_timestamp = 101,
+            .created_at_ns = 101,
+            .topology_epoch = 1,
+            .participants = &participants,
+        } },
+    });
+
+    const prepare_a = try data_raft_batch.encode(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .transaction = .{ .prepare = .{ .txn_id = txn_a, .topology_epoch = 1 } },
+    });
+    defer alloc.free(prepare_a);
+    const prepare_b = try data_raft_batch.encode(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"beta\"}" }},
+        .transaction = .{ .prepare = .{ .txn_id = txn_b, .topology_epoch = 1 } },
+    });
+    defer alloc.free(prepare_b);
+    const entries = [_]raft_engine.core.Entry{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = prepare_a },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = prepare_b },
+    };
+
+    try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entries, &.{});
+    try std.testing.expectEqual(@as(u64, 2), apply_sm.appliedIndex(group_id));
+    try std.testing.expect(apply_sm.takeApplyFailure(group_id, 1) == null);
+    const conflict = apply_sm.takeApplyFailure(group_id, 2) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(
+        RaftTableApplyStateMachine.ExpectedApplyFailure.intent_conflict,
+        conflict,
+    );
 }
 
 test "data server can register a store without enabling data raft" {
