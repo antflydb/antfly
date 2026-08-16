@@ -33,7 +33,6 @@ from conftest import (
     _standalone_stateful_command,
     _read_log_tail,
     antfly_public_api_url,
-    find_free_port,
     lookup_key_path,
     maybe_preserve_tempdir,
     raise_if_server_process_exited,
@@ -41,6 +40,7 @@ from conftest import (
     resolve_binary_path,
     wait_for_server,
 )
+from port_reservations import find_free_port
 
 AUTH_PUBLIC_API_ROOT = "/auth/v1"
 AUTH_STARTUP_TIMEOUT_SECONDS = 30.0

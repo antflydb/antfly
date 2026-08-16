@@ -34,7 +34,6 @@ import requests
 
 from conftest import (
     DEFAULT_ANTFLY_BIN,
-    LoopbackPortReservations,
     _read_log_tail,
     _standalone_stateful_command,
     lookup_key_path,
@@ -42,6 +41,7 @@ from conftest import (
     resolve_binary_path,
     wait_for_server,
 )
+from port_reservations import LoopbackPortReservations
 
 
 HA_ADMIN_ROOT = "/admin/v1/ha"
@@ -80,8 +80,7 @@ class HAStandaloneNode:
         self.node_id = node_id
         self.host = "127.0.0.1"
         self.port_reservations = LoopbackPortReservations(self.host)
-        self.port = self.port_reservations.reserve()
-        self.health_port = self.port_reservations.reserve()
+        self.port, self.health_port = self.port_reservations.reserve_many(2)
         self.url = f"http://{self.host}:{self.port}"
         self.log_path = self.root / f"{role}-{node_id}.log"
         self.log_file = self.log_path.open("a")
@@ -183,13 +182,15 @@ class HAStandaloneNode:
             assert self.admin_token is not None
             env[self.admin_token_env] = self.admin_token
 
-        self.port_reservations.release_if_reserved(self.port, self.health_port)
-        self.proc = subprocess.Popen(
-            command,
-            stdout=self.log_file,
-            stderr=subprocess.STDOUT,
-            cwd=self.root,
-            env=env,
+        self.proc = self.port_reservations.handoff_to(
+            (self.port, self.health_port),
+            lambda: subprocess.Popen(
+                command,
+                stdout=self.log_file,
+                stderr=subprocess.STDOUT,
+                cwd=self.root,
+                env=env,
+            ),
         )
         if not wait_for_server(self.url, path="/readyz", timeout=30.0):
             logs = self.debug_logs()
@@ -201,7 +202,7 @@ class HAStandaloneNode:
         if self.ha_root.exists():
             shutil.rmtree(self.ha_root)
 
-    def stop(self) -> None:
+    def _stop_process(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:
@@ -211,6 +212,10 @@ class HAStandaloneNode:
                 self.proc.wait()
         self.proc = None
 
+    def stop(self) -> None:
+        self._stop_process()
+        self.port_reservations.ensure_reserved(self.port, self.health_port)
+
     def restart(self, *, enable_replication: bool = True) -> None:
         self.stop()
         self.log_file.close()
@@ -218,8 +223,8 @@ class HAStandaloneNode:
         self.start(enable_replication=enable_replication)
 
     def close(self) -> None:
+        self._stop_process()
         self.port_reservations.close()
-        self.stop()
         self.log_file.close()
 
     def debug_logs(self) -> str:

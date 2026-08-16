@@ -27,7 +27,6 @@ import requests
 
 from conftest import (
     DEFAULT_ANTFLY_BIN,
-    LoopbackPortReservations,
     REPO_ROOT,
     _metadata_command,
     _read_log_tail,
@@ -35,6 +34,7 @@ from conftest import (
     maybe_preserve_tempdir,
     wait_for_server,
 )
+from port_reservations import LoopbackPortReservations
 from helpers import wait_until
 
 
@@ -92,12 +92,14 @@ class SplitStatusCluster:
         self.root = Path(self.tempdir.name)
         self.port_reservations = LoopbackPortReservations(self.host)
 
-        self.metadata_port = self.port_reservations.reserve()
-        self.metadata_admin_port = self.port_reservations.reserve()
-        self.data_port = self.port_reservations.reserve()
-        self.data_raft_port = self.port_reservations.reserve()
-        self.api_port = self.port_reservations.reserve()
-        self.api_raft_port = self.port_reservations.reserve()
+        (
+            self.metadata_port,
+            self.metadata_admin_port,
+            self.data_port,
+            self.data_raft_port,
+            self.api_port,
+            self.api_raft_port,
+        ) = self.port_reservations.reserve_many(6)
 
         self.metadata_admin_url = f"http://{self.host}:{self.metadata_admin_port}"
         self.data_url = f"http://{self.host}:{self.data_port}"
@@ -129,12 +131,14 @@ class SplitStatusCluster:
             admin_port=self.metadata_admin_port,
             root=self.root,
         )
-        self.port_reservations.release(self.metadata_port, self.metadata_admin_port)
-        self.metadata_proc = subprocess.Popen(
-            metadata_command,
-            stdout=self.metadata_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=REPO_ROOT,
+        self.metadata_proc = self.port_reservations.handoff_to(
+            (self.metadata_port, self.metadata_admin_port),
+            lambda: subprocess.Popen(
+                metadata_command,
+                stdout=self.metadata_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=REPO_ROOT,
+            ),
         )
         if not wait_for_server(self.metadata_admin_url, path="/metadata/v1/status"):
             raise RuntimeError(f"Metadata server failed to start\n{self.debug_logs()}")
@@ -150,12 +154,14 @@ class SplitStatusCluster:
             store_id=2,
             store_role="data",
         )
-        self.port_reservations.release(self.data_port, self.data_raft_port)
-        self.data_proc = subprocess.Popen(
-            data_command,
-            stdout=self.data_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=REPO_ROOT,
+        self.data_proc = self.port_reservations.handoff_to(
+            (self.data_port, self.data_raft_port),
+            lambda: subprocess.Popen(
+                data_command,
+                stdout=self.data_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=REPO_ROOT,
+            ),
         )
         if not wait_for_server(self.data_api_url):
             raise RuntimeError(f"Data owner failed to start\n{self.debug_logs()}")
@@ -171,12 +177,14 @@ class SplitStatusCluster:
             store_id=3,
             store_role="api",
         )
-        self.port_reservations.release(self.api_port, self.api_raft_port)
-        self.api_proc = subprocess.Popen(
-            api_command,
-            stdout=self.api_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=REPO_ROOT,
+        self.api_proc = self.port_reservations.handoff_to(
+            (self.api_port, self.api_raft_port),
+            lambda: subprocess.Popen(
+                api_command,
+                stdout=self.api_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=REPO_ROOT,
+            ),
         )
         if not wait_for_server(self.api_url):
             raise RuntimeError(f"API-only node failed to start\n{self.debug_logs()}")

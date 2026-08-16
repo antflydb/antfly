@@ -33,11 +33,11 @@ import requests
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     StandaloneAntflyServer,
-    find_free_port,
     resolve_binary_path,
     wait_for_server,
 )
 from helpers import wait_until
+from port_reservations import find_free_port
 
 
 @pytest.fixture(scope="module")

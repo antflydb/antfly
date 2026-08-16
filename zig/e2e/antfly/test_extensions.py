@@ -27,7 +27,6 @@ import requests
 
 from conftest import (
     DEFAULT_ANTFLY_BIN,
-    LoopbackPortReservations,
     REPO_ROOT,
     _data_command,
     _metadata_command,
@@ -38,6 +37,7 @@ from conftest import (
     wait_for_server,
 )
 from helpers import wait_until
+from port_reservations import LoopbackPortReservations
 
 pytestmark = pytest.mark.slow
 
@@ -61,15 +61,27 @@ class _ExtensionProcess:
         self.package_store = MEMORYAF_PACKAGE_STORE
         if not (self.package_store / "memoryaf" / "extension.json").exists():
             raise RuntimeError(f"memoryaf extension package not found under {self.package_store}")
+        if mode not in {"standalone", "distributed"}:
+            raise ValueError(mode)
 
         self.port_reservations = LoopbackPortReservations(self.host)
         self.public_port = self.port_reservations.reserve()
-        self.metadata_raft_port = self.port_reservations.reserve()
-        self.metadata_admin_port = self.port_reservations.reserve()
-        self.data_raft_port = self.port_reservations.reserve()
+        self.metadata_raft_port: int | None = None
+        self.metadata_admin_port: int | None = None
+        self.data_raft_port: int | None = None
+        if mode == "distributed":
+            (
+                self.metadata_raft_port,
+                self.metadata_admin_port,
+                self.data_raft_port,
+            ) = self.port_reservations.reserve_many(3)
         self.url = f"http://{self.host}:{self.public_port}"
         self.api_url = antfly_public_api_url(self.url, binary=binary)
-        self.metadata_admin_url = f"http://{self.host}:{self.metadata_admin_port}"
+        self.metadata_admin_url = (
+            f"http://{self.host}:{self.metadata_admin_port}"
+            if self.metadata_admin_port is not None
+            else None
+        )
 
         self.standalone_log_path = self.root / "standalone.log"
         self.metadata_log_path = self.root / "metadata.log"
@@ -84,10 +96,8 @@ class _ExtensionProcess:
         try:
             if mode == "standalone":
                 self._start_standalone()
-            elif mode == "distributed":
-                self._start_distributed()
             else:
-                raise ValueError(mode)
+                self._start_distributed()
         except BaseException:
             self.stop()
             raise
@@ -116,12 +126,24 @@ class _ExtensionProcess:
             "--extension-package-store",
             str(self.package_store),
         ]
-        self.port_reservations.release(self.public_port)
-        self.standalone_proc = subprocess.Popen(command, stdout=self.standalone_log_file, stderr=subprocess.STDOUT, cwd=self.root, env=env)
+        self.standalone_proc = self.port_reservations.handoff_to(
+            (self.public_port,),
+            lambda: subprocess.Popen(
+                command,
+                stdout=self.standalone_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=self.root,
+                env=env,
+            ),
+        )
         if not wait_for_server(self.api_url):
             raise RuntimeError(f"standalone extension server failed to start\n{self.debug_logs()}")
 
     def _start_distributed(self) -> None:
+        assert self.metadata_raft_port is not None
+        assert self.metadata_admin_port is not None
+        assert self.metadata_admin_url is not None
+        assert self.data_raft_port is not None
         env = self._server_env()
         metadata_command = _metadata_command(
             self.binary,
@@ -131,13 +153,15 @@ class _ExtensionProcess:
             root=self.root,
         )
         metadata_command.extend(["--extension-package-store", str(self.package_store)])
-        self.port_reservations.release(self.metadata_raft_port, self.metadata_admin_port)
-        self.metadata_proc = subprocess.Popen(
-            metadata_command,
-            stdout=self.metadata_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=self.root,
-            env=env,
+        self.metadata_proc = self.port_reservations.handoff_to(
+            (self.metadata_raft_port, self.metadata_admin_port),
+            lambda: subprocess.Popen(
+                metadata_command,
+                stdout=self.metadata_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=self.root,
+                env=env,
+            ),
         )
         if not wait_for_server(self.metadata_admin_url, path="/metadata/v1/status"):
             raise RuntimeError(f"metadata extension server failed to start\n{self.debug_logs()}")
@@ -150,13 +174,15 @@ class _ExtensionProcess:
             metadata_admin_base_uri=self.metadata_admin_url,
             root=self.root,
         )
-        self.port_reservations.release(self.public_port, self.data_raft_port)
-        self.data_proc = subprocess.Popen(
-            data_command,
-            stdout=self.data_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=self.root,
-            env=env,
+        self.data_proc = self.port_reservations.handoff_to(
+            (self.public_port, self.data_raft_port),
+            lambda: subprocess.Popen(
+                data_command,
+                stdout=self.data_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=self.root,
+                env=env,
+            ),
         )
         if not wait_for_server(self.api_url):
             raise RuntimeError(f"data extension server failed to start\n{self.debug_logs()}")

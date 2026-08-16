@@ -30,8 +30,9 @@ from urllib.parse import quote
 import pytest
 import requests
 
-from conftest import LoopbackPortReservations, antfly_public_api_url, inference_public_api_url
+from conftest import antfly_public_api_url, inference_public_api_url
 from helpers import wait_until
+from port_reservations import LoopbackPortReservations
 
 
 pytestmark = pytest.mark.standalone_integration
@@ -150,8 +151,7 @@ class EmbeddedInferenceStandaloneServer:
         self.host = host
         self.inference_budget_mb = inference_budget_mb or {}
         self.port_reservations = LoopbackPortReservations(host)
-        self.public_port = self.port_reservations.reserve()
-        self.health_port = self.port_reservations.reserve()
+        self.public_port, self.health_port = self.port_reservations.reserve_many(2)
         self.public_url = f"http://{host}:{self.public_port}"
         self.url = antfly_public_api_url(self.public_url)
         self.health_url = f"http://{host}:{self.health_port}"
@@ -195,12 +195,14 @@ class EmbeddedInferenceStandaloneServer:
         ):
             if value > 0:
                 command.extend([flag_name, str(value)])
-        self.port_reservations.release(self.public_port, self.health_port)
-        self.proc = subprocess.Popen(
-            command,
-            stdout=self.log_file,
-            stderr=subprocess.STDOUT,
-            cwd=REPO_ROOT,
+        self.proc = self.port_reservations.handoff_to(
+            (self.public_port, self.health_port),
+            lambda: subprocess.Popen(
+                command,
+                stdout=self.log_file,
+                stderr=subprocess.STDOUT,
+                cwd=REPO_ROOT,
+            ),
         )
         if not _wait_for_server(self.url):
             logs = _read_log_tail(self.log_path)
