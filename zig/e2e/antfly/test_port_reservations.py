@@ -35,6 +35,7 @@ from conftest import (
 from port_reservations import LoopbackPortReservations, find_free_port
 from test_auth import StandaloneAuthServer
 from test_standalone import EmbeddedInferenceStandaloneServer
+from test_standby import HAStandaloneNode
 
 
 def test_loopback_port_reservations_hold_ports_until_handoff():
@@ -240,6 +241,42 @@ def test_standalone_fixture_command_disables_unused_health_listener(tmp_path: Pa
 
     health_flag = command.index("--health")
     assert command[health_flag + 1] == "false"
+
+
+def test_ha_standalone_node_reenables_its_reserved_health_listener(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    command: list[str] = []
+
+    class ExitedProcess:
+        def poll(self) -> int:
+            return 0
+
+    def capture_command(args: list[str], **kwargs: Any) -> ExitedProcess:
+        command.extend(args)
+        return ExitedProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", capture_command)
+    monkeypatch.setattr("test_standby.wait_for_server", lambda *args, **kwargs: True)
+    node = HAStandaloneNode(
+        binary="/missing-antfly",
+        root=tmp_path,
+        role="primary",
+        node_id="primary-a",
+        cluster_id=100,
+        timeline_id=1,
+        epoch=1,
+    )
+    try:
+        node.start()
+
+        health_flags = [index for index, arg in enumerate(command) if arg == "--health"]
+        assert command[health_flags[-1] + 1] == "true"
+        health_port_flag = command.index("--health-port")
+        assert command[health_port_flag + 1] == str(node.health_port)
+    finally:
+        node.close()
 
 
 @pytest.mark.parametrize(

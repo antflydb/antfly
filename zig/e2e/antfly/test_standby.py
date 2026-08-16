@@ -115,7 +115,7 @@ class HAStandaloneNode:
     def start(self, *, enable_replication: bool = True) -> None:
         self.node_root.mkdir(parents=True, exist_ok=True)
         command = _standalone_stateful_command(self.binary, host=self.host, port=self.port, root=self.node_root)
-        command.extend(["--health-port", str(self.health_port)])
+        command.extend(["--health", "true", "--health-port", str(self.health_port)])
         if self.role == "primary":
             command.extend(
                 [
