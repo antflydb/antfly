@@ -359,6 +359,12 @@ pub const HfTokenizer = struct {
 
     pub const BpeCacheResourceBudget = struct {
         context: *anyopaque,
+        /// Optional ownership hooks for capabilities whose context can outlive
+        /// the component that published it. Hooks must be supplied as a pair.
+        /// HfTokenizer retains the context while the capability is installed,
+        /// including while its accounted byte total is zero.
+        retain_context: ?*const fn (*anyopaque) bool = null,
+        release_context: ?*const fn (*anyopaque) void = null,
         /// Observe the total bytes owned by one stable tokenizer identity.
         /// The receiver must reject stale `previous` values. This makes
         /// duplicate releases fail closed instead of debiting another owner.
@@ -368,6 +374,19 @@ pub const HfTokenizer = struct {
             previous: usize,
             next: usize,
         ) bool,
+
+        pub fn hasValidLifetimeHooks(self: @This()) bool {
+            return (self.retain_context == null) == (self.release_context == null);
+        }
+
+        pub fn retainContext(self: @This()) bool {
+            if (!self.hasValidLifetimeHooks()) return false;
+            return if (self.retain_context) |retain| retain(self.context) else true;
+        }
+
+        pub fn releaseContext(self: @This()) void {
+            if (self.release_context) |release| release(self.context);
+        }
     };
 
     pub const BpeCacheConfig = struct {
@@ -5186,6 +5205,9 @@ pub const HfTokenizer = struct {
     ) bool {
         const previous_budget = self.cache_resource_budget;
         if (sameBpeCacheResourceBudget(previous_budget, next_budget)) return true;
+        if (next_budget) |budget| {
+            if (!budget.retainContext()) return false;
+        }
         lockBpeCacheMutex(&self.cache_resource_budget_mutex);
         defer self.cache_resource_budget_mutex.unlock();
         const bytes = self.cache_resource_budget_bytes;
@@ -5197,7 +5219,10 @@ pub const HfTokenizer = struct {
                     0,
                     bytes,
                 ))
+            {
+                budget.releaseContext();
                 return false;
+            }
         }
         if (previous_budget) |budget| {
             if (bytes != 0 and
@@ -5217,11 +5242,13 @@ pub const HfTokenizer = struct {
                             0,
                         );
                 }
+                if (next_budget) |next| next.releaseContext();
                 return false;
             }
         }
         self.cache_resource_budget = next_budget;
         if (next_budget == null) self.cache_resource_budget_bytes = 0;
+        if (previous_budget) |budget| budget.releaseContext();
         return true;
     }
 
@@ -5231,7 +5258,9 @@ pub const HfTokenizer = struct {
     ) bool {
         if (a == null or b == null) return a == null and b == null;
         return a.?.context == b.?.context and
-            a.?.observe == b.?.observe;
+            a.?.observe == b.?.observe and
+            a.?.retain_context == b.?.retain_context and
+            a.?.release_context == b.?.release_context;
     }
 
     /// Configure the local hard limit and optional process-wide admission
@@ -5272,6 +5301,7 @@ pub const HfTokenizer = struct {
         if (!sameBpeCacheResourceBudget(cache.resource_budget, config.resource_budget)) {
             const adopted = if (cache.resource_budget == null and config.resource_budget != null) blk: {
                 const budget = config.resource_budget.?;
+                if (!budget.retainContext()) break :blk false;
                 lockBpeCacheMutex(&self.cache_resource_budget_mutex);
                 defer self.cache_resource_budget_mutex.unlock();
                 std.debug.assert(self.cache_resource_budget_bytes == 0);
@@ -5280,8 +5310,10 @@ pub const HfTokenizer = struct {
                     self.cache_resource_budget_observer_id,
                     0,
                     base_bytes,
-                ))
+                )) {
+                    budget.releaseContext();
                     break :blk false;
+                }
                 self.cache_resource_budget_bytes = base_bytes;
                 self.cache_resource_budget = config.resource_budget;
                 break :blk true;
@@ -7112,6 +7144,11 @@ pub const HfTokenizer = struct {
             if (lease.cache) |*cache| cache.deinit(self);
         }
         std.debug.assert(self.cache_resource_budget_bytes == 0);
+        // Drop the capability only after all cache/workspace accounting has
+        // reached zero. This is the final lifetime edge to a shared resource
+        // domain and may destroy that domain.
+        const detached_resource_budget = self.switchResourceBudget(null);
+        std.debug.assert(detached_resource_budget);
         self.unigram_vocab.deinit(allocator);
         self.unigram_trie.deinit(allocator);
         if (self.bpe_direct_trie) |*t| t.deinit(allocator);
@@ -9036,6 +9073,55 @@ test "byte-level BPE parallel encoding preserves serial token order" {
         @as(usize, 0),
         cache_stats.affinity_stolen_chunks,
     );
+}
+
+test "tokenizer retains resource-budget context through physical teardown" {
+    const json_str =
+        \\{
+        \\  "model": {"type": "BPE", "vocab": {"a": 1}, "merges": []},
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
+        \\}
+    ;
+    const Budget = struct {
+        references: usize = 1,
+        used: usize = 0,
+
+        fn retain(context: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.references += 1;
+            return true;
+        }
+
+        fn release(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(self.references > 1);
+            self.references -= 1;
+        }
+
+        fn observe(context: *anyopaque, _: usize, previous: usize, next: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.used != previous) return false;
+            self.used = next;
+            return true;
+        }
+    };
+
+    var budget = Budget{};
+    var tok = try HfTokenizer.loadFromBytes(std.testing.allocator, json_str);
+    try tok.configureBpeCache(.{
+        .resource_budget = .{
+            .context = &budget,
+            .retain_context = Budget.retain,
+            .release_context = Budget.release,
+            .observe = Budget.observe,
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 2), budget.references);
+    try std.testing.expect(budget.used > 0);
+
+    tok.deinitSelf();
+    try std.testing.expectEqual(@as(usize, 1), budget.references);
+    try std.testing.expectEqual(@as(usize, 0), budget.used);
 }
 
 test "worker BPE caches honor external resource-budget denial" {

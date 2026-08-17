@@ -131,6 +131,11 @@ the executor owner and “inference backend runtime descriptor” for the value.
     overflowing, stale-observer, or over-release input retains capacity and
     increments an accounting error counter; it must never erase capacity owned
     by unrelated work.
+11. A resource capability owns its callback context. Admission and tokenizer
+    capabilities are retained when installed and released only after their last
+    lease, observer record, and physical allocation are gone. Configuration
+    fails closed if an external owner cannot provide this lifetime contract.
+    Public policy values such as `NodeConfig` never expose an unowned callback.
 
 ## Budget derivation
 
@@ -207,11 +212,13 @@ same-slice value cannot debit another observer. External ABI boundaries add
 monotonic owner identities to avoid pointer-reuse ambiguity.
 
 Local tokenizer credits remain ordinary `AdmissionLease` values held privately
-inside their ModelManager observer record. Each lease retains its controller,
-backend attribution, and admitted amount; shrinking uses `retain`, while full
-credit release uses the lease itself. There is no public detach or raw-byte
-release API, so a callback cannot reconstruct a release, select another backend
-ledger, or debit accounting owned by another tokenizer.
+inside a ref-counted resource-domain observer record. The domain owns the
+`AdmissionController`, tokenizer ledgers, and upstream capabilities independently
+of `ModelManager`; each lease retains its backend attribution and admitted
+amount. Shrinking uses `retain`, while full credit release uses the lease itself.
+There is no public detach or raw-byte release API, so a callback cannot
+reconstruct a release, select another backend ledger, or debit accounting owned
+by another tokenizer.
 
 Prompt and tokenizer caches both report `(observer identity, previous total,
 next total)`. Each tokenizer serializes only cold allocation, eviction, and
@@ -249,15 +256,25 @@ the observer capability: tokenizer cache geometry remains the policy selected
 by `NodeConfig` or `configureTokenizerCaches`, so attaching process ownership
 cannot silently widen, disable, or otherwise reset cache sizing.
 
-Every managed tokenizer retains a small ref-counted lifetime gate shared with
-its ModelManager. Normal cache transitions enter that gate before touching the
-manager. Shutdown closes it, waits for already-running cold-cache transitions,
-settles transferable tokenizer residency leases, and reconciles every local or
-external observer record to zero while the corresponding owner is still alive.
-The gate then rejects cache growth but accepts teardown decreases without
-dereferencing the destroyed manager. This lets a transferable tokenizer handle
-be destroyed safely after ModelManager or Node shutdown without prolonging the
-manager, leaking admission, or imposing work on the cache-hit path.
+Every tokenizer that adopts a resource capability retains the ref-counted
+resource domain directly; managed tokenizer handles additionally keep their
+model-residency lease in that domain. `ModelManager` shutdown closes new cache
+growth and drops only its own domain reference. It does not settle residency or
+pretend observer totals reached zero while the corresponding memory is still
+live. Existing tokenizers can continue read-only use, and physical teardown
+performs the exact cache decrease and residency-lease release before dropping
+the final capability reference. The last reference asserts empty ledgers,
+detaches the upstream admission bridge, releases both external capability
+contexts, and destroys the controller.
+
+The standalone boundary mirrors the same rule. ABI `ResourceBudget` version 15
+adds retain/release callbacks for its host context. The inference archive copies
+that table into an independently ref-counted context, and its local admission
+and tokenizer capabilities retain that context. The host
+`InferenceResourceBudgetOwner` in turn retains the node `ResourceManager` bridge
+until inference Node destruction has released every lease and observer. This
+keeps the Apache inference package decoupled from storage internals without
+depending on stack/defer ordering or a raw `LinkedInferenceState` pointer.
 
 Observer records remain accounting snapshots rather than raw byte-release
 authority. Local records own ordinary `AdmissionLease` credits; external

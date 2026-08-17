@@ -2178,6 +2178,8 @@ pub fn runFromIterator(
     var inference_resource_budget = inference_bridge.ResourceBudget{
         .abi_version = inference_bridge.abi_version,
         .context = &inference_resource_owner,
+        .retain_context = retainInferenceResourceOwner,
+        .release_context = releaseInferenceResourceOwner,
         .reserve_admission = reserveInferenceResources,
         .retain_admission = retainInferenceResources,
         .release_admission = releaseInferenceResources,
@@ -4859,10 +4861,20 @@ const InferenceResourceBudgetOwner = struct {
     tokenizer_mutex: std.atomic.Mutex = .unlocked,
     tokenizer_cache_observers: std.AutoHashMapUnmanaged(usize, u64) = .empty,
     outstanding_admission_leases: std.atomic.Value(usize) = .init(0),
+    references: std.atomic.Value(usize) = .init(1),
+    closing: std.atomic.Value(bool) = .init(false),
+    lifetime_mutex: std.atomic.Mutex = .unlocked,
 
     fn deinit(self: *@This()) void {
-        std.debug.assert(self.outstanding_admission_leases.load(.acquire) == 0);
-        std.debug.assert(self.active_leases.count() == 0);
+        lockAtomic(&self.lifetime_mutex);
+        defer self.lifetime_mutex.unlock();
+        if (self.closing.swap(true, .acq_rel))
+            @panic("inference resource owner closed twice");
+        if (self.references.load(.acquire) != 1)
+            @panic("inference resource owner closed with retained capability contexts");
+        if (self.outstanding_admission_leases.load(.acquire) != 0 or
+            self.active_leases.count() != 0)
+            @panic("inference resource owner closed with active admission leases");
         self.active_leases.deinit(self.alloc);
         self.active_leases = .empty;
         var current = self.free_leases;
@@ -4871,10 +4883,12 @@ const InferenceResourceBudgetOwner = struct {
             self.alloc.destroy(lease);
         }
         self.free_leases = null;
-        std.debug.assert(self.prompt_cache_observers.count() == 0);
+        if (self.prompt_cache_observers.count() != 0)
+            @panic("inference resource owner closed with prompt cache observers");
         self.prompt_cache_observers.deinit(self.alloc);
         self.prompt_cache_observers = .empty;
-        std.debug.assert(self.tokenizer_cache_observers.count() == 0);
+        if (self.tokenizer_cache_observers.count() != 0)
+            @panic("inference resource owner closed with tokenizer cache observers");
         self.tokenizer_cache_observers.deinit(self.alloc);
         self.tokenizer_cache_observers = .empty;
     }
@@ -5029,6 +5043,29 @@ const InferenceAdmissionLease = struct {
     reservation: antfly.resource_manager.BatchReservation,
     next_free: ?*InferenceAdmissionLease = null,
 };
+
+fn retainInferenceResourceOwner(context: *anyopaque) callconv(.c) u8 {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    lockAtomic(&owner.lifetime_mutex);
+    defer owner.lifetime_mutex.unlock();
+    if (owner.closing.load(.acquire)) return 0;
+    const current = owner.references.load(.acquire);
+    if (current == 0 or current == std.math.maxInt(usize)) return 0;
+    owner.references.store(current + 1, .release);
+    return 1;
+}
+
+fn releaseInferenceResourceOwner(context: *anyopaque) callconv(.c) void {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    lockAtomic(&owner.lifetime_mutex);
+    defer owner.lifetime_mutex.unlock();
+    // The standalone runtime owns the base reference until node destruction
+    // completes; capability consumers may never release that final edge.
+    const current = owner.references.load(.acquire);
+    if (current <= 1)
+        @panic("inference resource capability released its owner's base reference");
+    owner.references.store(current - 1, .release);
+}
 
 fn reserveInferenceResources(
     context: *anyopaque,
@@ -7039,6 +7076,10 @@ test "inference admission bridge charges combined native residency to resource m
         .manager = &manager,
     };
     defer owner.deinit();
+    try std.testing.expectEqual(@as(u8, 1), retainInferenceResourceOwner(&owner));
+    try std.testing.expectEqual(@as(usize, 2), owner.references.load(.acquire));
+    releaseInferenceResourceOwner(&owner);
+    try std.testing.expectEqual(@as(usize, 1), owner.references.load(.acquire));
 
     const oversized = inference_bridge.AdmissionAmounts{
         .host_weight_bytes = 80,

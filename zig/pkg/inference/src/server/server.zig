@@ -2745,6 +2745,8 @@ pub const Node = struct {
     ) !void {
         try self.model_manager.configureTokenizerCaches(config);
         self.config.tokenizer_cache = self.model_manager.tokenizer_cache_config;
+        // NodeConfig is public policy, not an owning runtime capability.
+        self.config.tokenizer_cache.resource_budget = null;
     }
 
     pub fn configureExternalResourceBudgets(
@@ -2757,6 +2759,7 @@ pub const Node = struct {
             tokenizer_budget,
         );
         self.config.tokenizer_cache = self.model_manager.tokenizer_cache_config;
+        self.config.tokenizer_cache.resource_budget = null;
     }
 
     pub fn configureForcedRunAdmissionDenialsForTesting(

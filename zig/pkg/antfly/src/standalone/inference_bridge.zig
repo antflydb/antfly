@@ -20,7 +20,7 @@ const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version: u32 = 14;
+pub const abi_version: u32 = 15;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -109,6 +109,10 @@ pub const ResourceBudget = extern struct {
     abi_version: u32,
     struct_size: u32 = @sizeOf(@This()),
     context: *anyopaque,
+    /// Retain/release the host-owned context across inference component
+    /// lifetimes. Configure fails when the owner is already shutting down.
+    retain_context: *const fn (*anyopaque) callconv(.c) u8,
+    release_context: *const fn (*anyopaque) callconv(.c) void,
     reserve_admission: *const fn (*anyopaque, *const AdmissionAmounts, *usize) callconv(.c) Status,
     retain_admission: *const fn (*anyopaque, usize, *const AdmissionAmounts) callconv(.c) Status,
     release_admission: *const fn (*anyopaque, usize) callconv(.c) void,

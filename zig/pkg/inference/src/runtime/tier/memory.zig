@@ -595,9 +595,26 @@ pub const AdmissionResourceError = error{
 
 pub const AdmissionResourceBudget = struct {
     context: *anyopaque,
+    /// Optional capability-context lifetime. Shared owners must provide both
+    /// hooks so an admission controller can safely outlive its publisher.
+    retain_context: ?*const fn (*anyopaque) bool = null,
+    release_context: ?*const fn (*anyopaque) void = null,
     try_reserve: *const fn (*anyopaque, AdmissionAmounts) AdmissionResourceError!usize,
     retain: *const fn (*anyopaque, usize, AdmissionAmounts) AdmissionResourceError!void,
     release: *const fn (*anyopaque, usize) void,
+
+    pub fn hasValidLifetimeHooks(self: @This()) bool {
+        return (self.retain_context == null) == (self.release_context == null);
+    }
+
+    pub fn retainContext(self: @This()) bool {
+        if (!self.hasValidLifetimeHooks()) return false;
+        return if (self.retain_context) |retain| retain(self.context) else true;
+    }
+
+    pub fn releaseContext(self: @This()) void {
+        if (self.release_context) |release| release(self.context);
+    }
 };
 
 pub const AdmissionRequest = struct {
@@ -708,6 +725,10 @@ pub const AdmissionController = struct {
     /// callers leave this at zero, so normal admission behavior is unchanged.
     forced_run_denials_for_testing: std.atomic.Value(usize) = .init(0),
 
+    pub fn deinit(self: *AdmissionController) void {
+        self.configureResourceBudget(null) catch unreachable;
+    }
+
     pub fn configureForcedRunDenialsForTesting(
         self: *AdmissionController,
         count: usize,
@@ -753,11 +774,23 @@ pub const AdmissionController = struct {
     pub fn configureResourceBudget(
         self: *AdmissionController,
         resource_budget: ?AdmissionResourceBudget,
-    ) void {
+    ) !void {
+        if (resource_budget) |budget| {
+            if (!budget.hasValidLifetimeHooks())
+                return error.InvalidResourceBudgetLifetime;
+            if (!budget.retainContext())
+                return error.ResourceOwnerShuttingDown;
+        }
+        errdefer if (resource_budget) |budget| budget.releaseContext();
         spinLockAdmission(&self.mutex);
-        defer self.mutex.unlock();
-        std.debug.assert(std.meta.eql(self.admitted, AdmissionAmounts{}));
+        if (!std.meta.eql(self.admitted, AdmissionAmounts{})) {
+            self.mutex.unlock();
+            return error.ResourceBudgetInUse;
+        }
+        const previous = self.resource_budget;
         self.resource_budget = resource_budget;
+        self.mutex.unlock();
+        if (previous) |budget| budget.releaseContext();
     }
 
     pub fn tryAcquire(
@@ -3282,6 +3315,19 @@ test "admission lease releases transient construction bytes while retaining resi
 test "admission resource budget mirrors acquire retain and release" {
     const Recorder = struct {
         current: AdmissionAmounts = .{},
+        references: usize = 1,
+
+        fn retainContext(context: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.references += 1;
+            return true;
+        }
+
+        fn releaseContext(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(self.references > 1);
+            self.references -= 1;
+        }
 
         fn reserve(context: *anyopaque, amounts: AdmissionAmounts) AdmissionResourceError!usize {
             const self: *@This() = @ptrCast(@alignCast(context));
@@ -3304,23 +3350,33 @@ test "admission resource budget mirrors acquire retain and release" {
 
     var recorder = Recorder{};
     var controller = AdmissionController{};
-    controller.configureResourceBudget(.{
+    try controller.configureResourceBudget(.{
         .context = &recorder,
+        .retain_context = Recorder.retainContext,
+        .release_context = Recorder.releaseContext,
         .try_reserve = Recorder.reserve,
         .retain = Recorder.retain,
         .release = Recorder.release,
     });
+    try std.testing.expectEqual(@as(usize, 2), recorder.references);
     var lease = try controller.tryAcquire(.cpu, .{}, .{
         .host_weight_bytes = 64,
         .host_scratch_bytes = 32,
     }, false);
     try std.testing.expectEqual(@as(usize, 64), recorder.current.host_weight_bytes);
     try std.testing.expectEqual(@as(usize, 32), recorder.current.host_scratch_bytes);
+    try std.testing.expectError(
+        error.ResourceBudgetInUse,
+        controller.configureResourceBudget(null),
+    );
+    try std.testing.expectEqual(@as(usize, 2), recorder.references);
 
     try lease.retain(.{ .host_weight_bytes = 64 });
     try std.testing.expectEqual(@as(usize, 0), recorder.current.host_scratch_bytes);
     lease.release();
     try std.testing.expectEqual(AdmissionAmounts{}, recorder.current);
+    controller.deinit();
+    try std.testing.expectEqual(@as(usize, 1), recorder.references);
 }
 
 test "estimate reservations can be rolled back transactionally" {

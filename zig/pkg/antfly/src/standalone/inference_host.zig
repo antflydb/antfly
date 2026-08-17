@@ -36,12 +36,57 @@ pub const LinkedInferenceState = struct {
     runtime_config: std.json.Parsed(InferenceRuntimeConfig),
     owned_models_dir: ?[]u8,
     owned_ml_dir: ?[]u8,
-    resource_budget: ?inference_bridge.ResourceBudget = null,
+    resource_budget_context: ?*LinkedResourceBudgetContext = null,
     routes: std.ArrayListUnmanaged(*RouteState) = .empty,
     route_manifest: std.ArrayListUnmanaged(inference_bridge.RouteManifestEntry) = .empty,
     route_validator: httpx.Router,
     route_manifest_mutex: std.atomic.Mutex = .unlocked,
     route_manifest_ready: bool = false,
+};
+
+/// Stable, ref-counted copy of the standalone resource-owner capability. The
+/// inference Node and any tokenizer resource domain may outlive the configure
+/// call and LinkedInferenceState fields, but never this context.
+const LinkedResourceBudgetContext = struct {
+    alloc: std.mem.Allocator,
+    budget: inference_bridge.ResourceBudget,
+    references: std.atomic.Value(usize) = .init(1),
+
+    fn create(
+        alloc: std.mem.Allocator,
+        budget: inference_bridge.ResourceBudget,
+    ) !*@This() {
+        if (budget.retain_context(budget.context) == 0)
+            return error.ResourceOwnerShuttingDown;
+        errdefer budget.release_context(budget.context);
+        const self = try alloc.create(@This());
+        self.* = .{ .alloc = alloc, .budget = budget };
+        return self;
+    }
+
+    fn retain(self: *@This()) bool {
+        var current = self.references.load(.acquire);
+        while (current != 0 and current != std.math.maxInt(usize)) {
+            if (self.references.cmpxchgWeak(
+                current,
+                current + 1,
+                .acq_rel,
+                .acquire,
+            )) |observed| {
+                current = observed;
+            } else return true;
+        }
+        return false;
+    }
+
+    fn release(self: *@This()) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous == 1) {
+            self.budget.release_context(self.budget.context);
+            self.alloc.destroy(self);
+        }
+    }
 };
 
 const InferenceRuntimeConfig = struct {
@@ -313,12 +358,22 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
         context.resource_budget.struct_size,
     ))
         return error.UnsupportedVersion;
-    state.resource_budget = context.resource_budget.*;
-    state.node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(state);
-    try state.node.configureExternalResourceBudgets(
-        inferenceAdmissionResourceBudget(state),
-        tokenizerCacheResourceBudget(state),
+    if (state.resource_budget_context != null)
+        return error.ExternalResourceBudgetsAlreadyConfigured;
+    const resource_context = try LinkedResourceBudgetContext.create(
+        state.alloc,
+        context.resource_budget.*,
     );
+    state.resource_budget_context = resource_context;
+    state.node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(state);
+    state.node.configureExternalResourceBudgets(
+        inferenceAdmissionResourceBudget(resource_context),
+        tokenizerCacheResourceBudget(resource_context),
+    ) catch |err| {
+        state.resource_budget_context = null;
+        resource_context.release();
+        return err;
+    };
     state.node.warmConfiguredModelsBeforeServing(state.alloc) catch |err| {
         std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
         return err;
@@ -698,6 +753,8 @@ pub fn linkedInferenceDestroy(handle: *anyopaque) void {
     const alloc = state.alloc;
     state.node.detachPromptCacheResourceUsageObserver();
     state.node.deinit();
+    if (state.resource_budget_context) |context| context.release();
+    state.resource_budget_context = null;
     for (state.routes.items) |route| alloc.destroy(route);
     state.routes.deinit(alloc);
     state.route_manifest.deinit(alloc);
@@ -719,14 +776,26 @@ fn promptCacheResourceUsageObserver(state: *LinkedInferenceState) inference.runt
 }
 
 fn inferenceAdmissionResourceBudget(
-    state: *LinkedInferenceState,
+    context: *LinkedResourceBudgetContext,
 ) inference.runtime.tier.memory.AdmissionResourceBudget {
     return .{
-        .context = state,
+        .context = context,
+        .retain_context = retainLinkedResourceBudgetContext,
+        .release_context = releaseLinkedResourceBudgetContext,
         .try_reserve = reserveInferenceAdmissionResources,
         .retain = retainInferenceAdmissionResources,
         .release = releaseInferenceAdmissionResources,
     };
+}
+
+fn retainLinkedResourceBudgetContext(context: *anyopaque) bool {
+    const resource_context: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    return resource_context.retain();
+}
+
+fn releaseLinkedResourceBudgetContext(context: *anyopaque) void {
+    const resource_context: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    resource_context.release();
 }
 
 fn bridgeAdmissionAmounts(
@@ -746,8 +815,8 @@ fn reserveInferenceAdmissionResources(
     context: *anyopaque,
     amounts: inference.runtime.tier.memory.AdmissionAmounts,
 ) inference.runtime.tier.memory.AdmissionResourceError!usize {
-    const state: *LinkedInferenceState = @ptrCast(@alignCast(context));
-    const budget = &(state.resource_budget orelse return error.ResourceLimitExceeded);
+    const resource_context: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    const budget = &resource_context.budget;
     const bridged = bridgeAdmissionAmounts(amounts);
     var lease: usize = 0;
     const status = budget.reserve_admission(budget.context, &bridged, &lease);
@@ -765,8 +834,8 @@ fn retainInferenceAdmissionResources(
     lease: usize,
     retained: inference.runtime.tier.memory.AdmissionAmounts,
 ) inference.runtime.tier.memory.AdmissionResourceError!void {
-    const state: *LinkedInferenceState = @ptrCast(@alignCast(context));
-    const budget = &(state.resource_budget orelse return error.ResourceLimitExceeded);
+    const resource_context: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    const budget = &resource_context.budget;
     const bridged = bridgeAdmissionAmounts(retained);
     const status = budget.retain_admission(budget.context, lease, &bridged);
     if (status.isOk()) return;
@@ -779,14 +848,15 @@ fn releaseInferenceAdmissionResources(
     context: *anyopaque,
     lease: usize,
 ) void {
-    const state: *LinkedInferenceState = @ptrCast(@alignCast(context));
-    const budget = &(state.resource_budget orelse return);
+    const resource_context: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    const budget = &resource_context.budget;
     budget.release_admission(budget.context, lease);
 }
 
 fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64) void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context));
-    const budget = &(state.resource_budget orelse return);
+    const resource_context = state.resource_budget_context orelse return;
+    const budget = &resource_context.budget;
     if (budget.observe_prompt_cache(
         budget.context,
         @intFromPtr(current),
@@ -839,10 +909,12 @@ test "standalone prompt cache detaches resource observer before owner teardown" 
 }
 
 fn tokenizerCacheResourceBudget(
-    state: *LinkedInferenceState,
+    context: *LinkedResourceBudgetContext,
 ) inference.hf_tokenizer.HfTokenizer.BpeCacheResourceBudget {
     return .{
-        .context = state,
+        .context = context,
+        .retain_context = retainLinkedResourceBudgetContext,
+        .release_context = releaseLinkedResourceBudgetContext,
         .observe = observeTokenizerCacheBytes,
     };
 }
@@ -853,8 +925,8 @@ fn observeTokenizerCacheBytes(
     previous: usize,
     next: usize,
 ) bool {
-    const state: *LinkedInferenceState = @ptrCast(@alignCast(context));
-    const budget = &(state.resource_budget orelse return false);
+    const resource_context: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    const budget = &resource_context.budget;
     return budget.observe_tokenizer_cache(
         budget.context,
         observer_id,
