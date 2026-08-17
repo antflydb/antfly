@@ -8968,6 +8968,20 @@ pub const ProvisionedTableWriteSource = struct {
         if (indexes_json) |value| configured_indexes_storage = try parseStartupConfiguredIndexes(alloc, value);
         defer if (configured_indexes_storage) |*summary| summary.deinit(alloc);
         const configured_indexes = if (configured_indexes_storage) |*summary| summary else null;
+        if (live_repair_guard) |guard| {
+            // The direct lease transfer below intentionally bypasses generic
+            // cache-open pruning: that path cannot retire an entry while this
+            // guard is proving its lifetime. Preserve the same correctness
+            // fences explicitly before mutating the authoritative writer.
+            try validateProvisionedDbIdentityNamespaceWithPolicy(
+                identity_namespace,
+                metadata.identity_validation,
+                guard.db,
+            );
+            if (!ProvisionedTableWriteCache.entryManagedConfigMatches(guard.entry.?, indexes_json)) {
+                return busy_result;
+            }
+        }
         const opening_db_startup = startupCatchUpStatsForPath(path, .opening_db, configured_indexes) catch db_mod.types.StartupCatchUpStats{
             .active = true,
             .phase = .opening_db,
@@ -8976,26 +8990,35 @@ pub const ProvisionedTableWriteSource = struct {
         // generation. Publishing before the open lets a normal WriterLocked
         // return overwrite a healthy writer observation indefinitely.
         const source_io = self.table_activity_threaded.io();
-        _ = db_mod.DB.recoverIncompleteRestoreImportIfNeededWithIo(alloc, source_io, path, .{}) catch |err| {
-            if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
-            std.log.warn("managed startup restore recovery failed phase=import class={s}", .{@errorName(err)});
-            return err;
-        };
-        const restore_repair_needed = db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, source_io, path) catch |err| {
-            if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
-            std.log.warn("managed startup restore recovery failed phase=repair_probe class={s}", .{@errorName(err)});
-            return err;
-        };
+        if (!use_live_repair_cache) {
+            _ = db_mod.DB.recoverIncompleteRestoreImportIfNeededWithIo(alloc, source_io, path, .{}) catch |err| {
+                if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
+                std.log.warn("managed startup restore recovery failed phase=import class={s}", .{@errorName(err)});
+                return err;
+            };
+        }
+        const restore_repair_needed = if (live_repair_guard) |guard|
+            guard.db.restoreRuntimeRepairNeeded() catch |err| {
+                std.log.warn("managed startup restore recovery failed phase=live_repair_probe class={s}", .{@errorName(err)});
+                return err;
+            }
+        else
+            db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, source_io, path) catch |err| {
+                if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
+                std.log.warn("managed startup restore recovery failed phase=repair_probe class={s}", .{@errorName(err)});
+                return err;
+            };
         const startup_open_mode: ManagedDbOpenMode = if (restore_repair_needed) .restore_repair else .startup_catch_up;
         // A provisioned writer is the generation owner. Index repair leases
         // that owner instead of opening a second DB over the same path; cold
         // startup recovery retains its dedicated short-lived cache.
-        const startup_cache = if (use_live_repair_cache) self.write_cache else self.startup_write_cache;
+        const startup_cache = if (use_live_repair_cache) null else self.startup_write_cache;
         var cached_db: ?ProvisionedTableWriteCache.CachedDb = null;
         defer if (cached_db) |*cached| cached.deinit(alloc);
         var uncached_db: ?db_mod.DB = null;
         var uncached_promotion_owner_state: ProvisionedTableWriteCache.PromotionOwnerState = .{};
         const db = db_blk: {
+            if (live_repair_guard) |guard| break :db_blk guard.db;
             if (startup_cache) |cache| {
                 cached_db = self.getOrOpenCachedDbModeWithMetadata(alloc, cache, path, group_id, table_name, startup_open_mode, null, null, .{
                     .indexes_json = indexes_json,
@@ -9099,8 +9122,8 @@ pub const ProvisionedTableWriteSource = struct {
             db,
             configured_indexes,
         ));
-        if (metadata.advance_index_repairs and cached_db != null) {
-            // The cache lease keeps the DB/root alive across retirement, while
+        if (metadata.advance_index_repairs and use_live_repair_cache) {
+            // The repair lease keeps the authoritative DB/root alive, while
             // the activation callback fences leadership and root generation.
             // Releasing this broad lifecycle guard prevents a multi-minute
             // corpus scan from head-of-line blocking unrelated group work.
@@ -9114,6 +9137,7 @@ pub const ProvisionedTableWriteSource = struct {
             table_name,
             db,
             metadata.advance_index_repairs,
+            if (use_live_repair_cache) .live_writer else .isolated,
             metadata.index_repair_options,
         );
         self.retireReadersAfterIndexRepairCompletion(table_name, result);
@@ -20989,6 +21013,11 @@ fn finishManagedMaintenanceStatusPublication(publication: anyerror!void) !void {
     };
 }
 
+const ManagedCatchUpOwner = enum {
+    isolated,
+    live_writer,
+};
+
 fn catchUpManagedDb(
     source: *ProvisionedTableWriteSource,
     alloc: std.mem.Allocator,
@@ -20996,6 +21025,7 @@ fn catchUpManagedDb(
     table_name: []const u8,
     db: *db_mod.DB,
     advance_index_repairs: bool,
+    owner: ManagedCatchUpOwner,
     index_repair_options: db_mod.types.ArtifactRepairRunOptions,
 ) !ProvisionedTableWriteSource.StartupCatchUpResult {
     const max_startup_catch_up_replay_passes: usize = 16;
@@ -21078,11 +21108,16 @@ fn catchUpManagedDb(
     var degraded_indexes: usize = 0;
     var made_progress = false;
     defer if (made_progress) {
-        // Only retire shared handles after this isolated owner changed durable
-        // state. Zero-progress retries must keep their cached owner so the next
-        // observation cannot reopen and rebuild the same DB from scratch.
+        // Readers must reopen after any durable visibility change. A repair
+        // that leased the live writer has already changed that authoritative
+        // in-memory owner, however, so retiring it would turn the next bounded
+        // quantum into a cold, read-exclusive reopen. Keep that writer both to
+        // avoid repeated open/replay work and to let queued repair progress
+        // while status continues reading the immutable published generation.
+        // Isolated startup owners still retire shared write handles so no
+        // independently cached writer can survive their durable mutation.
         source.invalidateReadCache(table_name);
-        source.invalidateWriteCacheForTable(table_name);
+        if (owner == .isolated) source.invalidateWriteCacheForTable(table_name);
         source.clearDirtyWriteTable(table_name);
     };
     if (restore_repair_needed) {
@@ -31752,6 +31787,9 @@ test "structural reconcile publishes durable index repair debt once per group" {
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
     defer alloc.free(path);
     const namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+    const indexes_json =
+        \\{"full_text_index_v1":{"type":"full_text"},"full_text_index_v2":{"type":"full_text"}}
+    ;
     {
         var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = namespace });
         defer db.close();
@@ -31775,7 +31813,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 7,
                     .name = "docs",
-                    .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+                    .indexes_json = indexes_json,
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
                     .group_id = 7001,
@@ -31856,7 +31894,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
     defer rebuilding.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), rebuilding.items.len);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.catching_up, rebuilding.items[0].metadata.freshness);
-    try std.testing.expectEqual(@as(usize, 1), rebuilding.items[0].stats.indexes.len);
+    try std.testing.expectEqual(@as(usize, 2), rebuilding.items[0].stats.indexes.len);
     try std.testing.expect(rebuilding.items[0].stats.indexes[0].index_repair_id != null);
     try std.testing.expectEqual(
         runtime_status.TableRuntimeSnapshotCache.PublishResult.stale_table,
@@ -31875,21 +31913,24 @@ test "structural reconcile publishes durable index repair debt once per group" {
 
     var attempted_repair = false;
     var repaired = false;
+    var repair_passes: usize = 0;
     {
         source.beginStatusRequest("docs");
         defer source.endReadRequest("docs");
         for (0..16) |_| {
             const repair = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
-                .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+                .indexes_json = indexes_json,
                 .identity_namespace = namespace,
                 .advance_index_repairs = true,
             });
             try std.testing.expect(!repair.busy);
+            repair_passes += 1;
             attempted_repair = attempted_repair or repair.index_repair_attempted;
             repaired = repaired or repair.index_repair_repaired;
             if (!repair.index_repair_pending) break;
         }
     }
+    try std.testing.expect(repair_passes >= 2);
     try std.testing.expect(attempted_repair);
     try std.testing.expect(repaired);
 
@@ -37145,7 +37186,7 @@ test "managed startup catch-up repeats replay while dense debt progresses" {
     });
     defer startup_db.close();
 
-    const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &startup_db, false, .{});
+    const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &startup_db, false, .isolated, .{});
     try std.testing.expect(!result.busy);
     try std.testing.expect(result.had_debt);
     try std.testing.expect(result.cleared_debt);
@@ -39002,7 +39043,7 @@ test "managed startup catch-up advances counterless incomplete dense repair" {
     try std.testing.expectEqualStrings("IncompleteBulkPublish", managed_db.core.index_manager.loadFailure("dense_idx").?);
 
     var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
-    const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &managed_db, true, .{});
+    const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &managed_db, true, .isolated, .{});
     try std.testing.expect(!result.busy);
     try std.testing.expect(!result.terminal_degraded);
     try std.testing.expect(result.had_debt);
