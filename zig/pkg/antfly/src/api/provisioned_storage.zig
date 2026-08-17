@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
-const builtin = @import("builtin");
+const process_memory = @import("antfly_platform").process_memory;
 const hbc_mod = @import("../storage/hbc_adapter.zig");
 const background_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
@@ -73,25 +73,6 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
-fn readMemoryLimitFile(path: []const u8) ?u64 {
-    if (builtin.os.tag == .freestanding) return null;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-
-    var file = std.Io.Dir.openFileAbsolute(io_impl.io(), path, .{}) catch return null;
-    defer file.close(io_impl.io());
-
-    var reader_buf: [128]u8 = undefined;
-    var reader = file.reader(io_impl.io(), &reader_buf);
-    var value_buf: [128]u8 = undefined;
-    const n = reader.interface.readSliceShort(&value_buf) catch return null;
-    const raw = std.mem.trim(u8, value_buf[0..n], " \t\r\n");
-    if (raw.len == 0 or std.mem.eql(u8, raw, "max")) return null;
-    const value = std.fmt.parseUnsigned(u64, raw, 10) catch return null;
-    if (value == 0 or value > (1 << 60)) return null;
-    return value;
-}
-
 pub const MemoryLimitSource = enum {
     explicit,
     cgroup_v2,
@@ -124,15 +105,16 @@ fn resolveEffectiveMemoryLimit(
 }
 
 fn detectedMemoryLimit() ?DetectedMemoryLimit {
-    if (builtin.os.tag == .linux) {
-        if (readMemoryLimitFile("/sys/fs/cgroup/memory.max")) |limit|
-            return .{ .bytes = limit, .source = .cgroup_v2 };
-        if (readMemoryLimitFile("/sys/fs/cgroup/memory/memory.limit_in_bytes")) |limit|
-            return .{ .bytes = limit, .source = .cgroup_v1 };
-    }
+    const envelope = process_memory.systemEnvelope();
+    if (envelope.limit_bytes == 0) return null;
     return .{
-        .bytes = std.process.totalSystemMemory() catch return null,
-        .source = .host,
+        .bytes = envelope.limit_bytes,
+        .source = switch (envelope.source) {
+            .cgroup_v2 => .cgroup_v2,
+            .cgroup_v1 => .cgroup_v1,
+            .host => .host,
+            .unavailable => .unavailable,
+        },
     };
 }
 
@@ -178,6 +160,26 @@ fn smartResourceBudgets(process_memory_limit_bytes: usize) SmartResourceBudgets 
     var budgets = smartResourceBudgetsForTotal(effective.bytes);
     budgets.effective_memory_limit_bytes = effective.bytes;
     budgets.memory_limit_source = effective.source;
+    return budgets;
+}
+
+fn smartResourceBudgetsResolved(
+    process_memory_limit_bytes: usize,
+    source: MemoryLimitSource,
+) SmartResourceBudgets {
+    if (process_memory_limit_bytes == 0) {
+        const lsm_cache_budget = lsm_backend.DefaultCacheSizeBytes;
+        var options = resource_manager_mod.Options{};
+        options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, @intCast(lsm_cache_budget));
+        return .{
+            .options = options,
+            .lsm_cache_budget_bytes = lsm_cache_budget,
+            .memory_limit_source = source,
+        };
+    }
+    var budgets = smartResourceBudgetsForTotal(@intCast(process_memory_limit_bytes));
+    budgets.effective_memory_limit_bytes = @intCast(process_memory_limit_bytes);
+    budgets.memory_limit_source = source;
     return budgets;
 }
 
@@ -267,10 +269,23 @@ pub const ProvisionedGroupStorage = struct {
         alloc: std.mem.Allocator,
         process_memory_limit_bytes: usize,
     ) ProvisionedGroupStorage {
-        const budgets = smartResourceBudgets(process_memory_limit_bytes);
+        return initWithProcessMemoryPolicy(alloc, process_memory_limit_bytes, null);
+    }
+
+    pub fn initWithProcessMemoryPolicy(
+        alloc: std.mem.Allocator,
+        process_memory_limit_bytes: usize,
+        resolved_source: ?MemoryLimitSource,
+    ) ProvisionedGroupStorage {
+        const budgets = if (resolved_source) |source|
+            smartResourceBudgetsResolved(process_memory_limit_bytes, source)
+        else
+            smartResourceBudgets(process_memory_limit_bytes);
+        var manager_options = budgets.options;
+        manager_options.identity_allocator = alloc;
         return .{
             .alloc = alloc,
-            .resource_manager = resource_manager_mod.ResourceManager.init(budgets.options),
+            .resource_manager = resource_manager_mod.ResourceManager.init(manager_options),
             .effective_memory_limit_bytes = budgets.effective_memory_limit_bytes,
             .memory_limit_source = budgets.memory_limit_source,
             .lsm_cache = lsm_backend.Cache.init(alloc, budgets.lsm_cache_budget_bytes),

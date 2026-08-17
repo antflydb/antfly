@@ -841,21 +841,24 @@ fn tokenizerCacheResourceBudget(
 ) inference.hf_tokenizer.HfTokenizer.BpeCacheResourceBudget {
     return .{
         .context = state,
-        .try_reserve = reserveTokenizerCacheBytes,
-        .release = releaseTokenizerCacheBytes,
+        .observe = observeTokenizerCacheBytes,
     };
 }
 
-fn reserveTokenizerCacheBytes(context: *anyopaque, bytes: usize) bool {
+fn observeTokenizerCacheBytes(
+    context: *anyopaque,
+    observer_id: usize,
+    previous: usize,
+    next: usize,
+) bool {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context));
     const budget = &(state.resource_budget orelse return false);
-    return budget.reserve_tokenizer_cache(budget.context, bytes) != 0;
-}
-
-fn releaseTokenizerCacheBytes(context: *anyopaque, bytes: usize) void {
-    const state: *LinkedInferenceState = @ptrCast(@alignCast(context));
-    const budget = &(state.resource_budget orelse return);
-    budget.release_tokenizer_cache(budget.context, bytes);
+    return budget.observe_tokenizer_cache(
+        budget.context,
+        observer_id,
+        @intCast(previous),
+        @intCast(next),
+    ) != 0;
 }
 
 fn localAntflyEmbedDenseTexts(

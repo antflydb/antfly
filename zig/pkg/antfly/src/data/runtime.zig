@@ -2791,6 +2791,10 @@ pub const DataServerConfig = struct {
     /// Optional operator-owned envelope for all host memory in this process.
     /// Zero auto-detects the cgroup or host limit.
     process_memory_limit_bytes: usize = 0,
+    /// Present when startup has already resolved the shared process envelope.
+    /// This prevents independently composed managers from probing different
+    /// cgroup views or sizing from different host values.
+    process_memory_limit_source: ?antfly.public_api.MemoryLimitSource = null,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
     ha: DataServerHAConfig = .{},
@@ -4519,9 +4523,10 @@ pub const DataServer = struct {
             .store_registration = cfg.store_registration,
             .group_leadership_source = cfg.group_leadership_source,
             .group_membership_source = cfg.group_membership_source,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryLimit(
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
                 alloc,
                 cfg.process_memory_limit_bytes,
+                cfg.process_memory_limit_source,
             ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
@@ -4560,9 +4565,10 @@ pub const DataServer = struct {
             .group_leadership_source = cfg.group_leadership_source orelse GroupLeadershipSource.fromManagedHostService(&svc.raft),
             .group_membership_source = cfg.group_membership_source orelse GroupMembershipSource.fromManagedHostService(&svc.raft),
             .local_transition_runtime = svc.raft.local_transition_runtime,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryLimit(
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
                 alloc,
                 cfg.process_memory_limit_bytes,
+                cfg.process_memory_limit_source,
             ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
@@ -4601,9 +4607,10 @@ pub const DataServer = struct {
             .group_leadership_source = cfg.group_leadership_source orelse GroupLeadershipSource.fromManagedHttpHostService(&svc.raft),
             .group_membership_source = cfg.group_membership_source orelse GroupMembershipSource.fromManagedHttpHostService(&svc.raft),
             .local_transition_runtime = svc.raft.local_transition_runtime,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryLimit(
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
                 alloc,
                 cfg.process_memory_limit_bytes,
+                cfg.process_memory_limit_source,
             ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
@@ -13467,9 +13474,10 @@ pub const DataServer = struct {
             .group_leadership_source = cfg.group_leadership_source orelse if (data_raft) |raft| GroupLeadershipSource.fromManagedHttpHostService(raft) else null,
             .group_membership_source = cfg.group_membership_source orelse if (data_raft) |raft| GroupMembershipSource.fromManagedHttpHostService(raft) else null,
             .local_transition_runtime = if (data_raft) |raft| raft.local_transition_runtime else null,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryLimit(
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
                 alloc,
                 cfg.process_memory_limit_bytes,
+                cfg.process_memory_limit_source,
             ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
@@ -16293,6 +16301,18 @@ fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }
 
+fn storageMemoryLimitSource(
+    source: process_memory_budget.EffectiveSource,
+) antfly.public_api.MemoryLimitSource {
+    return switch (source) {
+        .explicit => .explicit,
+        .cgroup_v2 => .cgroup_v2,
+        .cgroup_v1 => .cgroup_v1,
+        .host => .host,
+        .unavailable => .unavailable,
+    };
+}
+
 pub fn run(init: std.process.Init) !void {
     const alloc = init.gpa;
 
@@ -16323,7 +16343,7 @@ pub fn runFromIterator(
         cli.raft_tick_ms,
         cli.control_tick_ms,
     ) catch return error.InvalidArguments;
-    const process_memory_resolution = process_memory_budget.resolveDetailed(
+    const process_memory_resolution = process_memory_budget.resolveSystemDetailed(
         cli.process_memory_budget_mb,
         init.environ_map.get(process_memory_budget.canonical_env),
         null,
@@ -16448,6 +16468,7 @@ pub fn runFromIterator(
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
         .process_memory_limit_bytes = process_memory_limit_bytes,
+        .process_memory_limit_source = storageMemoryLimitSource(process_memory_resolution.effective_source),
         .store_registration = if (cli.node_id != null and cli.store_id != null) .{
             .node_id = cli.node_id.?,
             .store_id = cli.store_id.?,
@@ -16481,8 +16502,8 @@ pub fn runFromIterator(
         "process memory policy operator_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} managed_hard_limit_bytes={d}",
         .{
             @tagName(process_memory_resolution.source),
-            @tagName(data_server.provisioned_storage.memory_limit_source),
-            process_memory_limit_bytes,
+            @tagName(process_memory_resolution.effective_source),
+            process_memory_resolution.configured_limit_bytes,
             data_server.provisioned_storage.effective_memory_limit_bytes,
             managed_memory.hard_limit_bytes,
         },

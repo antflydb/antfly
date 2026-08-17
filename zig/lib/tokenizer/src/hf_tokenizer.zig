@@ -86,6 +86,9 @@ pub const HfTokenizer = struct {
     parallel_workspace_free_bytes: usize,
     parallel_bpe_config: ParallelBpeConfig,
     worker_bpe_caches: [max_worker_bpe_caches]WorkerBpeCacheLease,
+    cache_resource_budget_mutex: std.atomic.Mutex,
+    cache_resource_budget_observer_id: usize,
+    cache_resource_budget_bytes: usize,
     cache_resource_budget: ?BpeCacheResourceBudget,
     end_of_word_suffix: []const u8,
     byte_fallback: bool,
@@ -141,6 +144,14 @@ pub const HfTokenizer = struct {
     const worker_bpe_spill_count_max = std.math.maxInt(u16);
     const worker_bpe_initial_arena_ids = 4096;
     const max_prefix_commits_per_lock = 8;
+    var next_cache_resource_budget_observer_id: std.atomic.Value(usize) = .init(1);
+
+    fn acquireCacheResourceBudgetObserverId() usize {
+        while (true) {
+            const candidate = next_cache_resource_budget_observer_id.fetchAdd(1, .monotonic);
+            if (candidate != 0) return candidate;
+        }
+    }
 
     /// Gigatoken-style private cache entry. The key contains up to fifteen
     /// pretoken bytes and an eight-bit length tag. `value` contains one to
@@ -188,9 +199,7 @@ pub const HfTokenizer = struct {
                     } else unreachable;
                 },
             }
-            if (owner.cache_resource_budget) |budget| {
-                budget.release(budget.context, self.accounted_bytes);
-            }
+            owner.releaseResourceBudgetBytes(self.accounted_bytes);
             self.* = undefined;
         }
     };
@@ -328,6 +337,7 @@ pub const HfTokenizer = struct {
     };
 
     const BpeCache = struct {
+        owner: *HfTokenizer,
         shards: [bpe_cache_shard_count]BpeCacheShard =
             [_]BpeCacheShard{.{}} ** bpe_cache_shard_count,
         max_bytes: usize = default_bpe_cache_max_bytes,
@@ -349,8 +359,15 @@ pub const HfTokenizer = struct {
 
     pub const BpeCacheResourceBudget = struct {
         context: *anyopaque,
-        try_reserve: *const fn (context: *anyopaque, bytes: usize) bool,
-        release: *const fn (context: *anyopaque, bytes: usize) void,
+        /// Observe the total bytes owned by one stable tokenizer identity.
+        /// The receiver must reject stale `previous` values. This makes
+        /// duplicate releases fail closed instead of debiting another owner.
+        observe: *const fn (
+            context: *anyopaque,
+            observer_id: usize,
+            previous: usize,
+            next: usize,
+        ) bool,
     };
 
     pub const BpeCacheConfig = struct {
@@ -759,6 +776,9 @@ pub const HfTokenizer = struct {
             .parallel_workspace_free_bytes = 0,
             .parallel_bpe_config = .{},
             .worker_bpe_caches = [_]WorkerBpeCacheLease{.{}} ** max_worker_bpe_caches,
+            .cache_resource_budget_mutex = .unlocked,
+            .cache_resource_budget_observer_id = acquireCacheResourceBudgetObserverId(),
+            .cache_resource_budget_bytes = 0,
             .cache_resource_budget = null,
             .end_of_word_suffix = "",
             .byte_fallback = false,
@@ -787,7 +807,7 @@ pub const HfTokenizer = struct {
             // tokenization remain available when process memory pressure
             // prevents allocating its fixed table.
             if (allocator.create(BpeCache)) |cache| {
-                cache.* = .{};
+                cache.* = .{ .owner = self };
                 cache.used_bytes.store(@sizeOf(BpeCache), .monotonic);
                 self.bpe_cache = cache;
             } else |_| {}
@@ -1538,21 +1558,13 @@ pub const HfTokenizer = struct {
             added_capacity,
             @sizeOf(i32),
         ) catch return false;
-        var reserved = false;
-        if (self.cache_resource_budget) |budget| {
-            if (!budget.try_reserve(budget.context, added_bytes)) {
-                return false;
-            }
-            reserved = true;
-        }
+        const reserved = self.cache_resource_budget != null;
+        if (!self.tryReserveResourceBudgetBytes(added_bytes)) return false;
         cache.token_arena.ensureTotalCapacityPrecise(
             self.allocator,
             target_capacity,
         ) catch {
-            if (reserved) {
-                const budget = self.cache_resource_budget.?;
-                budget.release(budget.context, added_bytes);
-            }
+            if (reserved) self.releaseResourceBudgetBytes(added_bytes);
             return false;
         };
         cache.accounted_bytes += added_bytes;
@@ -1822,19 +1834,16 @@ pub const HfTokenizer = struct {
             lease.allocation_failed = true;
             return false;
         };
-        var reserved = false;
-        if (self.cache_resource_budget) |budget| {
-            if (!budget.try_reserve(budget.context, bytes)) {
-                lease.reservation_denials +|= 1;
-                const shift: u3 = @intCast(@min(
-                    lease.reservation_denials - 1,
-                    6,
-                ));
-                lease.reservation_retry_after =
-                    @as(u8, 1) << shift;
-                return false;
-            }
-            reserved = true;
+        const reserved = self.cache_resource_budget != null;
+        if (!self.tryReserveResourceBudgetBytes(bytes)) {
+            lease.reservation_denials +|= 1;
+            const shift: u3 = @intCast(@min(
+                lease.reservation_denials - 1,
+                6,
+            ));
+            lease.reservation_retry_after =
+                @as(u8, 1) << shift;
+            return false;
         }
         lease.reservation_denials = 0;
         lease.reservation_retry_after = 0;
@@ -1842,10 +1851,7 @@ pub const HfTokenizer = struct {
             slot_count,
             bytes,
         ) catch {
-            if (reserved) {
-                const budget = self.cache_resource_budget.?;
-                budget.release(budget.context, bytes);
-            }
+            if (reserved) self.releaseResourceBudgetBytes(bytes);
             // Repeated multi-megabyte allocator attempts under OOM can amplify
             // pressure. Resource-budget denials above remain retryable, while
             // an admitted allocation failure is terminal for this lease.
@@ -2426,14 +2432,7 @@ pub const HfTokenizer = struct {
         }
         const resource_accounted_bytes =
             workspace.resource_accounted_bytes.swap(0, .acq_rel);
-        if (resource_accounted_bytes != 0) {
-            if (self.cache_resource_budget) |budget| {
-                budget.release(
-                    budget.context,
-                    resource_accounted_bytes,
-                );
-            }
-        }
+        self.releaseResourceBudgetBytes(resource_accounted_bytes);
         for (&workspace.workers) |*worker| {
             worker.ids.deinit(self.allocator);
             worker.ids_u16.deinit(self.allocator);
@@ -2482,13 +2481,13 @@ pub const HfTokenizer = struct {
             retained_bytes <=
             self.parallel_bpe_config.max_retained_workspace_bytes;
         if (cacheable) {
-            if (self.cache_resource_budget) |budget| {
+            if (self.cache_resource_budget != null) {
                 const accounted_bytes =
                     workspace.resource_accounted_bytes.load(.acquire);
                 if (retained_bytes > accounted_bytes) {
                     const additional =
                         retained_bytes - accounted_bytes;
-                    if (budget.try_reserve(budget.context, additional)) {
+                    if (self.tryReserveResourceBudgetBytes(additional)) {
                         workspace.resource_accounted_bytes.store(
                             retained_bytes,
                             .release,
@@ -2497,10 +2496,7 @@ pub const HfTokenizer = struct {
                         cacheable = false;
                     }
                 } else if (retained_bytes < accounted_bytes) {
-                    budget.release(
-                        budget.context,
-                        accounted_bytes - retained_bytes,
-                    );
+                    self.releaseResourceBudgetBytes(accounted_bytes - retained_bytes);
                     workspace.resource_accounted_bytes.store(
                         retained_bytes,
                         .release,
@@ -3056,11 +3052,8 @@ pub const HfTokenizer = struct {
                 }
             }
             if (additional_bytes != 0) {
-                if (self.cache_resource_budget) |budget| {
-                    if (budget.try_reserve(
-                        budget.context,
-                        additional_bytes,
-                    )) {
+                if (self.cache_resource_budget != null) {
+                    if (self.tryReserveResourceBudgetBytes(additional_bytes)) {
                         _ = workspace.resource_accounted_bytes.fetchAdd(
                             additional_bytes,
                             .acq_rel,
@@ -5146,14 +5139,99 @@ pub const HfTokenizer = struct {
         while (!mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
+    fn tryReserveResourceBudgetBytes(self: *HfTokenizer, bytes: usize) bool {
+        if (bytes == 0) return true;
+        const budget = self.cache_resource_budget orelse return true;
+        lockBpeCacheMutex(&self.cache_resource_budget_mutex);
+        defer self.cache_resource_budget_mutex.unlock();
+        const previous = self.cache_resource_budget_bytes;
+        const next = std.math.add(usize, previous, bytes) catch return false;
+        if (!budget.observe(
+            budget.context,
+            self.cache_resource_budget_observer_id,
+            previous,
+            next,
+        ))
+            return false;
+        self.cache_resource_budget_bytes = next;
+        return true;
+    }
+
+    fn releaseResourceBudgetBytes(self: *HfTokenizer, bytes: usize) void {
+        if (bytes == 0 or self.cache_resource_budget == null) return;
+        const budget = self.cache_resource_budget.?;
+        lockBpeCacheMutex(&self.cache_resource_budget_mutex);
+        defer self.cache_resource_budget_mutex.unlock();
+        const previous = self.cache_resource_budget_bytes;
+        if (bytes > previous) {
+            std.debug.assert(false);
+            return;
+        }
+        const next = previous - bytes;
+        if (!budget.observe(
+            budget.context,
+            self.cache_resource_budget_observer_id,
+            previous,
+            next,
+        )) {
+            std.debug.assert(false);
+            return;
+        }
+        self.cache_resource_budget_bytes = next;
+    }
+
+    fn switchResourceBudget(
+        self: *HfTokenizer,
+        next_budget: ?BpeCacheResourceBudget,
+    ) bool {
+        const previous_budget = self.cache_resource_budget;
+        if (sameBpeCacheResourceBudget(previous_budget, next_budget)) return true;
+        lockBpeCacheMutex(&self.cache_resource_budget_mutex);
+        defer self.cache_resource_budget_mutex.unlock();
+        const bytes = self.cache_resource_budget_bytes;
+        if (next_budget) |budget| {
+            if (bytes != 0 and
+                !budget.observe(
+                    budget.context,
+                    self.cache_resource_budget_observer_id,
+                    0,
+                    bytes,
+                ))
+                return false;
+        }
+        if (previous_budget) |budget| {
+            if (bytes != 0 and
+                !budget.observe(
+                    budget.context,
+                    self.cache_resource_budget_observer_id,
+                    bytes,
+                    0,
+                ))
+            {
+                if (next_budget) |next| {
+                    if (bytes != 0)
+                        _ = next.observe(
+                            next.context,
+                            self.cache_resource_budget_observer_id,
+                            bytes,
+                            0,
+                        );
+                }
+                return false;
+            }
+        }
+        self.cache_resource_budget = next_budget;
+        if (next_budget == null) self.cache_resource_budget_bytes = 0;
+        return true;
+    }
+
     fn sameBpeCacheResourceBudget(
         a: ?BpeCacheResourceBudget,
         b: ?BpeCacheResourceBudget,
     ) bool {
         if (a == null or b == null) return a == null and b == null;
         return a.?.context == b.?.context and
-            a.?.try_reserve == b.?.try_reserve and
-            a.?.release == b.?.release;
+            a.?.observe == b.?.observe;
     }
 
     /// Configure the local hard limit and optional process-wide admission
@@ -5171,7 +5249,7 @@ pub const HfTokenizer = struct {
             // Parallel BPE remains available when the optional fixed cache
             // table could not be allocated. Its retained workspaces still
             // participate in the caller's process-wide resource budget.
-            self.cache_resource_budget = config.resource_budget;
+            _ = self.switchResourceBudget(config.resource_budget);
             return;
         };
         if (cache.bulk_slots != null) return error.BpeCacheAlreadyConfigured;
@@ -5185,32 +5263,42 @@ pub const HfTokenizer = struct {
 
         const base_bytes = cache.used_bytes.load(.acquire);
         if (config.max_bytes < base_bytes) {
-            if (cache.resource_budget) |old_budget| {
-                old_budget.release(old_budget.context, base_bytes);
-            }
+            self.releaseResourceBudgetBytes(base_bytes);
             self.allocator.destroy(cache);
             self.bpe_cache = null;
-            self.cache_resource_budget = config.resource_budget;
+            _ = self.switchResourceBudget(config.resource_budget);
             return;
         }
         if (!sameBpeCacheResourceBudget(cache.resource_budget, config.resource_budget)) {
-            if (config.resource_budget) |budget| {
-                if (!budget.try_reserve(budget.context, base_bytes)) {
-                    if (cache.resource_budget) |old_budget| {
-                        old_budget.release(old_budget.context, base_bytes);
-                    }
-                    self.allocator.destroy(cache);
-                    self.bpe_cache = null;
-                    self.cache_resource_budget = config.resource_budget;
-                    return;
-                }
-            }
-            if (cache.resource_budget) |old_budget| {
-                old_budget.release(old_budget.context, base_bytes);
+            const adopted = if (cache.resource_budget == null and config.resource_budget != null) blk: {
+                const budget = config.resource_budget.?;
+                lockBpeCacheMutex(&self.cache_resource_budget_mutex);
+                defer self.cache_resource_budget_mutex.unlock();
+                std.debug.assert(self.cache_resource_budget_bytes == 0);
+                if (!budget.observe(
+                    budget.context,
+                    self.cache_resource_budget_observer_id,
+                    0,
+                    base_bytes,
+                ))
+                    break :blk false;
+                self.cache_resource_budget_bytes = base_bytes;
+                self.cache_resource_budget = config.resource_budget;
+                break :blk true;
+            } else self.switchResourceBudget(config.resource_budget);
+            if (!adopted) {
+                self.releaseResourceBudgetBytes(base_bytes);
+                self.allocator.destroy(cache);
+                self.bpe_cache = null;
+                _ = self.switchResourceBudget(config.resource_budget);
+                return;
             }
             cache.resource_budget = config.resource_budget;
         }
-        self.cache_resource_budget = config.resource_budget;
+        std.debug.assert(sameBpeCacheResourceBudget(
+            self.cache_resource_budget,
+            config.resource_budget,
+        ));
         cache.max_bytes = config.max_bytes;
 
         if (config.bulk_slots_per_shard != 0) {
@@ -5538,21 +5626,17 @@ pub const HfTokenizer = struct {
                 .acquire,
             ) orelse break;
         }
-        if (cache.resource_budget) |budget| {
-            if (!budget.try_reserve(budget.context, bytes)) {
-                _ = cache.used_bytes.fetchSub(bytes, .acq_rel);
-                _ = cache.rejected_reservations.fetchAdd(1, .monotonic);
-                return false;
-            }
+        if (!cache.owner.tryReserveResourceBudgetBytes(bytes)) {
+            _ = cache.used_bytes.fetchSub(bytes, .acq_rel);
+            _ = cache.rejected_reservations.fetchAdd(1, .monotonic);
+            return false;
         }
         return true;
     }
 
     fn releaseBpeCacheBytes(cache: *BpeCache, bytes: usize) void {
         if (bytes == 0) return;
-        if (cache.resource_budget) |budget| {
-            budget.release(budget.context, bytes);
-        }
+        cache.owner.releaseResourceBudgetBytes(bytes);
         const previous = cache.used_bytes.fetchSub(bytes, .acq_rel);
         std.debug.assert(previous >= bytes);
     }
@@ -7014,9 +7098,7 @@ pub const HfTokenizer = struct {
                 allocator.destroy(entry);
                 retired = next;
             }
-            if (cache.resource_budget) |budget| {
-                budget.release(budget.context, accounted_bytes);
-            }
+            self.releaseResourceBudgetBytes(accounted_bytes);
             allocator.destroy(cache);
         }
         if (self.byte_level_direct_ids) |direct_ids| allocator.destroy(direct_ids);
@@ -7029,6 +7111,7 @@ pub const HfTokenizer = struct {
         for (&self.worker_bpe_caches) |*lease| {
             if (lease.cache) |*cache| cache.deinit(self);
         }
+        std.debug.assert(self.cache_resource_budget_bytes == 0);
         self.unigram_vocab.deinit(allocator);
         self.unigram_trie.deinit(allocator);
         if (self.bpe_direct_trie) |*t| t.deinit(allocator);
@@ -8972,25 +9055,20 @@ test "worker BPE caches honor external resource-budget denial" {
         used: std.atomic.Value(usize) = .init(0),
         denials: std.atomic.Value(usize) = .init(0),
 
-        fn tryReserve(context: *anyopaque, bytes: usize) bool {
+        fn observe(context: *anyopaque, _: usize, previous: usize, next: usize) bool {
             const self: *@This() = @ptrCast(@alignCast(context));
-            var used = self.used.load(.acquire);
-            while (used <= self.limit and bytes <= self.limit - used) {
-                used = self.used.cmpxchgWeak(
-                    used,
-                    used + bytes,
-                    .acq_rel,
-                    .acquire,
-                ) orelse return true;
+            if (self.used.load(.acquire) != previous) return false;
+            if (next <= previous) {
+                self.used.store(next, .release);
+                return true;
+            }
+            const bytes = next - previous;
+            if (bytes <= self.limit and previous <= self.limit - bytes) {
+                self.used.store(next, .release);
+                return true;
             }
             _ = self.denials.fetchAdd(1, .monotonic);
             return false;
-        }
-
-        fn release(context: *anyopaque, bytes: usize) void {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            const previous = self.used.fetchSub(bytes, .acq_rel);
-            std.debug.assert(previous >= bytes);
         }
     };
 
@@ -9002,8 +9080,7 @@ test "worker BPE caches honor external resource-budget denial" {
         .max_bytes = base_bytes,
         .resource_budget = .{
             .context = &budget,
-            .try_reserve = Budget.tryReserve,
-            .release = Budget.release,
+            .observe = Budget.observe,
         },
     });
     try tok.configureParallelBpe(.{
@@ -9094,8 +9171,14 @@ test "worker BPE caches retry transient resource-budget denial" {
         transient_denials: std.atomic.Value(usize) = .init(4),
         used: std.atomic.Value(usize) = .init(0),
 
-        fn tryReserve(context: *anyopaque, bytes: usize) bool {
+        fn observe(context: *anyopaque, _: usize, previous: usize, next: usize) bool {
             const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.used.load(.acquire) != previous) return false;
+            if (next <= previous) {
+                self.used.store(next, .release);
+                return true;
+            }
+            const bytes = next - previous;
             if (bytes == self.table_bytes) {
                 var remaining = self.transient_denials.load(.acquire);
                 while (remaining != 0) {
@@ -9107,14 +9190,8 @@ test "worker BPE caches retry transient resource-budget denial" {
                     ) orelse return false;
                 }
             }
-            _ = self.used.fetchAdd(bytes, .acq_rel);
+            self.used.store(next, .release);
             return true;
-        }
-
-        fn release(context: *anyopaque, bytes: usize) void {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            const previous = self.used.fetchSub(bytes, .acq_rel);
-            std.debug.assert(previous >= bytes);
         }
     };
 
@@ -9124,8 +9201,7 @@ test "worker BPE caches retry transient resource-budget denial" {
     try tok.configureBpeCache(.{
         .resource_budget = .{
             .context = &budget,
-            .try_reserve = Budget.tryReserve,
-            .release = Budget.release,
+            .observe = Budget.observe,
         },
     });
     try tok.configureParallelBpe(.{
@@ -9171,25 +9247,20 @@ test "stable boundary index yields resource priority to worker caches" {
         used: std.atomic.Value(usize) = .init(0),
         denials: std.atomic.Value(usize) = .init(0),
 
-        fn tryReserve(context: *anyopaque, bytes: usize) bool {
+        fn observe(context: *anyopaque, _: usize, previous: usize, next: usize) bool {
             const self: *@This() = @ptrCast(@alignCast(context));
-            var used = self.used.load(.acquire);
-            while (used <= self.limit and bytes <= self.limit - used) {
-                used = self.used.cmpxchgWeak(
-                    used,
-                    used + bytes,
-                    .acq_rel,
-                    .acquire,
-                ) orelse return true;
+            if (self.used.load(.acquire) != previous) return false;
+            if (next <= previous) {
+                self.used.store(next, .release);
+                return true;
+            }
+            const bytes = next - previous;
+            if (bytes <= self.limit and previous <= self.limit - bytes) {
+                self.used.store(next, .release);
+                return true;
             }
             _ = self.denials.fetchAdd(1, .monotonic);
             return false;
-        }
-
-        fn release(context: *anyopaque, bytes: usize) void {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            const previous = self.used.fetchSub(bytes, .acq_rel);
-            std.debug.assert(previous >= bytes);
         }
     };
 
@@ -9200,8 +9271,7 @@ test "stable boundary index yields resource priority to worker caches" {
         .max_bytes = 0,
         .resource_budget = .{
             .context = &budget,
-            .try_reserve = Budget.tryReserve,
-            .release = Budget.release,
+            .observe = Budget.observe,
         },
     });
     try tok.configureParallelBpe(.{
@@ -9402,29 +9472,24 @@ test "worker BPE spill arena falls back when resource budget denies growth" {
         limit: usize,
         used: std.atomic.Value(usize) = .init(0),
 
-        fn tryReserve(context: *anyopaque, bytes: usize) bool {
+        fn observe(context: *anyopaque, _: usize, previous: usize, next: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.used.load(.acquire) != previous) return false;
+            if (next <= previous) {
+                self.used.store(next, .release);
+                return true;
+            }
+            const bytes = next - previous;
             if (bytes == HfTokenizer.worker_bpe_initial_arena_ids *
                 @sizeOf(i32))
             {
                 return false;
             }
-            const self: *@This() = @ptrCast(@alignCast(context));
-            var used = self.used.load(.acquire);
-            while (used <= self.limit and bytes <= self.limit - used) {
-                used = self.used.cmpxchgWeak(
-                    used,
-                    used + bytes,
-                    .acq_rel,
-                    .acquire,
-                ) orelse return true;
+            if (bytes <= self.limit and previous <= self.limit - bytes) {
+                self.used.store(next, .release);
+                return true;
             }
             return false;
-        }
-
-        fn release(context: *anyopaque, bytes: usize) void {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            const previous = self.used.fetchSub(bytes, .acq_rel);
-            std.debug.assert(previous >= bytes);
         }
     };
 
@@ -9438,8 +9503,7 @@ test "worker BPE spill arena falls back when resource budget denies growth" {
         .max_bytes = base_bytes,
         .resource_budget = .{
             .context = &budget,
-            .try_reserve = Budget.tryReserve,
-            .release = Budget.release,
+            .observe = Budget.observe,
         },
     });
     try tok.configureParallelBpe(.{
@@ -9735,23 +9799,12 @@ test "BPE cache obeys local and external byte budgets" {
         max_bytes: usize,
         used_bytes: std.atomic.Value(usize) = .init(0),
 
-        fn tryReserve(context: *anyopaque, bytes: usize) bool {
+        fn observe(context: *anyopaque, _: usize, previous: usize, next: usize) bool {
             const self: *@This() = @ptrCast(@alignCast(context));
-            var used = self.used_bytes.load(.acquire);
-            while (true) {
-                if (bytes > self.max_bytes or used > self.max_bytes - bytes) return false;
-                used = self.used_bytes.cmpxchgWeak(
-                    used,
-                    used + bytes,
-                    .acq_rel,
-                    .acquire,
-                ) orelse return true;
-            }
-        }
-
-        fn release(context: *anyopaque, bytes: usize) void {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            _ = self.used_bytes.fetchSub(bytes, .acq_rel);
+            if (self.used_bytes.load(.acquire) != previous) return false;
+            if (next > self.max_bytes) return false;
+            self.used_bytes.store(next, .release);
+            return true;
         }
     };
 
@@ -9765,8 +9818,7 @@ test "BPE cache obeys local and external byte budgets" {
         .max_bytes = hard_limit,
         .resource_budget = .{
             .context = &budget,
-            .try_reserve = Budget.tryReserve,
-            .release = Budget.release,
+            .observe = Budget.observe,
         },
     });
 
@@ -9811,16 +9863,11 @@ test "BPE bulk cache table participates in external byte budget" {
     const Budget = struct {
         used_bytes: std.atomic.Value(usize) = .init(0),
 
-        fn tryReserve(context: *anyopaque, bytes: usize) bool {
+        fn observe(context: *anyopaque, _: usize, previous: usize, next: usize) bool {
             const self: *@This() = @ptrCast(@alignCast(context));
-            _ = self.used_bytes.fetchAdd(bytes, .acq_rel);
+            if (self.used_bytes.load(.acquire) != previous) return false;
+            self.used_bytes.store(next, .release);
             return true;
-        }
-
-        fn release(context: *anyopaque, bytes: usize) void {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            const previous = self.used_bytes.fetchSub(bytes, .acq_rel);
-            std.debug.assert(previous >= bytes);
         }
     };
 
@@ -9837,8 +9884,7 @@ test "BPE bulk cache table participates in external byte budget" {
         .bulk_slots_per_shard = bulk_slots_per_shard,
         .resource_budget = .{
             .context = &budget,
-            .try_reserve = Budget.tryReserve,
-            .release = Budget.release,
+            .observe = Budget.observe,
         },
     });
 
@@ -9868,26 +9914,12 @@ test "BPE bulk cache denial preserves the front cache" {
         max_bytes: usize,
         used_bytes: std.atomic.Value(usize) = .init(0),
 
-        fn tryReserve(context: *anyopaque, bytes: usize) bool {
+        fn observe(context: *anyopaque, _: usize, previous: usize, next: usize) bool {
             const self: *@This() = @ptrCast(@alignCast(context));
-            var used = self.used_bytes.load(.acquire);
-            while (true) {
-                if (bytes > self.max_bytes or used > self.max_bytes - bytes) {
-                    return false;
-                }
-                used = self.used_bytes.cmpxchgWeak(
-                    used,
-                    used + bytes,
-                    .acq_rel,
-                    .acquire,
-                ) orelse return true;
-            }
-        }
-
-        fn release(context: *anyopaque, bytes: usize) void {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            const previous = self.used_bytes.fetchSub(bytes, .acq_rel);
-            std.debug.assert(previous >= bytes);
+            if (self.used_bytes.load(.acquire) != previous) return false;
+            if (next > self.max_bytes) return false;
+            self.used_bytes.store(next, .release);
+            return true;
         }
     };
 
@@ -9899,8 +9931,7 @@ test "BPE bulk cache denial preserves the front cache" {
         .bulk_slots_per_shard = 4,
         .resource_budget = .{
             .context = &budget,
-            .try_reserve = Budget.tryReserve,
-            .release = Budget.release,
+            .observe = Budget.observe,
         },
     });
 
@@ -10136,16 +10167,11 @@ test "parallel workspaces remain resource-accounted without a BPE cache table" {
     const Budget = struct {
         used_bytes: std.atomic.Value(usize) = .init(0),
 
-        fn tryReserve(context: *anyopaque, bytes: usize) bool {
+        fn observe(context: *anyopaque, _: usize, previous: usize, next: usize) bool {
             const self: *@This() = @ptrCast(@alignCast(context));
-            _ = self.used_bytes.fetchAdd(bytes, .acq_rel);
+            if (self.used_bytes.load(.acquire) != previous) return false;
+            self.used_bytes.store(next, .release);
             return true;
-        }
-
-        fn release(context: *anyopaque, bytes: usize) void {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            const previous = self.used_bytes.fetchSub(bytes, .acq_rel);
-            std.debug.assert(previous >= bytes);
         }
     };
 
@@ -10158,8 +10184,7 @@ test "parallel workspaces remain resource-accounted without a BPE cache table" {
     try tok.configureBpeCache(.{
         .resource_budget = .{
             .context = &budget,
-            .try_reserve = Budget.tryReserve,
-            .release = Budget.release,
+            .observe = Budget.observe,
         },
     });
     const workspace = try tok.acquireParallelBpeWorkspace();

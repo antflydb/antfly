@@ -2037,6 +2037,7 @@ pub fn runFromIterator(
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
         .process_memory_limit_bytes = process_memory_limit_bytes,
+        .process_memory_limit_source = storageMemoryLimitSource(process_memory_resolution.effective_source),
         .store_registration = .{
             .node_id = local_node_id,
             .store_id = 1,
@@ -2113,8 +2114,8 @@ pub fn runFromIterator(
         "process memory policy operator_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} managed_hard_limit_bytes={d}",
         .{
             @tagName(process_memory_resolution.source),
-            @tagName(data_server.provisioned_storage.memory_limit_source),
-            process_memory_limit_bytes,
+            @tagName(process_memory_resolution.effective_source),
+            process_memory_resolution.configured_limit_bytes,
             data_server.provisioned_storage.effective_memory_limit_bytes,
             managed_memory.hard_limit_bytes,
         },
@@ -2181,8 +2182,7 @@ pub fn runFromIterator(
         .retain_admission = retainInferenceResources,
         .release_admission = releaseInferenceResources,
         .observe_prompt_cache = observeInferencePromptCache,
-        .reserve_tokenizer_cache = reserveInferenceTokenizerCache,
-        .release_tokenizer_cache = releaseInferenceTokenizerCache,
+        .observe_tokenizer_cache = observeInferenceTokenizerCache,
     };
     const configure_context = inference_bridge.ConfigureContext{
         .abi_version = inference_bridge.abi_version,
@@ -4857,7 +4857,7 @@ const InferenceResourceBudgetOwner = struct {
     observer_mutex: std.atomic.Mutex = .unlocked,
     prompt_cache_observers: std.AutoHashMapUnmanaged(usize, u64) = .empty,
     tokenizer_mutex: std.atomic.Mutex = .unlocked,
-    tokenizer_cache_bytes: u64 = 0,
+    tokenizer_cache_observers: std.AutoHashMapUnmanaged(usize, u64) = .empty,
     outstanding_admission_leases: std.atomic.Value(usize) = .init(0),
 
     fn deinit(self: *@This()) void {
@@ -4874,7 +4874,9 @@ const InferenceResourceBudgetOwner = struct {
         std.debug.assert(self.prompt_cache_observers.count() == 0);
         self.prompt_cache_observers.deinit(self.alloc);
         self.prompt_cache_observers = .empty;
-        std.debug.assert(self.tokenizer_cache_bytes == 0);
+        std.debug.assert(self.tokenizer_cache_observers.count() == 0);
+        self.tokenizer_cache_observers.deinit(self.alloc);
+        self.tokenizer_cache_observers = .empty;
     }
 
     fn acquireLease(self: *@This()) !*InferenceAdmissionLease {
@@ -4942,21 +4944,56 @@ const InferenceResourceBudgetOwner = struct {
         previous: u64,
         next: u64,
     ) bool {
-        lockAtomic(&self.observer_mutex);
-        defer self.observer_mutex.unlock();
+        return self.observeCacheUsage(
+            &self.observer_mutex,
+            &self.prompt_cache_observers,
+            .inference_prompt_cache,
+            observer_id,
+            previous,
+            next,
+        );
+    }
+
+    fn observeTokenizerCache(
+        self: *@This(),
+        observer_id: usize,
+        previous: u64,
+        next: u64,
+    ) bool {
+        return self.observeCacheUsage(
+            &self.tokenizer_mutex,
+            &self.tokenizer_cache_observers,
+            .inference_tokenizer_cache,
+            observer_id,
+            previous,
+            next,
+        );
+    }
+
+    fn observeCacheUsage(
+        self: *@This(),
+        mutex: *std.atomic.Mutex,
+        observers: *std.AutoHashMapUnmanaged(usize, u64),
+        slice: antfly.resource_manager.Slice,
+        observer_id: usize,
+        previous: u64,
+        next: u64,
+    ) bool {
+        lockAtomic(mutex);
+        defer mutex.unlock();
 
         if (observer_id == 0) {
             self.manager.recordAccountingError();
             return false;
         }
         var inserted = false;
-        const current = self.prompt_cache_observers.getPtr(observer_id) orelse blk: {
+        const current = observers.getPtr(observer_id) orelse blk: {
             if (previous != 0) {
                 self.manager.recordAccountingError();
                 return false;
             }
             if (next == 0) return true;
-            const entry = self.prompt_cache_observers.getOrPut(
+            const entry = observers.getOrPut(
                 self.alloc,
                 observer_id,
             ) catch {
@@ -4971,15 +5008,17 @@ const InferenceResourceBudgetOwner = struct {
             self.manager.recordAccountingError();
             return false;
         }
-        if (!self.manager.tryObserveUsage(
-            .inference_prompt_cache,
-            current,
+        if (!self.manager.tryObserveUsageIdentity(
+            slice,
+            observer_id,
+            current.*,
             next,
         )) {
-            if (inserted) _ = self.prompt_cache_observers.remove(observer_id);
+            if (inserted) _ = observers.remove(observer_id);
             return false;
         }
-        if (next == 0) _ = self.prompt_cache_observers.remove(observer_id);
+        current.* = next;
+        if (next == 0) _ = observers.remove(observer_id);
         return true;
     }
 };
@@ -5055,39 +5094,14 @@ fn observeInferencePromptCache(
     return @intFromBool(owner.observePromptCache(observer_id, previous, next));
 }
 
-fn reserveInferenceTokenizerCache(context: *anyopaque, bytes: usize) callconv(.c) u8 {
+fn observeInferenceTokenizerCache(
+    context: *anyopaque,
+    observer_id: usize,
+    previous: u64,
+    next: u64,
+) callconv(.c) u8 {
     const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
-    lockAtomic(&owner.tokenizer_mutex);
-    defer owner.tokenizer_mutex.unlock();
-    const manager = owner.manager;
-    if (manager.admissionDecision(.inference_tokenizer_cache, @intCast(bytes)).action == .shrink_cache)
-        return 0;
-    const next = std.math.add(u64, owner.tokenizer_cache_bytes, @as(u64, @intCast(bytes))) catch {
-        manager.recordAccountingError();
-        return 0;
-    };
-    manager.adjustUsage(
-        .inference_tokenizer_cache,
-        &owner.tokenizer_cache_bytes,
-        next,
-    ) catch return 0;
-    return 1;
-}
-
-fn releaseInferenceTokenizerCache(context: *anyopaque, bytes: usize) callconv(.c) void {
-    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
-    lockAtomic(&owner.tokenizer_mutex);
-    defer owner.tokenizer_mutex.unlock();
-    const released: u64 = @intCast(bytes);
-    if (released > owner.tokenizer_cache_bytes) {
-        owner.manager.recordAccountingError();
-        return;
-    }
-    owner.manager.adjustUsage(
-        .inference_tokenizer_cache,
-        &owner.tokenizer_cache_bytes,
-        owner.tokenizer_cache_bytes - released,
-    ) catch {};
+    return @intFromBool(owner.observeTokenizerCache(observer_id, previous, next));
 }
 
 fn mibToBytes(value: usize) !usize {
@@ -5097,12 +5111,24 @@ fn mibToBytes(value: usize) !usize {
 fn resolveProcessMemoryBudget(
     cli: CliConfig,
     env: *const std.process.Environ.Map,
-) !process_memory_budget.Resolution {
-    return process_memory_budget.resolveDetailed(
+) !process_memory_budget.EffectiveResolution {
+    return process_memory_budget.resolveSystemDetailed(
         cli.inference_process_memory_budget_mb,
         env.get(process_memory_budget.canonical_env),
         env.get(process_memory_budget.inference_compat_env),
     );
+}
+
+fn storageMemoryLimitSource(
+    source: process_memory_budget.EffectiveSource,
+) antfly.public_api.MemoryLimitSource {
+    return switch (source) {
+        .explicit => .explicit,
+        .cgroup_v2 => .cgroup_v2,
+        .cgroup_v1 => .cgroup_v1,
+        .host => .host,
+        .unavailable => .unavailable,
+    };
 }
 
 fn printUsage() void {
@@ -7112,10 +7138,13 @@ test "inference admission bridge charges combined native residency to resource m
     try std.testing.expectEqual(@as(u8, 1), observeInferencePromptCache(&owner, 2, 20, 0));
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 
-    try std.testing.expectEqual(@as(u8, 1), reserveInferenceTokenizerCache(&owner, 10));
-    releaseInferenceTokenizerCache(&owner, 11);
+    try std.testing.expectEqual(@as(u8, 1), observeInferenceTokenizerCache(&owner, 11, 0, 10));
+    try std.testing.expectEqual(@as(u8, 1), observeInferenceTokenizerCache(&owner, 22, 0, 10));
+    try std.testing.expectEqual(@as(u8, 0), observeInferenceTokenizerCache(&owner, 11, 0, 0));
+    try std.testing.expectEqual(@as(u64, 20), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u8, 1), observeInferenceTokenizerCache(&owner, 11, 10, 0));
     try std.testing.expectEqual(@as(u64, 10), manager.snapshot().memory.used_bytes);
-    releaseInferenceTokenizerCache(&owner, 10);
+    try std.testing.expectEqual(@as(u8, 1), observeInferenceTokenizerCache(&owner, 22, 10, 0));
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 

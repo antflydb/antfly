@@ -164,6 +164,13 @@ envelope minus raw leaf-cgroup usage and safety headroom. This live check covers
 unmanaged allocations and page cache that cannot appear in the reservation
 ledger.
 
+Linux automatic resolution reads the process's actual cgroup path, walks every
+ancestor to the visible controller mount, and falls back to streamed mountinfo
+discovery for namespace and subtree mounts. Storage does not perform a second,
+root-only probe after composition. This prevents storage from sizing against
+host RAM while inference independently discovers a nested systemd or container
+limit.
+
 Full standalone keeps node-owned inference slices as logical metrics without a
 host-derived hard limit. Applying one host limit to combined host and VRAM bytes
 would reject valid discrete-GPU models. Cross-subsystem host contention is
@@ -192,8 +199,18 @@ authority. Monotonic tokens are validated against an active owner registry, so
 a delayed duplicate cannot target a newer reservation that reused the same
 pool slot. Token records and registry capacity are reused, making steady-state
 admission allocation-free after reaching its concurrency high-water mark.
-Observed caches carry stable observer identities, and aggregate-only tokenizer
-accounting is serialized behind its owner counter.
+The core ResourceManager applies the same rule to single and batch reservation
+handles: the manager-issued identity and authoritative record, not copyable
+byte fields, authorize retain, grow, shrink, and release. Stable observer
+addresses are registered with their slice and last accepted total, so a stale
+same-slice value cannot debit another observer. External ABI boundaries add
+monotonic owner identities to avoid pointer-reuse ambiguity.
+
+Prompt and tokenizer caches both report `(observer identity, previous total,
+next total)`. Each tokenizer serializes only cold allocation, eviction, and
+teardown transitions; cache hits remain callback-free. Standalone maintains a
+separate registry entry per tokenizer, so a duplicate teardown can never
+consume bytes retained by a different tokenizer.
 
 ## Failure semantics
 

@@ -20,7 +20,7 @@ const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version: u32 = 13;
+pub const abi_version: u32 = 14;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -113,8 +113,7 @@ pub const ResourceBudget = extern struct {
     retain_admission: *const fn (*anyopaque, usize, *const AdmissionAmounts) callconv(.c) Status,
     release_admission: *const fn (*anyopaque, usize) callconv(.c) void,
     observe_prompt_cache: *const fn (*anyopaque, usize, u64, u64) callconv(.c) u8,
-    reserve_tokenizer_cache: *const fn (*anyopaque, usize) callconv(.c) u8,
-    release_tokenizer_cache: *const fn (*anyopaque, usize) callconv(.c) void,
+    observe_tokenizer_cache: *const fn (*anyopaque, usize, u64, u64) callconv(.c) u8,
 };
 
 /// Stable operation identifiers for the embedded inference service. Requests
