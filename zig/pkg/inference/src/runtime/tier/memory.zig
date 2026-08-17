@@ -726,7 +726,8 @@ pub const AdmissionController = struct {
     forced_run_denials_for_testing: std.atomic.Value(usize) = .init(0),
 
     pub fn deinit(self: *AdmissionController) void {
-        self.configureResourceBudget(null) catch unreachable;
+        self.configureResourceBudget(null) catch
+            @panic("admission controller deinitialized with active resource leases");
     }
 
     pub fn configureForcedRunDenialsForTesting(
@@ -1073,11 +1074,17 @@ pub const AdmissionController = struct {
         amounts: AdmissionAmounts,
         external_lease: ?usize,
     ) void {
-        self.releaseLocal(amounts_by_backend, amounts);
         if (external_lease) |token| {
-            if (self.resource_budget) |resource_budget|
-                resource_budget.release(resource_budget.context, token);
+            // Keep the local reservation published until the external owner has
+            // consumed its exactly-once token. configureResourceBudget() uses
+            // that reservation as its exclusion condition, so releasing local
+            // accounting first would let a concurrent reconfiguration detach
+            // the old context and route this token to a different capability.
+            const resource_budget = self.resource_budget orelse
+                @panic("external admission lease lost its resource budget");
+            resource_budget.release(resource_budget.context, token);
         }
+        self.releaseLocal(amounts_by_backend, amounts);
     }
 
     fn retainExternalLease(
@@ -3316,6 +3323,8 @@ test "admission resource budget mirrors acquire retain and release" {
     const Recorder = struct {
         current: AdmissionAmounts = .{},
         references: usize = 1,
+        controller: ?*AdmissionController = null,
+        reconfiguration_blocked_during_release: bool = false,
 
         fn retainContext(context: *anyopaque) bool {
             const self: *@This() = @ptrCast(@alignCast(context));
@@ -3344,12 +3353,22 @@ test "admission resource budget mirrors acquire retain and release" {
         fn release(context: *anyopaque, lease: usize) void {
             const self: *@This() = @ptrCast(@alignCast(context));
             std.debug.assert(lease == 1);
+            if (self.controller) |controller| {
+                controller.configureResourceBudget(null) catch |err| {
+                    self.reconfiguration_blocked_during_release =
+                        err == error.ResourceBudgetInUse;
+                    self.current = .{};
+                    return;
+                };
+                self.reconfiguration_blocked_during_release = false;
+            }
             self.current = .{};
         }
     };
 
     var recorder = Recorder{};
     var controller = AdmissionController{};
+    recorder.controller = &controller;
     try controller.configureResourceBudget(.{
         .context = &recorder,
         .retain_context = Recorder.retainContext,
@@ -3374,6 +3393,8 @@ test "admission resource budget mirrors acquire retain and release" {
     try lease.retain(.{ .host_weight_bytes = 64 });
     try std.testing.expectEqual(@as(usize, 0), recorder.current.host_scratch_bytes);
     lease.release();
+    try std.testing.expect(recorder.reconfiguration_blocked_during_release);
+    try std.testing.expectEqual(@as(usize, 2), recorder.references);
     try std.testing.expectEqual(AdmissionAmounts{}, recorder.current);
     controller.deinit();
     try std.testing.expectEqual(@as(usize, 1), recorder.references);

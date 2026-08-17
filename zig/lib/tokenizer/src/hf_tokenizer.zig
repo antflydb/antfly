@@ -389,6 +389,11 @@ pub const HfTokenizer = struct {
         }
     };
 
+    const ResourceBudgetCharge = enum {
+        uncharged,
+        charged,
+    };
+
     pub const BpeCacheConfig = struct {
         /// Hard bound for the fixed lookup table and immutable cache entries.
         /// A value smaller than the fixed table disables cache insertion.
@@ -1577,13 +1582,14 @@ pub const HfTokenizer = struct {
             added_capacity,
             @sizeOf(i32),
         ) catch return false;
-        const reserved = self.cache_resource_budget != null;
-        if (!self.tryReserveResourceBudgetBytes(added_bytes)) return false;
+        const resource_budget_charged = self.tryReserveResourceBudgetBytes(added_bytes) orelse
+            return false;
         cache.token_arena.ensureTotalCapacityPrecise(
             self.allocator,
             target_capacity,
         ) catch {
-            if (reserved) self.releaseResourceBudgetBytes(added_bytes);
+            if (resource_budget_charged == .charged)
+                self.releaseResourceBudgetBytes(added_bytes);
             return false;
         };
         cache.accounted_bytes += added_bytes;
@@ -1853,8 +1859,7 @@ pub const HfTokenizer = struct {
             lease.allocation_failed = true;
             return false;
         };
-        const reserved = self.cache_resource_budget != null;
-        if (!self.tryReserveResourceBudgetBytes(bytes)) {
+        const resource_budget_charged = self.tryReserveResourceBudgetBytes(bytes) orelse {
             lease.reservation_denials +|= 1;
             const shift: u3 = @intCast(@min(
                 lease.reservation_denials - 1,
@@ -1863,14 +1868,15 @@ pub const HfTokenizer = struct {
             lease.reservation_retry_after =
                 @as(u8, 1) << shift;
             return false;
-        }
+        };
         lease.reservation_denials = 0;
         lease.reservation_retry_after = 0;
         const allocation = self.allocateWorkerBpeCacheEntries(
             slot_count,
             bytes,
         ) catch {
-            if (reserved) self.releaseResourceBudgetBytes(bytes);
+            if (resource_budget_charged == .charged)
+                self.releaseResourceBudgetBytes(bytes);
             // Repeated multi-megabyte allocator attempts under OOM can amplify
             // pressure. Resource-budget denials above remain retryable, while
             // an admitted allocation failure is terminal for this lease.
@@ -2500,27 +2506,27 @@ pub const HfTokenizer = struct {
             retained_bytes <=
             self.parallel_bpe_config.max_retained_workspace_bytes;
         if (cacheable) {
-            if (self.cache_resource_budget != null) {
-                const accounted_bytes =
-                    workspace.resource_accounted_bytes.load(.acquire);
-                if (retained_bytes > accounted_bytes) {
-                    const additional =
-                        retained_bytes - accounted_bytes;
-                    if (self.tryReserveResourceBudgetBytes(additional)) {
+            const accounted_bytes =
+                workspace.resource_accounted_bytes.load(.acquire);
+            if (retained_bytes > accounted_bytes) {
+                const additional =
+                    retained_bytes - accounted_bytes;
+                if (self.tryReserveResourceBudgetBytes(additional)) |charge| {
+                    if (charge == .charged) {
                         workspace.resource_accounted_bytes.store(
                             retained_bytes,
                             .release,
                         );
-                    } else {
-                        cacheable = false;
                     }
-                } else if (retained_bytes < accounted_bytes) {
-                    self.releaseResourceBudgetBytes(accounted_bytes - retained_bytes);
-                    workspace.resource_accounted_bytes.store(
-                        retained_bytes,
-                        .release,
-                    );
+                } else {
+                    cacheable = false;
                 }
+            } else if (retained_bytes < accounted_bytes) {
+                self.releaseResourceBudgetBytes(accounted_bytes - retained_bytes);
+                workspace.resource_accounted_bytes.store(
+                    retained_bytes,
+                    .release,
+                );
             }
         }
         while (!self.parallel_workspace_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -3071,15 +3077,15 @@ pub const HfTokenizer = struct {
                 }
             }
             if (additional_bytes != 0) {
-                if (self.cache_resource_budget != null) {
-                    if (self.tryReserveResourceBudgetBytes(additional_bytes)) {
+                if (self.tryReserveResourceBudgetBytes(additional_bytes)) |charge| {
+                    if (charge == .charged) {
                         _ = workspace.resource_accounted_bytes.fetchAdd(
                             additional_bytes,
                             .acq_rel,
                         );
-                    } else {
-                        build_stable_boundaries = false;
                     }
+                } else {
+                    build_stable_boundaries = false;
                 }
             }
             if (build_stable_boundaries) {
@@ -5158,44 +5164,44 @@ pub const HfTokenizer = struct {
         while (!mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
-    fn tryReserveResourceBudgetBytes(self: *HfTokenizer, bytes: usize) bool {
-        if (bytes == 0) return true;
-        const budget = self.cache_resource_budget orelse return true;
+    /// Reserve bytes against the capability installed at the serialization
+    /// point. `.uncharged` means no capability was installed, `.charged` means
+    /// the caller owns a charge that must be rolled back if allocation fails,
+    /// and `null` is an admission denial. Returning explicit ownership avoids a
+    /// racy pre-lock capability read around fallible allocations.
+    fn tryReserveResourceBudgetBytes(self: *HfTokenizer, bytes: usize) ?ResourceBudgetCharge {
+        if (bytes == 0) return .uncharged;
         lockBpeCacheMutex(&self.cache_resource_budget_mutex);
         defer self.cache_resource_budget_mutex.unlock();
+        const budget = self.cache_resource_budget orelse return .uncharged;
         const previous = self.cache_resource_budget_bytes;
-        const next = std.math.add(usize, previous, bytes) catch return false;
+        const next = std.math.add(usize, previous, bytes) catch return null;
         if (!budget.observe(
             budget.context,
             self.cache_resource_budget_observer_id,
             previous,
             next,
         ))
-            return false;
+            return null;
         self.cache_resource_budget_bytes = next;
-        return true;
+        return .charged;
     }
 
     fn releaseResourceBudgetBytes(self: *HfTokenizer, bytes: usize) void {
-        if (bytes == 0 or self.cache_resource_budget == null) return;
-        const budget = self.cache_resource_budget.?;
+        if (bytes == 0) return;
         lockBpeCacheMutex(&self.cache_resource_budget_mutex);
         defer self.cache_resource_budget_mutex.unlock();
+        const budget = self.cache_resource_budget orelse return;
         const previous = self.cache_resource_budget_bytes;
-        if (bytes > previous) {
-            std.debug.assert(false);
-            return;
-        }
+        if (bytes > previous)
+            @panic("tokenizer resource budget release exceeds owned bytes");
         const next = previous - bytes;
         if (!budget.observe(
             budget.context,
             self.cache_resource_budget_observer_id,
             previous,
             next,
-        )) {
-            std.debug.assert(false);
-            return;
-        }
+        )) @panic("tokenizer resource budget rejected a release");
         self.cache_resource_budget_bytes = next;
     }
 
@@ -5203,13 +5209,13 @@ pub const HfTokenizer = struct {
         self: *HfTokenizer,
         next_budget: ?BpeCacheResourceBudget,
     ) bool {
+        lockBpeCacheMutex(&self.cache_resource_budget_mutex);
+        defer self.cache_resource_budget_mutex.unlock();
         const previous_budget = self.cache_resource_budget;
         if (sameBpeCacheResourceBudget(previous_budget, next_budget)) return true;
         if (next_budget) |budget| {
             if (!budget.retainContext()) return false;
         }
-        lockBpeCacheMutex(&self.cache_resource_budget_mutex);
-        defer self.cache_resource_budget_mutex.unlock();
         const bytes = self.cache_resource_budget_bytes;
         if (next_budget) |budget| {
             if (bytes != 0 and
@@ -5658,7 +5664,7 @@ pub const HfTokenizer = struct {
                 .acquire,
             ) orelse break;
         }
-        if (!cache.owner.tryReserveResourceBudgetBytes(bytes)) {
+        if (cache.owner.tryReserveResourceBudgetBytes(bytes) == null) {
             _ = cache.used_bytes.fetchSub(bytes, .acq_rel);
             _ = cache.rejected_reservations.fetchAdd(1, .monotonic);
             return false;
@@ -7143,12 +7149,14 @@ pub const HfTokenizer = struct {
         for (&self.worker_bpe_caches) |*lease| {
             if (lease.cache) |*cache| cache.deinit(self);
         }
-        std.debug.assert(self.cache_resource_budget_bytes == 0);
+        if (self.cache_resource_budget_bytes != 0)
+            @panic("tokenizer deinitialized with live resource charges");
         // Drop the capability only after all cache/workspace accounting has
         // reached zero. This is the final lifetime edge to a shared resource
         // domain and may destroy that domain.
         const detached_resource_budget = self.switchResourceBudget(null);
-        std.debug.assert(detached_resource_budget);
+        if (!detached_resource_budget)
+            @panic("tokenizer could not detach its resource budget");
         self.unigram_vocab.deinit(allocator);
         self.unigram_trie.deinit(allocator);
         if (self.bpe_direct_trie) |*t| t.deinit(allocator);

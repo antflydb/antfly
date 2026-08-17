@@ -698,9 +698,14 @@ pub const ResourceManager = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         var it = self.capacity_domains.valueIterator();
-        while (it.next()) |domain| std.debug.assert(domain.reserved_bytes == 0);
-        std.debug.assert(self.reservation_identities.count() == 0);
-        std.debug.assert(self.batch_reservation_identities.count() == 0);
+        while (it.next()) |domain| {
+            if (domain.reserved_bytes != 0)
+                @panic("resource manager deinitialized with live capacity reservations");
+        }
+        if (self.reservation_identities.count() != 0)
+            @panic("resource manager deinitialized with live reservations");
+        if (self.batch_reservation_identities.count() != 0)
+            @panic("resource manager deinitialized with live batch reservations");
         self.capacity_domains.deinit(alloc);
         self.capacity_domains = .empty;
         self.reservation_identities.deinit(self.identity_allocator);
