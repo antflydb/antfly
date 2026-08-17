@@ -14539,7 +14539,11 @@ pub const DB = struct {
             std.log.info("restore runtime repair phase=rebuild_replayed_embeddings", .{});
             const rebuilt_dense = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
             if (rebuilt_dense > 0) self.clearDenseHbcCaches();
-            _ = try self.repairRestoreDenseArtifactCoverageFromFinalArtifacts(alloc);
+            const coverage_repair = try self.repairRestoreDenseArtifactCoverageFromFinalArtifacts(alloc);
+            if (coverage_repair.waiting_for_workers) {
+                if (coverage_repair.made_progress) return true;
+                return error.RestoreRuntimeRepairIncomplete;
+            }
             _ = try self.rebuildSparseIndexesForTargetCoverage(alloc);
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "sync_indexes", false);
             return true;
@@ -14551,15 +14555,25 @@ pub const DB = struct {
             // leaving a completed artifact projection with an older applied
             // watermark or a rebuilding checkpoint. A restore must not publish
             // its completion marker until both forms of debt converge.
+            // Resolve durable restore-owned intents first. In particular, a
+            // missing-counter intent is itself reported as rebuild debt, so
+            // checking the plan before bootstrapping its counter would keep
+            // rediscovering the same intent forever.
+            const artifact_completion = try self.completeRestoreDenseArtifactRepairs(alloc);
+            if (artifact_completion == .progressed) return true;
+
             const rebuilt_dense = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
             if (rebuilt_dense > 0) self.clearDenseHbcCaches();
-            try self.completeRestoreDenseArtifactRepairs(alloc);
             if (try self.hasPendingDenseArtifactRebuild(alloc) or
                 try self.denseArtifactWatermarkRepairNeeded(alloc))
             {
+                // A successful bounded rebuild is real visibility progress.
+                // Publish/invalidate it before a later proof-only retry.
+                if (rebuilt_dense > 0) return true;
                 return error.RestoreDenseArtifactRebuildIncomplete;
             }
             if (self.core.index_manager.hasRepairUnavailableIndexes()) {
+                if (rebuilt_dense > 0 or artifact_completion == .completed_with_progress) return true;
                 return error.RestoreIndexAvailabilityIncomplete;
             }
             try self.saveAllLiveIndexStatusSnapshots(alloc);
@@ -18610,7 +18624,13 @@ pub const DB = struct {
     /// earlier counter bootstrap, so recompute each durable counter from that
     /// final store and rebuild any unpublished generation whose exact coverage
     /// differs. No live shadow-generation job is needed or allowed here.
-    fn repairRestoreDenseArtifactCoverageFromFinalArtifacts(self: *DB, alloc: Allocator) !usize {
+    const RestoreDenseArtifactCoverageRepair = struct {
+        rebuilt: usize = 0,
+        made_progress: bool = false,
+        waiting_for_workers: bool = false,
+    };
+
+    fn repairRestoreDenseArtifactCoverageFromFinalArtifacts(self: *DB, alloc: Allocator) !RestoreDenseArtifactCoverageRepair {
         var target_counts = try self.collectDenseArtifactTargetCounts(alloc, null);
         defer target_counts.deinit(alloc);
 
@@ -18619,26 +18639,36 @@ pub const DB = struct {
             for (names.items) |name| alloc.free(name);
             names.deinit(alloc);
         }
+        var result = RestoreDenseArtifactCoverageRepair{};
         for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
             if (!try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, entry.config)) continue;
             const expected = target_counts.per_target_index.get(dense_index_idx) orelse 0;
-            var raw: [8]u8 = undefined;
-            std.mem.writeInt(u64, raw[0..8], expected, .little);
-            const counter_key = try denseArtifactTargetCounterKeyAlloc(alloc, entry.config.name);
-            defer alloc.free(counter_key);
-            try self.core.store.put(counter_key, &raw);
+            const current = try loadDenseArtifactTargetCounter(alloc, self.core.store, entry.config.name);
+            if (current == null or current.? != expected) {
+                var raw: [8]u8 = undefined;
+                std.mem.writeInt(u64, raw[0..8], expected, .little);
+                const counter_key = try denseArtifactTargetCounterKeyAlloc(alloc, entry.config.name);
+                defer alloc.free(counter_key);
+                try self.core.store.put(counter_key, &raw);
+                result.made_progress = true;
+            }
             if (entry.index.stats().active_count == expected) continue;
             try names.append(alloc, try alloc.dupe(u8, entry.config.name));
         }
-        if (names.items.len > 0 and self.start_index_workers) return error.RestoreRuntimeRepairIncomplete;
+        if (names.items.len > 0 and self.start_index_workers) {
+            result.waiting_for_workers = true;
+            return result;
+        }
 
-        var rebuilt: usize = 0;
         for (names.items) |name| {
             try self.core.index_manager.resetDenseIndexForArtifactRebuild(name);
-            rebuilt += try rebuildDenseIndexForTargetCoverageContext(self.async_context, name, 2048);
+            result.rebuilt += try rebuildDenseIndexForTargetCoverageContext(self.async_context, name, 2048);
         }
-        if (names.items.len > 0) self.clearDenseHbcCaches();
-        return rebuilt;
+        if (names.items.len > 0) {
+            self.clearDenseHbcCaches();
+            result.made_progress = true;
+        }
+        return result;
     }
 
     /// Portable restore owns the complete logical corpus and rebuilds every
@@ -18648,13 +18678,21 @@ pub const DB = struct {
     /// worker. Clear only the matching durable debt after counter coverage,
     /// replay, and checkpoint identity all prove the active generation
     /// queryable.
-    fn completeRestoreDenseArtifactRepairs(self: *DB, alloc: Allocator) !void {
+    const RestoreDenseArtifactCompletion = enum {
+        complete,
+        progressed,
+        completed_with_progress,
+    };
+
+    fn completeRestoreDenseArtifactRepairs(self: *DB, alloc: Allocator) !RestoreDenseArtifactCompletion {
         var state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
-            error.FileNotFound, error.DurableIndexRepairStateUnavailable => return,
+            error.FileNotFound, error.DurableIndexRepairStateUnavailable => return .complete,
             else => return err,
         };
         defer state.deinit(alloc);
 
+        // Validate every durable intent before changing counters or removing
+        // any intent. A pending proof error must be observably mutation-free.
         for (state.entries.items) |entry| {
             if (entry.intent.trigger != .artifact_counter_missing and
                 entry.intent.trigger != .artifact_coverage_mismatch)
@@ -18668,15 +18706,36 @@ pub const DB = struct {
             {
                 return error.RestoreDenseConfigProofIncomplete;
             }
+        }
 
-            if (entry.intent.trigger == .artifact_counter_missing) {
-                try self.ensureDenseArtifactTargetCounterForRepair(
-                    alloc,
-                    cfg.*,
-                    entry.intent.repair_id,
-                    null,
-                );
+        // Counter bootstrap is required input for worker convergence. Publish
+        // it as its own successful bounded quantum, then retry all proofs from
+        // a stable state instead of returning a pending error after mutation.
+        var bootstrapped = false;
+        for (state.entries.items) |entry| {
+            if (entry.intent.trigger != .artifact_counter_missing) continue;
+            const cfg = self.core.index_manager.get(entry.intent.index_name) orelse unreachable;
+            if (try loadDenseArtifactTargetCounter(alloc, self.core.store, cfg.name) != null) continue;
+            try self.ensureDenseArtifactTargetCounterForRepair(
+                alloc,
+                cfg.*,
+                entry.intent.repair_id,
+                null,
+            );
+            bootstrapped = true;
+        }
+        if (bootstrapped) return .progressed;
+
+        // Complete every proof before removing the first intent. This keeps
+        // all pending exits side-effect free and avoids partially publishing a
+        // multi-index restore proof.
+        for (state.entries.items) |entry| {
+            if (entry.intent.trigger != .artifact_counter_missing and
+                entry.intent.trigger != .artifact_coverage_mismatch)
+            {
+                continue;
             }
+            const cfg = self.core.index_manager.get(entry.intent.index_name) orelse unreachable;
             const expected = (try loadDenseArtifactTargetCounter(alloc, self.core.store, cfg.name)) orelse
                 return error.RestoreDenseCounterProofIncomplete;
             const dense = self.core.index_manager.denseIndex(cfg.name) orelse
@@ -18700,13 +18759,22 @@ pub const DB = struct {
             {
                 return error.RestoreDenseCheckpointIncomplete;
             }
-
-            // This is restore-owned metadata debt, not a shadow-generation
-            // attempt, so there is no candidate phase chain to advance. Once
-            // the restored active generation has passed the full proof above,
-            // remove the stale discovery intent directly.
-            try self.removeIndexRepairIntentAndPin(alloc, entry.intent.repair_id);
         }
+
+        var removed_any = false;
+        for (state.entries.items) |entry| {
+            if (entry.intent.trigger != .artifact_counter_missing and
+                entry.intent.trigger != .artifact_coverage_mismatch)
+            {
+                continue;
+            }
+            // This is restore-owned metadata debt, not a shadow-generation
+            // attempt, so there is no candidate phase chain to advance. All
+            // entries passed proof before the first durable removal.
+            try self.removeIndexRepairIntentAndPin(alloc, entry.intent.repair_id);
+            removed_any = true;
+        }
+        return if (removed_any) .completed_with_progress else .complete;
     }
 
     fn repairDenseArtifactAppliedSequencesIfCovered(self: *DB, alloc: Allocator) !usize {
@@ -85494,6 +85562,119 @@ test "db restore snapshot replays managed chunked dense embeddings for durable l
     }, 1);
     defer after.deinit();
     try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
+}
+
+test "db restore dense artifact completion publishes counter bootstrap as a bounded quantum" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, "dense_idx");
+    defer alloc.free(counter_key);
+    try db.core.store.delete(counter_key);
+    const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
+    const repair_id = try db.ensureAutomaticDenseGenerationRepairIntent(
+        alloc,
+        cfg.*,
+        .artifact_counter_missing,
+        "dense_artifact_counter_missing",
+    );
+
+    try std.testing.expectEqual(
+        DB.RestoreDenseArtifactCompletion.progressed,
+        try db.completeRestoreDenseArtifactRepairs(alloc),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dense_idx"),
+    );
+    try std.testing.expectEqual(
+        repair_id,
+        (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult,
+    );
+
+    try std.testing.expectEqual(
+        DB.RestoreDenseArtifactCompletion.completed_with_progress,
+        try db.completeRestoreDenseArtifactRepairs(alloc),
+    );
+    try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
+}
+
+test "db restore dense artifact completion keeps every intent when one proof is pending" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    inline for (.{ "dense_a", "dense_b" }) |name| {
+        try db.addIndex(.{
+            .name = name,
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+        });
+    }
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"_embeddings\":{\"dense_a\":[1,0],\"dense_b\":[0,1]}}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    const cfg_a = db.core.index_manager.get("dense_a") orelse return error.TestUnexpectedResult;
+    const repair_a = try db.ensureAutomaticDenseGenerationRepairIntent(
+        alloc,
+        cfg_a.*,
+        .artifact_coverage_mismatch,
+        "dense_artifact_coverage_mismatch",
+    );
+    const cfg_b = db.core.index_manager.get("dense_b") orelse return error.TestUnexpectedResult;
+    const repair_b = try db.ensureAutomaticDenseGenerationRepairIntent(
+        alloc,
+        cfg_b.*,
+        .artifact_coverage_mismatch,
+        "dense_artifact_coverage_mismatch",
+    );
+    const counter_b = try DB.denseArtifactTargetCounterKeyAlloc(alloc, "dense_b");
+    defer alloc.free(counter_b);
+    try db.core.store.delete(counter_b);
+
+    try std.testing.expectError(
+        error.RestoreDenseCounterProofIncomplete,
+        db.completeRestoreDenseArtifactRepairs(alloc),
+    );
+    try std.testing.expectEqual(
+        repair_a,
+        (try db.indexRepairIdForIndex(alloc, "dense_a")) orelse return error.TestUnexpectedResult,
+    );
+    try std.testing.expectEqual(
+        repair_b,
+        (try db.indexRepairIdForIndex(alloc, "dense_b")) orelse return error.TestUnexpectedResult,
+    );
 }
 
 test "db explicit restore runtime repair repairs managed chunked dense embeddings once for restored shard" {
