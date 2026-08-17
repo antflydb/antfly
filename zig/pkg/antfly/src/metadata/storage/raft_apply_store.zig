@@ -3440,7 +3440,15 @@ pub const RaftApplyStore = struct {
     }
 
     fn applyNodeShutdownRequestTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, node_id: u64) !void {
-        try self.setNodeLifecycleTxn(txn, group_id, node_id, metadata_table_manager.node_lifecycle_draining, true);
+        const existing = try self.loadNodeRecordTxn(txn, group_id, node_id);
+        defer if (existing) |record| metadata_table_manager.freeNode(self.alloc, record);
+        // A retried request is idempotent across every accepted shutdown
+        // phase. Only cancellation may move finalizing back to active; keeping
+        // this state monotonic preserves the one-shot finalize intent while
+        // placement or store observations drain.
+        if (existing == null or !metadata_table_manager.nodeLifecycleFinalizing(existing.?.lifecycle)) {
+            try self.setNodeLifecycleTxn(txn, group_id, node_id, metadata_table_manager.node_lifecycle_draining, true);
+        }
         try self.setNodeStoresDrainRequestedTxn(txn, group_id, node_id, true);
     }
 
@@ -8550,6 +8558,8 @@ test "metadata raft apply store waits for termination debt before finalizing nod
     defer std.testing.allocator.free(clear_target_store_cmd);
     const finalize_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .finalize_node_shutdown = .{ .node_id = 12 } });
     defer std.testing.allocator.free(finalize_cmd);
+    const retry_shutdown_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .request_node_shutdown = .{ .node_id = 12 } });
+    defer std.testing.allocator.free(retry_shutdown_cmd);
 
     const initial_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = target_node_cmd },
@@ -8558,6 +8568,9 @@ test "metadata raft apply store waits for termination debt before finalizing nod
         .{ .term = 1, .index = 4, .entry_type = .normal, .data = other_store_cmd },
         .{ .term = 1, .index = 5, .entry_type = .normal, .data = placement_cmd },
         .{ .term = 2, .index = 6, .entry_type = .normal, .data = finalize_cmd },
+        // Retrying the original request after finalization was accepted must
+        // not erase the durable completion intent.
+        .{ .term = 2, .index = 7, .entry_type = .normal, .data = retry_shutdown_cmd },
     });
     defer std.testing.allocator.free(initial_entries);
 
@@ -8565,7 +8578,7 @@ test "metadata raft apply store waits for termination debt before finalizing nod
     defer store.deinit();
     try store.snapshotBuilder().applyBatch(.{
         .group_id = 24,
-        .commit_index = 6,
+        .commit_index = 7,
         .entries_bytes = initial_entries,
     });
     {
@@ -8583,12 +8596,12 @@ test "metadata raft apply store waits for termination debt before finalizing nod
     // runtime/membership debt. The original accepted finalization intent stays
     // durable; no second finalize command is needed.
     const placement_removed_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 2, .index = 7, .entry_type = .normal, .data = remove_placement_cmd },
+        .{ .term = 2, .index = 8, .entry_type = .normal, .data = remove_placement_cmd },
     });
     defer std.testing.allocator.free(placement_removed_entries);
     try store.snapshotBuilder().applyBatch(.{
         .group_id = 24,
-        .commit_index = 7,
+        .commit_index = 8,
         .entries_bytes = placement_removed_entries,
     });
     {
@@ -8602,12 +8615,12 @@ test "metadata raft apply store waits for termination debt before finalizing nod
     // Clearing the final store observation transactionally completes the
     // pending finalization without mutation retries or a polling scan.
     const drained_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 2, .index = 8, .entry_type = .normal, .data = clear_target_store_cmd },
+        .{ .term = 2, .index = 9, .entry_type = .normal, .data = clear_target_store_cmd },
     });
     defer std.testing.allocator.free(drained_entries);
     try store.snapshotBuilder().applyBatch(.{
         .group_id = 24,
-        .commit_index = 8,
+        .commit_index = 9,
         .entries_bytes = drained_entries,
     });
 

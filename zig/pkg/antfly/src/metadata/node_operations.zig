@@ -121,7 +121,11 @@ pub const Operations = struct {
         for (snapshot.nodes) |node| {
             if (node.node_id != node_id) continue;
             node_found = true;
-            if (std.mem.eql(u8, node.lifecycle, table_manager.node_lifecycle_draining)) break;
+            // Shutdown is monotonic unless the operator explicitly cancels it.
+            // In particular, an idempotent request retry must not demote a
+            // pending finalization back to draining and lose its completion
+            // intent.
+            if (!table_manager.nodeLifecycleActive(node.lifecycle)) break;
             var updated = try table_manager.cloneNode(alloc, node);
             var updated_owned = true;
             errdefer if (updated_owned) table_manager.freeNode(alloc, updated);
@@ -309,6 +313,68 @@ test "metadata node operations stop canceled shutdown before source mutation" {
         .cancellation = operation.CancellationToken.fromAtomic(&canceled),
     }, 9));
     try std.testing.expectEqual(@as(usize, 0), source.calls);
+}
+
+test "metadata node operations preserve pending finalization on shutdown retry" {
+    const FakeSource = struct {
+        nodes: [1]table_manager.NodeRecord = .{.{
+            .node_id = 9,
+            .lifecycle = table_manager.node_lifecycle_finalizing,
+        }},
+        stores: [1]table_manager.StoreRecord = .{.{
+            .store_id = 9,
+            .node_id = 9,
+            .drain_requested = false,
+        }},
+        node_upserts: usize = 0,
+        store_upserts: usize = 0,
+
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .nodes = self.nodes[0..],
+                .stores = self.stores[0..],
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertNode(ptr: *anyopaque, alloc: std.mem.Allocator, record: table_manager.NodeRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.node_upserts += 1;
+            table_manager.freeNode(alloc, record);
+        }
+
+        fn upsertStore(ptr: *anyopaque, alloc: std.mem.Allocator, record: table_manager.StoreRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.store_upserts += 1;
+            try std.testing.expect(record.drain_requested);
+            table_manager.freeStore(alloc, record);
+        }
+    };
+
+    var source = FakeSource{};
+    const ops = Operations{ .source = .{
+        .ptr = &source,
+        .vtable = &.{
+            .snapshot = FakeSource.snapshot,
+            .free_snapshot = FakeSource.freeSnapshot,
+            .upsert_node = FakeSource.upsertNode,
+            .upsert_store = FakeSource.upsertStore,
+        },
+        .supports_upsert_node = true,
+        .supports_upsert_store = true,
+    } };
+
+    try ops.requestShutdown(std.testing.allocator, .{}, 9);
+    try std.testing.expectEqual(@as(usize, 0), source.node_upserts);
+    try std.testing.expectEqual(@as(usize, 1), source.store_upserts);
 }
 
 test "metadata node operations reject finalization while termination debt remains" {
