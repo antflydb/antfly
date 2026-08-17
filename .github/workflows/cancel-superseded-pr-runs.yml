@@ -5,6 +5,10 @@ on:
     branches: ["main"]
     types: [synchronize]
 
+concurrency:
+  group: cancel-superseded-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 # This privileged workflow intentionally never checks out or executes pull
 # request code. It only reconciles Actions runs using trusted default-branch
 # JavaScript from actions/github-script.
@@ -22,7 +26,7 @@ jobs:
         with:
           script: |
             const { owner, repo } = context.repo;
-            const pull = context.payload.pull_request;
+            const eventPull = context.payload.pull_request;
             const activeStatuses = new Set([
               "in_progress",
               "pending",
@@ -30,6 +34,26 @@ jobs:
               "requested",
               "waiting",
             ]);
+
+            const { data: pull } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: eventPull.number,
+            });
+            if (pull.head.sha !== eventPull.head.sha) {
+              core.info(
+                `Skipping cleanup for ${eventPull.head.sha}; ` +
+                `PR #${pull.number} is now at ${pull.head.sha}`,
+              );
+              return;
+            }
+            const pullHeadRepo = pull.head.repo?.full_name;
+            if (!pullHeadRepo) {
+              core.warning(
+                `Skipping cleanup because PR #${pull.number} has no head repository`,
+              );
+              return;
+            }
 
             const runs = await github.paginate(
               github.rest.actions.listWorkflowRunsForRepo,
@@ -41,14 +65,39 @@ jobs:
                 per_page: 100,
               },
             );
-            const staleRuns = runs.filter((run) =>
-              run.head_sha !== pull.head.sha &&
-              activeStatuses.has(run.status) &&
-              run.pull_requests.some((candidate) => candidate.number === pull.number)
-            );
+            const staleRuns = runs.filter((run) => {
+              const associatedWithPull = run.pull_requests.some(
+                (candidate) => candidate.number === pull.number,
+              );
+              const matchesPullHead =
+                run.head_repository?.full_name === pullHeadRepo &&
+                run.head_branch === pull.head.ref;
+
+              return (
+                run.head_sha !== pull.head.sha &&
+                activeStatuses.has(run.status) &&
+                (associatedWithPull || matchesPullHead)
+              );
+            });
 
             if (staleRuns.length === 0) {
               core.info("No superseded PR workflow runs are active");
+              return;
+            }
+
+            // Close the window between the first live-head check and pagination.
+            // Per-PR concurrency cancels this job once a newer cleanup starts, and
+            // this check also protects the new head before that cancellation lands.
+            const { data: latestPull } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: pull.number,
+            });
+            if (latestPull.head.sha !== pull.head.sha) {
+              core.info(
+                `Skipping cleanup for ${pull.head.sha}; ` +
+                `PR #${pull.number} is now at ${latestPull.head.sha}`,
+              );
               return;
             }
 
@@ -67,22 +116,56 @@ jobs:
               }
             }
 
-            await new Promise((resolve) => setTimeout(resolve, 15_000));
-            for (const run of staleRuns) {
-              const current = await github.rest.actions.getWorkflowRun({
-                owner,
-                repo,
-                run_id: run.id,
-              });
-              if (!activeStatuses.has(current.data.status)) continue;
+            const pollIntervalMs = 30_000;
+            const pollCount = 4;
+            const stableChecksRequired = 3;
+            const activeRuns = new Map(
+              staleRuns.map((run) => [
+                run.id,
+                { run, lastStatus: run.status, stableChecks: 1 },
+              ]),
+            );
+
+            for (let poll = 1; poll <= pollCount && activeRuns.size > 0; poll++) {
+              await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+              for (const [runId, candidate] of activeRuns) {
+                const current = await github.rest.actions.getWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: runId,
+                });
+                const status = current.data.status;
+                if (!activeStatuses.has(status)) {
+                  activeRuns.delete(runId);
+                  continue;
+                }
+
+                candidate.stableChecks =
+                  status === candidate.lastStatus ? candidate.stableChecks + 1 : 1;
+                candidate.lastStatus = status;
+                core.info(
+                  `Superseded ${candidate.run.name} run ${runId} remains ${status} ` +
+                  `(poll ${poll}/${pollCount})`,
+                );
+              }
+            }
+
+            for (const [runId, candidate] of activeRuns) {
+              if (candidate.stableChecks < stableChecksRequired) {
+                core.warning(
+                  `Leaving superseded ${candidate.run.name} run ${runId} to ` +
+                  `ordinary cancellation because its status changed recently`,
+                );
+                continue;
+              }
 
               core.warning(
-                `Force-cancelling stuck superseded ${run.name} run ${run.id}`,
+                `Force-cancelling stuck superseded ${candidate.run.name} run ${runId}`,
               );
               try {
                 await github.request(
                   "POST /repos/{owner}/{repo}/actions/runs/{run_id}/force-cancel",
-                  { owner, repo, run_id: run.id },
+                  { owner, repo, run_id: runId },
                 );
               } catch (error) {
                 if (error.status !== 409) throw error;
