@@ -38,7 +38,12 @@ export {
   AntflyClient,
   DEFAULT_WRITE_MAX_REQUEST_BYTES,
   DEFAULT_WRITE_MAX_RESPONSE_BYTES,
+  HierarchyCursorStaleError,
+  QUERY_TEMPORARILY_UNAVAILABLE_CODES,
+  type QueryTemporarilyUnavailableCode,
+  QueryTemporarilyUnavailableError,
   type RestoreOptions,
+  StorageReadTemporarilyUnavailableError,
 } from "./client.js";
 export {
   InferenceAPIError,

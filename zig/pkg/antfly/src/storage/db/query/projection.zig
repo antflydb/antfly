@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const document_query = @import("../document_query.zig");
 const search_exec = @import("search_exec.zig");
+const hierarchy_navigation = @import("../../hierarchy_navigation.zig");
 
 pub const SpecialFieldSelection = struct {
     all_artifacts: bool = false,
@@ -183,6 +184,11 @@ pub fn normalizeChunkArtifactForQuery(alloc: Allocator, value: *std.json.Value) 
     if (value.* != .object) return;
     var obj = &value.object;
 
+    // Synthetic `_chunks` and `_artifacts` values are public projections, not
+    // raw storage records. Strip revision-validation metadata here so every
+    // projection path is safe by construction, including nested values.
+    hierarchy_navigation.stripPublicInternalFieldsValue(alloc, value);
+
     if (obj.get("_id") == null) {
         if (obj.get("_chunk_id")) |chunk_id| {
             try putOwnedValue(alloc, obj, "_id", try cloneJsonValue(alloc, chunk_id));
@@ -294,4 +300,23 @@ fn mergeStoredDocumentWithSpecialFields(
     const json = try std.json.Stringify.valueAlloc(alloc, root, .{});
     freeJsonValue(alloc, &root);
     return json;
+}
+
+test "normalizeChunkArtifactForQuery strips private unit revision metadata" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"_chunk_id\":\"chunk:1\",\"_artifact_unit_fingerprint\":\"private\",\"text\":\"visible\"}",
+        .{},
+    );
+    defer parsed.deinit();
+    var owned = try cloneJsonValue(alloc, parsed.value);
+    defer freeJsonValue(alloc, &owned);
+
+    try normalizeChunkArtifactForQuery(alloc, &owned);
+
+    try std.testing.expect(owned.object.get("_artifact_unit_fingerprint") == null);
+    try std.testing.expectEqualStrings("chunk:1", owned.object.get("_id").?.string);
+    try std.testing.expectEqualStrings("visible", owned.object.get("_content").?.string);
 }

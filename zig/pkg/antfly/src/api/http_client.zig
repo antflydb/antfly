@@ -287,20 +287,29 @@ pub const ApiHttpClient = struct {
         key: []const u8,
         fields: ?[]const u8,
     ) !LookupResponse {
-        const path = if (fields) |field_list|
+        const encoded_table_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_table_name);
+        const encoded_key = try percentEncodePathComponent(self.alloc, key);
+        defer self.alloc.free(encoded_key);
+        const encoded_fields = if (fields) |field_list|
+            try percentEncodePathComponent(self.alloc, field_list)
+        else
+            null;
+        defer if (encoded_fields) |value| self.alloc.free(value);
+        const path = if (fields) |_|
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?fields={s}", .{
                 routes.Routes.tables_prefix,
-                table_name,
+                encoded_table_name,
                 routes.Routes.documents_marker,
-                key,
-                field_list,
+                encoded_key,
+                encoded_fields orelse unreachable,
             })
         else
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
                 routes.Routes.tables_prefix,
-                table_name,
+                encoded_table_name,
                 routes.Routes.documents_marker,
-                key,
+                encoded_key,
             });
         defer self.alloc.free(path);
         const uri = try self.joinRoute(base_uri, path);
@@ -330,20 +339,53 @@ pub const ApiHttpClient = struct {
         key: []const u8,
         fields: ?[]const u8,
     ) !LookupResponse {
-        const suffix = if (fields) |field_list|
-            try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?fields={s}", .{
+        return self.fetchGroupLookupWithControl(base_uri, group_id, table_name, key, fields, "read_index", null, null);
+    }
+
+    pub fn fetchGroupLookupWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        key: []const u8,
+        fields: ?[]const u8,
+        read_consistency: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !LookupResponse {
+        // Group lookups are also used for routed derived-artifact hydration.
+        // Those storage keys are binary and contain namespace bytes and NUL
+        // component terminators, so every externally represented component
+        // must be encoded before it enters an HTTP request target. Fields are
+        // user-controlled JSON paths and must likewise remain a single query
+        // value even when they contain URI delimiters.
+        const encoded_table_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_table_name);
+        const encoded_key = try percentEncodePathComponent(self.alloc, key);
+        defer self.alloc.free(encoded_key);
+        const encoded_consistency = try percentEncodePathComponent(self.alloc, read_consistency);
+        defer self.alloc.free(encoded_consistency);
+        const encoded_fields = if (fields) |field_list|
+            try percentEncodePathComponent(self.alloc, field_list)
+        else
+            null;
+        defer if (encoded_fields) |value| self.alloc.free(value);
+        const suffix = if (fields) |_|
+            try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?fields={s}&read_consistency={s}", .{
                 routes.Routes.tables_prefix,
-                table_name,
+                encoded_table_name,
                 routes.Routes.documents_marker,
-                key,
-                field_list,
+                encoded_key,
+                encoded_fields orelse unreachable,
+                encoded_consistency,
             })
         else
-            try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
+            try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?read_consistency={s}", .{
                 routes.Routes.tables_prefix,
-                table_name,
+                encoded_table_name,
                 routes.Routes.documents_marker,
-                key,
+                encoded_key,
+                encoded_consistency,
             });
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
@@ -351,10 +393,16 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{ .method = .GET, .uri = uri });
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .GET,
+            .uri = uri,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+        });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
@@ -2852,6 +2900,8 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     if (std.mem.eql(u8, body, "TopologyChanged") or std.mem.eql(u8, body, "topology changed")) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "IdentityReadGenerationChanged") or
         std.mem.eql(u8, body, "identity read generation changed")) return error.IdentityReadGenerationChanged;
+    if (std.mem.eql(u8, body, "HierarchyCursorStale") or
+        std.mem.eql(u8, body, "hierarchy cursor stale")) return error.HierarchyCursorStale;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "repair cancelled")) return error.Canceled;
     return error.UnexpectedHttpStatus;
@@ -2914,6 +2964,11 @@ fn parseIdentityReadGenerationHeader(resp: http_common.HttpResponse) !?u64 {
 test "api http client preserves remote transaction decision conflicts" {
     try std.testing.expectEqual(error.DecisionConflict, remoteGroupConflictError("decision conflict"));
     try std.testing.expectEqual(error.DecisionConflict, remoteGroupConflictError("DecisionConflict"));
+}
+
+test "api http client preserves stale hierarchy cursor conflicts" {
+    try std.testing.expectEqual(error.HierarchyCursorStale, remoteGroupConflictError("HierarchyCursorStale"));
+    try std.testing.expectEqual(error.HierarchyCursorStale, remoteGroupConflictError("hierarchy cursor stale"));
 }
 
 test "api http client preserves remote storage read contention" {
@@ -2981,6 +3036,38 @@ test "api http client accepts durable pending batch responses" {
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), response.status);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "\"status\":\"committed_pending\"") != null);
+}
+
+test "api http client encodes lookup route and query components" {
+    const LookupExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expect(std.mem.indexOfScalar(u8, req.uri, 0) == null);
+            try std.testing.expect(std.mem.endsWith(
+                u8,
+                req.uri,
+                "/tables/docs%2Ftenant/documents/%01doc%00%00%20asset?fields=title%2Cowner%26admin",
+            ));
+            return .{
+                .status = 200,
+                .body = try alloc.dupe(u8, "{}"),
+            };
+        }
+    };
+
+    var executor = LookupExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    var response = try client.fetchLookup(
+        "http://127.0.0.1:1",
+        "docs/tenant",
+        "\x01doc\x00\x00\x20asset",
+        "title,owner&admin",
+    );
+    defer response.deinit(std.testing.allocator);
 }
 
 test "api http client preserves retryable group transaction unavailability" {
@@ -3118,12 +3205,26 @@ test "api http client forwards internal query controls and maps remote timeout" 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             try std.testing.expectEqual(@as(u32, 37), req.timeout_ms.?);
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            if (std.mem.indexOf(u8, req.uri, "/join-") == null) {
-                try std.testing.expect(req.cancellation != null);
+            switch (req.method) {
+                .GET => {
+                    if (std.mem.indexOf(u8, req.uri, "%01doc%00%00%20asset") != null) {
+                        try std.testing.expect(std.mem.indexOfScalar(u8, req.uri, 0) == null);
+                        try std.testing.expect(std.mem.indexOf(u8, req.uri, "fields=title%2Cowner%26admin&read_consistency=stale") != null);
+                    } else {
+                        try std.testing.expect(std.mem.indexOf(u8, req.uri, "/documents/doc%3Aa?") != null);
+                        try std.testing.expect(std.mem.indexOf(u8, req.uri, "fields=title&read_consistency=stale") != null);
+                    }
+                    try std.testing.expect(req.cancellation != null);
+                },
+                .POST => if (std.mem.indexOf(u8, req.uri, "/join-") == null) {
+                    try std.testing.expect(req.cancellation != null);
+                },
+                else => return error.TestUnexpectedMethod,
             }
             return .{
-                .status = 408,
+                // The operation layer reports server-side deadlines as 504;
+                // client-side cancellation remains the existing 408 shape.
+                .status = if (req.method == .GET) 504 else 408,
                 .body = try alloc.dupe(u8, "query timeout"),
             };
         }
@@ -3133,6 +3234,8 @@ test "api http client forwards internal query controls and maps remote timeout" 
     var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
     const base_uri = "http://127.0.0.1:1";
     var cancellation = http_common.RequestCancellation{};
+    try std.testing.expectError(error.Timeout, client.fetchGroupLookupWithControl(base_uri, 7, "docs", "doc:a", "title", "stale", 37, &cancellation));
+    try std.testing.expectError(error.Timeout, client.fetchGroupLookupWithControl(base_uri, 7, "docs", "\x01doc\x00\x00\x20asset", "title,owner&admin", "stale", 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupQueryWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupQueryPreflightWithControl(base_uri, 7, "docs", "{}", 0, 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupTextStatsWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
@@ -3145,7 +3248,7 @@ test "api http client forwards internal query controls and maps remote timeout" 
     try std.testing.expectError(error.Timeout, client.fetchGroupGraphExpandWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupGraphHydrateWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupGraphEdgesWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
-    try std.testing.expectEqual(@as(usize, 12), executor.calls);
+    try std.testing.expectEqual(@as(usize, 14), executor.calls);
 }
 
 test "api http client encodes table name for repair cancel callback" {

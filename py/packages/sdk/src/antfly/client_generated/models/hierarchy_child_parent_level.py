@@ -1,9 +1,8 @@
 from enum import Enum
 
 
-class HierarchyGroupByLevel(str, Enum):
+class HierarchyChildParentLevel(str, Enum):
     SOURCE = "source"
-    UNIT = "unit"
 
     def __str__(self) -> str:
         return str(self.value)

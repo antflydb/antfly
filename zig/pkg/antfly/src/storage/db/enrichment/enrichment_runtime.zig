@@ -23,6 +23,7 @@ const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const mem_backend = @import("../../mem_backend.zig");
 const internal_keys = @import("../../internal_keys.zig");
+const hierarchy_navigation = @import("../../hierarchy_navigation.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
 const replay_source_mod = @import("../derived/replay_source.zig");
@@ -35,6 +36,7 @@ const enrichment_state = @import("enrichment_state.zig");
 const embedder_mod = @import("embedder.zig");
 const asset_producer_mod = @import("asset_producer.zig");
 const document_extraction_mod = @import("document_extraction.zig");
+const document_unit_fingerprint = @import("document_unit_fingerprint.zig");
 const artifact_ids = @import("../artifact_ids.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("chunker_stub.zig")
@@ -3405,11 +3407,26 @@ fn processDocumentExtractionAsset(
     defer if (metadata_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
     if (metadata_fingerprint) |fingerprint| {
         if (existing_state) |state| {
-            if (documentExtractionStateFingerprintMatches(runtime.alloc, state, fingerprint)) {
+            if (documentExtractionStateFingerprintMatches(runtime.alloc, state, fingerprint) and
+                documentExtractionStateHasChunkUnitFingerprints(runtime.alloc, state))
+            {
                 if (existing_manifest) |value| {
                     if (!(try documentExtractionManifestHasLastError(runtime.alloc, value))) {
-                        runtime.skip_by_hash_count += 1;
-                        return;
+                        const navigation_ready = ensureRuntimeDocumentExtractionNavigationIndex(
+                            runtime,
+                            request.doc_key,
+                            artifact_name,
+                            fingerprint,
+                            state,
+                            from_generation,
+                        ) catch |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            else => false,
+                        };
+                        if (navigation_ready) {
+                            runtime.skip_by_hash_count += 1;
+                            return;
+                        }
                     }
                 }
             }
@@ -3587,7 +3604,26 @@ fn processDocumentExtractionAsset(
     };
     defer collection_alloc.free(desired_unit_descriptors);
 
-    const new_state = documentExtractionStateValueAlloc(collection_alloc, source_fingerprint, desired_unit_keys.items, desired_unit_descriptors, desired_chunk_keys.items) catch |err| {
+    const navigation_digest = hierarchy_navigation.artifactDigestAlloc(collection_alloc, desired_unit_descriptors) catch |err| {
+        if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
+            return error.DocumentExtractionWorkingSetTooLarge;
+        return err;
+    };
+    defer collection_alloc.free(navigation_digest);
+    const navigation_unit_count = std.math.cast(u32, desired_unit_descriptors.len) orelse
+        return error.InvalidDocumentExtractionState;
+    const navigation_block_count = hierarchy_navigation.blockCount(navigation_unit_count);
+
+    const new_state = documentExtractionStateValueAlloc(
+        collection_alloc,
+        source_fingerprint,
+        desired_unit_keys.items,
+        desired_unit_descriptors,
+        desired_chunk_keys.items,
+        navigation_digest,
+        navigation_block_count,
+        true,
+    ) catch |err| {
         if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
             return error.DocumentExtractionWorkingSetTooLarge;
         return err;
@@ -3598,6 +3634,14 @@ fn processDocumentExtractionAsset(
         if (std.mem.eql(u8, state, new_state)) {
             if (existing_manifest) |value| {
                 if (!(try documentExtractionManifestHasLastError(runtime.alloc, value))) {
+                    _ = try ensureRuntimeDocumentExtractionNavigationIndex(
+                        runtime,
+                        request.doc_key,
+                        artifact_name,
+                        source_fingerprint,
+                        state,
+                        from_generation,
+                    );
                     // Full-index writes may precompute and persist document
                     // extraction before the generated replay reaches this
                     // worker. Preserve the final coverage outcome for an empty
@@ -3646,6 +3690,14 @@ fn processDocumentExtractionAsset(
             try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.changed_artifact_keys, previous_key);
             try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.deleted_keys, previous_key);
         }
+        try appendRuntimeObsoleteNavigationBlockDeletes(
+            runtime.alloc,
+            request.doc_key,
+            artifact_name,
+            previous_state,
+            navigation_block_count,
+            &deletes,
+        );
     }
 
     const empty_units: [0]document_extraction_mod.Unit = .{};
@@ -3797,6 +3849,24 @@ fn processDocumentExtractionAsset(
         .key = try runtime.alloc.dupe(u8, manifest_key),
         .value = try runtime.alloc.dupe(u8, manifest),
     });
+    // Publish the converged manifest, navigation index, and extraction state
+    // in one atomic store batch. Readers reject the preceding in-progress
+    // manifest, so they can observe either the old revision or the complete
+    // new revision, never a hybrid of the two.
+    try appendRuntimeDocumentExtractionNavigationWrites(
+        runtime.alloc,
+        request.doc_key,
+        artifact_name,
+        to_generation,
+        desired_unit_descriptors,
+        navigation_digest,
+        navigation_block_count,
+        &writes,
+    );
+    try writes.append(runtime.alloc, .{
+        .key = try runtime.alloc.dupe(u8, state_key),
+        .value = try runtime.alloc.dupe(u8, new_state),
+    });
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
 
     try storePutBatchWithRetry(runtime, writes.items, deletes.items);
@@ -3833,13 +3903,6 @@ fn processDocumentExtractionAsset(
         try finalizeEmptyDocumentExtractionCoverage(runtime, window, request, manifest);
     }
     try flushGeneratedReplayWindow(runtime, window);
-
-    try writes.append(runtime.alloc, .{
-        .key = try runtime.alloc.dupe(u8, state_key),
-        .value = try runtime.alloc.dupe(u8, new_state),
-    });
-    try storePutBatchWithRetry(runtime, writes.items, deletes.items);
-    clearRuntimeKVBatch(runtime, &writes, &deletes);
 }
 
 fn writeDocumentExtractionFailureManifest(
@@ -3955,6 +4018,33 @@ fn deleteDocumentExtractionForRuntime(
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
             try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, previous_key);
         }
+        try appendRuntimeDocumentExtractionNavigationDeleteKeys(
+            runtime.alloc,
+            doc_key,
+            artifact_name,
+            previous_state,
+            &deletes,
+        );
+    } else {
+        // Deletion is infrequent and correctness matters more than avoiding a
+        // bounded prefix scan here. Recover exact block keys so a missing or
+        // externally removed state cannot strand navigation storage.
+        var recovered = RuntimeDocumentExtractionPreviousState{
+            .navigation_block_keys = try scanRuntimeDocumentExtractionNavigationBlockKeys(
+                runtime,
+                doc_key,
+                artifact_name,
+            ),
+            .recovered_from_store_scan = true,
+        };
+        defer recovered.deinit(runtime.alloc);
+        try appendRuntimeDocumentExtractionNavigationDeleteKeys(
+            runtime.alloc,
+            doc_key,
+            artifact_name,
+            recovered,
+            &deletes,
+        );
     }
 
     try storePutBatchWithRetry(runtime, &.{}, deletes.items);
@@ -5715,7 +5805,16 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
         const unit_range_id = try documentExtractionRangeIdAlloc(working_alloc, documentExtractionUnitRangeIndexFromTextLengths(self.unit_text_lengths, self.unit_index));
         defer working_alloc.free(unit_range_id);
         const unit_route = documentExtractionRangeRoute(self.previous_child_ranges, unit_range_id, "unit", self.artifact_name);
-        const payload = try documentUnitPayloadAlloc(working_alloc, self.doc_key, self.artifact_name, unit.*, self.source_url, self.info.content_type, unit_route);
+        const payload = try documentUnitPayloadAlloc(
+            working_alloc,
+            self.doc_key,
+            self.artifact_name,
+            unit.*,
+            self.desired_unit_descriptors[self.unit_index].fingerprint,
+            self.source_url,
+            self.info.content_type,
+            unit_route,
+        );
         defer working_alloc.free(payload);
 
         if (self.mode == .store_artifacts) {
@@ -5749,7 +5848,15 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
         }
         try self.accountAndFlushReplay(unit_working_bytes, generated_cache_bytes);
 
-        try appendRuntimeDocumentUnitChunkWrites(self, working_alloc, unit_key, unit.*, unit_working_bytes, generated_cache_bytes);
+        try appendRuntimeDocumentUnitChunkWrites(
+            self,
+            working_alloc,
+            unit_key,
+            self.desired_unit_descriptors[self.unit_index].fingerprint,
+            unit.*,
+            unit_working_bytes,
+            generated_cache_bytes,
+        );
         self.unit_index += 1;
         try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
 
@@ -5770,6 +5877,7 @@ fn appendRuntimeDocumentUnitChunkWrites(
     context: *RuntimeDocumentExtractionMaterializeContext,
     working_alloc: Allocator,
     unit_key: []const u8,
+    unit_fingerprint: []const u8,
     unit: document_extraction_mod.Unit,
     unit_working_bytes: usize,
     generated_cache_bytes: usize,
@@ -5803,7 +5911,7 @@ fn appendRuntimeDocumentUnitChunkWrites(
             const chunk_key_index = documentExtractionKeyIndex(context.desired_chunk_keys, chunk_key) orelse return error.DocumentExtractionChunkRangeMissing;
             const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, context.chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
             const chunk_route = documentExtractionRangeRoute(context.previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
-            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, context.doc_key, unit_key, entry.name, context.artifact_name, entry.source_field, unit, chunk, true, chunk_route);
+            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, context.doc_key, unit_key, unit_fingerprint, entry.name, context.artifact_name, entry.source_field, unit, chunk, true, chunk_route);
             if (context.mode == .store_artifacts) {
                 try appendOwnedRuntimeKVPair(context.resource_tracker, context.runtime.alloc, context.writes, chunk_key, payload);
             } else {
@@ -5845,6 +5953,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
     alloc: Allocator,
     doc_key: []const u8,
     unit_key: []const u8,
+    unit_fingerprint: []const u8,
     artifact_name: []const u8,
     source_artifact_name: []const u8,
     source_field: []const u8,
@@ -5857,6 +5966,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, try alloc.dupe(u8, "_parent_doc_key"), .{ .string = try alloc.dupe(u8, doc_key) });
     try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_key"), .{ .string = try alloc.dupe(u8, unit_key) });
+    try obj.put(alloc, try alloc.dupe(u8, hierarchy_navigation.unit_fingerprint_field), .{ .string = try alloc.dupe(u8, unit_fingerprint) });
     try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_id"), .{ .string = try alloc.dupe(u8, unit.unit_id) });
     try obj.put(alloc, try alloc.dupe(u8, "_artifact_name"), .{ .string = try alloc.dupe(u8, artifact_name) });
     try obj.put(alloc, try alloc.dupe(u8, "_source_artifact_name"), .{ .string = try alloc.dupe(u8, source_artifact_name) });
@@ -8493,12 +8603,15 @@ const RuntimeDocumentExtractionPreviousState = struct {
     unit_keys: []const []const u8 = &.{},
     unit_descriptors: []DocumentExtractionUnitDescriptor = &.{},
     chunk_keys: []const []const u8 = &.{},
+    navigation_block_count: u32 = 0,
+    navigation_block_keys: []const []const u8 = &.{},
     recovered_from_store_scan: bool = false,
 
     fn deinit(self: *@This(), alloc: Allocator) void {
         freeOwnedConstKeySlice(alloc, self.unit_keys);
         freeDocumentExtractionUnitDescriptors(alloc, self.unit_descriptors);
         freeOwnedConstKeySlice(alloc, self.chunk_keys);
+        freeOwnedConstKeySlice(alloc, self.navigation_block_keys);
         self.* = undefined;
     }
 };
@@ -8510,7 +8623,14 @@ fn loadRuntimeDocumentExtractionPreviousState(
     state: []const u8,
 ) !RuntimeDocumentExtractionPreviousState {
     if (loadRuntimeDocumentExtractionPreviousStateFromJson(runtime.alloc, state)) |parsed| {
-        return parsed;
+        var out = parsed;
+        errdefer out.deinit(runtime.alloc);
+        out.navigation_block_keys = try scanRuntimeDocumentExtractionNavigationBlockKeys(
+            runtime,
+            doc_key,
+            artifact_name,
+        );
+        return out;
     } else |err| switch (err) {
         error.OutOfMemory => return err,
         else => {},
@@ -8526,6 +8646,13 @@ fn loadRuntimeDocumentExtractionPreviousStateFromJson(alloc: Allocator, state: [
     out.unit_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
     out.unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(alloc, state);
     out.chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
+    out.navigation_block_count = try documentExtractionStateNavigationBlockCount(alloc, state);
+    const unit_count = std.math.cast(u32, out.unit_keys.len) orelse return error.InvalidDocumentExtractionState;
+    if (out.navigation_block_count != 0 and
+        out.navigation_block_count != hierarchy_navigation.blockCount(unit_count))
+    {
+        return error.InvalidDocumentExtractionState;
+    }
     return out;
 }
 
@@ -8572,6 +8699,9 @@ fn scanRuntimeDocumentExtractionPreviousStateFromStore(
 
     out.unit_keys = try unit_keys.toOwnedSlice(runtime.alloc);
     out.chunk_keys = try chunk_keys.toOwnedSlice(runtime.alloc);
+    out.navigation_block_keys = try scanRuntimeDocumentExtractionNavigationBlockKeys(runtime, doc_key, artifact_name);
+    out.navigation_block_count = std.math.cast(u32, out.navigation_block_keys.len) orelse
+        return error.InvalidDocumentExtractionState;
     out.unit_descriptors = try runtime.alloc.alloc(DocumentExtractionUnitDescriptor, out.unit_keys.len);
     for (out.unit_descriptors) |*descriptor| {
         descriptor.* = .{ .key = "", .fingerprint = "" };
@@ -8585,97 +8715,130 @@ fn scanRuntimeDocumentExtractionPreviousStateFromStore(
     return out;
 }
 
+fn scanRuntimeDocumentExtractionNavigationBlockKeys(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]const []const u8 {
+    const prefix = try internal_keys.documentUnitNavigationBlockPrefixAlloc(
+        runtime.alloc,
+        doc_key,
+        artifact_name,
+    );
+    defer runtime.alloc.free(prefix);
+    const rows = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
+    defer backend_scan.freeResults(runtime.alloc, rows);
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (keys.items) |key| runtime.alloc.free(@constCast(key));
+        keys.deinit(runtime.alloc);
+    }
+    for (rows) |row| {
+        // The prefix ends immediately before the fixed-width block number.
+        // Ignore malformed suffixes rather than broadening a repair deletion.
+        if (row.key.len != prefix.len + @sizeOf(u32)) continue;
+        try keys.append(runtime.alloc, try runtime.alloc.dupe(u8, row.key));
+    }
+    return try keys.toOwnedSlice(runtime.alloc);
+}
+
+fn cleanupRuntimeObsoleteNavigationBlocks(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    keep_block_count: u32,
+) !void {
+    const existing_keys = try scanRuntimeDocumentExtractionNavigationBlockKeys(
+        runtime,
+        doc_key,
+        artifact_name,
+    );
+    defer freeOwnedConstKeySlice(runtime.alloc, existing_keys);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| runtime.alloc.free(@constCast(key));
+        deletes.deinit(runtime.alloc);
+    }
+    for (existing_keys) |key| {
+        const block_index = try runtimeNavigationBlockIndex(key);
+        if (block_index >= keep_block_count) {
+            try appendUniqueDupeConstKey(runtime.alloc, &deletes, key);
+        }
+    }
+    if (deletes.items.len > 0) try storePutBatchWithRetry(runtime, &.{}, deletes.items);
+}
+
+fn runtimeNavigationBlockIndex(key: []const u8) !u32 {
+    if (key.len < @sizeOf(u32)) return error.InvalidDocumentExtractionState;
+    return std.mem.readInt(u32, key[key.len - @sizeOf(u32) ..][0..@sizeOf(u32)], .big);
+}
+
+fn documentExtractionStateNavigationBlockCount(alloc: Allocator, state: []const u8) !u32 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, state, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return 0;
+    const value = parsed.value.object.get("navigation_block_count") orelse return 0;
+    if (value != .integer) return error.InvalidDocumentExtractionState;
+    return std.math.cast(u32, value.integer) orelse error.InvalidDocumentExtractionState;
+}
+
+fn appendRuntimeObsoleteNavigationBlockDeletes(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    previous_state: RuntimeDocumentExtractionPreviousState,
+    next_block_count: u32,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    if (previous_state.navigation_block_keys.len > 0) {
+        for (previous_state.navigation_block_keys) |key| {
+            const block_index = try runtimeNavigationBlockIndex(key);
+            if (block_index >= next_block_count) {
+                try appendUniqueDupeConstKey(alloc, deletes, key);
+            }
+        }
+        return;
+    }
+    var block_index = next_block_count;
+    while (block_index < previous_state.navigation_block_count) : (block_index += 1) {
+        try appendUniqueOwnedConstKey(
+            alloc,
+            deletes,
+            try internal_keys.documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, block_index),
+        );
+    }
+}
+
+fn appendRuntimeDocumentExtractionNavigationDeleteKeys(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    previous_state: RuntimeDocumentExtractionPreviousState,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    try appendUniqueOwnedConstKey(
+        alloc,
+        deletes,
+        try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, doc_key, artifact_name),
+    );
+    if (previous_state.navigation_block_keys.len > 0) {
+        for (previous_state.navigation_block_keys) |key| {
+            try appendUniqueDupeConstKey(alloc, deletes, key);
+        }
+        return;
+    }
+    var block_index: u32 = 0;
+    while (block_index < previous_state.navigation_block_count) : (block_index += 1) {
+        try appendUniqueOwnedConstKey(
+            alloc,
+            deletes,
+            try internal_keys.documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, block_index),
+        );
+    }
+}
+
 fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extraction_mod.Unit) ![]u8 {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(unit.unit_id);
-    hasher.update(unit.unit_type);
-    hasher.update(unit.text);
-    hasher.update(unit.method);
-    if (unit.source_path) |source_path| hasher.update(source_path);
-    if (unit.extraction_status) |extraction_status| hasher.update(extraction_status);
-    if (unit.source_sha256) |source_sha256| hasher.update(source_sha256);
-    if (unit.byte_length) |byte_length| {
-        var buf: [@sizeOf(u64)]u8 = undefined;
-        std.mem.writeInt(u64, &buf, byte_length, .big);
-        hasher.update(&buf);
-    }
-    hasher.update(if (unit.ocr_used) "ocr:1" else "ocr:0");
-    hasher.update(if (unit.ocr_attempted) "ocr_attempted:1" else "ocr_attempted:0");
-    if (unit.ocr_render_dpi) |dpi| {
-        var dpi_buf: [@sizeOf(u16)]u8 = undefined;
-        std.mem.writeInt(u16, &dpi_buf, dpi, .big);
-        hasher.update(&dpi_buf);
-    }
-    if (unit.ocr_effective_render_dpi) |dpi| {
-        var dpi_buf: [@sizeOf(u16)]u8 = undefined;
-        std.mem.writeInt(u16, &dpi_buf, dpi, .big);
-        hasher.update(&dpi_buf);
-    }
-    if (unit.ocr_rendered_width) |value| hasher.update(std.mem.asBytes(&value));
-    if (unit.ocr_rendered_height) |value| hasher.update(std.mem.asBytes(&value));
-    if (unit.ocr_rendered_bytes) |value| hasher.update(std.mem.asBytes(&value));
-    if (unit.ocr_failure_stage) |value| hasher.update(value);
-    if (unit.ocr_failure_retryable) |value| hasher.update(if (value) "ocr_failure_retryable:1" else "ocr_failure_retryable:0");
-    if (unit.ocr_trigger_reasons) |value| hasher.update(value);
-    if (unit.ocr_embedded_quality) |value| hasher.update(value);
-    if (unit.ocr_output_quality) |value| hasher.update(value);
-    if (unit.ocr_confidence) |confidence| {
-        var value = confidence;
-        hasher.update(std.mem.asBytes(&value));
-    }
-    if (unit.ocr_bbox) |bbox| {
-        for (bbox) |coord| {
-            var value = coord;
-            hasher.update(std.mem.asBytes(&value));
-        }
-    }
-    hasher.update(if (unit.transcript_used) "transcript:1" else "transcript:0");
-    if (unit.transcript_confidence) |confidence| {
-        var value = confidence;
-        hasher.update(std.mem.asBytes(&value));
-    }
-    if (unit.extraction_warning) |warning| hasher.update(warning);
-    if (unit.page_number) |page_number| {
-        var buf: [@sizeOf(u32)]u8 = undefined;
-        std.mem.writeInt(u32, &buf, page_number, .big);
-        hasher.update(&buf);
-    }
-    if (unit.page_label) |page_label| hasher.update(page_label);
-    if (unit.page_bbox) |bbox| {
-        for (bbox) |coord| {
-            const coord_value: u64 = @bitCast(coord);
-            hasher.update(std.mem.asBytes(&coord_value));
-        }
-    }
-    if (unit.page_rotation) |rotation| {
-        var buf: [@sizeOf(i32)]u8 = undefined;
-        std.mem.writeInt(i32, &buf, rotation, .big);
-        hasher.update(&buf);
-    }
-    for (unit.text_regions) |region| {
-        for (region.span) |span| {
-            var buf: [@sizeOf(u32)]u8 = undefined;
-            std.mem.writeInt(u32, &buf, span, .big);
-            hasher.update(&buf);
-        }
-        for (region.bbox) |coord| {
-            const coord_value: u64 = @bitCast(coord);
-            hasher.update(std.mem.asBytes(&coord_value));
-        }
-    }
-    if (unit.char_start) |char_start| {
-        var buf: [@sizeOf(u32)]u8 = undefined;
-        std.mem.writeInt(u32, &buf, char_start, .big);
-        hasher.update(&buf);
-    }
-    if (unit.char_end) |char_end| {
-        var buf: [@sizeOf(u32)]u8 = undefined;
-        std.mem.writeInt(u32, &buf, char_end, .big);
-        hasher.update(&buf);
-    }
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    return try hexBytesAlloc(alloc, &digest);
+    return try document_unit_fingerprint.fingerprintAlloc(alloc, unit);
 }
 
 fn documentExtractionUnitDescriptorsFromKeysAlloc(
@@ -8702,12 +8865,154 @@ fn freeDocumentExtractionUnitDescriptors(alloc: Allocator, descriptors: []Docume
     if (descriptors.len > 0) alloc.free(descriptors);
 }
 
+fn appendRuntimeDocumentExtractionNavigationWrites(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    generation: u64,
+    descriptors: []const DocumentExtractionUnitDescriptor,
+    digest: []const u8,
+    block_count: u32,
+    writes: *std.ArrayListUnmanaged(KVPair),
+) !void {
+    const unit_count = std.math.cast(u32, descriptors.len) orelse return error.InvalidDocumentExtractionState;
+    if (block_count != hierarchy_navigation.blockCount(unit_count)) return error.InvalidDocumentExtractionState;
+    const summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, doc_key, artifact_name);
+    defer alloc.free(summary_key);
+    const summary = try hierarchy_navigation.summaryValueAlloc(alloc, generation, digest, unit_count, block_count);
+    defer alloc.free(summary);
+    try writes.append(alloc, .{
+        .key = try alloc.dupe(u8, summary_key),
+        .value = try alloc.dupe(u8, summary),
+    });
+
+    var block_index: u32 = 0;
+    while (block_index < block_count) : (block_index += 1) {
+        const start = @as(usize, block_index) * hierarchy_navigation.block_size;
+        const end = @min(start + hierarchy_navigation.block_size, descriptors.len);
+        const block_key = try internal_keys.documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, block_index);
+        defer alloc.free(block_key);
+        const block_value = try hierarchy_navigation.blockValueAlloc(alloc, block_index, descriptors[start..end]);
+        defer alloc.free(block_value);
+        try writes.append(alloc, .{
+            .key = try alloc.dupe(u8, block_key),
+            .value = try alloc.dupe(u8, block_value),
+        });
+    }
+}
+
+fn ensureRuntimeDocumentExtractionNavigationIndex(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_fingerprint: []const u8,
+    state: []const u8,
+    generation: u64,
+) !bool {
+    const summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(runtime.alloc, doc_key, artifact_name);
+    defer runtime.alloc.free(summary_key);
+    const existing_summary = storeGetAlloc(runtime, summary_key) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    };
+    defer if (existing_summary) |summary| runtime.alloc.free(summary);
+    if (existing_summary) |summary| {
+        if (try hierarchy_navigation.indexMetadataMatches(runtime.alloc, state, summary, generation)) {
+            try cleanupRuntimeObsoleteNavigationBlocks(
+                runtime,
+                doc_key,
+                artifact_name,
+                try documentExtractionStateNavigationBlockCount(runtime.alloc, state),
+            );
+            return true;
+        }
+    }
+
+    const unit_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
+    defer freeOwnedConstKeySlice(runtime.alloc, unit_keys);
+    const chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
+    defer freeOwnedConstKeySlice(runtime.alloc, chunk_keys);
+    const descriptors = try documentExtractionStateUnitDescriptorsAlloc(runtime.alloc, state);
+    defer freeDocumentExtractionUnitDescriptors(runtime.alloc, descriptors);
+    if (descriptors.len != unit_keys.len) return false;
+    for (descriptors, unit_keys) |descriptor, unit_key| {
+        if (!std.mem.eql(u8, descriptor.key, unit_key)) return false;
+        if (descriptor.fingerprint.len == 0) return false;
+        var unit_ref = (try artifact_ids.decodeArtifactRefAlloc(runtime.alloc, descriptor.key)) orelse return false;
+        defer unit_ref.deinit(runtime.alloc);
+        if (unit_ref.kind != .asset or unit_ref.unit_id == null or
+            !std.mem.eql(u8, unit_ref.document_id, doc_key) or
+            !std.mem.eql(u8, unit_ref.name, artifact_name)) return false;
+    }
+
+    const digest = try hierarchy_navigation.artifactDigestAlloc(runtime.alloc, descriptors);
+    defer runtime.alloc.free(digest);
+    const unit_count = std.math.cast(u32, descriptors.len) orelse return error.InvalidDocumentExtractionState;
+    const block_count = hierarchy_navigation.blockCount(unit_count);
+    const indexed_state = try documentExtractionStateValueAlloc(
+        runtime.alloc,
+        source_fingerprint,
+        unit_keys,
+        descriptors,
+        chunk_keys,
+        digest,
+        block_count,
+        documentExtractionStateHasChunkUnitFingerprints(runtime.alloc, state),
+    );
+    defer runtime.alloc.free(indexed_state);
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer {
+        for (writes.items) |write| {
+            runtime.alloc.free(@constCast(write.key));
+            runtime.alloc.free(@constCast(write.value));
+        }
+        writes.deinit(runtime.alloc);
+    }
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| runtime.alloc.free(@constCast(key));
+        deletes.deinit(runtime.alloc);
+    }
+    try appendRuntimeDocumentExtractionNavigationWrites(
+        runtime.alloc,
+        doc_key,
+        artifact_name,
+        generation,
+        descriptors,
+        digest,
+        block_count,
+        &writes,
+    );
+    const state_key = try assetStateKeyAlloc(runtime.alloc, doc_key, artifact_name);
+    defer runtime.alloc.free(state_key);
+    try writes.append(runtime.alloc, .{
+        .key = try runtime.alloc.dupe(u8, state_key),
+        .value = try runtime.alloc.dupe(u8, indexed_state),
+    });
+    const existing_block_keys = try scanRuntimeDocumentExtractionNavigationBlockKeys(
+        runtime,
+        doc_key,
+        artifact_name,
+    );
+    defer freeOwnedConstKeySlice(runtime.alloc, existing_block_keys);
+    for (existing_block_keys) |key| {
+        const existing_index = try runtimeNavigationBlockIndex(key);
+        if (existing_index >= block_count) try appendUniqueDupeConstKey(runtime.alloc, &deletes, key);
+    }
+    try storePutBatchWithRetry(runtime, writes.items, deletes.items);
+    return true;
+}
+
 fn documentExtractionStateValueAlloc(
     alloc: Allocator,
     fingerprint: []const u8,
     unit_keys: []const []const u8,
     unit_descriptors: []const DocumentExtractionUnitDescriptor,
     chunk_keys: []const []const u8,
+    navigation_digest: []const u8,
+    navigation_block_count: u32,
+    chunk_unit_fingerprints: bool,
 ) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, .{
         .kind = "document_extraction_state_v1",
@@ -8715,7 +9020,19 @@ fn documentExtractionStateValueAlloc(
         .unit_keys = unit_keys,
         .unit_descriptors = unit_descriptors,
         .chunk_keys = chunk_keys,
+        .navigation_digest = navigation_digest,
+        .navigation_block_count = navigation_block_count,
+        .navigation_block_size = hierarchy_navigation.block_size,
+        .chunk_unit_fingerprint_version = if (chunk_unit_fingerprints) document_unit_fingerprint.current_state_version else @as(u8, 0),
     }, .{});
+}
+
+fn documentExtractionStateHasChunkUnitFingerprints(alloc: Allocator, state: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, state, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const version = parsed.value.object.get("chunk_unit_fingerprint_version") orelse return false;
+    return document_unit_fingerprint.stateVersionIsCurrent(version);
 }
 
 fn documentExtractionStateFingerprintMatches(alloc: Allocator, state: []const u8, fingerprint: []const u8) bool {
@@ -8844,6 +9161,7 @@ fn documentUnitPayloadAlloc(
     doc_key: []const u8,
     artifact_name: []const u8,
     unit: document_extraction_mod.Unit,
+    unit_fingerprint: []const u8,
     source_url: []const u8,
     content_type: []const u8,
     route: DocumentExtractionRangeRoute,
@@ -8856,6 +9174,7 @@ fn documentUnitPayloadAlloc(
         ._artifact_range_kind = "unit",
         ._artifact_route_status = route.route_status,
         ._artifact_owner_group_id = owner_group_id,
+        ._artifact_unit_fingerprint = unit_fingerprint,
         .unit_id = unit.unit_id,
         .unit_type = unit.unit_type,
         .text = unit.text,
@@ -10199,7 +10518,25 @@ fn appendUniqueDupeKey(alloc: Allocator, keys: *std.ArrayListUnmanaged([]u8), ke
     try keys.append(alloc, try alloc.dupe(u8, key));
 }
 
+fn appendUniqueDupeConstKey(alloc: Allocator, keys: *std.ArrayListUnmanaged([]const u8), key: []const u8) !void {
+    for (keys.items) |candidate| {
+        if (std.mem.eql(u8, candidate, key)) return;
+    }
+    try keys.append(alloc, try alloc.dupe(u8, key));
+}
+
 fn appendUniqueOwnedKey(alloc: Allocator, keys: *std.ArrayListUnmanaged([]u8), key: []u8) !void {
+    errdefer alloc.free(key);
+    for (keys.items) |candidate| {
+        if (std.mem.eql(u8, candidate, key)) {
+            alloc.free(key);
+            return;
+        }
+    }
+    try keys.append(alloc, key);
+}
+
+fn appendUniqueOwnedConstKey(alloc: Allocator, keys: *std.ArrayListUnmanaged([]const u8), key: []u8) !void {
     errdefer alloc.free(key);
     for (keys.items) |candidate| {
         if (std.mem.eql(u8, candidate, key)) {
@@ -11982,7 +12319,7 @@ test "document extraction generated OCR batch fallback isolates malformed batch 
 
 test "enrichment runtime document extraction state parses byte-array keys" {
     const alloc = std.testing.allocator;
-    const state = "{\"kind\":\"document_extraction_state_v1\",\"fingerprint\":\"source\",\"unit_keys\":[[65,0,255]],\"unit_descriptors\":[{\"key\":[65,0,255],\"fingerprint\":\"fp\"}],\"chunk_keys\":[[66,1,254]]}";
+    const state = "{\"kind\":\"document_extraction_state_v1\",\"fingerprint\":\"source\",\"unit_keys\":[[65,0,255]],\"unit_descriptors\":[{\"key\":[65,0,255],\"fingerprint\":\"fp\"}],\"chunk_keys\":[[66,1,254]],\"navigation_block_count\":1}";
 
     var parsed = try loadRuntimeDocumentExtractionPreviousStateFromJson(alloc, state);
     defer parsed.deinit(alloc);
@@ -11996,6 +12333,105 @@ test "enrichment runtime document extraction state parses byte-array keys" {
     try std.testing.expectEqualStrings("fp", parsed.unit_descriptors[0].fingerprint);
     try std.testing.expectEqual(@as(usize, 1), parsed.chunk_keys.len);
     try std.testing.expectEqualSlices(u8, &expected_chunk_key, parsed.chunk_keys[0]);
+    try std.testing.expectEqual(@as(u32, 1), parsed.navigation_block_count);
+}
+
+test "enrichment runtime navigation cleanup removes superseded and deleted blocks" {
+    const alloc = std.testing.allocator;
+    const previous = RuntimeDocumentExtractionPreviousState{ .navigation_block_count = 3 };
+
+    var shrink_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (shrink_deletes.items) |key| alloc.free(@constCast(key));
+        shrink_deletes.deinit(alloc);
+    }
+    try appendRuntimeObsoleteNavigationBlockDeletes(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        previous,
+        1,
+        &shrink_deletes,
+    );
+    try std.testing.expectEqual(@as(usize, 2), shrink_deletes.items.len);
+    for (shrink_deletes.items, 1..) |actual, block_index| {
+        const expected = try internal_keys.documentUnitNavigationBlockKeyAlloc(
+            alloc,
+            "doc:a",
+            "document_units_v1",
+            @intCast(block_index),
+        );
+        defer alloc.free(expected);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+    }
+
+    const orphan = try internal_keys.documentUnitNavigationBlockKeyAlloc(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        7,
+    );
+    defer alloc.free(orphan);
+    const exact_keys = [_][]const u8{orphan};
+    const recovered = RuntimeDocumentExtractionPreviousState{
+        .navigation_block_count = 1,
+        .navigation_block_keys = &exact_keys,
+    };
+    var orphan_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (orphan_deletes.items) |key| alloc.free(@constCast(key));
+        orphan_deletes.deinit(alloc);
+    }
+    try appendRuntimeObsoleteNavigationBlockDeletes(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        recovered,
+        1,
+        &orphan_deletes,
+    );
+    try std.testing.expectEqual(@as(usize, 1), orphan_deletes.items.len);
+    try std.testing.expectEqualSlices(u8, orphan, orphan_deletes.items[0]);
+
+    var artifact_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (artifact_deletes.items) |key| alloc.free(@constCast(key));
+        artifact_deletes.deinit(alloc);
+    }
+    try appendRuntimeDocumentExtractionNavigationDeleteKeys(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        previous,
+        &artifact_deletes,
+    );
+    try std.testing.expectEqual(@as(usize, 4), artifact_deletes.items.len);
+    const expected_summary = try internal_keys.documentUnitNavigationSummaryKeyAlloc(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+    );
+    defer alloc.free(expected_summary);
+    try std.testing.expectEqualSlices(u8, expected_summary, artifact_deletes.items[0]);
+    for (artifact_deletes.items[1..], 0..) |actual, block_index| {
+        const expected = try internal_keys.documentUnitNavigationBlockKeyAlloc(
+            alloc,
+            "doc:a",
+            "document_units_v1",
+            @intCast(block_index),
+        );
+        defer alloc.free(expected);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+    }
+}
+
+test "enrichment runtime rejects unbounded navigation block counts" {
+    const alloc = std.testing.allocator;
+    const state = "{\"unit_keys\":[\"unit:1\"],\"unit_descriptors\":[{\"key\":\"unit:1\",\"fingerprint\":\"fp\"}],\"chunk_keys\":[],\"navigation_block_count\":4294967295}";
+    try std.testing.expectError(
+        error.InvalidDocumentExtractionState,
+        loadRuntimeDocumentExtractionPreviousStateFromJson(alloc, state),
+    );
 }
 
 test "enrichment runtime document extraction manifest uses v2 range and merge shape" {
@@ -12079,7 +12515,18 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
         .text_bytes = 123,
     }};
 
-    const state = try documentExtractionStateValueAlloc(alloc, "source-fingerprint", &unit_keys, &desired_descriptors, &chunk_keys);
+    const navigation_digest = try hierarchy_navigation.artifactDigestAlloc(alloc, &desired_descriptors);
+    defer alloc.free(navigation_digest);
+    const state = try documentExtractionStateValueAlloc(
+        alloc,
+        "source-fingerprint",
+        &unit_keys,
+        &desired_descriptors,
+        &chunk_keys,
+        navigation_digest,
+        hierarchy_navigation.blockCount(@intCast(desired_descriptors.len)),
+        true,
+    );
     defer alloc.free(state);
     try std.testing.expect(std.mem.indexOf(u8, state, "\"unit_descriptors\"") != null);
 

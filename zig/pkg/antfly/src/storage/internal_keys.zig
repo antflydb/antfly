@@ -31,6 +31,8 @@ pub const asset_state_kind: u8 = 0x33;
 pub const graph_asset_state_kind: u8 = 0x34;
 pub const document_unit_record_kind: u8 = 0x35;
 pub const derived_coverage_kind: u8 = 0x36;
+pub const document_unit_navigation_summary_kind: u8 = 0x37;
+pub const document_unit_navigation_block_kind: u8 = 0x38;
 pub const derived_coverage_outcome_marker_kind: u8 = 0x00;
 pub const derived_coverage_outcome_count_kind: u8 = 0xff;
 
@@ -1164,6 +1166,73 @@ pub fn matchesAssetArtifactName(key: []const u8, artifact_name: []const u8) bool
     return false;
 }
 
+pub fn isDocumentUnitArtifactRecordKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    pos += 1;
+    if (!componentEquals(key, pos, "asset")) return false;
+    pos = findComponentTerminator(key, pos).? + 2;
+    const name_term = findComponentTerminator(key, pos) orelse return false;
+    pos = name_term + 2;
+    if (pos >= key.len or key[pos] != document_unit_record_kind) return false;
+    pos += 1;
+    const unit_term = findComponentTerminator(key, pos) orelse return false;
+    return unit_term + 2 == key.len;
+}
+
+/// Parent-owned compact hierarchy summary. Keeping navigation metadata outside
+/// the unit payload namespace lets sequential browsing seek without loading
+/// every page body or reparsing the complete extraction state.
+pub fn documentUnitNavigationSummaryKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, document_unit_navigation_summary_kind);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// A fixed-size parent-owned block of unit keys and fingerprints. The block
+/// number is big-endian so the keys retain traversal order for diagnostics and
+/// repair tooling even though the query path performs direct point reads.
+pub fn documentUnitNavigationBlockKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    block_index: u32,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).fromOwnedSlice(
+        try documentUnitNavigationBlockPrefixAlloc(alloc, doc_key, artifact_name),
+    );
+    defer list.deinit(alloc);
+    var encoded_index: [4]u8 = undefined;
+    std.mem.writeInt(u32, &encoded_index, block_index, .big);
+    try list.appendSlice(alloc, &encoded_index);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// Prefix shared by every compact navigation block for one extraction
+/// artifact. Repair and deletion paths use it to reclaim exact persisted keys
+/// when the state record is missing or corrupt.
+pub fn documentUnitNavigationBlockPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, document_unit_navigation_block_kind);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
 /// Returns true if key is a summary artifact: [0x01][doc][0x00 0x00][0x20]["summary"][0x00 0x00][name][0x00 0x00]
 pub fn isSummaryArtifactKey(key: []const u8) bool {
     if (!isInternalUserKey(key)) return false;
@@ -1765,6 +1834,34 @@ test "matchesAssetArtifactName matches top-level and document unit assets" {
     try std.testing.expect(matchesAssetArtifactName(unit, "document_units_v1"));
     try std.testing.expect(!matchesAssetArtifactName(unit, "other_units_v1"));
     try std.testing.expect(!matchesAssetArtifactName(chunk, "document_units_v1"));
+}
+
+test "document unit navigation keys are parent scoped and block ordered" {
+    const alloc = std.testing.allocator;
+    const doc_key = "doc\x00:a";
+    const artifact_name = "document\x00units:v1";
+    const summary = try documentUnitNavigationSummaryKeyAlloc(alloc, doc_key, artifact_name);
+    defer alloc.free(summary);
+    const block_zero = try documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, 0);
+    defer alloc.free(block_zero);
+    const block_one = try documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, 1);
+    defer alloc.free(block_one);
+    const block_large = try documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, 0x0100_0000);
+    defer alloc.free(block_large);
+
+    try std.testing.expect(isInternalUserKey(summary));
+    try std.testing.expect(isInternalUserKey(block_zero));
+    try std.testing.expect(!std.mem.eql(u8, summary, block_zero));
+    try std.testing.expect(std.mem.lessThan(u8, block_zero, block_one));
+    try std.testing.expect(std.mem.lessThan(u8, block_one, block_large));
+
+    const unit = try documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, "page:000001");
+    defer alloc.free(unit);
+    const chunk = try documentUnitChunkArtifactKeyAlloc(alloc, doc_key, artifact_name, "page:000001", 0);
+    defer alloc.free(chunk);
+    try std.testing.expect(isDocumentUnitArtifactRecordKey(unit));
+    try std.testing.expect(!isDocumentUnitArtifactRecordKey(chunk));
+    try std.testing.expect(!isDocumentUnitArtifactRecordKey(summary));
 }
 
 test "asset artifact source index keys group by source artifact" {

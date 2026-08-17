@@ -7354,6 +7354,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
             error.Timeout => return error.ReadUnavailable,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
+            error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
@@ -7492,6 +7493,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+                error.HierarchyCursorStale => return error.HierarchyCursorStale,
                 error.ModelNotFound => return error.ModelNotFound,
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
                 error.QueryEmbeddingInputTooLarge,
@@ -7546,6 +7548,7 @@ pub const ApiHttpServer = struct {
             error.EmbedUpstreamFailure,
             => return err,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.TableNotFound, error.NotFound => return error.NotFound,
@@ -7614,6 +7617,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.QueryEmbeddingInputTooLarge,
@@ -10166,29 +10170,22 @@ pub const ApiHttpServer = struct {
             else
                 try contextual_operations.textAlloc(self.alloc, 422, "unsupported query request"),
             error.IdentityReadGenerationChanged => try contextualRetryableTextResponse(self.alloc, 409, "identity read generation changed"),
+            error.HierarchyCursorStale => try contextualHierarchyCursorStaleResponse(self.alloc),
             error.QueryCandidateBudgetExceeded => try contextualQueryCandidateBudgetExceededResponse(self.alloc),
             error.QueryEmbeddingInputTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "query embedding input too large"),
             error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(self.alloc, 429, "query embedding overloaded"),
             error.EmbedRateLimited => try contextualRetryableTextResponse(self.alloc, 429, "query embedding rate limited"),
-            error.EmbedTransientFailure => try contextualRetryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
+            error.EmbedTransientFailure => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .query_embedding_temporarily_unavailable),
             error.EmbedUpstreamFailure => try contextual_operations.textAlloc(self.alloc, 502, "query embedding provider failed"),
             error.Timeout => try contextual_operations.textAlloc(self.alloc, 504, "query timed out"),
             error.Cancelled => try contextual_operations.textAlloc(self.alloc, 499, "client closed request"),
             error.NotFound, error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
             error.ModelNotFound => contextual_operations.json(try self.alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"), false),
-            error.DocIdentityNamespaceMismatch => try contextual_operations.textAlloc(self.alloc, 503, "doc identity unavailable"),
-            error.IndexRebuilding => try contextualJsonResponse(self.alloc, 503, .{
-                .code = "index_rebuilding",
-                .message = "required index is rebuilding",
-                .retryable = true,
-            }),
-            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextual_operations.textAlloc(self.alloc, 503, "read requires primary"),
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextual_operations.textAlloc(self.alloc, 503, "standby read unavailable"),
-            error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable => blk: {
-                var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(self.alloc);
-                defer response.deinit(self.alloc);
-                break :blk try contextualResponseFromPublicTable(self.alloc, response);
-            },
+            error.DocIdentityNamespaceMismatch => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .doc_identity_unavailable),
+            error.IndexRebuilding => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .index_rebuilding),
+            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .read_requires_primary),
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .standby_read_unavailable),
+            error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
             error.InvalidManifest,
             error.InvalidTableFile,
             error.TableBlockChecksumMismatch,
@@ -12041,6 +12038,28 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
     if (query_req.order_by.len == 0 and cursor.len == 0) return;
     try validatePublicCountOnlySortPageContract(query_req);
     try validatePublicSortCursorContract(query_req);
+    if (query_req.hierarchy_children != null) {
+        // `_hierarchy.position` is produced by the traversal planner, not by a
+        // mapped document field. The query contract has already selected the
+        // dedicated child-navigation mode; validate its exact synthetic order
+        // here instead of sending it through the native doc-value capability
+        // gate used by ordinary search sorts.
+        if (query_req.order_by.len != 2 or
+            !std.mem.eql(u8, query_req.order_by[0].field, "_hierarchy.position") or
+            query_req.order_by[0].desc or
+            !std.mem.eql(u8, query_req.order_by[1].field, "_id") or
+            query_req.order_by[1].desc or
+            query_req.search_before.len != 0 or
+            (query_req.search_after.len > 0 and
+                (query_req.search_after.len != 2 or
+                    query_req.search_after[0] != .string or
+                    query_req.search_after[1] != .string)))
+        {
+            recordPublicSortCapabilityRejection("_hierarchy.position", "invalid_cursor_arity", "invalid_hierarchy_navigation_order");
+            return error.InvalidQueryRequest;
+        }
+        return;
+    }
     try validatePublicScoreSortSource(query_req);
     try validatePublicApproximateSortSource(query_req);
     if (query_req.order_by.len == 0) return;
@@ -12661,6 +12680,23 @@ fn contextualQueryCandidateBudgetExceededResponse(alloc: std.mem.Allocator) !con
         .sort_rejection_detail = public_rejection.detail,
         .sort_rejection_field = diagnostic.field,
     });
+}
+
+fn contextualHierarchyCursorStaleResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    return .{
+        .status = 409,
+        .content_type = "application/json",
+        .body = try public_table_http.hierarchyCursorStaleBody(alloc),
+    };
+}
+
+fn contextualQueryTemporarilyUnavailableResponse(
+    alloc: std.mem.Allocator,
+    reason: public_table_http.QueryTemporarilyUnavailableReason,
+) !contextual_operations.OwnedResponse {
+    var response = try public_table_http.queryTemporarilyUnavailableOwnedResponse(alloc, reason);
+    defer response.deinit(alloc);
+    return try contextualResponseFromPublicTable(alloc, response);
 }
 
 fn ownedContextualHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !contextual_operations.Header {
@@ -16302,6 +16338,30 @@ test "api http unsupported unsorted query response remains generic" {
     try std.testing.expectEqualStrings("unsupported query request", resp.body);
 }
 
+test "api http stale hierarchy cursor response is actionable and machine readable" {
+    const alloc = std.testing.allocator;
+    var resp = try contextualHierarchyCursorStaleResponse(alloc);
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 409), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
+    const ErrorBody = struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        action: []const u8,
+        restart_without: []const u8,
+        retryable: bool,
+    };
+    var parsed = try std.json.parseFromSlice(ErrorBody, alloc, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 409), parsed.value.status);
+    try std.testing.expectEqualStrings("hierarchy_cursor_stale", parsed.value.@"error");
+    try std.testing.expectEqualStrings("restart_hierarchy_traversal", parsed.value.action);
+    try std.testing.expectEqualStrings("search_after", parsed.value.restart_without);
+    try std.testing.expect(!parsed.value.retryable);
+}
+
 test "api http retry sleep is bounded by request deadline" {
     const now_ns: u64 = 1_000;
     try std.testing.expectEqual(
@@ -16897,6 +16957,175 @@ test "api http plain public query preserves outer absolute request deadline" {
     try std.testing.expectEqualStrings("{\"hits\":[],\"total\":0}", response.json);
 }
 
+test "api http hierarchy traversal preserves policy and cursor across remote hydration seam" {
+    const alloc = std.testing.allocator;
+    const position = "hn3/0000000000000000000000000000000000000000000000000000000000000000/646f63756d656e745f756e6974735f7631/00000000000000000001/00000000000000000000/ef399c1fbabe67d0050324c3919e367b5e58601110d9a3f563071d97c7905066";
+    const public_unit_id = "af1:asset:unit:page-1";
+    const row_filter = "{\"term\":{\"tenant\":\"acme\"}}";
+
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .schema_json = "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"text\"}}}}}}",
+                    .indexes_json = "{}",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = null }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        calls: usize = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.SearchRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expect(req.hierarchy_children != null);
+            try std.testing.expectEqualStrings("doc:a", req.hierarchy_children.?.parent_id);
+            try std.testing.expectEqualStrings(row_filter, req.filter_query_json);
+            try std.testing.expectEqual(@as(usize, 2), req.order_by.len);
+            try std.testing.expectEqualStrings("_hierarchy.position", req.order_by[0].field);
+            try std.testing.expectEqualStrings("_id", req.order_by[1].field);
+            if (self.calls == 0) {
+                try std.testing.expectEqual(@as(usize, 0), req.search_after.len);
+            } else {
+                try std.testing.expectEqual(@as(usize, 2), req.search_after.len);
+                try std.testing.expectEqualStrings(position, req.search_after[0].string);
+                try std.testing.expectEqualStrings(public_unit_id, req.search_after[1].string);
+            }
+
+            // Exercise the coordinator-to-shard serializer and the trusted
+            // internal parser with the policy field injected at ingress.
+            const encoded = try table_reads.testing.encodeRemoteQueryRequestAlloc(inner_alloc, req);
+            defer inner_alloc.free(encoded);
+            var remote = try query_contract.parseQueryRequest(inner_alloc, null, table_name, encoded);
+            defer remote.deinit(inner_alloc);
+            try std.testing.expect(remote.req.hierarchy_children != null);
+            try std.testing.expectEqualStrings(row_filter, remote.req.filter_query_json);
+            try std.testing.expectEqual(req.search_after.len, remote.req.search_after.len);
+
+            var sort_values = [_]std.json.Value{
+                .{ .string = @constCast(position) },
+                .{ .string = @constCast(public_unit_id) },
+            };
+            var hit = db_mod.types.SearchHit{
+                .id = @constCast(public_unit_id),
+                .sort_values = sort_values[0..],
+                .artifact_ref = .{
+                    .document_id = @constCast("doc:a"),
+                    .name = @constCast("document_units_v1"),
+                    .kind = .asset,
+                    .unit_id = @constCast("page:000001"),
+                },
+            };
+            try table_reads.testing.applyHierarchyNavigationLookupForTest(
+                inner_alloc,
+                &hit,
+                "{\"unit_id\":\"page:000001\",\"unit_type\":\"page\",\"text\":\"page one\",\"_artifact_unit_fingerprint\":\"fingerprint-v1\"}",
+            );
+            defer inner_alloc.free(hit.stored_data.?);
+            try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "\"_hierarchy\"") == null);
+            try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "\"text\":\"page one\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "_artifact_unit_fingerprint") == null);
+
+            self.calls += 1;
+            return .{ .json = try std.fmt.allocPrint(
+                inner_alloc,
+                "{{\"responses\":[{{\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{s}\",\"_sort\":[\"{s}\",\"{s}\"],\"_source\":{s}}}]}} ,\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
+                .{ public_unit_id, position, public_unit_id, hit.stored_data.? },
+            ) };
+        }
+    };
+
+    const first_body =
+        \\{"hierarchy":{"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},"fields":["unit_id","unit_type","text"],"order_by":[{"field":"_hierarchy.position"}],"limit":1}
+    ;
+    const replay_body =
+        \\{"hierarchy":{"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},"fields":["unit_id","unit_type","text"],"order_by":[{"field":"_hierarchy.position"}],"limit":1,"search_after":["hn3/0000000000000000000000000000000000000000000000000000000000000000/646f63756d656e745f756e6974735f7631/00000000000000000001/00000000000000000000/ef399c1fbabe67d0050324c3919e367b5e58601110d9a3f563071d97c7905066","af1:asset:unit:page-1"]}
+    ;
+
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
+    defer server.deinit();
+    var first = try server.executePlainPublicTableQuery(
+        alloc,
+        reads.source(),
+        "docs",
+        first_body,
+        row_filter,
+        null,
+        null,
+        .{ .domain = .internal, .value = "test" },
+        null,
+    );
+    defer first.deinit(alloc);
+    var first_json = try std.json.parseFromSlice(std.json.Value, alloc, first.json, .{});
+    defer first_json.deinit();
+    const first_hit = first_json.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
+    try std.testing.expectEqualStrings(position, first_hit.get("_sort").?.array.items[0].string);
+    try std.testing.expectEqualStrings(public_unit_id, first_hit.get("_sort").?.array.items[1].string);
+    try std.testing.expectEqualStrings("page one", first_hit.get("_source").?.object.get("text").?.string);
+
+    var replay = try server.executePlainPublicTableQuery(
+        alloc,
+        reads.source(),
+        "docs",
+        replay_body,
+        row_filter,
+        null,
+        null,
+        .{ .domain = .internal, .value = "test" },
+        null,
+    );
+    defer replay.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), reads.calls);
+}
+
 test "api http server obtains query embedding policy from resource manager" {
     const alloc = std.testing.allocator;
     var manager = resource_manager_mod.ResourceManager.init(.{
@@ -16959,6 +17188,32 @@ test "api http public table dispatch preserves unsupported sorted query as exact
         alloc,
         "{\"join\":{}}",
     ));
+}
+
+test "api http public sort gate accepts synthetic hierarchy child positions" {
+    const runtime_schema = storage_schema.TableSchema{};
+    const order = [_]db_mod.types.SortField{
+        .{ .field = "_hierarchy.position" },
+        .{ .field = "_id" },
+    };
+    const cursor = [_]std.json.Value{
+        .{ .string = "hn3/0000000000000000000000000000000000000000000000000000000000000000/646f63756d656e745f756e6974735f7631/00000000000000000001/00000000000000000000/ef399c1fbabe67d0050324c3919e367b5e58601110d9a3f563071d97c7905066" },
+        .{ .string = "af1:asset:unit" },
+    };
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .order_by = &order,
+        .search_after = &cursor,
+    }, runtime_schema, &.{});
+
+    const wrong_order = [_]db_mod.types.SortField{
+        .{ .field = "created_at" },
+        .{ .field = "_id" },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .order_by = &wrong_order,
+    }, runtime_schema, &.{}));
 }
 
 test "api http public sort capability gate validates mapped sortable fields" {
@@ -22037,7 +22292,39 @@ test "api http server serves fielded full-text search through mcp tools" {
     }
     try std.testing.expect(found_source_group_projection_constraint);
     const query_request_not = query_request_contract_schema.object.get("not") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(usize, 2), query_request_not.object.get("allOf").?.array.items.len);
+    const invalid_query_states = query_request_not.object.get("anyOf") orelse return error.TestExpectedEqual;
+    var guards_group_projection = false;
+    var guards_child_projection = false;
+    var guards_child_order = false;
+    for (invalid_query_states.array.items) |invalid_state| {
+        const all_of = invalid_state.object.get("allOf") orelse continue;
+        if (all_of.array.items.len != 2) continue;
+        const hierarchy = all_of.array.items[0].object.get("properties") orelse continue;
+        const hierarchy_value = hierarchy.object.get("hierarchy") orelse continue;
+        const required_mode = hierarchy_value.object.get("required") orelse continue;
+        if (required_mode.array.items.len != 1 or required_mode.array.items[0] != .string) continue;
+        const missing = all_of.array.items[1].object.get("not") orelse continue;
+        const missing_required = missing.object.get("required") orelse continue;
+        if (missing_required.array.items.len != 1 or missing_required.array.items[0] != .string) continue;
+        if (std.mem.eql(u8, required_mode.array.items[0].string, "group_by") and
+            std.mem.eql(u8, missing_required.array.items[0].string, "fields"))
+        {
+            guards_group_projection = true;
+        }
+        if (std.mem.eql(u8, required_mode.array.items[0].string, "children") and
+            std.mem.eql(u8, missing_required.array.items[0].string, "fields"))
+        {
+            guards_child_projection = true;
+        }
+        if (std.mem.eql(u8, required_mode.array.items[0].string, "children") and
+            std.mem.eql(u8, missing_required.array.items[0].string, "order_by"))
+        {
+            guards_child_order = true;
+        }
+    }
+    try std.testing.expect(guards_group_projection);
+    try std.testing.expect(guards_child_projection);
+    try std.testing.expect(guards_child_order);
     const query_tool_not = query_tool.inputSchema.object.get("not") orelse return error.TestExpectedEqual;
     try std.testing.expect(query_tool_not.object.get("anyOf").?.array.items.len > 0);
 
@@ -26473,12 +26760,15 @@ test "api http server preserves public query availability errors" {
         status: u16,
         body: []const u8,
         json: bool = false,
+        unavailable_code: ?[]const u8 = null,
+        unavailable_message: []const u8 = "",
     }{
-        .{ .query_error = error.DocIdentityNamespaceMismatch, .status = 503, .body = "doc identity unavailable" },
-        .{ .query_error = error.ReadUnavailable, .status = 503, .body = "standby read unavailable" },
-        .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "read requires primary" },
-        .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}", .json = true },
-        .{ .query_error = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}", .json = true },
+        .{ .query_error = error.DocIdentityNamespaceMismatch, .status = 503, .body = "", .json = true, .unavailable_code = "doc_identity_unavailable", .unavailable_message = "doc identity unavailable" },
+        .{ .query_error = error.ReadUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "standby_read_unavailable", .unavailable_message = "standby read unavailable" },
+        .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "", .json = true, .unavailable_code = "read_requires_primary", .unavailable_message = "read requires primary" },
+        .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
+        .{ .query_error = error.IndexRebuilding, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
+        .{ .query_error = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
         .{ .query_error = error.TableNotFound, .status = 404, .body = "not found" },
         .{ .query_error = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
     };
@@ -26493,10 +26783,20 @@ test "api http server preserves public query availability errors" {
         defer resp.deinit(alloc);
 
         try std.testing.expectEqual(case.status, resp.status);
-        try std.testing.expectEqualStrings(case.body, resp.body);
+        if (case.unavailable_code) |code| {
+            const expected = try std.json.Stringify.valueAlloc(alloc, .{
+                .code = code,
+                .message = case.unavailable_message,
+                .retryable = true,
+            }, .{});
+            defer alloc.free(expected);
+            try ant_json.testing.expectSubsetJsonText(alloc, expected, resp.body);
+        } else {
+            try std.testing.expectEqualStrings(case.body, resp.body);
+        }
         try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", resp.content_type);
         try std.testing.expectEqual(
-            case.query_error == error.StorageReadTemporarilyUnavailable,
+            case.unavailable_code != null,
             resp.headers.len == 1 and std.ascii.eqlIgnoreCase(resp.headers[0].name, "Retry-After"),
         );
 
@@ -26505,7 +26805,17 @@ test "api http server preserves public query availability errors" {
         , null);
         defer multi_resp.deinit(alloc);
         try std.testing.expectEqual(case.status, multi_resp.status);
-        try std.testing.expectEqualStrings(case.body, multi_resp.body);
+        if (case.unavailable_code) |code| {
+            const expected = try std.json.Stringify.valueAlloc(alloc, .{
+                .code = code,
+                .message = case.unavailable_message,
+                .retryable = true,
+            }, .{});
+            defer alloc.free(expected);
+            try ant_json.testing.expectSubsetJsonText(alloc, expected, multi_resp.body);
+        } else {
+            try std.testing.expectEqualStrings(case.body, multi_resp.body);
+        }
         try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", multi_resp.content_type);
     }
 }

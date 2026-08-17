@@ -70,6 +70,12 @@ class McpSchemaFragmentTests(unittest.TestCase):
                 for branch in generated["allOf"]
             )
         )
+        self.assertTrue(
+            any(
+                branch.get("not", {}).get("required") == ["group_by", "children"]
+                for branch in generated["allOf"]
+            )
+        )
 
     def test_compact_query_request_keeps_cross_field_constraints(self) -> None:
         with generator.SPEC.open(encoding="utf-8") as handle:
@@ -79,19 +85,63 @@ class McpSchemaFragmentTests(unittest.TestCase):
 
         self.assertNotIn("table", generated["properties"])
         self.assertIn("hierarchy", generated["properties"])
-        self.assertEqual(
-            ["hierarchy"],
-            generated["not"]["allOf"][0]["required"],
+        invalid_states = generated["not"]["anyOf"]
+        missing_group_fields = next(
+            branch
+            for branch in invalid_states
+            if branch.get("allOf", [{}])[0].get("properties", {}).get("hierarchy", {}).get("required") == ["group_by"]
         )
-        self.assertEqual(
-            ["group_by"],
-            generated["not"]["allOf"][0]["properties"]["hierarchy"]["required"],
+        self.assertEqual(["hierarchy"], missing_group_fields["allOf"][0]["required"])
+        self.assertEqual(["fields"], missing_group_fields["allOf"][1]["not"]["required"])
+        self.assertTrue(
+            any(
+                branch.get("allOf", [{}])[0].get("properties", {}).get("hierarchy", {}).get("required") == ["children"]
+                for branch in invalid_states
+            )
         )
-        self.assertEqual(["fields"], generated["not"]["allOf"][1]["not"]["required"])
         self.assertIn(
             {"not": generator.property_has_non_null_value("table")},
             generated["allOf"],
         )
+
+    def test_child_navigation_schema_matches_the_dedicated_runtime_mode(self) -> None:
+        with generator.SPEC.open(encoding="utf-8") as handle:
+            schemas = yaml.safe_load(handle)["components"]["schemas"]
+
+        validator = Draft202012Validator(generator.compact_query_request_schema(schemas))
+        valid = {
+            "fields": ["unit_id", "unit_type", "text"],
+            "hierarchy": {
+                "children": {
+                    "parent": {"level": "source", "id": "doc:a"},
+                    "level": "unit",
+                }
+            },
+            "order_by": [{"field": "_hierarchy.position"}],
+            "limit": 20,
+            "search_after": ["hn1/revision/artifact/1/0/fingerprint", "artifact:unit"],
+        }
+        self.assertEqual([], list(validator.iter_errors(valid)))
+
+        invalid_variants = []
+        for field, value in (
+            ("query", {"match_all": {}}),
+            ("filter_query", {"term": {"path": "/tenant", "value": "acme"}}),
+            ("offset", 0),
+            ("search_before", []),
+            ("limit", 101),
+            ("search_after", ["position-only"]),
+            ("order_by", [{"field": "_hierarchy.position", "desc": True}]),
+        ):
+            candidate = copy.deepcopy(valid)
+            candidate[field] = value
+            invalid_variants.append(candidate)
+        missing_order = copy.deepcopy(valid)
+        del missing_order["order_by"]
+        invalid_variants.append(missing_order)
+
+        for invalid in invalid_variants:
+            self.assertNotEqual([], list(validator.iter_errors(invalid)), invalid)
 
     def test_query_tool_schema_expresses_raw_shorthand_exclusivity(self) -> None:
         with generator.SPEC.open(encoding="utf-8") as handle:
