@@ -167,9 +167,12 @@ def test_max_tokens_respected(api):
 def test_generate_response_format_json_object(api):
     model = _first_generator_model(api)
     resp = api.generate(
-        [{"role": "user", "content": "Return a tiny JSON object"}],
+        [{"role": "user", "content": "Return exactly the JSON object {}, with no other text."}],
         model=model,
-        max_tokens=16,
+        # This is a grammar-wiring smoke, not an output-quality benchmark.
+        # Unconstrained JSON permits trailing whitespace, so a CPU-only Gemma
+        # decode can consume the entire budget even after emitting an object.
+        max_tokens=4,
         chat_template_kwargs={"enable_thinking": False},
         response_format={"type": "json_object"},
     )
@@ -380,7 +383,7 @@ def test_multimodal_generation(api):
     messages = [{
         "role": "user",
         "content": [
-            {"type": "text", "text": "Describe this image in one short sentence."},
+            {"type": "text", "text": "Describe this image with one word."},
             {"type": "image_url", "image_url": {"url": TINY_PNG_URI}},
         ],
     }]
@@ -388,7 +391,9 @@ def test_multimodal_generation(api):
     r = api.post("/generate", json={
         "model": model,
         "messages": messages,
-        "max_tokens": 8,
+        # Projector execution and the first decoded content are the contract.
+        # Keep the CPU-only release smoke below the request deadline.
+        "max_tokens": 2,
         "chat_template_kwargs": {"enable_thinking": False},
     })
     r.raise_for_status()
