@@ -20,6 +20,9 @@ class HierarchyGroupBy:
     """
     Attributes:
         level (HierarchyGroupByLevel): Hierarchy level used to group the records matched by the targeted index.
+            Unit groups are relevance-ranked and do not accept `order_by`, `search_after`,
+            or `search_before`; use `hierarchy.children` for sequential, cursor-paginated
+            unit traversal.
         matches (HierarchyMatches | Unset):
     """
 

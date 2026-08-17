@@ -4236,6 +4236,7 @@ pub fn build(b: *std.Build) void {
             "document unit fingerprint canonically separates variable field boundaries",
             "document unit fingerprint distinguishes absent and empty optional fields",
             "document unit fingerprint state version rejects legacy encodings",
+            "db canonical hierarchy traversal rejects typed retrieval controls",
             "db document unit payload preserves pdf page provenance",
             "db document extraction asset materializes unit artifacts from data url",
             "db document extraction chunks units through source artifact enrichment",
@@ -7209,6 +7210,7 @@ pub fn build(b: *std.Build) void {
             "storage.enrichment.",
             "storage.filesystem_capacity.",
             "storage.hbc_adapter.",
+            "storage.hierarchy_navigation.",
             "storage.internal_keys.",
             "storage.lmdb.",
             "storage.lmdb_backend.",
@@ -7241,7 +7243,7 @@ pub fn build(b: *std.Build) void {
         5 * 1024 * 1024 * 1024,
         8 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
-        4 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
     };
     const unit_storage_sharded_test_step = b.step(

@@ -52138,6 +52138,56 @@ test "db document extraction asset materializes unit artifacts from data url" {
     }));
 }
 
+test "db canonical hierarchy traversal rejects typed retrieval controls" {
+    const order = [_]types.SortField{
+        .{ .field = "_hierarchy.position" },
+        .{ .field = "_id" },
+    };
+    const canonical = types.SearchRequest{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .include_all_fields = false,
+        .fields = &.{},
+        .order_by = &order,
+    };
+    try std.testing.expect(types.canonicalHierarchyChildrenRequestIsValid(canonical));
+
+    var match_none = canonical;
+    match_none.query = .{ .match_none = {} };
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(match_none));
+
+    var profiled = canonical;
+    profiled.profile = true;
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(profiled));
+
+    var ranked = canonical;
+    ranked.reranker_query_text = "ignored";
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(ranked));
+
+    var native_filtered = canonical;
+    native_filtered.filter_ids = &.{1};
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(native_filtered));
+
+    var text_resolved = canonical;
+    var text_filter_marker: u8 = 0;
+    text_resolved.resolved_text_doc_filter = &text_filter_marker;
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(text_resolved));
+
+    var algebraic_resolution = canonical;
+    algebraic_resolution.require_algebraic_filter_resolution = true;
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(algebraic_resolution));
+
+    var distributed = canonical;
+    distributed.distributed_text_stats = &.{.{ .field = "body" }};
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(distributed));
+
+    var authorized = canonical;
+    authorized.filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"a\"}}";
+    authorized.filter_doc_ids = &.{"doc:a"};
+    authorized.filter_doc_ids_positive = true;
+    try std.testing.expect(types.canonicalHierarchyChildrenRequestIsValid(authorized));
+}
+
 test "db hierarchy navigation seeks only the descriptor blocks needed by the page" {
     const alloc = std.testing.allocator;
 
