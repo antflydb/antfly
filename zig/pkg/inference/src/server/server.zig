@@ -2750,13 +2750,13 @@ pub const Node = struct {
     pub fn configureExternalResourceBudgets(
         self: *Node,
         admission_budget: runtime.tier.memory.AdmissionResourceBudget,
-        tokenizer_config: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig,
+        tokenizer_budget: hf_tokenizer_mod.HfTokenizer.BpeCacheResourceBudget,
     ) !void {
         try self.model_manager.configureExternalResourceBudgets(
             admission_budget,
-            tokenizer_config,
+            tokenizer_budget,
         );
-        self.config.tokenizer_cache = tokenizer_config;
+        self.config.tokenizer_cache = self.model_manager.tokenizer_cache_config;
     }
 
     pub fn configureForcedRunAdmissionDenialsForTesting(

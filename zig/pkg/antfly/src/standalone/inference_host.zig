@@ -272,6 +272,9 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
         .preload = warm_models.items,
         .process_memory_limit_bytes = context.process_memory_limit_bytes,
         .resource_ownership = .external_required,
+        .tokenizer_cache = .{
+            .bulk_slots_per_shard = 16 * 1024,
+        },
         .kernel_jit = runtime_config.value.kernel_jit,
         .prompt_cache = runtime_config.value.prompt_cache,
     };
@@ -314,10 +317,7 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
     state.node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(state);
     try state.node.configureExternalResourceBudgets(
         inferenceAdmissionResourceBudget(state),
-        .{
-            .bulk_slots_per_shard = 16 * 1024,
-            .resource_budget = tokenizerCacheResourceBudget(state),
-        },
+        tokenizerCacheResourceBudget(state),
     );
     state.node.warmConfiguredModelsBeforeServing(state.alloc) catch |err| {
         std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});

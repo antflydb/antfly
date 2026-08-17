@@ -3220,7 +3220,7 @@ pub const WhisperCompositeAssets = struct {
     }
 
     fn reclaimableAdmission(self: *const WhisperCompositeAssets) ?runtime.tier.memory.AdmissionLease {
-        return self.managed_tokenizer.resource_lease;
+        return self.managed_tokenizer.reclaimableAdmission();
     }
 
     fn deinit(self: *WhisperCompositeAssets) void {
@@ -3280,6 +3280,157 @@ pub const ModelManager = struct {
         records: std.AutoHashMapUnmanaged(usize, *TokenizerCacheBudgetRecord) = .empty,
     };
 
+    /// Ref-counted callback gate shared by ModelManager and every transferable
+    /// tokenizer it creates. Manager shutdown closes the gate and waits only
+    /// for already-running cold-cache transitions; later growth is rejected
+    /// and teardown decreases become harmless no-ops against the drained
+    /// ledger. This prevents a ManagedHfTokenizer from retaining a raw pointer
+    /// to a destroyed ModelManager or external resource owner.
+    const TokenizerCacheBudgetLifetime = struct {
+        allocator: std.mem.Allocator,
+        manager: ?*ModelManager,
+        references: std.atomic.Value(usize) = .init(1),
+        active_callbacks: std.atomic.Value(usize) = .init(0),
+        closing: std.atomic.Value(bool) = .init(false),
+        managed_mutex: std.atomic.Mutex = .unlocked,
+        managed_head: ?*ManagedTokenizerLifetime = null,
+
+        fn create(allocator: std.mem.Allocator, manager: *ModelManager) !*@This() {
+            const lifetime = try allocator.create(@This());
+            lifetime.* = .{
+                .allocator = allocator,
+                .manager = manager,
+            };
+            return lifetime;
+        }
+
+        fn retain(self: *@This()) void {
+            const previous = self.references.fetchAdd(1, .monotonic);
+            std.debug.assert(previous > 0);
+        }
+
+        fn release(self: *@This()) void {
+            const previous = self.references.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+            if (previous == 1) {
+                std.debug.assert(self.closing.load(.acquire));
+                std.debug.assert(self.active_callbacks.load(.acquire) == 0);
+                self.allocator.destroy(self);
+            }
+        }
+
+        fn close(self: *@This()) void {
+            const was_closing = self.closing.swap(true, .acq_rel);
+            std.debug.assert(!was_closing);
+            while (self.active_callbacks.load(.acquire) != 0)
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+
+            // Transferable tokenizers may still own their model-residency
+            // admission leases. Settle those while AdmissionController and an
+            // external process owner are both still alive; the handle's later
+            // deinit only destroys its tokenizer and unregisters its pin.
+            spinLock(&self.managed_mutex);
+            var current = self.managed_head;
+            while (current) |managed| {
+                if (managed.resource_lease) |*lease| lease.release();
+                managed.resource_lease = null;
+                current = managed.next;
+            }
+            self.managed_mutex.unlock();
+            self.manager = null;
+        }
+
+        fn registerManagedTokenizer(
+            self: *@This(),
+            resource_lease: ?runtime.tier.memory.AdmissionLease,
+        ) !*ManagedTokenizerLifetime {
+            if (self.closing.load(.acquire)) return error.ResourceOwnerShuttingDown;
+            const managed = try self.allocator.create(ManagedTokenizerLifetime);
+            managed.* = .{
+                .lifetime = self,
+                .resource_lease = resource_lease,
+            };
+            self.retain();
+
+            spinLock(&self.managed_mutex);
+            if (self.closing.load(.acquire)) {
+                self.managed_mutex.unlock();
+                self.allocator.destroy(managed);
+                self.release();
+                return error.ResourceOwnerShuttingDown;
+            }
+            managed.next = self.managed_head;
+            if (self.managed_head) |head| head.previous = managed;
+            self.managed_head = managed;
+            self.managed_mutex.unlock();
+            return managed;
+        }
+
+        fn unregisterManagedTokenizer(
+            self: *@This(),
+            managed: *ManagedTokenizerLifetime,
+        ) void {
+            spinLock(&self.managed_mutex);
+            if (managed.previous) |previous| {
+                previous.next = managed.next;
+            } else {
+                std.debug.assert(self.managed_head == managed);
+                self.managed_head = managed.next;
+            }
+            if (managed.next) |next| next.previous = managed.previous;
+            if (managed.resource_lease) |*lease| lease.release();
+            managed.resource_lease = null;
+            managed.previous = null;
+            managed.next = null;
+            self.managed_mutex.unlock();
+
+            self.allocator.destroy(managed);
+            self.release();
+        }
+
+        fn resourceBudget(
+            self: *@This(),
+        ) hf_tokenizer.HfTokenizer.BpeCacheResourceBudget {
+            return .{
+                .context = self,
+                .observe = observe,
+            };
+        }
+
+        fn observe(
+            context: *anyopaque,
+            observer_id: usize,
+            previous: usize,
+            next: usize,
+        ) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.closing.load(.acquire)) return next <= previous;
+
+            _ = self.active_callbacks.fetchAdd(1, .acq_rel);
+            defer {
+                const active_before = self.active_callbacks.fetchSub(1, .release);
+                std.debug.assert(active_before > 0);
+            }
+            // Close may begin between the first check and publishing the active
+            // callback. Its second check observes that transition and avoids
+            // touching manager state; otherwise close waits for this callback.
+            if (self.closing.load(.acquire)) return next <= previous;
+            const manager = self.manager orelse return false;
+            return manager.reconcileTokenizerCacheUsage(observer_id, previous, next);
+        }
+    };
+
+    const ManagedTokenizerLifetime = struct {
+        lifetime: *TokenizerCacheBudgetLifetime,
+        resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+        previous: ?*ManagedTokenizerLifetime = null,
+        next: ?*ManagedTokenizerLifetime = null,
+
+        fn release(self: *@This()) void {
+            self.lifetime.unregisterManagedTokenizer(self);
+        }
+    };
+
     const EvictedModel = struct {
         key: []const u8,
         model: *LoadedModel,
@@ -3322,6 +3473,8 @@ pub const ModelManager = struct {
     ) = .empty,
     component_plan_cache_lock: std.atomic.Mutex = .unlocked,
     tokenizer_cache_config_mutex: std.atomic.Mutex = .unlocked,
+    tokenizer_cache_budget_lifetime: ?*TokenizerCacheBudgetLifetime = null,
+    external_tokenizer_cache_budget: ?hf_tokenizer.HfTokenizer.BpeCacheResourceBudget = null,
     tokenizer_cache_budget_shards: [tokenizer_cache_budget_shard_count]TokenizerCacheBudgetShard =
         [_]TokenizerCacheBudgetShard{.{}} ** tokenizer_cache_budget_shard_count,
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
@@ -3381,8 +3534,8 @@ pub const ModelManager = struct {
                 }
                 if (self.tokenizer_cache_config.resource_budget != null)
                     return error.UntrackedTokenizerResourceBudget;
-                self.tokenizer_cache_config.resource_budget =
-                    self.localTokenizerCacheResourceBudget();
+                const lifetime = try self.ensureTokenizerCacheBudgetLifetime();
+                self.tokenizer_cache_config.resource_budget = lifetime.resourceBudget();
                 self.tokenizer_cache_budget_source = .local_manager;
             },
             .external_required => {
@@ -3394,23 +3547,13 @@ pub const ModelManager = struct {
         }
     }
 
-    fn localTokenizerCacheResourceBudget(
+    fn ensureTokenizerCacheBudgetLifetime(
         self: *ModelManager,
-    ) hf_tokenizer.HfTokenizer.BpeCacheResourceBudget {
-        return .{
-            .context = self,
-            .observe = observeLocalTokenizerCacheUsage,
-        };
-    }
-
-    fn observeLocalTokenizerCacheUsage(
-        context: *anyopaque,
-        observer_id: usize,
-        previous: usize,
-        next: usize,
-    ) bool {
-        const self: *ModelManager = @ptrCast(@alignCast(context));
-        return self.reconcileLocalTokenizerCacheUsage(observer_id, previous, next);
+    ) !*TokenizerCacheBudgetLifetime {
+        if (self.tokenizer_cache_budget_lifetime) |lifetime| return lifetime;
+        const lifetime = try TokenizerCacheBudgetLifetime.create(self.allocator, self);
+        self.tokenizer_cache_budget_lifetime = lifetime;
+        return lifetime;
     }
 
     fn tokenizerCacheBudgetShard(
@@ -3623,6 +3766,141 @@ pub const ModelManager = struct {
         return true;
     }
 
+    fn reconcileExternalTokenizerCacheUsage(
+        self: *ModelManager,
+        observer_id: usize,
+        previous: usize,
+        next: usize,
+    ) bool {
+        if (observer_id == 0) return false;
+        const upstream = self.external_tokenizer_cache_budget orelse return false;
+        const shard = self.tokenizerCacheBudgetShard(observer_id);
+        spinLock(&shard.mutex);
+
+        var inserted = false;
+        const record = shard.records.get(observer_id) orelse blk: {
+            if (previous != 0) {
+                shard.mutex.unlock();
+                return false;
+            }
+            if (next == 0) {
+                shard.mutex.unlock();
+                return true;
+            }
+            const created = self.allocator.create(TokenizerCacheBudgetRecord) catch {
+                shard.mutex.unlock();
+                return false;
+            };
+            created.* = .{};
+            shard.records.put(self.allocator, observer_id, created) catch {
+                self.allocator.destroy(created);
+                shard.mutex.unlock();
+                return false;
+            };
+            inserted = true;
+            break :blk created;
+        };
+        if (record.actual_bytes != previous or record.transitioning) {
+            shard.mutex.unlock();
+            return false;
+        }
+        record.transitioning = true;
+        shard.mutex.unlock();
+
+        if (!upstream.observe(upstream.context, observer_id, previous, next)) {
+            spinLock(&shard.mutex);
+            record.transitioning = false;
+            if (inserted) self.removeTokenizerCacheBudgetRecord(
+                shard,
+                observer_id,
+                record,
+            );
+            shard.mutex.unlock();
+            return false;
+        }
+
+        spinLock(&shard.mutex);
+        record.actual_bytes = next;
+        record.transitioning = false;
+        if (next == 0) self.removeTokenizerCacheBudgetRecord(
+            shard,
+            observer_id,
+            record,
+        );
+        shard.mutex.unlock();
+        return true;
+    }
+
+    fn reconcileTokenizerCacheUsage(
+        self: *ModelManager,
+        observer_id: usize,
+        previous: usize,
+        next: usize,
+    ) bool {
+        return switch (self.tokenizer_cache_budget_source) {
+            .none => false,
+            .local_manager => self.reconcileLocalTokenizerCacheUsage(
+                observer_id,
+                previous,
+                next,
+            ),
+            .external_pair => self.reconcileExternalTokenizerCacheUsage(
+                observer_id,
+                previous,
+                next,
+            ),
+        };
+    }
+
+    fn drainTokenizerCacheBudgetRecords(self: *ModelManager) void {
+        for (&self.tokenizer_cache_budget_shards) |*shard| {
+            // The lifetime gate is closed and has drained active callbacks, so
+            // records are now exclusively owned by manager teardown.
+            var records = shard.records.iterator();
+            while (records.next()) |entry| {
+                const observer_id = entry.key_ptr.*;
+                const record = entry.value_ptr.*;
+                std.debug.assert(!record.transitioning);
+                switch (self.tokenizer_cache_budget_source) {
+                    .none => std.debug.assert(false),
+                    .local_manager => {
+                        if (record.reserved_bytes != 0)
+                            releaseTokenizerCacheCredit(record, record.reserved_bytes);
+                    },
+                    .external_pair => {
+                        if (self.external_tokenizer_cache_budget) |upstream| {
+                            if (record.actual_bytes != 0 and
+                                !upstream.observe(
+                                    upstream.context,
+                                    observer_id,
+                                    record.actual_bytes,
+                                    0,
+                                ))
+                            {
+                                std.log.err(
+                                    "tokenizer budget shutdown reconciliation rejected observer_id={d} bytes={d}",
+                                    .{ observer_id, record.actual_bytes },
+                                );
+                            }
+                        } else {
+                            std.log.err(
+                                "tokenizer budget shutdown missing external owner observer_id={d} bytes={d}",
+                                .{ observer_id, record.actual_bytes },
+                            );
+                        }
+                    },
+                }
+                record.actual_bytes = 0;
+                std.debug.assert(record.reserved_bytes == 0);
+                std.debug.assert(record.credits.items.len == 0);
+                record.credits.deinit(self.allocator);
+                self.allocator.destroy(record);
+            }
+            shard.records.deinit(self.allocator);
+            shard.records = .empty;
+        }
+    }
+
     pub fn configureModelCache(
         self: *ModelManager,
         keep_alive_ms: u64,
@@ -3679,20 +3957,22 @@ pub const ModelManager = struct {
     pub fn configureExternalResourceBudgets(
         self: *ModelManager,
         admission_budget: runtime.tier.memory.AdmissionResourceBudget,
-        tokenizer_config: hf_tokenizer.HfTokenizer.BpeCacheConfig,
+        tokenizer_budget: hf_tokenizer.HfTokenizer.BpeCacheResourceBudget,
     ) !void {
         std.debug.assert(self.loaded.count() == 0);
         std.debug.assert(self.whisper_assets.count() == 0);
         if (self.resource_ownership != .external_required)
             return error.ExternalResourceBudgetInLocalOwnership;
-        if (tokenizer_config.resource_budget == null)
-            return error.ExternalTokenizerResourceManagerNotConfigured;
         spinLock(&self.tokenizer_cache_config_mutex);
         defer self.tokenizer_cache_config_mutex.unlock();
         if (self.tokenizer_cache_budget_source != .none)
             return error.ExternalResourceBudgetsAlreadyConfigured;
+        const lifetime = try self.ensureTokenizerCacheBudgetLifetime();
         self.admission.configureResourceBudget(admission_budget);
-        self.tokenizer_cache_config = tokenizer_config;
+        self.external_tokenizer_cache_budget = tokenizer_budget;
+        // Ownership pairing changes only provenance. Cache geometry remains
+        // the policy selected in NodeConfig/configureTokenizerCaches.
+        self.tokenizer_cache_config.resource_budget = lifetime.resourceBudget();
         self.tokenizer_cache_budget_source = .external_pair;
     }
 
@@ -4601,9 +4881,16 @@ pub const ModelManager = struct {
         try tokenizer.configureParallelBpe(self.tokenizer_parallel_bpe_config);
         if (resource_lease) |*lease| try lease.retain(plan.resident);
 
+        const managed_lifetime = if (self.tokenizer_cache_budget_lifetime) |lifetime|
+            try lifetime.registerManagedTokenizer(resource_lease)
+        else
+            null;
+        if (managed_lifetime != null) resource_lease = null;
+
         return .{
             .tokenizer = tokenizer,
             .resource_lease = resource_lease,
+            .managed_lifetime = managed_lifetime,
         };
     }
 
@@ -4734,10 +5021,19 @@ pub const ModelManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.loaded_aliases.deinit(self.allocator);
-        for (&self.tokenizer_cache_budget_shards) |*shard| {
-            std.debug.assert(shard.records.count() == 0);
-            shard.records.deinit(self.allocator);
-            shard.records = .empty;
+        if (self.tokenizer_cache_budget_lifetime) |lifetime| {
+            lifetime.close();
+            self.drainTokenizerCacheBudgetRecords();
+            self.tokenizer_cache_config.resource_budget = null;
+            self.external_tokenizer_cache_budget = null;
+            self.tokenizer_cache_budget_lifetime = null;
+            lifetime.release();
+        } else {
+            for (&self.tokenizer_cache_budget_shards) |*shard| {
+                std.debug.assert(shard.records.count() == 0);
+                shard.records.deinit(self.allocator);
+                shard.records = .empty;
+            }
         }
     }
 
@@ -6080,18 +6376,31 @@ pub const ManagedSession = struct {
 pub const ManagedHfTokenizer = struct {
     tokenizer: *hf_tokenizer.HfTokenizer,
     resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    managed_lifetime: ?*ModelManager.ManagedTokenizerLifetime = null,
     owns_tokenizer: bool = true,
+
+    fn reclaimableAdmission(self: *const ManagedHfTokenizer) ?runtime.tier.memory.AdmissionLease {
+        if (self.resource_lease) |lease| return lease;
+        const managed = self.managed_lifetime orelse return null;
+        const lifetime = managed.lifetime;
+        spinLock(&lifetime.managed_mutex);
+        defer lifetime.managed_mutex.unlock();
+        return managed.resource_lease;
+    }
 
     pub fn deinit(self: *ManagedHfTokenizer) void {
         if (self.owns_tokenizer) self.tokenizer.deinitSelf();
         if (self.resource_lease) |*lease| lease.release();
+        if (self.managed_lifetime) |managed| managed.release();
         self.resource_lease = null;
+        self.managed_lifetime = null;
         self.owns_tokenizer = false;
     }
 
     pub fn take(self: *ManagedHfTokenizer) ManagedHfTokenizer {
         const owned = self.*;
         self.resource_lease = null;
+        self.managed_lifetime = null;
         self.owns_tokenizer = false;
         return owned;
     }
@@ -6693,10 +7002,8 @@ test "external resource ownership fails closed until budget is attached" {
             .release = Bridge.release,
         },
         .{
-            .resource_budget = .{
-                .context = &context,
-                .observe = CacheBridge.observe,
-            },
+            .context = &context,
+            .observe = CacheBridge.observe,
         },
     );
     try manager.ensureResourceOwnerReady();
@@ -6836,6 +7143,153 @@ test "local tokenizer lifecycle releases its persistent admission credit" {
     );
     for (&manager.tokenizer_cache_budget_shards) |*shard|
         try std.testing.expectEqual(@as(usize, 0), shard.records.count());
+}
+
+test "managed tokenizer safely outlives ModelManager shutdown" {
+    const allocator = std.testing.allocator;
+    const tokenizer_json =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 1, "b": 2, "ab": 3},
+        \\    "merges": ["a b"]
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
+        \\}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "tokenizer.json",
+        .data = tokenizer_json,
+    });
+    const tokenizer_path = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "tokenizer.json" },
+    );
+    defer allocator.free(tokenizer_path);
+
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    manager.configureServingPolicy(.{});
+    try manager.ensureResourceOwnerReady();
+    var managed = try manager.loadManagedHfTokenizerFile(tokenizer_path);
+    try std.testing.expect(managed.managed_lifetime != null);
+    try std.testing.expect(manager.admission.snapshot().host_weight_bytes > 0);
+
+    // Shutdown drains both the token residency lease and its cache credits,
+    // while the ref-counted callback gate remains alive with the handle.
+    manager.deinit();
+    try std.testing.expectEqual(
+        runtime.tier.memory.AdmissionAmounts{},
+        manager.admission.snapshot(),
+    );
+    managed.deinit();
+}
+
+test "external ownership pairing preserves cache policy and drains observers" {
+    const AdmissionBridge = struct {
+        fn reserve(_: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+            return 1;
+        }
+        fn retain(_: *anyopaque, _: usize, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
+    };
+    const CacheBridge = struct {
+        current: usize = 0,
+        transitions: usize = 0,
+        alive: bool = true,
+        callbacks_after_shutdown: usize = 0,
+
+        fn observe(
+            context: *anyopaque,
+            _: usize,
+            previous: usize,
+            next: usize,
+        ) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (!self.alive) {
+                self.callbacks_after_shutdown += 1;
+                return false;
+            }
+            if (self.current != previous) return false;
+            self.current = next;
+            self.transitions += 1;
+            return true;
+        }
+    };
+
+    var admission_context: u8 = 0;
+    var cache_context = CacheBridge{};
+    var manager = ModelManager.init(
+        std.testing.allocator,
+        backends.SessionManager.init(std.testing.allocator),
+    );
+    var manager_closed = false;
+    defer if (!manager_closed) manager.deinit();
+    try manager.configureResourceOwnership(.external_required);
+    try manager.configureTokenizerCaches(.{
+        .max_bytes = 7 * 1024 * 1024,
+        .bulk_slots_per_shard = 1024,
+    });
+    try manager.configureExternalResourceBudgets(
+        .{
+            .context = &admission_context,
+            .try_reserve = AdmissionBridge.reserve,
+            .retain = AdmissionBridge.retain,
+            .release = AdmissionBridge.release,
+        },
+        .{
+            .context = &cache_context,
+            .observe = CacheBridge.observe,
+        },
+    );
+    try manager.ensureResourceOwnerReady();
+    try std.testing.expectEqual(
+        @as(usize, 7 * 1024 * 1024),
+        manager.tokenizer_cache_config.max_bytes,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1024),
+        manager.tokenizer_cache_config.bulk_slots_per_shard,
+    );
+
+    const tokenizer_json =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 1, "b": 2, "ab": 3},
+        \\    "merges": ["a b"]
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
+        \\}
+    ;
+    const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(
+        std.testing.allocator,
+        tokenizer_json,
+    );
+    var tokenizer_owned = true;
+    errdefer if (tokenizer_owned) tokenizer.deinitSelf();
+    try tokenizer.configureBpeCache(manager.tokenizer_cache_config);
+    const managed_lifetime = try manager.tokenizer_cache_budget_lifetime.?
+        .registerManagedTokenizer(null);
+    var managed = ManagedHfTokenizer{
+        .tokenizer = tokenizer,
+        .managed_lifetime = managed_lifetime,
+    };
+    tokenizer_owned = false;
+    defer managed.deinit();
+    try std.testing.expect(cache_context.current > 0);
+
+    manager.deinit();
+    manager_closed = true;
+    try std.testing.expectEqual(@as(usize, 0), cache_context.current);
+    try std.testing.expect(cache_context.transitions >= 2);
+
+    // The external owner can disappear immediately after manager shutdown;
+    // late tokenizer teardown remains entirely inside the closed lifetime gate.
+    cache_context.alive = false;
+    managed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), cache_context.callbacks_after_shutdown);
 }
 
 test "model loading preserves retryable admission errors across backend probes" {

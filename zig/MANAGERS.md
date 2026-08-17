@@ -244,15 +244,27 @@ Ownership provenance is explicit and immutable once attached. Local mode
 installs only the ModelManager adapter. Embedded mode attaches the admission
 lease bridge and tokenizer observer bridge as one external pair; supplying only
 one half, mixing an external tokenizer callback into local mode, or changing
-ownership after attachment fails before model loading.
+ownership after attachment fails before model loading. Pairing replaces only
+the observer capability: tokenizer cache geometry remains the policy selected
+by `NodeConfig` or `configureTokenizerCaches`, so attaching process ownership
+cannot silently widen, disable, or otherwise reset cache sizing.
 
-Observer records are manager-owned accounting snapshots, not leases. An owner
-that continues using the manager reconciles its snapshot to zero when its
-allocation disappears. Destroying the manager is the terminal cancellation
-boundary for any remaining snapshots because the observed allocations and
-their ledger are being torn down together. Reservation handles remain strict:
-they must be released before manager destruction because they are transferable
-ownership tokens whose lifetime is independent of the observed allocation.
+Every managed tokenizer retains a small ref-counted lifetime gate shared with
+its ModelManager. Normal cache transitions enter that gate before touching the
+manager. Shutdown closes it, waits for already-running cold-cache transitions,
+settles transferable tokenizer residency leases, and reconciles every local or
+external observer record to zero while the corresponding owner is still alive.
+The gate then rejects cache growth but accepts teardown decreases without
+dereferencing the destroyed manager. This lets a transferable tokenizer handle
+be destroyed safely after ModelManager or Node shutdown without prolonging the
+manager, leaking admission, or imposing work on the cache-hit path.
+
+Observer records remain accounting snapshots rather than raw byte-release
+authority. Local records own ordinary `AdmissionLease` credits; external
+records retain exact observer totals solely so shutdown can perform the final
+validated transition. Other reservation handles remain strict and must be
+released before their owning manager is destroyed unless their public wrapper
+explicitly carries an equivalent lifetime pin.
 
 ## Failure semantics
 
@@ -297,6 +309,9 @@ Permanent tests cover:
 - oversized minimum-progress operations remaining inside the host envelope;
 - exactly-once batch release and invalid retain preserving unrelated capacity;
 - single-release and stale-observer mismatch retaining all accounted capacity;
+- tokenizer handles surviving manager shutdown without callback use-after-free
+  or admission leakage;
+- external ownership pairing preserving configured tokenizer cache geometry;
 - preload and request paths using the same admission controller;
 - inference, API, and control executor isolation plus lane shutdown/drain
   behavior.
