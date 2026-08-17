@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/antflydb/antfly/go/pkg/libaf/json"
@@ -182,6 +183,75 @@ func (e *APIError) Error() string {
 	return e.Message
 }
 
+// HierarchyCursorStaleError reports that a hierarchy traversal cursor belongs
+// to an older source-artifact revision. Retrying the same cursor cannot
+// succeed; callers should restart the traversal without SearchAfter.
+type HierarchyCursorStaleError struct {
+	StatusCode     int
+	Code           string
+	Message        string
+	Action         string
+	RestartWithout string
+	Retryable      bool
+}
+
+func (e *HierarchyCursorStaleError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Code
+}
+
+// QueryTemporarilyUnavailableError reports a retryable query dependency or
+// read-availability failure. RetryAfterSeconds is zero when the server did not
+// provide a valid positive Retry-After value.
+type QueryTemporarilyUnavailableError struct {
+	StatusCode        int
+	Code              string
+	Message           string
+	Retryable         bool
+	RetryAfterSeconds int
+}
+
+func (e *QueryTemporarilyUnavailableError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Code
+}
+
+type structuredAPIErrorResponse struct {
+	Status         int    `json:"status"`
+	Error          string `json:"error"`
+	Code           string `json:"code"`
+	Message        string `json:"message"`
+	Action         string `json:"action"`
+	RestartWithout string `json:"restart_without"`
+	Retryable      *bool  `json:"retryable"`
+}
+
+func queryRetryAfterSeconds(header http.Header) int {
+	seconds, err := strconv.Atoi(header.Get("Retry-After"))
+	if err != nil || seconds <= 0 {
+		return 0
+	}
+	return seconds
+}
+
+func isQueryTemporarilyUnavailableCode(code string) bool {
+	switch code {
+	case "doc_identity_unavailable",
+		"read_requires_primary",
+		"standby_read_unavailable",
+		"storage_read_temporarily_unavailable",
+		"index_rebuilding",
+		"query_embedding_temporarily_unavailable":
+		return true
+	default:
+		return false
+	}
+}
+
 func readLimitedBody(r io.Reader, maxBytes int64) ([]byte, bool, error) {
 	if maxBytes <= 0 {
 		body, err := io.ReadAll(r)
@@ -204,11 +274,39 @@ func readErrorResponse(resp *http.Response) error {
 		return fmt.Errorf("reading http response: %w", err)
 	}
 
-	// Try to parse as JSON error response
-	var errResp struct {
-		Error string `json:"error"`
+	// Preserve actionable query failures as typed errors so convenience-client
+	// callers do not need to parse wire JSON or switch to the generated client.
+	var errResp structuredAPIErrorResponse
+	parsedStructuredError := json.Unmarshal(respBody, &errResp) == nil
+	if parsedStructuredError {
+		if resp.StatusCode == http.StatusConflict &&
+			errResp.Status == http.StatusConflict &&
+			errResp.Error == "hierarchy_cursor_stale" &&
+			errResp.Action == "restart_hierarchy_traversal" &&
+			errResp.RestartWithout == "search_after" &&
+			errResp.Retryable != nil && !*errResp.Retryable {
+			return &HierarchyCursorStaleError{
+				StatusCode:     resp.StatusCode,
+				Code:           errResp.Error,
+				Message:        errResp.Message,
+				Action:         errResp.Action,
+				RestartWithout: errResp.RestartWithout,
+				Retryable:      false,
+			}
+		}
+		if resp.StatusCode == http.StatusServiceUnavailable &&
+			errResp.Retryable != nil && *errResp.Retryable &&
+			isQueryTemporarilyUnavailableCode(errResp.Code) {
+			return &QueryTemporarilyUnavailableError{
+				StatusCode:        resp.StatusCode,
+				Code:              errResp.Code,
+				Message:           errResp.Message,
+				Retryable:         true,
+				RetryAfterSeconds: queryRetryAfterSeconds(resp.Header),
+			}
+		}
 	}
-	if err := json.Unmarshal(respBody, &errResp); err == nil && errResp.Error != "" {
+	if parsedStructuredError && errResp.Error != "" {
 		return &APIError{
 			StatusCode: resp.StatusCode,
 			Message:    errResp.Error,

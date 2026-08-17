@@ -134,7 +134,7 @@ class QueryRequest:
             Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration.
 
             When `hierarchy.group_by` is present, aggregations operate on the complete
-            set of top-level grouped source documents. Nested `group_by.matches` are
+            set of top-level grouped source or unit records. Nested `group_by.matches` are
             bounded evidence projections and are not counted as aggregation rows.
 
             Supports metric aggregations (sum, avg, min, max, count, stats, cardinality),
@@ -178,7 +178,8 @@ class QueryRequest:
         fields (list[str] | Unset): List of fields to include in the results. If not specified, all fields are returned.
             Use to reduce response size and improve performance. This field is required when
             hierarchy.group_by is present so a grouped query cannot accidentally hydrate an
-            entire source document. Use an empty array for identity-only source groups.
+            entire grouped document. Use an empty array for identity-only groups.
+            This projection is also required for hierarchy.children traversal.
              Example: ['title', 'url', 'summary', 'created_at'].
         hierarchy (QueryHierarchy | Unset): Returns direct index matches with optional projected ancestor context, or
             groups
@@ -186,10 +187,14 @@ class QueryRequest:
             projection is independently bounded and defaults to three hits while the top-level
             `limit` continues to control the number of groups.
 
+            `children` is a separate sequential-browsing operation. It enumerates every unit
+            in the selected source revision, including units with no searchable chunk, and uses
+            the top-level `_sort`/`search_after` cursor contract.
+
             Ancestor and nested-match field projections are always explicit to keep response
             size predictable. The presence of this object selects the canonical contract:
-            without `group_by`, including when the object is empty, direct index matches are
-            returned. `ancestors` only controls projected context and never changes result
+            without `group_by` or `children`, including when the object is empty, direct index
+            matches are returned. `ancestors` only controls projected context and never changes result
             cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
         limit (int | Unset): Maximum number of top-level results to return. For semantic_search, this is the topk
             parameter.
@@ -209,6 +214,8 @@ class QueryRequest:
              Example: 5000.
         order_by (list[SortField] | Unset): Sort order for results. Array of sort fields with direction.
             Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
+            Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque,
+            sortable value is bound to the complete source hierarchy revision.
             Supported for exact text-backed, match_all, and filter-only requests
             when each non-`_id` field is a mapped exact scalar field with sortable
             native doc-value coverage. Sortable mapping types are keyword,
@@ -231,6 +238,9 @@ class QueryRequest:
             order and the cursor tuple must contain exactly one `_id` string.
             Supported for exact text-backed, match_all, and filter-only requests;
             not supported for semantic_search or count-only requests.
+            For hierarchy child traversal, a cursor whose source-artifact revision
+            changed returns `409 hierarchy_cursor_stale`; restart the same traversal
+            without `search_after` rather than retrying the stale tuple.
         search_before (list[Any] | Unset): Cursor for backward pagination. Pass the `_sort` values from the first hit
             of the current page exactly, including the appended `_id` tie-breaker.
             Values preserve their JSON types; for example numbers remain numbers,

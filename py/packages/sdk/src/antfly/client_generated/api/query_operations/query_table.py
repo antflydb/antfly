@@ -8,8 +8,10 @@ from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
 from ...models.exact_sort_error import ExactSortError
+from ...models.hierarchy_cursor_stale_error import HierarchyCursorStaleError
 from ...models.query_request import QueryRequest
 from ...models.query_responses import QueryResponses
+from ...models.query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
 from ...models.table_storage_unreadable_error import TableStorageUnreadableError
 from ...types import File, Response
 
@@ -43,7 +45,16 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Error | Error | TableStorageUnreadableError | ExactSortError | QueryResponses | None:
+) -> (
+    Error
+    | Error
+    | TableStorageUnreadableError
+    | ExactSortError
+    | HierarchyCursorStaleError
+    | QueryResponses
+    | QueryTemporarilyUnavailableError
+    | None
+):
     if response.status_code == 200:
         response_200 = QueryResponses.from_dict(response.json())
 
@@ -58,6 +69,11 @@ def _parse_response(
         response_404 = Error.from_dict(response.json())
 
         return response_404
+
+    if response.status_code == 409:
+        response_409 = HierarchyCursorStaleError.from_dict(response.json())
+
+        return response_409
 
     if response.status_code == 422:
         response_422 = ExactSortError.from_dict(response.json())
@@ -85,6 +101,11 @@ def _parse_response(
 
         return response_500
 
+    if response.status_code == 503:
+        response_503 = QueryTemporarilyUnavailableError.from_dict(response.json())
+
+        return response_503
+
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -93,7 +114,15 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Error | Error | TableStorageUnreadableError | ExactSortError | QueryResponses]:
+) -> Response[
+    Error
+    | Error
+    | TableStorageUnreadableError
+    | ExactSortError
+    | HierarchyCursorStaleError
+    | QueryResponses
+    | QueryTemporarilyUnavailableError
+]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -107,7 +136,15 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: QueryRequest | File,
-) -> Response[Error | Error | TableStorageUnreadableError | ExactSortError | QueryResponses]:
+) -> Response[
+    Error
+    | Error
+    | TableStorageUnreadableError
+    | ExactSortError
+    | HierarchyCursorStaleError
+    | QueryResponses
+    | QueryTemporarilyUnavailableError
+]:
     """Query a specific table
 
     Args:
@@ -120,7 +157,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | TableStorageUnreadableError | ExactSortError | QueryResponses]
+        Response[Error | Error | TableStorageUnreadableError | ExactSortError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError]
     """
 
     kwargs = _get_kwargs(
@@ -140,7 +177,16 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: QueryRequest | File,
-) -> Error | Error | TableStorageUnreadableError | ExactSortError | QueryResponses | None:
+) -> (
+    Error
+    | Error
+    | TableStorageUnreadableError
+    | ExactSortError
+    | HierarchyCursorStaleError
+    | QueryResponses
+    | QueryTemporarilyUnavailableError
+    | None
+):
     """Query a specific table
 
     Args:
@@ -153,7 +199,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | TableStorageUnreadableError | ExactSortError | QueryResponses
+        Error | Error | TableStorageUnreadableError | ExactSortError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError
     """
 
     return sync_detailed(
@@ -168,7 +214,15 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: QueryRequest | File,
-) -> Response[Error | Error | TableStorageUnreadableError | ExactSortError | QueryResponses]:
+) -> Response[
+    Error
+    | Error
+    | TableStorageUnreadableError
+    | ExactSortError
+    | HierarchyCursorStaleError
+    | QueryResponses
+    | QueryTemporarilyUnavailableError
+]:
     """Query a specific table
 
     Args:
@@ -181,7 +235,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | TableStorageUnreadableError | ExactSortError | QueryResponses]
+        Response[Error | Error | TableStorageUnreadableError | ExactSortError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError]
     """
 
     kwargs = _get_kwargs(
@@ -199,7 +253,16 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: QueryRequest | File,
-) -> Error | Error | TableStorageUnreadableError | ExactSortError | QueryResponses | None:
+) -> (
+    Error
+    | Error
+    | TableStorageUnreadableError
+    | ExactSortError
+    | HierarchyCursorStaleError
+    | QueryResponses
+    | QueryTemporarilyUnavailableError
+    | None
+):
     """Query a specific table
 
     Args:
@@ -212,7 +275,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | TableStorageUnreadableError | ExactSortError | QueryResponses
+        Error | Error | TableStorageUnreadableError | ExactSortError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError
     """
 
     return (

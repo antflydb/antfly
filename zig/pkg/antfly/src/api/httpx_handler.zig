@@ -1030,6 +1030,10 @@ pub const AntflyApiHandler = struct {
                 .status = 409,
                 .message = "doc identity namespace mismatch",
             },
+            error.HierarchyCursorStale => .{
+                .status = 409,
+                .message = "HierarchyCursorStale",
+            },
             else => null,
         };
     }
@@ -1076,6 +1080,8 @@ pub const AntflyApiHandler = struct {
             ctx.request.uri.query orelse "",
         ) catch return textResponse(ctx, 400, "invalid lookup options");
         defer lookup_options.deinit(ctx.allocator);
+        const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch
+            return textResponse(ctx, 400, "invalid read consistency");
         var result = self.internalGroupOperations().lookup(
             ctx.allocator,
             operationContext(ctx, null),
@@ -1084,6 +1090,7 @@ pub const AntflyApiHandler = struct {
                 .table_name = table_name,
                 .key = key,
                 .options = lookup_options.opts,
+                .consistency = consistency,
             },
         ) catch |err| return internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
@@ -5558,10 +5565,13 @@ const SchemaReconcileWriteSource = struct {
     }
 };
 
-test "typed internal HTTP errors preserve doc identity conflict semantics" {
+test "typed internal HTTP errors preserve conflict semantics" {
     const spec = AntflyApiHandler.sharedInternalHttpErrorSpec(error.DocIdentityNamespaceMismatch).?;
     try std.testing.expectEqual(@as(u16, 409), spec.status);
     try std.testing.expectEqualStrings("doc identity namespace mismatch", spec.message);
+    const stale_cursor = AntflyApiHandler.sharedInternalHttpErrorSpec(error.HierarchyCursorStale).?;
+    try std.testing.expectEqual(@as(u16, 409), stale_cursor.status);
+    try std.testing.expectEqualStrings("HierarchyCursorStale", stale_cursor.message);
     try std.testing.expect(AntflyApiHandler.sharedInternalHttpErrorSpec(error.NotFound) == null);
 }
 
@@ -6035,7 +6045,7 @@ test "httpx internal control routes call typed operations directly" {
             try std.testing.expectEqualStrings("doc:a", key);
             try std.testing.expectEqual(@as(usize, 1), opts.fields.len);
             try std.testing.expectEqualStrings("title", opts.fields[0]);
-            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.stale, consistency);
             return .{ .json = try inner_alloc.dupe(u8, "{\"title\":\"alpha\"}"), .version = 42 };
         }
 
@@ -6062,7 +6072,7 @@ test "httpx internal control routes call typed operations directly" {
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
 
-    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/documents/doc:a?fields=title", .{base_url});
+    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/documents/doc:a?fields=title&read_consistency=stale", .{base_url});
     defer alloc.free(lookup_url);
     var lookup = try getWithRetry(&client, client_io.io(), lookup_url, null, 20);
     defer lookup.deinit();

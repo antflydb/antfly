@@ -49,11 +49,7 @@ export function term(term: string, field?: string, boost?: number): Query {
  * match("golang tutorial")
  * match("computer science", "title", { analyzer: "standard", boost: 1.5 })
  */
-export function match(
-  match: string,
-  field?: string,
-  options?: MatchOptions
-): MatchQuery {
+export function match(match: string, field?: string, options?: MatchOptions): MatchQuery {
   return {
     match,
     field,

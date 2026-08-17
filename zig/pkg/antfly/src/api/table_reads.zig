@@ -37,6 +37,8 @@ const ha_public_gate_state = @import("../storage/ha/public_gate_state.zig");
 const ha_read_gate_mod = @import("../storage/ha/read_gate.zig");
 const ha_standby_mod = @import("../storage/ha/standby.zig");
 const storage_schema = @import("../storage/schema.zig");
+const internal_keys = @import("../storage/internal_keys.zig");
+const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
@@ -143,6 +145,105 @@ fn queryRequestCancellation(req: db_mod.types.SearchRequest) http_common.Request
     return if (req.cancellation) |token| .fromToken(token) else .{};
 }
 
+fn checkLookupOptionsActive(opts: db_mod.types.LookupOptions) !void {
+    if (opts.cancellation) |value| {
+        if (value.isCancelled()) return error.Cancelled;
+    }
+    const deadline_ns = opts.execution_deadline_ns orelse return;
+    if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+}
+
+fn lookupRemainingTimeoutMs(opts: db_mod.types.LookupOptions) !?u32 {
+    try checkLookupOptionsActive(opts);
+    const deadline_ns = opts.execution_deadline_ns orelse return null;
+    const now_ns = platform_time.monotonicNs();
+    if (now_ns >= deadline_ns) return error.Timeout;
+    const remaining_ns = deadline_ns - now_ns;
+    const rounded_ms = @max(
+        @as(u64, 1),
+        std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1,
+    );
+    return @intCast(@min(rounded_ms, @as(u64, std.math.maxInt(u32))));
+}
+
+fn hierarchyNavigationLookupOptions(req: db_mod.types.SearchRequest, fields: []const []const u8, include_all_fields: bool) db_mod.types.LookupOptions {
+    return .{
+        .fields = fields,
+        .include_all_fields = include_all_fields,
+        .execution_deadline_ns = req.execution_deadline_ns,
+        .cancellation = req.cancellation,
+    };
+}
+
+fn fullPayloadLookupOptions(opts: db_mod.types.LookupOptions) db_mod.types.LookupOptions {
+    var full = opts;
+    full.fields = &.{};
+    full.include_all_fields = true;
+    return full;
+}
+
+const AuthoritativePayloadLookup = struct {
+    options: db_mod.types.LookupOptions,
+    owned_fields: []const []const u8 = &.{},
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.owned_fields.len > 0) alloc.free(self.owned_fields);
+        self.* = undefined;
+    }
+};
+
+fn authoritativePayloadLookupAlloc(
+    alloc: std.mem.Allocator,
+    opts: db_mod.types.LookupOptions,
+) !AuthoritativePayloadLookup {
+    const special = db_mod.query_projection.buildLookupFieldSelectionPlan(opts).special;
+    const selected_count = @as(usize, @intFromBool(special.all_artifacts)) +
+        @as(usize, @intFromBool(special.all_chunks)) +
+        @as(usize, @intFromBool(special.all_embeddings));
+    if (selected_count == 0) {
+        return .{ .options = fullPayloadLookupOptions(opts) };
+    }
+
+    // A wildcard keeps the complete stored unit available for fingerprint
+    // validation and local reprojection. The explicit synthetic selectors
+    // cause storage to materialize only the namespaces requested by the
+    // caller, so the authoritative retry is lossless without loading every
+    // potentially large enrichment artifact.
+    const fields = try alloc.alloc([]const u8, selected_count + 1);
+    errdefer alloc.free(fields);
+    fields[0] = "*";
+    var index: usize = 1;
+    if (special.all_artifacts) {
+        fields[index] = "_artifacts";
+        index += 1;
+    }
+    if (special.all_chunks) {
+        fields[index] = "_chunks";
+        index += 1;
+    }
+    if (special.all_embeddings) {
+        fields[index] = "_embeddings";
+    }
+
+    var authoritative = opts;
+    authoritative.fields = fields;
+    authoritative.include_all_fields = false;
+    return .{ .options = authoritative, .owned_fields = fields };
+}
+
+fn controlledLookupResponseAlloc(
+    alloc: std.mem.Allocator,
+    json: []const u8,
+    version: u64,
+    opts: db_mod.types.LookupOptions,
+) !LookupResponse {
+    try checkLookupOptionsActive(opts);
+    const cloned = try alloc.dupe(u8, json);
+    errdefer alloc.free(cloned);
+    try checkLookupOptionsActive(opts);
+    return .{ .json = cloned, .version = version };
+}
+
 fn nsToUsFloat(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1000.0;
 }
@@ -158,6 +259,23 @@ pub const ObservedDynamicFieldCapabilitySet = table_read_source.ObservedDynamicF
 pub const ParsedTextStatsHttpResponse = table_read_source.ParsedTextStatsHttpResponse;
 
 pub const testing = if (builtin.is_test) struct {
+    pub fn encodeRemoteQueryRequestAlloc(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
+        return try encodeQueryRequest(alloc, req);
+    }
+
+    pub fn applyHierarchyNavigationLookupForTest(
+        alloc: std.mem.Allocator,
+        hit: *db_mod.types.SearchHit,
+        json: []const u8,
+    ) !void {
+        var response = LookupResponse{
+            .json = try alloc.dupe(u8, json),
+            .version = 1,
+        };
+        defer response.deinit(alloc);
+        try applyHierarchyNavigationLookup(alloc, hit, &response);
+    }
+
     pub fn rejectResolvedDocFilterForCrossGroup(req: db_mod.types.SearchRequest, group_count: usize) !void {
         return rejectCrossGroupResolvedDocFilter(req, group_count);
     }
@@ -1859,6 +1977,8 @@ fn encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(
             .hierarchy_match_fields = @constCast(req.hierarchy_match_fields),
             .hierarchy_match_include_all_fields = req.hierarchy_match_include_all_fields,
             .hierarchy_grouped_matches = req.hierarchy_grouped_matches,
+            .hierarchy_group_level = req.hierarchy_group_level,
+            .defer_hierarchy_child_hydration = req.defer_hierarchy_child_hydration,
             .hierarchy_source_fields = @constCast(req.hierarchy_source_fields),
             .hierarchy_source_include_all_fields = req.hierarchy_source_include_all_fields,
             .hierarchy_unit_fields = @constCast(req.hierarchy_unit_fields),
@@ -2006,10 +2126,7 @@ pub const BoundTableReadSource = struct {
         var result = (try self.reads.lookupWithConsistency(alloc, self.db, key, opts, consistency)) orelse return null;
         defer result.deinit(alloc);
 
-        return .{
-            .json = try alloc.dupe(u8, result.json),
-            .version = try self.db.getTimestamp(alloc, key),
-        };
+        return try controlledLookupResponseAlloc(alloc, result.json, try self.db.getTimestamp(alloc, key), opts);
     }
 
     fn scan(
@@ -2759,11 +2876,14 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try checkLookupOptionsActive(opts);
         try self.ensureHAReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
+            try checkLookupOptionsActive(opts);
             var prepared = try self.prepareRoutedKeyRead(alloc, table_name, key, .{ .lookup = .{ .key = key, .opts = opts } }, consistency, .general);
             defer prepared.deinit();
+            try checkLookupOptionsActive(opts);
             const group_id = prepared.group_id orelse return null;
             return lookupProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, .stale) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
@@ -3706,13 +3826,16 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try checkLookupOptionsActive(opts);
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, key)) orelse {
             return null;
         };
+        try checkLookupOptionsActive(opts);
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse {
             return null;
         };
         defer route.deinit(alloc);
+        try checkLookupOptionsActive(opts);
 
         if (try lookupViaRoute(self, alloc, route, group_id, table_name, key, opts, consistency)) |result| return result;
         return try lookupAcrossActivePlacements(self, alloc, group_id, table_name, key, opts, consistency, route);
@@ -3794,7 +3917,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         return switch (route) {
             .local => try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency),
-            .remote => |remote| lookupRemote(self.executor, alloc, remote.base_uri, group_id, table_name, key, opts) catch |err| switch (err) {
+            .remote => |remote| lookupRemote(self.executor, alloc, remote.base_uri, group_id, table_name, key, opts, consistency) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -3837,7 +3960,7 @@ pub const HostedProvisionedTableReadSource = struct {
             }
             const base_uri = (try self.router.nodeBaseUriForGroup(alloc, group_id, node_id)) orelse continue;
             defer alloc.free(base_uri);
-            if (lookupRemote(self.executor, alloc, base_uri, group_id, table_name, key, opts)) |result| {
+            if (lookupRemote(self.executor, alloc, base_uri, group_id, table_name, key, opts, consistency)) |result| {
                 return result;
             } else |err| switch (err) {
                 error.UnexpectedHttpStatus => continue,
@@ -4845,6 +4968,19 @@ fn distributedSearchShardRequest(
     copy.offset = 0;
     copy.limit = distributedSearchShardLimit(req);
     copy.distributed_text_stats = distributed_text_stats;
+    // Unit payloads and their parent-owned navigation state may belong to
+    // independent child ranges. Shards select identities from local state; the
+    // coordinator hydrates the globally selected unit page through routed
+    // point lookups. Set this before either direct-local or encoded-remote
+    // execution so routing topology cannot change query semantics.
+    if (req.hierarchy_group_level == .unit or req.hierarchy_children != null) {
+        copy.defer_hierarchy_child_hydration = true;
+        if (req.hierarchy_group_level == .unit) {
+            // The internal revision envelope is transported through `_source`
+            // and removed before the public response is encoded.
+            copy.include_stored = true;
+        }
+    }
     return copy;
 }
 
@@ -4982,6 +5118,30 @@ test "distributed query shard request preserves sorted cursor contract" {
     try std.testing.expect(!grouped_shard_req.hierarchy_grouped_matches);
     try std.testing.expectEqual(@as(u32, 0), grouped_shard_req.max_chunks_per_parent);
 
+    const grouped_unit_shard_req = distributedSearchShardRequest(.{
+        .return_mode = .unit_with_chunks,
+        .hierarchy_group_level = .unit,
+        .hierarchy_grouped_matches = true,
+        .max_chunks_per_parent = 20,
+        .limit = 10,
+    }, &.{}, false);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.unit, grouped_unit_shard_req.return_mode);
+    try std.testing.expect(grouped_unit_shard_req.defer_hierarchy_child_hydration);
+
+    const child_fields = [_][]const u8{"text"};
+    const children_shard_req = distributedSearchShardRequest(.{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .include_stored = true,
+        .include_all_fields = false,
+        .fields = &child_fields,
+        .limit = 10,
+    }, &.{}, false);
+    try std.testing.expect(children_shard_req.hierarchy_children != null);
+    try std.testing.expect(children_shard_req.defer_hierarchy_child_hydration);
+    try std.testing.expect(children_shard_req.include_stored);
+    try std.testing.expectEqualStrings("text", children_shard_req.fields[0]);
+
     const expansion_shard_req = distributedSearchShardRequest(.{
         .return_mode = .parent_with_chunks,
         .hierarchy_grouped_matches = true,
@@ -4990,6 +5150,38 @@ test "distributed query shard request preserves sorted cursor contract" {
     }, &.{}, true);
     try std.testing.expect(expansion_shard_req.hierarchy_grouped_matches);
     try std.testing.expectEqual(@as(u32, 100), expansion_shard_req.max_chunks_per_parent);
+}
+
+test "distributed unit grouping round trips deferred shard hydration" {
+    const alloc = std.testing.allocator;
+    const fields = [_][]const u8{"text"};
+    const shard_req = distributedSearchShardRequest(.{
+        .return_mode = .unit_with_chunks,
+        .hierarchy_group_level = .unit,
+        .hierarchy_grouped_matches = true,
+        .max_chunks_per_parent = 3,
+        .include_all_fields = false,
+        .fields = &fields,
+    }, &.{}, false);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.unit, shard_req.return_mode);
+    try std.testing.expect(shard_req.defer_hierarchy_child_hydration);
+
+    const encoded = try encodeQueryRequest(alloc, shard_req);
+    defer alloc.free(encoded);
+    var round_trip = try query_contract.parseQueryRequest(alloc, null, "docs", encoded);
+    defer round_trip.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.HierarchyGroupLevel.unit, round_trip.req.hierarchy_group_level);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.unit, round_trip.req.return_mode);
+    try std.testing.expect(round_trip.req.defer_hierarchy_child_hydration);
+
+    const invalid_encoded = try encodeQueryRequest(alloc, .{
+        .defer_hierarchy_child_hydration = true,
+    });
+    defer alloc.free(invalid_encoded);
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        query_contract.parseQueryRequest(alloc, null, "docs", invalid_encoded),
+    );
 }
 
 test "distributed grouped hierarchy expands only the globally merged page" {
@@ -5042,12 +5234,325 @@ test "distributed grouped hierarchy expands only the globally merged page" {
     };
     defer expanded.deinit();
 
-    applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded);
+    try applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded);
     try std.testing.expectEqual(@as(usize, 1), selected.hits[0].chunk_hits.len);
     try std.testing.expectEqualStrings("source:c#chunk:0", selected.hits[0].chunk_hits[0].id);
     try std.testing.expectEqualStrings("source:d#chunk:0", selected.hits[1].chunk_hits[0].id);
     try std.testing.expectEqual(@as(usize, 0), expanded.hits[0].chunk_hits.len);
     try std.testing.expectEqual(@as(usize, 0), expanded.hits[1].chunk_hits.len);
+}
+
+test "distributed grouped unit expansion rejects a cross-revision result" {
+    const alloc = std.testing.allocator;
+    const selected_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    selected_hits[0] = .{
+        .id = try alloc.dupe(u8, "unit:0"),
+        .stored_data = try alloc.dupe(u8, "{\"_hierarchy_unit_revision_token\":\"selected-revision\"}"),
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "document_units_v1"),
+            .kind = .asset,
+            .unit_id = try alloc.dupe(u8, "page:000001"),
+        },
+    };
+    var selected = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = selected_hits,
+        .total_hits = 1,
+    };
+    defer selected.deinit();
+
+    const expanded_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    const matches = try alloc.alloc(db_mod.types.ChunkHit, 1);
+    matches[0] = .{ .id = try alloc.dupe(u8, "chunk:0") };
+    expanded_hits[0] = .{
+        .id = try alloc.dupe(u8, "unit:0"),
+        .stored_data = try alloc.dupe(u8, "{\"_hierarchy_unit_revision_token\":\"expanded-revision\"}"),
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "document_units_v1"),
+            .kind = .asset,
+            .unit_id = try alloc.dupe(u8, "page:000001"),
+        },
+        .chunk_hits = matches,
+    };
+    var expanded = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = expanded_hits,
+        .total_hits = 1,
+    };
+    defer expanded.deinit();
+
+    try std.testing.expectError(
+        error.StorageReadTemporarilyUnavailable,
+        applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded),
+    );
+    try std.testing.expectEqual(@as(usize, 0), selected.hits[0].chunk_hits.len);
+    try std.testing.expectEqual(@as(usize, 1), expanded.hits[0].chunk_hits.len);
+}
+
+test "distributed grouped unit expansion rejects a missing selected group" {
+    const alloc = std.testing.allocator;
+    const selected_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    selected_hits[0] = .{
+        .id = try alloc.dupe(u8, "unit:0"),
+        .stored_data = try alloc.dupe(u8, "{\"_hierarchy_unit_revision_token\":\"selected-revision\"}"),
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "document_units_v1"),
+            .kind = .asset,
+            .unit_id = try alloc.dupe(u8, "page:000001"),
+        },
+    };
+    var selected = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = selected_hits,
+        .total_hits = 1,
+    };
+    defer selected.deinit();
+
+    var expanded = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+    };
+    defer expanded.deinit();
+
+    try std.testing.expectError(
+        error.StorageReadTemporarilyUnavailable,
+        applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded),
+    );
+}
+
+test "distributed unit group hydration routes selected units and deduplicates sources" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        io_impl: ?*std.Io.Threaded = null,
+        unit_calls: usize = 0,
+        source_calls: usize = 0,
+
+        fn lookup(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            _: []const u8,
+            key: []const u8,
+            _: db_mod.types.LookupOptions,
+            consistency_inner: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const json = if (std.mem.eql(u8, key, "doc:a")) blk: {
+                try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency_inner);
+                self.source_calls += 1;
+                break :blk "{\"title\":\"source\"}";
+            } else blk: {
+                try std.testing.expectEqual(raft_mod.ReadConsistency.stale, consistency_inner);
+                self.unit_calls += 1;
+                break :blk "{\"text\":\"unit\",\"_artifact_unit_fingerprint\":\"private\"}";
+            };
+            return .{ .json = try inner_alloc.dupe(u8, json), .version = 1 };
+        }
+    };
+
+    const hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    for (hits, 0..) |*hit, i| {
+        const unit_id = if (i == 0) "page:000001" else "page:000002";
+        const matches = try alloc.alloc(db_mod.types.ChunkHit, 1);
+        matches[0] = .{ .id = try std.fmt.allocPrint(alloc, "chunk:{d}", .{i}) };
+        hit.* = .{
+            .id = try std.fmt.allocPrint(alloc, "unit:{d}", .{i}),
+            .stored_data = try alloc.dupe(u8, "{\"_hierarchy_unit_revision_token\":\"private\"}"),
+            .artifact_ref = .{
+                .document_id = try alloc.dupe(u8, "doc:a"),
+                .name = try alloc.dupe(u8, "document_units_v1"),
+                .kind = .asset,
+                .unit_id = try alloc.dupe(u8, unit_id),
+            },
+            .chunk_hits = matches,
+        };
+    }
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    };
+    defer result.deinit();
+    var source = FakeSource{};
+    try hydrateDistributedGroupedUnitHits(
+        FakeSource,
+        &source,
+        alloc,
+        "docs",
+        .{
+            .hierarchy_group_level = .unit,
+            .include_stored = true,
+            .include_all_fields = false,
+            .fields = &.{"text"},
+            .hierarchy_include_unit = true,
+            .hierarchy_unit_include_all_fields = false,
+            .hierarchy_unit_fields = &.{"text"},
+            .hierarchy_include_source = true,
+            .hierarchy_source_include_all_fields = false,
+            .hierarchy_source_fields = &.{"title"},
+        },
+        &result,
+        .read_index,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), source.unit_calls);
+    try std.testing.expectEqual(@as(usize, 1), source.source_calls);
+    for (result.hits) |hit| {
+        try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "private") == null);
+        try std.testing.expect(std.mem.indexOf(u8, hit.ancestor_unit_data.?, "private") == null);
+        try std.testing.expectEqualStrings("{\"title\":\"source\"}", hit.ancestor_source_data.?);
+        try std.testing.expectEqualStrings(hit.ancestor_unit_data.?, hit.chunk_hits[0].ancestor_unit_data.?);
+        try std.testing.expectEqualStrings(hit.ancestor_source_data.?, hit.chunk_hits[0].ancestor_source_data.?);
+    }
+}
+
+test "distributed unit hydration preserves exclusion-only projections" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        io_impl: ?*std.Io.Threaded = null,
+        calls: usize = 0,
+
+        fn lookup(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            opts: db_mod.types.LookupOptions,
+            consistency_inner: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(raft_mod.ReadConsistency.stale, consistency_inner);
+            for (opts.fields) |field| {
+                try std.testing.expect(!std.mem.eql(u8, field, hierarchy_navigation_unit_fingerprint_field));
+            }
+            self.calls += 1;
+            const raw = if (self.calls == 1)
+                "{\"text\":\"stale text\",\"title\":\"stale title\",\"secret\":\"stale secret\",\"_artifact_unit_fingerprint\":\"stale\"}"
+            else
+                "{\"text\":\"current text\",\"title\":\"current title\",\"secret\":\"current secret\",\"_artifact_unit_fingerprint\":\"private\"}";
+            const projected = try db_mod.document_query.lookupJson(
+                inner_alloc,
+                raw,
+                opts,
+            );
+            return .{ .json = projected.json, .version = 1 };
+        }
+    };
+
+    const hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "unit:0"),
+        .stored_data = try alloc.dupe(u8, "{\"_hierarchy_unit_revision_token\":\"private\"}"),
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "document_units_v1"),
+            .kind = .asset,
+            .unit_id = try alloc.dupe(u8, "page:000001"),
+        },
+    };
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+    };
+    defer result.deinit();
+    var source = FakeSource{};
+    try hydrateDistributedGroupedUnitHits(
+        FakeSource,
+        &source,
+        alloc,
+        "docs",
+        .{
+            .hierarchy_group_level = .unit,
+            .include_stored = true,
+            .include_all_fields = false,
+            .fields = &.{ "-text", "-_artifact_unit_fingerprint" },
+            .hierarchy_include_unit = true,
+            .hierarchy_unit_include_all_fields = false,
+            .hierarchy_unit_fields = &.{"-secret"},
+        },
+        &result,
+        .read_index,
+    );
+
+    // Explicitly excluding the marker triggers one full-payload validation
+    // lookup; the ancestor exclusion retains it and completes in one read.
+    try std.testing.expectEqual(@as(usize, 3), source.calls);
+    var stored = try std.json.parseFromSlice(std.json.Value, alloc, result.hits[0].stored_data.?, .{});
+    defer stored.deinit();
+    try std.testing.expect(stored.value.object.get("text") == null);
+    try std.testing.expectEqualStrings("current title", stored.value.object.get("title").?.string);
+    try std.testing.expectEqualStrings("current secret", stored.value.object.get("secret").?.string);
+    try std.testing.expect(stored.value.object.get(hierarchy_navigation_unit_fingerprint_field) == null);
+
+    var ancestor = try std.json.parseFromSlice(std.json.Value, alloc, result.hits[0].ancestor_unit_data.?, .{});
+    defer ancestor.deinit();
+    try std.testing.expectEqualStrings("current text", ancestor.value.object.get("text").?.string);
+    try std.testing.expectEqualStrings("current title", ancestor.value.object.get("title").?.string);
+    try std.testing.expect(ancestor.value.object.get("secret") == null);
+    try std.testing.expect(ancestor.value.object.get(hierarchy_navigation_unit_fingerprint_field) == null);
+}
+
+test "distributed unit group hydration rejects a cross-revision unit payload" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        io_impl: ?*std.Io.Threaded = null,
+
+        fn lookup(
+            _: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            consistency_inner: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            try std.testing.expectEqual(raft_mod.ReadConsistency.stale, consistency_inner);
+            return .{
+                .json = try inner_alloc.dupe(
+                    u8,
+                    "{\"text\":\"new revision\",\"_artifact_unit_fingerprint\":\"new-fingerprint\"}",
+                ),
+                .version = 2,
+            };
+        }
+    };
+
+    const hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "unit:0"),
+        .stored_data = try alloc.dupe(u8, "{\"_hierarchy_unit_revision_token\":\"selected-fingerprint\"}"),
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "document_units_v1"),
+            .kind = .asset,
+            .unit_id = try alloc.dupe(u8, "page:000001"),
+        },
+    };
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+    };
+    defer result.deinit();
+    var source = FakeSource{};
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, hydrateDistributedGroupedUnitHits(
+        FakeSource,
+        &source,
+        alloc,
+        "docs",
+        .{
+            .hierarchy_group_level = .unit,
+            .include_stored = true,
+            .include_all_fields = false,
+            .fields = &.{"text"},
+        },
+        &result,
+        .read_index,
+    ));
+    try std.testing.expect(result.hits[0].stored_data == null);
 }
 
 test "hosted distributed grouped hierarchy expands the globally selected shard page" {
@@ -5952,33 +6457,981 @@ fn canonicalGroupedMatchExpansionPlanAlloc(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
     result: db_mod.types.SearchResult,
-) !struct { request: db_mod.types.SearchRequest, parent_ids: []const []const u8 } {
+) !struct { request: db_mod.types.SearchRequest, parent_ids: []const []const u8, filter_json: ?[]u8 = null } {
     const parent_ids = try alloc.alloc([]const u8, result.hits.len);
-    for (result.hits, 0..) |hit, i| parent_ids[i] = hit.id;
+    errdefer alloc.free(parent_ids);
+    for (result.hits, 0..) |hit, i| {
+        parent_ids[i] = if (req.hierarchy_group_level == .unit)
+            (hit.artifact_ref orelse return error.InvalidQueryRequest).document_id
+        else
+            hit.id;
+    }
     const snapshot_req = requestWithResultIdentityGeneration(req, result);
+    var request = db_mod.types.canonicalGroupedMatchExpansionRequest(snapshot_req, parent_ids);
+    const filter_json = if (req.hierarchy_group_level == .unit)
+        try hierarchyUnitGroupsFilterJsonAlloc(alloc, req.filter_query_json, result.hits)
+    else
+        null;
+    if (filter_json) |value| request.filter_query_json = value;
     return .{
-        .request = db_mod.types.canonicalGroupedMatchExpansionRequest(snapshot_req, parent_ids),
+        .request = request,
         .parent_ids = parent_ids,
+        .filter_json = filter_json,
     };
+}
+
+fn hierarchyUnitGroupsFilterJsonAlloc(
+    alloc: std.mem.Allocator,
+    existing_filter_json: []const u8,
+    hits: []const db_mod.types.SearchHit,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    if (existing_filter_json.len > 0) {
+        try out.appendSlice(alloc, "{\"bool\":{\"must\":[");
+        try out.appendSlice(alloc, existing_filter_json);
+        try out.appendSlice(alloc, ",");
+    }
+    try out.appendSlice(alloc, "{\"bool\":{\"should\":[");
+    for (hits, 0..) |hit, i| {
+        const artifact_ref = hit.artifact_ref orelse return error.InvalidQueryRequest;
+        const unit_id = artifact_ref.unit_id orelse return error.InvalidQueryRequest;
+        const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(
+            alloc,
+            artifact_ref.document_id,
+            artifact_ref.name,
+            unit_id,
+        );
+        defer alloc.free(unit_key);
+        if (i > 0) try out.append(alloc, ',');
+        const encoded_doc_id = try std.json.Stringify.valueAlloc(alloc, artifact_ref.document_id, .{});
+        defer alloc.free(encoded_doc_id);
+        const encoded_unit_key = try std.json.Stringify.valueAlloc(alloc, unit_key, .{});
+        defer alloc.free(encoded_unit_key);
+        try out.appendSlice(alloc, "{\"bool\":{\"must\":[{\"term\":{\"path\":\"/_parent_doc_key\",\"value\":");
+        try out.appendSlice(alloc, encoded_doc_id);
+        try out.appendSlice(alloc, "}},{\"term\":{\"path\":\"/_parent_unit_key\",\"value\":");
+        try out.appendSlice(alloc, encoded_unit_key);
+        try out.appendSlice(alloc, "}}]}}");
+    }
+    try out.appendSlice(alloc, "]}}");
+    if (existing_filter_json.len > 0) try out.appendSlice(alloc, "]}}");
+    return try out.toOwnedSlice(alloc);
 }
 
 fn applyCanonicalGroupedMatchExpansion(
     alloc: std.mem.Allocator,
     selected: *db_mod.types.SearchResult,
     expanded: *db_mod.types.SearchResult,
-) void {
+) !void {
+    var expanded_by_id = std.StringHashMapUnmanaged(usize).empty;
+    defer expanded_by_id.deinit(alloc);
+    for (expanded.hits, 0..) |expanded_hit, i| {
+        const gop = try expanded_by_id.getOrPut(alloc, expanded_hit.id);
+        if (gop.found_existing) return error.StorageReadTemporarilyUnavailable;
+        gop.key_ptr.* = expanded_hit.id;
+        gop.value_ptr.* = i;
+    }
+
     for (selected.hits) |*selected_hit| {
         for (selected_hit.chunk_hits) |*match| match.deinit(alloc);
         if (selected_hit.chunk_hits.len > 0) alloc.free(selected_hit.chunk_hits);
         selected_hit.chunk_hits = &.{};
 
-        for (expanded.hits) |*expanded_hit| {
-            if (!std.mem.eql(u8, selected_hit.id, expanded_hit.id)) continue;
-            selected_hit.chunk_hits = expanded_hit.chunk_hits;
-            expanded_hit.chunk_hits = &.{};
-            break;
+        // Selection proves that every returned group has at least one matching
+        // descendant. A missing expansion therefore means the two distributed
+        // phases observed different query or extraction revisions. Returning
+        // the selected identity with an empty `matches` array would turn a
+        // transient race into a plausible but false public result.
+        const expanded_index = expanded_by_id.get(selected_hit.id) orelse
+            return error.StorageReadTemporarilyUnavailable;
+        const expanded_hit = &expanded.hits[expanded_index];
+        if (selected_hit.artifact_ref != null and selected_hit.artifact_ref.?.unit_id != null) {
+            const selected_revision = try groupedUnitRevisionEnvelopeFingerprintAlloc(
+                alloc,
+                selected_hit.stored_data orelse return error.StorageReadTemporarilyUnavailable,
+            );
+            defer alloc.free(selected_revision);
+            const expanded_revision = try groupedUnitRevisionEnvelopeFingerprintAlloc(
+                alloc,
+                expanded_hit.stored_data orelse return error.StorageReadTemporarilyUnavailable,
+            );
+            defer alloc.free(expanded_revision);
+            if (!std.mem.eql(u8, selected_revision, expanded_revision)) {
+                return error.StorageReadTemporarilyUnavailable;
+            }
+        }
+        selected_hit.chunk_hits = expanded_hit.chunk_hits;
+        expanded_hit.chunk_hits = &.{};
+    }
+}
+
+fn groupedUnitRevisionEnvelopeFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    stored: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.StorageReadTemporarilyUnavailable;
+    const fingerprint = parsed.value.object.get(hierarchy_navigation.grouped_unit_revision_envelope_field) orelse
+        return error.StorageReadTemporarilyUnavailable;
+    if (fingerprint != .string or fingerprint.string.len == 0) {
+        return error.StorageReadTemporarilyUnavailable;
+    }
+    return try alloc.dupe(u8, fingerprint.string);
+}
+
+fn takeGroupedUnitRevisionEnvelopeFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    hit: *db_mod.types.SearchHit,
+) ![]u8 {
+    const artifact_ref = hit.artifact_ref orelse return error.InvalidDocumentExtractionState;
+    if (artifact_ref.kind != .asset or artifact_ref.unit_id == null) {
+        return error.InvalidDocumentExtractionState;
+    }
+    const stored = hit.stored_data orelse return error.StorageReadTemporarilyUnavailable;
+    const fingerprint = try groupedUnitRevisionEnvelopeFingerprintAlloc(alloc, stored);
+    alloc.free(stored);
+    hit.stored_data = null;
+    return fingerprint;
+}
+
+const hierarchy_navigation_position_version = hierarchy_navigation.position_version;
+const hierarchy_navigation_unit_fingerprint_field = hierarchy_navigation.unit_fingerprint_field;
+
+fn hierarchyNavigationPositionParse(artifact_name: []const u8, position: []const u8) !hierarchy_navigation.Position {
+    return hierarchy_navigation.parsePositionForArtifact(artifact_name, position) catch |err| switch (err) {
+        error.InvalidHierarchyNavigationPosition => error.InvalidQueryRequest,
+        error.HierarchyNavigationPositionVersionStale => error.HierarchyCursorStale,
+    };
+}
+
+const HierarchyNavigationFingerprintStatus = enum { matches, missing, mismatch };
+
+fn hierarchyNavigationProjectedFingerprintStatus(
+    alloc: std.mem.Allocator,
+    stored: []const u8,
+    artifact_name: []const u8,
+    position: hierarchy_navigation.Position,
+) !HierarchyNavigationFingerprintStatus {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionState;
+    const value = parsed.value.object.get(hierarchy_navigation_unit_fingerprint_field) orelse return .missing;
+    if (value != .string) return error.InvalidDocumentExtractionState;
+    return if (hierarchy_navigation.positionUnitFingerprintMatches(position, artifact_name, value.string)) .matches else .mismatch;
+}
+
+fn groupedUnitProjectedFingerprintStatus(
+    alloc: std.mem.Allocator,
+    stored: []const u8,
+    expected: []const u8,
+) !HierarchyNavigationFingerprintStatus {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionState;
+    const value = parsed.value.object.get(hierarchy_navigation_unit_fingerprint_field) orelse return .missing;
+    if (value != .string) return error.InvalidDocumentExtractionState;
+    return if (std.mem.eql(u8, expected, value.string)) .matches else .mismatch;
+}
+
+fn hierarchyNavigationFullPayloadMatchesFingerprint(
+    alloc: std.mem.Allocator,
+    stored: []const u8,
+    artifact_name: []const u8,
+    position: hierarchy_navigation.Position,
+) !bool {
+    switch (try hierarchyNavigationProjectedFingerprintStatus(alloc, stored, artifact_name, position)) {
+        .matches => return true,
+        .mismatch => return false,
+        .missing => {},
+    }
+    const actual = try db_mod.documentExtractionStoredUnitFingerprintAlloc(alloc, stored);
+    defer alloc.free(actual);
+    return hierarchy_navigation.positionUnitFingerprintMatches(position, artifact_name, actual);
+}
+
+fn groupedUnitFullPayloadMatchesFingerprint(
+    alloc: std.mem.Allocator,
+    stored: []const u8,
+    expected: []const u8,
+) !bool {
+    switch (try groupedUnitProjectedFingerprintStatus(alloc, stored, expected)) {
+        .matches => return true,
+        .mismatch => return false,
+        .missing => {},
+    }
+    const actual = try db_mod.documentExtractionStoredUnitFingerprintAlloc(alloc, stored);
+    defer alloc.free(actual);
+    return std.mem.eql(u8, expected, actual);
+}
+
+fn hierarchyNavigationLookupFieldsAlloc(
+    alloc: std.mem.Allocator,
+    fields: []const []const u8,
+    include_all_fields: bool,
+) ![]const []const u8 {
+    var has_positive_include = false;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field, hierarchy_navigation_unit_fingerprint_field)) {
+            const out = try alloc.alloc([]const u8, fields.len);
+            @memcpy(out, fields);
+            return out;
+        }
+        if (field.len == 0 or field[0] != '-') has_positive_include = true;
+    }
+
+    // Adding a positive field to an exclusion-only projection changes it into
+    // an include projection. Include-all and exclusion-only lookups already
+    // carry the private marker unless it was explicitly excluded, in which
+    // case hydration performs the bounded full-payload validation fallback.
+    if ((fields.len == 0 and include_all_fields) or (fields.len > 0 and !has_positive_include)) {
+        const out = try alloc.alloc([]const u8, fields.len);
+        @memcpy(out, fields);
+        return out;
+    }
+    const out = try alloc.alloc([]const u8, fields.len + 1);
+    @memcpy(out[0..fields.len], fields);
+    out[fields.len] = hierarchy_navigation_unit_fingerprint_field;
+    return out;
+}
+
+fn replaceLookupResponseWithProjectedFullPayload(
+    alloc: std.mem.Allocator,
+    response: *LookupResponse,
+    full: *const LookupResponse,
+    options: db_mod.types.LookupOptions,
+) !void {
+    const projected = try db_mod.document_query.lookupJson(alloc, full.json, options);
+    response.deinit(alloc);
+    response.* = .{
+        .json = projected.json,
+        .version = full.version,
+    };
+}
+
+fn ensureHierarchyNavigationProjectedResponse(
+    comptime Source: type,
+    source: *Source,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    key: []const u8,
+    response: *LookupResponse,
+    artifact_name: []const u8,
+    position: hierarchy_navigation.Position,
+    options: db_mod.types.LookupOptions,
+) !void {
+    switch (try hierarchyNavigationProjectedFingerprintStatus(alloc, response.json, artifact_name, position)) {
+        .matches => return,
+        .mismatch => return error.StorageReadTemporarilyUnavailable,
+        .missing => {},
+    }
+
+    if (options.fields.len == 0 and options.include_all_fields) {
+        if (!(try hierarchyNavigationFullPayloadMatchesFingerprint(alloc, response.json, artifact_name, position))) {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+        return;
+    }
+
+    var authoritative = try authoritativePayloadLookupAlloc(alloc, options);
+    defer authoritative.deinit(alloc);
+    var full = (try Source.lookup(
+        source,
+        alloc,
+        table_name,
+        key,
+        authoritative.options,
+        .stale,
+    )) orelse return error.StorageReadTemporarilyUnavailable;
+    defer full.deinit(alloc);
+    if (!(try hierarchyNavigationFullPayloadMatchesFingerprint(alloc, full.json, artifact_name, position))) {
+        return error.StorageReadTemporarilyUnavailable;
+    }
+
+    // The projected read could have come from a different stale-replica
+    // revision. Derive the public payload from the response whose fingerprint
+    // was actually validated instead of combining bytes from two reads.
+    try replaceLookupResponseWithProjectedFullPayload(alloc, response, &full, options);
+}
+
+fn hierarchyNavigationUnitKeyAlloc(alloc: std.mem.Allocator, hit: db_mod.types.SearchHit) ![]u8 {
+    const artifact_ref = hit.artifact_ref orelse return error.InvalidDocumentExtractionState;
+    const unit_id = artifact_ref.unit_id orelse return error.InvalidDocumentExtractionState;
+    if (artifact_ref.kind != .asset) return error.InvalidDocumentExtractionState;
+    return try internal_keys.documentUnitArtifactKeyAlloc(alloc, artifact_ref.document_id, artifact_ref.name, unit_id);
+}
+
+fn applyHierarchyNavigationLookup(
+    alloc: std.mem.Allocator,
+    hit: *db_mod.types.SearchHit,
+    response: *LookupResponse,
+) !void {
+    if (hit.sort_values.len != 2 or hit.sort_values[0] != .string or hit.sort_values[1] != .string) {
+        return error.InvalidQueryRequest;
+    }
+    hit.stored_data = try hierarchy_navigation.stripUnitFingerprintAlloc(alloc, response.json);
+}
+
+const HierarchyNavigationLookupSlot = struct {
+    arena: std.heap.ArenaAllocator,
+    response: ?LookupResponse = null,
+    err: ?anyerror = null,
+
+    fn init(alloc: std.mem.Allocator) HierarchyNavigationLookupSlot {
+        return .{ .arena = std.heap.ArenaAllocator.init(alloc) };
+    }
+
+    fn deinit(self: *HierarchyNavigationLookupSlot) void {
+        if (self.response) |*response| response.deinit(self.arena.allocator());
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+fn initHierarchyNavigationLookupSlots(
+    alloc: std.mem.Allocator,
+    count: usize,
+) ![]HierarchyNavigationLookupSlot {
+    const slots = try alloc.alloc(HierarchyNavigationLookupSlot, count);
+    for (slots) |*slot| slot.* = HierarchyNavigationLookupSlot.init(alloc);
+    return slots;
+}
+
+fn deinitHierarchyNavigationLookupSlots(
+    alloc: std.mem.Allocator,
+    slots: []HierarchyNavigationLookupSlot,
+) void {
+    for (slots) |*slot| slot.deinit();
+    alloc.free(slots);
+}
+
+fn sameLookupProjection(
+    left_fields: []const []const u8,
+    left_all: bool,
+    right_fields: []const []const u8,
+    right_all: bool,
+) bool {
+    if (left_all != right_all or left_fields.len != right_fields.len) return false;
+    for (left_fields, right_fields) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+/// Hydrate unit groups after the global shard merge. Unit records, chunks, and
+/// source documents may be owned by three independent ranges; doing routed
+/// point reads only for the selected page keeps shard selection correct and
+/// bounds hydration work by the public hierarchy budget.
+fn hydrateDistributedGroupedUnitHits(
+    comptime Source: type,
+    source: *Source,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+    result: *db_mod.types.SearchResult,
+    consistency: raft_mod.ReadConsistency,
+) !void {
+    if (req.hierarchy_group_level != .unit) return;
+
+    try checkQueryDeadline(req);
+    if (!req.include_stored and !req.hierarchy_include_unit and !req.hierarchy_include_source) {
+        // Identity-only groups still carry an internal revision envelope from
+        // the shard. Consume and validate its shape, but do not turn a zero-
+        // payload response into N routed unit reads.
+        for (result.hits) |*hit| {
+            const fingerprint = try takeGroupedUnitRevisionEnvelopeFingerprintAlloc(alloc, hit);
+            alloc.free(fingerprint);
+        }
+        try checkQueryDeadline(req);
+        return;
+    }
+
+    const stored_fields = try hierarchyNavigationLookupFieldsAlloc(alloc, req.fields, req.include_all_fields);
+    defer alloc.free(stored_fields);
+    const unit_fields = try hierarchyNavigationLookupFieldsAlloc(
+        alloc,
+        req.hierarchy_unit_fields,
+        req.hierarchy_unit_include_all_fields,
+    );
+    defer alloc.free(unit_fields);
+    const validation_fields = [_][]const u8{hierarchy_navigation_unit_fingerprint_field};
+    const stored_options = hierarchyNavigationLookupOptions(req, stored_fields, req.include_all_fields);
+    const unit_options = hierarchyNavigationLookupOptions(req, unit_fields, req.hierarchy_unit_include_all_fields);
+    const validation_options = hierarchyNavigationLookupOptions(req, &validation_fields, false);
+    const source_options = hierarchyNavigationLookupOptions(
+        req,
+        req.hierarchy_source_fields,
+        req.hierarchy_source_include_all_fields,
+    );
+    const shared_unit_projection = req.include_stored and req.hierarchy_include_unit and
+        sameLookupProjection(
+            req.fields,
+            req.include_all_fields,
+            req.hierarchy_unit_fields,
+            req.hierarchy_unit_include_all_fields,
+        );
+
+    const expected_fingerprints = try alloc.alloc([]u8, result.hits.len);
+    var expected_initialized: usize = 0;
+    defer {
+        for (expected_fingerprints[0..expected_initialized]) |fingerprint| alloc.free(fingerprint);
+        alloc.free(expected_fingerprints);
+    }
+    var source_indexes = std.StringHashMapUnmanaged(usize).empty;
+    defer source_indexes.deinit(alloc);
+    var source_ids = std.ArrayListUnmanaged([]const u8).empty;
+    defer source_ids.deinit(alloc);
+    const hit_source_indexes = try alloc.alloc(?usize, result.hits.len);
+    defer alloc.free(hit_source_indexes);
+    @memset(hit_source_indexes, null);
+
+    for (result.hits, 0..) |*hit, hit_index| {
+        expected_fingerprints[hit_index] = try takeGroupedUnitRevisionEnvelopeFingerprintAlloc(alloc, hit);
+        expected_initialized += 1;
+
+        if (req.hierarchy_include_source) {
+            const artifact_ref = hit.artifact_ref.?;
+            const gop = try source_indexes.getOrPut(alloc, artifact_ref.document_id);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = artifact_ref.document_id;
+                gop.value_ptr.* = source_ids.items.len;
+                try source_ids.append(alloc, artifact_ref.document_id);
+            }
+            hit_source_indexes[hit_index] = gop.value_ptr.*;
         }
     }
+
+    const HydrationSlot = struct {
+        arena: std.heap.ArenaAllocator,
+        stored_response: ?LookupResponse = null,
+        unit_response: ?LookupResponse = null,
+        source_response: ?LookupResponse = null,
+        err: ?anyerror = null,
+
+        fn init(inner_alloc: std.mem.Allocator) @This() {
+            return .{ .arena = std.heap.ArenaAllocator.init(inner_alloc) };
+        }
+
+        fn deinit(self: *@This()) void {
+            const arena = self.arena.allocator();
+            if (self.stored_response) |*response| response.deinit(arena);
+            if (self.unit_response) |*response| response.deinit(arena);
+            if (self.source_response) |*response| response.deinit(arena);
+            self.arena.deinit();
+            self.* = undefined;
+        }
+    };
+    const task_count = result.hits.len + source_ids.items.len;
+    const slots = try alloc.alloc(HydrationSlot, task_count);
+    var slots_initialized: usize = 0;
+    defer {
+        for (slots[0..slots_initialized]) |*slot| slot.deinit();
+        alloc.free(slots);
+    }
+    for (slots) |*slot| {
+        slot.* = HydrationSlot.init(alloc);
+        slots_initialized += 1;
+    }
+
+    const Fiber = struct {
+        fn validateResponse(
+            inner_source: *Source,
+            arena: std.mem.Allocator,
+            table_name_inner: []const u8,
+            key: []const u8,
+            response: *?LookupResponse,
+            expected_fingerprint: []const u8,
+            options: db_mod.types.LookupOptions,
+        ) !void {
+            const value = response.* orelse return error.StorageReadTemporarilyUnavailable;
+            switch (try groupedUnitProjectedFingerprintStatus(arena, value.json, expected_fingerprint)) {
+                .matches => return,
+                .mismatch => return error.StorageReadTemporarilyUnavailable,
+                .missing => {},
+            }
+
+            // A projection can omit the persisted marker (for example, an
+            // explicit exclusion or a legacy unit). Validate against the full
+            // payload only in that uncommon case, then reproject those exact
+            // validated bytes for the caller.
+            if (options.fields.len == 0 and options.include_all_fields) {
+                if (!(try groupedUnitFullPayloadMatchesFingerprint(arena, value.json, expected_fingerprint))) {
+                    return error.StorageReadTemporarilyUnavailable;
+                }
+                return;
+            }
+            var authoritative = try authoritativePayloadLookupAlloc(arena, options);
+            defer authoritative.deinit(arena);
+            var full = (try Source.lookup(
+                inner_source,
+                arena,
+                table_name_inner,
+                key,
+                authoritative.options,
+                .stale,
+            )) orelse return error.StorageReadTemporarilyUnavailable;
+            defer full.deinit(arena);
+            if (!(try groupedUnitFullPayloadMatchesFingerprint(arena, full.json, expected_fingerprint))) {
+                return error.StorageReadTemporarilyUnavailable;
+            }
+            if (response.*) |*projected_response| {
+                try replaceLookupResponseWithProjectedFullPayload(arena, projected_response, &full, options);
+            } else unreachable;
+        }
+
+        fn runUnit(
+            inner_source: *Source,
+            slot: *HydrationSlot,
+            table_name_inner: []const u8,
+            hit: db_mod.types.SearchHit,
+            expected_fingerprint: []const u8,
+            stored_options_inner: db_mod.types.LookupOptions,
+            unit_options_inner: db_mod.types.LookupOptions,
+            validation_options_inner: db_mod.types.LookupOptions,
+            include_stored: bool,
+            include_unit: bool,
+            shared_projection: bool,
+            request: db_mod.types.SearchRequest,
+        ) void {
+            checkQueryDeadline(request) catch |err| {
+                slot.err = err;
+                return;
+            };
+            const arena = slot.arena.allocator();
+            const key = hierarchyNavigationUnitKeyAlloc(arena, hit) catch |err| {
+                slot.err = err;
+                return;
+            };
+            if (shared_projection) {
+                slot.stored_response = Source.lookup(inner_source, arena, table_name_inner, key, stored_options_inner, .stale) catch |err| {
+                    slot.err = err;
+                    return;
+                };
+                validateResponse(inner_source, arena, table_name_inner, key, &slot.stored_response, expected_fingerprint, stored_options_inner) catch |err| {
+                    slot.err = err;
+                    return;
+                };
+            } else {
+                if (include_stored) {
+                    slot.stored_response = Source.lookup(inner_source, arena, table_name_inner, key, stored_options_inner, .stale) catch |err| {
+                        slot.err = err;
+                        return;
+                    };
+                    validateResponse(inner_source, arena, table_name_inner, key, &slot.stored_response, expected_fingerprint, stored_options_inner) catch |err| {
+                        slot.err = err;
+                        return;
+                    };
+                }
+                if (include_unit) {
+                    slot.unit_response = Source.lookup(inner_source, arena, table_name_inner, key, unit_options_inner, .stale) catch |err| {
+                        slot.err = err;
+                        return;
+                    };
+                    validateResponse(inner_source, arena, table_name_inner, key, &slot.unit_response, expected_fingerprint, unit_options_inner) catch |err| {
+                        slot.err = err;
+                        return;
+                    };
+                }
+                if (!include_stored and !include_unit) {
+                    slot.unit_response = Source.lookup(inner_source, arena, table_name_inner, key, validation_options_inner, .stale) catch |err| {
+                        slot.err = err;
+                        return;
+                    };
+                    validateResponse(inner_source, arena, table_name_inner, key, &slot.unit_response, expected_fingerprint, validation_options_inner) catch |err| {
+                        slot.err = err;
+                        return;
+                    };
+                }
+            }
+            checkQueryDeadline(request) catch |err| {
+                slot.err = err;
+            };
+        }
+
+        fn runSource(
+            inner_source: *Source,
+            slot: *HydrationSlot,
+            table_name_inner: []const u8,
+            source_id: []const u8,
+            options: db_mod.types.LookupOptions,
+            consistency_inner: raft_mod.ReadConsistency,
+            request: db_mod.types.SearchRequest,
+        ) void {
+            checkQueryDeadline(request) catch |err| {
+                slot.err = err;
+                return;
+            };
+            slot.source_response = Source.lookup(
+                inner_source,
+                slot.arena.allocator(),
+                table_name_inner,
+                source_id,
+                options,
+                consistency_inner,
+            ) catch |err| {
+                slot.err = err;
+                return;
+            };
+            if (slot.source_response == null) slot.err = error.StorageReadTemporarilyUnavailable;
+            checkQueryDeadline(request) catch |err| {
+                slot.err = err;
+            };
+        }
+    };
+
+    const io_impl: ?*std.Io.Threaded = if (@hasField(Source, "io_impl")) source.io_impl else null;
+    const plan = planFanout(.query, io_impl, task_count);
+    var task_start: usize = 0;
+    while (task_start < task_count) : (task_start += plan.width) {
+        try checkQueryDeadline(req);
+        const task_end = @min(task_start + plan.width, task_count);
+        if (plan.parallel) {
+            var group: std.Io.Group = .init;
+            for (task_start..task_end) |task_index| {
+                if (task_index < result.hits.len) {
+                    group.async(io_impl.?.io(), Fiber.runUnit, .{
+                        source,
+                        &slots[task_index],
+                        table_name,
+                        result.hits[task_index],
+                        expected_fingerprints[task_index],
+                        stored_options,
+                        unit_options,
+                        validation_options,
+                        req.include_stored,
+                        req.hierarchy_include_unit,
+                        shared_unit_projection,
+                        req,
+                    });
+                } else {
+                    const source_index = task_index - result.hits.len;
+                    group.async(io_impl.?.io(), Fiber.runSource, .{
+                        source,
+                        &slots[task_index],
+                        table_name,
+                        source_ids.items[source_index],
+                        source_options,
+                        consistency,
+                        req,
+                    });
+                }
+            }
+            try group.await(io_impl.?.io());
+        } else {
+            for (task_start..task_end) |task_index| {
+                if (task_index < result.hits.len) {
+                    Fiber.runUnit(
+                        source,
+                        &slots[task_index],
+                        table_name,
+                        result.hits[task_index],
+                        expected_fingerprints[task_index],
+                        stored_options,
+                        unit_options,
+                        validation_options,
+                        req.include_stored,
+                        req.hierarchy_include_unit,
+                        shared_unit_projection,
+                        req,
+                    );
+                } else {
+                    const source_index = task_index - result.hits.len;
+                    Fiber.runSource(
+                        source,
+                        &slots[task_index],
+                        table_name,
+                        source_ids.items[source_index],
+                        source_options,
+                        consistency,
+                        req,
+                    );
+                }
+            }
+        }
+        for (slots[task_start..task_end]) |slot| if (slot.err) |err| return err;
+    }
+
+    for (result.hits, 0..) |*hit, hit_index| {
+        const slot = &slots[hit_index];
+        if (shared_unit_projection) {
+            const response = slot.stored_response orelse return error.StorageReadTemporarilyUnavailable;
+            const projected = try hierarchy_navigation.stripUnitFingerprintAlloc(alloc, response.json);
+            defer alloc.free(projected);
+            if (req.include_stored) hit.stored_data = try alloc.dupe(u8, projected);
+            if (req.hierarchy_include_unit) hit.ancestor_unit_data = try alloc.dupe(u8, projected);
+        } else {
+            if (req.include_stored) {
+                const response = slot.stored_response orelse return error.StorageReadTemporarilyUnavailable;
+                hit.stored_data = try hierarchy_navigation.stripUnitFingerprintAlloc(alloc, response.json);
+            }
+            if (req.hierarchy_include_unit) {
+                const response = slot.unit_response orelse return error.StorageReadTemporarilyUnavailable;
+                hit.ancestor_unit_data = try hierarchy_navigation.stripUnitFingerprintAlloc(alloc, response.json);
+            }
+        }
+        if (hit_source_indexes[hit_index]) |source_index| {
+            const source_response = slots[result.hits.len + source_index].source_response orelse
+                return error.StorageReadTemporarilyUnavailable;
+            hit.ancestor_source_data = try alloc.dupe(u8, source_response.json);
+        }
+
+        // Every bounded match belongs to this unit group, so reuse the routed
+        // ancestor payloads instead of issuing per-chunk lookups.
+        for (hit.chunk_hits) |*match| {
+            if (req.hierarchy_include_unit and match.ancestor_unit_data == null) {
+                match.ancestor_unit_data = try alloc.dupe(u8, hit.ancestor_unit_data orelse
+                    return error.StorageReadTemporarilyUnavailable);
+            }
+            if (req.hierarchy_include_source and match.ancestor_source_data == null) {
+                match.ancestor_source_data = try alloc.dupe(u8, hit.ancestor_source_data orelse
+                    return error.StorageReadTemporarilyUnavailable);
+            }
+        }
+    }
+    try checkQueryDeadline(req);
+}
+
+fn hydrateProvisionedHierarchyNavigationHits(
+    self: *ProvisionedTableReadSource,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+    result: *db_mod.types.SearchResult,
+    _: raft_mod.ReadConsistency,
+) !void {
+    try checkQueryDeadline(req);
+    const lookup_fields = try hierarchyNavigationLookupFieldsAlloc(alloc, req.fields, req.include_all_fields);
+    defer alloc.free(lookup_fields);
+    const options = hierarchyNavigationLookupOptions(req, lookup_fields, req.include_all_fields);
+    const plan = planFanout(.query, self.io_impl, result.hits.len);
+    if (plan.parallel and result.hits.len > 1) {
+        const slots = try initHierarchyNavigationLookupSlots(alloc, result.hits.len);
+        defer deinitHierarchyNavigationLookupSlots(alloc, slots);
+        const Fiber = struct {
+            fn run(
+                source: *ProvisionedTableReadSource,
+                slot: *HierarchyNavigationLookupSlot,
+                table_name_inner: []const u8,
+                hit: db_mod.types.SearchHit,
+                options_inner: db_mod.types.LookupOptions,
+                request: db_mod.types.SearchRequest,
+            ) void {
+                if (hit.stored_data != null) return;
+                checkQueryDeadline(request) catch |err| {
+                    slot.err = err;
+                    return;
+                };
+                const arena = slot.arena.allocator();
+                const key = hierarchyNavigationUnitKeyAlloc(arena, hit) catch |err| {
+                    slot.err = err;
+                    return;
+                };
+                // The parent-owned extraction state already fixed the exact
+                // payload fingerprint. A stale hydration read is safe only
+                // when that fingerprint matches, and avoids a second Raft
+                // barrier for every unit on the page.
+                slot.response = ProvisionedTableReadSource.lookup(source, arena, table_name_inner, key, options_inner, .stale) catch |err| {
+                    slot.err = err;
+                    return;
+                };
+                if (slot.response == null) slot.err = error.StorageReadTemporarilyUnavailable;
+                if (slot.err != null) return;
+                const artifact_ref = hit.artifact_ref orelse {
+                    slot.err = error.InvalidDocumentExtractionState;
+                    return;
+                };
+                const position = hierarchyNavigationPositionParse(artifact_ref.name, hit.sort_values[0].string) catch |err| {
+                    slot.err = err;
+                    return;
+                };
+                if (slot.response) |*response| {
+                    ensureHierarchyNavigationProjectedResponse(
+                        ProvisionedTableReadSource,
+                        source,
+                        arena,
+                        table_name_inner,
+                        key,
+                        response,
+                        artifact_ref.name,
+                        position,
+                        options_inner,
+                    ) catch |err| {
+                        slot.err = err;
+                        return;
+                    };
+                } else {
+                    slot.err = error.StorageReadTemporarilyUnavailable;
+                    return;
+                }
+                checkQueryDeadline(request) catch |err| {
+                    slot.err = err;
+                };
+            }
+        };
+        var start: usize = 0;
+        while (start < result.hits.len) : (start += plan.width) {
+            try checkQueryDeadline(req);
+            const end = @min(start + plan.width, result.hits.len);
+            var group: std.Io.Group = .init;
+            for (result.hits[start..end], start..end) |hit, i| {
+                group.async(self.io_impl.?.io(), Fiber.run, .{ self, &slots[i], table_name, hit, options, req });
+            }
+            try group.await(self.io_impl.?.io());
+            try checkQueryDeadline(req);
+        }
+        for (result.hits, slots) |*hit, *slot| {
+            if (slot.err) |err| return err;
+            if (hit.stored_data != null) continue;
+            if (slot.response) |*response| {
+                try applyHierarchyNavigationLookup(alloc, hit, response);
+            } else return error.StorageReadTemporarilyUnavailable;
+        }
+        return;
+    }
+    for (result.hits) |*hit| {
+        try checkQueryDeadline(req);
+        if (hit.stored_data != null) continue;
+        const key = try hierarchyNavigationUnitKeyAlloc(alloc, hit.*);
+        defer alloc.free(key);
+        var response = (try ProvisionedTableReadSource.lookup(self, alloc, table_name, key, options, .stale)) orelse
+            return error.StorageReadTemporarilyUnavailable;
+        defer response.deinit(alloc);
+        const artifact_ref = hit.artifact_ref orelse return error.InvalidDocumentExtractionState;
+        const position = try hierarchyNavigationPositionParse(artifact_ref.name, hit.sort_values[0].string);
+        try ensureHierarchyNavigationProjectedResponse(
+            ProvisionedTableReadSource,
+            self,
+            alloc,
+            table_name,
+            key,
+            &response,
+            artifact_ref.name,
+            position,
+            options,
+        );
+        try applyHierarchyNavigationLookup(alloc, hit, &response);
+    }
+    try checkQueryDeadline(req);
+}
+
+fn hydrateHostedHierarchyNavigationHits(
+    self: *HostedProvisionedTableReadSource,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+    result: *db_mod.types.SearchResult,
+    _: raft_mod.ReadConsistency,
+) !void {
+    try checkQueryDeadline(req);
+    const lookup_fields = try hierarchyNavigationLookupFieldsAlloc(alloc, req.fields, req.include_all_fields);
+    defer alloc.free(lookup_fields);
+    const options = hierarchyNavigationLookupOptions(req, lookup_fields, req.include_all_fields);
+    const plan = planFanout(.query, self.io_impl, result.hits.len);
+    if (plan.parallel and result.hits.len > 1) {
+        const slots = try initHierarchyNavigationLookupSlots(alloc, result.hits.len);
+        defer deinitHierarchyNavigationLookupSlots(alloc, slots);
+        const Fiber = struct {
+            fn run(
+                source: *HostedProvisionedTableReadSource,
+                slot: *HierarchyNavigationLookupSlot,
+                table_name_inner: []const u8,
+                hit: db_mod.types.SearchHit,
+                options_inner: db_mod.types.LookupOptions,
+                request: db_mod.types.SearchRequest,
+            ) void {
+                if (hit.stored_data != null) return;
+                checkQueryDeadline(request) catch |err| {
+                    slot.err = err;
+                    return;
+                };
+                const arena = slot.arena.allocator();
+                const key = hierarchyNavigationUnitKeyAlloc(arena, hit) catch |err| {
+                    slot.err = err;
+                    return;
+                };
+                slot.response = HostedProvisionedTableReadSource.lookup(source, arena, table_name_inner, key, options_inner, .stale) catch |err| {
+                    slot.err = err;
+                    return;
+                };
+                if (slot.response == null) slot.err = error.StorageReadTemporarilyUnavailable;
+                if (slot.err != null) return;
+                const artifact_ref = hit.artifact_ref orelse {
+                    slot.err = error.InvalidDocumentExtractionState;
+                    return;
+                };
+                const position = hierarchyNavigationPositionParse(artifact_ref.name, hit.sort_values[0].string) catch |err| {
+                    slot.err = err;
+                    return;
+                };
+                if (slot.response) |*response| {
+                    ensureHierarchyNavigationProjectedResponse(
+                        HostedProvisionedTableReadSource,
+                        source,
+                        arena,
+                        table_name_inner,
+                        key,
+                        response,
+                        artifact_ref.name,
+                        position,
+                        options_inner,
+                    ) catch |err| {
+                        slot.err = err;
+                        return;
+                    };
+                } else {
+                    slot.err = error.StorageReadTemporarilyUnavailable;
+                    return;
+                }
+                checkQueryDeadline(request) catch |err| {
+                    slot.err = err;
+                };
+            }
+        };
+        var start: usize = 0;
+        while (start < result.hits.len) : (start += plan.width) {
+            try checkQueryDeadline(req);
+            const end = @min(start + plan.width, result.hits.len);
+            var group: std.Io.Group = .init;
+            for (result.hits[start..end], start..end) |hit, i| {
+                group.async(self.io_impl.?.io(), Fiber.run, .{ self, &slots[i], table_name, hit, options, req });
+            }
+            try group.await(self.io_impl.?.io());
+            try checkQueryDeadline(req);
+        }
+        for (result.hits, slots) |*hit, *slot| {
+            if (slot.err) |err| return err;
+            if (hit.stored_data != null) continue;
+            if (slot.response) |*response| {
+                try applyHierarchyNavigationLookup(alloc, hit, response);
+            } else return error.StorageReadTemporarilyUnavailable;
+        }
+        return;
+    }
+    for (result.hits) |*hit| {
+        try checkQueryDeadline(req);
+        if (hit.stored_data != null) continue;
+        const key = try hierarchyNavigationUnitKeyAlloc(alloc, hit.*);
+        defer alloc.free(key);
+        var response = (try HostedProvisionedTableReadSource.lookup(self, alloc, table_name, key, options, .stale)) orelse
+            return error.StorageReadTemporarilyUnavailable;
+        defer response.deinit(alloc);
+        const artifact_ref = hit.artifact_ref orelse return error.InvalidDocumentExtractionState;
+        const position = try hierarchyNavigationPositionParse(artifact_ref.name, hit.sort_values[0].string);
+        try ensureHierarchyNavigationProjectedResponse(
+            HostedProvisionedTableReadSource,
+            self,
+            alloc,
+            table_name,
+            key,
+            &response,
+            artifact_ref.name,
+            position,
+            options,
+        );
+        try applyHierarchyNavigationLookup(alloc, hit, &response);
+    }
+    try checkQueryDeadline(req);
 }
 
 fn queryProvisionedAcrossGroups(
@@ -6011,16 +7464,41 @@ fn queryProvisionedAcrossGroupsAtGenerations(
     @memset(selected_generations, null);
     var selected = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
     errdefer selected.deinit();
-    if (!req.hierarchy_grouped_matches or selected.hits.len == 0) return selected;
+    if (req.hierarchy_children != null) {
+        if (req.include_stored) try hydrateProvisionedHierarchyNavigationHits(self, alloc, table_name, req, &selected, consistency);
+        return selected;
+    }
+    if (!req.hierarchy_grouped_matches or selected.hits.len == 0) {
+        try hydrateDistributedGroupedUnitHits(
+            ProvisionedTableReadSource,
+            self,
+            alloc,
+            table_name,
+            req,
+            &selected,
+            consistency,
+        );
+        return selected;
+    }
 
     const expansion = try canonicalGroupedMatchExpansionPlanAlloc(alloc, req, selected);
     defer alloc.free(expansion.parent_ids);
+    defer if (expansion.filter_json) |value| alloc.free(value);
     const expanded_generations = try alloc.alloc(?u64, group_ids.len);
     defer alloc.free(expanded_generations);
     @memset(expanded_generations, null);
     var expanded = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, expansion.request, table_name, consistency, distributed_text_stats, true, selected_generations, expanded_generations);
     defer expanded.deinit();
-    applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded);
+    try applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded);
+    try hydrateDistributedGroupedUnitHits(
+        ProvisionedTableReadSource,
+        self,
+        alloc,
+        table_name,
+        req,
+        &selected,
+        consistency,
+    );
     return selected;
 }
 
@@ -6055,16 +7533,41 @@ fn queryHostedAcrossGroupsAtGenerations(
     @memset(selected_generations, null);
     var selected = try queryHostedAcrossGroupsPhase(self, alloc, group_ids, req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
     errdefer selected.deinit();
-    if (!req.hierarchy_grouped_matches or selected.hits.len == 0) return selected;
+    if (req.hierarchy_children != null) {
+        if (req.include_stored) try hydrateHostedHierarchyNavigationHits(self, alloc, table_name, req, &selected, consistency);
+        return selected;
+    }
+    if (!req.hierarchy_grouped_matches or selected.hits.len == 0) {
+        try hydrateDistributedGroupedUnitHits(
+            HostedProvisionedTableReadSource,
+            self,
+            alloc,
+            table_name,
+            req,
+            &selected,
+            consistency,
+        );
+        return selected;
+    }
 
     const expansion = try canonicalGroupedMatchExpansionPlanAlloc(alloc, req, selected);
     defer alloc.free(expansion.parent_ids);
+    defer if (expansion.filter_json) |value| alloc.free(value);
     const expanded_generations = try alloc.alloc(?u64, group_ids.len);
     defer alloc.free(expanded_generations);
     @memset(expanded_generations, null);
     var expanded = try queryHostedAcrossGroupsPhase(self, alloc, group_ids, expansion.request, table_name, consistency, distributed_text_stats, true, selected_generations, expanded_generations);
     defer expanded.deinit();
-    applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded);
+    try applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded);
+    try hydrateDistributedGroupedUnitHits(
+        HostedProvisionedTableReadSource,
+        self,
+        alloc,
+        table_name,
+        req,
+        &selected,
+        consistency,
+    );
     return selected;
 }
 
@@ -6538,18 +8041,20 @@ fn lookupLocal(
     opts: db_mod.types.LookupOptions,
     consistency: raft_mod.ReadConsistency,
 ) !?LookupResponse {
+    try checkLookupOptionsActive(opts);
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
     defer alloc.free(path);
     var db = try db_mod.DB.open(alloc, path, .{});
     defer db.close();
+    try checkLookupOptionsActive(opts);
 
     var reads = raft_mod.FeatureDBReads.init(group_id, requester);
     var result = (try reads.lookupWithConsistency(alloc, &db, key, opts, consistency)) orelse return null;
     defer result.deinit(alloc);
-    return .{
-        .json = try alloc.dupe(u8, result.json),
-        .version = try db.getTimestamp(alloc, key),
-    };
+    try checkLookupOptionsActive(opts);
+    const version = try db.getTimestamp(alloc, key);
+    try checkLookupOptionsActive(opts);
+    return try controlledLookupResponseAlloc(alloc, result.json, version, opts);
 }
 
 fn lookupProvisionedLocal(
@@ -6567,6 +8072,7 @@ fn lookupProvisionedLocal(
     opts: db_mod.types.LookupOptions,
     consistency: raft_mod.ReadConsistency,
 ) !?LookupResponse {
+    try checkLookupOptionsActive(opts);
     // Point lookups need only the primary document store. Prefer the existing
     // generation-matched writer/apply DB so a lookup does not open and retire a
     // second full index catalog over a path that is concurrently compacting.
@@ -6578,16 +8084,16 @@ fn lookupProvisionedLocal(
         if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{ .read_activity_held = true })) |lease_value| {
             var lease = lease_value;
             defer lease.release(alloc);
+            try checkLookupOptionsActive(opts);
             try validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db);
+            try checkLookupOptionsActive(opts);
 
             var reads = raft_mod.FeatureDBReads.init(group_id, requester);
             var result = (try reads.lookupWithConsistency(alloc, lease.db, key, opts, consistency)) orelse return null;
             defer result.deinit(alloc);
             const version = try lease.db.getTimestamp(alloc, key);
-            return .{
-                .json = try alloc.dupe(u8, result.json),
-                .version = version,
-            };
+            try checkLookupOptionsActive(opts);
+            return try controlledLookupResponseAlloc(alloc, result.json, version, opts);
         }
     }
 
@@ -6596,16 +8102,16 @@ fn lookupProvisionedLocal(
     if (cache) |cached| {
         var lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
         defer lease.release();
+        try checkLookupOptionsActive(opts);
         try validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db);
+        try checkLookupOptionsActive(opts);
 
         var reads = raft_mod.FeatureDBReads.init(group_id, requester);
         var result = (try reads.lookupWithConsistency(alloc, lease.db, key, opts, consistency)) orelse return null;
         defer result.deinit(alloc);
         const version = try lease.db.getTimestamp(alloc, key);
-        return .{
-            .json = try alloc.dupe(u8, result.json),
-            .version = version,
-        };
+        try checkLookupOptionsActive(opts);
+        return try controlledLookupResponseAlloc(alloc, result.json, version, opts);
     }
 
     var db = try openProvisionedLookupDbForTable(
@@ -6618,14 +8124,14 @@ fn lookupProvisionedLocal(
         try requireTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id),
     );
     defer db.close();
+    try checkLookupOptionsActive(opts);
 
     var reads = raft_mod.FeatureDBReads.init(group_id, requester);
     var result = (try reads.lookupWithConsistency(alloc, &db, key, opts, consistency)) orelse return null;
     defer result.deinit(alloc);
-    return .{
-        .json = try alloc.dupe(u8, result.json),
-        .version = try db.getTimestamp(alloc, key),
-    };
+    const version = try db.getTimestamp(alloc, key);
+    try checkLookupOptionsActive(opts);
+    return try controlledLookupResponseAlloc(alloc, result.json, version, opts);
 }
 
 fn lookupHostedLocal(
@@ -12280,7 +13786,15 @@ fn queryNeedsDistributedTextStats(req: db_mod.types.SearchRequest) bool {
 }
 
 fn encodeQueryTextStatsRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
-    const encoded_query = try encodeQueryRequest(alloc, req);
+    // Distributed term statistics depend on the retrieval expression, not on
+    // how the coordinator shapes or traverses its results. Strip hierarchy
+    // response controls from this internal subrequest so it remains valid even
+    // when a test or trusted caller constructed the SearchRequest directly.
+    var stats_req = req;
+    stats_req.hierarchy_children = null;
+    stats_req.hierarchy_grouped_matches = false;
+    stats_req.hierarchy_group_level = .source;
+    const encoded_query = try encodeQueryRequest(alloc, stats_req);
     defer alloc.free(encoded_query);
     return try std.fmt.allocPrint(alloc, "{{\"query_request\":{s}}}", .{encoded_query});
 }
@@ -14055,16 +15569,38 @@ fn lookupRemote(
     table_name: []const u8,
     key: []const u8,
     opts: db_mod.types.LookupOptions,
+    consistency: raft_mod.ReadConsistency,
 ) !?LookupResponse {
+    try checkLookupOptionsActive(opts);
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const fields = try encodeLookupFields(alloc, opts);
     defer if (fields) |value| alloc.free(value);
-    var result = try client.fetchGroupLookup(base_uri, group_id, table_name, key, fields);
-    defer result.deinit(alloc);
-    return .{
-        .json = try alloc.dupe(u8, result.body),
-        .version = if (result.version) |version| try std.fmt.parseUnsigned(u64, version, 10) else 0,
+    const timeout_ms = try lookupRemainingTimeoutMs(opts);
+    var request_cancellation = if (opts.cancellation) |token| http_common.RequestCancellation.fromToken(token) else http_common.RequestCancellation{};
+    const cancellation: ?*const http_common.RequestCancellation = if (opts.cancellation != null) &request_cancellation else null;
+    const read_consistency = switch (consistency) {
+        .stale => "stale",
+        .leader_lease => "leader_lease",
+        .read_index => "read_index",
     };
+    var result = try client.fetchGroupLookupWithControl(
+        base_uri,
+        group_id,
+        table_name,
+        key,
+        fields,
+        read_consistency,
+        timeout_ms,
+        cancellation,
+    );
+    defer result.deinit(alloc);
+    try checkLookupOptionsActive(opts);
+    return try controlledLookupResponseAlloc(
+        alloc,
+        result.body,
+        if (result.version) |version| try std.fmt.parseUnsigned(u64, version, 10) else 0,
+        opts,
+    );
 }
 
 const RemoteDocumentArtifactManifest = struct {
@@ -14613,8 +16149,19 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     try out.append(alloc, '{');
     var first = true;
 
-    if (req.fields.len > 0 and !req.include_all_fields) {
+    if (!req.include_all_fields and
+        (req.fields.len > 0 or
+            req.hierarchy_children != null or
+            req.hierarchy_grouped_matches or
+            req.hierarchy_group_level == .unit))
+    {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
+    }
+    if (req.hierarchy_children != null or
+        req.hierarchy_grouped_matches or
+        req.hierarchy_group_level == .unit)
+    {
+        try appendQueryHierarchyField(alloc, &out, &first, req);
     }
     if (req.limit != 10) {
         try appendJsonFieldU32(alloc, &out, &first, "limit", req.limit);
@@ -14622,6 +16169,9 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     if (req.offset != 0) {
         try appendJsonFieldU32(alloc, &out, &first, "offset", req.offset);
     }
+    if (req.order_by.len > 0) try appendQueryOrderByField(alloc, &out, &first, req.order_by);
+    if (req.search_after.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_after", req.search_after);
+    if (req.search_before.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_before", req.search_before);
     if (req.count_only) {
         try appendJsonFieldBool(alloc, &out, &first, "count", true);
     }
@@ -14648,6 +16198,9 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     }
     if (req.identity_read_generation) |generation| {
         try appendJsonFieldU64(alloc, &out, &first, "_identity_read_generation", generation);
+    }
+    if (req.hierarchy_children != null or req.defer_hierarchy_child_hydration) {
+        try appendJsonFieldBool(alloc, &out, &first, "_defer_hierarchy_child_hydration", true);
     }
     if (req.resolved_doc_filter != null) {
         try db_mod.doc_filter_wire.appendSearchRequestFieldAlloc(alloc, &out, &first, req);
@@ -14683,7 +16236,11 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     if (req.dense_queries.len > 0 or req.sparse_queries.len > 0) {
         try appendEmbeddingsField(alloc, &out, &first, req.dense_queries, req.sparse_queries);
     }
-    if (req.full_text) |full_text| {
+    if (req.hierarchy_children != null) {
+        // Child traversal is an ordered hierarchy scan rather than a relevance
+        // query. Keeping the query clause out of the internal wire request also
+        // lets the public parser reject accidental mixed-mode requests.
+    } else if (req.full_text) |full_text| {
         try appendTextQueryField(alloc, &out, &first, "full_text_search", full_text);
     } else {
         try appendQueryField(alloc, &out, &first, req.query, req.limit);
@@ -14691,6 +16248,87 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
 
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendQueryHierarchyField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    req: db_mod.types.SearchRequest,
+) !void {
+    try appendJsonFieldName(alloc, out, first, "hierarchy");
+    try out.append(alloc, '{');
+    if (req.hierarchy_children) |children| {
+        try out.appendSlice(alloc, "\"children\":{\"parent\":{\"level\":\"source\",\"id\":");
+        try appendJsonString(alloc, out, children.parent_id);
+        try out.appendSlice(alloc, "},\"level\":\"unit\"}");
+    } else {
+        try out.appendSlice(alloc, "\"group_by\":{\"level\":");
+        try appendJsonString(alloc, out, @tagName(req.hierarchy_group_level));
+        if (req.hierarchy_grouped_matches) {
+            try out.appendSlice(alloc, ",\"matches\":{");
+            try out.appendSlice(alloc, "\"limit\":");
+            try out.print(alloc, "{d}", .{req.max_chunks_per_parent});
+            try out.appendSlice(alloc, ",\"fields\":");
+            try appendJsonStringArray(alloc, out, req.hierarchy_match_fields);
+            try out.append(alloc, '}');
+        }
+        try out.append(alloc, '}');
+        if (req.hierarchy_include_source or req.hierarchy_include_unit) {
+            try out.appendSlice(alloc, ",\"ancestors\":{");
+            var first_ancestor = true;
+            if (req.hierarchy_include_source) {
+                try out.appendSlice(alloc, "\"source\":{\"fields\":");
+                try appendJsonStringArray(alloc, out, req.hierarchy_source_fields);
+                try out.append(alloc, '}');
+                first_ancestor = false;
+            }
+            if (req.hierarchy_include_unit) {
+                if (!first_ancestor) try out.append(alloc, ',');
+                try out.appendSlice(alloc, "\"unit\":{\"fields\":");
+                try appendJsonStringArray(alloc, out, req.hierarchy_unit_fields);
+                try out.append(alloc, '}');
+            }
+            try out.append(alloc, '}');
+        }
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendQueryOrderByField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    order_by: []const db_mod.types.SortField,
+) !void {
+    try appendJsonFieldName(alloc, out, first, "order_by");
+    try out.append(alloc, '[');
+    for (order_by, 0..) |field, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "{\"field\":");
+        try appendJsonString(alloc, out, field.field);
+        if (field.desc) try out.appendSlice(alloc, ",\"desc\":true");
+        try out.append(alloc, '}');
+    }
+    try out.append(alloc, ']');
+}
+
+fn appendQueryCursorField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    name: []const u8,
+    values: []const std.json.Value,
+) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    try out.append(alloc, '[');
+    for (values, 0..) |value, i| {
+        if (i > 0) try out.append(alloc, ',');
+        const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+    try out.append(alloc, ']');
 }
 
 fn appendDocFilterBindingsField(
@@ -15788,11 +17426,16 @@ test "parseRemoteSearchResult preserves fused index scores" {
 test "parseRemoteSearchResult preserves grouped hierarchy matches" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[{"_id":"doc:a","_score":0.9,"_source":{},"hierarchy":{"level":"source","parent_doc_key":"doc:a","matches":[{"_id":"chunk:1","_score":0.8,"_source":{"text":"alpha"},"hierarchy":{"level":"chunk","parent_doc_key":"doc:a","parent_unit_id":"page:1","artifact":{"name":"body_chunks","kind":"chunk","chunk_id":1,"unit_id":"page:1","source":{"name":"pdf_pages","kind":"asset","unit_id":"page:1"}},"ancestors":{"source":{"id":"doc:a","document":{"title":"A"}},"unit":{"id":"page:1","document":{"page":1}}}}}]}}]},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[{"_id":"doc:a","_score":0.9,"_source":{"_hierarchy_unit_revision_token":"fingerprint"},"hierarchy":{"level":"source","parent_doc_key":"doc:a","matches":[{"_id":"chunk:1","_score":0.8,"_source":{"text":"alpha"},"hierarchy":{"level":"chunk","parent_doc_key":"doc:a","parent_unit_id":"page:1","artifact":{"name":"body_chunks","kind":"chunk","chunk_id":1,"unit_id":"page:1","source":{"name":"pdf_pages","kind":"asset","unit_id":"page:1"}},"ancestors":{"source":{"id":"doc:a","document":{"title":"A"}},"unit":{"id":"page:1","document":{"page":1}}}}}]}}]},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.hits[0].stored_data orelse return error.TestUnexpectedResult,
+        hierarchy_navigation.grouped_unit_revision_envelope_field,
+    ) != null);
     try std.testing.expectEqual(@as(usize, 1), result.hits[0].chunk_hits.len);
     const match = result.hits[0].chunk_hits[0];
     try std.testing.expectEqualStrings("chunk:1", match.id);
@@ -16158,6 +17801,19 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(escaped);
     try out.appendSlice(alloc, escaped);
+}
+
+fn appendJsonStringArray(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    values: []const []const u8,
+) !void {
+    try out.append(alloc, '[');
+    for (values, 0..) |value, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, value);
+    }
+    try out.append(alloc, ']');
 }
 
 fn appendScanLine(
@@ -18827,6 +20483,554 @@ test "provisioned table read source falls back from read_index to stale on not l
     try std.testing.expectEqual(@as(usize, 2), reads.ends);
 }
 
+test "encode query request preserves hierarchy unit navigation contract" {
+    const alloc = std.testing.allocator;
+    const position = try hierarchy_navigation.positionAlloc(
+        alloc,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "document_units_v1",
+        1,
+        0,
+        "fingerprint-v1",
+    );
+    defer alloc.free(position);
+    const fields = [_][]const u8{ "unit_id", "unit_type", "text" };
+    const order = [_]db_mod.types.SortField{
+        .{ .field = "_hierarchy.position" },
+        .{ .field = "_id" },
+    };
+    const cursor = [_]std.json.Value{
+        .{ .string = position },
+        .{ .string = "artifact:unit" },
+    };
+    const encoded = try encodeQueryRequest(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .include_all_fields = false,
+        .fields = &fields,
+        .order_by = &order,
+        .search_after = &cursor,
+        .limit = 20,
+        .identity_read_generation = 42,
+        .filter_query_json = "{\"term\":{\"tenant\":\"acme\"}}",
+    });
+    defer alloc.free(encoded);
+
+    var parsed = try parseJsonTestBody(std.json.Value, alloc, encoded);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("query") == null);
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.object.get("fields").?.array.items.len);
+    try std.testing.expectEqualStrings("doc:a", parsed.value.object.get("hierarchy").?.object.get("children").?.object.get("parent").?.object.get("id").?.string);
+    try std.testing.expectEqualStrings("_hierarchy.position", parsed.value.object.get("order_by").?.array.items[0].object.get("field").?.string);
+    try std.testing.expectEqualStrings("_id", parsed.value.object.get("order_by").?.array.items[1].object.get("field").?.string);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("search_after").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, 42), parsed.value.object.get("_identity_read_generation").?.integer);
+    try std.testing.expect(parsed.value.object.get("_defer_hierarchy_child_hydration").?.bool);
+    try std.testing.expectEqualStrings("{\"term\":{\"tenant\":\"acme\"}}", parsed.value.object.get("_filter_query_json").?.string);
+
+    var round_trip = try query_contract.parseQueryRequest(alloc, null, "docs", encoded);
+    defer round_trip.deinit(alloc);
+    try std.testing.expect(round_trip.req.hierarchy_children != null);
+    try std.testing.expect(round_trip.req.defer_hierarchy_child_hydration);
+    try std.testing.expectEqualStrings("doc:a", round_trip.req.hierarchy_children.?.parent_id);
+    try std.testing.expectEqual(@as(?u64, 42), round_trip.req.identity_read_generation);
+    try std.testing.expectEqualStrings("{\"term\":{\"tenant\":\"acme\"}}", round_trip.req.filter_query_json);
+}
+
+test "hierarchy navigation hydration validates the planned unit fingerprint" {
+    const alloc = std.testing.allocator;
+    const source_revision = "0000000000000000000000000000000000000000000000000000000000000000";
+    const position = try hierarchy_navigation.positionAlloc(
+        alloc,
+        source_revision,
+        "document_units_v1",
+        7,
+        0,
+        "unit-fingerprint",
+    );
+    defer alloc.free(position);
+    const parsed = try hierarchyNavigationPositionParse("document_units_v1", position);
+    try std.testing.expectEqualStrings(source_revision, parsed.source_revision);
+    try std.testing.expect(hierarchy_navigation.positionUnitFingerprintMatches(parsed, "document_units_v1", "unit-fingerprint"));
+    try std.testing.expect(std.mem.indexOf(u8, position, "756e69742d66696e6765727072696e74") == null);
+    try std.testing.expectEqual(
+        HierarchyNavigationFingerprintStatus.matches,
+        try hierarchyNavigationProjectedFingerprintStatus(
+            alloc,
+            "{\"_artifact_unit_fingerprint\":\"unit-fingerprint\",\"text\":\"alpha\"}",
+            "document_units_v1",
+            parsed,
+        ),
+    );
+    try std.testing.expectEqual(
+        HierarchyNavigationFingerprintStatus.mismatch,
+        try hierarchyNavigationProjectedFingerprintStatus(
+            alloc,
+            "{\"_artifact_unit_fingerprint\":\"new-fingerprint\"}",
+            "document_units_v1",
+            parsed,
+        ),
+    );
+    try std.testing.expectEqual(
+        HierarchyNavigationFingerprintStatus.missing,
+        try hierarchyNavigationProjectedFingerprintStatus(
+            alloc,
+            "{\"text\":\"legacy\"}",
+            "document_units_v1",
+            parsed,
+        ),
+    );
+
+    const fields = try hierarchyNavigationLookupFieldsAlloc(alloc, &.{"text"}, false);
+    defer alloc.free(fields);
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expectEqualStrings(hierarchy_navigation_unit_fingerprint_field, fields[1]);
+
+    const exclusion_fields = try hierarchyNavigationLookupFieldsAlloc(alloc, &.{"-text"}, false);
+    defer alloc.free(exclusion_fields);
+    try std.testing.expectEqual(@as(usize, 1), exclusion_fields.len);
+    try std.testing.expectEqualStrings("-text", exclusion_fields[0]);
+
+    const include_all_fields = try hierarchyNavigationLookupFieldsAlloc(alloc, &.{}, true);
+    defer alloc.free(include_all_fields);
+    try std.testing.expectEqual(@as(usize, 0), include_all_fields.len);
+
+    const identity_fields = try hierarchyNavigationLookupFieldsAlloc(alloc, &.{}, false);
+    defer alloc.free(identity_fields);
+    try std.testing.expectEqual(@as(usize, 1), identity_fields.len);
+    try std.testing.expectEqualStrings(hierarchy_navigation_unit_fingerprint_field, identity_fields[0]);
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    const controlled = db_mod.types.LookupOptions{
+        .fields = fields,
+        .include_all_fields = false,
+        .execution_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+        .cancellation = db_mod.types.CancellationToken.fromAtomic(&cancelled),
+    };
+    try std.testing.expectError(error.Cancelled, checkLookupOptionsActive(controlled));
+    cancelled.store(false, .release);
+    var expired = controlled;
+    expired.execution_deadline_ns = platform_time.monotonicNs();
+    try std.testing.expectError(error.Timeout, lookupRemainingTimeoutMs(expired));
+    const full = fullPayloadLookupOptions(controlled);
+    try std.testing.expect(full.include_all_fields);
+    try std.testing.expectEqual(@as(usize, 0), full.fields.len);
+    try std.testing.expect(full.execution_deadline_ns != null);
+    try std.testing.expect(full.cancellation != null);
+
+    const synthetic_fields = [_][]const u8{
+        "title",
+        "_embeddings.*",
+        "_chunks",
+        "_artifacts.*",
+        "-_chunks.*._embedding",
+    };
+    var authoritative = try authoritativePayloadLookupAlloc(alloc, .{
+        .fields = &synthetic_fields,
+        .include_all_fields = false,
+        .execution_deadline_ns = controlled.execution_deadline_ns,
+        .cancellation = controlled.cancellation,
+    });
+    defer authoritative.deinit(alloc);
+    try std.testing.expect(!authoritative.options.include_all_fields);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "*", "_artifacts", "_chunks", "_embeddings" },
+        authoritative.options.fields,
+    );
+    try std.testing.expect(authoritative.options.execution_deadline_ns != null);
+    try std.testing.expect(authoritative.options.cancellation != null);
+
+    // The marker is requested internally even for `fields: []`, but it must
+    // never become part of the public source payload. Keep this assertion at
+    // the hydration seam so local and remotely routed lookups have identical
+    // projection semantics.
+    var hit = db_mod.types.SearchHit{
+        .id = @constCast("af1:asset:unit:page-1"),
+        .sort_values = @constCast((&[_]std.json.Value{
+            .{ .string = @constCast(position) },
+            .{ .string = @constCast("af1:asset:unit:page-1") },
+        })[0..]),
+        .artifact_ref = .{
+            .document_id = @constCast("doc:a"),
+            .name = @constCast("document_units_v1"),
+            .kind = .asset,
+            .unit_id = @constCast("page:000001"),
+        },
+    };
+    try testing.applyHierarchyNavigationLookupForTest(
+        alloc,
+        &hit,
+        "{\"_artifact_unit_fingerprint\":\"unit-fingerprint\",\"text\":\"alpha\"}",
+    );
+    defer alloc.free(hit.stored_data.?);
+    var hydrated = try parseJsonTestBody(std.json.Value, alloc, hit.stored_data.?);
+    defer hydrated.deinit();
+    try std.testing.expect(hydrated.value.object.get(hierarchy_navigation_unit_fingerprint_field) == null);
+    try std.testing.expectEqualStrings("alpha", hydrated.value.object.get("text").?.string);
+    try std.testing.expect(hydrated.value.object.get("_hierarchy") == null);
+
+    const RevisionAdvancingSource = struct {
+        calls: usize = 0,
+
+        fn lookup(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            opts: db_mod.types.LookupOptions,
+            consistency_inner: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(raft_mod.ReadConsistency.stale, consistency_inner);
+            try std.testing.expect(!opts.include_all_fields);
+            try std.testing.expectEqualSlices([]const u8, &.{ "*", "_chunks" }, opts.fields);
+            return .{
+                .json = try inner_alloc.dupe(
+                    u8,
+                    "{\"title\":\"current\",\"text\":\"hidden\",\"_chunks\":{\"body_chunks_v1\":[{\"_content\":\"current chunk\"}]},\"_artifact_unit_fingerprint\":\"unit-fingerprint\"}",
+                ),
+                .version = 2,
+            };
+        }
+    };
+    var advancing_source = RevisionAdvancingSource{};
+    var stale_projection = LookupResponse{
+        .json = try alloc.dupe(
+            u8,
+            "{\"title\":\"stale\",\"_chunks\":{\"body_chunks_v1\":[{\"_content\":\"stale chunk\"}]}}",
+        ),
+        .version = 1,
+    };
+    defer stale_projection.deinit(alloc);
+    const fallback_fields = [_][]const u8{ "title", "_chunks", "-text", "-_artifact_unit_fingerprint" };
+    try ensureHierarchyNavigationProjectedResponse(
+        RevisionAdvancingSource,
+        &advancing_source,
+        alloc,
+        "docs",
+        "unit-key",
+        &stale_projection,
+        "document_units_v1",
+        parsed,
+        .{ .fields = &fallback_fields, .include_all_fields = false },
+    );
+    try std.testing.expectEqual(@as(usize, 1), advancing_source.calls);
+    try std.testing.expectEqual(@as(u64, 2), stale_projection.version);
+    var repaired = try parseJsonTestBody(std.json.Value, alloc, stale_projection.json);
+    defer repaired.deinit();
+    try std.testing.expectEqualStrings("current", repaired.value.object.get("title").?.string);
+    try std.testing.expectEqualStrings(
+        "current chunk",
+        repaired.value.object.get("_chunks").?.object.get("body_chunks_v1").?.array.items[0].object.get("_content").?.string,
+    );
+    try std.testing.expect(repaired.value.object.get("text") == null);
+    try std.testing.expect(repaired.value.object.get(hierarchy_navigation_unit_fingerprint_field) == null);
+}
+
+test "hosted hierarchy navigation routes projection-safe hydration and advances cursors" {
+    const alloc = std.testing.allocator;
+    const positions = [_][]const u8{
+        try hierarchy_navigation.positionAlloc(
+            alloc,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "document_units_v1",
+            7,
+            0,
+            "fingerprint-1",
+        ),
+        try hierarchy_navigation.positionAlloc(
+            alloc,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "document_units_v1",
+            7,
+            1,
+            "fingerprint-2",
+        ),
+    };
+    defer for (positions) |position| alloc.free(position);
+    const public_ids = [_][]const u8{
+        "af1:asset:unit:page-1",
+        "af1:asset:unit:page-2",
+    };
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{
+                        .group_id = 7,
+                        .table_id = 7,
+                        .range_id = 7,
+                        .start_key = "",
+                        .end_key = "m",
+                    },
+                    .{
+                        .group_id = 8,
+                        .table_id = 7,
+                        .range_id = 8,
+                        .start_key = "m",
+                        .end_key = null,
+                    },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{
+                    .{
+                        .record = .{ .group_id = 7, .replica_id = 2, .local_node_id = 2 },
+                        .serving_state = .serving,
+                    },
+                    .{
+                        .record = .{ .group_id = 8, .replica_id = 3, .local_node_id = 2 },
+                        .serving_state = .serving,
+                    },
+                })[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7 or group_id == 8) 2 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2 and (group_id == 7 or group_id == 8)) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, inner_alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try inner_alloc.dupe(u8, "http://remote.test");
+        }
+    };
+
+    const Executor = struct {
+        positions: [2][]const u8,
+        query_calls: usize = 0,
+        lookup_calls: usize = 0,
+        selected_page: usize = 0,
+        all_missing: bool = false,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn ownedHeader(inner_alloc: std.mem.Allocator, name: []const u8, value: []const u8) ![]http_common.Header {
+            const headers = try inner_alloc.alloc(http_common.Header, 1);
+            errdefer inner_alloc.free(headers);
+            const owned_name = try inner_alloc.dupe(u8, name);
+            errdefer inner_alloc.free(owned_name);
+            const owned_value = try inner_alloc.dupe(u8, value);
+            headers[0] = .{
+                .name = owned_name,
+                .value = owned_value,
+            };
+            return headers;
+        }
+
+        fn execute(ptr: *anyopaque, inner_alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const group_7_query = std.mem.endsWith(u8, request.uri, "/internal/v1/groups/7/tables/docs/query");
+            const group_8_query = std.mem.endsWith(u8, request.uri, "/internal/v1/groups/8/tables/docs/query");
+            if (request.method == .POST and (group_7_query or group_8_query)) {
+                const is_replay = std.mem.indexOf(u8, request.body, "\"search_after\"") != null;
+                self.query_calls += 1;
+                if (group_8_query or self.all_missing) {
+                    return .{
+                        .status = 200,
+                        .headers = try ownedHeader(inner_alloc, query_api.QueryResponse.identity_read_generation_header, "42"),
+                        .body = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"hits\":[]},\"took\":0,\"status\":200,\"table\":\"docs\"}]}"),
+                    };
+                }
+                self.selected_page = if (is_replay) 1 else 0;
+                if (is_replay) {
+                    try std.testing.expect(std.mem.indexOf(u8, request.body, self.positions[0]) != null);
+                    try std.testing.expect(std.mem.indexOf(u8, request.body, public_ids[0]) != null);
+                }
+                return .{
+                    .status = 200,
+                    .headers = try ownedHeader(inner_alloc, query_api.QueryResponse.identity_read_generation_header, "42"),
+                    .body = try std.fmt.allocPrint(
+                        inner_alloc,
+                        "{{\"responses\":[{{\"hits\":{{\"total\":{{\"value\":2,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{s}\",\"_score\":1,\"_sort\":[\"{s}\",\"{s}\"],\"hierarchy\":{{\"level\":\"unit\",\"parent_doc_key\":\"doc:a\",\"parent_unit_id\":\"page:00000{d}\",\"artifact\":{{\"name\":\"document_units_v1\",\"kind\":\"asset\",\"unit_id\":\"page:00000{d}\"}}}}}}]}},\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
+                        .{ public_ids[self.selected_page], self.positions[self.selected_page], public_ids[self.selected_page], self.selected_page + 1, self.selected_page + 1 },
+                    ),
+                };
+            }
+            if (request.method == .GET and std.mem.indexOf(u8, request.uri, "/internal/v1/groups/7/tables/docs/documents/") != null) {
+                try std.testing.expect(std.mem.indexOf(u8, request.uri, hierarchy_navigation_unit_fingerprint_field) != null);
+                self.lookup_calls += 1;
+                return .{
+                    .status = 200,
+                    .headers = try ownedHeader(inner_alloc, "X-Antfly-Version", "9"),
+                    .body = try std.fmt.allocPrint(
+                        inner_alloc,
+                        "{{\"_artifact_unit_fingerprint\":\"fingerprint-{d}\"}}",
+                        .{self.selected_page + 1},
+                    ),
+                };
+            }
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var executor = Executor{ .positions = positions };
+    var hosted = HostedProvisionedTableReadSource.init(
+        "/tmp/antfly-hosted-hierarchy-navigation-routing",
+        FakeCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+        FakeRouter.iface(),
+        executor.iface(),
+    );
+    const group_ids = [_]u64{ 7, 8 };
+    const order = [_]db_mod.types.SortField{
+        .{ .field = "_hierarchy.position" },
+        .{ .field = "_id" },
+    };
+    const fields = [_][]const u8{};
+    const base_request = db_mod.types.SearchRequest{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .include_all_fields = false,
+        .fields = &fields,
+        .order_by = &order,
+        .limit = 1,
+    };
+
+    var first = try queryHostedAcrossGroups(&hosted, alloc, &group_ids, base_request, "docs", .read_index);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.hits.len);
+    try std.testing.expectEqualStrings(public_ids[0], first.hits[0].id);
+    try std.testing.expectEqualStrings(positions[0], first.hits[0].sort_values[0].string);
+    var first_source = try parseJsonTestBody(std.json.Value, alloc, first.hits[0].stored_data.?);
+    defer first_source.deinit();
+    try std.testing.expect(first_source.value.object.get(hierarchy_navigation_unit_fingerprint_field) == null);
+    try std.testing.expectEqual(@as(usize, 0), first_source.value.object.count());
+    try std.testing.expect(first_source.value.object.get("_hierarchy") == null);
+
+    const cursor = [_]std.json.Value{
+        .{ .string = @constCast(positions[0]) },
+        .{ .string = @constCast(public_ids[0]) },
+    };
+    var replay_request = base_request;
+    replay_request.search_after = &cursor;
+    var replay = try queryHostedAcrossGroups(&hosted, alloc, &group_ids, replay_request, "docs", .read_index);
+    defer replay.deinit();
+    try std.testing.expectEqual(@as(usize, 1), replay.hits.len);
+    try std.testing.expectEqualStrings(public_ids[1], replay.hits[0].id);
+    try std.testing.expectEqualStrings(positions[1], replay.hits[0].sort_values[0].string);
+    try std.testing.expectEqual(@as(usize, 4), executor.query_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.lookup_calls);
+
+    // If every shard reports that it does not own the parent plan, the outer
+    // coordinator—not an arbitrary non-owner shard—classifies the continuation
+    // as stale and provides the public restart guidance.
+    executor.all_missing = true;
+    try std.testing.expectError(
+        error.HierarchyCursorStale,
+        queryHostedAcrossGroups(&hosted, alloc, &group_ids, replay_request, "docs", .read_index),
+    );
+    try std.testing.expectEqual(@as(usize, 6), executor.query_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.lookup_calls);
+}
+
+test "encode query request preserves unit grouping ancestor projections" {
+    const alloc = std.testing.allocator;
+    const source_fields = [_][]const u8{ "title", "owner" };
+    const unit_fields = [_][]const u8{ "unit_id", "provenance.page_number" };
+    const match_fields = [_][]const u8{"text"};
+    const encoded = try encodeQueryRequest(alloc, .{
+        .include_all_fields = false,
+        .fields = &.{},
+        .hierarchy_group_level = .unit,
+        .hierarchy_grouped_matches = true,
+        .return_mode = .unit_with_chunks,
+        .max_chunks_per_parent = 2,
+        .hierarchy_match_fields = &match_fields,
+        .hierarchy_match_include_all_fields = false,
+        .hierarchy_include_source = true,
+        .hierarchy_include_unit = true,
+        .hierarchy_source_fields = &source_fields,
+        .hierarchy_source_include_all_fields = false,
+        .hierarchy_unit_fields = &unit_fields,
+        .hierarchy_unit_include_all_fields = false,
+    });
+    defer alloc.free(encoded);
+
+    var parsed = try parseJsonTestBody(std.json.Value, alloc, encoded);
+    defer parsed.deinit();
+    const hierarchy = parsed.value.object.get("hierarchy").?.object;
+    try std.testing.expectEqualStrings("unit", hierarchy.get("group_by").?.object.get("level").?.string);
+    try std.testing.expectEqual(@as(usize, 1), hierarchy.get("group_by").?.object.get("matches").?.object.get("fields").?.array.items.len);
+    const ancestors = hierarchy.get("ancestors").?.object;
+    try std.testing.expectEqualStrings("title", ancestors.get("source").?.object.get("fields").?.array.items[0].string);
+    try std.testing.expectEqualStrings("provenance.page_number", ancestors.get("unit").?.object.get("fields").?.array.items[1].string);
+
+    var round_trip = try query_api.parseQueryRequest(alloc, null, "docs", encoded);
+    defer round_trip.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.HierarchyGroupLevel.unit, round_trip.req.hierarchy_group_level);
+    try std.testing.expect(round_trip.req.hierarchy_include_source);
+    try std.testing.expect(round_trip.req.hierarchy_include_unit);
+    try std.testing.expectEqualStrings("owner", round_trip.req.hierarchy_source_fields[1]);
+    try std.testing.expectEqualStrings("unit_id", round_trip.req.hierarchy_unit_fields[0]);
+
+    const selected = [_]db_mod.types.SearchHit{.{
+        .id = @constCast("public-unit-id"),
+        .artifact_ref = .{
+            .document_id = @constCast("doc:a"),
+            .name = @constCast("document_units_v1"),
+            .kind = .asset,
+            .unit_id = @constCast("page:000001"),
+        },
+    }};
+    const exact_filter = try hierarchyUnitGroupsFilterJsonAlloc(alloc, "", &selected);
+    defer alloc.free(exact_filter);
+    try std.testing.expect(std.mem.indexOf(u8, exact_filter, "_parent_unit_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exact_filter, "_parent_unit_id") == null);
+}
+
 test "encode query request round-trips composed bleve full_text queries" {
     const alloc = std.testing.allocator;
 
@@ -19771,7 +21975,7 @@ test "simple vector shard request lowers to vector worker envelope" {
         .defer_stored_projection = true,
         .search_effort = 0.5,
         .distance_under = 0.9,
-        .return_mode = .parent_with_chunks,
+        .return_mode = .unit_with_chunks,
         .max_chunks_per_parent = 2,
         .hierarchy_include_source = true,
         .hierarchy_include_unit = true,
@@ -19779,6 +21983,8 @@ test "simple vector shard request lowers to vector worker envelope" {
         .hierarchy_match_fields = &.{"text"},
         .hierarchy_match_include_all_fields = false,
         .hierarchy_grouped_matches = true,
+        .hierarchy_group_level = .unit,
+        .defer_hierarchy_child_hydration = true,
         .hierarchy_source_fields = &.{ "title", "url" },
         .hierarchy_source_include_all_fields = false,
         .hierarchy_unit_fields = &.{"page"},
@@ -19816,7 +22022,7 @@ test "simple vector shard request lowers to vector worker envelope" {
     try std.testing.expectEqualStrings("score", envelope.options.fields[1]);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), envelope.options.search_effort.?, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), envelope.options.distance_under.?, 0.0001);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, envelope.options.return_mode);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.unit_with_chunks, envelope.options.return_mode);
     try std.testing.expectEqual(@as(u32, 2), envelope.options.max_chunks_per_parent);
     try std.testing.expect(envelope.options.hierarchy_include_source);
     try std.testing.expect(envelope.options.hierarchy_include_unit);
@@ -19824,6 +22030,8 @@ test "simple vector shard request lowers to vector worker envelope" {
     try std.testing.expectEqualStrings("text", envelope.options.hierarchy_match_fields[0]);
     try std.testing.expect(!envelope.options.hierarchy_match_include_all_fields);
     try std.testing.expect(envelope.options.hierarchy_grouped_matches);
+    try std.testing.expectEqual(db_mod.types.HierarchyGroupLevel.unit, envelope.options.hierarchy_group_level);
+    try std.testing.expect(envelope.options.defer_hierarchy_child_hydration);
     try std.testing.expectEqualStrings("url", envelope.options.hierarchy_source_fields[1]);
     try std.testing.expect(!envelope.options.hierarchy_source_include_all_fields);
     try std.testing.expectEqualStrings("page", envelope.options.hierarchy_unit_fields[0]);
@@ -19834,6 +22042,39 @@ test "simple vector shard request lowers to vector worker envelope" {
     try std.testing.expectEqualStrings("doc:b", envelope.native_doc_id_constraints.constraints.include_doc_ids[1]);
     try std.testing.expectEqualStrings("doc:c", envelope.native_doc_id_constraints.constraints.exclude_doc_ids[0]);
     try std.testing.expect((try envelope.proveTensorProgramAlloc(alloc)).safe());
+
+    const worker_req = searchRequestFromVectorWorkerEnvelope(&envelope);
+    try std.testing.expectEqual(db_mod.types.HierarchyGroupLevel.unit, worker_req.hierarchy_group_level);
+    try std.testing.expect(worker_req.defer_hierarchy_child_hydration);
+
+    const sparse_body = (try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, .{
+        .index_name = "sparse_idx",
+        .return_mode = .unit,
+        .hierarchy_group_level = .unit,
+        .defer_hierarchy_child_hydration = true,
+        .query = .{ .sparse_knn = .{
+            .indices = &.{ 1, 7 },
+            .values = &.{ 0.25, 0.75 },
+            .k = 5,
+        } },
+    })).?;
+    defer alloc.free(sparse_body);
+    var sparse_envelope = try query_contract.parseAlgebraicVectorWorkerRequestEnvelopeAlloc(alloc, sparse_body);
+    defer sparse_envelope.deinit(alloc);
+    const sparse_worker_req = searchRequestFromVectorWorkerEnvelope(&sparse_envelope);
+    try std.testing.expectEqual(db_mod.types.HierarchyGroupLevel.unit, sparse_worker_req.hierarchy_group_level);
+    try std.testing.expect(sparse_worker_req.defer_hierarchy_child_hydration);
+
+    const invalid_defer_body = (try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, .{
+        .index_name = "dense_idx",
+        .defer_hierarchy_child_hydration = true,
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } },
+    })).?;
+    defer alloc.free(invalid_defer_body);
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        query_contract.parseAlgebraicVectorWorkerRequestEnvelopeAlloc(alloc, invalid_defer_body),
+    );
 
     const supported_filter = try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, .{
         .index_name = "dense_idx",
@@ -20679,6 +22920,72 @@ test "algebraic partial request rejects legacy cardinality bodies" {
         alloc,
         "{\"index_name\":\"alg\",\"histogram_cardinality\":{\"aggregation_name\":\"x\",\"field\":\"amount\",\"kind\":\"numeric\",\"interval\":10,\"children\":[]}}",
     ));
+}
+
+test "identity-only distributed unit groups consume envelopes without routed reads" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        io_impl: ?*std.Io.Threaded = null,
+        calls: usize = 0,
+
+        fn lookup(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    const hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "unit:0"),
+        .stored_data = try alloc.dupe(u8, "{\"_hierarchy_unit_revision_token\":\"selected-fingerprint\"}"),
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "document_units_v1"),
+            .kind = .asset,
+            .unit_id = try alloc.dupe(u8, "page:000001"),
+        },
+    };
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+    };
+    defer result.deinit();
+    var source = FakeSource{};
+    const req = db_mod.types.SearchRequest{
+        .return_mode = .unit,
+        .hierarchy_group_level = .unit,
+        .include_stored = false,
+        .include_all_fields = false,
+        .fields = &.{},
+    };
+    try hydrateDistributedGroupedUnitHits(
+        FakeSource,
+        &source,
+        alloc,
+        "docs",
+        req,
+        &result,
+        .read_index,
+    );
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+    try std.testing.expect(result.hits[0].stored_data == null);
+
+    var response = try query_contract.encodeQueryResponses(alloc, "docs", req, .{}, result);
+    defer response.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        response.json,
+        hierarchy_navigation.grouped_unit_revision_envelope_field,
+    ) == null);
 }
 
 test "aggregation context rejects non-current identity generation" {

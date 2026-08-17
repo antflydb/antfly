@@ -99,8 +99,10 @@ const query_request_description_json =
     \\      "queryRequest.table is rejected because tableName selects the table-scoped route.",
     \\      "Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema.",
     \\      "For hierarchical documents, the presence of hierarchy selects direct matches unless group_by is present; ancestors only controls projected context.",
-    \\      "Use hierarchy.group_by.level=source with bounded group_by.matches for grouped source results; nested matches default to three, cannot exceed 100, and top-level limit does not bound them.",
-    \\      "Aggregations on hierarchy.group_by queries operate on the complete top-level source-group set; nested matches are evidence and are not aggregation rows.",
+    \\      "Use hierarchy.group_by.level=source or unit with bounded group_by.matches for grouped relevance results; nested matches default to three, cannot exceed 100, and top-level limit does not bound them.",
+    \\      "Use hierarchy.children from a source to unit for sequential browsing; order by _hierarchy.position ascending and paginate with the returned two-value _sort/search_after cursor.",
+    \\      "Hierarchy child cursors are bound to the extraction revision and are rejected when stale.",
+    \\      "Aggregations on hierarchy.group_by queries operate on the complete top-level group set; nested matches are evidence and are not aggregation rows.",
     \\      "For source groups, project source fields with top-level fields; hierarchy.ancestors.source is rejected because it would duplicate the grouping-level document.",
     \\      "Never request _chunks.* through MCP because it can expand every child stored on a matched source.",
     \\      "Structured filter_query.geo_bbox accepts field, min_lat, min_lon, max_lat, and max_lon; min_lon greater than max_lon represents an antimeridian-wrapped box."
@@ -111,6 +113,8 @@ const query_request_description_json =
     \\    "fielded_full_text": {"full_text_search":{"match":"hello","field":"body"},"fields":["title","body"],"limit":5,"timeout_ms":5000},
     \\    "match_retrieval": {"semantic_search":"How does Antfly index documents?","indexes":["document_vectors"],"hierarchy":{"ancestors":{"source":{"fields":["title","url"]}}},"fields":["text"],"limit":5},
     \\    "source_with_matches": {"semantic_search":"Antfly indexing","indexes":["document_vectors"],"hierarchy":{"group_by":{"level":"source","matches":{"limit":3,"fields":["text"]}}},"fields":["title","url"],"limit":5},
+    \\    "unit_with_matches": {"semantic_search":"Antfly indexing","indexes":["document_vectors"],"hierarchy":{"group_by":{"level":"unit","matches":{"limit":3,"fields":["text"]}}},"fields":["unit_id","unit_type","provenance.page_number"],"limit":5},
+    \\    "browse_units": {"fields":["unit_id","unit_type","text","provenance.page_number","provenance.page_label"],"hierarchy":{"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},"order_by":[{"field":"_hierarchy.position"}],"limit":20},
     \\    "hybrid": {"full_text_search":{"match":"raft","field":"body"},"semantic_search":"raft snapshot architecture","indexes":["body_embedding"],"merge_config":{"strategy":"rrf"},"fields":["title","body"],"limit":20,"profile":true},
     \\    "filtered": {"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"filter":[{"term":{"path":"/tenant","value":"acme"}}]}},"fields":["title","url"],"limit":10},
     \\    "geo_bbox_filter": {"filter_query":{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}},"limit":10}
