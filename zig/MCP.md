@@ -146,17 +146,46 @@ projection:
 }
 ```
 
-The presence of `hierarchy` selects the canonical contract. Without `group_by`, including for `hierarchy: {}`, Antfly
+The presence of `hierarchy` selects the canonical contract. Without `group_by` or `children`, including for `hierarchy: {}`, Antfly
 returns direct index matches; `ancestors` only adds projected context and never changes result cardinality.
-`group_by.level` currently supports `source`; its nested `matches` retain their actual `hierarchy.level`, so the response
+`group_by.level` supports `source` and `unit`; its nested `matches` retain their actual `hierarchy.level`, so the response
 is not tied to chunks. Every match or ancestor projection must specify `fields`; use an empty array when only hierarchy
 identity is needed. Omitting `group_by.matches.limit` defaults it to three, and the server rejects values above 100 before
-executing the query. Nested matches follow the effective query order and each group carries its best match score.
+executing the query. Nested matches follow the effective query order and each group carries its best match score. Unit
+groups are relevance-ranked and reject `order_by`, `search_after`, and `search_before`; use `hierarchy.children` for
+sequential cursor-paginated unit traversal.
 
 For source-level groups, an explicit top-level `fields` projection is required so grouping can never implicitly hydrate a
 complete source document (including its stored `_chunks` array). Use `fields: []` when only source identity is needed. A
 source ancestor projection would duplicate the grouping-level document and is rejected. A unit ancestor projection may be
 combined with source grouping when nested matches need intermediate unit context.
+
+Sequential browsing is a separate source-to-unit operation and includes blank or failed-extraction units that have no
+searchable match:
+
+```json
+{
+  "tableName": "document_search_import",
+  "queryRequest": {
+    "fields": ["unit_id", "unit_type", "text", "provenance.page_number", "provenance.page_label"],
+    "hierarchy": {
+      "children": {
+        "parent": {"level": "source", "id": "doc:a"},
+        "level": "unit"
+      }
+    },
+    "order_by": [{"field": "_hierarchy.position"}],
+    "limit": 20
+  }
+}
+```
+
+Antfly appends `_id` as the deterministic tie-breaker. Continue with the returned two-value `_sort` array as top-level
+`search_after`. The opaque hierarchy position is bound
+to the complete source hierarchy revision (all unit artifacts, generations, ordered unit keys, and unit fingerprints),
+so Antfly rejects a cursor after any participating artifact changes instead of mixing units from different revisions.
+The public API reports that case as `409` with `error: "hierarchy_cursor_stale"` and
+`action: "restart_hierarchy_traversal"`. Restart the request without `search_after`; retrying the same cursor cannot succeed.
 
 The legacy hierarchy controls remain accepted for existing callers, but they cannot be mixed with `group_by` or
 `ancestors`. They are intentionally omitted from MCP discovery so new integrations see only the canonical controls.

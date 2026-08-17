@@ -1056,6 +1056,12 @@ pub const Query = union(enum) {
 pub const LookupOptions = struct {
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
+    /// Internal, absolute monotonic deadline used by routed lookups. It is not
+    /// part of the public lookup projection contract and is never serialized.
+    execution_deadline_ns: ?u64 = null,
+    /// Borrowed request cancellation source. Callers must keep it alive for
+    /// the synchronous lookup call.
+    cancellation: ?CancellationToken = null,
 };
 
 pub const LookupResult = struct {
@@ -1288,6 +1294,12 @@ pub const SearchRequest = struct {
     hierarchy_match_fields: []const []const u8 = &.{},
     hierarchy_match_include_all_fields: bool = true,
     hierarchy_grouped_matches: bool = false,
+    hierarchy_group_level: HierarchyGroupLevel = .source,
+    hierarchy_children: ?HierarchyChildrenRequest = null,
+    /// Internal distributed-planning control. Parent-owned navigation and
+    /// globally merged unit groups may return identity-only hits for payloads
+    /// routed elsewhere; direct callers fail closed when payload is absent.
+    defer_hierarchy_child_hydration: bool = false,
     hierarchy_source_fields: []const []const u8 = &.{},
     hierarchy_source_include_all_fields: bool = true,
     hierarchy_unit_fields: []const []const u8 = &.{},
@@ -1336,7 +1348,141 @@ pub const max_canonical_hierarchy_groups: u32 = 100;
 pub const max_canonical_hierarchy_matches_per_group: u32 = 100;
 pub const max_canonical_hierarchy_total_matches: u32 = 1000;
 
+// Every SearchRequest field must be deliberately classified for child
+// traversal. The compile-time audit prevents newly added retrieval controls
+// from becoming silently accepted no-ops at this storage boundary.
+const hierarchy_children_validated_fields = [_][]const u8{
+    "return_mode",
+    "hierarchy_grouped_matches",
+    "hierarchy_children",
+    "fields",
+    "order_by",
+    "search_after",
+    "include_all_fields",
+    "limit",
+    "offset",
+    "include_stored",
+};
+
+const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "filter_query_json",
+    "exclusion_query_json",
+    "defer_hierarchy_child_hydration",
+    "defer_stored_projection",
+    "filter_doc_ids",
+    "filter_doc_ids_positive",
+    "exclude_doc_ids",
+    "resolved_doc_filter",
+    "resolved_doc_filter_owned",
+    "resolved_doc_filter_wire_context",
+    "identity_read_generation",
+    "execution_deadline_ns",
+    "cancellation",
+};
+
+const hierarchy_children_rejected_fields = [_][]const u8{
+    "query",
+    "index_name",
+    "primary_text_index_name",
+    "aggregations_json",
+    "count_only",
+    "profile",
+    "full_text",
+    "filter_text",
+    "exclusion_text",
+    "full_text_queries",
+    "doc_filter_bindings",
+    "dense",
+    "sparse",
+    "dense_queries",
+    "sparse_queries",
+    "graph_queries",
+    "merge_config",
+    "reranker",
+    "reranker_query_text",
+    "pruner",
+    "expand_strategy",
+    "max_chunks_per_parent",
+    "hierarchy_include_source",
+    "hierarchy_include_unit",
+    "hierarchy_omit_implicit_source_ancestor_document",
+    "hierarchy_match_fields",
+    "hierarchy_match_include_all_fields",
+    "hierarchy_group_level",
+    "hierarchy_source_fields",
+    "hierarchy_source_include_all_fields",
+    "hierarchy_unit_fields",
+    "hierarchy_unit_include_all_fields",
+    "search_before",
+    "search_effort",
+    "filter_prefix",
+    "distance_over",
+    "distance_under",
+    "filter_ids",
+    "exclude_ids",
+    "resolved_text_doc_filter",
+    "graph_table_read_authorizer",
+    "require_algebraic_filter_resolution",
+    "distributed_text_stats",
+};
+
+fn auditHierarchyChildrenSearchRequestFields() void {
+    @setEvalBranchQuota(10_000);
+    inline for (@typeInfo(SearchRequest).@"struct".fields) |field| {
+        comptime var classifications: usize = 0;
+        inline for (hierarchy_children_validated_fields) |name| {
+            if (std.mem.eql(u8, field.name, name)) classifications += 1;
+        }
+        inline for (hierarchy_children_supported_internal_fields) |name| {
+            if (std.mem.eql(u8, field.name, name)) classifications += 1;
+        }
+        inline for (hierarchy_children_rejected_fields) |name| {
+            if (std.mem.eql(u8, field.name, name)) classifications += 1;
+        }
+        if (classifications != 1) {
+            @compileError("SearchRequest field must have exactly one hierarchy-children policy: " ++ field.name);
+        }
+    }
+}
+
+/// Validate the fully normalized storage contract for sequential hierarchy
+/// traversal. Public parsers enforce the same shape, but typed and internal
+/// callers also cross this boundary and must never be able to trigger unchecked
+/// cursor indexing or accidentally request unbounded materialization.
+pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
+    @setEvalBranchQuota(100_000);
+    comptime auditHierarchyChildrenSearchRequestFields();
+    const children = req.hierarchy_children orelse return true;
+    if (children.parent_id.len == 0 or children.parent_level != .source or children.level != .unit) return false;
+    if (req.return_mode != .unit or req.hierarchy_grouped_matches or req.max_chunks_per_parent != 0) return false;
+    // Traversal is deliberately not a retrieval operation. Reject every
+    // scoring, ranking, or transform control at this final typed boundary so
+    // embedded callers and worker envelopes cannot receive plausible-looking
+    // results for options that navigation would otherwise ignore. Internal
+    // authorization constraints and lifecycle controls remain supported.
+    const defaults = SearchRequest{};
+    inline for (hierarchy_children_rejected_fields) |field_name| {
+        if (!std.meta.eql(@field(req, field_name), @field(defaults, field_name))) return false;
+    }
+    if (req.limit == 0 or req.limit > max_canonical_hierarchy_groups) return false;
+    if (req.offset != 0 or req.count_only or req.aggregations_json.len > 0) return false;
+    if (req.search_before.len > 0 or req.include_all_fields) return false;
+    if (req.order_by.len != 2 or
+        !std.mem.eql(u8, req.order_by[0].field, "_hierarchy.position") or
+        req.order_by[0].desc or
+        !std.mem.eql(u8, req.order_by[1].field, "_id") or
+        req.order_by[1].desc)
+    {
+        return false;
+    }
+    if (req.search_after.len == 0) return true;
+    return req.search_after.len == 2 and
+        req.search_after[0] == .string and
+        req.search_after[1] == .string;
+}
+
 pub fn canonicalHierarchyExecutionWithinBudget(req: SearchRequest) bool {
+    if (!canonicalHierarchyChildrenRequestIsValid(req)) return false;
     if (!req.hierarchy_grouped_matches) return true;
     if (req.limit == 0 or req.limit > max_canonical_hierarchy_groups) return false;
     if (req.max_chunks_per_parent == 0 or
@@ -1353,13 +1499,16 @@ pub fn canonicalHierarchyExecutionWithinBudget(req: SearchRequest) bool {
 /// and only then issue one bounded expansion for those selected groups.
 pub fn canonicalGroupedMatchSelectionRequest(req: SearchRequest) SearchRequest {
     if (!req.hierarchy_grouped_matches or
-        req.return_mode != .parent_with_chunks or
+        (req.return_mode != .parent_with_chunks and req.return_mode != .unit_with_chunks) or
         req.max_chunks_per_parent == 0)
     {
         return req;
     }
     var selection = req;
-    selection.return_mode = .parent;
+    selection.return_mode = switch (req.hierarchy_group_level) {
+        .source => .parent,
+        .unit => .unit,
+    };
     selection.max_chunks_per_parent = 0;
     selection.hierarchy_grouped_matches = false;
     return selection;
@@ -1461,6 +1610,19 @@ pub const ReturnMode = enum {
     parent,
     chunk,
     parent_with_chunks,
+    unit,
+    unit_with_chunks,
+};
+
+pub const HierarchyGroupLevel = enum {
+    source,
+    unit,
+};
+
+pub const HierarchyChildrenRequest = struct {
+    parent_id: []const u8,
+    parent_level: HierarchyGroupLevel = .source,
+    level: HierarchyGroupLevel = .unit,
 };
 
 pub const NamedGraphQuery = struct {

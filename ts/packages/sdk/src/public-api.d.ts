@@ -2697,6 +2697,51 @@ export interface components {
              */
             retryable: false;
         };
+        /** @description A transient query dependency or read-availability failure that is safe to retry. */
+        QueryTemporarilyUnavailableError: {
+            /**
+             * @description Stable machine-readable retry classification.
+             * @enum {string}
+             */
+            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable";
+            /** @description Human-readable error summary. */
+            message: string;
+            /**
+             * @description Always true; retry after the response's Retry-After delay.
+             * @enum {boolean}
+             */
+            retryable: true;
+        };
+        /** @description A hierarchy traversal cursor bound to an older source-artifact revision. */
+        HierarchyCursorStaleError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 409;
+            /**
+             * @description Stable machine-readable error code.
+             * @enum {string}
+             */
+            error: "hierarchy_cursor_stale";
+            /** @description Human-readable explanation of why traversal cannot continue. */
+            message: string;
+            /**
+             * @description Stable client action for recovering from the conflict.
+             * @enum {string}
+             */
+            action: "restart_hierarchy_traversal";
+            /**
+             * @description Request field to omit when restarting at the first unit.
+             * @enum {string}
+             */
+            restart_without: "search_after";
+            /**
+             * @description Retrying the same cursor cannot succeed; restart traversal instead.
+             * @enum {boolean}
+             */
+            retryable: false;
+        };
         ExactSortError: {
             /**
              * @description Stable error class.
@@ -6038,11 +6083,44 @@ export interface components {
         HierarchyGroupBy: {
             /**
              * @description Hierarchy level used to group the records matched by the targeted index.
+             *     Unit groups are relevance-ranked and do not accept `order_by`, `search_after`,
+             *     or `search_before`; use `hierarchy.children` for sequential, cursor-paginated
+             *     unit traversal.
              * @enum {string}
              */
-            level: "source";
+            level: "source" | "unit";
             matches?: components["schemas"]["HierarchyMatches"];
         };
+        HierarchyChildParent: {
+            /** @enum {string} */
+            level: "source";
+            id: string;
+        };
+        HierarchyChildren: {
+            parent: components["schemas"]["HierarchyChildParent"];
+            /**
+             * @description Child level to enumerate. Unit traversal reads the versioned extraction
+             *     hierarchy rather than a relevance index, so empty and failed units are included.
+             * @enum {string}
+             */
+            level: "unit";
+        };
+        /**
+         * @description The required public order for sequential hierarchy traversal. Specify
+         *     `_hierarchy.position` ascending; Antfly appends `_id` ascending as the
+         *     deterministic tie-breaker and returns both values in each hit's `_sort`.
+         */
+        HierarchyChildrenOrderBy: {
+            /** @enum {string} */
+            field: "_hierarchy.position";
+            /**
+             * @default false
+             * @enum {boolean}
+             */
+            desc?: false;
+        }[];
+        /** @description Opaque position and unit-id tuple returned in the preceding hit's `_sort`. */
+        HierarchyChildrenSearchAfter: string[];
         HierarchyAncestors: {
             source?: components["schemas"]["HierarchyProjection"];
             unit?: components["schemas"]["HierarchyProjection"];
@@ -6053,16 +6131,21 @@ export interface components {
          *     projection is independently bounded and defaults to three hits while the top-level
          *     `limit` continues to control the number of groups.
          *
+         *     `children` is a separate sequential-browsing operation. It enumerates every unit
+         *     in the selected source revision, including units with no searchable chunk, and uses
+         *     the top-level `_sort`/`search_after` cursor contract.
+         *
          *     Ancestor and nested-match field projections are always explicit to keep response
          *     size predictable. The presence of this object selects the canonical contract:
-         *     without `group_by`, including when the object is empty, direct index matches are
-         *     returned. `ancestors` only controls projected context and never changes result
+         *     without `group_by` or `children`, including when the object is empty, direct index
+         *     matches are returned. `ancestors` only controls projected context and never changes result
          *     cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
          */
         QueryHierarchy: {
             group_by?: components["schemas"]["HierarchyGroupBy"];
             ancestors?: components["schemas"]["HierarchyAncestors"];
-        } & unknown;
+            children?: components["schemas"]["HierarchyChildren"];
+        } & (unknown & unknown & unknown);
         QueryRequest: {
             /**
              * @description Name of the table to query. Optional for global queries.
@@ -6225,7 +6308,7 @@ export interface components {
              *     Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration.
              *
              *     When `hierarchy.group_by` is present, aggregations operate on the complete
-             *     set of top-level grouped source documents. Nested `group_by.matches` are
+             *     set of top-level grouped source or unit records. Nested `group_by.matches` are
              *     bounded evidence projections and are not counted as aggregation rows.
              *
              *     Supports metric aggregations (sum, avg, min, max, count, stats, cardinality),
@@ -6282,7 +6365,8 @@ export interface components {
              * @description List of fields to include in the results. If not specified, all fields are returned.
              *     Use to reduce response size and improve performance. This field is required when
              *     hierarchy.group_by is present so a grouped query cannot accidentally hydrate an
-             *     entire source document. Use an empty array for identity-only source groups.
+             *     entire grouped document. Use an empty array for identity-only groups.
+             *     This projection is also required for hierarchy.children traversal.
              * @example [
              *       "title",
              *       "url",
@@ -6320,6 +6404,8 @@ export interface components {
             /**
              * @description Sort order for results. Array of sort fields with direction.
              *     Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
+             *     Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque,
+             *     sortable value is bound to the complete source hierarchy revision.
              *     Supported for exact text-backed, match_all, and filter-only requests
              *     when each non-`_id` field is a mapped exact scalar field with sortable
              *     native doc-value coverage. Sortable mapping types are keyword,
@@ -6354,6 +6440,9 @@ export interface components {
              *     order and the cursor tuple must contain exactly one `_id` string.
              *     Supported for exact text-backed, match_all, and filter-only requests;
              *     not supported for semantic_search or count-only requests.
+             *     For hierarchy child traversal, a cursor whose source-artifact revision
+             *     changed returns `409 hierarchy_cursor_stale`; restart the same traversal
+             *     without `search_after` rather than retrying the stale tuple.
              */
             search_after?: unknown[];
             /**
@@ -7097,6 +7186,10 @@ export interface components {
             evidence?: components["schemas"]["HierarchyEvidence"];
             /** @description Matching descendant hits attached by the canonical hierarchy.group_by request. */
             matches?: components["schemas"]["HierarchyMatchHit"][];
+            /** @description Opaque format-neutral position used for sequential hierarchy traversal. */
+            position?: string;
+            /** @description Composite source hierarchy revision to which the position and cursor are bound. */
+            revision?: string;
             /**
              * @deprecated
              * @description Legacy child chunk hits included for source-level rollups.
@@ -13257,6 +13350,26 @@ export interface components {
                 "application/json": components["schemas"]["ExactSortError"];
             };
         };
+        /** @description The hierarchy changed after the traversal cursor was issued */
+        HierarchyCursorStale: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["HierarchyCursorStaleError"];
+            };
+        };
+        /** @description A query dependency or read path is temporarily unavailable and the request is safe to retry */
+        QueryTemporarilyUnavailable: {
+            headers: {
+                /** @description Minimum number of seconds clients should wait before retrying. */
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryTemporarilyUnavailableError"];
+            };
+        };
         /** @description Internal server error */
         InternalServerError: {
             headers: {
@@ -14260,8 +14373,10 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            409: components["responses"]["HierarchyCursorStale"];
             422: components["responses"]["UnsupportedExactSort"];
             500: components["responses"]["QueryInternalServerError"];
+            503: components["responses"]["QueryTemporarilyUnavailable"];
         };
     };
     evaluate: {
@@ -14536,8 +14651,10 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["HierarchyCursorStale"];
             422: components["responses"]["UnsupportedExactSort"];
             500: components["responses"]["QueryInternalServerError"];
+            503: components["responses"]["QueryTemporarilyUnavailable"];
         };
     };
     batchWrite: {

@@ -18,6 +18,7 @@ const types = @import("../types.zig");
 const doc_set = @import("../doc_set.zig");
 const artifact_ids = @import("../artifact_ids.zig");
 const internal_keys = @import("../../internal_keys.zig");
+const hierarchy_navigation = @import("../../hierarchy_navigation.zig");
 const graph_exec = @import("graph_exec.zig");
 
 pub const VisibleHitEvaluator = struct {
@@ -61,6 +62,18 @@ pub const ChunkParentResultShaper = struct {
     load_many_stored: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
+        keys: []const []const u8,
+    ) anyerror![]?[]u8 = null,
+    load_projected_stored: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        key: []const u8,
+    ) anyerror!?[]u8 = null,
+    load_many_projected_stored: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
         keys: []const []const u8,
     ) anyerror![]?[]u8 = null,
 };
@@ -145,6 +158,18 @@ pub const SearchResultPostprocessor = struct {
     load_many_stored: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
+        keys: []const []const u8,
+    ) anyerror![]?[]u8 = null,
+    load_projected_stored: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        key: []const u8,
+    ) anyerror!?[]u8 = null,
+    load_many_projected_stored: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
         keys: []const []const u8,
     ) anyerror![]?[]u8 = null,
     resolve_doc_set_doc_ids: ?*const fn (
@@ -318,6 +343,13 @@ pub fn reshapeChunkBackedResult(
 ) !types.SearchResult {
     if (req.return_mode == .chunk) return try hydrateDirectChunkAncestors(alloc, req, raw, shaper);
 
+    const group_by_unit = req.return_mode == .unit or req.return_mode == .unit_with_chunks;
+    const loaded_unit_chunk_payloads = if (group_by_unit)
+        try loadMissingUnitChunkPayloads(alloc, raw.hits, shaper)
+    else
+        null;
+    defer if (loaded_unit_chunk_payloads) |payloads| freeOptionalOwnedBytes(alloc, payloads);
+
     var grouped = std.StringHashMapUnmanaged(usize).empty;
     defer grouped.deinit(alloc);
     var parents = std.ArrayListUnmanaged(types.SearchHit).empty;
@@ -326,22 +358,53 @@ pub fn reshapeChunkBackedResult(
         parents.deinit(alloc);
     }
 
-    for (raw.hits) |chunk_hit| {
-        const parent_id = try shaper.resolve_parent_id(shaper.ctx, alloc, chunk_hit);
-        defer alloc.free(parent_id);
+    for (raw.hits, 0..) |chunk_hit, chunk_index| {
+        var unit_identity = if (group_by_unit)
+            try resolveChunkUnitIdentity(
+                alloc,
+                chunk_hit.stored_data orelse loaded_unit_chunk_payloads.?[chunk_index] orelse return error.StoredDocMissing,
+            )
+        else
+            null;
+        defer if (unit_identity) |*identity| identity.deinit(alloc);
+        const parent_id = if (unit_identity) |identity|
+            identity.key
+        else
+            try shaper.resolve_parent_id(shaper.ctx, alloc, chunk_hit);
+        defer if (!group_by_unit) alloc.free(parent_id);
 
         const gop = try grouped.getOrPut(alloc, parent_id);
         if (!gop.found_existing) {
-            try parents.append(alloc, .{
+            var unit_ref = if (group_by_unit) try artifact_ids.decodeArtifactRefAlloc(alloc, parent_id) else null;
+            errdefer if (unit_ref) |*artifact_ref| artifact_ref.deinit(alloc);
+            var parent = types.SearchHit{
                 .id = try alloc.dupe(u8, parent_id),
                 .doc_ordinal = chunk_hit.doc_ordinal,
                 .score = chunk_hit.score,
                 .distance = chunk_hit.distance,
-                .stored_data = null,
+                .stored_data = if (req.defer_hierarchy_child_hydration and group_by_unit)
+                    try groupedUnitRevisionEnvelopeAlloc(
+                        alloc,
+                        unit_identity.?.fingerprint orelse return error.StorageReadTemporarilyUnavailable,
+                    )
+                else
+                    null,
+                .artifact_ref = unit_ref,
                 .chunk_hits = &.{},
-            });
+            };
+            unit_ref = null;
+            errdefer parent.deinit(alloc);
+            try parents.append(alloc, parent);
             gop.key_ptr.* = parents.items[parents.items.len - 1].id;
             gop.value_ptr.* = parents.items.len - 1;
+        } else if (req.defer_hierarchy_child_hydration and group_by_unit) {
+            const expected = try groupedUnitRevisionEnvelopeFingerprint(
+                alloc,
+                parents.items[gop.value_ptr.*].stored_data orelse return error.StorageReadTemporarilyUnavailable,
+            );
+            defer alloc.free(expected);
+            const actual = unit_identity.?.fingerprint orelse return error.StorageReadTemporarilyUnavailable;
+            if (!std.mem.eql(u8, expected, actual)) return error.StorageReadTemporarilyUnavailable;
         }
 
         const parent_hit = &parents.items[gop.value_ptr.*];
@@ -350,7 +413,7 @@ pub fn reshapeChunkBackedResult(
             parent_hit.score = chunk_hit.score;
             parent_hit.distance = chunk_hit.distance;
         }
-        if (req.return_mode == .parent_with_chunks) {
+        if (req.return_mode == .parent_with_chunks or req.return_mode == .unit_with_chunks) {
             if (req.max_chunks_per_parent > 0 and parent_hit.chunk_hits.len >= req.max_chunks_per_parent) {
                 continue;
             }
@@ -372,8 +435,16 @@ pub fn reshapeChunkBackedResult(
         }
     }
 
-    if (req.include_stored and parents.items.len > 0) {
-        try loadParentStoredForGroupedHits(alloc, req, &parents, shaper);
+    if (parents.items.len > 0) {
+        if (group_by_unit) {
+            if (!req.defer_hierarchy_child_hydration) {
+                if (req.include_stored) try loadUnitStoredForGroupedHits(alloc, req, &parents, shaper);
+                if (req.hierarchy_include_unit) try loadGroupedUnitAncestors(alloc, req, &parents, shaper);
+                if (req.hierarchy_include_source) try loadGroupedSourceAncestors(alloc, req, &parents, shaper);
+            }
+        } else if (req.include_stored) {
+            try loadParentStoredForGroupedHits(alloc, req, &parents, shaper);
+        }
     }
     try normalizeGroupedParentHitOrder(alloc, &parents);
 
@@ -390,6 +461,251 @@ pub fn reshapeChunkBackedResult(
         .total_hits_relation = relationForRewrittenLocalTotal(source, original_hits_len),
         .graph_results = &.{},
     };
+}
+
+const ChunkUnitIdentity = struct {
+    key: []u8,
+    fingerprint: ?[]u8 = null,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.key);
+        if (self.fingerprint) |fingerprint| alloc.free(fingerprint);
+        self.* = undefined;
+    }
+};
+
+fn resolveChunkUnitIdentity(
+    alloc: Allocator,
+    stored: []const u8,
+) !ChunkUnitIdentity {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidChunkArtifact;
+    const unit_key = parsed.value.object.get("_parent_unit_key") orelse return error.InvalidChunkArtifact;
+    if (unit_key != .string or !internal_keys.isDocumentUnitArtifactRecordKey(unit_key.string)) {
+        return error.InvalidChunkArtifact;
+    }
+    const fingerprint = parsed.value.object.get(hierarchy_navigation.unit_fingerprint_field);
+    if (fingerprint != null and (fingerprint.? != .string or fingerprint.?.string.len == 0)) {
+        return error.InvalidChunkArtifact;
+    }
+    return .{
+        .key = try alloc.dupe(u8, unit_key.string),
+        .fingerprint = if (fingerprint) |value| try alloc.dupe(u8, value.string) else null,
+    };
+}
+
+fn groupedUnitRevisionEnvelopeAlloc(alloc: Allocator, fingerprint: []const u8) ![]u8 {
+    if (fingerprint.len == 0) return error.StorageReadTemporarilyUnavailable;
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        ._hierarchy_unit_revision_token = fingerprint,
+    }, .{});
+}
+
+fn groupedUnitRevisionEnvelopeFingerprint(alloc: Allocator, stored: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.StorageReadTemporarilyUnavailable;
+    const value = parsed.value.object.get(hierarchy_navigation.grouped_unit_revision_envelope_field) orelse
+        return error.StorageReadTemporarilyUnavailable;
+    if (value != .string or value.string.len == 0) return error.StorageReadTemporarilyUnavailable;
+    return try alloc.dupe(u8, value.string);
+}
+
+fn loadMissingUnitChunkPayloads(
+    alloc: Allocator,
+    hits: []const types.SearchHit,
+    shaper: ChunkParentResultShaper,
+) ![]?[]u8 {
+    const loaded = try alloc.alloc(?[]u8, hits.len);
+    errdefer freeOptionalOwnedBytes(alloc, loaded);
+    @memset(loaded, null);
+
+    var missing_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer missing_keys.deinit(alloc);
+    for (hits) |hit| {
+        if (hit.stored_data == null) try missing_keys.append(alloc, hit.id);
+    }
+    if (missing_keys.items.len == 0) return loaded;
+
+    if (shaper.load_many_stored) |load_many| {
+        var many = try load_many(shaper.ctx, alloc, missing_keys.items);
+        defer {
+            for (many) |value| if (value) |bytes| alloc.free(bytes);
+            if (many.len > 0) alloc.free(many);
+        }
+        if (many.len != missing_keys.items.len) return error.InvalidChunkArtifact;
+        var missing_index: usize = 0;
+        for (hits, 0..) |hit, hit_index| {
+            if (hit.stored_data != null) continue;
+            loaded[hit_index] = many[missing_index] orelse return error.StoredDocMissing;
+            many[missing_index] = null;
+            missing_index += 1;
+        }
+        return loaded;
+    }
+
+    const load_one = shaper.load_stored orelse return error.StoredDocMissing;
+    for (hits, 0..) |hit, i| {
+        if (hit.stored_data != null) continue;
+        loaded[i] = (try load_one(shaper.ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
+    }
+    return loaded;
+}
+
+fn loadUnitStoredForGroupedHits(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    units: *std.ArrayListUnmanaged(types.SearchHit),
+    shaper: ChunkParentResultShaper,
+) !void {
+    if (shaper.load_projected_stored == null and shaper.load_many_projected_stored == null and
+        shaper.load_stored == null and shaper.load_many_stored == null) return;
+    const keys = try alloc.alloc([]const u8, units.items.len);
+    defer alloc.free(keys);
+    for (units.items, 0..) |hit, i| keys[i] = hit.id;
+
+    if (shaper.load_many_projected_stored != null or shaper.load_many_stored != null) {
+        const loaded = if (shaper.load_many_projected_stored) |load_many_projected|
+            try load_many_projected(shaper.ctx, alloc, req, keys)
+        else
+            try shaper.load_many_stored.?(shaper.ctx, alloc, keys);
+        defer freeOptionalOwnedBytes(alloc, loaded);
+        if (loaded.len != units.items.len) return error.InvalidChunkArtifact;
+        for (units.items, 0..) |*hit, i| {
+            const stored = loaded[i] orelse {
+                if (req.defer_hierarchy_child_hydration) continue;
+                return error.StoredDocMissing;
+            };
+            hit.stored_data = try hierarchy_navigation.stripUnitFingerprintAlloc(alloc, stored);
+            alloc.free(stored);
+            loaded[i] = null;
+        }
+        return;
+    }
+    for (units.items) |*hit| {
+        const stored = if (shaper.load_projected_stored) |load_projected|
+            try load_projected(shaper.ctx, alloc, req, hit.id)
+        else
+            try shaper.load_stored.?(shaper.ctx, alloc, hit.id);
+        const value = stored orelse {
+            if (req.defer_hierarchy_child_hydration) continue;
+            return error.StoredDocMissing;
+        };
+        defer alloc.free(value);
+        hit.stored_data = try hierarchy_navigation.stripUnitFingerprintAlloc(alloc, value);
+    }
+}
+
+fn hierarchyAncestorProjectionRequest(
+    req: types.SearchRequest,
+    fields: []const []const u8,
+    include_all_fields: bool,
+) types.SearchRequest {
+    var projection = req;
+    projection.fields = fields;
+    projection.include_all_fields = include_all_fields;
+    projection.include_stored = true;
+    projection.defer_stored_projection = false;
+    return projection;
+}
+
+fn loadGroupedUnitAncestors(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    units: *std.ArrayListUnmanaged(types.SearchHit),
+    shaper: ChunkParentResultShaper,
+) !void {
+    if (shaper.load_projected_stored == null and shaper.load_many_projected_stored == null and
+        shaper.load_stored == null and shaper.load_many_stored == null) return;
+
+    const projection = hierarchyAncestorProjectionRequest(
+        req,
+        req.hierarchy_unit_fields,
+        req.hierarchy_unit_include_all_fields,
+    );
+    const keys = try alloc.alloc([]const u8, units.items.len);
+    defer alloc.free(keys);
+    for (units.items, 0..) |hit, i| keys[i] = hit.id;
+
+    if (shaper.load_many_projected_stored != null or shaper.load_many_stored != null) {
+        const loaded = if (shaper.load_many_projected_stored) |load_many_projected|
+            try load_many_projected(shaper.ctx, alloc, projection, keys)
+        else
+            try shaper.load_many_stored.?(shaper.ctx, alloc, keys);
+        defer freeOptionalOwnedBytes(alloc, loaded);
+        if (loaded.len != units.items.len) return error.InvalidChunkArtifact;
+        for (units.items, 0..) |*hit, i| {
+            const stored = loaded[i] orelse {
+                if (req.defer_hierarchy_child_hydration) continue;
+                return error.StoredDocMissing;
+            };
+            hit.ancestor_unit_data = try hierarchy_navigation.stripUnitFingerprintAlloc(alloc, stored);
+        }
+        return;
+    }
+
+    for (units.items) |*hit| {
+        const stored = if (shaper.load_projected_stored) |load_projected|
+            try load_projected(shaper.ctx, alloc, projection, hit.id)
+        else
+            try shaper.load_stored.?(shaper.ctx, alloc, hit.id);
+        const value = stored orelse {
+            if (req.defer_hierarchy_child_hydration) continue;
+            return error.StoredDocMissing;
+        };
+        defer alloc.free(value);
+        hit.ancestor_unit_data = try hierarchy_navigation.stripUnitFingerprintAlloc(alloc, value);
+    }
+}
+
+fn loadGroupedSourceAncestors(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    units: *std.ArrayListUnmanaged(types.SearchHit),
+    shaper: ChunkParentResultShaper,
+) !void {
+    const projection = hierarchyAncestorProjectionRequest(
+        req,
+        req.hierarchy_source_fields,
+        req.hierarchy_source_include_all_fields,
+    );
+    var source_indexes = std.StringHashMapUnmanaged(usize).empty;
+    defer source_indexes.deinit(alloc);
+    var source_ids = std.ArrayListUnmanaged([]const u8).empty;
+    defer source_ids.deinit(alloc);
+    const hit_source_indexes = try alloc.alloc(usize, units.items.len);
+    defer alloc.free(hit_source_indexes);
+
+    for (units.items, 0..) |hit, hit_index| {
+        const source_id = (hit.artifact_ref orelse return error.InvalidChunkArtifact).document_id;
+        const gop = try source_indexes.getOrPut(alloc, source_id);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = source_id;
+            gop.value_ptr.* = source_ids.items.len;
+            try source_ids.append(alloc, source_id);
+        }
+        hit_source_indexes[hit_index] = gop.value_ptr.*;
+    }
+
+    const loaded = if (shaper.load_parent_stored_many) |load_many|
+        try load_many(shaper.ctx, alloc, projection, source_ids.items)
+    else blk: {
+        const out = try alloc.alloc(?[]u8, source_ids.items.len);
+        errdefer freeOptionalOwnedBytes(alloc, out);
+        @memset(out, null);
+        for (source_ids.items, 0..) |source_id, i| {
+            out[i] = try shaper.load_parent_stored(shaper.ctx, alloc, projection, source_id);
+        }
+        break :blk out;
+    };
+    defer freeOptionalOwnedBytes(alloc, loaded);
+    if (loaded.len != source_ids.items.len) return error.InvalidChunkArtifact;
+
+    for (units.items, hit_source_indexes) |*hit, source_index| {
+        const stored = loaded[source_index] orelse continue;
+        hit.ancestor_source_data = try alloc.dupe(u8, stored);
+    }
 }
 
 const ChunkAncestorInfo = struct {
@@ -1067,6 +1383,11 @@ pub fn postprocessTextSearchResult(
     chunk_backed: bool,
     processor: SearchResultPostprocessor,
 ) !types.SearchResult {
+    if (req.hierarchy_group_level == .unit and !chunk_backed) {
+        var owned = raw;
+        owned.deinit();
+        return error.UnsupportedQueryRequest;
+    }
     var filtered = try filterVisibleSearchResult(alloc, raw, .{
         .ctx = processor.ctx,
         .func = processor.is_visible,
@@ -1089,6 +1410,8 @@ pub fn postprocessTextSearchResult(
             .load_parent_stored_many = processor.load_many_parent_stored,
             .load_stored = processor.load_stored,
             .load_many_stored = processor.load_many_stored,
+            .load_projected_stored = processor.load_projected_stored,
+            .load_many_projected_stored = processor.load_many_projected_stored,
         });
         if (req.count_only) return stripCountOnlySearchHits(alloc, reshaped);
         return reshaped;
@@ -1104,6 +1427,11 @@ pub fn postprocessVectorSearchResult(
     chunk_backed: bool,
     processor: SearchResultPostprocessor,
 ) !types.SearchResult {
+    if (req.hierarchy_group_level == .unit and !chunk_backed) {
+        var owned = raw;
+        owned.deinit();
+        return error.UnsupportedQueryRequest;
+    }
     var filtered = try filterVisibleSearchResult(alloc, raw, .{
         .ctx = processor.ctx,
         .func = processor.is_visible,
@@ -1118,6 +1446,8 @@ pub fn postprocessVectorSearchResult(
             .load_parent_stored_many = processor.load_many_parent_stored,
             .load_stored = processor.load_stored,
             .load_many_stored = processor.load_many_stored,
+            .load_projected_stored = processor.load_projected_stored,
+            .load_many_projected_stored = processor.load_many_projected_stored,
         });
     }
     return try applyStoredSearchPatternFilters(alloc, req, filtered, .{
@@ -1694,6 +2024,31 @@ test "postprocessTextSearchResult preserves exact upstream total when page is un
     try std.testing.expectEqual(@as(usize, 2), result.hits.len);
 }
 
+test "unit relevance grouping rejects source-backed text and vector results" {
+    const alloc = std.testing.allocator;
+    var loader = TestStoredLoader{};
+    const processor = SearchResultPostprocessor{
+        .ctx = &loader,
+        .is_visible = TestPostprocessor.isVisible,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestChunkParentShaper.loadParentStored,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+    };
+    const request = types.SearchRequest{ .hierarchy_group_level = .unit };
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, postprocessTextSearchResult(alloc, request, .{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+    }, false, processor));
+    try std.testing.expectError(error.UnsupportedQueryRequest, postprocessVectorSearchResult(alloc, request, .{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+    }, false, processor));
+}
+
 test "postprocessTextSearchResult forwards batch stored loader to pattern filters" {
     const alloc = std.testing.allocator;
 
@@ -1914,6 +2269,324 @@ test "reshapeChunkBackedResult uses the best descendant relevance score and dist
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 7), result.hits[0].doc_ordinal);
     try std.testing.expectEqual(@as(?f32, 0.6), result.hits[0].score);
     try std.testing.expectEqual(@as(?f32, 0.4), result.hits[0].distance);
+}
+
+test "reshapeChunkBackedResult groups matching chunks by unit" {
+    const alloc = std.testing.allocator;
+    const unit_a = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "page:000001");
+    defer alloc.free(unit_a);
+    const unit_b = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "page:000002");
+    defer alloc.free(unit_b);
+
+    var raw_hits = try alloc.alloc(types.SearchHit, 3);
+    raw_hits[0] = .{
+        .id = try alloc.dupe(u8, "chunk:a:0"),
+        .score = 0.9,
+        .stored_data = try std.fmt.allocPrint(alloc, "{{\"_parent_unit_key\":{f},\"text\":\"best\"}}", .{std.json.fmt(unit_a, .{})}),
+    };
+    raw_hits[1] = .{
+        .id = try alloc.dupe(u8, "chunk:a:1"),
+        .score = 0.7,
+        .stored_data = try std.fmt.allocPrint(alloc, "{{\"_parent_unit_key\":{f},\"text\":\"second\"}}", .{std.json.fmt(unit_a, .{})}),
+    };
+    raw_hits[2] = .{
+        .id = try alloc.dupe(u8, "chunk:b:0"),
+        .score = 0.8,
+        .stored_data = try std.fmt.allocPrint(alloc, "{{\"_parent_unit_key\":{f},\"text\":\"other\"}}", .{std.json.fmt(unit_b, .{})}),
+    };
+
+    var result = try reshapeChunkBackedResult(alloc, .{
+        .return_mode = .unit_with_chunks,
+        .limit = 2,
+        .max_chunks_per_parent = 1,
+        .include_stored = false,
+    }, .{
+        .alloc = alloc,
+        .hits = raw_hits,
+        .total_hits = 3,
+    }, .{
+        .ctx = null,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestChunkParentShaper.loadParentStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqualStrings(unit_a, result.hits[0].id);
+    try std.testing.expectEqual(@as(?f32, 0.9), result.hits[0].score);
+    try std.testing.expectEqual(@as(usize, 1), result.hits[0].chunk_hits.len);
+    try std.testing.expectEqualStrings("chunk:a:0", result.hits[0].chunk_hits[0].id);
+    const artifact_ref = result.hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(types.ArtifactKind.asset, artifact_ref.kind);
+    try std.testing.expectEqualStrings("page:000001", artifact_ref.unit_id.?);
+}
+
+test "unit grouping independently batch-hydrates projected unit and deduplicated source ancestors" {
+    const alloc = std.testing.allocator;
+    const unit_a = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "page:000001");
+    defer alloc.free(unit_a);
+    const unit_b = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "page:000002");
+    defer alloc.free(unit_b);
+    const Loader = struct {
+        unit_batches: usize = 0,
+        source_batches: usize = 0,
+
+        fn loadParent(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) !?[]u8 {
+            return error.TestUnexpectedSingleLoad;
+        }
+
+        fn loadParents(
+            ctx: ?*anyopaque,
+            inner_alloc: Allocator,
+            req: types.SearchRequest,
+            keys: []const []const u8,
+        ) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.source_batches += 1;
+            try std.testing.expectEqual(@as(usize, 1), keys.len);
+            try std.testing.expectEqualStrings("doc:a", keys[0]);
+            try std.testing.expect(!req.include_all_fields);
+            try std.testing.expectEqualStrings("title", req.fields[0]);
+            const out = try inner_alloc.alloc(?[]u8, 1);
+            out[0] = try inner_alloc.dupe(u8, "{\"title\":\"source\"}");
+            return out;
+        }
+
+        fn loadUnits(
+            ctx: ?*anyopaque,
+            inner_alloc: Allocator,
+            req: types.SearchRequest,
+            keys: []const []const u8,
+        ) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.unit_batches += 1;
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            try std.testing.expect(!req.include_all_fields);
+            try std.testing.expectEqualStrings("text", req.fields[0]);
+            const out = try inner_alloc.alloc(?[]u8, keys.len);
+            for (out, 0..) |*value, i| {
+                value.* = try std.fmt.allocPrint(
+                    inner_alloc,
+                    "{{\"text\":\"unit-{d}\",\"_artifact_unit_fingerprint\":\"private\"}}",
+                    .{i + 1},
+                );
+            }
+            return out;
+        }
+    };
+
+    var raw_hits = try alloc.alloc(types.SearchHit, 2);
+    raw_hits[0] = .{
+        .id = try alloc.dupe(u8, "chunk:a"),
+        .score = 0.9,
+        .stored_data = try std.fmt.allocPrint(alloc, "{{\"_parent_unit_key\":{f}}}", .{std.json.fmt(unit_a, .{})}),
+    };
+    raw_hits[1] = .{
+        .id = try alloc.dupe(u8, "chunk:b"),
+        .score = 0.8,
+        .stored_data = try std.fmt.allocPrint(alloc, "{{\"_parent_unit_key\":{f}}}", .{std.json.fmt(unit_b, .{})}),
+    };
+    var loader = Loader{};
+    var result = try reshapeChunkBackedResult(alloc, .{
+        .return_mode = .unit,
+        .limit = 2,
+        .include_stored = false,
+        .include_all_fields = false,
+        .hierarchy_include_source = true,
+        .hierarchy_source_include_all_fields = false,
+        .hierarchy_source_fields = &.{"title"},
+        .hierarchy_include_unit = true,
+        .hierarchy_unit_include_all_fields = false,
+        .hierarchy_unit_fields = &.{"text"},
+    }, .{
+        .alloc = alloc,
+        .hits = raw_hits,
+        .total_hits = 2,
+    }, .{
+        .ctx = &loader,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = Loader.loadParent,
+        .load_parent_stored_many = Loader.loadParents,
+        .load_many_projected_stored = Loader.loadUnits,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), loader.unit_batches);
+    try std.testing.expectEqual(@as(usize, 1), loader.source_batches);
+    for (result.hits) |hit| {
+        try std.testing.expect(hit.stored_data == null);
+        try std.testing.expectEqualStrings("{\"title\":\"source\"}", hit.ancestor_source_data.?);
+        try std.testing.expect(std.mem.indexOf(u8, hit.ancestor_unit_data.?, "\"text\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, hit.ancestor_unit_data.?, hierarchy_navigation.unit_fingerprint_field) == null);
+    }
+}
+
+test "unit grouping batch-loads candidates and uses sanitized projected unit payloads" {
+    const alloc = std.testing.allocator;
+    const unit_a = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "page:000001");
+    defer alloc.free(unit_a);
+    const unit_b = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "page:000002");
+    defer alloc.free(unit_b);
+
+    const Loader = struct {
+        unit_a: []const u8,
+        unit_b: []const u8,
+        single_calls: usize = 0,
+        candidate_batch_calls: usize = 0,
+        projected_batch_calls: usize = 0,
+
+        fn isVisible(_: ?*anyopaque, _: Allocator, _: types.SearchHit) !bool {
+            return true;
+        }
+
+        fn loadStored(ctx: ?*anyopaque, _: Allocator, _: []const u8) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.single_calls += 1;
+            return error.TestUnexpectedSingleLoad;
+        }
+
+        fn loadManyStored(ctx: ?*anyopaque, inner_alloc: Allocator, keys: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.candidate_batch_calls += 1;
+            const out = try inner_alloc.alloc(?[]u8, keys.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |value| if (value) |bytes| inner_alloc.free(bytes);
+                inner_alloc.free(out);
+            }
+            for (keys, 0..) |_, i| {
+                out[i] = try std.fmt.allocPrint(
+                    inner_alloc,
+                    "{{\"_parent_unit_key\":{f},\"text\":\"candidate\"}}",
+                    .{std.json.fmt(if (i == 0) self.unit_a else self.unit_b, .{})},
+                );
+                initialized += 1;
+            }
+            return out;
+        }
+
+        fn loadManyProjectedStored(
+            ctx: ?*anyopaque,
+            inner_alloc: Allocator,
+            req: types.SearchRequest,
+            keys: []const []const u8,
+        ) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.projected_batch_calls += 1;
+            try std.testing.expect(!req.defer_stored_projection);
+            try std.testing.expectEqualStrings("_embeddings", req.fields[0]);
+            const out = try inner_alloc.alloc(?[]u8, keys.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |value| if (value) |bytes| inner_alloc.free(bytes);
+                inner_alloc.free(out);
+            }
+            for (keys, 0..) |_, i| {
+                out[i] = try std.fmt.allocPrint(
+                    inner_alloc,
+                    "{{\"_embeddings\":{{\"semantic\":[{d}]}},\"_artifact_unit_fingerprint\":\"internal\"}}",
+                    .{i + 1},
+                );
+                initialized += 1;
+            }
+            return out;
+        }
+    };
+
+    var loader = Loader{ .unit_a = unit_a, .unit_b = unit_b };
+    var raw_hits = try alloc.alloc(types.SearchHit, 2);
+    raw_hits[0] = .{ .id = try alloc.dupe(u8, "chunk:a"), .score = 0.9 };
+    raw_hits[1] = .{ .id = try alloc.dupe(u8, "chunk:b"), .score = 0.8 };
+    var result = try postprocessVectorSearchResult(alloc, .{
+        .return_mode = .unit,
+        .limit = 2,
+        .include_stored = true,
+        .include_all_fields = false,
+        .fields = &.{"_embeddings"},
+        .defer_stored_projection = false,
+    }, .{
+        .alloc = alloc,
+        .hits = raw_hits,
+        .total_hits = 2,
+    }, true, .{
+        .ctx = &loader,
+        .is_visible = Loader.isVisible,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestChunkParentShaper.loadParentStored,
+        .load_stored = Loader.loadStored,
+        .load_many_stored = Loader.loadManyStored,
+        .load_many_projected_stored = Loader.loadManyProjectedStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), loader.single_calls);
+    try std.testing.expectEqual(@as(usize, 1), loader.candidate_batch_calls);
+    try std.testing.expectEqual(@as(usize, 1), loader.projected_batch_calls);
+    for (result.hits) |hit| {
+        const stored = hit.stored_data orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, stored, "_embeddings") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stored, hierarchy_navigation.unit_fingerprint_field) == null);
+    }
+}
+
+test "distributed unit grouping defers payloads owned by another child range" {
+    const alloc = std.testing.allocator;
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        "page:000001",
+    );
+    defer alloc.free(unit_key);
+
+    const Loader = struct {
+        fn loadMissing(
+            _: ?*anyopaque,
+            inner_alloc: Allocator,
+            _: types.SearchRequest,
+            keys: []const []const u8,
+        ) ![]?[]u8 {
+            const out = try inner_alloc.alloc(?[]u8, keys.len);
+            @memset(out, null);
+            return out;
+        }
+    };
+
+    var raw_hits = try alloc.alloc(types.SearchHit, 1);
+    raw_hits[0] = .{
+        .id = try alloc.dupe(u8, "chunk:a"),
+        .score = 0.9,
+        .stored_data = try std.fmt.allocPrint(
+            alloc,
+            "{{\"_parent_unit_key\":{f},\"_artifact_unit_fingerprint\":\"unit-fingerprint\"}}",
+            .{std.json.fmt(unit_key, .{})},
+        ),
+    };
+    var result = try reshapeChunkBackedResult(alloc, .{
+        .return_mode = .unit,
+        .limit = 1,
+        .include_stored = true,
+        .hierarchy_include_unit = true,
+        .defer_hierarchy_child_hydration = true,
+    }, .{
+        .alloc = alloc,
+        .hits = raw_hits,
+        .total_hits = 1,
+    }, .{
+        .ctx = null,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestChunkParentShaper.loadParentStored,
+        .load_many_projected_stored = Loader.loadMissing,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.hits[0].stored_data orelse return error.TestUnexpectedResult,
+        hierarchy_navigation.grouped_unit_revision_envelope_field,
+    ) != null);
+    try std.testing.expect(result.hits[0].ancestor_unit_data == null);
 }
 
 test "reshapeChunkBackedResult preserves nested chunk artifact refs" {

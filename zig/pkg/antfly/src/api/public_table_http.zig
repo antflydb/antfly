@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const builtin = @import("builtin");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const backups_api = @import("backups.zig");
@@ -105,6 +106,7 @@ pub const TableApi = struct {
         ModelNotFound,
         UnsupportedExactSort,
         QueryCandidateBudgetExceeded,
+        HierarchyCursorStale,
         QueryEmbeddingInputTooLarge,
         QueryEmbeddingOverloaded,
         EmbedRateLimited,
@@ -605,13 +607,71 @@ pub const OwnedResponse = struct {
 pub const storage_read_temporarily_unavailable_body = "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}";
 pub const storage_read_temporarily_unavailable_retry_after_seconds: u32 = 1;
 
-pub fn storageReadTemporarilyUnavailableOwnedResponse(alloc: std.mem.Allocator) !OwnedResponse {
+/// Stable, machine-readable reasons for a retryable query 503. Keep this set in
+/// sync with QueryTemporarilyUnavailableError in the public OpenAPI contract.
+pub const QueryTemporarilyUnavailableReason = enum {
+    doc_identity_unavailable,
+    read_requires_primary,
+    standby_read_unavailable,
+    storage_read_temporarily_unavailable,
+    index_rebuilding,
+    query_embedding_temporarily_unavailable,
+};
+
+pub fn queryTemporarilyUnavailableOwnedResponse(
+    alloc: std.mem.Allocator,
+    reason: QueryTemporarilyUnavailableReason,
+) !OwnedResponse {
+    const message: []const u8 = switch (reason) {
+        .doc_identity_unavailable => "doc identity unavailable",
+        .read_requires_primary => "read requires primary",
+        .standby_read_unavailable => "standby read unavailable",
+        .storage_read_temporarily_unavailable => "storage read temporarily unavailable",
+        .index_rebuilding => "required index is rebuilding",
+        .query_embedding_temporarily_unavailable => "query embedding temporarily unavailable",
+    };
     return .{
         .status = 503,
-        .body = try alloc.dupe(u8, storage_read_temporarily_unavailable_body),
+        .body = try std.json.Stringify.valueAlloc(alloc, .{
+            .code = @tagName(reason),
+            .message = message,
+            .retryable = true,
+        }, .{}),
         .json = true,
         .retry_after_seconds = storage_read_temporarily_unavailable_retry_after_seconds,
     };
+}
+
+pub fn storageReadTemporarilyUnavailableOwnedResponse(alloc: std.mem.Allocator) !OwnedResponse {
+    return queryTemporarilyUnavailableOwnedResponse(alloc, .storage_read_temporarily_unavailable);
+}
+
+fn expectQueryTemporarilyUnavailableResponse(
+    alloc: std.mem.Allocator,
+    response: OwnedResponse,
+    code: []const u8,
+    message: []const u8,
+) !void {
+    const expected = try std.json.Stringify.valueAlloc(alloc, .{
+        .code = code,
+        .message = message,
+        .retryable = true,
+    }, .{});
+    defer alloc.free(expected);
+    try ant_json.testing.expectSubsetJsonText(alloc, expected, response.body);
+    try std.testing.expect(response.json);
+    try std.testing.expectEqual(@as(?u32, 1), response.retry_after_seconds);
+}
+
+pub fn hierarchyCursorStaleBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = 409,
+        .@"error" = "hierarchy_cursor_stale",
+        .message = "the source hierarchy changed after this cursor was issued",
+        .action = "restart_hierarchy_traversal",
+        .restart_without = "search_after",
+        .retryable = false,
+    }, .{});
 }
 
 pub fn isNonRetryableTableStorageReadError(err: anyerror) bool {
@@ -801,15 +861,15 @@ pub fn handleTableQueryRequest(
             },
             error.DocIdentityUnavailable => {
                 std.log.warn("public table query doc identity unavailable table={s} err={}", .{ table_name, err });
-                return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") };
+                return try queryTemporarilyUnavailableOwnedResponse(alloc, .doc_identity_unavailable);
             },
             error.ReadRequiresPrimary => {
                 std.log.warn("public table query requires primary table={s} err={}", .{ table_name, err });
-                return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") };
+                return try queryTemporarilyUnavailableOwnedResponse(alloc, .read_requires_primary);
             },
             error.ReadUnavailable => {
                 std.log.warn("public table query standby unavailable table={s} err={}", .{ table_name, err });
-                return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") };
+                return try queryTemporarilyUnavailableOwnedResponse(alloc, .standby_read_unavailable);
             },
             error.StorageReadTemporarilyUnavailable => {
                 std.log.warn("public table query storage temporarily unavailable table={s}", .{table_name});
@@ -817,11 +877,7 @@ pub fn handleTableQueryRequest(
             },
             error.IndexRebuilding => {
                 std.log.info("public table query index rebuilding table={s}", .{table_name});
-                return .{
-                    .status = 503,
-                    .body = try alloc.dupe(u8, "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}"),
-                    .json = true,
-                };
+                return try queryTemporarilyUnavailableOwnedResponse(alloc, .index_rebuilding);
             },
             error.ModelNotFound => {
                 std.log.warn("public table query model not found table={s} err={}", .{ table_name, err });
@@ -830,6 +886,10 @@ pub fn handleTableQueryRequest(
             error.QueryCandidateBudgetExceeded => {
                 std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
                 return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc) };
+            },
+            error.HierarchyCursorStale => {
+                std.log.info("public hierarchy traversal cursor stale table={s}", .{table_name});
+                return .{ .status = 409, .body = try hierarchyCursorStaleBody(alloc), .json = true };
             },
             error.QueryEmbeddingInputTooLarge => {
                 return .{ .status = 413, .body = try alloc.dupe(u8, "query embedding input too large") };
@@ -842,7 +902,7 @@ pub fn handleTableQueryRequest(
             },
             error.EmbedTransientFailure => {
                 std.log.warn("public table query embedding temporarily unavailable table={s}", .{table_name});
-                return .{ .status = 503, .body = try alloc.dupe(u8, "query embedding temporarily unavailable") };
+                return try queryTemporarilyUnavailableOwnedResponse(alloc, .query_embedding_temporarily_unavailable);
             },
             error.EmbedUpstreamFailure => {
                 std.log.warn("public table query embedding upstream failure table={s}", .{table_name});
@@ -932,9 +992,9 @@ pub fn handleTableQueryView(
 ) !OwnedResponse {
     const response_body = api.executeTableQueryView(alloc, table_name, view) catch |err| switch (err) {
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
-        error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
-        error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
-        error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
+        error.DocIdentityUnavailable => return try queryTemporarilyUnavailableOwnedResponse(alloc, .doc_identity_unavailable),
+        error.ReadRequiresPrimary => return try queryTemporarilyUnavailableOwnedResponse(alloc, .read_requires_primary),
+        error.ReadUnavailable => return try queryTemporarilyUnavailableOwnedResponse(alloc, .standby_read_unavailable),
         error.StorageReadTemporarilyUnavailable => return try storageReadTemporarilyUnavailableOwnedResponse(alloc),
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") },
         error.Canceled => return error.Canceled,
@@ -2366,7 +2426,12 @@ test "public table query handler maps doc identity unavailable errors" {
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
-    try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+    try expectQueryTemporarilyUnavailableResponse(
+        std.testing.allocator,
+        resp,
+        "doc_identity_unavailable",
+        "doc identity unavailable",
+    );
 }
 
 test "public table query handler preserves structured filter diagnostics" {
@@ -2490,15 +2555,18 @@ test "public table query handler preserves retryable failure status" {
         status: u16,
         body: []const u8,
         json: bool = false,
+        unavailable_code: ?[]const u8 = null,
+        unavailable_message: []const u8 = "",
     };
     const cases = [_]Case{
         .{ .err = error.QueryEmbeddingInputTooLarge, .status = 413, .body = "query embedding input too large" },
         .{ .err = error.QueryEmbeddingOverloaded, .status = 429, .body = "query embedding overloaded" },
         .{ .err = error.EmbedRateLimited, .status = 429, .body = "query embedding rate limited" },
-        .{ .err = error.EmbedTransientFailure, .status = 503, .body = "query embedding temporarily unavailable" },
+        .{ .err = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
         .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "query embedding provider failed" },
-        .{ .err = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}", .json = true },
-        .{ .err = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}", .json = true },
+        .{ .err = error.IndexRebuilding, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
+        .{ .err = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
+        .{ .err = error.HierarchyCursorStale, .status = 409, .body = "{\"status\":409,\"error\":\"hierarchy_cursor_stale\",\"message\":\"the source hierarchy changed after this cursor was issued\",\"action\":\"restart_hierarchy_traversal\",\"restart_without\":\"search_after\",\"retryable\":false}", .json = true },
         .{ .err = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
         .{ .err = error.CorruptInput, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"CorruptInput\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
     };
@@ -2510,10 +2578,14 @@ test "public table query handler preserves retryable failure status" {
         , null, backend.iface());
         defer resp.deinit(std.testing.allocator);
         try std.testing.expectEqual(tc.status, resp.status);
-        try std.testing.expectEqualStrings(tc.body, resp.body);
+        if (tc.unavailable_code) |code| {
+            try expectQueryTemporarilyUnavailableResponse(std.testing.allocator, resp, code, tc.unavailable_message);
+        } else {
+            try std.testing.expectEqualStrings(tc.body, resp.body);
+        }
         try std.testing.expectEqual(tc.json, resp.json);
         try std.testing.expectEqual(
-            if (tc.err == error.StorageReadTemporarilyUnavailable) @as(?u32, 1) else null,
+            if (tc.unavailable_code != null) @as(?u32, 1) else null,
             resp.retry_after_seconds,
         );
     }
@@ -2560,7 +2632,12 @@ test "public table query handler maps HA read gate errors" {
     , null, primary_backend.iface());
     defer primary_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 503), primary_resp.status);
-    try std.testing.expectEqualStrings("read requires primary", primary_resp.body);
+    try expectQueryTemporarilyUnavailableResponse(
+        std.testing.allocator,
+        primary_resp,
+        "read_requires_primary",
+        "read requires primary",
+    );
 
     var lag_backend = Backend{ .err = error.ReadUnavailable };
     var lag_resp = try handleTableQueryRequest(std.testing.allocator, "docs",
@@ -2568,7 +2645,12 @@ test "public table query handler maps HA read gate errors" {
     , null, lag_backend.iface());
     defer lag_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 503), lag_resp.status);
-    try std.testing.expectEqualStrings("standby read unavailable", lag_resp.body);
+    try expectQueryTemporarilyUnavailableResponse(
+        std.testing.allocator,
+        lag_resp,
+        "standby_read_unavailable",
+        "standby read unavailable",
+    );
 }
 
 test "public table query handler returns json response" {
@@ -3131,7 +3213,12 @@ test "public table query view handler maps doc identity unavailable errors" {
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
-    try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+    try expectQueryTemporarilyUnavailableResponse(
+        std.testing.allocator,
+        resp,
+        "doc_identity_unavailable",
+        "doc identity unavailable",
+    );
 }
 
 test "public table query view handler maps HA read gate errors" {
@@ -3169,7 +3256,12 @@ test "public table query view handler maps HA read gate errors" {
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
-    try std.testing.expectEqualStrings("read requires primary", resp.body);
+    try expectQueryTemporarilyUnavailableResponse(
+        std.testing.allocator,
+        resp,
+        "read_requires_primary",
+        "read requires primary",
+    );
 }
 
 test "public table query view handler returns json response" {

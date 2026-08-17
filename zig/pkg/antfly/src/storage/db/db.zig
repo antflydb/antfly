@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const vector_mod = @import("antfly_vector").vector;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
@@ -33,6 +34,7 @@ const generation_lifecycle = @import("generation_lifecycle.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
+const hierarchy_navigation = @import("../hierarchy_navigation.zig");
 const doc_identity = @import("doc_identity.zig");
 const range_cardinality = @import("range_cardinality.zig");
 pub const DocIdentityNamespace = doc_identity.Namespace;
@@ -87,6 +89,7 @@ const vectorindex_mod = @import("antfly_vectorindex");
 const embedder_mod = @import("enrichment/embedder.zig");
 const asset_producer_mod = @import("enrichment/asset_producer.zig");
 const document_extraction_mod = @import("enrichment/document_extraction.zig");
+const document_unit_fingerprint = @import("enrichment/document_unit_fingerprint.zig");
 const portable_backup = @import("../portable_backup.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("enrichment/chunker_stub.zig")
@@ -245,7 +248,6 @@ test "document extraction templated inline source size is rejected before persis
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
-
     try std.testing.expectError(error.StreamTooLong, db.batch(.{
         .writes = &.{.{
             .key = "doc:templated-too-large",
@@ -7874,6 +7876,19 @@ pub const DB = struct {
         };
     }
 
+    /// Returns an artifact through a public response boundary. Raw artifact
+    /// values are retained internally because compute/apply transports need
+    /// storage metadata, while public lookup must never expose hierarchy
+    /// revision fingerprints or coordinator envelopes.
+    pub fn getPublicArtifact(self: *DB, alloc: Allocator, artifact_id: []const u8) !?types.ArtifactRecord {
+        var artifact = (try self.getArtifact(alloc, artifact_id)) orelse return null;
+        errdefer artifact.deinit(alloc);
+        const public_value = try hierarchy_navigation.publicArtifactPayloadAlloc(alloc, artifact.value);
+        alloc.free(artifact.value);
+        artifact.value = public_value;
+        return artifact;
+    }
+
     pub fn getDocumentArtifactManifest(
         self: *DB,
         alloc: Allocator,
@@ -13513,10 +13528,14 @@ pub const DB = struct {
     }
 
     pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+        try checkLookupOptionsActive(opts);
         if (!internal_keys.isInternalUserKey(key) and (try isExpiredDocumentKey(self, alloc, key))) return null;
         const raw = try self.get(alloc, key) orelse return null;
         defer alloc.free(raw);
+        try checkLookupOptionsActive(opts);
         const stored = try projectLookupStoredBytes(self, alloc, key, raw, opts);
+        errdefer alloc.free(stored);
+        try checkLookupOptionsActive(opts);
         return .{ .json = stored };
     }
 
@@ -21422,6 +21441,12 @@ pub const DB = struct {
         externalize_artifact_ids: bool,
     ) !types.SearchResult {
         const execution_req = directSingleVectorRequest(req) orelse req;
+        if (execution_req.hierarchy_children != null) {
+            var children = try self.navigateHierarchyChildren(alloc, execution_req);
+            errdefer children.deinit();
+            if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &children);
+            return children;
+        }
         const selection_req = types.canonicalGroupedMatchSelectionRequest(execution_req);
         if (searchRequestRequiresComposedSearch(selection_req)) {
             var composed = try self.searchComposed(alloc, selection_req, exec_ctx);
@@ -21481,6 +21506,371 @@ pub const DB = struct {
         return base;
     }
 
+    fn hierarchyChildrenInaccessibleParentResult(
+        alloc: Allocator,
+        req: types.SearchRequest,
+    ) !types.SearchResult {
+        if (req.search_after.len == 0) {
+            return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &.{} };
+        }
+        // Keep absent, expired, and authorization-hidden parents externally
+        // indistinguishable. Cursor shape is still validated so callers receive
+        // actionable 400 versus 409 behavior without learning whether the parent
+        // exists behind their current row policy.
+        if (req.search_after.len != 2 or req.search_after[0] != .string or req.search_after[1] != .string) {
+            return error.InvalidQueryRequest;
+        }
+        _ = hierarchy_navigation.parsePosition(req.search_after[0].string) catch |err| switch (err) {
+            error.HierarchyNavigationPositionVersionStale => return error.HierarchyCursorStale,
+            error.InvalidHierarchyNavigationPosition => return error.InvalidQueryRequest,
+        };
+        return error.HierarchyCursorStale;
+    }
+
+    fn navigateHierarchyChildren(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+    ) !types.SearchResult {
+        const navigation = req.hierarchy_children orelse return error.InvalidQueryRequest;
+        if (navigation.parent_level != .source or navigation.level != .unit) return error.UnsupportedQueryRequest;
+
+        const source_key = try internal_keys.documentKeyAlloc(alloc, navigation.parent_id);
+        defer alloc.free(source_key);
+        const maybe_stored_source = try self.core.getStoreValue(alloc, source_key);
+        if (maybe_stored_source == null) {
+            // Distributed traversal is fanned out across table groups. Parent
+            // absence on one shard only means that shard does not own the plan;
+            // the outer coordinator decides whether every shard was empty.
+            if (req.defer_hierarchy_child_hydration) {
+                return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &.{} };
+            }
+            return try hierarchyChildrenInaccessibleParentResult(alloc, req);
+        }
+        var source_hits = try alloc.alloc(types.SearchHit, 1);
+        source_hits[0] = .{
+            .id = try alloc.dupe(u8, navigation.parent_id),
+            .stored_data = maybe_stored_source.?,
+        };
+        var visible_source = try db_query_result_shape.filterVisibleSearchResult(alloc, .{
+            .alloc = alloc,
+            .hits = source_hits,
+            .total_hits = 1,
+        }, .{
+            .ctx = self,
+            .func = isVisibleSearchHitCallback,
+            .filter_many = filterVisibleSearchHitsManyCallback,
+        });
+        defer visible_source.deinit();
+        visible_source = try db_query_result_shape.applyStoredSearchPatternFilters(alloc, req, visible_source, .{
+            .ctx = self,
+            .load_stored = loadStoredForHitCallback,
+            .load_many_stored = loadStoredSearchDocumentManyCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+        });
+        const parent_visible = visible_source.hits.len == 1;
+        if (!parent_visible) {
+            return try hierarchyChildrenInaccessibleParentResult(alloc, req);
+        }
+
+        var artifacts = std.ArrayListUnmanaged(HierarchyNavigationArtifact).empty;
+        defer {
+            for (artifacts.items) |*artifact| artifact.deinit(alloc);
+            artifacts.deinit(alloc);
+        }
+        // Unit payloads share the asset key prefix with their top-level
+        // manifest. Scanning that prefix would materialize every page body on
+        // every traversal request. The enrichment catalog is the authoritative
+        // namespace list, so probe only configured document-extraction
+        // manifests and read unit payloads later for the selected page.
+        for (self.core.index_manager.enrichments.items, 0..) |entry, entry_index| {
+            if (entry_index % hierarchy_navigation_cancel_stride == 0) try checkHierarchyNavigationCancelled(req);
+            if (entry.kind != .asset) continue;
+            var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, entry.producer_json);
+            defer producer_cfg.deinit(alloc);
+            if (producer_cfg.type != .document_extraction) continue;
+
+            const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, navigation.parent_id, "asset", entry.name);
+            defer alloc.free(manifest_key);
+            const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse continue;
+            defer alloc.free(manifest);
+            const manifest_info = try documentUnitHierarchyManifestInfo(alloc, manifest);
+            const generation = manifest_info.published_generation orelse
+                return error.StorageReadTemporarilyUnavailable;
+            const state_key = try assetStateKeyAlloc(alloc, navigation.parent_id, entry.name);
+            defer alloc.free(state_key);
+            const summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, navigation.parent_id, entry.name);
+            defer alloc.free(summary_key);
+            const summary_raw = try self.core.getStoreValue(alloc, summary_key);
+            defer if (summary_raw) |value| alloc.free(value);
+            var legacy_units: ?[]DocumentExtractionUnitDescriptor = null;
+            var digest: []u8 = undefined;
+            var unit_count: u32 = 0;
+            var block_count: u32 = 0;
+            var block_size: u32 = hierarchy_navigation_block_size;
+            if (summary_raw) |value| {
+                const summary = try hierarchyNavigationSummaryParseAlloc(alloc, value);
+                if (summary.generation != generation) {
+                    alloc.free(summary.digest);
+                    return error.StorageReadTemporarilyUnavailable;
+                }
+                // Transfer the digest allocation to the artifact descriptor;
+                // Zig values have no implicit destructor, so this is a single
+                // explicit ownership handoff rather than a clone.
+                digest = summary.digest;
+                unit_count = summary.unit_count;
+                block_count = summary.block_count;
+                block_size = summary.block_size;
+            } else {
+                const state = try self.core.getStoreValue(alloc, state_key) orelse return error.InvalidDocumentExtractionState;
+                defer alloc.free(state);
+                // Only state records with no navigation-era markers are
+                // provably legacy. A current-format record without its summary
+                // is an incomplete/corrupt publication and must fail closed;
+                // synthesizing a revision from its descriptors could otherwise
+                // issue cursors for a mixed artifact generation.
+                if (try documentExtractionStateHasNavigationMetadata(alloc, state)) {
+                    return error.StorageReadTemporarilyUnavailable;
+                }
+                // Rolling-upgrade fallback. A subsequent extraction writes the
+                // compact summary and blocks; until then, preserve correctness
+                // with the legacy state representation.
+                const units = try documentExtractionStateUnitDescriptorsAlloc(alloc, state);
+                errdefer freeDocumentExtractionUnitDescriptors(alloc, units);
+                for (units) |unit| {
+                    try validateHierarchyNavigationUnitDescriptor(alloc, navigation.parent_id, entry.name, unit);
+                }
+                legacy_units = units;
+                digest = try hierarchyNavigationArtifactDigestAlloc(alloc, units);
+                unit_count = std.math.cast(u32, units.len) orelse return error.QueryCandidateBudgetExceeded;
+                block_count = hierarchyNavigationBlockCount(unit_count);
+            }
+            errdefer alloc.free(digest);
+            try artifacts.append(alloc, .{
+                .name = try alloc.dupe(u8, entry.name),
+                .generation = generation,
+                .digest = digest,
+                .unit_count = unit_count,
+                .block_count = block_count,
+                .block_size = block_size,
+                .legacy_units = legacy_units,
+            });
+        }
+        std.mem.sort(HierarchyNavigationArtifact, artifacts.items, {}, hierarchyNavigationArtifactLessThan);
+        if (artifacts.items.len > 1) {
+            for (artifacts.items[1..], artifacts.items[0 .. artifacts.items.len - 1]) |current, previous| {
+                if (std.mem.eql(u8, current.name, previous.name)) return error.InvalidDocumentExtractionState;
+            }
+        }
+        const source_revision = try hierarchyNavigationSourceRevisionAlloc(alloc, artifacts.items);
+        defer alloc.free(source_revision);
+
+        // Validate the complete opaque position before classifying it. A
+        // malformed cursor is a bad request; a well-formed cursor bound to a
+        // different source hierarchy revision is an actionable conflict that
+        // requires restarting traversal without search_after.
+        const cursor_position: ?hierarchy_navigation.Position = if (req.search_after.len > 0)
+            hierarchy_navigation.parsePosition(req.search_after[0].string) catch |err| switch (err) {
+                error.HierarchyNavigationPositionVersionStale => return error.HierarchyCursorStale,
+                error.InvalidHierarchyNavigationPosition => return error.InvalidQueryRequest,
+            }
+        else
+            null;
+        if (cursor_position) |cursor| {
+            if (!std.mem.eql(u8, cursor.source_revision, source_revision)) return error.HierarchyCursorStale;
+        }
+
+        var units = std.ArrayListUnmanaged(types.SearchHit).empty;
+        var units_owns_hits = true;
+        errdefer if (units_owns_hits) {
+            for (units.items) |*hit| hit.deinit(alloc);
+            units.deinit(alloc);
+        };
+        var total_units_u64: u64 = 0;
+        for (artifacts.items) |artifact| total_units_u64 += @as(u64, artifact.unit_count);
+        const total = std.math.cast(u32, total_units_u64) orelse return error.QueryCandidateBudgetExceeded;
+
+        var start_artifact_index: usize = 0;
+        var start_ordinal: u64 = 0;
+        var cursor_needs_validation = cursor_position != null;
+        if (cursor_position) |cursor| {
+            var found = false;
+            for (artifacts.items, 0..) |artifact, artifact_index| {
+                if (!hierarchy_navigation.encodedComponentMatches(cursor.artifact_name_hex, artifact.name)) continue;
+                if (artifact.generation != cursor.generation or cursor.ordinal >= @as(u64, artifact.unit_count)) {
+                    return error.InvalidQueryRequest;
+                }
+                start_artifact_index = artifact_index;
+                start_ordinal = cursor.ordinal;
+                found = true;
+                break;
+            }
+            if (!found) return error.InvalidQueryRequest;
+        }
+
+        var remaining_offset: u64 = if (cursor_position == null) req.offset else 0;
+        artifact_loop: for (artifacts.items[start_artifact_index..], start_artifact_index..) |artifact, artifact_index| {
+            var ordinal: u64 = if (artifact_index == start_artifact_index) start_ordinal else 0;
+            const artifact_remaining = @as(u64, artifact.unit_count) - ordinal;
+            if (!cursor_needs_validation and remaining_offset >= artifact_remaining) {
+                remaining_offset -= artifact_remaining;
+                continue;
+            }
+            ordinal += remaining_offset;
+            remaining_offset = 0;
+
+            while (ordinal < @as(u64, artifact.unit_count)) {
+                try checkHierarchyNavigationCancelled(req);
+                const block_index: u32 = @intCast(ordinal / artifact.block_size);
+                const block_start = @as(u64, block_index) * @as(u64, artifact.block_size);
+                const block_units = try hierarchyNavigationArtifactBlockUnitsAlloc(
+                    self,
+                    alloc,
+                    navigation.parent_id,
+                    artifact,
+                    block_index,
+                );
+                defer freeDocumentExtractionUnitDescriptors(alloc, block_units);
+                var block_offset: usize = @intCast(ordinal - block_start);
+                while (block_offset < block_units.len) : (block_offset += 1) {
+                    const unit = block_units[block_offset];
+                    const unit_ordinal = block_start + @as(u64, block_offset);
+                    var unit_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, unit.key)) orelse
+                        return error.InvalidDocumentExtractionState;
+                    defer unit_ref.deinit(alloc);
+                    const public_id = try artifact_ids.artifactPublicIdAlloc(alloc, unit_ref);
+                    defer alloc.free(public_id);
+
+                    if (cursor_needs_validation) {
+                        const cursor = cursor_position.?;
+                        if (unit_ordinal != cursor.ordinal or
+                            !hierarchy_navigation.positionUnitFingerprintMatches(cursor, artifact.name, unit.fingerprint) or
+                            !std.mem.eql(u8, public_id, req.search_after[1].string))
+                        {
+                            return error.InvalidQueryRequest;
+                        }
+                        cursor_needs_validation = false;
+                        ordinal = unit_ordinal + 1;
+                        continue;
+                    }
+                    if (units.items.len >= @as(usize, req.limit)) break :artifact_loop;
+
+                    const position = try hierarchyNavigationPositionAlloc(
+                        alloc,
+                        source_revision,
+                        artifact.name,
+                        artifact.generation,
+                        @intCast(unit_ordinal),
+                        unit.fingerprint,
+                    );
+                    defer alloc.free(position);
+                    var unit_hit = types.SearchHit{
+                        .id = try alloc.dupe(u8, unit.key),
+                        .score = 1,
+                    };
+                    errdefer unit_hit.deinit(alloc);
+                    unit_hit.sort_values = try alloc.alloc(std.json.Value, 2);
+                    unit_hit.sort_values[0] = .null;
+                    unit_hit.sort_values[1] = .null;
+                    unit_hit.sort_values[0] = .{ .string = try alloc.dupe(u8, position) };
+                    unit_hit.sort_values[1] = .{ .string = try alloc.dupe(u8, public_id) };
+                    unit_hit.artifact_ref = try unit_ref.clone(alloc);
+                    try units.append(alloc, unit_hit);
+                    ordinal = unit_ordinal + 1;
+                }
+            }
+        }
+        if (cursor_needs_validation) return error.InvalidQueryRequest;
+
+        const page = try units.toOwnedSlice(alloc);
+        units_owns_hits = false;
+        var page_initialized: usize = 0;
+        errdefer {
+            for (page[0..page_initialized]) |*hit| hit.deinit(alloc);
+            if (page.len > 0) alloc.free(page);
+        }
+        if (!req.include_stored) {
+            page_initialized = page.len;
+            try self.ensureHierarchyNavigationArtifactsStillPublished(
+                alloc,
+                navigation.parent_id,
+                artifacts.items,
+                req,
+            );
+            return .{
+                .alloc = alloc,
+                .hits = page,
+                .total_hits = total,
+                .total_hits_relation = .exact,
+                .graph_results = &.{},
+            };
+        }
+        for (page) |*hit| {
+            page_initialized += 1;
+            const artifact_ref = hit.artifact_ref orelse return error.InvalidDocumentExtractionState;
+            const unit_id = artifact_ref.unit_id orelse return error.InvalidDocumentExtractionState;
+            const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, artifact_ref.document_id, artifact_ref.name, unit_id);
+            defer alloc.free(unit_key);
+            const stored = try self.core.getStoreValue(alloc, unit_key) orelse {
+                if (req.defer_hierarchy_child_hydration) continue;
+                return error.InvalidDocumentExtractionState;
+            };
+            defer alloc.free(stored);
+            const position = hit.sort_values[0].string;
+            const parsed_position = try hierarchyNavigationPositionParse(artifact_ref.name, position);
+            if (!(try hierarchyNavigationStoredUnitMatchesPosition(alloc, stored, artifact_ref.name, parsed_position))) {
+                return error.InvalidDocumentExtractionState;
+            }
+            const projected = if (req.fields.len > 0 or !req.include_all_fields)
+                try projectLookupStoredBytes(self, alloc, unit_key, stored, .{
+                    .fields = req.fields,
+                    .include_all_fields = req.include_all_fields,
+                })
+            else
+                try alloc.dupe(u8, stored);
+            defer alloc.free(projected);
+            hit.stored_data = try hierarchy_navigation.stripUnitFingerprintAlloc(alloc, projected);
+        }
+        // Close the read-publication race after all selected payloads are in
+        // owned memory. If extraction started or completed since the initial
+        // manifest read, discard the page rather than returning a hybrid.
+        try self.ensureHierarchyNavigationArtifactsStillPublished(
+            alloc,
+            navigation.parent_id,
+            artifacts.items,
+            req,
+        );
+        return .{
+            .alloc = alloc,
+            .hits = page,
+            .total_hits = total,
+            .total_hits_relation = .exact,
+            .graph_results = &.{},
+        };
+    }
+
+    fn ensureHierarchyNavigationArtifactsStillPublished(
+        self: *DB,
+        alloc: Allocator,
+        parent_id: []const u8,
+        artifacts: []const HierarchyNavigationArtifact,
+        req: types.SearchRequest,
+    ) !void {
+        for (artifacts, 0..) |artifact, i| {
+            if (i % hierarchy_navigation_cancel_stride == 0) try checkHierarchyNavigationCancelled(req);
+            const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, parent_id, "asset", artifact.name);
+            defer alloc.free(manifest_key);
+            const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse
+                return error.StorageReadTemporarilyUnavailable;
+            defer alloc.free(manifest);
+            const info = try documentUnitHierarchyManifestInfo(alloc, manifest);
+            if (info.published_generation == null or info.published_generation.? != artifact.generation) {
+                return error.StorageReadTemporarilyUnavailable;
+            }
+        }
+    }
+
     /// Canonical hierarchy grouping uses a collapse-and-expand execution plan:
     /// the primary query selects the requested source-group page, and a second
     /// bounded query per returned source obtains that group's exact top
@@ -21494,17 +21884,28 @@ pub const DB = struct {
         result: *types.SearchResult,
     ) anyerror!void {
         if (!req.hierarchy_grouped_matches or
-            req.return_mode != .parent_with_chunks or
+            (req.return_mode != .parent_with_chunks and req.return_mode != .unit_with_chunks) or
             req.max_chunks_per_parent == 0 or
             result.hits.len == 0)
         {
             return;
         }
         for (result.hits) |*group_hit| {
-            const parent_filter = [_][]const u8{group_hit.id};
+            const parent_id = if (req.hierarchy_group_level == .unit)
+                (group_hit.artifact_ref orelse return error.InvalidChunkArtifact).document_id
+            else
+                group_hit.id;
+            const parent_filter = [_][]const u8{parent_id};
             const match_req = types.canonicalGroupedMatchDescendantRequest(req, &parent_filter);
+            var scoped_match_req = match_req;
+            const unit_filter_json = if (req.hierarchy_group_level == .unit) blk: {
+                _ = group_hit.artifact_ref orelse return error.InvalidChunkArtifact;
+                break :blk try hierarchyUnitMatchFilterJsonAlloc(alloc, req.filter_query_json, group_hit.id);
+            } else null;
+            defer if (unit_filter_json) |value| alloc.free(value);
+            if (unit_filter_json) |value| scoped_match_req.filter_query_json = value;
 
-            var matches = try self.searchLockedWithExecutionContextImpl(alloc, match_req, exec_ctx, false);
+            var matches = try self.searchLockedWithExecutionContextImpl(alloc, scoped_match_req, exec_ctx, false);
             defer matches.deinit();
 
             const nested_matches: []types.ChunkHit = if (matches.hits.len == 0)
@@ -21966,6 +22367,8 @@ pub const DB = struct {
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .load_many_parent_stored = loadParentStoredForSearchManyCallback,
             .load_many_stored = loadStoredSearchDocumentManyCallback,
+            .load_projected_stored = loadProjectedSearchDocumentCallback,
+            .load_many_projected_stored = loadProjectedSearchDocumentManyCallback,
         });
     }
 
@@ -23302,6 +23705,8 @@ pub const DB = struct {
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .load_many_parent_stored = loadParentStoredForSearchManyCallback,
             .load_many_stored = loadStoredSearchDocumentManyCallback,
+            .load_projected_stored = loadProjectedSearchDocumentCallback,
+            .load_many_projected_stored = loadProjectedSearchDocumentManyCallback,
         });
     }
 
@@ -24639,7 +25044,10 @@ fn artifactProjectionValue(self: *DB, alloc: Allocator, artifact_ref: types.Arti
             }
         },
         .asset => {
-            try putOwnedValue(alloc, &obj, "value", try assetPayloadJsonValue(alloc, content_type, raw));
+            var value = try assetPayloadJsonValue(alloc, content_type, raw);
+            errdefer freeJsonValue(alloc, &value);
+            hierarchy_navigation.stripPublicInternalFieldsValue(alloc, &value);
+            try putOwnedValue(alloc, &obj, "value", value);
         },
         .embedding => {
             if (enrichment_artifact_codec.decodeDenseEmbeddingDims(raw) catch null) |dims| {
@@ -26190,13 +26598,26 @@ fn computeDocumentExtractionAssetRequestDerived(
     if (!force_reprocess) {
         if (metadata_fingerprint) |fingerprint| {
             if (existing_state) |state| {
-                if (documentExtractionStateFingerprintMatches(alloc, state, fingerprint)) {
+                if (documentExtractionStateFingerprintMatches(alloc, state, fingerprint) and
+                    documentExtractionStateHasChunkUnitFingerprints(alloc, state))
+                {
                     if (existing_manifest) |value| {
                         const manifest_has_last_error = documentExtractionManifestHasLastError(alloc, value) catch |err| switch (err) {
                             error.OutOfMemory => return err,
                             else => true,
                         };
                         if (!manifest_has_last_error) {
+                            try appendDocumentExtractionNavigationBackfill(
+                                alloc,
+                                db,
+                                request.doc_key,
+                                artifact_name,
+                                fingerprint,
+                                state,
+                                from_generation,
+                                artifact_writes,
+                                artifact_delete_keys,
+                            );
                             try artifact_writes.append(alloc, .{
                                 .key = try alloc.dupe(u8, manifest_key),
                                 .value = try alloc.dupe(u8, value),
@@ -26307,14 +26728,36 @@ fn computeDocumentExtractionAssetRequestDerived(
     const desired_unit_descriptors = try documentExtractionUnitDescriptorsFromKeysAlloc(alloc, desired_unit_keys.items, desired_unit_fingerprints.items);
     defer alloc.free(desired_unit_descriptors);
 
-    const new_state = try documentExtractionStateValueAlloc(alloc, source_fingerprint, desired_unit_keys.items, desired_unit_descriptors, desired_chunk_keys.items);
+    const navigation_digest = try hierarchyNavigationArtifactDigestAlloc(alloc, desired_unit_descriptors);
+    defer alloc.free(navigation_digest);
+    const navigation_unit_count = std.math.cast(u32, desired_unit_descriptors.len) orelse
+        return error.InvalidDocumentExtractionState;
+    const navigation_block_count = hierarchyNavigationBlockCount(navigation_unit_count);
+
+    const new_state = try documentExtractionStateValueAlloc(
+        alloc,
+        source_fingerprint,
+        desired_unit_keys.items,
+        desired_unit_descriptors,
+        desired_chunk_keys.items,
+        navigation_digest,
+        navigation_block_count,
+        true,
+    );
     defer alloc.free(new_state);
+    const navigation_summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, request.doc_key, artifact_name);
+    defer alloc.free(navigation_summary_key);
+    const existing_navigation_summary = try db.core.getStoreValue(alloc, navigation_summary_key);
+    defer if (existing_navigation_summary) |value| alloc.free(value);
 
     var previous_state = DocumentExtractionPreviousState{};
     defer previous_state.deinit(alloc);
 
     if (existing_state) |state| {
-        if (!force_reprocess and std.mem.eql(u8, state, new_state)) {
+        if (!force_reprocess and existing_navigation_summary != null and
+            std.mem.eql(u8, state, new_state) and
+            try hierarchy_navigation.indexMetadataMatches(alloc, state, existing_navigation_summary.?, from_generation))
+        {
             if (existing_manifest) |value| {
                 if (!(try documentExtractionManifestHasLastError(alloc, value))) {
                     try artifact_writes.append(alloc, .{
@@ -26340,6 +26783,57 @@ fn computeDocumentExtractionAssetRequestDerived(
         }
     }
 
+    // Persist compact, directly addressable hierarchy metadata with the same
+    // derived write batch as the manifest and unit payloads. Cursor requests
+    // can then validate one summary and fetch only the blocks covering the
+    // requested page instead of reparsing every unit descriptor.
+    const navigation_summary = try hierarchyNavigationSummaryValueAlloc(
+        alloc,
+        to_generation,
+        navigation_digest,
+        navigation_unit_count,
+        navigation_block_count,
+    );
+    defer alloc.free(navigation_summary);
+    try artifact_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, navigation_summary_key),
+        .value = try alloc.dupe(u8, navigation_summary),
+    });
+    var navigation_block_index: u32 = 0;
+    while (navigation_block_index < navigation_block_count) : (navigation_block_index += 1) {
+        const start = @as(usize, navigation_block_index) * hierarchy_navigation_block_size;
+        const end = @min(start + hierarchy_navigation_block_size, desired_unit_descriptors.len);
+        const block_key = try internal_keys.documentUnitNavigationBlockKeyAlloc(
+            alloc,
+            request.doc_key,
+            artifact_name,
+            navigation_block_index,
+        );
+        defer alloc.free(block_key);
+        const block_value = try hierarchyNavigationBlockValueAlloc(
+            alloc,
+            navigation_block_index,
+            desired_unit_descriptors[start..end],
+        );
+        defer alloc.free(block_value);
+        try artifact_writes.append(alloc, .{
+            .key = try alloc.dupe(u8, block_key),
+            .value = try alloc.dupe(u8, block_value),
+        });
+    }
+    var obsolete_navigation_block = navigation_block_count;
+    while (obsolete_navigation_block < previous_state.navigation_block_count) : (obsolete_navigation_block += 1) {
+        try artifact_delete_keys.append(
+            alloc,
+            try internal_keys.documentUnitNavigationBlockKeyAlloc(
+                alloc,
+                request.doc_key,
+                artifact_name,
+                obsolete_navigation_block,
+            ),
+        );
+    }
+
     const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, request.full_text_index);
     defer {
         for (text_indexes) |name| alloc.free(name);
@@ -26359,7 +26853,7 @@ fn computeDocumentExtractionAssetRequestDerived(
             try documentUnitCanSkipLocalWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes))
         {
             if (force_reprocess) {
-                const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type, unit_route);
+                const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, unit_descriptor.fingerprint, source_url, extraction.content_type, unit_route);
                 defer alloc.free(payload);
                 try artifact_writes.append(alloc, .{
                     .key = try alloc.dupe(u8, unit_key),
@@ -26390,7 +26884,7 @@ fn computeDocumentExtractionAssetRequestDerived(
             }
             continue;
         }
-        const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type, unit_route);
+        const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, unit_descriptor.fingerprint, source_url, extraction.content_type, unit_route);
         defer alloc.free(payload);
         try artifact_writes.append(alloc, .{
             .key = try alloc.dupe(u8, unit_key),
@@ -26416,7 +26910,7 @@ fn computeDocumentExtractionAssetRequestDerived(
             });
         }
 
-        try appendDocumentUnitChunkWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges, artifact_writes, documents, dense_embeddings, sparse_embeddings);
+        try appendDocumentUnitChunkWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges, artifact_writes, documents, dense_embeddings, sparse_embeddings);
     }
 
     const manifest = try documentExtractionManifestPayloadAlloc(
@@ -26446,6 +26940,104 @@ fn computeDocumentExtractionAssetRequestDerived(
     try artifact_writes.append(alloc, .{
         .key = try alloc.dupe(u8, state_key),
         .value = try alloc.dupe(u8, new_state),
+    });
+}
+
+fn appendDocumentExtractionNavigationBackfill(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_fingerprint: []const u8,
+    state: []const u8,
+    generation: u64,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, doc_key, artifact_name);
+    defer alloc.free(summary_key);
+    const existing_summary = try db.core.getStoreValue(alloc, summary_key);
+    defer if (existing_summary) |value| alloc.free(value);
+    if (existing_summary) |summary| {
+        if (try hierarchy_navigation.indexMetadataMatches(alloc, state, summary, generation)) return;
+    }
+
+    const unit_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
+    defer freeOwnedConstKeySlice(alloc, unit_keys);
+    const chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
+    defer freeOwnedConstKeySlice(alloc, chunk_keys);
+    const descriptors = try documentExtractionStateUnitDescriptorsAlloc(alloc, state);
+    defer freeDocumentExtractionUnitDescriptors(alloc, descriptors);
+    if (descriptors.len != unit_keys.len) return error.InvalidDocumentExtractionState;
+
+    for (descriptors, unit_keys) |*descriptor, unit_key| {
+        if (!std.mem.eql(u8, descriptor.key, unit_key)) return error.InvalidDocumentExtractionState;
+        var unit_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, descriptor.key)) orelse
+            return error.InvalidDocumentExtractionState;
+        defer unit_ref.deinit(alloc);
+        if (unit_ref.kind != .asset or unit_ref.unit_id == null or
+            !std.mem.eql(u8, unit_ref.document_id, doc_key) or
+            !std.mem.eql(u8, unit_ref.name, artifact_name))
+        {
+            return error.InvalidDocumentExtractionState;
+        }
+        if (descriptor.fingerprint.len == 0) {
+            const stored = try db.core.getStoreValue(alloc, descriptor.key) orelse
+                return error.InvalidDocumentExtractionState;
+            defer alloc.free(stored);
+            descriptor.fingerprint = try documentExtractionStoredUnitFingerprintAlloc(alloc, stored);
+        }
+    }
+
+    const digest = try hierarchy_navigation.artifactDigestAlloc(alloc, descriptors);
+    defer alloc.free(digest);
+    const unit_count = std.math.cast(u32, descriptors.len) orelse return error.InvalidDocumentExtractionState;
+    const block_count = hierarchy_navigation.blockCount(unit_count);
+    const indexed_state = try documentExtractionStateValueAlloc(
+        alloc,
+        source_fingerprint,
+        unit_keys,
+        descriptors,
+        chunk_keys,
+        digest,
+        block_count,
+        documentExtractionStateHasChunkUnitFingerprints(alloc, state),
+    );
+    defer alloc.free(indexed_state);
+    const summary = try hierarchy_navigation.summaryValueAlloc(alloc, generation, digest, unit_count, block_count);
+    defer alloc.free(summary);
+    try artifact_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, summary_key),
+        .value = try alloc.dupe(u8, summary),
+    });
+
+    var block_index: u32 = 0;
+    while (block_index < block_count) : (block_index += 1) {
+        const start = @as(usize, block_index) * hierarchy_navigation.block_size;
+        const end = @min(start + hierarchy_navigation.block_size, descriptors.len);
+        const block_key = try internal_keys.documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, block_index);
+        defer alloc.free(block_key);
+        const block_value = try hierarchy_navigation.blockValueAlloc(alloc, block_index, descriptors[start..end]);
+        defer alloc.free(block_value);
+        try artifact_writes.append(alloc, .{
+            .key = try alloc.dupe(u8, block_key),
+            .value = try alloc.dupe(u8, block_value),
+        });
+    }
+
+    const previous_block_count = try documentExtractionStateNavigationBlockCount(alloc, state);
+    var obsolete_block = block_count;
+    while (obsolete_block < previous_block_count) : (obsolete_block += 1) {
+        try artifact_delete_keys.append(
+            alloc,
+            try internal_keys.documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, obsolete_block),
+        );
+    }
+    const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
+    defer alloc.free(state_key);
+    try artifact_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, state_key),
+        .value = try alloc.dupe(u8, indexed_state),
     });
 }
 
@@ -26763,7 +27355,18 @@ fn appendDocumentExtractionDeleteKeys(
         for (previous_state.chunk_keys) |previous_key| {
             try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
         }
+        var block_index: u32 = 0;
+        while (block_index < previous_state.navigation_block_count) : (block_index += 1) {
+            try artifact_delete_keys.append(
+                alloc,
+                try internal_keys.documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, block_index),
+            );
+        }
     }
+    try artifact_delete_keys.append(
+        alloc,
+        try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, doc_key, artifact_name),
+    );
     try artifact_delete_keys.append(alloc, state_key);
 }
 
@@ -26804,6 +27407,7 @@ const DocumentExtractionPreviousState = struct {
     unit_keys: []const []const u8 = &.{},
     unit_descriptors: []DocumentExtractionUnitDescriptor = &.{},
     chunk_keys: []const []const u8 = &.{},
+    navigation_block_count: u32 = 0,
     recovered_from_store_scan: bool = false,
 
     fn deinit(self: *@This(), alloc: Allocator) void {
@@ -26846,6 +27450,7 @@ fn loadDocumentExtractionPreviousStateFromJson(alloc: Allocator, state: []const 
     out.unit_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
     out.unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(alloc, state);
     out.chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
+    out.navigation_block_count = try documentExtractionStateNavigationBlockCount(alloc, state);
     return out;
 }
 
@@ -27139,6 +27744,7 @@ fn appendDocumentUnitChunkWrites(
     doc_key: []const u8,
     source_artifact_name: []const u8,
     unit_key: []const u8,
+    unit_fingerprint: []const u8,
     unit: document_extraction_mod.Unit,
     desired_chunk_keys: []const []const u8,
     chunk_range_base_index: usize,
@@ -27177,7 +27783,7 @@ fn appendDocumentUnitChunkWrites(
             const chunk_key_index = documentExtractionKeyIndex(desired_chunk_keys, chunk_key) orelse return error.DocumentExtractionChunkRangeMissing;
             const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
             const chunk_route = documentExtractionRangeRoute(previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
-            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit, chunk, true, chunk_route);
+            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, unit_fingerprint, entry.name, source_artifact_name, entry.source_field, unit, chunk, true, chunk_route);
             try artifact_writes.append(alloc, .{
                 .key = try alloc.dupe(u8, chunk_key),
                 .value = try alloc.dupe(u8, payload),
@@ -27301,6 +27907,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
     alloc: Allocator,
     doc_key: []const u8,
     unit_key: []const u8,
+    unit_fingerprint: []const u8,
     artifact_name: []const u8,
     source_artifact_name: []const u8,
     source_field: []const u8,
@@ -27313,6 +27920,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, try alloc.dupe(u8, "_parent_doc_key"), .{ .string = try alloc.dupe(u8, doc_key) });
     try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_key"), .{ .string = try alloc.dupe(u8, unit_key) });
+    try obj.put(alloc, try alloc.dupe(u8, hierarchy_navigation_unit_fingerprint_field), .{ .string = try alloc.dupe(u8, unit_fingerprint) });
     try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_id"), .{ .string = try alloc.dupe(u8, unit.unit_id) });
     try obj.put(alloc, try alloc.dupe(u8, "_artifact_name"), .{ .string = try alloc.dupe(u8, artifact_name) });
     try obj.put(alloc, try alloc.dupe(u8, "_source_artifact_name"), .{ .string = try alloc.dupe(u8, source_artifact_name) });
@@ -27378,98 +27986,162 @@ fn documentExtractionFingerprintAlloc(
 }
 
 fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extraction_mod.Unit) ![]u8 {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(unit.unit_id);
-    hasher.update(unit.unit_type);
-    hasher.update(unit.text);
-    hasher.update(unit.method);
-    if (unit.source_path) |source_path| hasher.update(source_path);
-    if (unit.extraction_status) |extraction_status| hasher.update(extraction_status);
-    if (unit.source_sha256) |source_sha256| hasher.update(source_sha256);
-    if (unit.byte_length) |byte_length| {
-        var buf: [@sizeOf(u64)]u8 = undefined;
-        std.mem.writeInt(u64, &buf, byte_length, .big);
-        hasher.update(&buf);
+    return try document_unit_fingerprint.fingerprintAlloc(alloc, unit);
+}
+
+/// Reconstruct the legacy extraction fingerprint from a pre-marker stored
+/// unit payload. New payloads persist their versioned fingerprint directly;
+/// this fallback keeps hierarchy traversal revision-safe during rolling
+/// upgrades without forcing a generation-wide migration rewrite.
+pub fn documentExtractionStoredUnitFingerprintAlloc(alloc: Allocator, stored: []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var parsed = try std.json.parseFromSlice(std.json.Value, scratch, stored, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionState;
+    const object = parsed.value.object;
+    const provenance_value = object.get("provenance") orelse return error.InvalidDocumentExtractionState;
+    if (provenance_value != .object) return error.InvalidDocumentExtractionState;
+    const provenance = provenance_value.object;
+
+    const text_regions = try storedUnitTextRegionsAlloc(scratch, provenance.get("text_regions"));
+    const unit = document_extraction_mod.Unit{
+        .unit_id = @constCast(try storedUnitRequiredString(object, "unit_id")),
+        .unit_type = @constCast(try storedUnitRequiredString(object, "unit_type")),
+        .text = @constCast(try storedUnitRequiredString(object, "text")),
+        .method = @constCast(try storedUnitRequiredString(provenance, "method")),
+        .source_path = if (try storedUnitOptionalString(object, "source_path")) |value| @constCast(value) else null,
+        .extraction_status = if (try storedUnitOptionalString(object, "extraction_status")) |value| @constCast(value) else null,
+        .source_sha256 = if (try storedUnitOptionalString(object, "source_sha256")) |value| @constCast(value) else null,
+        .byte_length = try storedUnitOptionalInteger(u64, object, "byte_length"),
+        .ocr_used = try storedUnitRequiredBool(provenance, "ocr_used"),
+        .ocr_attempted = try storedUnitRequiredBool(object, "ocr_attempted"),
+        .ocr_render_dpi = try storedUnitOptionalInteger(u16, object, "ocr_render_dpi"),
+        .ocr_effective_render_dpi = try storedUnitOptionalInteger(u16, object, "ocr_effective_render_dpi"),
+        .ocr_rendered_width = try storedUnitOptionalInteger(u32, object, "ocr_rendered_width"),
+        .ocr_rendered_height = try storedUnitOptionalInteger(u32, object, "ocr_rendered_height"),
+        .ocr_rendered_bytes = try storedUnitOptionalInteger(u64, object, "ocr_rendered_bytes"),
+        .ocr_failure_stage = if (try storedUnitOptionalString(object, "ocr_failure_stage")) |value| @constCast(value) else null,
+        .ocr_failure_retryable = try storedUnitOptionalBool(object, "ocr_failure_retryable"),
+        .ocr_trigger_reasons = if (try storedUnitOptionalString(object, "ocr_trigger_reasons")) |value| @constCast(value) else null,
+        .ocr_embedded_quality = if (try storedUnitOptionalString(object, "ocr_embedded_quality")) |value| @constCast(value) else null,
+        .ocr_output_quality = if (try storedUnitOptionalString(object, "ocr_output_quality")) |value| @constCast(value) else null,
+        .ocr_confidence = try storedUnitOptionalFloat(object, "ocr_confidence"),
+        .ocr_bbox = try storedUnitOptionalBbox(object, "ocr_bbox"),
+        .transcript_used = try storedUnitRequiredBool(provenance, "transcript_used"),
+        .transcript_confidence = try storedUnitOptionalFloat(object, "transcript_confidence"),
+        .extraction_warning = if (try storedUnitOptionalString(object, "extraction_warning")) |value| @constCast(value) else null,
+        .page_number = try storedUnitOptionalInteger(u32, provenance, "page_number"),
+        .page_label = if (try storedUnitOptionalString(provenance, "page_label")) |value| @constCast(value) else null,
+        .page_bbox = try storedUnitOptionalBbox(provenance, "page_bbox"),
+        .page_rotation = try storedUnitOptionalInteger(i32, provenance, "page_rotation"),
+        .text_regions = text_regions,
+        .char_start = try storedUnitOptionalInteger(u32, provenance, "char_start"),
+        .char_end = try storedUnitOptionalInteger(u32, provenance, "char_end"),
+    };
+    // A payload without the marker predates the canonical fingerprint
+    // encoding. Its state descriptor therefore contains the legacy digest;
+    // reconstruct that exact value for rolling-upgrade validation. Current
+    // payloads always validate through their persisted `duf2:` marker.
+    return try document_unit_fingerprint.legacyFingerprintAlloc(alloc, unit);
+}
+
+fn storedUnitRequiredString(object: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    return (try storedUnitOptionalString(object, name)) orelse error.InvalidDocumentExtractionState;
+}
+
+fn storedUnitOptionalString(object: std.json.ObjectMap, name: []const u8) !?[]const u8 {
+    const value = object.get(name) orelse return null;
+    return switch (value) {
+        .null => null,
+        .string => |text| text,
+        else => error.InvalidDocumentExtractionState,
+    };
+}
+
+fn storedUnitRequiredBool(object: std.json.ObjectMap, name: []const u8) !bool {
+    return (try storedUnitOptionalBool(object, name)) orelse error.InvalidDocumentExtractionState;
+}
+
+fn storedUnitOptionalBool(object: std.json.ObjectMap, name: []const u8) !?bool {
+    const value = object.get(name) orelse return null;
+    return switch (value) {
+        .null => null,
+        .bool => |boolean| boolean,
+        else => error.InvalidDocumentExtractionState,
+    };
+}
+
+fn storedUnitOptionalInteger(comptime T: type, object: std.json.ObjectMap, name: []const u8) !?T {
+    const value = object.get(name) orelse return null;
+    return switch (value) {
+        .null => null,
+        .integer => |integer| std.math.cast(T, integer) orelse error.InvalidDocumentExtractionState,
+        .number_string => |text| std.fmt.parseInt(T, text, 10) catch error.InvalidDocumentExtractionState,
+        else => error.InvalidDocumentExtractionState,
+    };
+}
+
+fn storedUnitOptionalFloat(object: std.json.ObjectMap, name: []const u8) !?f64 {
+    const value = object.get(name) orelse return null;
+    return switch (value) {
+        .null => null,
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| if (std.math.isFinite(float)) float else error.InvalidDocumentExtractionState,
+        .number_string => |text| blk: {
+            const parsed = std.fmt.parseFloat(f64, text) catch return error.InvalidDocumentExtractionState;
+            if (!std.math.isFinite(parsed)) return error.InvalidDocumentExtractionState;
+            break :blk parsed;
+        },
+        else => error.InvalidDocumentExtractionState,
+    };
+}
+
+fn storedUnitOptionalBbox(object: std.json.ObjectMap, name: []const u8) !?[4]f64 {
+    const value = object.get(name) orelse return null;
+    if (value == .null) return null;
+    if (value != .array or value.array.items.len != 4) return error.InvalidDocumentExtractionState;
+    var bbox: [4]f64 = undefined;
+    for (value.array.items, 0..) |coordinate, i| {
+        bbox[i] = switch (coordinate) {
+            .integer => |integer| @floatFromInt(integer),
+            .float => |float| if (std.math.isFinite(float)) float else return error.InvalidDocumentExtractionState,
+            .number_string => |text| std.fmt.parseFloat(f64, text) catch return error.InvalidDocumentExtractionState,
+            else => return error.InvalidDocumentExtractionState,
+        };
+        if (!std.math.isFinite(bbox[i])) return error.InvalidDocumentExtractionState;
     }
-    hasher.update(if (unit.ocr_used) "ocr:1" else "ocr:0");
-    hasher.update(if (unit.ocr_attempted) "ocr_attempted:1" else "ocr_attempted:0");
-    if (unit.ocr_render_dpi) |dpi| {
-        var dpi_buf: [@sizeOf(u16)]u8 = undefined;
-        std.mem.writeInt(u16, &dpi_buf, dpi, .big);
-        hasher.update(&dpi_buf);
+    return bbox;
+}
+
+fn storedUnitTextRegionsAlloc(alloc: Allocator, value: ?std.json.Value) ![]document_extraction_mod.TextRegion {
+    const regions_value = value orelse return &.{};
+    if (regions_value == .null) return &.{};
+    if (regions_value != .array) return error.InvalidDocumentExtractionState;
+    const regions = try alloc.alloc(document_extraction_mod.TextRegion, regions_value.array.items.len);
+    for (regions_value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidDocumentExtractionState;
+        const span_value = item.object.get("span") orelse return error.InvalidDocumentExtractionState;
+        if (span_value != .array or span_value.array.items.len != 2) return error.InvalidDocumentExtractionState;
+        const bbox = (try storedUnitOptionalBbox(item.object, "bbox")) orelse return error.InvalidDocumentExtractionState;
+        regions[i] = .{
+            .span = .{
+                try storedUnitIntegerValue(u32, span_value.array.items[0]),
+                try storedUnitIntegerValue(u32, span_value.array.items[1]),
+            },
+            .bbox = bbox,
+        };
     }
-    if (unit.ocr_effective_render_dpi) |dpi| {
-        var dpi_buf: [@sizeOf(u16)]u8 = undefined;
-        std.mem.writeInt(u16, &dpi_buf, dpi, .big);
-        hasher.update(&dpi_buf);
-    }
-    if (unit.ocr_rendered_width) |value| hasher.update(std.mem.asBytes(&value));
-    if (unit.ocr_rendered_height) |value| hasher.update(std.mem.asBytes(&value));
-    if (unit.ocr_rendered_bytes) |value| hasher.update(std.mem.asBytes(&value));
-    if (unit.ocr_failure_stage) |value| hasher.update(value);
-    if (unit.ocr_failure_retryable) |value| hasher.update(if (value) "ocr_failure_retryable:1" else "ocr_failure_retryable:0");
-    if (unit.ocr_trigger_reasons) |value| hasher.update(value);
-    if (unit.ocr_embedded_quality) |value| hasher.update(value);
-    if (unit.ocr_output_quality) |value| hasher.update(value);
-    if (unit.ocr_confidence) |confidence| {
-        var value = confidence;
-        hasher.update(std.mem.asBytes(&value));
-    }
-    if (unit.ocr_bbox) |bbox| {
-        for (bbox) |coord| {
-            var value = coord;
-            hasher.update(std.mem.asBytes(&value));
-        }
-    }
-    hasher.update(if (unit.transcript_used) "transcript:1" else "transcript:0");
-    if (unit.transcript_confidence) |confidence| {
-        var value = confidence;
-        hasher.update(std.mem.asBytes(&value));
-    }
-    if (unit.extraction_warning) |warning| hasher.update(warning);
-    if (unit.page_number) |page_number| {
-        var buf: [@sizeOf(u32)]u8 = undefined;
-        std.mem.writeInt(u32, &buf, page_number, .big);
-        hasher.update(&buf);
-    }
-    if (unit.page_label) |page_label| {
-        hasher.update(page_label);
-    }
-    if (unit.page_bbox) |bbox| {
-        for (bbox) |coord| {
-            var coord_value = coord;
-            hasher.update(std.mem.asBytes(&coord_value));
-        }
-    }
-    if (unit.page_rotation) |rotation| {
-        var buf: [@sizeOf(i32)]u8 = undefined;
-        std.mem.writeInt(i32, &buf, rotation, .big);
-        hasher.update(&buf);
-    }
-    for (unit.text_regions) |region| {
-        for (region.span) |span| {
-            var buf: [@sizeOf(u32)]u8 = undefined;
-            std.mem.writeInt(u32, &buf, span, .big);
-            hasher.update(&buf);
-        }
-        for (region.bbox) |coord| {
-            var coord_value = coord;
-            hasher.update(std.mem.asBytes(&coord_value));
-        }
-    }
-    if (unit.char_start) |char_start| {
-        var buf: [@sizeOf(u32)]u8 = undefined;
-        std.mem.writeInt(u32, &buf, char_start, .big);
-        hasher.update(&buf);
-    }
-    if (unit.char_end) |char_end| {
-        var buf: [@sizeOf(u32)]u8 = undefined;
-        std.mem.writeInt(u32, &buf, char_end, .big);
-        hasher.update(&buf);
-    }
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    return try hexBytesAlloc(alloc, &digest);
+    return regions;
+}
+
+fn storedUnitIntegerValue(comptime T: type, value: std.json.Value) !T {
+    return switch (value) {
+        .integer => |integer| std.math.cast(T, integer) orelse error.InvalidDocumentExtractionState,
+        .number_string => |text| std.fmt.parseInt(T, text, 10) catch error.InvalidDocumentExtractionState,
+        else => error.InvalidDocumentExtractionState,
+    };
 }
 
 fn hexBytesAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
@@ -27487,6 +28159,9 @@ fn documentExtractionStateValueAlloc(
     unit_keys: []const []const u8,
     unit_descriptors: []const DocumentExtractionUnitDescriptor,
     chunk_keys: []const []const u8,
+    navigation_digest: []const u8,
+    navigation_block_count: u32,
+    chunk_unit_fingerprints: bool,
 ) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, .{
         .kind = "document_extraction_state_v1",
@@ -27494,7 +28169,38 @@ fn documentExtractionStateValueAlloc(
         .unit_keys = unit_keys,
         .unit_descriptors = unit_descriptors,
         .chunk_keys = chunk_keys,
+        .navigation_digest = navigation_digest,
+        .navigation_block_count = navigation_block_count,
+        .navigation_block_size = hierarchy_navigation_block_size,
+        .chunk_unit_fingerprint_version = if (chunk_unit_fingerprints) document_unit_fingerprint.current_state_version else @as(u8, 0),
     }, .{});
+}
+
+fn documentExtractionStateHasChunkUnitFingerprints(alloc: Allocator, state: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, state, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const version = parsed.value.object.get("chunk_unit_fingerprint_version") orelse return false;
+    return document_unit_fingerprint.stateVersionIsCurrent(version);
+}
+
+fn documentExtractionStateHasNavigationMetadata(alloc: Allocator, state: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, state, .{}) catch
+        return error.InvalidDocumentExtractionState;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionState;
+    return parsed.value.object.get("navigation_digest") != null or
+        parsed.value.object.get("navigation_block_count") != null or
+        parsed.value.object.get("navigation_block_size") != null;
+}
+
+fn documentExtractionStateNavigationBlockCount(alloc: Allocator, state: []const u8) !u32 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, state, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return 0;
+    const value = parsed.value.object.get("navigation_block_count") orelse return 0;
+    if (value != .integer) return error.InvalidDocumentExtractionState;
+    return std.math.cast(u32, value.integer) orelse error.InvalidDocumentExtractionState;
 }
 
 fn documentExtractionStateFingerprintMatches(alloc: Allocator, state: []const u8, fingerprint: []const u8) bool {
@@ -27623,6 +28329,7 @@ fn documentUnitPayloadAlloc(
     doc_key: []const u8,
     artifact_name: []const u8,
     unit: document_extraction_mod.Unit,
+    unit_fingerprint: []const u8,
     source_url: []const u8,
     content_type: []const u8,
     route: DocumentExtractionRangeRoute,
@@ -27635,6 +28342,7 @@ fn documentUnitPayloadAlloc(
         ._artifact_range_kind = "unit",
         ._artifact_route_status = route.route_status,
         ._artifact_owner_group_id = owner_group_id,
+        ._artifact_unit_fingerprint = unit_fingerprint,
         .unit_id = unit.unit_id,
         .unit_type = unit.unit_type,
         .text = unit.text,
@@ -31209,7 +31917,424 @@ fn reshapeChunkBackedResult(self: *DB, alloc: Allocator, req: types.SearchReques
         .load_parent_stored_many = loadParentStoredForSearchManyCallback,
         .load_stored = loadStoredForHitCallback,
         .load_many_stored = loadStoredSearchDocumentManyCallback,
+        .load_projected_stored = DB.loadProjectedSearchDocumentCallback,
+        .load_many_projected_stored = DB.loadProjectedSearchDocumentManyCallback,
     });
+}
+
+const hierarchy_navigation_position_version = hierarchy_navigation.position_version;
+const hierarchy_navigation_unit_fingerprint_field = hierarchy_navigation.unit_fingerprint_field;
+const hierarchy_navigation_cancel_stride: usize = 64;
+const hierarchy_navigation_block_size: u32 = 128;
+
+const HierarchyNavigationArtifact = struct {
+    name: []u8,
+    generation: u64,
+    digest: []u8,
+    unit_count: u32,
+    block_count: u32,
+    block_size: u32,
+    /// Legacy extraction states predate compact navigation blocks. They remain
+    /// readable until their next extraction rewrites the state in indexed form.
+    legacy_units: ?[]DocumentExtractionUnitDescriptor = null,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.digest);
+        if (self.legacy_units) |units| freeDocumentExtractionUnitDescriptors(alloc, units);
+        self.* = undefined;
+    }
+};
+
+const HierarchyNavigationSummary = struct {
+    generation: u64,
+    digest: []u8,
+    unit_count: u32,
+    block_count: u32,
+    block_size: u32,
+};
+
+fn validateHierarchyNavigationUnitDescriptor(
+    alloc: Allocator,
+    parent_id: []const u8,
+    artifact_name: []const u8,
+    unit: DocumentExtractionUnitDescriptor,
+) !void {
+    if (!internal_keys.isDocumentUnitArtifactRecordKey(unit.key) or unit.fingerprint.len == 0) {
+        return error.InvalidDocumentExtractionState;
+    }
+    var unit_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, unit.key)) orelse
+        return error.InvalidDocumentExtractionState;
+    defer unit_ref.deinit(alloc);
+    if (unit_ref.kind != .asset or unit_ref.unit_id == null or
+        !std.mem.eql(u8, unit_ref.document_id, parent_id) or
+        !std.mem.eql(u8, unit_ref.name, artifact_name))
+    {
+        return error.InvalidDocumentExtractionState;
+    }
+}
+
+fn hierarchyNavigationArtifactBlockUnitsAlloc(
+    self: *DB,
+    alloc: Allocator,
+    parent_id: []const u8,
+    artifact: HierarchyNavigationArtifact,
+    block_index: u32,
+) ![]DocumentExtractionUnitDescriptor {
+    if (block_index >= artifact.block_count or artifact.block_size != hierarchy_navigation_block_size) {
+        return error.InvalidDocumentExtractionState;
+    }
+    const block_start = @as(usize, block_index) * @as(usize, artifact.block_size);
+    const expected_len = @min(
+        @as(usize, artifact.block_size),
+        @as(usize, artifact.unit_count) - block_start,
+    );
+    const units = if (artifact.legacy_units) |legacy| blk: {
+        const out = try alloc.alloc(DocumentExtractionUnitDescriptor, expected_len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |descriptor| {
+                alloc.free(@constCast(descriptor.key));
+                alloc.free(@constCast(descriptor.fingerprint));
+            }
+            alloc.free(out);
+        }
+        for (legacy[block_start .. block_start + expected_len], 0..) |descriptor, i| {
+            out[i] = .{
+                .key = try alloc.dupe(u8, descriptor.key),
+                .fingerprint = try alloc.dupe(u8, descriptor.fingerprint),
+            };
+            initialized += 1;
+        }
+        break :blk out;
+    } else blk: {
+        const block_key = try internal_keys.documentUnitNavigationBlockKeyAlloc(
+            alloc,
+            parent_id,
+            artifact.name,
+            block_index,
+        );
+        defer alloc.free(block_key);
+        const raw = try self.core.getStoreValue(alloc, block_key) orelse
+            return error.InvalidDocumentExtractionState;
+        defer alloc.free(raw);
+        break :blk try hierarchyNavigationBlockUnitsAlloc(alloc, raw, block_index, expected_len);
+    };
+    errdefer freeDocumentExtractionUnitDescriptors(alloc, units);
+    for (units) |unit| try validateHierarchyNavigationUnitDescriptor(alloc, parent_id, artifact.name, unit);
+    return units;
+}
+
+fn checkHierarchyNavigationCancelled(req: types.SearchRequest) !void {
+    if (req.cancellation) |cancellation| {
+        if (cancellation.isCancelled()) return error.Cancelled;
+    }
+    if (req.execution_deadline_ns) |deadline_ns| {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+    }
+}
+
+fn checkLookupOptionsActive(opts: types.LookupOptions) !void {
+    if (opts.cancellation) |cancellation| {
+        if (cancellation.isCancelled()) return error.Cancelled;
+    }
+    if (opts.execution_deadline_ns) |deadline_ns| {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+    }
+}
+
+fn hierarchyNavigationArtifactLessThan(_: void, left: HierarchyNavigationArtifact, right: HierarchyNavigationArtifact) bool {
+    return std.mem.lessThan(u8, left.name, right.name);
+}
+
+const DocumentUnitHierarchyManifestInfo = struct {
+    generation: u64,
+    /// The last safely published hierarchy generation. An in-progress merge
+    /// has no readable generation; a failed merge retains its prior revision.
+    published_generation: ?u64,
+};
+
+fn documentUnitHierarchyManifestInfo(alloc: Allocator, manifest: []const u8) !DocumentUnitHierarchyManifestInfo {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, manifest, .{}) catch
+        return error.InvalidDocumentExtractionManifest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
+    const artifact_type = parsed.value.object.get("artifact_type") orelse return error.InvalidDocumentExtractionManifest;
+    if (artifact_type != .string) return error.InvalidDocumentExtractionManifest;
+    if (!std.mem.eql(u8, artifact_type.string, "document_units")) return error.InvalidDocumentExtractionManifest;
+    const generation = parsed.value.object.get("generation") orelse return error.InvalidDocumentExtractionManifest;
+    if (generation != .integer or generation.integer < 0) return error.InvalidDocumentExtractionManifest;
+    const generation_u64 = std.math.cast(u64, generation.integer) orelse return error.InvalidDocumentExtractionManifest;
+    const merge_plan = parsed.value.object.get("merge_plan") orelse return error.InvalidDocumentExtractionManifest;
+    if (merge_plan != .object) return error.InvalidDocumentExtractionManifest;
+    const status = merge_plan.object.get("status") orelse return error.InvalidDocumentExtractionManifest;
+    const from_generation = merge_plan.object.get("from_generation") orelse return error.InvalidDocumentExtractionManifest;
+    const to_generation = merge_plan.object.get("to_generation") orelse return error.InvalidDocumentExtractionManifest;
+    if (status != .string or from_generation != .integer or to_generation != .integer or
+        from_generation.integer < 0 or to_generation.integer <= 0)
+    {
+        return error.InvalidDocumentExtractionManifest;
+    }
+    const from_generation_u64 = std.math.cast(u64, from_generation.integer) orelse
+        return error.InvalidDocumentExtractionManifest;
+    const to_generation_u64 = std.math.cast(u64, to_generation.integer) orelse
+        return error.InvalidDocumentExtractionManifest;
+    if (from_generation_u64 >= to_generation_u64) {
+        return error.InvalidDocumentExtractionManifest;
+    }
+    if (std.mem.eql(u8, status.string, "converged")) {
+        if (generation_u64 == 0 or to_generation_u64 != generation_u64) return error.InvalidDocumentExtractionManifest;
+        return .{ .generation = generation_u64, .published_generation = generation_u64 };
+    }
+    if (std.mem.eql(u8, status.string, "failed")) {
+        if (generation_u64 == 0 or to_generation_u64 != generation_u64) return error.InvalidDocumentExtractionManifest;
+        // Streaming materialization may have flushed a prefix before failing.
+        // The retained prior summary therefore cannot prove that every old
+        // payload is intact; fail retryably until repair converges.
+        return .{ .generation = generation_u64, .published_generation = null };
+    }
+    if (std.mem.eql(u8, status.string, "in_progress")) {
+        if (from_generation_u64 != generation_u64) return error.InvalidDocumentExtractionManifest;
+        return .{ .generation = generation_u64, .published_generation = null };
+    }
+    return error.InvalidDocumentExtractionManifest;
+}
+
+fn hierarchyNavigationSourceRevisionAlloc(
+    alloc: Allocator,
+    artifacts: []const HierarchyNavigationArtifact,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(hierarchy_navigation_position_version);
+    for (artifacts) |artifact| {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, @intCast(artifact.name.len), .big);
+        hasher.update(&length);
+        hasher.update(artifact.name);
+        var generation: [8]u8 = undefined;
+        std.mem.writeInt(u64, &generation, artifact.generation, .big);
+        hasher.update(&generation);
+        var unit_count: [8]u8 = undefined;
+        std.mem.writeInt(u64, &unit_count, artifact.unit_count, .big);
+        hasher.update(&unit_count);
+        std.mem.writeInt(u64, &length, @intCast(artifact.digest.len), .big);
+        hasher.update(&length);
+        hasher.update(artifact.digest);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try hexBytesAlloc(alloc, &digest);
+}
+
+fn hierarchyNavigationArtifactDigestAlloc(
+    alloc: Allocator,
+    units: []const DocumentExtractionUnitDescriptor,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly-hierarchy-artifact-v1");
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, @intCast(units.len), .big);
+    hasher.update(&encoded);
+    for (units) |unit| {
+        std.mem.writeInt(u64, &encoded, @intCast(unit.key.len), .big);
+        hasher.update(&encoded);
+        hasher.update(unit.key);
+        std.mem.writeInt(u64, &encoded, @intCast(unit.fingerprint.len), .big);
+        hasher.update(&encoded);
+        hasher.update(unit.fingerprint);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try hexBytesAlloc(alloc, &digest);
+}
+
+fn hierarchyNavigationDigestIsValid(digest: []const u8) bool {
+    if (digest.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return false;
+    for (digest) |byte| {
+        if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return false;
+    }
+    return true;
+}
+
+fn hierarchyNavigationSummaryValueAlloc(
+    alloc: Allocator,
+    generation: u64,
+    digest: []const u8,
+    unit_count: u32,
+    block_count: u32,
+) ![]u8 {
+    if (generation == 0 or !hierarchyNavigationDigestIsValid(digest) or
+        block_count != hierarchyNavigationBlockCount(unit_count))
+    {
+        return error.InvalidDocumentExtractionState;
+    }
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .kind = "document_unit_navigation_summary_v1",
+        .generation = generation,
+        .digest = digest,
+        .unit_count = unit_count,
+        .block_count = block_count,
+        .block_size = hierarchy_navigation_block_size,
+    }, .{});
+}
+
+fn hierarchyNavigationSummaryParseAlloc(alloc: Allocator, raw: []const u8) !HierarchyNavigationSummary {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionState;
+    const object = parsed.value.object;
+    const kind = object.get("kind") orelse return error.InvalidDocumentExtractionState;
+    const generation = object.get("generation") orelse return error.InvalidDocumentExtractionState;
+    const digest = object.get("digest") orelse return error.InvalidDocumentExtractionState;
+    const unit_count = object.get("unit_count") orelse return error.InvalidDocumentExtractionState;
+    const block_count = object.get("block_count") orelse return error.InvalidDocumentExtractionState;
+    const block_size = object.get("block_size") orelse return error.InvalidDocumentExtractionState;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "document_unit_navigation_summary_v1") or
+        generation != .integer or generation.integer <= 0 or
+        digest != .string or !hierarchyNavigationDigestIsValid(digest.string) or
+        unit_count != .integer or block_count != .integer or block_size != .integer)
+    {
+        return error.InvalidDocumentExtractionState;
+    }
+    const summary = HierarchyNavigationSummary{
+        .generation = std.math.cast(u64, generation.integer) orelse return error.InvalidDocumentExtractionState,
+        .digest = try alloc.dupe(u8, digest.string),
+        .unit_count = std.math.cast(u32, unit_count.integer) orelse return error.InvalidDocumentExtractionState,
+        .block_count = std.math.cast(u32, block_count.integer) orelse return error.InvalidDocumentExtractionState,
+        .block_size = std.math.cast(u32, block_size.integer) orelse return error.InvalidDocumentExtractionState,
+    };
+    errdefer alloc.free(summary.digest);
+    if (summary.block_size != hierarchy_navigation_block_size or
+        summary.block_count != hierarchyNavigationBlockCount(summary.unit_count))
+    {
+        return error.InvalidDocumentExtractionState;
+    }
+    return summary;
+}
+
+fn hierarchyNavigationBlockCount(unit_count: u32) u32 {
+    if (unit_count == 0) return 0;
+    return std.math.divCeil(u32, unit_count, hierarchy_navigation_block_size) catch unreachable;
+}
+
+fn hierarchyNavigationBlockValueAlloc(
+    alloc: Allocator,
+    block_index: u32,
+    units: []const DocumentExtractionUnitDescriptor,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .kind = "document_unit_navigation_block_v1",
+        .block_index = block_index,
+        .units = units,
+    }, .{});
+}
+
+fn hierarchyNavigationBlockUnitsAlloc(
+    alloc: Allocator,
+    raw: []const u8,
+    expected_block_index: u32,
+    expected_len: usize,
+) ![]DocumentExtractionUnitDescriptor {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionState;
+    const kind = parsed.value.object.get("kind") orelse return error.InvalidDocumentExtractionState;
+    const block_index = parsed.value.object.get("block_index") orelse return error.InvalidDocumentExtractionState;
+    const units = parsed.value.object.get("units") orelse return error.InvalidDocumentExtractionState;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "document_unit_navigation_block_v1") or
+        block_index != .integer or std.math.cast(u32, block_index.integer) != expected_block_index or
+        units != .array or units.array.items.len != expected_len)
+    {
+        return error.InvalidDocumentExtractionState;
+    }
+    const out = try alloc.alloc(DocumentExtractionUnitDescriptor, units.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |descriptor| {
+            alloc.free(@constCast(descriptor.key));
+            alloc.free(@constCast(descriptor.fingerprint));
+        }
+        alloc.free(out);
+    }
+    for (units.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidDocumentExtractionState;
+        const key_value = item.object.get("key") orelse return error.InvalidDocumentExtractionState;
+        const fingerprint_value = item.object.get("fingerprint") orelse return error.InvalidDocumentExtractionState;
+        if (fingerprint_value != .string or fingerprint_value.string.len == 0) return error.InvalidDocumentExtractionState;
+        out[i] = .{
+            .key = try documentExtractionStateByteSliceAlloc(alloc, key_value),
+            .fingerprint = try alloc.dupe(u8, fingerprint_value.string),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn hierarchyNavigationPositionAlloc(
+    alloc: Allocator,
+    source_revision: []const u8,
+    artifact_name: []const u8,
+    generation: u64,
+    ordinal: usize,
+    unit_fingerprint: []const u8,
+) ![]u8 {
+    return hierarchy_navigation.positionAlloc(
+        alloc,
+        source_revision,
+        artifact_name,
+        generation,
+        ordinal,
+        unit_fingerprint,
+    ) catch |err| switch (err) {
+        error.InvalidHierarchyNavigationPosition => error.InvalidDocumentExtractionState,
+        else => |other| other,
+    };
+}
+
+fn hierarchyNavigationPositionParse(artifact_name: []const u8, position: []const u8) !hierarchy_navigation.Position {
+    return hierarchy_navigation.parsePositionForArtifact(artifact_name, position) catch |err| switch (err) {
+        error.InvalidHierarchyNavigationPosition => error.InvalidDocumentExtractionState,
+        error.HierarchyNavigationPositionVersionStale => error.HierarchyCursorStale,
+    };
+}
+
+fn hierarchyNavigationStoredUnitMatchesPosition(
+    alloc: Allocator,
+    stored: []const u8,
+    artifact_name: []const u8,
+    position: hierarchy_navigation.Position,
+) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionState;
+    if (parsed.value.object.get(hierarchy_navigation_unit_fingerprint_field)) |fingerprint| {
+        if (fingerprint != .string) return error.InvalidDocumentExtractionState;
+        return hierarchy_navigation.positionUnitFingerprintMatches(position, artifact_name, fingerprint.string);
+    }
+    const actual = try documentExtractionStoredUnitFingerprintAlloc(alloc, stored);
+    defer alloc.free(actual);
+    return hierarchy_navigation.positionUnitFingerprintMatches(position, artifact_name, actual);
+}
+
+fn hierarchyUnitMatchFilterJsonAlloc(
+    alloc: Allocator,
+    existing_filter_json: []const u8,
+    unit_key: []const u8,
+) ![]u8 {
+    const encoded_unit_key = try std.json.Stringify.valueAlloc(alloc, unit_key, .{});
+    defer alloc.free(encoded_unit_key);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    if (existing_filter_json.len > 0) {
+        try out.appendSlice(alloc, "{\"bool\":{\"must\":[");
+        try out.appendSlice(alloc, existing_filter_json);
+        try out.append(alloc, ',');
+    }
+    try out.appendSlice(alloc, "{\"term\":{\"path\":\"/_parent_unit_key\",\"value\":");
+    try out.appendSlice(alloc, encoded_unit_key);
+    try out.appendSlice(alloc, "}}");
+    if (existing_filter_json.len > 0) try out.appendSlice(alloc, "]}}");
+    return try out.toOwnedSlice(alloc);
 }
 
 fn resolveChunkParentId(self: *DB, alloc: Allocator, hit: types.SearchHit) ![]u8 {
@@ -50500,7 +51625,13 @@ test "db document unit payload preserves pdf page provenance" {
         .char_end = 5,
     };
 
-    const payload = try documentUnitPayloadAlloc(alloc, "doc:a", "document_units_v1", unit, "data:application/pdf;base64,AA==", "application/pdf", .{ .range_id = "range:000000" });
+    const fingerprint = try documentExtractionUnitFingerprintAlloc(alloc, unit);
+    defer alloc.free(fingerprint);
+    const legacy_fingerprint = try document_unit_fingerprint.legacyFingerprintAlloc(alloc, unit);
+    defer alloc.free(legacy_fingerprint);
+    try std.testing.expect(document_unit_fingerprint.isCurrent(fingerprint));
+    try std.testing.expect(!std.mem.eql(u8, fingerprint, legacy_fingerprint));
+    const payload = try documentUnitPayloadAlloc(alloc, "doc:a", "document_units_v1", unit, fingerprint, "data:application/pdf;base64,AA==", "application/pdf", .{ .range_id = "range:000000" });
     defer alloc.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
@@ -50529,6 +51660,25 @@ test "db document unit payload preserves pdf page provenance" {
     try std.testing.expectEqual(@as(i64, 5), region.get("span").?.array.items[1].integer);
     try std.testing.expectEqual(@as(i64, 72), region.get("bbox").?.array.items[0].integer);
     try std.testing.expectEqual(@as(i64, 712), region.get("bbox").?.array.items[3].integer);
+
+    // Pre-marker payloads remain readable during rolling upgrades. Their
+    // fingerprint is reconstructed with the legacy encoding from the stored
+    // unit fields,
+    // while malformed legacy provenance is rejected instead of trapping.
+    _ = parsed.value.object.orderedRemove(hierarchy_navigation_unit_fingerprint_field);
+    const legacy_payload = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    defer alloc.free(legacy_payload);
+    const reconstructed = try documentExtractionStoredUnitFingerprintAlloc(alloc, legacy_payload);
+    defer alloc.free(reconstructed);
+    try std.testing.expectEqualStrings(legacy_fingerprint, reconstructed);
+
+    const malformed_payload =
+        \\{"unit_id":"page:000001","unit_type":"page","text":"hello","ocr_attempted":false,"provenance":{"method":"pdf_text","ocr_used":false,"transcript_used":false,"text_regions":[{"span":["bad",5],"bbox":[72,700,120,712]}]}}
+    ;
+    try std.testing.expectError(
+        error.InvalidDocumentExtractionState,
+        documentExtractionStoredUnitFingerprintAlloc(alloc, malformed_payload),
+    );
 }
 
 test "db document unit payload marks scanned pdf pages as pending OCR" {
@@ -50547,11 +51697,11 @@ test "db document unit payload marks scanned pdf pages as pending OCR" {
         .char_end = 5,
     };
 
-    const payload = try documentUnitPayloadAlloc(alloc, "doc:a", "document_units_v1", unit, "data:application/pdf;base64,AA==", "application/pdf", .{ .range_id = "range:000000" });
-    defer alloc.free(payload);
     const fingerprint = try documentExtractionUnitFingerprintAlloc(alloc, unit);
     defer alloc.free(fingerprint);
-    try std.testing.expectEqual(@as(usize, 64), fingerprint.len);
+    const payload = try documentUnitPayloadAlloc(alloc, "doc:a", "document_units_v1", unit, fingerprint, "data:application/pdf;base64,AA==", "application/pdf", .{ .range_id = "range:000000" });
+    defer alloc.free(payload);
+    try std.testing.expect(document_unit_fingerprint.isCurrent(fingerprint));
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
     defer parsed.deinit();
@@ -50592,6 +51742,15 @@ test "db document extraction asset materializes unit artifacts from data url" {
         .content_type = "application/json",
         .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
     });
+    // A source may have multiple asset enrichments. Opaque non-document
+    // payloads must never be sniffed as extraction manifests by traversal.
+    try db.addEnrichment(.{
+        .name = "source_copy_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"copy\"}",
+    });
 
     try db.batch(.{
         .writes = &.{.{
@@ -50609,6 +51768,10 @@ test "db document extraction asset materializes unit artifacts from data url" {
     defer alloc.free(unit_key);
     const state_key = try assetStateKeyAlloc(alloc, "doc:a", "document_units_v1");
     defer alloc.free(state_key);
+    const navigation_summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, "doc:a", "document_units_v1");
+    defer alloc.free(navigation_summary_key);
+    const navigation_block_key = try internal_keys.documentUnitNavigationBlockKeyAlloc(alloc, "doc:a", "document_units_v1", 0);
+    defer alloc.free(navigation_block_key);
 
     const manifest = try db.core.store.get(alloc, manifest_key);
     defer alloc.free(manifest);
@@ -50623,12 +51786,285 @@ test "db document extraction asset materializes unit artifacts from data url" {
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"unit_id\":\"document:000001\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"alpha beta\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"_artifact_unit_fingerprint\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"_hierarchy\"") == null);
 
     const state = try db.core.store.get(alloc, state_key);
     defer alloc.free(state);
     try std.testing.expect(std.mem.indexOf(u8, state, "\"kind\":\"document_extraction_state_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, state, "\"unit_descriptors\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, state, "document:000001") != null);
+
+    const navigation_summary = try db.core.store.get(alloc, navigation_summary_key);
+    defer alloc.free(navigation_summary);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"kind\":\"document_unit_navigation_summary_v1\",\"generation\":1,\"unit_count\":1,\"block_count\":1}",
+        navigation_summary,
+    );
+
+    const navigation_block = try db.core.store.get(alloc, navigation_block_key);
+    defer alloc.free(navigation_block);
+    try std.testing.expect(std.mem.indexOf(u8, navigation_block, "\"kind\":\"document_unit_navigation_block_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, navigation_block, "document:000001") != null);
+
+    // Simulate an artifact retained from before compact navigation metadata.
+    // An unchanged-source enrichment pass must backfill from descriptors while
+    // preserving the manifest generation, rather than downloading/extracting.
+    var legacy_state_parsed = try std.json.parseFromSlice(std.json.Value, alloc, state, .{});
+    defer legacy_state_parsed.deinit();
+    _ = legacy_state_parsed.value.object.orderedRemove("navigation_digest");
+    _ = legacy_state_parsed.value.object.orderedRemove("navigation_block_count");
+    _ = legacy_state_parsed.value.object.orderedRemove("navigation_block_size");
+    const legacy_state = try std.json.Stringify.valueAlloc(alloc, legacy_state_parsed.value, .{});
+    defer alloc.free(legacy_state);
+    try db.core.store.put(state_key, legacy_state);
+    try db.core.store.delete(navigation_summary_key);
+    try db.core.store.delete(navigation_block_key);
+    var backfill_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer {
+        for (backfill_writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        backfill_writes.deinit(alloc);
+    }
+    var backfill_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (backfill_deletes.items) |key| alloc.free(@constCast(key));
+        backfill_deletes.deinit(alloc);
+    }
+    try appendDocumentExtractionNavigationBackfill(
+        alloc,
+        &db,
+        "doc:a",
+        "document_units_v1",
+        "6c1146dc037bb3ca77d4248754322b14697b236ddaddf5203b13ab97f133fb78",
+        legacy_state,
+        (try documentUnitHierarchyManifestInfo(alloc, manifest)).published_generation.?,
+        &backfill_writes,
+        &backfill_deletes,
+    );
+    for (backfill_writes.items) |write| try db.core.store.put(write.key, write.value);
+    for (backfill_deletes.items) |key| try db.core.store.delete(key);
+    const backfilled_manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(backfilled_manifest);
+    try std.testing.expectEqualStrings(manifest, backfilled_manifest);
+    const backfilled_state = try db.core.store.get(alloc, state_key);
+    defer alloc.free(backfilled_state);
+    const backfilled_summary = try db.core.store.get(alloc, navigation_summary_key);
+    defer alloc.free(backfilled_summary);
+    const backfilled_block = try db.core.store.get(alloc, navigation_block_key);
+    defer alloc.free(backfilled_block);
+    try std.testing.expect(try hierarchy_navigation.indexMetadataMatches(alloc, backfilled_state, backfilled_summary, 1));
+
+    const navigation_order = [_]types.SortField{
+        .{ .field = "_hierarchy.position" },
+        .{ .field = "_id" },
+    };
+
+    // A missing summary is only eligible for legacy fallback when the state
+    // predates all navigation metadata. Current-format state must never be
+    // traversed through that fallback during a partial publication.
+    try db.core.store.delete(navigation_summary_key);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .limit = 20,
+        .include_all_fields = false,
+    }));
+    try db.core.store.put(navigation_summary_key, backfilled_summary);
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.search(alloc, .{
+        .query = .{ .match_none = {} },
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .include_all_fields = false,
+    }));
+    var navigation = try db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .limit = 20,
+        .include_all_fields = false,
+        .fields = &.{ "unit_id", "unit_type", "text", hierarchy_navigation_unit_fingerprint_field },
+    });
+    defer navigation.deinit();
+    try std.testing.expectEqual(@as(u32, 1), navigation.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), navigation.hits.len);
+    try std.testing.expectEqual(@as(usize, 2), navigation.hits[0].sort_values.len);
+    try std.testing.expect(std.mem.startsWith(u8, navigation.hits[0].sort_values[0].string, "hn3/"));
+    try std.testing.expect(std.mem.indexOf(u8, navigation.hits[0].sort_values[0].string, "/646f63756d656e745f756e6974735f7631/") != null);
+    try std.testing.expectEqualStrings("document:000001", navigation.hits[0].artifact_ref.?.unit_id.?);
+    var projected_unit = try std.json.parseFromSlice(std.json.Value, alloc, navigation.hits[0].stored_data.?, .{});
+    defer projected_unit.deinit();
+    try ant_json.testing.expectSubsetJsonValue(
+        alloc,
+        "{\"unit_id\":\"document:000001\",\"text\":\"alpha beta\"}",
+        projected_unit.value,
+    );
+    try std.testing.expect(projected_unit.value.object.get("_hierarchy") == null);
+    try std.testing.expect(projected_unit.value.object.get(hierarchy_navigation_unit_fingerprint_field) == null);
+
+    // A reader that races an extraction must never combine the old summary
+    // with artifacts being rewritten under an in-progress manifest.
+    try db.core.store.put(
+        manifest_key,
+        "{\"artifact_type\":\"document_units\",\"generation\":1," ++
+            "\"merge_plan\":{\"from_generation\":1,\"to_generation\":2,\"status\":\"in_progress\"}}",
+    );
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .limit = 20,
+        .include_all_fields = false,
+    }));
+    try db.core.store.put(
+        manifest_key,
+        "{\"artifact_type\":\"document_units\",\"generation\":2," ++
+            "\"merge_plan\":{\"from_generation\":1,\"to_generation\":2,\"status\":\"failed\"}}",
+    );
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .limit = 20,
+        .include_all_fields = false,
+    }));
+    try db.core.store.put(manifest_key, manifest);
+
+    // Independently read records are cross-checked by revision so even an
+    // unexpected non-atomic store implementation fails closed.
+    var mismatched_summary_parsed = try std.json.parseFromSlice(std.json.Value, alloc, backfilled_summary, .{});
+    defer mismatched_summary_parsed.deinit();
+    mismatched_summary_parsed.value.object.getPtr("generation").?.* = .{ .integer = 2 };
+    const mismatched_summary = try std.json.Stringify.valueAlloc(alloc, mismatched_summary_parsed.value, .{});
+    defer alloc.free(mismatched_summary);
+    try db.core.store.put(navigation_summary_key, mismatched_summary);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .limit = 20,
+        .include_all_fields = false,
+    }));
+    try db.core.store.put(navigation_summary_key, backfilled_summary);
+
+    var identity_navigation = try db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .limit = 20,
+        .include_stored = false,
+        .include_all_fields = false,
+        .fields = &.{},
+    });
+    defer identity_navigation.deinit();
+    try std.testing.expectEqual(@as(usize, 1), identity_navigation.hits.len);
+    try std.testing.expect(identity_navigation.hits[0].stored_data == null);
+    try std.testing.expectEqualStrings(
+        navigation.hits[0].sort_values[0].string,
+        identity_navigation.hits[0].sort_values[0].string,
+    );
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .limit = 20,
+        .include_all_fields = false,
+        .cancellation = types.CancellationToken.fromAtomic(&cancelled),
+    }));
+
+    // The parent-owned state remains authoritative when a unit payload is on a
+    // child-range shard. The local planner must retain the unit and let the
+    // table coordinator hydrate the selected page through routed lookups.
+    try db.core.store.delete(unit_key);
+    var remote_unit_page = try db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .defer_hierarchy_child_hydration = true,
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .limit = 20,
+        .include_all_fields = false,
+    });
+    defer remote_unit_page.deinit();
+    try std.testing.expectEqual(@as(u32, 1), remote_unit_page.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), remote_unit_page.hits.len);
+    try std.testing.expect(remote_unit_page.hits[0].stored_data == null);
+    try db.core.store.put(unit_key, unit_payload);
+
+    const stale_cursor = [_]std.json.Value{
+        .{ .string = navigation.hits[0].sort_values[0].string },
+        .{ .string = navigation.hits[0].sort_values[1].string },
+    };
+    const malformed_cursor = [_]std.json.Value{
+        .{ .string = "hn1/not-a-source-revision/document_units_v1/00000000000000000001/00000000000000000000/fingerprint" },
+        .{ .string = navigation.hits[0].sort_values[1].string },
+    };
+    const legacy_cursor = [_]std.json.Value{
+        .{ .string = "hn2/retired" },
+        .{ .string = navigation.hits[0].sort_values[1].string },
+    };
+    const short_cursor = [_]std.json.Value{.{ .string = navigation.hits[0].sort_values[0].string }};
+    const non_string_cursor = [_]std.json.Value{
+        .{ .integer = 1 },
+        .{ .string = navigation.hits[0].sort_values[1].string },
+    };
+    for ([_][]const std.json.Value{ &short_cursor, &non_string_cursor }) |invalid_cursor| {
+        try std.testing.expectError(error.InvalidQueryRequest, db.search(alloc, .{
+            .hierarchy_children = .{ .parent_id = "doc:a" },
+            .return_mode = .unit,
+            .order_by = &navigation_order,
+            .search_after = invalid_cursor,
+            .limit = 20,
+            .include_all_fields = false,
+        }));
+    }
+    for ([_]u32{ 0, types.max_canonical_hierarchy_groups + 1 }) |invalid_limit| {
+        try std.testing.expectError(error.InvalidQueryRequest, db.search(alloc, .{
+            .hierarchy_children = .{ .parent_id = "doc:a" },
+            .return_mode = .unit,
+            .order_by = &navigation_order,
+            .limit = invalid_limit,
+            .include_all_fields = false,
+        }));
+    }
+    try std.testing.expectError(error.InvalidQueryRequest, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .search_after = &malformed_cursor,
+        .limit = 20,
+        .include_all_fields = false,
+    }));
+    try std.testing.expectError(error.HierarchyCursorStale, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .search_after = &legacy_cursor,
+        .limit = 20,
+        .include_all_fields = false,
+    }));
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,Z2FtbWEgZGVsdGE=\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try std.testing.expectError(error.HierarchyCursorStale, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .search_after = &stale_cursor,
+        .limit = 20,
+        .include_all_fields = false,
+    }));
 
     try db.batch(.{
         .writes = &.{.{
@@ -50640,6 +52076,322 @@ test "db document extraction asset materializes unit artifacts from data url" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, manifest_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unit_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, navigation_summary_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, navigation_block_key));
+
+    // Row policy must not turn parent existence into a cursor-response oracle.
+    // Exercise the same initial/valid/malformed cursor matrix below while the
+    // source still exists but an internal authorization filter excludes it.
+    const hidden_parent_request = types.SearchRequest{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .limit = 20,
+        .include_all_fields = false,
+        .filter_doc_ids = &.{"doc:other"},
+        .filter_doc_ids_positive = true,
+    };
+    var hidden_source = try db.search(alloc, hidden_parent_request);
+    defer hidden_source.deinit();
+    try std.testing.expectEqual(@as(u32, 0), hidden_source.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), hidden_source.hits.len);
+    var hidden_valid_cursor = hidden_parent_request;
+    hidden_valid_cursor.search_after = &stale_cursor;
+    try std.testing.expectError(error.HierarchyCursorStale, db.search(alloc, hidden_valid_cursor));
+    var hidden_malformed_cursor = hidden_parent_request;
+    hidden_malformed_cursor.search_after = &malformed_cursor;
+    try std.testing.expectError(error.InvalidQueryRequest, db.search(alloc, hidden_malformed_cursor));
+
+    // Deleting the parent after issuing a page cursor invalidates the complete
+    // hierarchy revision. Initial traversal remains an empty collection, while
+    // continuation returns exactly the same cursor classifications as the
+    // authorization-hidden source above.
+    try db.batch(.{
+        .deletes = &.{"doc:a"},
+        .sync_level = .enrichments,
+    });
+    var missing_source = try db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .limit = 20,
+        .include_all_fields = false,
+    });
+    defer missing_source.deinit();
+    try std.testing.expectEqual(@as(u32, 0), missing_source.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), missing_source.hits.len);
+    const missing_shard_request = types.SearchRequest{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .search_after = &stale_cursor,
+        .limit = 20,
+        .include_all_fields = false,
+        .defer_hierarchy_child_hydration = true,
+    };
+    var missing_shard = try db.search(alloc, missing_shard_request);
+    defer missing_shard.deinit();
+    try std.testing.expectEqual(@as(u32, 0), missing_shard.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), missing_shard.hits.len);
+    try std.testing.expectError(error.HierarchyCursorStale, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .search_after = &stale_cursor,
+        .limit = 20,
+        .include_all_fields = false,
+    }));
+    try std.testing.expectError(error.InvalidQueryRequest, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &navigation_order,
+        .search_after = &malformed_cursor,
+        .limit = 20,
+        .include_all_fields = false,
+    }));
+}
+
+test "db canonical hierarchy traversal rejects typed retrieval controls" {
+    const order = [_]types.SortField{
+        .{ .field = "_hierarchy.position" },
+        .{ .field = "_id" },
+    };
+    const canonical = types.SearchRequest{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .include_all_fields = false,
+        .fields = &.{},
+        .order_by = &order,
+    };
+    try std.testing.expect(types.canonicalHierarchyChildrenRequestIsValid(canonical));
+
+    var match_none = canonical;
+    match_none.query = .{ .match_none = {} };
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(match_none));
+
+    var profiled = canonical;
+    profiled.profile = true;
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(profiled));
+
+    var ranked = canonical;
+    ranked.reranker_query_text = "ignored";
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(ranked));
+
+    var native_filtered = canonical;
+    native_filtered.filter_ids = &.{1};
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(native_filtered));
+
+    var text_resolved = canonical;
+    var text_filter_marker: u8 = 0;
+    text_resolved.resolved_text_doc_filter = &text_filter_marker;
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(text_resolved));
+
+    var algebraic_resolution = canonical;
+    algebraic_resolution.require_algebraic_filter_resolution = true;
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(algebraic_resolution));
+
+    var distributed = canonical;
+    distributed.distributed_text_stats = &.{.{ .field = "body" }};
+    try std.testing.expect(!types.canonicalHierarchyChildrenRequestIsValid(distributed));
+
+    var authorized = canonical;
+    authorized.filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"a\"}}";
+    authorized.filter_doc_ids = &.{"doc:a"};
+    authorized.filter_doc_ids_positive = true;
+    try std.testing.expect(types.canonicalHierarchyChildrenRequestIsValid(authorized));
+}
+
+test "db hierarchy navigation seeks only the descriptor blocks needed by the page" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:blocked", .value = "{\"title\":\"blocked traversal\"}" }},
+        .sync_level = .write,
+    });
+
+    const descriptors = try alloc.alloc(DocumentExtractionUnitDescriptor, hierarchy_navigation_block_size + 1);
+    var initialized: usize = 0;
+    defer {
+        for (descriptors[0..initialized]) |descriptor| {
+            alloc.free(@constCast(descriptor.key));
+            alloc.free(@constCast(descriptor.fingerprint));
+        }
+        alloc.free(descriptors);
+    }
+    for (descriptors, 0..) |*descriptor, ordinal| {
+        const unit_id = try std.fmt.allocPrint(alloc, "page:{d:0>6}", .{ordinal + 1});
+        defer alloc.free(unit_id);
+        descriptor.* = .{
+            .key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:blocked", "document_units_v1", unit_id),
+            .fingerprint = try std.fmt.allocPrint(alloc, "fingerprint-{d}", .{ordinal + 1}),
+        };
+        initialized += 1;
+    }
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:blocked", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    try db.core.store.put(
+        manifest_key,
+        "{\"artifact_type\":\"document_units\",\"generation\":1," ++
+            "\"merge_plan\":{\"from_generation\":0,\"to_generation\":1,\"status\":\"converged\"}}",
+    );
+    const digest = try hierarchyNavigationArtifactDigestAlloc(alloc, descriptors);
+    defer alloc.free(digest);
+    const summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, "doc:blocked", "document_units_v1");
+    defer alloc.free(summary_key);
+    const summary = try hierarchyNavigationSummaryValueAlloc(alloc, 1, digest, @intCast(descriptors.len), 2);
+    defer alloc.free(summary);
+    try db.core.store.put(summary_key, summary);
+
+    const first_block_key = try internal_keys.documentUnitNavigationBlockKeyAlloc(alloc, "doc:blocked", "document_units_v1", 0);
+    defer alloc.free(first_block_key);
+    const first_block = try hierarchyNavigationBlockValueAlloc(alloc, 0, descriptors[0..hierarchy_navigation_block_size]);
+    defer alloc.free(first_block);
+    try db.core.store.put(first_block_key, first_block);
+    try db.core.store.put(descriptors[0].key, "{\"_artifact_unit_fingerprint\":\"fingerprint-1\"}");
+    const second_block_key = try internal_keys.documentUnitNavigationBlockKeyAlloc(alloc, "doc:blocked", "document_units_v1", 1);
+    defer alloc.free(second_block_key);
+    // A corrupt later block is intentional: the first page must not touch it.
+    try db.core.store.put(second_block_key, "{}");
+
+    const order = [_]types.SortField{
+        .{ .field = "_hierarchy.position" },
+        .{ .field = "_id" },
+    };
+    var first_page = try db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:blocked" },
+        .return_mode = .unit,
+        .order_by = &order,
+        .limit = 1,
+        .include_all_fields = false,
+        .fields = &.{},
+    });
+    defer first_page.deinit();
+    try std.testing.expectEqual(@as(u32, hierarchy_navigation_block_size + 1), first_page.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), first_page.hits.len);
+    try std.testing.expectEqualStrings("page:000001", first_page.hits[0].artifact_ref.?.unit_id.?);
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:blocked" },
+        .return_mode = .unit,
+        .order_by = &order,
+        .offset = hierarchy_navigation_block_size,
+        .limit = 1,
+        .include_all_fields = false,
+        .fields = &.{},
+    }));
+
+    try db.core.store.delete(descriptors[0].key);
+    try std.testing.expectError(error.InvalidDocumentExtractionState, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:blocked" },
+        .return_mode = .unit,
+        .order_by = &order,
+        .limit = 1,
+        .include_all_fields = false,
+        .fields = &.{},
+    }));
+}
+
+test "db hierarchy cursor binds every unit artifact revision under its source" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    for ([_][]const u8{ "a/units_v1", "z_units_v1" }) |name| {
+        try db.addEnrichment(.{
+            .name = name,
+            .kind = .asset,
+            .field = "url",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+        });
+    }
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    const order = [_]types.SortField{
+        .{ .field = "_hierarchy.position" },
+        .{ .field = "_id" },
+    };
+    var first_page = try db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &order,
+        .limit = 1,
+        .include_all_fields = false,
+    });
+    defer first_page.deinit();
+    try std.testing.expectEqual(@as(u32, 2), first_page.total_hits);
+    try std.testing.expectEqualStrings("a/units_v1", first_page.hits[0].artifact_ref.?.name);
+    const cursor = [_]std.json.Value{
+        .{ .string = first_page.hits[0].sort_values[0].string },
+        .{ .string = first_page.hits[0].sort_values[1].string },
+    };
+
+    var replay = try db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &order,
+        .search_after = &cursor,
+        .limit = 1,
+        .include_all_fields = false,
+    });
+    defer replay.deinit();
+    try std.testing.expectEqual(@as(usize, 1), replay.hits.len);
+    try std.testing.expectEqualStrings("z_units_v1", replay.hits[0].artifact_ref.?.name);
+
+    // Reprocess only the later-sorting sibling artifact. A cursor located in
+    // the unchanged first artifact must still be rejected because traversal is
+    // bound to the complete source hierarchy revision.
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "z_units_v1"));
+    try std.testing.expectError(error.HierarchyCursorStale, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &order,
+        .search_after = &cursor,
+        .limit = 1,
+        .include_all_fields = false,
+    }));
+
+    const corrupt_manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "z_units_v1");
+    defer alloc.free(corrupt_manifest_key);
+    try db.core.store.put(corrupt_manifest_key, "{\"artifact_type\":\"document_units\"}");
+    try std.testing.expectError(error.InvalidDocumentExtractionManifest, db.search(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .return_mode = .unit,
+        .order_by = &order,
+        .limit = 1,
+        .include_all_fields = false,
+    }));
 }
 
 test "db async document extraction accounts resource manager working set" {
@@ -54767,6 +56519,10 @@ test "db document extraction chunks units through source artifact enrichment" {
 
     const chunk_payload = try db.core.store.get(alloc, chunk_key);
     defer alloc.free(chunk_payload);
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    var parsed_unit_payload = try std.json.parseFromSlice(std.json.Value, alloc, unit_payload, .{});
+    defer parsed_unit_payload.deinit();
     try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"_parent_doc_key\":\"doc:a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"_parent_unit_id\":\"document:000001\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"_artifact_name\":\"document_chunks_v1\"") != null);
@@ -54778,6 +56534,10 @@ test "db document extraction chunks units through source artifact enrichment" {
     try std.testing.expectEqualStrings("chunk", parsed_chunk_payload.value.object.get("_artifact_range_kind").?.string);
     try std.testing.expectEqualStrings("local_committed", parsed_chunk_payload.value.object.get("_artifact_route_status").?.string);
     try std.testing.expectEqual(@as(i64, 0), parsed_chunk_payload.value.object.get("_artifact_owner_group_id").?.integer);
+    try std.testing.expectEqualStrings(
+        parsed_unit_payload.value.object.get(hierarchy_navigation_unit_fingerprint_field).?.string,
+        parsed_chunk_payload.value.object.get(hierarchy_navigation_unit_fingerprint_field).?.string,
+    );
     const chunk_provenance = parsed_chunk_payload.value.object.get("provenance").?.object;
     try std.testing.expectEqualStrings("unit", chunk_provenance.get("offset_basis").?.string);
     try std.testing.expectEqualStrings("document:000001", chunk_provenance.get("parent_unit_id").?.string);
@@ -54801,6 +56561,11 @@ test "db document extraction chunks units through source artifact enrichment" {
     try std.testing.expect(std.mem.indexOf(u8, state, "\"chunk_keys\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, state, "\"unit_descriptors\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, state, "\"fingerprint\"") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"chunk_unit_fingerprint_version\":2}",
+        state,
+    );
 
     const manifest = try db.core.store.get(alloc, manifest_key);
     defer alloc.free(manifest);
@@ -54992,7 +56757,18 @@ test "db document extraction state round-trips binary chunk keys beyond one byte
 
     const descriptors = try documentExtractionUnitDescriptorsFromKeysAlloc(alloc, unit_keys.items, unit_fingerprints.items);
     defer alloc.free(descriptors);
-    const state = try documentExtractionStateValueAlloc(alloc, "source-fingerprint", unit_keys.items, descriptors, chunk_keys.items);
+    const navigation_digest = try hierarchyNavigationArtifactDigestAlloc(alloc, descriptors);
+    defer alloc.free(navigation_digest);
+    const state = try documentExtractionStateValueAlloc(
+        alloc,
+        "source-fingerprint",
+        unit_keys.items,
+        descriptors,
+        chunk_keys.items,
+        navigation_digest,
+        hierarchyNavigationBlockCount(@intCast(descriptors.len)),
+        true,
+    );
     defer alloc.free(state);
 
     const parsed_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
@@ -60256,7 +62032,7 @@ test "db ttl broad live filter preserves all-doc sentinel" {
     try std.testing.expect(filtered == .all);
 }
 
-test "db getArtifact loads stored chunk artifacts by public id" {
+test "db public artifact lookup strips private hierarchy metadata without changing internal records" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -60270,7 +62046,10 @@ test "db getArtifact loads stored chunk artifacts by public id" {
     defer alloc.free(chunk_zero);
     const internal_key = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(internal_key);
-    try db.core.store.put(internal_key, "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0}");
+    try db.core.store.put(
+        internal_key,
+        "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0,\"_artifact_unit_fingerprint\":\"private\"}",
+    );
 
     var artifact = (try db.getArtifact(alloc, chunk_zero)) orelse return error.TestUnexpectedResult;
     defer artifact.deinit(alloc);
@@ -60280,8 +62059,20 @@ test "db getArtifact loads stored chunk artifacts by public id" {
     try std.testing.expectEqualStrings("doc:a", artifact.artifact_ref.document_id);
     try std.testing.expectEqualStrings("body_chunks_v1", artifact.artifact_ref.name);
     try std.testing.expectEqual(@as(?u32, 0), artifact.artifact_ref.chunk_id);
-    try std.testing.expect(std.mem.indexOf(u8, artifact.value, "\"_chunk_id\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, artifact.value, "\"body\":\"abcdefgh\"") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"body\":\"abcdefgh\",\"_chunk_id\":0,\"_artifact_unit_fingerprint\":\"private\"}",
+        artifact.value,
+    );
+
+    var public_artifact = (try db.getPublicArtifact(alloc, chunk_zero)) orelse return error.TestUnexpectedResult;
+    defer public_artifact.deinit(alloc);
+    try std.testing.expectEqualStrings(chunk_zero, public_artifact.id);
+    try ant_json.testing.expectEqualJsonText(
+        alloc,
+        "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0}",
+        public_artifact.value,
+    );
 }
 
 test "canonical grouped match requests isolate nested pagination and work" {
@@ -79098,7 +80889,7 @@ test "db lookup includes chunk artifacts when _chunks is requested" {
     defer alloc.free(chunk_zero);
     const chunk_one = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 1);
     defer alloc.free(chunk_one);
-    try db.core.store.put(chunk_zero, "{\"body\":\"hello\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0,\"_start_offset\":0,\"_end_offset\":5}");
+    try db.core.store.put(chunk_zero, "{\"body\":\"hello\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0,\"_start_offset\":0,\"_end_offset\":5,\"_artifact_unit_fingerprint\":\"private\"}");
     try db.core.store.put(chunk_one, "{\"body\":\"world\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":1,\"_start_offset\":6,\"_end_offset\":11}");
 
     var result = (try db.lookup(alloc, "doc:a", .{
@@ -79120,6 +80911,7 @@ test "db lookup includes chunk artifacts when _chunks is requested" {
     try std.testing.expectEqualStrings("hello", chunks[0].object.get("body").?.string);
     try std.testing.expectEqualStrings("hello", chunks[0].object.get("_content").?.string);
     try std.testing.expect(chunks[0].object.get("_artifact_name") == null);
+    try std.testing.expect(chunks[0].object.get(hierarchy_navigation_unit_fingerprint_field) == null);
     try std.testing.expectEqual(@as(i64, 1), chunks[1].object.get("_chunk_id").?.integer);
 }
 
@@ -79153,7 +80945,7 @@ test "db lookup includes unified artifact projection when _artifacts is requeste
     defer alloc.free(chunk_zero);
     const chunk_one = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 1);
     defer alloc.free(chunk_one);
-    try db.core.store.put(chunk_zero, "{\"body\":\"hello\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0,\"_start_offset\":0,\"_end_offset\":5}");
+    try db.core.store.put(chunk_zero, "{\"body\":\"hello\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0,\"_start_offset\":0,\"_end_offset\":5,\"_artifact_unit_fingerprint\":\"private\"}");
     try db.core.store.put(chunk_one, "{\"body\":\"world\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":1,\"_start_offset\":6,\"_end_offset\":11}");
 
     const dense_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
@@ -79178,7 +80970,7 @@ test "db lookup includes unified artifact projection when _artifacts is requeste
     defer entities_ref.deinit(alloc);
     const entities_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, entities_ref);
     defer alloc.free(entities_key);
-    try db.core.store.put(entities_key, "{\"entities\":[{\"text\":\"Antfly\"}],\"relations\":[]}");
+    try db.core.store.put(entities_key, "{\"entities\":[{\"text\":\"Antfly\"}],\"relations\":[],\"_artifact_unit_fingerprint\":\"private\"}");
 
     var result = (try db.lookup(alloc, "doc:a", .{
         .fields = &.{ "title", "_artifacts" },
@@ -79200,6 +80992,7 @@ test "db lookup includes unified artifact projection when _artifacts is requeste
     try std.testing.expectEqualStrings("chunk", items[0].object.get("artifact_ref").?.object.get("kind").?.string);
     try std.testing.expectEqual(@as(i64, 0), items[0].object.get("artifact_ref").?.object.get("chunk_id").?.integer);
     try std.testing.expectEqualStrings("hello", items[0].object.get("value").?.object.get("_content").?.string);
+    try std.testing.expect(items[0].object.get("value").?.object.get(hierarchy_navigation_unit_fingerprint_field) == null);
 
     const embedding = artifacts.get("body_dense_v1").?.object;
     try std.testing.expect(std.mem.startsWith(u8, embedding.get("artifact_id").?.string, "af1:embedding:"));
@@ -79218,6 +81011,7 @@ test "db lookup includes unified artifact projection when _artifacts is requeste
     const entities = artifacts.get("entities_v1").?.object;
     try std.testing.expectEqualStrings("application/json", entities.get("content_type").?.string);
     try std.testing.expectEqualStrings("Antfly", entities.get("value").?.object.get("entities").?.array.items[0].object.get("text").?.string);
+    try std.testing.expect(entities.get("value").?.object.get(hierarchy_navigation_unit_fingerprint_field) == null);
 }
 
 test "db search includes chunk artifacts on hydrated hits when _chunks is requested" {

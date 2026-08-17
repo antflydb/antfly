@@ -60,6 +60,51 @@ func TestQueryRequestMarshalPreservesHierarchyGrouping(t *testing.T) {
 	}
 }
 
+func TestQueryRequestMarshalPreservesUnitGrouping(t *testing.T) {
+	body, err := json.Marshal(QueryRequest{
+		Hierarchy: &QueryHierarchy{
+			GroupBy: &HierarchyGroupBy{Level: HierarchyGroupByLevelUnit},
+		},
+		Fields: []string{"unit_id", "unit_type"},
+		Limit:  5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"hierarchy":{"group_by":{"level":"unit"}}`)) {
+		t.Fatalf("unit hierarchy grouping missing from request: %s", body)
+	}
+}
+
+func TestQueryRequestMarshalPreservesHierarchyChildrenCursor(t *testing.T) {
+	body, err := json.Marshal(QueryRequest{
+		Hierarchy: &QueryHierarchy{
+			Children: &HierarchyChildren{
+				Parent: HierarchyChildParent{
+					Level: HierarchyChildParentLevelSource,
+					Id:    "doc:a",
+				},
+				Level: HierarchyChildrenLevelUnit,
+			},
+		},
+		Fields:      []string{},
+		OrderBy:     []SortField{{Field: "_hierarchy.position"}},
+		SearchAfter: []any{"opaque-position", "af1:asset:unit:page-1"},
+		Limit:       20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"hierarchy":{"children":{"level":"unit","parent":{"id":"doc:a","level":"source"}}}`)) {
+		t.Fatalf("hierarchy children missing from request: %s", body)
+	}
+	if !bytes.Contains(body, []byte(`"fields":[]`)) ||
+		!bytes.Contains(body, []byte(`"order_by":[{"field":"_hierarchy.position"}]`)) ||
+		!bytes.Contains(body, []byte(`"search_after":["opaque-position","af1:asset:unit:page-1"]`)) {
+		t.Fatalf("hierarchy cursor projection missing from request: %s", body)
+	}
+}
+
 func TestQueryRequestMarshalPreservesIdentityOnlyHierarchyGrouping(t *testing.T) {
 	body, err := json.Marshal(QueryRequest{
 		Hierarchy: &QueryHierarchy{

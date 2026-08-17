@@ -4002,6 +4002,38 @@ pub const HierarchyArtifactSource = struct {
     unit_id: ?[]const u8 = null,
 };
 
+pub const HierarchyChildParent = struct {
+    level: []const u8,
+    id: []const u8,
+};
+
+pub const HierarchyChildren = struct {
+    parent: HierarchyChildParent,
+    /// Child level to enumerate. Unit traversal reads the versioned extraction hierarchy rather than a relevance index, so empty and failed units are included.
+    level: []const u8,
+};
+
+/// The required public order for sequential hierarchy traversal. Specify `_hierarchy.position` ascending; Antfly appends `_id` ascending as the deterministic tie-breaker and returns both values in each hit's `_sort`.
+pub const HierarchyChildrenOrderBy = []const std.json.Value;
+
+/// Opaque position and unit-id tuple returned in the preceding hit's `_sort`.
+pub const HierarchyChildrenSearchAfter = []const []const u8;
+
+/// A hierarchy traversal cursor bound to an older source-artifact revision.
+pub const HierarchyCursorStaleError = struct {
+    status: i32,
+    /// Stable machine-readable error code.
+    @"error": []const u8,
+    /// Human-readable explanation of why traversal cannot continue.
+    message: []const u8,
+    /// Stable client action for recovering from the conflict.
+    action: []const u8,
+    /// Request field to omit when restarting at the first unit.
+    restart_without: []const u8,
+    /// Retrying the same cursor cannot succeed; restart traversal instead.
+    retryable: bool,
+};
+
 pub const HierarchyEvidence = struct {
     local_id: ?[]const u8 = null,
     decision: ?[]const u8 = null,
@@ -4017,7 +4049,7 @@ pub const HierarchyEvidence = struct {
 };
 
 pub const HierarchyGroupBy = struct {
-    /// Hierarchy level used to group the records matched by the targeted index.
+    /// Hierarchy level used to group the records matched by the targeted index. Unit groups are relevance-ranked and do not accept `order_by`, `search_after`, or `search_before`; use `hierarchy.children` for sequential, cursor-paginated unit traversal.
     level: []const u8,
     matches: ?HierarchyMatches = null,
 };
@@ -6831,10 +6863,11 @@ pub const QueryBuilderResult = struct {
     warnings: ?[]const []const u8 = null,
 };
 
-/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
 pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
     ancestors: ?HierarchyAncestors = null,
+    children: ?HierarchyChildren = null,
 };
 
 /// A single query result hit
@@ -6866,6 +6899,10 @@ pub const QueryHitHierarchy = struct {
     evidence: ?HierarchyEvidence = null,
     /// Matching descendant hits attached by the canonical hierarchy.group_by request.
     matches: ?[]const HierarchyMatchHit = null,
+    /// Opaque format-neutral position used for sequential hierarchy traversal.
+    position: ?[]const u8 = null,
+    /// Composite source hierarchy revision to which the position and cursor are bound.
+    revision: ?[]const u8 = null,
     /// Legacy child chunk hits included for source-level rollups.
     chunks: ?[]const HierarchyMatchHit = null,
 };
@@ -6962,13 +6999,13 @@ pub const QueryRequest = struct {
     filter_query: ?RawQuery = null,
     /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
     exclusion_query: ?RawQuery = null,
-    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. When `hierarchy.group_by` is present, aggregations operate on the complete set of top-level grouped source documents. Nested `group_by.matches` are bounded evidence projections and are not counted as aggregation rows. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
+    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. When `hierarchy.group_by` is present, aggregations operate on the complete set of top-level grouped source or unit records. Nested `group_by.matches` are bounded evidence projections and are not counted as aggregation rows. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
     aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
     /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
     /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
-    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire source document. Use an empty array for identity-only source groups.
+    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
     /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
@@ -6977,9 +7014,9 @@ pub const QueryRequest = struct {
     offset: ?i64 = null,
     /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
-    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
+    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests. For hierarchy child traversal, a cursor whose source-artifact revision changed returns `409 hierarchy_cursor_stale`; restart the same traversal without `search_after` rather than retrying the stale tuple.
     search_after: ?[]const std.json.Value = null,
     /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
     search_before: ?[]const std.json.Value = null,
@@ -7071,6 +7108,16 @@ pub const QueryStrategy = enum {
 pub const QueryStringQuery = struct {
     query: []const u8,
     boost: ?Boost = null,
+};
+
+/// A transient query dependency or read-availability failure that is safe to retry.
+pub const QueryTemporarilyUnavailableError = struct {
+    /// Stable machine-readable retry classification.
+    code: []const u8,
+    /// Human-readable error summary.
+    message: []const u8,
+    /// Always true; retry after the response's Retry-After delay.
+    retryable: bool,
 };
 
 /// A validated Antfly query retained as raw JSON by Go servers and clients.
@@ -7507,13 +7554,13 @@ pub const RetrievalQueryRequest = struct {
     filter_query: ?RawQuery = null,
     /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
     exclusion_query: ?RawQuery = null,
-    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. When `hierarchy.group_by` is present, aggregations operate on the complete set of top-level grouped source documents. Nested `group_by.matches` are bounded evidence projections and are not counted as aggregation rows. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
+    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. When `hierarchy.group_by` is present, aggregations operate on the complete set of top-level grouped source or unit records. Nested `group_by.matches` are bounded evidence projections and are not counted as aggregation rows. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
     aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
     /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
     /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
-    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire source document. Use an empty array for identity-only source groups.
+    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
     fields: ?[]const []const u8 = null,
     hierarchy: ?QueryHierarchy = null,
     /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
@@ -7522,9 +7569,9 @@ pub const RetrievalQueryRequest = struct {
     offset: ?i64 = null,
     /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
-    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
+    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests. For hierarchy child traversal, a cursor whose source-artifact revision changed returns `409 hierarchy_cursor_stale`; restart the same traversal without `search_after` rather than retrying the stale tuple.
     search_after: ?[]const std.json.Value = null,
     /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
     search_before: ?[]const std.json.Value = null,

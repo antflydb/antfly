@@ -294,6 +294,17 @@ from .hierarchy_artifact import HierarchyArtifact
 from .hierarchy_artifact_kind import HierarchyArtifactKind
 from .hierarchy_artifact_source import HierarchyArtifactSource
 from .hierarchy_artifact_source_kind import HierarchyArtifactSourceKind
+from .hierarchy_child_parent import HierarchyChildParent
+from .hierarchy_child_parent_level import HierarchyChildParentLevel
+from .hierarchy_children import HierarchyChildren
+from .hierarchy_children_level import HierarchyChildrenLevel
+from .hierarchy_children_order_by_item import HierarchyChildrenOrderByItem
+from .hierarchy_children_order_by_item_field import HierarchyChildrenOrderByItemField
+from .hierarchy_cursor_stale_error import HierarchyCursorStaleError
+from .hierarchy_cursor_stale_error_action import HierarchyCursorStaleErrorAction
+from .hierarchy_cursor_stale_error_error import HierarchyCursorStaleErrorError
+from .hierarchy_cursor_stale_error_restart_without import HierarchyCursorStaleErrorRestartWithout
+from .hierarchy_cursor_stale_error_status import HierarchyCursorStaleErrorStatus
 from .hierarchy_evidence import HierarchyEvidence
 from .hierarchy_evidence_canonical import HierarchyEvidenceCanonical
 from .hierarchy_evidence_mention import HierarchyEvidenceMention
@@ -581,6 +592,8 @@ from .query_result_analyses import QueryResultAnalyses
 from .query_result_graph_results import QueryResultGraphResults
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
+from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
+from .query_temporarily_unavailable_error_code import QueryTemporarilyUnavailableErrorCode
 from .regexp_query import RegexpQuery
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
@@ -1037,6 +1050,17 @@ __all__ = (
     "HierarchyArtifactKind",
     "HierarchyArtifactSource",
     "HierarchyArtifactSourceKind",
+    "HierarchyChildParent",
+    "HierarchyChildParentLevel",
+    "HierarchyChildren",
+    "HierarchyChildrenLevel",
+    "HierarchyChildrenOrderByItem",
+    "HierarchyChildrenOrderByItemField",
+    "HierarchyCursorStaleError",
+    "HierarchyCursorStaleErrorAction",
+    "HierarchyCursorStaleErrorError",
+    "HierarchyCursorStaleErrorRestartWithout",
+    "HierarchyCursorStaleErrorStatus",
     "HierarchyEvidence",
     "HierarchyEvidenceCanonical",
     "HierarchyEvidenceMention",
@@ -1322,6 +1346,8 @@ __all__ = (
     "QueryResultGraphResults",
     "QueryStrategy",
     "QueryStringQuery",
+    "QueryTemporarilyUnavailableError",
+    "QueryTemporarilyUnavailableErrorCode",
     "RegexpQuery",
     "RepairIssueListRequest",
     "RepairRunRequest",

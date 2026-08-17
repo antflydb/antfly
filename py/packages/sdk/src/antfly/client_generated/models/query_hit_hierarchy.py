@@ -30,6 +30,8 @@ class QueryHitHierarchy:
         evidence (HierarchyEvidence | Unset):
         matches (list[HierarchyMatchHit] | Unset): Matching descendant hits attached by the canonical hierarchy.group_by
             request.
+        position (str | Unset): Opaque format-neutral position used for sequential hierarchy traversal.
+        revision (str | Unset): Composite source hierarchy revision to which the position and cursor are bound.
         chunks (list[HierarchyMatchHit] | Unset): Legacy child chunk hits included for source-level rollups.
     """
 
@@ -40,6 +42,8 @@ class QueryHitHierarchy:
     ancestors: QueryHitHierarchyAncestors | Unset = UNSET
     evidence: HierarchyEvidence | Unset = UNSET
     matches: list[HierarchyMatchHit] | Unset = UNSET
+    position: str | Unset = UNSET
+    revision: str | Unset = UNSET
     chunks: list[HierarchyMatchHit] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -70,6 +74,10 @@ class QueryHitHierarchy:
                 matches_item = matches_item_data.to_dict()
                 matches.append(matches_item)
 
+        position = self.position
+
+        revision = self.revision
+
         chunks: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.chunks, Unset):
             chunks = []
@@ -94,6 +102,10 @@ class QueryHitHierarchy:
             field_dict["evidence"] = evidence
         if matches is not UNSET:
             field_dict["matches"] = matches
+        if position is not UNSET:
+            field_dict["position"] = position
+        if revision is not UNSET:
+            field_dict["revision"] = revision
         if chunks is not UNSET:
             field_dict["chunks"] = chunks
 
@@ -148,6 +160,10 @@ class QueryHitHierarchy:
 
                 matches.append(matches_item)
 
+        position = d.pop("position", UNSET)
+
+        revision = d.pop("revision", UNSET)
+
         _chunks = d.pop("chunks", UNSET)
         chunks: list[HierarchyMatchHit] | Unset = UNSET
         if _chunks is not UNSET:
@@ -165,6 +181,8 @@ class QueryHitHierarchy:
             ancestors=ancestors,
             evidence=evidence,
             matches=matches,
+            position=position,
+            revision=revision,
             chunks=chunks,
         )
 

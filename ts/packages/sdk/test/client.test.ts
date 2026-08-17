@@ -27,8 +27,15 @@ vi.mock("openapi-fetch", () => ({
 }));
 
 // Import client after mocking
-const { AntflyClient, normalizeBaseUrl, readLimitedResponseBytes, readLimitedResponseText } =
-  await import("../src/client.js");
+const {
+  AntflyClient,
+  HierarchyCursorStaleError,
+  QueryTemporarilyUnavailableError,
+  StorageReadTemporarilyUnavailableError,
+  normalizeBaseUrl,
+  readLimitedResponseBytes,
+  readLimitedResponseText,
+} = await import("../src/client.js");
 const { default: createClient } = await import("openapi-fetch");
 
 describe("bounded response readers", () => {
@@ -773,6 +780,96 @@ describe("AntflyClient", () => {
       };
 
       await expect(client.query(request)).rejects.toThrow("Query failed: Table not found");
+    });
+
+    it("preserves retry guidance when query storage is temporarily unavailable", async () => {
+      mockPost.mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          code: "storage_read_temporarily_unavailable",
+          message: "storage read temporarily unavailable",
+          retryable: true,
+        },
+        response: new Response(undefined, {
+          status: 503,
+          headers: { "Retry-After": "3" },
+        }),
+      });
+
+      const promise = client.query({ table: "products", limit: 10 });
+      await expect(promise).rejects.toMatchObject({
+        name: "StorageReadTemporarilyUnavailableError",
+        status: 503,
+        code: "storage_read_temporarily_unavailable",
+        retryable: true,
+        retryAfterSeconds: 3,
+      });
+      await promise.catch((error: unknown) => {
+        expect(error).toBeInstanceOf(StorageReadTemporarilyUnavailableError);
+      });
+    });
+
+    it("preserves hierarchy traversal restart guidance for stale cursors", async () => {
+      mockPost.mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          status: 409,
+          error: "hierarchy_cursor_stale",
+          message: "the source artifact changed during traversal",
+          action: "restart_hierarchy_traversal",
+          restart_without: "search_after",
+          retryable: false,
+        },
+        response: new Response(undefined, { status: 409 }),
+      });
+
+      const promise = client.query({ table: "products", limit: 10 });
+      await expect(promise).rejects.toMatchObject({
+        name: "HierarchyCursorStaleError",
+        message: "Query failed: the source artifact changed during traversal",
+        status: 409,
+        code: "hierarchy_cursor_stale",
+        action: "restart_hierarchy_traversal",
+        restartWithout: "search_after",
+        retryable: false,
+      });
+      await promise.catch((error: unknown) => {
+        expect(error).toBeInstanceOf(HierarchyCursorStaleError);
+      });
+    });
+
+    it.each([
+      ["doc_identity_unavailable", "doc identity unavailable"],
+      ["read_requires_primary", "read requires primary"],
+      ["standby_read_unavailable", "standby read unavailable"],
+      ["index_rebuilding", "required index is rebuilding"],
+      ["query_embedding_temporarily_unavailable", "query embedding temporarily unavailable"],
+    ] as const)("classifies retryable query availability response %s", async (code, message) => {
+      mockPost.mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          code,
+          message,
+          retryable: true,
+        },
+        response: new Response(undefined, {
+          status: 503,
+          headers: { "Retry-After": "2" },
+        }),
+      });
+
+      const promise = client.query({ table: "products", limit: 10 });
+      await expect(promise).rejects.toMatchObject({
+        name: "QueryTemporarilyUnavailableError",
+        status: 503,
+        code,
+        retryable: true,
+        retryAfterSeconds: 2,
+      });
+      await promise.catch((error: unknown) => {
+        expect(error).toBeInstanceOf(QueryTemporarilyUnavailableError);
+        expect(error).not.toBeInstanceOf(StorageReadTemporarilyUnavailableError);
+      });
     });
   });
 

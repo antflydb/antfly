@@ -25,6 +25,7 @@ const platform_time = @import("antfly_platform").time;
 pub const Error = operation.ApiError || error{
     TopologyChanged,
     IdentityReadGenerationChanged,
+    HierarchyCursorStale,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
     GroupLeaderUnavailable,
@@ -84,6 +85,7 @@ pub const LookupInput = struct {
     table_name: []const u8,
     key: []const u8,
     options: db_mod.types.LookupOptions = .{},
+    consistency: raft_mod.ReadConsistency = .read_index,
 };
 
 pub const Operations = struct {
@@ -520,14 +522,19 @@ pub const Operations = struct {
     ) Error!table_reads.LookupResponse {
         try request.ensureActive();
         const reads = self.reads orelse return error.NotFound;
+        var options = input.options;
+        options.execution_deadline_ns = request.deadline_ns;
+        options.cancellation = request.cancellation;
         const result = reads.lookupGroupLocal(
             alloc,
             input.group_id,
             input.table_name,
             input.key,
-            input.options,
-            .read_index,
+            options,
+            input.consistency,
         ) catch |err| switch (err) {
+            error.Timeout => return error.DeadlineExceeded,
+            error.Cancelled, error.Canceled => return error.Canceled,
             error.TopologyChanged => return error.TopologyChanged,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -617,6 +624,7 @@ pub const Operations = struct {
         try request.ensureActive();
         const reads = self.reads orelse return error.NotFound;
         return (reads.queryGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
+            error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return error.InvalidArgument,
             error.TopologyChanged => return error.TopologyChanged,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
@@ -922,6 +930,7 @@ test "typed internal query workers preserve identity generation validation" {
             try std.testing.expectEqualStrings("documents", table_name);
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
             try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
+            if (req.hierarchy_children != null) return error.HierarchyCursorStale;
             return error.UnsupportedQueryRequest;
         }
 
@@ -945,6 +954,16 @@ test "typed internal query workers preserve identity generation validation" {
         17,
         "documents",
         .{ .identity_read_generation = 12345 },
+    ));
+    try std.testing.expectError(error.HierarchyCursorStale, operations.query(
+        std.testing.allocator,
+        .{},
+        17,
+        "documents",
+        .{
+            .identity_read_generation = 12345,
+            .hierarchy_children = .{ .parent_id = "doc:a" },
+        },
     ));
 
     var frontier: [0]distributed_graph.GraphFrontierItem = .{};
