@@ -125,6 +125,9 @@ the executor owner and “inference backend runtime descriptor” for the value.
    lease.
 9. Lane concurrency and resource admission are orthogonal. Work must satisfy
    both contracts before it can allocate and execute.
+10. Release accounting is fail closed. Malformed, duplicate, overflowing, or
+    over-release input retains the reservation and increments an accounting
+    error counter; it must never erase capacity owned by unrelated work.
 
 ## Budget derivation
 
@@ -138,10 +141,13 @@ any smaller finite cgroup limit:
 An explicit envelope is necessary for Burstable Kubernetes pods whose request
 is lower than node memory but whose cgroup hard limit is `max`. Kubernetes does
 not expose the request as an allocation boundary inside that cgroup. Inference
-and full standalone accept `--process-memory-budget-mb` and
+inference, distributed data, and full standalone accept
+`--process-memory-budget-mb` and
 `ANTFLY_PROCESS_MEMORY_BUDGET_MB`. The older inference-prefixed flag and
-environment variable remain compatibility aliases. Malformed or overflowing
-operator values fail startup instead of silently reverting to host detection.
+environment variable remain compatibility aliases for inference-capable
+processes. CLI values take precedence—including an explicit zero that requests
+automatic detection—and malformed or overflowing selected values fail startup
+instead of silently reverting to host detection.
 Set the envelope below the orchestrator allocation so the kubelet, runtime, and
 test harness retain headroom.
 
@@ -194,7 +200,8 @@ eviction or a host OOM.
 ## Observability and tests
 
 Resource metrics must expose used, peak, soft-limit, hard-limit, pressure, and
-rejection counts for the aggregate host ledger and every logical slice.
+rejection and release-accounting-error counts for the aggregate host ledger,
+plus pressure and byte metrics for every logical slice.
 Inference metrics additionally retain backend class and the pressure domain
 that selected an eviction victim. Startup logs should report the detected or
 explicit process envelope and ownership mode.
@@ -210,6 +217,7 @@ Permanent tests cover:
 - aggregate host admission across otherwise-independent slices;
 - host-only external charging with logical host-plus-backend inference metrics;
 - oversized minimum-progress operations remaining inside the host envelope;
+- release overflow and mismatch retaining all accounted capacity;
 - preload and request paths using the same admission controller.
 - inference, API, and control executor isolation plus lane shutdown/drain
   behavior.

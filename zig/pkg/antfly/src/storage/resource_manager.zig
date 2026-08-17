@@ -329,6 +329,7 @@ pub const MemoryStats = struct {
     hard_limit_bytes: u64 = 0,
     soft_limit_events: u64 = 0,
     hard_limit_rejections: u64 = 0,
+    accounting_errors: u64 = 0,
     pressure: Pressure = .normal,
 };
 
@@ -497,6 +498,7 @@ const MutableMemory = struct {
     peak_bytes: u64 = 0,
     soft_limit_events: u64 = 0,
     hard_limit_rejections: u64 = 0,
+    accounting_errors: u64 = 0,
 };
 
 pub const ResourceManager = struct {
@@ -952,7 +954,12 @@ pub const ResourceManager = struct {
     }
 
     pub fn releaseBatch(self: *ResourceManager, amounts: []const SliceAmount) void {
-        const host_charge_bytes = hostChargeForAmounts(amounts) catch std.math.maxInt(u64);
+        const host_charge_bytes = hostChargeForAmounts(amounts) catch {
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            self.memory.accounting_errors +|= 1;
+            return;
+        };
         self.releaseBatchWithHostCharge(amounts, host_charge_bytes);
     }
 
@@ -963,12 +970,30 @@ pub const ResourceManager = struct {
     ) void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        for (amounts) |amount| {
+
+        if (host_charge_bytes > self.memory.used_bytes) {
+            self.memory.accounting_errors +|= 1;
+            return;
+        }
+        for (amounts, 0..) |amount, index| {
             if (amount.bytes == 0) continue;
             const state = &self.slices[sliceIndex(amount.slice)];
-            state.used_bytes -|= amount.bytes;
+            if (amount.bytes > state.used_bytes) {
+                self.memory.accounting_errors +|= 1;
+                return;
+            }
+            for (amounts[0..index]) |previous| {
+                if (previous.bytes > 0 and previous.slice == amount.slice) {
+                    self.memory.accounting_errors +|= 1;
+                    return;
+                }
+            }
         }
-        self.releaseMemoryLocked(host_charge_bytes);
+        for (amounts) |amount| {
+            if (amount.bytes == 0) continue;
+            self.slices[sliceIndex(amount.slice)].used_bytes -= amount.bytes;
+        }
+        self.memory.used_bytes -= host_charge_bytes;
         self.pressure_change.advance();
     }
 
@@ -1268,6 +1293,7 @@ pub const ResourceManager = struct {
                 .hard_limit_bytes = self.memory.budget.hard_limit_bytes,
                 .soft_limit_events = self.memory.soft_limit_events,
                 .hard_limit_rejections = self.memory.hard_limit_rejections,
+                .accounting_errors = self.memory.accounting_errors,
                 .pressure = pressureFor(self.memory.budget, self.memory.used_bytes),
             },
             .slices = stats,
@@ -1892,6 +1918,46 @@ test "logical inference slices can charge only physical host memory" {
         manager.sliceStats(.inference_kv_working_set).used_bytes);
     try std.testing.expectEqual(@as(u64, 80), manager.snapshot().memory.used_bytes);
     manager.releaseBatchWithHostCharge(&logical, 80);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "batch release accounting errors fail closed" {
+    var manager = ResourceManager.init(.{});
+    const admitted = [_]SliceAmount{
+        .{ .slice = .inference_model_residency, .bytes = 20 },
+        .{ .slice = .inference_kv_working_set, .bytes = 10 },
+    };
+    try manager.reserveBatchClassifiedWithHostCharge(&admitted, 15);
+
+    manager.releaseBatch(&.{
+        .{ .slice = .inference_model_residency, .bytes = std.math.maxInt(u64) },
+        .{ .slice = .inference_kv_working_set, .bytes = 1 },
+    });
+    var stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 15), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.memory.accounting_errors);
+
+    manager.releaseBatchWithHostCharge(&admitted, 16);
+    stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 15), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 2), stats.memory.accounting_errors);
+
+    manager.releaseBatchWithHostCharge(&.{
+        .{ .slice = .inference_model_residency, .bytes = 10 },
+        .{ .slice = .inference_model_residency, .bytes = 10 },
+    }, 15);
+    stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 15), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 3), stats.memory.accounting_errors);
+
+    manager.releaseBatchWithHostCharge(&.{
+        .{ .slice = .inference_model_residency, .bytes = 21 },
+    }, 15);
+    stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 15), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 4), stats.memory.accounting_errors);
+
+    manager.releaseBatchWithHostCharge(&admitted, 15);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 

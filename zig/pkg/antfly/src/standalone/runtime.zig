@@ -21,6 +21,7 @@ const antfly = @import("runtime_root.zig");
 const group_ids = @import("../common/group_ids.zig");
 const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 const fs_paths = @import("../common/fs_paths.zig");
+const process_memory_budget = @import("../common/process_memory_budget.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const inference_bridge = @import("inference_bridge.zig");
@@ -112,7 +113,7 @@ const CliConfig = struct {
     inference_combined_budget_mb: usize = 0,
     inference_kv_budget_mb: usize = 0,
     inference_scratch_budget_mb: usize = 0,
-    inference_process_memory_budget_mb: usize = 0,
+    inference_process_memory_budget_mb: ?usize = null,
     inference_kernel_jit_mode: ?antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode = null,
     inference_preload_models: std.ArrayListUnmanaged(inference_bridge.WarmModel) = .empty,
     data_dir: ?[]const u8 = null,
@@ -4862,20 +4863,18 @@ fn releaseInferenceTokenizerCache(context: *anyopaque, bytes: usize) callconv(.c
 }
 
 fn mibToBytes(value: usize) !usize {
-    return std.math.mul(usize, value, 1024 * 1024) catch error.InvalidArguments;
+    return process_memory_budget.mibToBytes(value);
 }
 
 fn resolveProcessMemoryLimitBytes(
     cli: CliConfig,
     env: *const std.process.Environ.Map,
 ) !usize {
-    if (cli.inference_process_memory_budget_mb != 0)
-        return mibToBytes(cli.inference_process_memory_budget_mb);
-
-    const raw = env.get("ANTFLY_PROCESS_MEMORY_BUDGET_MB") orelse
-        env.get("ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB") orelse return 0;
-    const value = std.fmt.parseUnsigned(usize, raw, 10) catch return error.InvalidArguments;
-    return mibToBytes(value);
+    return process_memory_budget.resolve(
+        cli.inference_process_memory_budget_mb,
+        env.get(process_memory_budget.canonical_env),
+        env.get(process_memory_budget.inference_compat_env),
+    );
 }
 
 fn printUsage() void {
@@ -6640,6 +6639,10 @@ test "antfly config uses cli override before common config" {
 
 test "standalone memory budget conversion rejects overflow" {
     try std.testing.expectError(error.InvalidArguments, mibToBytes(std.math.maxInt(usize)));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try process_memory_budget.resolve(0, "invalid", "14000"),
+    );
 }
 
 test "standalone public api caps keep alive request reuse" {
@@ -6704,7 +6707,7 @@ test "parse cli accepts inference budget overrides" {
     try std.testing.expectEqual(@as(usize, 16384), cfg.inference_combined_budget_mb);
     try std.testing.expectEqual(@as(usize, 2048), cfg.inference_kv_budget_mb);
     try std.testing.expectEqual(@as(usize, 1024), cfg.inference_scratch_budget_mb);
-    try std.testing.expectEqual(@as(usize, 14000), cfg.inference_process_memory_budget_mb);
+    try std.testing.expectEqual(@as(?usize, 14000), cfg.inference_process_memory_budget_mb);
     try std.testing.expectEqual(antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode.required, cfg.inference_kernel_jit_mode.?);
 }
 

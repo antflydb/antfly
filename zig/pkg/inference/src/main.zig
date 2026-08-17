@@ -350,6 +350,18 @@ fn printRunUsage(usage_name: []const u8) void {
     , .{usage_name});
 }
 
+fn resolveProcessMemoryBudgetMib(
+    cli_override: ?usize,
+    canonical_env_value: ?[]const u8,
+    compatibility_env_value: ?[]const u8,
+    config_value: ?usize,
+) !?usize {
+    if (cli_override) |value| return value;
+    if (canonical_env_value orelse compatibility_env_value) |raw|
+        return std.fmt.parseUnsigned(usize, raw, 10) catch error.InvalidArguments;
+    return config_value;
+}
+
 fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
@@ -457,14 +469,12 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     defer if (config_preload_models.len > 0) allocator.free(config_preload_models);
 
     const budget_override_limits = try budget_overrides_mib.toByteLimits();
-    const process_memory_budget_mb_from_env: ?usize = if (platform.env.getenv("ANTFLY_PROCESS_MEMORY_BUDGET_MB") orelse
-        platform.env.getenv("ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB")) |raw|
-        std.fmt.parseUnsigned(usize, raw, 10) catch return error.InvalidArguments
-    else
-        null;
-    const process_memory_budget_mb = process_memory_budget_mb_override orelse
-        process_memory_budget_mb_from_env orelse
-        if (loaded_cfg) |parsed| parsed.value.process_memory_budget_mb else null;
+    const process_memory_budget_mb = try resolveProcessMemoryBudgetMib(
+        process_memory_budget_mb_override,
+        platform.env.getenv("ANTFLY_PROCESS_MEMORY_BUDGET_MB"),
+        platform.env.getenv("ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB"),
+        if (loaded_cfg) |parsed| parsed.value.process_memory_budget_mb else null,
+    );
     const process_memory_limit_bytes = if (process_memory_budget_mb) |value|
         (try (inference.runtime.tier.memory.BudgetOverridesMib{ .host = value }).toByteLimits()).host_limit_bytes
     else
@@ -861,6 +871,29 @@ test "kernel JIT mode precedence is CLI then environment then config" {
     const defaults = try resolveKernelJitConfig(null, null, null);
     try std.testing.expectEqual(inference.graph.kernel_jit.Mode.off, defaults.mode);
     try std.testing.expectError(error.InvalidArguments, resolveKernelJitConfig(null, "invalid", null));
+}
+
+test "process memory budget precedence ignores shadowed invalid sources" {
+    try std.testing.expectEqual(
+        @as(?usize, 0),
+        try resolveProcessMemoryBudgetMib(0, "invalid", "also-invalid", 512),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 256),
+        try resolveProcessMemoryBudgetMib(null, "256", "invalid", 512),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 384),
+        try resolveProcessMemoryBudgetMib(null, null, "384", 512),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 512),
+        try resolveProcessMemoryBudgetMib(null, null, null, 512),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        resolveProcessMemoryBudgetMib(null, "invalid", null, 512),
+    );
 }
 
 test "inference run rejects unknown flags instead of silently disabling policy" {
