@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const operation = @import("../api/operation.zig");
+const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_api = @import("api.zig");
 const table_manager = @import("table_manager.zig");
 
@@ -215,7 +216,7 @@ pub const Operations = struct {
         const callback = self.source.vtable.finalize_shutdown.?;
         var snapshot = try self.source.vtable.snapshot(self.source.ptr);
         defer self.source.vtable.free_snapshot(self.source.ptr, &snapshot);
-        if (wouldDeleteActiveNodeOrStore(&snapshot, node_id)) return error.ActiveNodeFinalizeRejected;
+        if (nodeFinalizeUnsafe(&snapshot, node_id)) return error.ActiveNodeFinalizeRejected;
         try callback(self.source.ptr, node_id);
         try self.triggerReallocateIfSupported();
     }
@@ -260,7 +261,7 @@ fn preserveLifecycleAndDrainIntent(alloc: std.mem.Allocator, snapshot: *const me
     }
 }
 
-fn wouldDeleteActiveNodeOrStore(snapshot: *const metadata_api.AdminSnapshot, node_id: u64) bool {
+fn nodeFinalizeUnsafe(snapshot: *const metadata_api.AdminSnapshot, node_id: u64) bool {
     var draining_node = false;
     for (snapshot.nodes) |node| {
         if (node.node_id != node_id) continue;
@@ -268,9 +269,13 @@ fn wouldDeleteActiveNodeOrStore(snapshot: *const metadata_api.AdminSnapshot, nod
         draining_node = true;
         break;
     }
-    if (draining_node) return false;
+    for (snapshot.placement_intents) |intent| {
+        if (intent.record.local_node_id == node_id) return true;
+    }
     for (snapshot.stores) |store| {
-        if (store.node_id == node_id and !store.drain_requested) return true;
+        if (store.node_id != node_id) continue;
+        if (!draining_node and !store.drain_requested) return true;
+        if (store.group_statuses.len != 0 or store.runtime_statuses.len != 0) return true;
     }
     return false;
 }
@@ -304,4 +309,42 @@ test "metadata node operations stop canceled shutdown before source mutation" {
         .cancellation = operation.CancellationToken.fromAtomic(&canceled),
     }, 9));
     try std.testing.expectEqual(@as(usize, 0), source.calls);
+}
+
+test "metadata node operations reject finalization while termination debt remains" {
+    var placements = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{ .group_id = 101, .replica_id = 1, .local_node_id = 9 },
+        .store_id = 9,
+    }};
+    var group_statuses = [_]table_manager.GroupStatusReport{.{ .group_id = 101 }};
+    var runtime_statuses = [_]table_manager.RuntimeGroupStatusReport{.{ .group_id = 101, .node_id = 9, .store_id = 9 }};
+    var stores = [_]table_manager.StoreRecord{.{
+        .store_id = 9,
+        .node_id = 9,
+        .drain_requested = true,
+        .group_statuses = group_statuses[0..],
+        .runtime_statuses = runtime_statuses[0..],
+    }};
+    var nodes = [_]table_manager.NodeRecord{.{
+        .node_id = 9,
+        .lifecycle = table_manager.node_lifecycle_draining,
+    }};
+    var snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .nodes = nodes[0..],
+        .stores = stores[0..],
+        .placement_intents = placements[0..],
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+
+    try std.testing.expect(nodeFinalizeUnsafe(&snapshot, 9));
+    snapshot.placement_intents = &.{};
+    try std.testing.expect(nodeFinalizeUnsafe(&snapshot, 9));
+    stores[0].group_statuses = &.{};
+    try std.testing.expect(nodeFinalizeUnsafe(&snapshot, 9));
+    stores[0].runtime_statuses = &.{};
+    try std.testing.expect(!nodeFinalizeUnsafe(&snapshot, 9));
 }

@@ -3451,9 +3451,18 @@ pub const RaftApplyStore = struct {
         defer if (existing_node) |record| metadata_table_manager.freeNode(self.alloc, record);
         var draining_node = false;
         if (existing_node) |record| {
-            if (metadata_table_manager.nodeLifecycleActive(record.lifecycle)) return error.ActiveNodeFinalizeRejected;
+            // This command is already committed. A preflight observation may
+            // race cancellation or new termination debt, so rejection must be
+            // a deterministic no-op rather than an apply error that prevents
+            // replicas from advancing their applied index.
+            if (metadata_table_manager.nodeLifecycleActive(record.lifecycle)) return;
             draining_node = true;
         }
+
+        // Placement ownership is the durable deletion fence. Observational
+        // store debt below may lag, but finalization must never remove the
+        // node/store records while a placement still targets this node.
+        if (try self.nodeHasPlacementIntentTxn(txn, group_id, node_id)) return;
 
         const StoreRef = struct {
             store_id: u64,
@@ -3473,7 +3482,8 @@ pub const RaftApplyStore = struct {
                 const store = try decodeStoreRecord(self.alloc, kv.value);
                 defer metadata_table_manager.freeStore(self.alloc, store);
                 if (store.node_id == node_id) {
-                    if (!draining_node and !store.drain_requested) return error.ActiveNodeFinalizeRejected;
+                    if (!draining_node and !store.drain_requested) return;
+                    if (store.group_statuses.len != 0 or store.runtime_statuses.len != 0) return;
                     try stores_to_delete.append(self.alloc, .{ .store_id = store.store_id, .node_id = store.node_id });
                 }
             }
@@ -3500,6 +3510,26 @@ pub const RaftApplyStore = struct {
                 .node_id = store.node_id,
             });
         }
+    }
+
+    fn nodeHasPlacementIntentTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        metadata_group_id: u64,
+        node_id: u64,
+    ) !bool {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try placementPrefixForGroup(&prefix_buf, metadata_group_id);
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var entry = try cur.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cur.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            const intent = try decodePlacementIntent(self.alloc, kv.value);
+            defer raft_reconciler.freeIntentOwned(self.alloc, intent);
+            if (intent.record.local_node_id == node_id) return true;
+        }
+        return false;
     }
 
     fn setNodeLifecycleTxn(
@@ -8415,7 +8445,7 @@ test "metadata raft apply store ignores stale draining node registration after c
     try std.testing.expect(metadata_table_manager.nodeLifecycleActive(nodes[0].lifecycle));
 }
 
-test "metadata raft apply store finalizes node shutdown by deleting node and stores" {
+test "metadata raft apply store waits for termination debt before finalizing node shutdown" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -8452,24 +8482,90 @@ test "metadata raft apply store finalizes node shutdown by deleting node and sto
         .upsert_store = .{ .store_id = 13, .node_id = 13, .role = "data", .health_class = "healthy", .live = true },
     });
     defer std.testing.allocator.free(other_store_cmd);
+    const placement_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
+        .expected_metadata_version = null,
+        .expected_target_drain_requested = true,
+        .replacement = .{
+            .record = .{ .group_id = 41, .replica_id = 1, .local_node_id = 12 },
+            .store_id = 12,
+            .peer_node_ids = &.{12},
+            .serving_state = .draining,
+        },
+    } });
+    defer std.testing.allocator.free(placement_cmd);
+    const remove_placement_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .remove_replica_intent = .{
+        .group_id = 41,
+        .local_node_id = 12,
+        .expected_metadata_version = 1,
+    } });
+    defer std.testing.allocator.free(remove_placement_cmd);
+    const clear_target_store_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_store = .{
+            .store_id = 12,
+            .node_id = 12,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .drain_requested = true,
+        },
+    });
+    defer std.testing.allocator.free(clear_target_store_cmd);
     const finalize_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .finalize_node_shutdown = .{ .node_id = 12 } });
     defer std.testing.allocator.free(finalize_cmd);
 
-    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+    const initial_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = target_node_cmd },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = other_node_cmd },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = target_store_cmd },
         .{ .term = 1, .index = 4, .entry_type = .normal, .data = other_store_cmd },
-        .{ .term = 2, .index = 5, .entry_type = .normal, .data = finalize_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = placement_cmd },
+        .{ .term = 2, .index = 6, .entry_type = .normal, .data = finalize_cmd },
     });
-    defer std.testing.allocator.free(encoded_entries);
+    defer std.testing.allocator.free(initial_entries);
 
     var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
     defer store.deinit();
     try store.snapshotBuilder().applyBatch(.{
         .group_id = 24,
-        .commit_index = 5,
-        .entries_bytes = encoded_entries,
+        .commit_index = 6,
+        .entries_bytes = initial_entries,
+    });
+    {
+        const nodes = try store.listNodes(std.testing.allocator, 24);
+        defer store.freeNodes(std.testing.allocator, nodes);
+        const stores = try store.listStores(std.testing.allocator, 24);
+        defer store.freeStores(std.testing.allocator, stores);
+        try std.testing.expectEqual(@as(usize, 2), nodes.len);
+        try std.testing.expectEqual(@as(usize, 2), stores.len);
+    }
+
+    // Removing the durable placement still leaves the store's last observed
+    // runtime/membership debt, so this finalization also commits as a no-op.
+    const placement_removed_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 7, .entry_type = .normal, .data = remove_placement_cmd },
+        .{ .term = 2, .index = 8, .entry_type = .normal, .data = finalize_cmd },
+    });
+    defer std.testing.allocator.free(placement_removed_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 24,
+        .commit_index = 8,
+        .entries_bytes = placement_removed_entries,
+    });
+    {
+        const nodes = try store.listNodes(std.testing.allocator, 24);
+        defer store.freeNodes(std.testing.allocator, nodes);
+        try std.testing.expectEqual(@as(usize, 2), nodes.len);
+    }
+
+    const drained_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 9, .entry_type = .normal, .data = clear_target_store_cmd },
+        .{ .term = 2, .index = 10, .entry_type = .normal, .data = finalize_cmd },
+    });
+    defer std.testing.allocator.free(drained_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 24,
+        .commit_index = 10,
+        .entries_bytes = drained_entries,
     });
 
     const nodes = try store.listNodes(std.testing.allocator, 24);
@@ -8483,7 +8579,7 @@ test "metadata raft apply store finalizes node shutdown by deleting node and sto
     try std.testing.expectEqual(@as(u64, 13), stores[0].store_id);
 }
 
-test "metadata raft apply store rejects finalizing active node shutdown" {
+test "metadata raft apply store commits active node finalization as a no-op" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -8519,11 +8615,11 @@ test "metadata raft apply store rejects finalizing active node shutdown" {
         .entries_bytes = initial_entries,
     });
 
-    try std.testing.expectError(error.ActiveNodeFinalizeRejected, store.snapshotBuilder().applyBatch(.{
+    try store.snapshotBuilder().applyBatch(.{
         .group_id = 25,
         .commit_index = 3,
         .entries_bytes = finalize_entries,
-    }));
+    });
 
     const nodes = try store.listNodes(std.testing.allocator, 25);
     defer store.freeNodes(std.testing.allocator, nodes);
@@ -8536,7 +8632,7 @@ test "metadata raft apply store rejects finalizing active node shutdown" {
     try std.testing.expectEqual(@as(u64, 14), stores[0].store_id);
 }
 
-test "metadata raft apply store rejects finalizing active store-only node" {
+test "metadata raft apply store commits active store-only finalization as a no-op" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -8567,11 +8663,11 @@ test "metadata raft apply store rejects finalizing active store-only node" {
         .entries_bytes = initial_entries,
     });
 
-    try std.testing.expectError(error.ActiveNodeFinalizeRejected, store.snapshotBuilder().applyBatch(.{
+    try store.snapshotBuilder().applyBatch(.{
         .group_id = 26,
         .commit_index = 2,
         .entries_bytes = finalize_entries,
-    }));
+    });
 
     const stores = try store.listStores(std.testing.allocator, 26);
     defer store.freeStores(std.testing.allocator, stores);

@@ -3179,7 +3179,6 @@ pub const ApiHttpServer = struct {
         // it does not make an incomplete lifecycle observation terminal. Only
         // the requested index detail path pays for this writer refresh, and it
         // stops doing so as soon as the cached proof is complete.
-        if (status.metadata.source == .live_writer_publish) return false;
         for (status.stats.indexes) |index| {
             if (!std.mem.eql(u8, index.name, target.name)) continue;
             // `repair_degraded` is also the derived representation of an
@@ -3187,7 +3186,12 @@ pub const ApiHttpServer = struct {
             // terminal damage from a retained observation that the writer may
             // already have advanced. Explicit issues and load failures are the
             // durable cases; keep reporting those without polling the writer.
-            if (index.load_error != null or index.repair_issue_count != 0) return false;
+            if (index.load_error != null or
+                index.repair_issue_count != 0 or
+                std.mem.eql(u8, index.index_repair_phase, "terminal"))
+            {
+                return false;
+            }
             // Refresh only for an incomplete proof attached to the requested
             // index. Table-level degradation may belong to another index, and
             // ordinary backfill/replay debt is already authoritative status;
@@ -29619,6 +29623,13 @@ test "api index status refreshes writer when read snapshot omits requested index
         .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
     }));
 
+    var retained_live_incomplete = incomplete_statuses[0];
+    retained_live_incomplete.metadata.source = .live_writer_publish;
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(&.{retained_live_incomplete}, .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+
     var terminal_index = incomplete_index;
     terminal_index.repair_issue_count = 1;
     const terminal_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
@@ -29633,6 +29644,23 @@ test "api index status refreshes writer when read snapshot omits requested index
         },
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+
+    var terminal_phase_index = incomplete_index;
+    terminal_phase_index.index_repair_phase = "terminal";
+    const terminal_phase_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = @constCast((&[_]db_mod.types.DBIndexStats{terminal_phase_index})[0..]),
+            .repair_degraded = true,
+        },
+    }};
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_phase_statuses[0..], .{
         .name = "older_idx",
         .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
     }));

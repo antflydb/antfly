@@ -15741,6 +15741,7 @@ fn overlayLiveRuntimeGroupFacts(
         for (runtime_statuses) |runtime_report| {
             if (runtime_report.group_id != group_status.group_id) continue;
             if (!std.mem.eql(u8, runtime_report.source, "live_writer_publish")) continue;
+            if (!std.mem.eql(u8, runtime_report.freshness, "fresh")) continue;
 
             // Group-status collection is intentionally cached and
             // ownership-safe. A relocation target can publish its hydrated
@@ -15760,10 +15761,9 @@ fn overlayLiveRuntimeGroupFacts(
             if (group_status.created_at_millis == 0 and runtime_report.created_at_millis != 0) {
                 group_status.created_at_millis = runtime_report.created_at_millis;
             }
-            group_status.updated_at_millis = @max(
-                group_status.updated_at_millis,
-                runtime_report.updated_at_ns / std.time.ns_per_ms,
-            );
+            // This timestamp is the freshness fence for Raft membership and
+            // readiness facts. A live writer can advance monotonic data facts,
+            // but its heartbeat must not renew a cached Raft observation.
             break;
         }
     }
@@ -19169,6 +19169,7 @@ test "data runtime live writer facts advance a conservative group status cache" 
         .{
             .group_id = 77,
             .source = "live_writer_publish",
+            .freshness = "fresh",
             .updated_at_ns = 30 * std.time.ns_per_ms,
             .doc_count = 12,
             .disk_bytes = 4096,
@@ -19178,6 +19179,7 @@ test "data runtime live writer facts advance a conservative group status cache" 
         .{
             .group_id = 88,
             .source = "live_writer_publish",
+            .freshness = "fresh",
             .updated_at_ns = 30 * std.time.ns_per_ms,
             .doc_count = 12,
         },
@@ -19190,7 +19192,7 @@ test "data runtime live writer facts advance a conservative group status cache" 
     try std.testing.expectEqual(@as(u64, 4096), groups[0].disk_bytes);
     try std.testing.expect(groups[0].disk_bytes_known);
     try std.testing.expectEqual(@as(u64, 5), groups[0].created_at_millis);
-    try std.testing.expectEqual(@as(u64, 30), groups[0].updated_at_millis);
+    try std.testing.expectEqual(@as(u64, 10), groups[0].updated_at_millis);
     // The overlay is monotonic: an older/lower writer observation cannot
     // regress already-published relocation evidence.
     try std.testing.expectEqual(@as(u64, 15), groups[1].doc_count);
@@ -19202,6 +19204,15 @@ test "data runtime live writer facts advance a conservative group status cache" 
         .doc_count = 99,
     }};
     overlayLiveRuntimeGroupFacts(&groups, &synthetic);
+    try std.testing.expectEqual(@as(u64, 12), groups[0].doc_count);
+
+    const stale_live = [_]antfly.metadata.table_manager.RuntimeGroupStatusReport{.{
+        .group_id = 77,
+        .source = "live_writer_publish",
+        .freshness = "stale",
+        .doc_count = 99,
+    }};
+    overlayLiveRuntimeGroupFacts(&groups, &stale_live);
     try std.testing.expectEqual(@as(u64, 12), groups[0].doc_count);
 }
 

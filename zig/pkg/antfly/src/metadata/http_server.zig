@@ -1587,7 +1587,7 @@ pub const MetadataHttpServer = struct {
         return switch (err) {
             error.InvalidArgument, error.StoreIdentityMismatch => ctx.status(400).text("invalid node request"),
             error.NodeNotFound, error.UnknownStore => ctx.status(404).text("node not found"),
-            error.ActiveNodeFinalizeRejected => ctx.status(409).text("active node cannot be finalized"),
+            error.ActiveNodeFinalizeRejected => ctx.status(409).text("node is not ready to finalize"),
             error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
             else => metadataReadError(ctx, err),
         };

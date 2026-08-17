@@ -6703,6 +6703,23 @@ pub const ProvisionedTableWriteSource = struct {
         return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id);
     }
 
+    fn tryBeginStartupCatchUpGroupOperation(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        advance_index_repairs: bool,
+    ) bool {
+        // Repair mutates an unpublished candidate while reads continue against
+        // immutable published generations. Treating the setup phase as a
+        // generic write lets frequent status polling starve the edge-triggered
+        // repair scheduler indefinitely. Cold startup/restore catch-up can
+        // replace broader runtime state and retains the exclusive admission.
+        return if (advance_index_repairs)
+            self.tryBeginReadCompatibleGroupOperation(table_name, group_id)
+        else
+            self.tryBeginGroupOperation(table_name, group_id);
+    }
+
     fn beginReplicatedApplyOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
@@ -8865,7 +8882,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(path);
         const lsm_root_generation = self.visibleRootGeneration(group_id);
 
-        if (!self.tryBeginGroupOperation(table_name, group_id)) return busy_result;
+        if (!self.tryBeginStartupCatchUpGroupOperation(table_name, group_id, metadata.advance_index_repairs)) return busy_result;
         if (!self.local_db_mutex.tryLock()) {
             self.endGroupOperation(table_name, group_id);
             return busy_result;
@@ -31216,6 +31233,38 @@ test "provisioned table write source read request permits replicated apply activ
     source.beginReplicatedApplyOperation("docs", 7001);
     defer source.endGroupOperation("docs", 7001);
 
+    try std.testing.expect(source.readCompatibleMaintenanceActiveBestEffort("docs", 7001));
+}
+
+test "managed index repair admission is not starved by status reads" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-repair-status-admission", NoCatalog.iface());
+    source.beginStatusRequest("docs");
+    defer source.endReadRequest("docs");
+
+    // Cold startup catch-up still excludes reads because it may replace the
+    // broader runtime state. Repair works on a candidate generation and must
+    // remain runnable while status is served from the published snapshot.
+    try std.testing.expect(!source.tryBeginStartupCatchUpGroupOperation("docs", 7001, false));
+    try std.testing.expect(source.tryBeginStartupCatchUpGroupOperation("docs", 7001, true));
+    defer source.endGroupOperation("docs", 7001);
     try std.testing.expect(source.readCompatibleMaintenanceActiveBestEffort("docs", 7001));
 }
 
