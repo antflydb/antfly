@@ -3162,14 +3162,40 @@ pub const ApiHttpServer = struct {
         target: IndexRuntimeTarget,
     ) bool {
         for (statuses) |status| {
-            if (runtimeStatusNeedsWriterRefresh(status)) return true;
-            // A read snapshot can be fresh for its retained index generation
-            // while the live writer is admitting or advancing a newer index.
-            // Refresh only the requested index path instead of making every
-            // table or list status request consult the writer.
-            if (runtimeStatusTargetRank(status, target) < 2) return true;
+            if (runtimeStatusTargetNeedsWriterRefresh(status, target)) return true;
         }
         return false;
+    }
+
+    fn runtimeStatusTargetNeedsWriterRefresh(
+        status: runtime_status.LocalTableRuntimeStatus,
+        target: IndexRuntimeTarget,
+    ) bool {
+        if (runtimeStatusNeedsWriterRefresh(status)) return true;
+        // A read snapshot can be fresh for its retained index generation
+        // while the live writer is admitting or advancing a newer index.
+        if (runtimeStatusTargetRank(status, target) < 2) return true;
+        // The read cache's freshness describes the observation it retained;
+        // it does not make an incomplete lifecycle observation terminal. Only
+        // the requested index detail path pays for this writer refresh, and it
+        // stops doing so as soon as the cached proof is complete.
+        if (status.metadata.source == .live_writer_publish or
+            status.stats.repair_degraded or
+            status.stats.repair_issue_count != 0)
+        {
+            return false;
+        }
+        for (status.stats.indexes) |index| {
+            if (!std.mem.eql(u8, index.name, target.name)) continue;
+            if (index.repair_degraded or index.repair_issue_count != 0) return false;
+            return !status.stats.repair_summary_ready or
+                !index.repair_summary_ready or
+                !index.coverage_summary_ready or
+                index.backfill_active or
+                index.replay_catch_up_required or
+                index.catch_up_active;
+        }
+        return true;
     }
 
     fn runtimeStatusTargetRank(status: runtime_status.LocalTableRuntimeStatus, target: IndexRuntimeTarget) u8 {
@@ -3342,6 +3368,17 @@ pub const ApiHttpServer = struct {
                 const candidate_rank = runtimeStatusTargetRank(status.*, index_target);
                 const existing_rank = runtimeStatusTargetRank(existing.*, index_target);
                 if (candidate_rank != existing_rank) break :blk candidate_rank > existing_rank;
+                // Once an incomplete cached observation caused a targeted
+                // writer refresh, the live writer is the authoritative view
+                // for that same incarnation even if its freshness is still
+                // catching_up. Otherwise the cached value can win forever.
+                const candidate_is_writer = status.metadata.source == .live_writer_publish;
+                const existing_is_writer = existing.metadata.source == .live_writer_publish;
+                if (candidate_is_writer != existing_is_writer and
+                    runtimeStatusTargetNeedsWriterRefresh(existing.*, index_target))
+                {
+                    break :blk candidate_is_writer;
+                }
                 break :blk runtimeStatusPreferred(status.*, existing.*);
             };
             if (!preferred) {
@@ -28350,20 +28387,22 @@ test "api http server serves provisioned index runtime backfill status across sh
     });
     defer parsed_detail.deinit();
     try std.testing.expectEqualStrings("search_idx", parsed_detail.value.config.object.get("name").?.string);
-    // Provisioned runtime status reopens shard DBs, so pending backfill is resumed before stats are read.
+    // A status-only provisioned open reports persisted lifecycle state without
+    // running writer-owned backfill work. The synthetic rebuild cursors above
+    // therefore have no physical indexed documents yet.
     if (parsed_detail.value.status.backfill_active) |active| try std.testing.expect(active);
     if (parsed_detail.value.status.rebuilding) |rebuilding| try std.testing.expect(rebuilding);
-    if (parsed_detail.value.status.doc_count) |doc_count| try std.testing.expect(doc_count >= 1);
-    if (parsed_detail.value.status.total_indexed) |total_indexed| try std.testing.expect(total_indexed >= 1);
+    try std.testing.expectEqual(@as(?u64, 0), parsed_detail.value.status.doc_count);
+    try std.testing.expectEqual(@as(?u64, 0), parsed_detail.value.status.total_indexed);
     if (parsed_detail.value.shard_status.@"7001" orelse parsed_detail.value.shard_status.local) |provisioned_left_shard| {
         try std.testing.expectEqual(@as(?bool, true), provisioned_left_shard.backfill_active);
-        try std.testing.expectEqual(@as(?u64, 1), provisioned_left_shard.doc_count);
+        try std.testing.expectEqual(@as(?u64, 0), provisioned_left_shard.doc_count);
     }
     if (parsed_detail.value.shard_status.@"7002") |right_shard| {
         try std.testing.expectEqual(@as(?bool, true), right_shard.backfill_active);
     }
     if (parsed_detail.value.shard_status.@"7002") |right_shard| {
-        try std.testing.expectEqual(@as(?u64, 1), right_shard.doc_count);
+        try std.testing.expectEqual(@as(?u64, 0), right_shard.doc_count);
     }
 }
 
@@ -29543,6 +29582,23 @@ test "api index status refreshes writer when read snapshot omits requested index
         .name = "older_idx",
         .identity = .{ .coverage_generation = 42, .coverage_config_hash = 99 },
     }));
+
+    var incomplete_index = current;
+    incomplete_index.repair_summary_ready = false;
+    incomplete_index.backfill_active = true;
+    const incomplete_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = @constCast((&[_]db_mod.types.DBIndexStats{incomplete_index})[0..]),
+        },
+    }};
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(incomplete_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
 }
 
 test "api index status prefers current same-name incarnation from write source" {
@@ -29629,6 +29685,7 @@ test "api index status prefers current same-name incarnation from write source" 
 
     const FakeReads = struct {
         status_calls: std.atomic.Value(u32) = .init(0),
+        current_incomplete: bool = false,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
@@ -29657,7 +29714,21 @@ test "api index status prefers current same-name incarnation from write source" 
         fn localRuntimeStatuses(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.status_calls.fetchAdd(1, .monotonic);
-            return try StatusFactory.make(inner_alloc, 41, 1, .cached_snapshot, .fresh, 7);
+            if (!self.current_incomplete) return try StatusFactory.make(inner_alloc, 41, 1, .cached_snapshot, .fresh, 7);
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                inner_alloc,
+                "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}",
+                .{},
+            );
+            defer parsed.deinit();
+            const identity = (try indexes_api.indexRuntimeIdentity(inner_alloc, "vec", parsed.value)) orelse
+                return error.TestUnexpectedResult;
+            var statuses = try StatusFactory.make(inner_alloc, identity.coverage_generation, identity.coverage_config_hash, .cached_snapshot, .fresh, 7);
+            statuses.items[0].stats.repair_summary_ready = false;
+            statuses.items[0].stats.indexes[0].repair_summary_ready = false;
+            statuses.items[0].stats.indexes[0].backfill_active = true;
+            return statuses;
         }
     };
 
@@ -29719,6 +29790,25 @@ test "api index status prefers current same-name incarnation from write source" 
     const config = parsed_response.value.object.get("config") orelse return error.TestUnexpectedResult;
     if (config != .object) return error.TestUnexpectedResult;
     try std.testing.expect(config.object.get("_coverage_incarnation") == null);
+
+    // A same-incarnation cache entry is not authoritative while it still
+    // advertises lifecycle debt. The targeted detail request must refresh it
+    // and prefer the writer's completed view even when the writer is marked
+    // catching_up at the group level.
+    reads.current_incomplete = true;
+    var refreshed_resp = try executeHttpxTestRequest(&server, .{
+        .method = .GET,
+        .uri = "/tables/docs/indexes/vec",
+    });
+    defer refreshed_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), refreshed_resp.status);
+    try std.testing.expectEqual(@as(u32, 2), reads.status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2), writes.status_calls.load(.monotonic));
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"shard_status\":{\"10\":{\"runtime_source\":\"live_writer_publish\"}}}",
+        refreshed_resp.body,
+    );
 }
 
 test "api index status uses propagated remote store runtime status" {

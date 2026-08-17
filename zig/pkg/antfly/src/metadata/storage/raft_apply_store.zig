@@ -2294,9 +2294,10 @@ pub const RaftApplyStore = struct {
                     .store_id = record.store_id,
                 });
             },
-            .upsert_replica_intent => |intent| {
+            .upsert_replica_intent => |intent| upsert: {
                 var key_buf: [192]u8 = undefined;
                 const key = try placementKeyForGroup(&key_buf, group_id, intent.record.group_id, intent.record.local_node_id);
+                if (!(try self.placementUpsertAllowedTxn(txn, group_id, key, intent))) break :upsert;
                 const value = try encodePlacementIntent(self.alloc, intent);
                 defer self.alloc.free(value);
                 try txn.put(key, value);
@@ -3642,6 +3643,33 @@ pub const RaftApplyStore = struct {
         const node = (try self.loadNodeRecordTxn(txn, group_id, node_id)) orelse return false;
         defer metadata_table_manager.freeNode(self.alloc, node);
         return !metadata_table_manager.nodeLifecycleActive(node.lifecycle);
+    }
+
+    fn placementUpsertAllowedTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        metadata_group_id: u64,
+        placement_key: []const u8,
+        intent: raft_reconciler.PlacementIntent,
+    ) !bool {
+        // Existing placements must remain mutable while they drain: the
+        // reconciler advances their expanded/final voter sets and lifecycle
+        // through ordinary upserts. Once removal commits, however, an older
+        // reconcile plan must not resurrect that placement on an excluded
+        // store or node.
+        _ = txn.get(placement_key) catch |err| switch (err) {
+            error.NotFound => {
+                if (try self.nodeDrainRequestedTxn(txn, metadata_group_id, intent.record.local_node_id)) return false;
+                if (intent.store_id != 0) {
+                    const store = (try self.loadStoreRecordTxn(txn, metadata_group_id, intent.store_id)) orelse return true;
+                    defer metadata_table_manager.freeStore(self.alloc, store);
+                    if (store.drain_requested) return false;
+                }
+                return true;
+            },
+            else => return err,
+        };
+        return true;
     }
 
     fn loadStoreRecordTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, store_id: u64) !?metadata.StoreRecord {
@@ -8030,6 +8058,74 @@ test "metadata raft apply store ignores stale drained first store registration a
     try std.testing.expect(metadata_table_manager.nodeLifecycleActive(nodes[0].lifecycle));
     try std.testing.expectEqual(@as(usize, 1), stores.len);
     try std.testing.expect(!stores[0].drain_requested);
+}
+
+test "metadata raft apply store does not resurrect removed placement on draining node" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-draining-placement-fence", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const register_node = try encodeTransitionCommand(std.testing.allocator, .{ .register_node = .{
+        .node_id = 12,
+        .role = "data",
+        .lifecycle = metadata_table_manager.node_lifecycle_active,
+    } });
+    defer std.testing.allocator.free(register_node);
+    const register_store = try encodeTransitionCommand(std.testing.allocator, .{ .register_store = .{
+        .store_id = 12,
+        .node_id = 12,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+    } });
+    defer std.testing.allocator.free(register_store);
+    const serving_placement = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
+        .record = .{ .group_id = 1201, .replica_id = 1, .local_node_id = 12 },
+        .store_id = 12,
+        .peer_node_ids = &.{12},
+    } });
+    defer std.testing.allocator.free(serving_placement);
+    const request_shutdown = try encodeTransitionCommand(std.testing.allocator, .{ .request_node_shutdown = .{ .node_id = 12 } });
+    defer std.testing.allocator.free(request_shutdown);
+    const draining_placement = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
+        .record = .{ .group_id = 1201, .replica_id = 1, .local_node_id = 12 },
+        .store_id = 12,
+        .peer_node_ids = &.{ 12, 13 },
+        .serving_state = .draining,
+    } });
+    defer std.testing.allocator.free(draining_placement);
+    const remove_placement = try encodeTransitionCommand(std.testing.allocator, .{ .remove_replica_intent = .{
+        .group_id = 1201,
+        .local_node_id = 12,
+    } });
+    defer std.testing.allocator.free(remove_placement);
+
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = register_node },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = register_store },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = serving_placement },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = request_shutdown },
+        // Existing drain lifecycle updates remain legal.
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = draining_placement },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = remove_placement },
+        // A plan computed before index 6 must not recreate shutdown debt.
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = draining_placement },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 21,
+        .commit_index = 7,
+        .entries_bytes = encoded_entries,
+    });
+
+    const intents = try store.listPlacementIntents(std.testing.allocator, 21);
+    defer store.freePlacementIntents(std.testing.allocator, intents);
+    try std.testing.expectEqual(@as(usize, 0), intents.len);
 }
 
 test "metadata raft apply store ignores stale draining node registration after cancellation" {
