@@ -1,31 +1,37 @@
 # Resource and model manager design
 
-Antfly has two cooperating managers because they answer different questions:
+Antfly has three cooperating process services because they answer different
+questions:
 
 - `ResourceManager` owns physical, process-wide capacity shared by storage,
   indexing, caches, and embedded inference.
 - `ModelManager` owns inference objects and decisions: model inspection,
   memory estimates, residency, request working sets, eviction, and backend
   selection.
+- `BackendRuntime` owns execution infrastructure and its lifetime: bounded I/O
+  executor lanes, durable background jobs, native storage I/O pools, and
+  shutdown fencing. It decides where and for how long work may execute, not
+  whether enough memory exists for that work.
 - `RunBudget` is request-local accounting. It prevents one execution from
   exceeding the limits granted by `ModelManager`; it is not a node scheduler.
 - `AdmissionController` is the adapter between model-aware estimates and the
   physical owner. It atomically mirrors inference leases into the external
   `ResourceManager` when one is present and also performs live pressure checks.
 
-Connecting the managers does not merge them. `ResourceManager` cannot decide
-which model can be evicted, and `ModelManager` must not independently assume it
-owns all memory in a process that also serves data.
+Connecting these services does not merge them. `ResourceManager` cannot decide
+which model can be evicted, `ModelManager` must not independently assume it
+owns all memory in a process that also serves data, and `BackendRuntime` lane
+capacity must not be treated as permission to allocate memory.
 
 ## Ownership by deployment mode
 
-| Deployment | Physical owner | Model owner | Required connection |
-| --- | --- | --- | --- |
-| `antfly inference run` | local inference admission controller | process-local `ModelManager` | local ownership is declared at `Node` creation |
-| full standalone Antfly | the data node's `ResourceManager` | embedded `ModelManager` | external owner is required before preload or serve |
-| distributed data process | that process's `ResourceManager` | none unless inference is embedded | no cross-process memory ledger |
-| distributed inference process | local inference admission controller | process-local `ModelManager` | cluster scheduling routes work; process admission protects memory |
-| offline conversion/inspection | command-scoped budgets | command-scoped loaders | no serving residency contract |
+| Deployment | Physical owner | Model owner | Execution owner | Required connection |
+| --- | --- | --- | --- | --- |
+| `antfly inference run` | local inference admission controller | process-local `ModelManager` | command-owned `std.Io` executor | local ownership is declared at `Node` creation |
+| full standalone Antfly | the data node's `ResourceManager` | embedded `ModelManager` | node `BackendRuntime`; inference borrows its isolated inference lane | external resource owner and inference lane are required before preload or serve |
+| distributed data process | that process's `ResourceManager` | none unless inference is embedded | process `BackendRuntime` with data, Raft, API, and control lanes | no cross-process memory or executor ledger |
+| distributed inference process | local inference admission controller | process-local `ModelManager` | role-local executor | cluster scheduling routes work; process admission protects memory |
+| offline conversion/inspection | command-scoped budgets | command-scoped loaders | command-owned executor | no serving residency contract |
 
 Memory coordination is deliberately process-local. A network-wide reservation
 protocol would be stale at allocation time and would couple failure domains.
@@ -36,6 +42,60 @@ The Apache-licensed inference package also cannot import Antfly's internal
 storage `ResourceManager`. The standalone ABI bridge preserves that boundary:
 inference exposes generic reserve/release callbacks, while the full product
 maps them to node-owned resource slices.
+
+## BackendRuntime: execution and lifetime authority
+
+The node `BackendRuntime` in `pkg/antfly/src/storage/background_runtime.zig`
+owns process-long execution machinery. Its responsibilities are:
+
+- bounded general, Raft inbound, Raft outbound, public API, inference, and
+  control-plane `std.Io` executors;
+- a durable job lane with owner identities, close/drain semantics, and exact
+  job-payload ownership transfer;
+- shared native storage I/O pools;
+- lifetime leases that prevent an executor lane from being destroyed while a
+  component still retains its `std.Io` interface;
+- shutdown ordering: close lane admission, reject new borrowers, drain active
+  leases and owned jobs, then destroy executors and pools;
+- lane telemetry for active/peak leases, acquisitions, and shutdown
+  rejections.
+
+The separate lanes are isolation domains. Public API saturation cannot consume
+the last control path, inference graph/model I/O and nested fan-out cannot
+ratchet API workers, and Raft traffic does not share the public listener's
+executor ceiling. A lane's bounded worker count also bounds retained thread
+stacks, but this is an execution guardrail rather than memory admission.
+
+Full standalone creates one node `BackendRuntime`, acquires its inference lane,
+and passes the borrowed `std.Io` interface through the inference ABI. The lease
+is retained until the embedded inference `Node` is destroyed. The same node
+runtime supplies the API and control lanes and is shared by storage maintenance
+and durable jobs. This makes executor ownership and shutdown order consistent
+without making inference depend on Antfly storage internals.
+
+The ordering contract for composed standalone startup is:
+
+1. construct the node `BackendRuntime` and acquire the inference lane lease;
+2. construct the inference `Node` with that borrowed executor;
+3. attach the node `ResourceManager` admission bridge;
+4. preload models, then publish request surfaces;
+5. during shutdown, stop and await submitted work, destroy the inference node,
+   release lane leases, and finally destroy the `BackendRuntime`.
+
+Resource admission precedes scheduling: `ResourceManager` and `ModelManager`
+must reserve capacity before code submits allocation-producing work to a
+backend lane. Executor saturation may queue, reject during shutdown, or apply
+concurrency backpressure; it must never bypass or manufacture a resource
+reservation. Conversely, a memory reservation does not grant an executor lane
+or extend its lifetime.
+
+There is also an inference type named `backends.BackendRuntime` in
+`pkg/inference/src/backends/backends.zig`. It is a small value describing the
+selected backend and concrete execution provider—for example, whether ONNX is
+CPU- or CUDA-hosted—so admission can select the correct physical domain. It
+does not own threads, tasks, shutdown, or budgets. New code should keep this
+distinction explicit; when ambiguity is possible, use “node BackendRuntime” for
+the executor owner and “inference backend runtime descriptor” for the value.
 
 ## Invariants
 
@@ -57,6 +117,11 @@ maps them to node-owned resource slices.
 7. A process envelope is charged against raw container usage, not only memory
    allocated through inference. Page cache, a test harness, storage, and sibling
    work therefore reduce the capacity available to a new inference allocation.
+8. Every retained `std.Io` interface has a live owning `BackendRuntime` lane
+   lease, and the borrower stops and awaits its tasks before releasing that
+   lease.
+9. Lane concurrency and resource admission are orthogonal. Work must satisfy
+   both contracts before it can allocate and execute.
 
 ## Budget derivation
 
@@ -121,6 +186,8 @@ Resource metrics must expose used, peak, soft-limit, hard-limit, and rejection
 counts for every logical slice. Inference metrics additionally retain backend
 class and the pressure domain that selected an eviction victim. Startup logs
 should report the detected or explicit process envelope and ownership mode.
+Backend runtime metrics separately report active/peak lane leases, acquisitions,
+and shutdown rejections; they must not be combined with byte-budget metrics.
 
 Permanent tests cover:
 
@@ -130,6 +197,8 @@ Permanent tests cover:
 - atomic external reserve/release and denial classification;
 - finite standalone inference slices;
 - preload and request paths using the same admission controller.
+- inference, API, and control executor isolation plus lane shutdown/drain
+  behavior.
 
 CI should give memory-heavy suites an explicit envelope when the runner cannot
 provide a finite cgroup limit. This is workload policy, not a runner resize.
@@ -138,6 +207,9 @@ provide a finite cgroup limit. This is workload policy, not a runner resize.
 
 - `ModelManager` should not depend directly on storage internals.
 - `ResourceManager` should not learn model formats or eviction ordering.
+- `BackendRuntime` should not estimate model memory or become a second byte
+  ledger.
+- Resource reservations should not own tasks or replace executor lane leases.
 - Per-process admission does not replace cluster placement or autoscaling.
 - Logical host-plus-backend slices are conservative on discrete GPUs. A future
   ABI version may expose separate physical host and device domains when the
