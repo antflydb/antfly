@@ -28,6 +28,9 @@ Usage:
     # Optional inference server model-cache limit:
     ANTFLY_INFERENCE_MAX_LOADED_MODELS=1 uv run --project e2e/inference pytest e2e/inference
 
+    # Separate deadline for explicitly marked first-use model/backend initialization:
+    ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT=900 uv run --project e2e/inference pytest e2e/inference
+
     # Lazily pull missing models with a local antfly binary (opt-in):
     ANTFLY_INFERENCE_DOWNLOAD=1 uv run --project e2e/inference pytest e2e/inference
 
@@ -59,7 +62,31 @@ from .models import (
 
 API_PREFIX = "/ai/v1"
 ML_API_PREFIX = "/ml/v1"
-DEFAULT_REQUEST_TIMEOUT = float(os.environ.get("ANTFLY_INFERENCE_REQUEST_TIMEOUT", "30"))
+
+
+def _positive_timeout(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = default if raw is None else float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be a positive finite number, got {raw!r}"
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number, got {value!r}")
+    return value
+
+
+DEFAULT_REQUEST_TIMEOUT = _positive_timeout("ANTFLY_INFERENCE_REQUEST_TIMEOUT", 30)
+# Cold model import and backend/projector initialization are different from the
+# steady request-latency contract. Tests must opt into this larger deadline so a
+# global timeout increase cannot hide an ordinary serving hang.
+FIRST_USE_REQUEST_TIMEOUT = max(
+    DEFAULT_REQUEST_TIMEOUT,
+    _positive_timeout(
+        "ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT
+    ),
+)
 SERVER_OUTPUT_LIMIT = 64 * 1024
 CAPACITY_RETRY_TIMEOUT = float(
     os.environ.get("ANTFLY_INFERENCE_CAPACITY_RETRY_TIMEOUT", "30")
@@ -250,6 +277,16 @@ class InferenceServer:
             status = f"exited with status {returncode}"
         return f"Local inference server {status}. Output tail:\n{self.read_output()}"
 
+    def request_failure_diagnostic(
+        self, method: str, path: str, exc: requests.RequestException
+    ) -> str:
+        """Attach bounded live-server output to transport failures."""
+
+        return (
+            f"Inference {method.upper()} {path} failed: {exc}\n"
+            f"{self.failure_diagnostic()}"
+        )
+
     def report_http_failure_once(self) -> None:
         """Expose backend logs for a live local server without moving its write offset."""
 
@@ -362,12 +399,14 @@ def api(base_url):
                 try:
                     return request(f"{self.url}{normalized_path}", json=json, **kwargs)
                 except requests.RequestException as exc:
-                    if (
-                        local_server is not None
-                        and local_server.proc.poll() is not None
-                    ):
-                        local_server.failure_reported = True
-                        raise AssertionError(local_server.failure_diagnostic()) from exc
+                    if local_server is not None:
+                        if local_server.proc.poll() is not None:
+                            local_server.failure_reported = True
+                        raise AssertionError(
+                            local_server.request_failure_diagnostic(
+                                method, normalized_path, exc
+                            )
+                        ) from exc
                     raise
 
             response = send()
@@ -409,13 +448,24 @@ def api(base_url):
             _check(r)
             return r.json()
 
-        def generate(self, messages: list[dict], model: str = "", stream: bool = False, **kwargs):
+        def generate(
+            self,
+            messages: list[dict],
+            model: str = "",
+            stream: bool = False,
+            *,
+            request_timeout: float | None = None,
+            **kwargs,
+        ):
             body = {"model": model, "messages": messages, "stream": stream, **kwargs}
+            request_kwargs = (
+                {"timeout": request_timeout} if request_timeout is not None else {}
+            )
             if stream:
-                r = self.post("/generate", json=body, stream=True)
+                r = self.post("/generate", json=body, stream=True, **request_kwargs)
                 _check(r)
                 return r
-            r = self.post("/generate", json=body)
+            r = self.post("/generate", json=body, **request_kwargs)
             _check(r)
             return r.json()
 

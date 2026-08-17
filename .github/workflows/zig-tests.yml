@@ -996,6 +996,10 @@ jobs:
           ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: ggml-org/gemma-4-e2b-it-gguf
           ANTFLY_INFERENCE_FLORENCE_MODEL: antflydb/florence-2-base
           ANTFLY_INFERENCE_REQUEST_TIMEOUT: "300"
+          # Cold native model and projector initialization can exceed the
+          # steady request deadline on CPU-only release runners. Only tests
+          # explicitly covering first-use paths opt into this hard bound.
+          ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "900"
           ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
           # This Burstable pod has a 15000Mi request but no finite memory.max.
           # Declare a smaller process envelope so admission leaves kubelet and
