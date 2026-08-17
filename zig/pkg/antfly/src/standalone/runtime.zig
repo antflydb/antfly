@@ -1725,13 +1725,14 @@ pub fn runFromIterator(
     // implementation is code-generated in the inference archive and reached
     // through an opaque internal ABI; the shipped artifact remains one binary.
     const loaded_cfg = if (loaded_config) |*cfg| cfg else null;
-    const process_memory_limit_bytes = resolveProcessMemoryLimitBytes(
+    const process_memory_resolution = resolveProcessMemoryBudget(
         cli,
         init.environ_map,
     ) catch |err| {
         std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
         return err;
     };
+    const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
     const configured_preload = if (loaded_cfg) |cfg| cfg.inference.preload else &.{};
     const loaded_preload = if (cli.inference_preload_models.items.len == 0 and configured_preload.len != 0) blk: {
         const out = try alloc.alloc(inference_bridge.WarmModel, configured_preload.len);
@@ -2107,6 +2108,24 @@ pub fn runFromIterator(
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
     defer data_server.deinitWithDeadline(supervisor.deadline());
+    const managed_memory = data_server.provisioned_storage.resource_manager.snapshot().memory;
+    std.log.info(
+        "process memory policy operator_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} managed_hard_limit_bytes={d}",
+        .{
+            @tagName(process_memory_resolution.source),
+            @tagName(data_server.provisioned_storage.memory_limit_source),
+            process_memory_limit_bytes,
+            data_server.provisioned_storage.effective_memory_limit_bytes,
+            managed_memory.hard_limit_bytes,
+        },
+    );
+    var inference_resource_owner = InferenceResourceBudgetOwner{
+        .alloc = alloc,
+        .manager = &data_server.provisioned_storage.resource_manager,
+    };
+    // This defer is registered before node teardown, so the node releases all
+    // opaque admission leases before the owner validates its registry.
+    defer inference_resource_owner.deinit();
     antfly_node_needs_errdeinit = false;
     defer {
         // DataServer sources, recovery workers, and durable API jobs retain the
@@ -2157,8 +2176,9 @@ pub fn runFromIterator(
 
     var inference_resource_budget = inference_bridge.ResourceBudget{
         .abi_version = inference_bridge.abi_version,
-        .context = &data_server.provisioned_storage.resource_manager,
+        .context = &inference_resource_owner,
         .reserve_admission = reserveInferenceResources,
+        .retain_admission = retainInferenceResources,
         .release_admission = releaseInferenceResources,
         .observe_prompt_cache = observeInferencePromptCache,
         .reserve_tokenizer_cache = reserveInferenceTokenizerCache,
@@ -4827,50 +4847,258 @@ fn inferenceHostCharge(amounts: *const inference_bridge.AdmissionAmounts) !u64 {
     return @intCast(total);
 }
 
-fn reserveInferenceResources(context: *anyopaque, amounts: *const inference_bridge.AdmissionAmounts) callconv(.c) inference_bridge.Status {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+const InferenceResourceBudgetOwner = struct {
+    alloc: std.mem.Allocator,
+    manager: *antfly.resource_manager.ResourceManager,
+    lease_pool_mutex: std.atomic.Mutex = .unlocked,
+    free_leases: ?*InferenceAdmissionLease = null,
+    active_leases: std.AutoHashMapUnmanaged(usize, *InferenceAdmissionLease) = .empty,
+    next_lease_token: usize = 1,
+    observer_mutex: std.atomic.Mutex = .unlocked,
+    prompt_cache_observers: std.AutoHashMapUnmanaged(usize, u64) = .empty,
+    tokenizer_mutex: std.atomic.Mutex = .unlocked,
+    tokenizer_cache_bytes: u64 = 0,
+    outstanding_admission_leases: std.atomic.Value(usize) = .init(0),
+
+    fn deinit(self: *@This()) void {
+        std.debug.assert(self.outstanding_admission_leases.load(.acquire) == 0);
+        std.debug.assert(self.active_leases.count() == 0);
+        self.active_leases.deinit(self.alloc);
+        self.active_leases = .empty;
+        var current = self.free_leases;
+        while (current) |lease| {
+            current = lease.next_free;
+            self.alloc.destroy(lease);
+        }
+        self.free_leases = null;
+        std.debug.assert(self.prompt_cache_observers.count() == 0);
+        self.prompt_cache_observers.deinit(self.alloc);
+        self.prompt_cache_observers = .empty;
+        std.debug.assert(self.tokenizer_cache_bytes == 0);
+    }
+
+    fn acquireLease(self: *@This()) !*InferenceAdmissionLease {
+        lockAtomic(&self.lease_pool_mutex);
+        if (self.free_leases) |lease| {
+            self.free_leases = lease.next_free;
+            self.lease_pool_mutex.unlock();
+            lease.next_free = null;
+            return lease;
+        }
+        self.lease_pool_mutex.unlock();
+        return try self.alloc.create(InferenceAdmissionLease);
+    }
+
+    fn recycleLease(self: *@This(), lease: *InferenceAdmissionLease) void {
+        lockAtomic(&self.lease_pool_mutex);
+        defer self.lease_pool_mutex.unlock();
+        lease.next_free = self.free_leases;
+        self.free_leases = lease;
+    }
+
+    fn registerLease(self: *@This(), lease: *InferenceAdmissionLease) !usize {
+        lockAtomic(&self.lease_pool_mutex);
+        defer self.lease_pool_mutex.unlock();
+
+        // Tokens are monotonically advanced and never expose the recycled
+        // pointer. On integer wrap, skip zero and any token still active.
+        // This prevents a delayed duplicate release from targeting a newer
+        // reservation that happens to reuse the same pool slot.
+        var token = self.next_lease_token;
+        while (token == 0 or self.active_leases.contains(token)) {
+            token +%= 1;
+        }
+        self.next_lease_token = token +% 1;
+        if (self.next_lease_token == 0) self.next_lease_token = 1;
+        try self.active_leases.put(self.alloc, token, lease);
+        return token;
+    }
+
+    fn retainLease(
+        self: *@This(),
+        token: usize,
+        retained: []const antfly.resource_manager.SliceAmount,
+        retained_host_charge_bytes: u64,
+    ) !void {
+        lockAtomic(&self.lease_pool_mutex);
+        defer self.lease_pool_mutex.unlock();
+        const lease = self.active_leases.get(token) orelse {
+            self.manager.recordAccountingError();
+            return error.InvalidArguments;
+        };
+        try lease.reservation.retain(retained, retained_host_charge_bytes);
+    }
+
+    fn takeLease(self: *@This(), token: usize) ?*InferenceAdmissionLease {
+        lockAtomic(&self.lease_pool_mutex);
+        defer self.lease_pool_mutex.unlock();
+        const removed = self.active_leases.fetchRemove(token) orelse return null;
+        return removed.value;
+    }
+
+    fn observePromptCache(
+        self: *@This(),
+        observer_id: usize,
+        previous: u64,
+        next: u64,
+    ) bool {
+        lockAtomic(&self.observer_mutex);
+        defer self.observer_mutex.unlock();
+
+        if (observer_id == 0) {
+            self.manager.recordAccountingError();
+            return false;
+        }
+        var inserted = false;
+        const current = self.prompt_cache_observers.getPtr(observer_id) orelse blk: {
+            if (previous != 0) {
+                self.manager.recordAccountingError();
+                return false;
+            }
+            if (next == 0) return true;
+            const entry = self.prompt_cache_observers.getOrPut(
+                self.alloc,
+                observer_id,
+            ) catch {
+                self.manager.recordAccountingError();
+                return false;
+            };
+            entry.value_ptr.* = 0;
+            inserted = true;
+            break :blk entry.value_ptr;
+        };
+        if (current.* != previous) {
+            self.manager.recordAccountingError();
+            return false;
+        }
+        if (!self.manager.tryObserveUsage(
+            .inference_prompt_cache,
+            current,
+            next,
+        )) {
+            if (inserted) _ = self.prompt_cache_observers.remove(observer_id);
+            return false;
+        }
+        if (next == 0) _ = self.prompt_cache_observers.remove(observer_id);
+        return true;
+    }
+};
+
+const InferenceAdmissionLease = struct {
+    reservation: antfly.resource_manager.BatchReservation,
+    next_free: ?*InferenceAdmissionLease = null,
+};
+
+fn reserveInferenceResources(
+    context: *anyopaque,
+    amounts: *const inference_bridge.AdmissionAmounts,
+    out_lease: *usize,
+) callconv(.c) inference_bridge.Status {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    out_lease.* = 0;
     const slices = inferenceResourceSlices(amounts) catch |err| return inference_bridge.statusFromError(err);
     const host_charge = inferenceHostCharge(amounts) catch |err| return inference_bridge.statusFromError(err);
-    manager.reserveBatchClassifiedWithHostCharge(&slices, host_charge) catch |err| return inference_bridge.statusFromError(err);
+    const lease = owner.acquireLease() catch |err|
+        return inference_bridge.statusFromError(err);
+    lease.* = .{
+        .reservation = owner.manager.reserveBatchClassifiedWithHostCharge(
+            &slices,
+            host_charge,
+        ) catch |err| {
+            owner.recycleLease(lease);
+            return inference_bridge.statusFromError(err);
+        },
+    };
+    const lease_token = owner.registerLease(lease) catch |err| {
+        lease.reservation.release();
+        owner.recycleLease(lease);
+        return inference_bridge.statusFromError(err);
+    };
+    _ = owner.outstanding_admission_leases.fetchAdd(1, .acq_rel);
+    out_lease.* = lease_token;
     return .ok;
 }
 
-fn releaseInferenceResources(context: *anyopaque, amounts: *const inference_bridge.AdmissionAmounts) callconv(.c) void {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    const slices = inferenceResourceSlices(amounts) catch return;
-    const host_charge = inferenceHostCharge(amounts) catch return;
-    manager.releaseBatchWithHostCharge(&slices, host_charge);
+fn retainInferenceResources(
+    context: *anyopaque,
+    lease_token: usize,
+    retained: *const inference_bridge.AdmissionAmounts,
+) callconv(.c) inference_bridge.Status {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    if (lease_token == 0) return inference_bridge.statusFromError(error.InvalidArguments);
+    const slices = inferenceResourceSlices(retained) catch |err| return inference_bridge.statusFromError(err);
+    const host_charge = inferenceHostCharge(retained) catch |err| return inference_bridge.statusFromError(err);
+    owner.retainLease(lease_token, &slices, host_charge) catch |err|
+        return inference_bridge.statusFromError(err);
+    return .ok;
 }
 
-fn observeInferencePromptCache(context: *anyopaque, previous: u64, next: u64) callconv(.c) void {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    var current = previous;
-    manager.observeUsage(.inference_prompt_cache, &current, next);
+fn releaseInferenceResources(context: *anyopaque, lease_token: usize) callconv(.c) void {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    if (lease_token == 0) return;
+    const lease = owner.takeLease(lease_token) orelse {
+        owner.manager.recordAccountingError();
+        return;
+    };
+    lease.reservation.release();
+    owner.recycleLease(lease);
+    _ = owner.outstanding_admission_leases.fetchSub(1, .acq_rel);
+}
+
+fn observeInferencePromptCache(
+    context: *anyopaque,
+    observer_id: usize,
+    previous: u64,
+    next: u64,
+) callconv(.c) u8 {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    return @intFromBool(owner.observePromptCache(observer_id, previous, next));
 }
 
 fn reserveInferenceTokenizerCache(context: *anyopaque, bytes: usize) callconv(.c) u8 {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    lockAtomic(&owner.tokenizer_mutex);
+    defer owner.tokenizer_mutex.unlock();
+    const manager = owner.manager;
     if (manager.admissionDecision(.inference_tokenizer_cache, @intCast(bytes)).action == .shrink_cache)
         return 0;
-    var reservation = manager.reserve(.inference_tokenizer_cache, @intCast(bytes)) catch return 0;
-    reservation.released = true;
+    const next = std.math.add(u64, owner.tokenizer_cache_bytes, @as(u64, @intCast(bytes))) catch {
+        manager.recordAccountingError();
+        return 0;
+    };
+    manager.adjustUsage(
+        .inference_tokenizer_cache,
+        &owner.tokenizer_cache_bytes,
+        next,
+    ) catch return 0;
     return 1;
 }
 
 fn releaseInferenceTokenizerCache(context: *anyopaque, bytes: usize) callconv(.c) void {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    manager.releaseBytes(.inference_tokenizer_cache, @intCast(bytes));
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    lockAtomic(&owner.tokenizer_mutex);
+    defer owner.tokenizer_mutex.unlock();
+    const released: u64 = @intCast(bytes);
+    if (released > owner.tokenizer_cache_bytes) {
+        owner.manager.recordAccountingError();
+        return;
+    }
+    owner.manager.adjustUsage(
+        .inference_tokenizer_cache,
+        &owner.tokenizer_cache_bytes,
+        owner.tokenizer_cache_bytes - released,
+    ) catch {};
 }
 
 fn mibToBytes(value: usize) !usize {
     return process_memory_budget.mibToBytes(value);
 }
 
-fn resolveProcessMemoryLimitBytes(
+fn resolveProcessMemoryBudget(
     cli: CliConfig,
     env: *const std.process.Environ.Map,
-) !usize {
-    return process_memory_budget.resolve(
+) !process_memory_budget.Resolution {
+    return process_memory_budget.resolveDetailed(
         cli.inference_process_memory_budget_mb,
         env.get(process_memory_budget.canonical_env),
         env.get(process_memory_budget.inference_compat_env),
@@ -6778,6 +7006,11 @@ test "inference admission bridge charges combined native residency to resource m
     budgets[@intFromEnum(antfly.resource_manager.Slice.inference_model_residency)] =
         .{ .hard_limit_bytes = 100 };
     var manager = antfly.resource_manager.ResourceManager.init(.{ .budgets = budgets });
+    var owner = InferenceResourceBudgetOwner{
+        .alloc = std.testing.allocator,
+        .manager = &manager,
+    };
+    defer owner.deinit();
 
     const oversized = inference_bridge.AdmissionAmounts{
         .host_weight_bytes = 80,
@@ -6787,10 +7020,12 @@ test "inference admission bridge charges combined native residency to resource m
         .host_scratch_bytes = 0,
         .backend_scratch_bytes = 0,
     };
+    var lease_token: usize = 0;
     try std.testing.expectEqual(
         error.ResourceRequestTooLarge,
-        inference_bridge.errorFromStatus(reserveInferenceResources(&manager, &oversized)),
+        inference_bridge.errorFromStatus(reserveInferenceResources(&owner, &oversized, &lease_token)),
     );
+    try std.testing.expectEqual(@as(usize, 0), lease_token);
     try std.testing.expectEqual(
         @as(u64, 0),
         manager.sliceStats(.inference_model_residency).used_bytes,
@@ -6804,7 +7039,8 @@ test "inference admission bridge charges combined native residency to resource m
         .host_scratch_bytes = 0,
         .backend_scratch_bytes = 0,
     };
-    try std.testing.expect(reserveInferenceResources(&manager, &admitted).isOk());
+    try std.testing.expect(reserveInferenceResources(&owner, &admitted, &lease_token).isOk());
+    try std.testing.expect(lease_token != 0);
     try std.testing.expectEqual(
         @as(u64, 90),
         manager.sliceStats(.inference_model_residency).used_bytes,
@@ -6814,24 +7050,72 @@ test "inference admission bridge charges combined native residency to resource m
         manager.snapshot().memory.used_bytes,
     );
 
+    const retained = inference_bridge.AdmissionAmounts{
+        .host_weight_bytes = 40,
+        .backend_weight_bytes = 30,
+        .host_kv_bytes = 0,
+        .backend_kv_bytes = 0,
+        .host_scratch_bytes = 0,
+        .backend_scratch_bytes = 0,
+    };
+    try std.testing.expect(retainInferenceResources(&owner, lease_token, &retained).isOk());
+    try std.testing.expectEqual(
+        @as(u64, 70),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+
     const unavailable = inference_bridge.AdmissionAmounts{
-        .host_weight_bytes = 11,
+        .host_weight_bytes = 31,
         .backend_weight_bytes = 0,
         .host_kv_bytes = 0,
         .backend_kv_bytes = 0,
         .host_scratch_bytes = 0,
         .backend_scratch_bytes = 0,
     };
+    var unavailable_lease: usize = 0;
     try std.testing.expectEqual(
         error.ResourceTemporarilyUnavailable,
-        inference_bridge.errorFromStatus(reserveInferenceResources(&manager, &unavailable)),
+        inference_bridge.errorFromStatus(reserveInferenceResources(&owner, &unavailable, &unavailable_lease)),
     );
+    try std.testing.expectEqual(@as(usize, 0), unavailable_lease);
 
-    releaseInferenceResources(&manager, &admitted);
+    releaseInferenceResources(&owner, lease_token);
     try std.testing.expectEqual(
         @as(u64, 0),
         manager.sliceStats(.inference_model_residency).used_bytes,
     );
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+
+    var replacement_token: usize = 0;
+    const replacement = inference_bridge.AdmissionAmounts{
+        .host_weight_bytes = 10,
+        .backend_weight_bytes = 0,
+        .host_kv_bytes = 0,
+        .backend_kv_bytes = 0,
+        .host_scratch_bytes = 0,
+        .backend_scratch_bytes = 0,
+    };
+    try std.testing.expect(reserveInferenceResources(&owner, &replacement, &replacement_token).isOk());
+    try std.testing.expect(replacement_token != lease_token);
+    releaseInferenceResources(&owner, lease_token);
+    try std.testing.expectEqual(@as(u64, 10), manager.snapshot().memory.used_bytes);
+    try std.testing.expect(!retainInferenceResources(&owner, lease_token, &replacement).isOk());
+    try std.testing.expectEqual(@as(u64, 10), manager.snapshot().memory.used_bytes);
+    releaseInferenceResources(&owner, replacement_token);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+
+    try std.testing.expectEqual(@as(u8, 1), observeInferencePromptCache(&owner, 1, 0, 10));
+    try std.testing.expectEqual(@as(u8, 1), observeInferencePromptCache(&owner, 2, 0, 20));
+    try std.testing.expectEqual(@as(u8, 0), observeInferencePromptCache(&owner, 1, 0, 0));
+    try std.testing.expectEqual(@as(u64, 30), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u8, 1), observeInferencePromptCache(&owner, 1, 10, 0));
+    try std.testing.expectEqual(@as(u8, 1), observeInferencePromptCache(&owner, 2, 20, 0));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+
+    try std.testing.expectEqual(@as(u8, 1), reserveInferenceTokenizerCache(&owner, 10));
+    releaseInferenceTokenizerCache(&owner, 11);
+    try std.testing.expectEqual(@as(u64, 10), manager.snapshot().memory.used_bytes);
+    releaseInferenceTokenizerCache(&owner, 10);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 

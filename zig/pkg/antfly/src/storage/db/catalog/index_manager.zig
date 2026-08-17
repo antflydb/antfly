@@ -3147,7 +3147,11 @@ pub const IndexManager = struct {
     fn releaseFullTextPendingBytes(self: *IndexManager) void {
         if (self.full_text_pending_bytes_accounted == 0) return;
         if (self.resource_manager) |manager| {
-            manager.releaseBytes(.full_text_pending_segments, self.full_text_pending_bytes_accounted);
+            manager.adjustUsage(
+                .full_text_pending_segments,
+                &self.full_text_pending_bytes_accounted,
+                0,
+            ) catch {};
         }
         self.full_text_pending_bytes_accounted = 0;
     }

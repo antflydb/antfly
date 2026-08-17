@@ -154,6 +154,43 @@ pub const SliceAmount = struct {
     bytes: u64,
 };
 
+/// An exactly-once batch ownership token. Callers retain this value for the
+/// lifetime of the admitted memory instead of reconstructing release amounts.
+/// This prevents a duplicate teardown from consuming an equivalent reservation
+/// owned by unrelated work in the same logical slices.
+pub const BatchReservation = struct {
+    manager: *ResourceManager,
+    amounts: [slice_count]u64,
+    host_charge_bytes: u64,
+    released: bool = false,
+
+    pub fn retain(
+        self: *BatchReservation,
+        retained: []const SliceAmount,
+        retained_host_charge_bytes: u64,
+    ) !void {
+        if (self.released) return error.ReservationReleased;
+        const normalized = ResourceManager.normalizeSliceAmounts(retained) catch |err| {
+            self.manager.recordAccountingError();
+            return err;
+        };
+        try self.manager.retainBatchReservation(
+            self,
+            normalized,
+            retained_host_charge_bytes,
+        );
+    }
+
+    pub fn release(self: *BatchReservation) void {
+        if (self.released) return;
+        _ = self.manager.releaseBatchReservation(self);
+        // A failed accounting validation intentionally retains capacity, but
+        // the ownership token is still consumed so retries cannot repeatedly
+        // mutate or inflate the error counter.
+        self.released = true;
+    }
+};
+
 /// Internal HBC cache safety ceilings. These are not index configuration:
 /// byte admission remains authoritative and shared across every index using
 /// this manager. The ceilings only bound the local CLOCK bookkeeping arrays.
@@ -825,6 +862,19 @@ pub const ResourceManager = struct {
         ResourceTemporarilyUnavailable,
     };
 
+    fn normalizeSliceAmounts(
+        amounts: []const SliceAmount,
+    ) error{DuplicateResourceSlice}![slice_count]u64 {
+        var normalized = [_]u64{0} ** slice_count;
+        for (amounts) |amount| {
+            if (amount.bytes == 0) continue;
+            const index = sliceIndex(amount.slice);
+            if (normalized[index] != 0) return error.DuplicateResourceSlice;
+            normalized[index] = amount.bytes;
+        }
+        return normalized;
+    }
+
     fn hostChargeForAmounts(amounts: []const SliceAmount) ClassifiedBatchReserveError!u64 {
         var total: u64 = 0;
         for (amounts) |amount| {
@@ -853,10 +903,6 @@ pub const ResourceManager = struct {
         return next;
     }
 
-    fn releaseMemoryLocked(self: *ResourceManager, bytes: u64) void {
-        self.memory.used_bytes -|= bytes;
-    }
-
     /// Atomically reserve several independent slices while distinguishing a
     /// request that can never fit from temporary contention with reservations
     /// already held by other work.
@@ -867,7 +913,7 @@ pub const ResourceManager = struct {
     pub fn reserveBatchClassified(
         self: *ResourceManager,
         amounts: []const SliceAmount,
-    ) ClassifiedBatchReserveError!void {
+    ) ClassifiedBatchReserveError!BatchReservation {
         const host_charge_bytes = try hostChargeForAmounts(amounts);
         return self.reserveBatchClassifiedWithHostCharge(amounts, host_charge_bytes);
     }
@@ -880,14 +926,8 @@ pub const ResourceManager = struct {
         self: *ResourceManager,
         amounts: []const SliceAmount,
         host_charge_bytes: u64,
-    ) ClassifiedBatchReserveError!void {
-        for (amounts, 0..) |amount, index| {
-            if (amount.bytes == 0) continue;
-            for (amounts[0..index]) |previous| {
-                if (previous.bytes > 0 and previous.slice == amount.slice)
-                    return error.DuplicateResourceSlice;
-            }
-        }
+    ) ClassifiedBatchReserveError!BatchReservation {
+        const normalized = try normalizeSliceAmounts(amounts);
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -940,11 +980,16 @@ pub const ResourceManager = struct {
         }
         self.commitMemoryLocked(next_memory);
         self.pressure_change.advance();
+        return .{
+            .manager = self,
+            .amounts = normalized,
+            .host_charge_bytes = host_charge_bytes,
+        };
     }
 
     /// Compatibility wrapper for callers that do not need denial
     /// classification.
-    pub fn reserveBatch(self: *ResourceManager, amounts: []const SliceAmount) !void {
+    pub fn reserveBatch(self: *ResourceManager, amounts: []const SliceAmount) !BatchReservation {
         return self.reserveBatchClassified(amounts) catch |err| switch (err) {
             error.DuplicateResourceSlice => error.DuplicateResourceSlice,
             error.ResourceRequestTooLarge,
@@ -953,48 +998,75 @@ pub const ResourceManager = struct {
         };
     }
 
-    pub fn releaseBatch(self: *ResourceManager, amounts: []const SliceAmount) void {
-        const host_charge_bytes = hostChargeForAmounts(amounts) catch {
-            lockAtomic(&self.mutex);
-            defer self.mutex.unlock();
-            self.memory.accounting_errors +|= 1;
-            return;
-        };
-        self.releaseBatchWithHostCharge(amounts, host_charge_bytes);
-    }
-
-    pub fn releaseBatchWithHostCharge(
+    fn retainBatchReservation(
         self: *ResourceManager,
-        amounts: []const SliceAmount,
-        host_charge_bytes: u64,
-    ) void {
+        reservation: *BatchReservation,
+        retained: [slice_count]u64,
+        retained_host_charge_bytes: u64,
+    ) !void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
-        if (host_charge_bytes > self.memory.used_bytes) {
+        if (retained_host_charge_bytes > reservation.host_charge_bytes) {
             self.memory.accounting_errors +|= 1;
-            return;
+            return error.InvalidReservationReduction;
         }
-        for (amounts, 0..) |amount, index| {
-            if (amount.bytes == 0) continue;
-            const state = &self.slices[sliceIndex(amount.slice)];
-            if (amount.bytes > state.used_bytes) {
+        inline for (0..slice_count) |index| {
+            if (retained[index] > reservation.amounts[index]) {
                 self.memory.accounting_errors +|= 1;
-                return;
-            }
-            for (amounts[0..index]) |previous| {
-                if (previous.bytes > 0 and previous.slice == amount.slice) {
-                    self.memory.accounting_errors +|= 1;
-                    return;
-                }
+                return error.InvalidReservationReduction;
             }
         }
-        for (amounts) |amount| {
-            if (amount.bytes == 0) continue;
-            self.slices[sliceIndex(amount.slice)].used_bytes -= amount.bytes;
+
+        const released_host = reservation.host_charge_bytes - retained_host_charge_bytes;
+        if (released_host > self.memory.used_bytes) {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
         }
-        self.memory.used_bytes -= host_charge_bytes;
+        inline for (0..slice_count) |index| {
+            const released = reservation.amounts[index] - retained[index];
+            if (released > self.slices[index].used_bytes) {
+                self.memory.accounting_errors +|= 1;
+                return error.ResourceAccountingMismatch;
+            }
+        }
+        inline for (0..slice_count) |index| {
+            self.slices[index].used_bytes -= reservation.amounts[index] - retained[index];
+        }
+        self.memory.used_bytes -= released_host;
+        reservation.amounts = retained;
+        reservation.host_charge_bytes = retained_host_charge_bytes;
         self.pressure_change.advance();
+    }
+
+    pub fn recordAccountingError(self: *ResourceManager) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.memory.accounting_errors +|= 1;
+    }
+
+    fn releaseBatchReservation(
+        self: *ResourceManager,
+        reservation: *const BatchReservation,
+    ) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        if (reservation.host_charge_bytes > self.memory.used_bytes) {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        }
+        inline for (0..slice_count) |index| {
+            if (reservation.amounts[index] > self.slices[index].used_bytes) {
+                self.memory.accounting_errors +|= 1;
+                return false;
+            }
+        }
+        inline for (0..slice_count) |index|
+            self.slices[index].used_bytes -= reservation.amounts[index];
+        self.memory.used_bytes -= reservation.host_charge_bytes;
+        self.pressure_change.advance();
+        return true;
     }
 
     pub fn reserve(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
@@ -1213,21 +1285,31 @@ pub const ResourceManager = struct {
         return granted;
     }
 
-    pub fn releaseBytes(self: *ResourceManager, slice: Slice, bytes: u64) void {
-        if (bytes == 0) return;
+    fn releaseReservationBytes(self: *ResourceManager, slice: Slice, bytes: u64) void {
+        _ = self.tryReleaseReservationBytes(slice, bytes);
+    }
+
+    fn tryReleaseReservationBytes(self: *ResourceManager, slice: Slice, bytes: u64) bool {
+        if (bytes == 0) return true;
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
         const state = &self.slices[sliceIndex(slice)];
-        state.used_bytes -|= bytes;
-        self.releaseMemoryLocked(bytes);
+        if (bytes > state.used_bytes or bytes > self.memory.used_bytes) {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        }
+        state.used_bytes -= bytes;
+        self.memory.used_bytes -= bytes;
         self.pressure_change.advance();
+        return true;
     }
 
     pub fn adjustUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) !void {
         if (next == current.*) return;
         if (next < current.*) {
-            self.releaseBytes(slice, current.* - next);
+            if (!self.tryReleaseReservationBytes(slice, current.* - next))
+                return error.ResourceAccountingMismatch;
             current.* = next;
             return;
         }
@@ -1239,15 +1321,34 @@ pub const ResourceManager = struct {
     }
 
     pub fn observeUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) void {
-        if (next == current.*) return;
+        _ = self.tryObserveUsage(slice, current, next);
+    }
+
+    /// Reconcile one observer-owned contribution without allowing stale input
+    /// to debit bytes belonging to another observer or slice. On failure both
+    /// ledgers and the caller's current value remain unchanged.
+    pub fn tryObserveUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) bool {
+        if (next == current.*) return true;
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
         const state = &self.slices[sliceIndex(slice)];
-        state.used_bytes = state.used_bytes -| current.*;
-        state.used_bytes = state.used_bytes +| next;
-        self.memory.used_bytes = self.memory.used_bytes -| current.*;
-        self.memory.used_bytes = self.memory.used_bytes +| next;
+        if (current.* > state.used_bytes or current.* > self.memory.used_bytes) {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        }
+        const slice_base = state.used_bytes - current.*;
+        const memory_base = self.memory.used_bytes - current.*;
+        const slice_next = std.math.add(u64, slice_base, next) catch {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        };
+        const memory_next = std.math.add(u64, memory_base, next) catch {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        };
+        state.used_bytes = slice_next;
+        self.memory.used_bytes = memory_next;
         current.* = next;
         state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
         self.memory.peak_bytes = @max(self.memory.peak_bytes, self.memory.used_bytes);
@@ -1262,6 +1363,7 @@ pub const ResourceManager = struct {
         if (self.memory.budget.hard_limit_bytes > 0 and self.memory.used_bytes > self.memory.budget.hard_limit_bytes)
             self.memory.hard_limit_rejections +|= 1;
         self.pressure_change.advance();
+        return true;
     }
 
     pub fn snapshot(self: *ResourceManager) Stats {
@@ -1563,7 +1665,7 @@ pub const Reservation = struct {
 
     pub fn release(self: *Reservation) void {
         if (self.released) return;
-        self.manager.releaseBytes(self.slice, self.bytes);
+        self.manager.releaseReservationBytes(self.slice, self.bytes);
         self.released = true;
     }
 
@@ -1583,7 +1685,7 @@ pub const Reservation = struct {
     pub fn shrink(self: *Reservation, bytes: u64) void {
         if (self.released or bytes == 0) return;
         const released_bytes = @min(bytes, self.bytes);
-        self.manager.releaseBytes(self.slice, released_bytes);
+        self.manager.releaseReservationBytes(self.slice, released_bytes);
         self.bytes -= released_bytes;
     }
 };
@@ -1838,12 +1940,12 @@ test "batch reservation is atomic across inference resource slices" {
         .{ .slice = .inference_model_residency, .bytes = 80 },
         .{ .slice = .inference_kv_working_set, .bytes = 20 },
     };
-    try manager.reserveBatch(&admitted);
+    var reservation = try manager.reserveBatch(&admitted);
     try std.testing.expectEqual(
         @as(u64, 80),
         manager.sliceStats(.inference_model_residency).used_bytes,
     );
-    manager.releaseBatch(&admitted);
+    reservation.release();
     try std.testing.expectEqual(
         @as(u64, 0),
         manager.sliceStats(.inference_model_residency).used_bytes,
@@ -1865,7 +1967,7 @@ test "classified batch reservation distinguishes size from contention" {
     const admitted = [_]SliceAmount{
         .{ .slice = .inference_model_residency, .bytes = 80 },
     };
-    try manager.reserveBatchClassified(&admitted);
+    var reservation = try manager.reserveBatchClassified(&admitted);
     try std.testing.expectError(
         error.ResourceTemporarilyUnavailable,
         manager.reserveBatchClassified(&.{
@@ -1877,12 +1979,12 @@ test "classified batch reservation distinguishes size from contention" {
         manager.sliceStats(.inference_model_residency).used_bytes,
     );
 
-    manager.releaseBatch(&admitted);
+    reservation.release();
     const after_release = [_]SliceAmount{
         .{ .slice = .inference_model_residency, .bytes = 21 },
     };
-    try manager.reserveBatchClassified(&after_release);
-    manager.releaseBatch(&after_release);
+    var after_release_reservation = try manager.reserveBatchClassified(&after_release);
+    after_release_reservation.release();
 }
 
 test "aggregate host memory admission is atomic across slices" {
@@ -1913,11 +2015,11 @@ test "logical inference slices can charge only physical host memory" {
         .{ .slice = .inference_model_residency, .bytes = 240 },
         .{ .slice = .inference_kv_working_set, .bytes = 60 },
     };
-    try manager.reserveBatchClassifiedWithHostCharge(&logical, 80);
+    var reservation = try manager.reserveBatchClassifiedWithHostCharge(&logical, 80);
     try std.testing.expectEqual(@as(u64, 300), manager.sliceStats(.inference_model_residency).used_bytes +
         manager.sliceStats(.inference_kv_working_set).used_bytes);
     try std.testing.expectEqual(@as(u64, 80), manager.snapshot().memory.used_bytes);
-    manager.releaseBatchWithHostCharge(&logical, 80);
+    reservation.release();
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 
@@ -1927,37 +2029,62 @@ test "batch release accounting errors fail closed" {
         .{ .slice = .inference_model_residency, .bytes = 20 },
         .{ .slice = .inference_kv_working_set, .bytes = 10 },
     };
-    try manager.reserveBatchClassifiedWithHostCharge(&admitted, 15);
+    var first = try manager.reserveBatchClassifiedWithHostCharge(&admitted, 15);
+    var second = try manager.reserveBatchClassifiedWithHostCharge(&admitted, 15);
 
-    manager.releaseBatch(&.{
-        .{ .slice = .inference_model_residency, .bytes = std.math.maxInt(u64) },
-        .{ .slice = .inference_kv_working_set, .bytes = 1 },
-    });
+    first.release();
+    first.release();
     var stats = manager.snapshot();
     try std.testing.expectEqual(@as(u64, 15), stats.memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 1), stats.memory.accounting_errors);
+    try std.testing.expectEqual(@as(u64, 20), manager.sliceStats(.inference_model_residency).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.memory.accounting_errors);
 
-    manager.releaseBatchWithHostCharge(&admitted, 16);
+    try std.testing.expectError(
+        error.InvalidReservationReduction,
+        second.retain(&.{.{ .slice = .inference_model_residency, .bytes = 21 }}, 15),
+    );
+    try std.testing.expectError(
+        error.DuplicateResourceSlice,
+        second.retain(&.{
+            .{ .slice = .inference_model_residency, .bytes = 10 },
+            .{ .slice = .inference_model_residency, .bytes = 10 },
+        }, 15),
+    );
+    try std.testing.expectEqual(@as(u64, 15), manager.snapshot().memory.used_bytes);
+
+    // Simulate a damaged aggregate ledger. Release must retain every slice
+    // reservation and make the mismatch observable rather than saturating.
+    manager.memory.used_bytes = 14;
+    second.release();
     stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 15), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 14), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 20), manager.sliceStats(.inference_model_residency).used_bytes);
+    try std.testing.expectEqual(@as(u64, 3), stats.memory.accounting_errors);
+}
+
+test "single release and observer mismatch cannot debit unrelated memory" {
+    var manager = ResourceManager.init(.{});
+    var first = try manager.reserve(.inference_tokenizer_cache, 10);
+    var unrelated = try manager.reserve(.inference_model_residency, 20);
+
+    try std.testing.expect(!manager.tryReleaseReservationBytes(.inference_tokenizer_cache, 11));
+    var stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 30), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 10), manager.sliceStats(.inference_tokenizer_cache).used_bytes);
+
+    var stale_observation: u64 = 11;
+    try std.testing.expect(!manager.tryObserveUsage(
+        .inference_tokenizer_cache,
+        &stale_observation,
+        0,
+    ));
+    stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 30), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 11), stale_observation);
     try std.testing.expectEqual(@as(u64, 2), stats.memory.accounting_errors);
 
-    manager.releaseBatchWithHostCharge(&.{
-        .{ .slice = .inference_model_residency, .bytes = 10 },
-        .{ .slice = .inference_model_residency, .bytes = 10 },
-    }, 15);
-    stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 15), stats.memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 3), stats.memory.accounting_errors);
-
-    manager.releaseBatchWithHostCharge(&.{
-        .{ .slice = .inference_model_residency, .bytes = 21 },
-    }, 15);
-    stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 15), stats.memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 4), stats.memory.accounting_errors);
-
-    manager.releaseBatchWithHostCharge(&admitted, 15);
+    first.release();
+    unrelated.release();
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 

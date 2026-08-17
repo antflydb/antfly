@@ -595,8 +595,9 @@ pub const AdmissionResourceError = error{
 
 pub const AdmissionResourceBudget = struct {
     context: *anyopaque,
-    try_reserve: *const fn (*anyopaque, AdmissionAmounts) AdmissionResourceError!void,
-    release: *const fn (*anyopaque, AdmissionAmounts) void,
+    try_reserve: *const fn (*anyopaque, AdmissionAmounts) AdmissionResourceError!usize,
+    retain: *const fn (*anyopaque, usize, AdmissionAmounts) AdmissionResourceError!void,
+    release: *const fn (*anyopaque, usize) void,
 };
 
 pub const AdmissionRequest = struct {
@@ -636,6 +637,9 @@ pub const AdmissionLease = struct {
     amounts: AdmissionAmounts,
     amounts_by_backend: [backend_class_count]AdmissionAmounts,
     retain_backend_class: ?BackendClass,
+    /// Opaque exactly-once ownership token returned by the external process
+    /// manager. Byte totals are never reconstructed for release.
+    external_lease: ?usize = null,
     /// Bytes committed against the current live-memory pressure epoch. This is
     /// deliberately separate from policy accounting: the kernel/cgroup probe
     /// reflects physical pressure, while AdmissionAmounts tracks ownership.
@@ -652,6 +656,7 @@ pub const AdmissionLease = struct {
             return error.InvalidAdmissionLeaseReduction;
         const retained_live_bytes = liveHostBytes(retained) catch
             return error.InvalidAdmissionLeaseReduction;
+        try controller.retainExternalLease(self.external_lease, retained);
         controller.releaseSingle(backend_class, released);
         controller.settleLiveReservation(
             self.live_reserved_bytes,
@@ -665,11 +670,12 @@ pub const AdmissionLease = struct {
     pub fn release(self: *AdmissionLease) void {
         const controller = self.controller orelse return;
         controller.releaseLiveReservation(self.live_reserved_bytes);
-        controller.release(self.amounts_by_backend, self.amounts);
+        controller.release(self.amounts_by_backend, self.amounts, self.external_lease);
         self.controller = null;
         self.amounts = .{};
         self.amounts_by_backend = emptyAdmissionAmountsByBackend();
         self.retain_backend_class = null;
+        self.external_lease = null;
         self.live_reserved_bytes = 0;
     }
 };
@@ -952,13 +958,19 @@ pub const AdmissionController = struct {
             self.admitted_by_backend = next_by_backend;
         }
 
+        var external_lease: ?usize = null;
         if (self.resource_budget) |resource_budget| {
-            resource_budget.try_reserve(resource_budget.context, amounts) catch |err| {
+            const token = resource_budget.try_reserve(resource_budget.context, amounts) catch |err| {
                 if (err == error.ResourceTemporarilyUnavailable)
                     pressure.* = .external_budget;
                 self.releaseLocal(amounts_by_backend, amounts);
                 return err;
             };
+            if (token == 0) {
+                self.releaseLocal(amounts_by_backend, amounts);
+                return error.ResourceLimitExceeded;
+            }
+            external_lease = token;
         }
 
         var live_reserved_bytes: usize = 0;
@@ -968,13 +980,13 @@ pub const AdmissionController = struct {
             // Linux MemAvailable, or a valid device-resident model is rejected merely
             // because its VRAM footprint exceeds free host RAM.
             const live_host_incremental = liveHostBytes(amounts) catch {
-                self.release(amounts_by_backend, amounts);
+                self.release(amounts_by_backend, amounts, external_lease);
                 return error.ResourceLimitExceeded;
             };
             live_reserved_bytes = self.tryReserveLiveCapacity(live_host_incremental) catch |err| {
                 if (err == error.ResourceTemporarilyUnavailable)
                     pressure.* = .live_host;
-                self.release(amounts_by_backend, amounts);
+                self.release(amounts_by_backend, amounts, external_lease);
                 return err;
             };
         }
@@ -992,6 +1004,7 @@ pub const AdmissionController = struct {
             .amounts = amounts,
             .amounts_by_backend = amounts_by_backend,
             .retain_backend_class = retain_backend_class,
+            .external_lease = external_lease,
             .live_reserved_bytes = live_reserved_bytes,
         };
     }
@@ -1018,17 +1031,31 @@ pub const AdmissionController = struct {
     ) void {
         var amounts_by_backend = emptyAdmissionAmountsByBackend();
         amounts_by_backend[backendClassIndex(backend_class)] = amounts;
-        self.release(amounts_by_backend, amounts);
+        self.releaseLocal(amounts_by_backend, amounts);
     }
 
     fn release(
         self: *AdmissionController,
         amounts_by_backend: [backend_class_count]AdmissionAmounts,
         amounts: AdmissionAmounts,
+        external_lease: ?usize,
     ) void {
         self.releaseLocal(amounts_by_backend, amounts);
-        if (self.resource_budget) |resource_budget|
-            resource_budget.release(resource_budget.context, amounts);
+        if (external_lease) |token| {
+            if (self.resource_budget) |resource_budget|
+                resource_budget.release(resource_budget.context, token);
+        }
+    }
+
+    fn retainExternalLease(
+        self: *AdmissionController,
+        external_lease: ?usize,
+        retained: AdmissionAmounts,
+    ) AdmissionResourceError!void {
+        const token = external_lease orelse return;
+        const resource_budget = self.resource_budget orelse
+            return error.ResourceLimitExceeded;
+        try resource_budget.retain(resource_budget.context, token, retained);
     }
 
     fn releaseLocal(
@@ -1417,7 +1444,7 @@ fn staticLimitsForBackend(backend: BackendClass) Limits {
 pub fn currentSystemMemoryInfo() ?SystemMemoryInfo {
     return switch (builtin.os.tag) {
         .macos => probeSystemMemoryInfoMacos(),
-        .linux => probeSystemMemoryInfoLinux(),
+        .linux => probeSystemMemoryInfoLinuxSample().info,
         else => null,
     };
 }
@@ -1427,12 +1454,22 @@ pub fn currentSystemMemoryInfo() ?SystemMemoryInfo {
 /// page cache, a test harness, and sibling processes remain visible even when
 /// memory.max itself is unlimited.
 pub fn currentSystemMemoryInfoForLimit(limit_bytes: usize) ?SystemMemoryInfo {
-    const detected = currentSystemMemoryInfo();
-    const leaf_current = if (builtin.os.tag == .linux)
-        probeCgroupMemoryInfoLinux().leaf_current_bytes
-    else
-        null;
-    return applyOptionalProcessMemoryLimit(detected, limit_bytes, leaf_current);
+    return switch (builtin.os.tag) {
+        .linux => blk: {
+            const sample = probeSystemMemoryInfoLinuxSample();
+            break :blk applyOptionalProcessMemoryLimit(
+                sample.info,
+                limit_bytes,
+                sample.cgroup.leaf_current_bytes,
+            );
+        },
+        .macos => applyOptionalProcessMemoryLimit(
+            probeSystemMemoryInfoMacos(),
+            limit_bytes,
+            null,
+        ),
+        else => applyOptionalProcessMemoryLimit(null, limit_bytes, null),
+    };
 }
 
 fn applyOptionalProcessMemoryLimit(
@@ -1624,6 +1661,11 @@ const CgroupMemoryInfo = struct {
     /// Current usage at the process leaf, retained even when memory.max is
     /// unlimited so an explicit process envelope can still be enforced.
     leaf_current_bytes: ?usize = null,
+};
+
+const LinuxSystemMemorySample = struct {
+    info: ?SystemMemoryInfo = null,
+    cgroup: CgroupMemoryInfo = .{},
 };
 
 const CgroupVersion = enum {
@@ -2206,12 +2248,17 @@ fn applyCgroupMemoryInfo(
     };
 }
 
-fn probeSystemMemoryInfoLinux() ?SystemMemoryInfo {
-    if (builtin.os.tag != .linux) return null;
+fn probeSystemMemoryInfoLinuxSample() LinuxSystemMemorySample {
+    if (builtin.os.tag != .linux) return .{};
+    const cgroup = probeCgroupMemoryInfoLinux();
     var meminfo_buffer: [8192]u8 = undefined;
-    const bytes = readSmallLinuxFile("/proc/meminfo", &meminfo_buffer) orelse return null;
-    const host = parseLinuxMemInfo(bytes) orelse return null;
-    return applyCgroupMemoryInfo(host, probeCgroupMemoryInfoLinux());
+    const bytes = readSmallLinuxFile("/proc/meminfo", &meminfo_buffer) orelse
+        return .{ .cgroup = cgroup };
+    const host = parseLinuxMemInfo(bytes) orelse return .{ .cgroup = cgroup };
+    return .{
+        .info = applyCgroupMemoryInfo(host, cgroup),
+        .cgroup = cgroup,
+    };
 }
 
 fn mib(value: usize) usize {
@@ -3236,14 +3283,22 @@ test "admission resource budget mirrors acquire retain and release" {
     const Recorder = struct {
         current: AdmissionAmounts = .{},
 
-        fn reserve(context: *anyopaque, amounts: AdmissionAmounts) !void {
+        fn reserve(context: *anyopaque, amounts: AdmissionAmounts) AdmissionResourceError!usize {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.current = try self.current.merge(amounts);
+            return 1;
         }
 
-        fn release(context: *anyopaque, amounts: AdmissionAmounts) void {
+        fn retain(context: *anyopaque, lease: usize, retained: AdmissionAmounts) AdmissionResourceError!void {
             const self: *@This() = @ptrCast(@alignCast(context));
-            self.current = subtractAdmissionAmounts(self.current, amounts) orelse unreachable;
+            if (lease != 1) return error.ResourceLimitExceeded;
+            self.current = retained;
+        }
+
+        fn release(context: *anyopaque, lease: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(lease == 1);
+            self.current = .{};
         }
     };
 
@@ -3252,6 +3307,7 @@ test "admission resource budget mirrors acquire retain and release" {
     controller.configureResourceBudget(.{
         .context = &recorder,
         .try_reserve = Recorder.reserve,
+        .retain = Recorder.retain,
         .release = Recorder.release,
     });
     var lease = try controller.tryAcquire(.cpu, .{}, .{

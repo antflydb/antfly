@@ -16323,7 +16323,7 @@ pub fn runFromIterator(
         cli.raft_tick_ms,
         cli.control_tick_ms,
     ) catch return error.InvalidArguments;
-    const process_memory_limit_bytes = process_memory_budget.resolve(
+    const process_memory_resolution = process_memory_budget.resolveDetailed(
         cli.process_memory_budget_mb,
         init.environ_map.get(process_memory_budget.canonical_env),
         null,
@@ -16331,6 +16331,7 @@ pub fn runFromIterator(
         std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
         return err;
     };
+    const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
 
     var secret_store: antfly.common.secrets.FileStore = undefined;
     var secret_store_initialized = false;
@@ -16475,6 +16476,17 @@ pub fn runFromIterator(
         },
     }, metadata_api_urls.urls);
     defer data_server.deinitWithDeadline(supervisor.deadline());
+    const managed_memory = data_server.provisioned_storage.resource_manager.snapshot().memory;
+    std.log.info(
+        "process memory policy operator_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} managed_hard_limit_bytes={d}",
+        .{
+            @tagName(process_memory_resolution.source),
+            @tagName(data_server.provisioned_storage.memory_limit_source),
+            process_memory_limit_bytes,
+            data_server.provisioned_storage.effective_memory_limit_bytes,
+            managed_memory.hard_limit_bytes,
+        },
+    );
     try data_server.start();
 
     const base_uri = try data_server.baseUri(alloc);

@@ -92,12 +92,48 @@ fn readMemoryLimitFile(path: []const u8) ?u64 {
     return value;
 }
 
-fn detectedMemoryLimitBytes() ?u64 {
-    if (builtin.os.tag == .linux) {
-        if (readMemoryLimitFile("/sys/fs/cgroup/memory.max")) |limit| return limit;
-        if (readMemoryLimitFile("/sys/fs/cgroup/memory/memory.limit_in_bytes")) |limit| return limit;
+pub const MemoryLimitSource = enum {
+    explicit,
+    cgroup_v2,
+    cgroup_v1,
+    host,
+    unavailable,
+};
+
+const DetectedMemoryLimit = struct {
+    bytes: u64,
+    source: MemoryLimitSource,
+};
+
+fn resolveEffectiveMemoryLimit(
+    explicit_bytes: ?u64,
+    detected: ?DetectedMemoryLimit,
+) ?DetectedMemoryLimit {
+    if (detected) |detected_limit| {
+        if (explicit_bytes) |explicit_limit| {
+            if (explicit_limit <= detected_limit.bytes) {
+                return .{ .bytes = explicit_limit, .source = .explicit };
+            }
+        }
+        return detected_limit;
     }
-    return std.process.totalSystemMemory() catch null;
+    if (explicit_bytes) |explicit_limit| {
+        return .{ .bytes = explicit_limit, .source = .explicit };
+    }
+    return null;
+}
+
+fn detectedMemoryLimit() ?DetectedMemoryLimit {
+    if (builtin.os.tag == .linux) {
+        if (readMemoryLimitFile("/sys/fs/cgroup/memory.max")) |limit|
+            return .{ .bytes = limit, .source = .cgroup_v2 };
+        if (readMemoryLimitFile("/sys/fs/cgroup/memory/memory.limit_in_bytes")) |limit|
+            return .{ .bytes = limit, .source = .cgroup_v1 };
+    }
+    return .{
+        .bytes = std.process.totalSystemMemory() catch return null,
+        .source = .host,
+    };
 }
 
 fn adaptiveSliceHardLimit(total: u64, divisor: u64, min_bytes: u64, max_bytes: u64) u64 {
@@ -123,25 +159,26 @@ fn resourceBudget(soft_numerator: u64, hard_limit_bytes: u64) resource_manager_m
 const SmartResourceBudgets = struct {
     options: resource_manager_mod.Options,
     lsm_cache_budget_bytes: usize,
+    effective_memory_limit_bytes: u64 = 0,
+    memory_limit_source: MemoryLimitSource = .unavailable,
 };
 
 fn smartResourceBudgets(process_memory_limit_bytes: usize) SmartResourceBudgets {
     var options = resource_manager_mod.Options{};
-    const detected = detectedMemoryLimitBytes();
     const explicit: ?u64 = if (process_memory_limit_bytes == 0) null else @intCast(process_memory_limit_bytes);
-    const total = if (detected) |value|
-        if (explicit) |limit| @min(value, limit) else value
-    else
-        explicit orelse {
-            const lsm_cache_budget = lsm_backend.DefaultCacheSizeBytes;
-            options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, @intCast(lsm_cache_budget));
-            return .{
-                .options = options,
-                .lsm_cache_budget_bytes = lsm_cache_budget,
-            };
+    const effective = resolveEffectiveMemoryLimit(explicit, detectedMemoryLimit()) orelse {
+        const lsm_cache_budget = lsm_backend.DefaultCacheSizeBytes;
+        options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, @intCast(lsm_cache_budget));
+        return .{
+            .options = options,
+            .lsm_cache_budget_bytes = lsm_cache_budget,
         };
+    };
 
-    return smartResourceBudgetsForTotal(total);
+    var budgets = smartResourceBudgetsForTotal(effective.bytes);
+    budgets.effective_memory_limit_bytes = effective.bytes;
+    budgets.memory_limit_source = effective.source;
+    return budgets;
 }
 
 fn safeManagedHostMemory(total: u64) u64 {
@@ -219,6 +256,8 @@ pub const ProvisionedGroupStorage = struct {
     write_cache: table_writes.ProvisionedTableWriteCache,
     startup_write_cache: table_writes.ProvisionedTableWriteCache,
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
+    effective_memory_limit_bytes: u64 = 0,
+    memory_limit_source: MemoryLimitSource = .unavailable,
 
     pub fn init(alloc: std.mem.Allocator) ProvisionedGroupStorage {
         return initWithProcessMemoryLimit(alloc, 0);
@@ -232,6 +271,8 @@ pub const ProvisionedGroupStorage = struct {
         return .{
             .alloc = alloc,
             .resource_manager = resource_manager_mod.ResourceManager.init(budgets.options),
+            .effective_memory_limit_bytes = budgets.effective_memory_limit_bytes,
+            .memory_limit_source = budgets.memory_limit_source,
             .lsm_cache = lsm_backend.Cache.init(alloc, budgets.lsm_cache_budget_bytes),
             .hbc_cache = hbc_mod.Cache.init(alloc),
             .runtime_status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc),
@@ -498,6 +539,27 @@ test "provisioned lsm cache budget scales with node memory and remains capped" {
             budgets.options.memory_budget.hard_limit_bytes,
         );
     }
+}
+
+test "effective process memory limit preserves source and clamps explicit requests" {
+    const detected = DetectedMemoryLimit{ .bytes = 8 * GiB, .source = .cgroup_v2 };
+
+    const automatic = resolveEffectiveMemoryLimit(null, detected).?;
+    try std.testing.expectEqual(@as(u64, 8 * GiB), automatic.bytes);
+    try std.testing.expectEqual(MemoryLimitSource.cgroup_v2, automatic.source);
+
+    const explicit = resolveEffectiveMemoryLimit(4 * GiB, detected).?;
+    try std.testing.expectEqual(@as(u64, 4 * GiB), explicit.bytes);
+    try std.testing.expectEqual(MemoryLimitSource.explicit, explicit.source);
+
+    const clamped = resolveEffectiveMemoryLimit(16 * GiB, detected).?;
+    try std.testing.expectEqual(@as(u64, 8 * GiB), clamped.bytes);
+    try std.testing.expectEqual(MemoryLimitSource.cgroup_v2, clamped.source);
+
+    const explicit_without_detection = resolveEffectiveMemoryLimit(2 * GiB, null).?;
+    try std.testing.expectEqual(@as(u64, 2 * GiB), explicit_without_detection.bytes);
+    try std.testing.expectEqual(MemoryLimitSource.explicit, explicit_without_detection.source);
+    try std.testing.expectEqual(@as(?DetectedMemoryLimit, null), resolveEffectiveMemoryLimit(null, null));
 }
 
 test "provisioned group storage wires remote content to writer caches" {

@@ -6358,13 +6358,17 @@ test "external resource ownership fails closed until budget is attached" {
     );
 
     const Bridge = struct {
-        fn reserve(_: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {}
-        fn release(_: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) void {}
+        fn reserve(_: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+            return 1;
+        }
+        fn retain(_: *anyopaque, _: usize, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
     };
     var context: u8 = 0;
     manager.configureAdmissionResourceBudget(.{
         .context = &context,
         .try_reserve = Bridge.reserve,
+        .retain = Bridge.retain,
         .release = Bridge.release,
     });
     try manager.ensureResourceOwnerReady();

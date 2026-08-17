@@ -722,6 +722,7 @@ fn inferenceAdmissionResourceBudget(
     return .{
         .context = state,
         .try_reserve = reserveInferenceAdmissionResources,
+        .retain = retainInferenceAdmissionResources,
         .release = releaseInferenceAdmissionResources,
     };
 }
@@ -742,11 +743,30 @@ fn bridgeAdmissionAmounts(
 fn reserveInferenceAdmissionResources(
     context: *anyopaque,
     amounts: inference.runtime.tier.memory.AdmissionAmounts,
-) inference.runtime.tier.memory.AdmissionResourceError!void {
+) inference.runtime.tier.memory.AdmissionResourceError!usize {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context));
     const budget = &(state.resource_budget orelse return error.ResourceLimitExceeded);
     const bridged = bridgeAdmissionAmounts(amounts);
-    const status = budget.reserve_admission(budget.context, &bridged);
+    var lease: usize = 0;
+    const status = budget.reserve_admission(budget.context, &bridged, &lease);
+    if (status.isOk()) {
+        if (lease == 0) return error.ResourceLimitExceeded;
+        return lease;
+    }
+    const err = inference_bridge.errorFromStatus(status);
+    if (err == error.ResourceTemporarilyUnavailable) return error.ResourceTemporarilyUnavailable;
+    return error.ResourceLimitExceeded;
+}
+
+fn retainInferenceAdmissionResources(
+    context: *anyopaque,
+    lease: usize,
+    retained: inference.runtime.tier.memory.AdmissionAmounts,
+) inference.runtime.tier.memory.AdmissionResourceError!void {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(context));
+    const budget = &(state.resource_budget orelse return error.ResourceLimitExceeded);
+    const bridged = bridgeAdmissionAmounts(retained);
+    const status = budget.retain_admission(budget.context, lease, &bridged);
     if (status.isOk()) return;
     const err = inference_bridge.errorFromStatus(status);
     if (err == error.ResourceTemporarilyUnavailable) return error.ResourceTemporarilyUnavailable;
@@ -755,19 +775,23 @@ fn reserveInferenceAdmissionResources(
 
 fn releaseInferenceAdmissionResources(
     context: *anyopaque,
-    amounts: inference.runtime.tier.memory.AdmissionAmounts,
+    lease: usize,
 ) void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context));
     const budget = &(state.resource_budget orelse return);
-    const bridged = bridgeAdmissionAmounts(amounts);
-    budget.release_admission(budget.context, &bridged);
+    budget.release_admission(budget.context, lease);
 }
 
 fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64) void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context));
     const budget = &(state.resource_budget orelse return);
-    budget.observe_prompt_cache(budget.context, current.*, next);
-    current.* = next;
+    if (budget.observe_prompt_cache(
+        budget.context,
+        @intFromPtr(current),
+        current.*,
+        next,
+    ) != 0)
+        current.* = next;
 }
 
 test "standalone prompt cache detaches resource observer before owner teardown" {

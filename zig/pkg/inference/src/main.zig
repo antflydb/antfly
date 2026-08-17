@@ -350,16 +350,36 @@ fn printRunUsage(usage_name: []const u8) void {
     , .{usage_name});
 }
 
+const ProcessMemoryBudgetSource = enum {
+    cli,
+    canonical_environment,
+    compatibility_environment,
+    config,
+    automatic,
+};
+
+const ProcessMemoryBudgetResolution = struct {
+    value_mib: ?usize,
+    source: ProcessMemoryBudgetSource,
+};
+
 fn resolveProcessMemoryBudgetMib(
     cli_override: ?usize,
     canonical_env_value: ?[]const u8,
     compatibility_env_value: ?[]const u8,
     config_value: ?usize,
-) !?usize {
-    if (cli_override) |value| return value;
-    if (canonical_env_value orelse compatibility_env_value) |raw|
-        return std.fmt.parseUnsigned(usize, raw, 10) catch error.InvalidArguments;
-    return config_value;
+) !ProcessMemoryBudgetResolution {
+    if (cli_override) |value| return .{ .value_mib = value, .source = .cli };
+    if (canonical_env_value) |raw| return .{
+        .value_mib = std.fmt.parseUnsigned(usize, raw, 10) catch return error.InvalidArguments,
+        .source = .canonical_environment,
+    };
+    if (compatibility_env_value) |raw| return .{
+        .value_mib = std.fmt.parseUnsigned(usize, raw, 10) catch return error.InvalidArguments,
+        .source = .compatibility_environment,
+    };
+    if (config_value) |value| return .{ .value_mib = value, .source = .config };
+    return .{ .value_mib = null, .source = .automatic };
 }
 
 fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -469,16 +489,20 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     defer if (config_preload_models.len > 0) allocator.free(config_preload_models);
 
     const budget_override_limits = try budget_overrides_mib.toByteLimits();
-    const process_memory_budget_mb = try resolveProcessMemoryBudgetMib(
+    const process_memory_resolution = try resolveProcessMemoryBudgetMib(
         process_memory_budget_mb_override,
         platform.env.getenv("ANTFLY_PROCESS_MEMORY_BUDGET_MB"),
         platform.env.getenv("ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB"),
         if (loaded_cfg) |parsed| parsed.value.process_memory_budget_mb else null,
     );
-    const process_memory_limit_bytes = if (process_memory_budget_mb) |value|
+    const process_memory_limit_bytes = if (process_memory_resolution.value_mib) |value|
         (try (inference.runtime.tier.memory.BudgetOverridesMib{ .host = value }).toByteLimits()).host_limit_bytes
     else
         0;
+    std.log.info(
+        "process memory policy operator_source={s} configured_limit_bytes={d}",
+        .{ @tagName(process_memory_resolution.source), process_memory_limit_bytes },
+    );
     var node_cfg = inference.server.NodeConfig{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
@@ -875,20 +899,28 @@ test "kernel JIT mode precedence is CLI then environment then config" {
 
 test "process memory budget precedence ignores shadowed invalid sources" {
     try std.testing.expectEqual(
+        ProcessMemoryBudgetSource.cli,
+        (try resolveProcessMemoryBudgetMib(0, "invalid", "also-invalid", 512)).source,
+    );
+    try std.testing.expectEqual(
         @as(?usize, 0),
-        try resolveProcessMemoryBudgetMib(0, "invalid", "also-invalid", 512),
+        (try resolveProcessMemoryBudgetMib(0, "invalid", "also-invalid", 512)).value_mib,
     );
     try std.testing.expectEqual(
         @as(?usize, 256),
-        try resolveProcessMemoryBudgetMib(null, "256", "invalid", 512),
+        (try resolveProcessMemoryBudgetMib(null, "256", "invalid", 512)).value_mib,
     );
     try std.testing.expectEqual(
         @as(?usize, 384),
-        try resolveProcessMemoryBudgetMib(null, null, "384", 512),
+        (try resolveProcessMemoryBudgetMib(null, null, "384", 512)).value_mib,
     );
     try std.testing.expectEqual(
         @as(?usize, 512),
-        try resolveProcessMemoryBudgetMib(null, null, null, 512),
+        (try resolveProcessMemoryBudgetMib(null, null, null, 512)).value_mib,
+    );
+    try std.testing.expectEqual(
+        ProcessMemoryBudgetSource.config,
+        (try resolveProcessMemoryBudgetMib(null, null, null, 512)).source,
     );
     try std.testing.expectError(
         error.InvalidArguments,

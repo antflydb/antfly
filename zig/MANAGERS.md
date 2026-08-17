@@ -40,8 +40,8 @@ process still performs authoritative local admission.
 
 The Apache-licensed inference package also cannot import Antfly's internal
 storage `ResourceManager`. The standalone ABI bridge preserves that boundary:
-inference exposes generic reserve/release callbacks, while the full product
-maps them to node-owned resource slices.
+inference exposes generic reserve/retain/release callbacks, while the full
+product maps them to node-owned resource slices.
 
 ## BackendRuntime: execution and lifetime authority
 
@@ -125,9 +125,12 @@ the executor owner and “inference backend runtime descriptor” for the value.
    lease.
 9. Lane concurrency and resource admission are orthogonal. Work must satisfy
    both contracts before it can allocate and execute.
-10. Release accounting is fail closed. Malformed, duplicate, overflowing, or
-    over-release input retains the reservation and increments an accounting
-    error counter; it must never erase capacity owned by unrelated work.
+10. Release accounting is fail closed. Batch admission returns an exactly-once
+    ownership token, retain operations can only shrink that token, and teardown
+    releases the token rather than reconstructed byte totals. Malformed,
+    overflowing, stale-observer, or over-release input retains capacity and
+    increments an accounting error counter; it must never erase capacity owned
+    by unrelated work.
 
 ## Budget derivation
 
@@ -140,8 +143,8 @@ any smaller finite cgroup limit:
 
 An explicit envelope is necessary for Burstable Kubernetes pods whose request
 is lower than node memory but whose cgroup hard limit is `max`. Kubernetes does
-not expose the request as an allocation boundary inside that cgroup. Inference
-inference, distributed data, and full standalone accept
+not expose the request as an allocation boundary inside that cgroup. Inference,
+distributed data, and full standalone accept
 `--process-memory-budget-mb` and
 `ANTFLY_PROCESS_MEMORY_BUDGET_MB`. The older inference-prefixed flag and
 environment variable remain compatibility aliases for inference-capable
@@ -182,7 +185,15 @@ The common lifecycle is:
    destruction.
 
 External leases mirror the same transitions. They are not sampled telemetry:
-successful reserve/release pairs are part of allocation correctness.
+successful reserve/retain/release operations are part of allocation
+correctness. The standalone ABI carries an opaque owner-issued token through
+the inference `AdmissionLease`; byte totals are never accepted as release
+authority. Monotonic tokens are validated against an active owner registry, so
+a delayed duplicate cannot target a newer reservation that reused the same
+pool slot. Token records and registry capacity are reused, making steady-state
+admission allocation-free after reaching its concurrency high-water mark.
+Observed caches carry stable observer identities, and aggregate-only tokenizer
+accounting is serialized behind its owner counter.
 
 ## Failure semantics
 
@@ -203,8 +214,16 @@ Resource metrics must expose used, peak, soft-limit, hard-limit, pressure, and
 rejection and release-accounting-error counts for the aggregate host ledger,
 plus pressure and byte metrics for every logical slice.
 Inference metrics additionally retain backend class and the pressure domain
-that selected an eviction victim. Startup logs should report the detected or
-explicit process envelope and ownership mode.
+that selected an eviction victim. Data and full-standalone startup logs report
+the operator source (CLI, canonical or compatibility environment variable, or
+automatic), the effective source (explicit, cgroup v2, cgroup v1, host, or
+unavailable), configured and effective bytes, and the derived managed hard
+limit. Keeping operator intent separate from the effective source makes
+container clamping visible without waiting for an admission failure. Direct
+inference also reports operator source and configured bytes alongside its
+resource-ownership policy. Linux live admission obtains host, cgroup limit,
+and raw leaf usage from one coherent probe so the hot path does not repeat
+filesystem work or combine different sampling instants.
 Backend runtime metrics separately report active/peak lane leases, acquisitions,
 and shutdown rejections; they must not be combined with byte-budget metrics.
 
@@ -217,8 +236,9 @@ Permanent tests cover:
 - aggregate host admission across otherwise-independent slices;
 - host-only external charging with logical host-plus-backend inference metrics;
 - oversized minimum-progress operations remaining inside the host envelope;
-- release overflow and mismatch retaining all accounted capacity;
-- preload and request paths using the same admission controller.
+- exactly-once batch release and invalid retain preserving unrelated capacity;
+- single-release and stale-observer mismatch retaining all accounted capacity;
+- preload and request paths using the same admission controller;
 - inference, API, and control executor isolation plus lane shutdown/drain
   behavior.
 
