@@ -6212,6 +6212,10 @@ pub const ProvisionedTableWriteSource = struct {
         return false;
     }
 
+    fn structuralDrainPendingLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        return self.hasAnyExecutingGroupOperationLocked(table_name);
+    }
+
     fn hasAnyReadBlockingGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
         for (self.active_table_activities.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
@@ -6664,7 +6668,7 @@ pub const ProvisionedTableWriteSource = struct {
         // structural_active parks queued group operations. Drain only work
         // that entered before this fence; including parked waiters here would
         // create a cycle because they cannot enter until structural work ends.
-        while (self.hasAnyExecutingGroupOperationLocked(table_name)) {
+        while (self.structuralDrainPendingLocked(table_name)) {
             self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
         }
     }
@@ -6826,15 +6830,6 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return 0;
         return self.active_table_activities.items[index].operation_waiters;
-    }
-
-    pub fn testingStructuralActivityActive(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        if (!builtin.is_test) @compileError("testingStructuralActivityActive is test-only");
-        const io = self.table_activity_threaded.io();
-        self.table_activity_mutex.lockUncancelable(io);
-        defer self.table_activity_mutex.unlock(io);
-        const index = self.findTableActivityLocked(table_name, null) orelse return false;
-        return self.active_table_activities.items[index].structural_active;
     }
 
     fn tryBeginGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
@@ -7279,7 +7274,7 @@ pub const ProvisionedTableWriteSource = struct {
                 while (true) {
                     const current_index = self.findTableActivityLocked(table_name, null) orelse unreachable;
                     const current = self.active_table_activities.items[current_index];
-                    if (current.read_request_active == 0 and current.status_request_active == 0 and !self.hasAnyExecutingGroupOperationLocked(table_name)) break;
+                    if (current.read_request_active == 0 and current.status_request_active == 0 and !self.structuralDrainPendingLocked(table_name)) break;
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                 }
                 self.table_activity_mutex.unlock(io);
@@ -31733,21 +31728,6 @@ test "managed maintenance admission distinguishes status from data reads" {
         }
     };
 
-    const BlockingGroupWorker = struct {
-        source: *ProvisionedTableWriteSource,
-        entered: std.atomic.Value(bool) = .init(false),
-        release: std.atomic.Value(bool) = .init(false),
-
-        fn run(io: std.Io, self: *@This()) std.Io.Cancelable!void {
-            self.source.beginGroupOperation("docs", 7001);
-            defer self.source.endGroupOperation("docs", 7001);
-            self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) {
-                try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
-            }
-        }
-    };
-
     var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-repair-status-admission", NoCatalog.iface());
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -31827,57 +31807,42 @@ test "managed maintenance admission distinguishes status from data reads" {
     structural_group_active = false;
     try std.testing.expect(!source.hasReadBlockingActivityBestEffort("docs", 7001));
 
-    // A queued blocking group operation must remain parked while structural
-    // ownership drains the operation that entered before its fence. The
-    // queued waiter is not executing work and must not become part of the
-    // structural drain predicate.
+    // Structural ownership drains the operation that entered before its
+    // fence, but not a queued operation that cannot execute until structural
+    // work ends. Exercise the exact production predicate synchronously: a
+    // thread-based reproduction of the old cycle cannot be canceled because
+    // admission waits are deliberately uninterruptible.
     source.beginGroupOperation("docs", 7001);
-    var initial_group_active = true;
-    var blocking_worker = BlockingGroupWorker{ .source = &source };
-    var blocking_group: std.Io.Group = .init;
-    try blocking_group.concurrent(io, BlockingGroupWorker.run, .{ io, &blocking_worker });
-    var blocking_group_active = true;
-    var queued_structural_worker = StructuralWorker{ .source = &source };
-    var queued_structural_group: std.Io.Group = .init;
-    var queued_structural_group_active = false;
+    var synthetic_waiter_active = false;
     defer {
-        if (initial_group_active) source.endGroupOperation("docs", 7001);
-        queued_structural_worker.release.store(true, .release);
-        blocking_worker.release.store(true, .release);
-        if (queued_structural_group_active) queued_structural_group.cancel(io);
-        if (blocking_group_active) blocking_group.cancel(io);
+        const activity_io = source.table_activity_threaded.io();
+        source.table_activity_mutex.lockUncancelable(activity_io);
+        if (synthetic_waiter_active) {
+            const index = source.findTableActivityLocked("docs", 7001) orelse unreachable;
+            source.active_table_activities.items[index].operation_waiters -= 1;
+            source.pruneTableActivityLocked("docs", 7001);
+        }
+        source.table_activity_mutex.unlock(activity_io);
     }
-    for (0..2_000) |_| {
-        if (source.testingGroupOperationWaiterCount("docs", 7001) != 0) break;
-        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    {
+        const activity_io = source.table_activity_threaded.io();
+        source.table_activity_mutex.lockUncancelable(activity_io);
+        defer source.table_activity_mutex.unlock(activity_io);
+        source.activityEntryLocked("docs", 7001).operation_waiters += 1;
+        synthetic_waiter_active = true;
+        try std.testing.expect(source.structuralDrainPendingLocked("docs"));
     }
-    try std.testing.expect(source.testingGroupOperationWaiterCount("docs", 7001) != 0);
-    try queued_structural_group.concurrent(io, StructuralWorker.run, .{ io, &queued_structural_worker });
-    queued_structural_group_active = true;
-    for (0..2_000) |_| {
-        if (source.testingStructuralActivityActive("docs")) break;
-        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
-    }
-    try std.testing.expect(source.testingStructuralActivityActive("docs"));
     source.endGroupOperation("docs", 7001);
-    initial_group_active = false;
-    for (0..2_000) |_| {
-        if (queued_structural_worker.entered.load(.acquire)) break;
-        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    {
+        const activity_io = source.table_activity_threaded.io();
+        source.table_activity_mutex.lockUncancelable(activity_io);
+        defer source.table_activity_mutex.unlock(activity_io);
+        try std.testing.expect(!source.structuralDrainPendingLocked("docs"));
+        const index = source.findTableActivityLocked("docs", 7001) orelse unreachable;
+        source.active_table_activities.items[index].operation_waiters -= 1;
+        synthetic_waiter_active = false;
+        source.pruneTableActivityLocked("docs", 7001);
     }
-    try std.testing.expect(queued_structural_worker.entered.load(.acquire));
-    try std.testing.expect(!blocking_worker.entered.load(.acquire));
-    queued_structural_worker.release.store(true, .release);
-    try queued_structural_group.await(io);
-    queued_structural_group_active = false;
-    for (0..2_000) |_| {
-        if (blocking_worker.entered.load(.acquire)) break;
-        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
-    }
-    try std.testing.expect(blocking_worker.entered.load(.acquire));
-    blocking_worker.release.store(true, .release);
-    try blocking_group.await(io);
-    blocking_group_active = false;
 
     try std.testing.expect(source.tryBeginStartupCatchUpGroupOperation("docs", 7001, true));
     try std.testing.expect(source.readCompatibleMaintenanceActiveBestEffort("docs", 7001));
