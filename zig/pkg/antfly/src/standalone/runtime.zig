@@ -1724,6 +1724,13 @@ pub fn runFromIterator(
     // implementation is code-generated in the inference archive and reached
     // through an opaque internal ABI; the shipped artifact remains one binary.
     const loaded_cfg = if (loaded_config) |*cfg| cfg else null;
+    const process_memory_limit_bytes = resolveProcessMemoryLimitBytes(
+        cli,
+        init.environ_map,
+    ) catch |err| {
+        std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
+        return err;
+    };
     const configured_preload = if (loaded_cfg) |cfg| cfg.inference.preload else &.{};
     const loaded_preload = if (cli.inference_preload_models.items.len == 0 and configured_preload.len != 0) blk: {
         const out = try alloc.alloc(inference_bridge.WarmModel, configured_preload.len);
@@ -1792,15 +1799,12 @@ pub fn runFromIterator(
         .data_dir_len = data_dir.len,
         .models_dir = inference_bridge.OptionalString.init(cli.inference_models_dir orelse if (loaded_cfg) |cfg| cfg.inference.models_dir else null),
         .ml_dir = inference_bridge.OptionalString.init(cli.inference_ml_dir orelse if (loaded_cfg) |cfg| cfg.inference.ml_dir else null),
-        .host_limit_bytes = mbToBytes(cli.inference_host_budget_mb),
-        .backend_limit_bytes = mbToBytes(cli.inference_backend_budget_mb),
-        .combined_limit_bytes = mbToBytes(cli.inference_combined_budget_mb),
-        .kv_limit_bytes = mbToBytes(cli.inference_kv_budget_mb),
-        .scratch_limit_bytes = mbToBytes(cli.inference_scratch_budget_mb),
-        .process_memory_limit_bytes = mbToBytes(if (cli.inference_process_memory_budget_mb != 0)
-            cli.inference_process_memory_budget_mb
-        else
-            platform.env.getenvUsize("ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB") orelse 0),
+        .host_limit_bytes = try mibToBytes(cli.inference_host_budget_mb),
+        .backend_limit_bytes = try mibToBytes(cli.inference_backend_budget_mb),
+        .combined_limit_bytes = try mibToBytes(cli.inference_combined_budget_mb),
+        .kv_limit_bytes = try mibToBytes(cli.inference_kv_budget_mb),
+        .scratch_limit_bytes = try mibToBytes(cli.inference_scratch_budget_mb),
+        .process_memory_limit_bytes = process_memory_limit_bytes,
         .preload_ptr = if (active_preload.len == 0) null else active_preload.ptr,
         .preload_len = active_preload.len,
         .keep_alive = inference_bridge.OptionalString.init(if (loaded_cfg) |cfg| cfg.inference.keep_alive else null),
@@ -2030,6 +2034,7 @@ pub fn runFromIterator(
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
+        .process_memory_limit_bytes = process_memory_limit_bytes,
         .store_registration = .{
             .node_id = local_node_id,
             .store_id = 1,
@@ -3454,7 +3459,9 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.inference_scratch_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--inference-process-memory-budget-mb")) {
+        if (std.mem.eql(u8, arg, "--process-memory-budget-mb") or
+            std.mem.eql(u8, arg, "--inference-process-memory-budget-mb"))
+        {
             cfg.inference_process_memory_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
@@ -4351,13 +4358,13 @@ const InferenceBudgetOverrides = struct {
     scratch_limit_bytes: usize,
 };
 
-fn resolveInferenceBudgetOverrides(cli: CliConfig) InferenceBudgetOverrides {
+fn resolveInferenceBudgetOverrides(cli: CliConfig) !InferenceBudgetOverrides {
     return .{
-        .host_limit_bytes = mbToBytes(cli.inference_host_budget_mb),
-        .backend_limit_bytes = mbToBytes(cli.inference_backend_budget_mb),
-        .combined_limit_bytes = mbToBytes(cli.inference_combined_budget_mb),
-        .kv_limit_bytes = mbToBytes(cli.inference_kv_budget_mb),
-        .scratch_limit_bytes = mbToBytes(cli.inference_scratch_budget_mb),
+        .host_limit_bytes = try mibToBytes(cli.inference_host_budget_mb),
+        .backend_limit_bytes = try mibToBytes(cli.inference_backend_budget_mb),
+        .combined_limit_bytes = try mibToBytes(cli.inference_combined_budget_mb),
+        .kv_limit_bytes = try mibToBytes(cli.inference_kv_budget_mb),
+        .scratch_limit_bytes = try mibToBytes(cli.inference_scratch_budget_mb),
     };
 }
 
@@ -4808,17 +4815,30 @@ fn inferenceResourceSlices(amounts: *const inference_bridge.AdmissionAmounts) ![
     };
 }
 
+fn inferenceHostCharge(amounts: *const inference_bridge.AdmissionAmounts) !u64 {
+    var total = try std.math.add(usize, amounts.host_weight_bytes, amounts.host_kv_bytes);
+    total = try std.math.add(usize, total, amounts.host_scratch_bytes);
+    if (builtin.os.tag == .macos) {
+        total = try std.math.add(usize, total, amounts.backend_weight_bytes);
+        total = try std.math.add(usize, total, amounts.backend_kv_bytes);
+        total = try std.math.add(usize, total, amounts.backend_scratch_bytes);
+    }
+    return @intCast(total);
+}
+
 fn reserveInferenceResources(context: *anyopaque, amounts: *const inference_bridge.AdmissionAmounts) callconv(.c) inference_bridge.Status {
     const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
     const slices = inferenceResourceSlices(amounts) catch |err| return inference_bridge.statusFromError(err);
-    manager.reserveBatchClassified(&slices) catch |err| return inference_bridge.statusFromError(err);
+    const host_charge = inferenceHostCharge(amounts) catch |err| return inference_bridge.statusFromError(err);
+    manager.reserveBatchClassifiedWithHostCharge(&slices, host_charge) catch |err| return inference_bridge.statusFromError(err);
     return .ok;
 }
 
 fn releaseInferenceResources(context: *anyopaque, amounts: *const inference_bridge.AdmissionAmounts) callconv(.c) void {
     const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
     const slices = inferenceResourceSlices(amounts) catch return;
-    manager.releaseBatch(&slices);
+    const host_charge = inferenceHostCharge(amounts) catch return;
+    manager.releaseBatchWithHostCharge(&slices, host_charge);
 }
 
 fn observeInferencePromptCache(context: *anyopaque, previous: u64, next: u64) callconv(.c) void {
@@ -4841,8 +4861,21 @@ fn releaseInferenceTokenizerCache(context: *anyopaque, bytes: usize) callconv(.c
     manager.releaseBytes(.inference_tokenizer_cache, @intCast(bytes));
 }
 
-fn mbToBytes(value: usize) usize {
-    return value * 1024 * 1024;
+fn mibToBytes(value: usize) !usize {
+    return std.math.mul(usize, value, 1024 * 1024) catch error.InvalidArguments;
+}
+
+fn resolveProcessMemoryLimitBytes(
+    cli: CliConfig,
+    env: *const std.process.Environ.Map,
+) !usize {
+    if (cli.inference_process_memory_budget_mb != 0)
+        return mibToBytes(cli.inference_process_memory_budget_mb);
+
+    const raw = env.get("ANTFLY_PROCESS_MEMORY_BUDGET_MB") orelse
+        env.get("ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB") orelse return 0;
+    const value = std.fmt.parseUnsigned(usize, raw, 10) catch return error.InvalidArguments;
+    return mibToBytes(value);
 }
 
 fn printUsage() void {
@@ -4868,9 +4901,10 @@ fn printUsage() void {
         \\  --inference-host-budget-mb <n>        Embedded inference native generation host budget override
         \\  --inference-backend-budget-mb <n>     Embedded inference native generation backend budget override
         \\  --inference-combined-budget-mb <n>    Embedded inference native generation combined budget override
+        \\  --process-memory-budget-mb <n>        Whole-process host-memory envelope (0: auto-detect)
         \\  --inference-kv-budget-mb <n>          Embedded inference native generation KV cache budget override
         \\  --inference-scratch-budget-mb <n>     Embedded inference native generation scratch budget override
-        \\  --inference-process-memory-budget-mb <n> Whole-process/container memory envelope
+        \\  --inference-process-memory-budget-mb <n> Compatibility alias for --process-memory-budget-mb
         \\  --kernel-jit-mode <off|shadow|on|required> Embedded inference runtime JIT mode override
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm an embedded model before serving
         \\  --data-dir <path>                     Local Antfly data directory root
@@ -6601,7 +6635,11 @@ test "antfly config uses cli override before common config" {
     };
     try std.testing.expectEqualStrings("/tmp/from-cli", resolveInferenceModelsDir(cli, &cfg).?);
     try std.testing.expectEqualStrings("/tmp/ml-from-cli", resolveInferenceMlDir(cli, &cfg).?);
-    try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), resolveInferenceBudgetOverrides(cli).backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), (try resolveInferenceBudgetOverrides(cli)).backend_limit_bytes);
+}
+
+test "standalone memory budget conversion rejects overflow" {
+    try std.testing.expectError(error.InvalidArguments, mibToBytes(std.math.maxInt(usize)));
 }
 
 test "standalone public api caps keep alive request reuse" {
@@ -6653,7 +6691,7 @@ test "parse cli accepts inference budget overrides" {
         "2048",
         "--inference-scratch-budget-mb",
         "1024",
-        "--inference-process-memory-budget-mb",
+        "--process-memory-budget-mb",
         "14000",
         "--kernel-jit-mode",
         "required",
@@ -6768,6 +6806,10 @@ test "inference admission bridge charges combined native residency to resource m
         @as(u64, 90),
         manager.sliceStats(.inference_model_residency).used_bytes,
     );
+    try std.testing.expectEqual(
+        if (builtin.os.tag == .macos) @as(u64, 90) else @as(u64, 60),
+        manager.snapshot().memory.used_bytes,
+    );
 
     const unavailable = inference_bridge.AdmissionAmounts{
         .host_weight_bytes = 11,
@@ -6787,6 +6829,7 @@ test "inference admission bridge charges combined native residency to resource m
         @as(u64, 0),
         manager.sliceStats(.inference_model_residency).used_bytes,
     );
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 
 test "standalone runtime resolves paths from common storage base dir" {

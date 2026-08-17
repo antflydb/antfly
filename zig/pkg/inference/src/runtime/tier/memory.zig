@@ -1427,14 +1427,25 @@ pub fn currentSystemMemoryInfo() ?SystemMemoryInfo {
 /// page cache, a test harness, and sibling processes remain visible even when
 /// memory.max itself is unlimited.
 pub fn currentSystemMemoryInfoForLimit(limit_bytes: usize) ?SystemMemoryInfo {
-    const detected = currentSystemMemoryInfo() orelse return null;
-    if (limit_bytes == 0) return detected;
-
+    const detected = currentSystemMemoryInfo();
     const leaf_current = if (builtin.os.tag == .linux)
         probeCgroupMemoryInfoLinux().leaf_current_bytes
     else
         null;
-    return applyProcessMemoryLimit(detected, limit_bytes, leaf_current);
+    return applyOptionalProcessMemoryLimit(detected, limit_bytes, leaf_current);
+}
+
+fn applyOptionalProcessMemoryLimit(
+    detected: ?SystemMemoryInfo,
+    limit_bytes: usize,
+    leaf_current_bytes: ?usize,
+) ?SystemMemoryInfo {
+    if (limit_bytes == 0) return detected;
+    return applyProcessMemoryLimit(detected orelse .{
+        .total_bytes = limit_bytes,
+        .available_bytes = limit_bytes,
+        .availability_basis = .mem_available,
+    }, limit_bytes, leaf_current_bytes);
 }
 
 fn applyProcessMemoryLimit(
@@ -1455,13 +1466,21 @@ fn applyProcessMemoryLimit(
 }
 
 fn stableSystemMemoryInfoForLimit(limit_bytes: usize) ?SystemMemoryInfo {
-    const detected = currentSystemMemoryInfo() orelse return null;
+    return stableMemoryInfoForLimit(currentSystemMemoryInfo(), limit_bytes);
+}
+
+fn stableMemoryInfoForLimit(detected: ?SystemMemoryInfo, limit_bytes: usize) ?SystemMemoryInfo {
     if (limit_bytes == 0) return detected;
-    const effective_limit = @min(detected.total_bytes, limit_bytes);
+    const baseline = detected orelse SystemMemoryInfo{
+        .total_bytes = limit_bytes,
+        .available_bytes = limit_bytes,
+        .availability_basis = .mem_available,
+    };
+    const effective_limit = @min(baseline.total_bytes, limit_bytes);
     return .{
         .total_bytes = effective_limit,
         .available_bytes = effective_limit,
-        .availability_basis = detected.availability_basis,
+        .availability_basis = baseline.availability_basis,
     };
 }
 
@@ -2745,6 +2764,17 @@ test "explicit process envelope charges raw leaf cgroup usage" {
     );
     try std.testing.expectEqual(gib(8), clamped.total_bytes);
     try std.testing.expectEqual(@as(?usize, gib(6)), clamped.available_bytes);
+}
+
+test "explicit process envelope remains authoritative without a host probe" {
+    const live = applyOptionalProcessMemoryLimit(null, gib(14), gib(3)).?;
+    try std.testing.expectEqual(gib(14), live.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(11)), live.available_bytes);
+
+    const stable = stableMemoryInfoForLimit(null, gib(14)).?;
+    try std.testing.expectEqual(gib(14), stable.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(14)), stable.available_bytes);
+    try std.testing.expect(stableMemoryInfoForLimit(null, 0) == null);
 }
 
 test "Linux live admission admits the CI model under shared-host pressure" {

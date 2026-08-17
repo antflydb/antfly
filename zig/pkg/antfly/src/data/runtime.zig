@@ -2070,6 +2070,13 @@ fn asyncMutexMetricValue(stats: antfly.db.types.DBMutexStats, field: AsyncMutexM
 
 fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.ResourceManager) !void {
     const snapshot = manager.snapshot();
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_used_bytes", "gauge", "Aggregate physical host memory currently charged to ResourceManager", snapshot.memory.used_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_peak_bytes", "gauge", "Peak aggregate physical host memory charged to ResourceManager", snapshot.memory.peak_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_soft_limit_bytes", "gauge", "Aggregate managed host-memory soft limit", snapshot.memory.soft_limit_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_hard_limit_bytes", "gauge", "Aggregate managed host-memory hard limit", snapshot.memory.hard_limit_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_soft_limit_events_total", "counter", "Aggregate managed host-memory soft-limit events", snapshot.memory.soft_limit_events);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_hard_limit_rejections_total", "counter", "Aggregate managed host-memory hard-limit rejections", snapshot.memory.hard_limit_rejections);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_pressure", "gauge", "Aggregate managed host-memory pressure state, 0 normal, 1 soft, 2 hard", pressureValue(snapshot.memory.pressure));
     try writeResourceMetricFamily(writer, snapshot, .used_bytes, "antfly_resource_used_bytes", "gauge", "Resource slice bytes currently accounted");
     try writeResourceMetricFamily(writer, snapshot, .peak_bytes, "antfly_resource_peak_bytes", "gauge", "Resource slice peak bytes accounted");
     try writeResourceMetricFamily(writer, snapshot, .soft_limit_bytes, "antfly_resource_soft_limit_bytes", "gauge", "Resource slice soft limit in bytes");
@@ -2778,6 +2785,9 @@ pub const DataServerConfig = struct {
     index_repair_max_activation_gap_sequences: u64 = 200,
     index_repair_max_convergence_rounds: u32 = 32,
     index_repair_max_activation_pause_ms: u64 = 250,
+    /// Optional operator-owned envelope for all host memory in this process.
+    /// Zero auto-detects the cgroup or host limit.
+    process_memory_limit_bytes: usize = 0,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
     ha: DataServerHAConfig = .{},
@@ -4506,7 +4516,10 @@ pub const DataServer = struct {
             .store_registration = cfg.store_registration,
             .group_leadership_source = cfg.group_leadership_source,
             .group_membership_source = cfg.group_membership_source,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryLimit(
+                alloc,
+                cfg.process_memory_limit_bytes,
+            ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 catalog,
@@ -4544,7 +4557,10 @@ pub const DataServer = struct {
             .group_leadership_source = cfg.group_leadership_source orelse GroupLeadershipSource.fromManagedHostService(&svc.raft),
             .group_membership_source = cfg.group_membership_source orelse GroupMembershipSource.fromManagedHostService(&svc.raft),
             .local_transition_runtime = svc.raft.local_transition_runtime,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryLimit(
+                alloc,
+                cfg.process_memory_limit_bytes,
+            ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 antfly.public_api.table_catalog.CatalogSource.fromMetadataService(svc),
@@ -4582,7 +4598,10 @@ pub const DataServer = struct {
             .group_leadership_source = cfg.group_leadership_source orelse GroupLeadershipSource.fromManagedHttpHostService(&svc.raft),
             .group_membership_source = cfg.group_membership_source orelse GroupMembershipSource.fromManagedHttpHostService(&svc.raft),
             .local_transition_runtime = svc.raft.local_transition_runtime,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryLimit(
+                alloc,
+                cfg.process_memory_limit_bytes,
+            ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 antfly.public_api.table_catalog.CatalogSource.fromMetadataHttpService(svc),

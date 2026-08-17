@@ -2728,6 +2728,16 @@ pub const Node = struct {
         return node;
     }
 
+    fn defaultGenerationLimits(
+        self: *const Node,
+        backend: runtime.tier.memory.BackendClass,
+    ) runtime.tier.memory.Limits {
+        return runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
+            backend,
+            self.config.process_memory_limit_bytes,
+        );
+    }
+
     /// Attach process-wide tokenizer-cache admission before loading models.
     pub fn configureTokenizerCaches(
         self: *Node,
@@ -3315,7 +3325,7 @@ pub const Node = struct {
         };
         const budget_limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(
             model.session,
-            runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
+            self.defaultGenerationLimits(budget_backend_class),
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const prompt_tokens = try countPromptTokens(allocator, model, gpt_config, messages, max_tokens);
@@ -6137,7 +6147,7 @@ pub const Node = struct {
                 .gpu
             else
                 .cpu;
-        var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
+        var budget_limits = self.defaultGenerationLimits(budget_backend_class);
         budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
         if (draft_model_for_generation) |draft_model| {
             const draft_budget_class: runtime.tier.memory.BackendClass =
@@ -6145,7 +6155,7 @@ pub const Node = struct {
             const draft_budget_limits = self.config.generation_budget_overrides.apply(
                 session_factory.widenBudgetLimitsForSession(
                     draft_model.session,
-                    runtime.tier.memory.defaultLimitsForBackend(draft_budget_class),
+                    self.defaultGenerationLimits(draft_budget_class),
                 ),
             );
             budget_limits = runtime.tier.memory.maxCompositeLimits(budget_limits, draft_budget_limits);
@@ -6287,7 +6297,7 @@ pub const Node = struct {
         const target_admission_limits = self.config.generation_budget_overrides.apply(
             session_factory.widenBudgetLimitsForSession(
                 model.session,
-                runtime.tier.memory.defaultLimitsForBackend(target_backend_class),
+                self.defaultGenerationLimits(target_backend_class),
             ),
         );
         var admission_requests: [2]runtime.tier.memory.AdmissionRequest = undefined;
@@ -6304,7 +6314,7 @@ pub const Node = struct {
                 .limits = self.config.generation_budget_overrides.apply(
                     session_factory.widenBudgetLimitsForSession(
                         draft_model_for_generation.?.session,
-                        runtime.tier.memory.defaultLimitsForBackend(draft_backend_class),
+                        self.defaultGenerationLimits(draft_backend_class),
                     ),
                 ),
                 .amounts = .fromEstimate(estimate),
@@ -7415,7 +7425,7 @@ pub const Node = struct {
                 };
                 const budget_limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(
                     model.session,
-                    runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
+                    self.defaultGenerationLimits(budget_backend_class),
                 ));
                 var leases = try ctx.allocator.alloc(runtime.scheduler.native_generate.Lease, group_indices.items.len);
                 for (leases) |*lease| lease.* = .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 0, .active_requests_snapshot = 0 };

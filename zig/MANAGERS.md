@@ -112,8 +112,11 @@ the executor owner and “inference backend runtime descriptor” for the value.
    retrying. It must not retry a request that is intrinsically larger than the
    configured hard limit.
 6. The external manager sees model residency, KV working set, and scratch
-   working set as separate logical slices. The inference controller retains the
-   host/backend split needed for unified-memory and discrete-accelerator policy.
+   working set as separate logical slices. Those metrics may contain host plus
+   accelerator bytes, while only the physical host component is charged to the
+   `ResourceManager` host aggregate on discrete-GPU systems. Unified-memory
+   systems charge both components. The inference controller retains the split
+   and remains authoritative for device capacity.
 7. A process envelope is charged against raw container usage, not only memory
    allocated through inference. Page cache, a test harness, storage, and sibling
    work therefore reduce the capacity available to a new inference allocation.
@@ -135,20 +138,28 @@ any smaller finite cgroup limit:
 An explicit envelope is necessary for Burstable Kubernetes pods whose request
 is lower than node memory but whose cgroup hard limit is `max`. Kubernetes does
 not expose the request as an allocation boundary inside that cgroup. Inference
-accepts `--process-memory-budget-mb` or
-`ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB`; full standalone accepts the
-corresponding `--inference-process-memory-budget-mb` flag and environment
-variable. Set the envelope below the orchestrator allocation so the kubelet,
-runtime, and test harness retain headroom.
+and full standalone accept `--process-memory-budget-mb` and
+`ANTFLY_PROCESS_MEMORY_BUDGET_MB`. The older inference-prefixed flag and
+environment variable remain compatibility aliases. Malformed or overflowing
+operator values fail startup instead of silently reverting to host detection.
+Set the envelope below the orchestrator allocation so the kubelet, runtime, and
+test harness retain headroom.
 
-The process envelope is not another inference slice. It bounds the whole live
-memory view. Stable model limits are derived from it, and immediately before an
-allocation the controller checks the requested increment against the envelope
-minus raw leaf-cgroup usage and safety headroom.
+The process envelope is not another inference slice. One resolved value is
+passed to storage and inference during standalone composition. ResourceManager
+derives an aggregate managed-host-memory budget from it; every storage slice
+reservation charges that aggregate as well as its local policy slice. Stable
+model and request limits use the same envelope, and immediately before an
+inference allocation the controller checks the requested increment against the
+envelope minus raw leaf-cgroup usage and safety headroom. This live check covers
+unmanaged allocations and page cache that cannot appear in the reservation
+ledger.
 
-Full standalone additionally derives finite node-owned inference slices from
-detected node memory. These slices provide cross-subsystem policy and metrics;
-the live envelope guards allocations that are invisible to slice ledgers.
+Full standalone keeps node-owned inference slices as logical metrics without a
+host-derived hard limit. Applying one host limit to combined host and VRAM bytes
+would reject valid discrete-GPU models. Cross-subsystem host contention is
+instead enforced by the aggregate host ledger, while ModelManager enforces
+backend-local and combined device policy.
 
 ## Reservation lifecycle
 
@@ -182,10 +193,11 @@ eviction or a host OOM.
 
 ## Observability and tests
 
-Resource metrics must expose used, peak, soft-limit, hard-limit, and rejection
-counts for every logical slice. Inference metrics additionally retain backend
-class and the pressure domain that selected an eviction victim. Startup logs
-should report the detected or explicit process envelope and ownership mode.
+Resource metrics must expose used, peak, soft-limit, hard-limit, pressure, and
+rejection counts for the aggregate host ledger and every logical slice.
+Inference metrics additionally retain backend class and the pressure domain
+that selected an eviction victim. Startup logs should report the detected or
+explicit process envelope and ownership mode.
 Backend runtime metrics separately report active/peak lane leases, acquisitions,
 and shutdown rejections; they must not be combined with byte-budget metrics.
 
@@ -195,7 +207,9 @@ Permanent tests cover:
 - raw leaf usage reducing explicit-envelope availability;
 - fail-closed external ownership;
 - atomic external reserve/release and denial classification;
-- finite standalone inference slices;
+- aggregate host admission across otherwise-independent slices;
+- host-only external charging with logical host-plus-backend inference metrics;
+- oversized minimum-progress operations remaining inside the host envelope;
 - preload and request paths using the same admission controller.
 - inference, API, and control executor isolation plus lane shutdown/drain
   behavior.
@@ -211,8 +225,6 @@ provide a finite cgroup limit. This is workload policy, not a runner resize.
   ledger.
 - Resource reservations should not own tasks or replace executor lane leases.
 - Per-process admission does not replace cluster placement or autoscaling.
-- Logical host-plus-backend slices are conservative on discrete GPUs. A future
-  ABI version may expose separate physical host and device domains when the
-  node owner has device-specific capacity information; until then inference's
-  backend-aware limits remain authoritative and the node slices are an
-  additional cross-subsystem ceiling.
+- A future ABI version may expose node-owned device capacity domains. Until the
+  node owner has reliable per-device capacity information, inference's
+  backend-aware limits remain authoritative for accelerator memory.

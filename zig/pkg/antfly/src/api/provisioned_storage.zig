@@ -28,6 +28,7 @@ const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_writes.zig");
 
 const MiB: u64 = 1024 * 1024;
+const GiB: u64 = 1024 * MiB;
 const MinSmartLsmCacheBytes: u64 = 64 * 1024 * 1024;
 // Decoded primary-run indexes are important for latency, but letting this
 // cache consume a full GiB leaves too little headroom for full-text mappings,
@@ -67,12 +68,6 @@ const MinSmartDenseRepairBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartDenseRepairBytes: u64 = 512 * 1024 * 1024;
 const MinSmartShardTransitionBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartShardTransitionBytes: u64 = 512 * 1024 * 1024;
-const MinSmartInferenceModelBytes: u64 = 1024 * 1024 * 1024;
-const MaxSmartInferenceModelBytes: u64 = 16 * 1024 * 1024 * 1024;
-const MinSmartInferenceKvBytes: u64 = 256 * 1024 * 1024;
-const MaxSmartInferenceKvBytes: u64 = 4 * 1024 * 1024 * 1024;
-const MinSmartInferenceScratchBytes: u64 = 256 * 1024 * 1024;
-const MaxSmartInferenceScratchBytes: u64 = 4 * 1024 * 1024 * 1024;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
@@ -130,22 +125,34 @@ const SmartResourceBudgets = struct {
     lsm_cache_budget_bytes: usize,
 };
 
-fn smartResourceBudgets() SmartResourceBudgets {
+fn smartResourceBudgets(process_memory_limit_bytes: usize) SmartResourceBudgets {
     var options = resource_manager_mod.Options{};
-    const total = detectedMemoryLimitBytes() orelse {
-        const lsm_cache_budget = lsm_backend.DefaultCacheSizeBytes;
-        options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, @intCast(lsm_cache_budget));
-        return .{
-            .options = options,
-            .lsm_cache_budget_bytes = lsm_cache_budget,
+    const detected = detectedMemoryLimitBytes();
+    const explicit: ?u64 = if (process_memory_limit_bytes == 0) null else @intCast(process_memory_limit_bytes);
+    const total = if (detected) |value|
+        if (explicit) |limit| @min(value, limit) else value
+    else
+        explicit orelse {
+            const lsm_cache_budget = lsm_backend.DefaultCacheSizeBytes;
+            options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, @intCast(lsm_cache_budget));
+            return .{
+                .options = options,
+                .lsm_cache_budget_bytes = lsm_cache_budget,
+            };
         };
-    };
 
     return smartResourceBudgetsForTotal(total);
 }
 
+fn safeManagedHostMemory(total: u64) u64 {
+    const preferred_headroom = std.math.clamp(@max(total / 4, 6 * GiB), 4 * GiB, 24 * GiB);
+    const headroom = @min(preferred_headroom, total / 2);
+    return total - headroom;
+}
+
 fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     var options = resource_manager_mod.Options{};
+    options.memory_budget = resourceBudget(3, safeManagedHostMemory(total));
 
     const lsm_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmCacheBytes, MaxSmartLsmCacheBytes);
     const lsm_compaction_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmCompactionBytes, MaxSmartLsmCompactionBytes);
@@ -164,9 +171,6 @@ fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     const algebraic_tensor_hard = adaptiveSliceHardLimit(total, 64, MinSmartAlgebraicTensorBytes, MaxSmartAlgebraicTensorBytes);
     const dense_repair_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseRepairBytes, MaxSmartDenseRepairBytes);
     const shard_transition_hard = adaptiveSliceHardLimit(total, 24, MinSmartShardTransitionBytes, MaxSmartShardTransitionBytes);
-    const inference_model_hard = adaptiveSliceHardLimit(total, 2, MinSmartInferenceModelBytes, MaxSmartInferenceModelBytes);
-    const inference_kv_hard = adaptiveSliceHardLimit(total, 8, MinSmartInferenceKvBytes, MaxSmartInferenceKvBytes);
-    const inference_scratch_hard = adaptiveSliceHardLimit(total, 8, MinSmartInferenceScratchBytes, MaxSmartInferenceScratchBytes);
 
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, lsm_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = resourceBudget(3, lsm_compaction_hard);
@@ -186,11 +190,9 @@ fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     options.budgets[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)] = resourceBudget(3, algebraic_tensor_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = resourceBudget(3, dense_repair_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.shard_transition_working_set)] = resourceBudget(3, shard_transition_hard);
-    // The embedded ModelManager still owns model-aware estimates and eviction,
-    // but its leases must fit finite node-owned physical-domain slices.
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.inference_model_residency)] = resourceBudget(3, inference_model_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.inference_kv_working_set)] = resourceBudget(3, inference_kv_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.inference_scratch_working_set)] = resourceBudget(3, inference_scratch_hard);
+    // Inference slices are logical host-plus-accelerator metrics. Their host
+    // component is enforced by the aggregate budget above; ModelManager and
+    // BackendRuntime retain device-aware backend admission.
 
     return .{
         .options = options,
@@ -219,7 +221,14 @@ pub const ProvisionedGroupStorage = struct {
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
 
     pub fn init(alloc: std.mem.Allocator) ProvisionedGroupStorage {
-        const budgets = smartResourceBudgets();
+        return initWithProcessMemoryLimit(alloc, 0);
+    }
+
+    pub fn initWithProcessMemoryLimit(
+        alloc: std.mem.Allocator,
+        process_memory_limit_bytes: usize,
+    ) ProvisionedGroupStorage {
+        const budgets = smartResourceBudgets(process_memory_limit_bytes);
         return .{
             .alloc = alloc,
             .resource_manager = resource_manager_mod.ResourceManager.init(budgets.options),
@@ -475,10 +484,19 @@ test "provisioned lsm cache budget scales with node memory and remains capped" {
     try std.testing.expect(small.lsm_cache_budget_bytes < medium.lsm_cache_budget_bytes);
     try std.testing.expectEqual(medium.lsm_cache_budget_bytes, large.lsm_cache_budget_bytes);
 
-    inline for (.{ small, medium, large }) |budgets| {
+    inline for (.{
+        .{ .budgets = small, .total = 2 * 1024 * MiB },
+        .{ .budgets = medium, .total = 8 * 1024 * MiB },
+        .{ .budgets = large, .total = 64 * 1024 * MiB },
+    }) |fixture| {
+        const budgets = fixture.budgets;
         const configured = budgets.options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
         try std.testing.expectEqual(@as(u64, @intCast(budgets.lsm_cache_budget_bytes)), configured.hard_limit_bytes);
         try std.testing.expectEqual(configured.hard_limit_bytes * 3 / 4, configured.soft_limit_bytes);
+        try std.testing.expectEqual(
+            safeManagedHostMemory(fixture.total),
+            budgets.options.memory_budget.hard_limit_bytes,
+        );
     }
 }
 
@@ -543,15 +561,22 @@ test "provisioned group storage derives all resource budgets" {
         resource_manager_mod.Slice.lite_native_link_cache,
         resource_manager_mod.Slice.dense_repair_working_set,
         resource_manager_mod.Slice.shard_transition_working_set,
-        resource_manager_mod.Slice.inference_model_residency,
-        resource_manager_mod.Slice.inference_kv_working_set,
-        resource_manager_mod.Slice.inference_scratch_working_set,
     }) |slice| {
         const stats = storage.resource_manager.sliceStats(slice);
         try std.testing.expect(stats.hard_limit_bytes > 0);
         try std.testing.expect(stats.soft_limit_bytes > 0);
         try std.testing.expect(stats.soft_limit_bytes <= stats.hard_limit_bytes);
     }
+
+    inline for (.{
+        resource_manager_mod.Slice.inference_model_residency,
+        resource_manager_mod.Slice.inference_kv_working_set,
+        resource_manager_mod.Slice.inference_scratch_working_set,
+    }) |slice| {
+        const stats = storage.resource_manager.sliceStats(slice);
+        try std.testing.expectEqual(@as(u64, 0), stats.hard_limit_bytes);
+    }
+    try std.testing.expect(storage.resource_manager.snapshot().memory.hard_limit_bytes > 0);
 
     const lsm_state = storage.resource_manager.sliceStats(.lsm_in_memory_state);
     try std.testing.expect(lsm_state.hard_limit_bytes <= MaxSmartLsmInMemoryStateBytes);

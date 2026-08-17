@@ -207,6 +207,10 @@ pub const Policy = struct {
 };
 
 pub const Options = struct {
+    /// Aggregate host-memory budget for every memory slice owned by this
+    /// manager. A zero limit preserves the legacy unlimited behavior for
+    /// tests and callers that do not own a process envelope.
+    memory_budget: Budget = .{},
     budgets: [slice_count]Budget = defaultBudgets(),
     policies: [slice_count]Policy = defaultPolicies(),
     /// Bound durable replay debt by record count as well as encoded bytes.
@@ -314,7 +318,18 @@ pub const SliceStats = struct {
 };
 
 pub const Stats = struct {
+    memory: MemoryStats,
     slices: [slice_count]SliceStats,
+};
+
+pub const MemoryStats = struct {
+    used_bytes: u64 = 0,
+    peak_bytes: u64 = 0,
+    soft_limit_bytes: u64 = 0,
+    hard_limit_bytes: u64 = 0,
+    soft_limit_events: u64 = 0,
+    hard_limit_rejections: u64 = 0,
+    pressure: Pressure = .normal,
 };
 
 /// Stable identity for one independently exhausted storage capacity domain.
@@ -476,9 +491,18 @@ const MutableSlice = struct {
     oversized_single_grants: u64 = 0,
 };
 
+const MutableMemory = struct {
+    budget: Budget = .{},
+    used_bytes: u64 = 0,
+    peak_bytes: u64 = 0,
+    soft_limit_events: u64 = 0,
+    hard_limit_rejections: u64 = 0,
+};
+
 pub const ResourceManager = struct {
     mutex: std.atomic.Mutex = .unlocked,
     pressure_change: PressureChange = .{},
+    memory: MutableMemory,
     slices: [slice_count]MutableSlice,
     dense_replay_window_budget_bytes: u64 = 0,
     dense_replay_last_finish_ns: u64 = 0,
@@ -506,6 +530,7 @@ pub const ResourceManager = struct {
         }
         const high_sequences = options.derived_backlog_high_sequences;
         return .{
+            .memory = .{ .budget = options.memory_budget },
             .slices = slices,
             .derived_backlog_high_sequences = high_sequences,
             .derived_backlog_resume_sequences = if (high_sequences == 0)
@@ -798,6 +823,38 @@ pub const ResourceManager = struct {
         ResourceTemporarilyUnavailable,
     };
 
+    fn hostChargeForAmounts(amounts: []const SliceAmount) ClassifiedBatchReserveError!u64 {
+        var total: u64 = 0;
+        for (amounts) |amount| {
+            total = std.math.add(u64, total, amount.bytes) catch
+                return error.ResourceRequestTooLarge;
+        }
+        return total;
+    }
+
+    fn commitMemoryLocked(self: *ResourceManager, next: u64) void {
+        self.memory.used_bytes = next;
+        self.memory.peak_bytes = @max(self.memory.peak_bytes, next);
+        if (self.memory.budget.soft_limit_bytes > 0 and next > self.memory.budget.soft_limit_bytes)
+            self.memory.soft_limit_events +|= 1;
+    }
+
+    fn checkMemoryLocked(self: *ResourceManager, additional_bytes: u64) !u64 {
+        const next = std.math.add(u64, self.memory.used_bytes, additional_bytes) catch {
+            self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        };
+        if (self.memory.budget.hard_limit_bytes > 0 and next > self.memory.budget.hard_limit_bytes) {
+            self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        }
+        return next;
+    }
+
+    fn releaseMemoryLocked(self: *ResourceManager, bytes: u64) void {
+        self.memory.used_bytes -|= bytes;
+    }
+
     /// Atomically reserve several independent slices while distinguishing a
     /// request that can never fit from temporary contention with reservations
     /// already held by other work.
@@ -808,6 +865,19 @@ pub const ResourceManager = struct {
     pub fn reserveBatchClassified(
         self: *ResourceManager,
         amounts: []const SliceAmount,
+    ) ClassifiedBatchReserveError!void {
+        const host_charge_bytes = try hostChargeForAmounts(amounts);
+        return self.reserveBatchClassifiedWithHostCharge(amounts, host_charge_bytes);
+    }
+
+    /// Reserve logical slices while charging only their physical host-memory
+    /// component to the process aggregate. This is used by bridges whose
+    /// logical metrics include accelerator bytes; ordinary callers should use
+    /// `reserveBatchClassified`, which charges the full batch.
+    pub fn reserveBatchClassifiedWithHostCharge(
+        self: *ResourceManager,
+        amounts: []const SliceAmount,
+        host_charge_bytes: u64,
     ) ClassifiedBatchReserveError!void {
         for (amounts, 0..) |amount, index| {
             if (amount.bytes == 0) continue;
@@ -820,6 +890,12 @@ pub const ResourceManager = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
+        const memory_hard_limit = self.memory.budget.hard_limit_bytes;
+        if (memory_hard_limit > 0 and host_charge_bytes > memory_hard_limit) {
+            self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceRequestTooLarge;
+        }
+
         for (amounts) |amount| {
             if (amount.bytes == 0) continue;
             const state = &self.slices[sliceIndex(amount.slice)];
@@ -828,6 +904,15 @@ pub const ResourceManager = struct {
                 state.hard_limit_rejections +|= 1;
                 return error.ResourceRequestTooLarge;
             }
+        }
+
+        const next_memory = std.math.add(u64, self.memory.used_bytes, host_charge_bytes) catch {
+            self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceTemporarilyUnavailable;
+        };
+        if (memory_hard_limit > 0 and next_memory > memory_hard_limit) {
+            self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceTemporarilyUnavailable;
         }
 
         for (amounts) |amount| {
@@ -851,6 +936,7 @@ pub const ResourceManager = struct {
             if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes)
                 state.soft_limit_events +|= 1;
         }
+        self.commitMemoryLocked(next_memory);
         self.pressure_change.advance();
     }
 
@@ -866,6 +952,15 @@ pub const ResourceManager = struct {
     }
 
     pub fn releaseBatch(self: *ResourceManager, amounts: []const SliceAmount) void {
+        const host_charge_bytes = hostChargeForAmounts(amounts) catch std.math.maxInt(u64);
+        self.releaseBatchWithHostCharge(amounts, host_charge_bytes);
+    }
+
+    pub fn releaseBatchWithHostCharge(
+        self: *ResourceManager,
+        amounts: []const SliceAmount,
+        host_charge_bytes: u64,
+    ) void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         for (amounts) |amount| {
@@ -873,6 +968,7 @@ pub const ResourceManager = struct {
             const state = &self.slices[sliceIndex(amount.slice)];
             state.used_bytes -|= amount.bytes;
         }
+        self.releaseMemoryLocked(host_charge_bytes);
         self.pressure_change.advance();
     }
 
@@ -892,11 +988,13 @@ pub const ResourceManager = struct {
             state.hard_limit_rejections += 1;
             return error.ResourceBudgetExceeded;
         }
+        const next_memory = try self.checkMemoryLocked(bytes);
         state.used_bytes = next;
         state.peak_bytes = @max(state.peak_bytes, next);
         if (state.budget.soft_limit_bytes > 0 and next > state.budget.soft_limit_bytes) {
             state.soft_limit_events += 1;
         }
+        self.commitMemoryLocked(next_memory);
         self.pressure_change.advance();
         return .{ .manager = self, .slice = slice, .bytes = bytes };
     }
@@ -923,19 +1021,25 @@ pub const ResourceManager = struct {
             return error.ResourceBudgetExceeded;
         };
         const hard_limit = state.budget.hard_limit_bytes;
+        var oversized_grant = false;
         if (hard_limit > 0 and next > hard_limit) {
             const bounded_limit = std.math.mul(u64, hard_limit, max_hard_limit_multiple) catch std.math.maxInt(u64);
             if (max_hard_limit_multiple <= 1 or state.used_bytes != 0 or bytes > bounded_limit) {
                 state.hard_limit_rejections +|= 1;
                 return error.ResourceBudgetExceeded;
             }
-            state.oversized_single_grants +|= 1;
+            oversized_grant = true;
         }
+        // Minimum-progress exceptions are local slice policy; they may never
+        // bypass the process-wide physical-memory envelope.
+        const next_memory = try self.checkMemoryLocked(bytes);
+        if (oversized_grant) state.oversized_single_grants +|= 1;
         state.used_bytes = next;
         state.peak_bytes = @max(state.peak_bytes, next);
         if (state.budget.soft_limit_bytes > 0 and next > state.budget.soft_limit_bytes) {
             state.soft_limit_events +|= 1;
         }
+        self.commitMemoryLocked(next_memory);
         self.pressure_change.advance();
         return .{ .manager = self, .slice = slice, .bytes = bytes };
     }
@@ -960,6 +1064,7 @@ pub const ResourceManager = struct {
             return error.ResourceBudgetExceeded;
         };
         const hard_limit = state.budget.hard_limit_bytes;
+        var oversized_grant = false;
         if (hard_limit > 0 and next > hard_limit) {
             const bounded_limit = std.math.mul(u64, hard_limit, max_hard_limit_multiple) catch std.math.maxInt(u64);
             const reservation_is_sole_user = state.used_bytes == reservation.bytes;
@@ -967,14 +1072,17 @@ pub const ResourceManager = struct {
                 state.hard_limit_rejections +|= 1;
                 return error.ResourceBudgetExceeded;
             }
-            if (reservation.bytes <= hard_limit) state.oversized_single_grants +|= 1;
+            oversized_grant = reservation.bytes <= hard_limit;
         }
+        const next_memory = try self.checkMemoryLocked(additional_bytes);
+        if (oversized_grant) state.oversized_single_grants +|= 1;
         state.used_bytes = next;
         reservation.bytes = next_reservation;
         state.peak_bytes = @max(state.peak_bytes, next);
         if (state.budget.soft_limit_bytes > 0 and next > state.budget.soft_limit_bytes) {
             state.soft_limit_events +|= 1;
         }
+        self.commitMemoryLocked(next_memory);
         self.pressure_change.advance();
     }
 
@@ -1040,7 +1148,34 @@ pub const ResourceManager = struct {
             }
         }
 
+        const MemoryCandidate = struct {
+            fn allowed(current: u64, additional: u64, hard: u64) bool {
+                const next = std.math.add(u64, current, additional) catch return false;
+                return hard == 0 or next <= hard;
+            }
+        };
+        if (!MemoryCandidate.allowed(self.memory.used_bytes, granted, self.memory.budget.hard_limit_bytes)) {
+            granted = minimum_bytes;
+            if (!Candidate.allowed(
+                state.used_bytes,
+                reservation.bytes,
+                granted,
+                hard_limit,
+                bounded_limit,
+                reservation_is_sole_user,
+                max_hard_limit_multiple,
+            ) or !MemoryCandidate.allowed(
+                self.memory.used_bytes,
+                granted,
+                self.memory.budget.hard_limit_bytes,
+            )) {
+                self.memory.hard_limit_rejections +|= 1;
+                return error.ResourceBudgetExceeded;
+            }
+        }
+
         const previous_reservation = reservation.bytes;
+        const next_memory = std.math.add(u64, self.memory.used_bytes, granted) catch unreachable;
         state.used_bytes += granted;
         reservation.bytes += granted;
         state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
@@ -1048,6 +1183,7 @@ pub const ResourceManager = struct {
             state.oversized_single_grants +|= 1;
         if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes)
             state.soft_limit_events +|= 1;
+        self.commitMemoryLocked(next_memory);
         self.pressure_change.advance();
         return granted;
     }
@@ -1059,6 +1195,7 @@ pub const ResourceManager = struct {
 
         const state = &self.slices[sliceIndex(slice)];
         state.used_bytes -|= bytes;
+        self.releaseMemoryLocked(bytes);
         self.pressure_change.advance();
     }
 
@@ -1084,14 +1221,21 @@ pub const ResourceManager = struct {
         const state = &self.slices[sliceIndex(slice)];
         state.used_bytes = state.used_bytes -| current.*;
         state.used_bytes = state.used_bytes +| next;
+        self.memory.used_bytes = self.memory.used_bytes -| current.*;
+        self.memory.used_bytes = self.memory.used_bytes +| next;
         current.* = next;
         state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
+        self.memory.peak_bytes = @max(self.memory.peak_bytes, self.memory.used_bytes);
         if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes) {
             state.soft_limit_events += 1;
         }
         if (state.budget.hard_limit_bytes > 0 and state.used_bytes > state.budget.hard_limit_bytes) {
             state.hard_limit_rejections += 1;
         }
+        if (self.memory.budget.soft_limit_bytes > 0 and self.memory.used_bytes > self.memory.budget.soft_limit_bytes)
+            self.memory.soft_limit_events +|= 1;
+        if (self.memory.budget.hard_limit_bytes > 0 and self.memory.used_bytes > self.memory.budget.hard_limit_bytes)
+            self.memory.hard_limit_rejections +|= 1;
         self.pressure_change.advance();
     }
 
@@ -1116,7 +1260,18 @@ pub const ResourceManager = struct {
                 .hard_action = state.policy.hard_action,
             };
         }
-        return .{ .slices = stats };
+        return .{
+            .memory = .{
+                .used_bytes = self.memory.used_bytes,
+                .peak_bytes = self.memory.peak_bytes,
+                .soft_limit_bytes = self.memory.budget.soft_limit_bytes,
+                .hard_limit_bytes = self.memory.budget.hard_limit_bytes,
+                .soft_limit_events = self.memory.soft_limit_events,
+                .hard_limit_rejections = self.memory.hard_limit_rejections,
+                .pressure = pressureFor(self.memory.budget, self.memory.used_bytes),
+            },
+            .slices = stats,
+        };
     }
 
     pub fn sliceStats(self: *ResourceManager, slice: Slice) SliceStats {
@@ -1153,17 +1308,24 @@ pub const ResourceManager = struct {
 
         const state = self.slices[sliceIndex(slice)];
         const projected_bytes = state.used_bytes +| additional_bytes;
-        const pressure = pressureFor(state.budget, projected_bytes);
+        const slice_pressure = pressureFor(state.budget, projected_bytes);
+        const projected_memory = self.memory.used_bytes +| additional_bytes;
+        const memory_pressure = pressureFor(self.memory.budget, projected_memory);
+        const aggregate_dominates = memory_pressure != .normal and
+            @intFromEnum(memory_pressure) >= @intFromEnum(slice_pressure);
+        const pressure = if (aggregate_dominates) memory_pressure else slice_pressure;
         return .{
             .pressure = pressure,
-            .action = switch (pressure) {
+            .action = if (aggregate_dominates and pressure == .hard)
+                .reject_work
+            else switch (pressure) {
                 .normal => .report,
                 .soft => state.policy.soft_action,
                 .hard => state.policy.hard_action,
             },
-            .used_bytes = projected_bytes,
-            .soft_limit_bytes = state.budget.soft_limit_bytes,
-            .hard_limit_bytes = state.budget.hard_limit_bytes,
+            .used_bytes = if (aggregate_dominates) projected_memory else projected_bytes,
+            .soft_limit_bytes = if (aggregate_dominates) self.memory.budget.soft_limit_bytes else state.budget.soft_limit_bytes,
+            .hard_limit_bytes = if (aggregate_dominates) self.memory.budget.hard_limit_bytes else state.budget.hard_limit_bytes,
             .change_epoch = self.pressure_change.snapshot(),
         };
     }
@@ -1695,6 +1857,56 @@ test "classified batch reservation distinguishes size from contention" {
     };
     try manager.reserveBatchClassified(&after_release);
     manager.releaseBatch(&after_release);
+}
+
+test "aggregate host memory admission is atomic across slices" {
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .soft_limit_bytes = 75, .hard_limit_bytes = 100 },
+    });
+
+    var first = try manager.reserve(.full_text_build_working_set, 70);
+    defer first.release();
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        manager.reserveBatchClassified(&.{
+            .{ .slice = .lsm_compaction_work, .bytes = 20 },
+            .{ .slice = .dense_apply_working_set, .bytes = 11 },
+        }),
+    );
+    const stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 70), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_compaction_work).used_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.memory.hard_limit_rejections);
+}
+
+test "logical inference slices can charge only physical host memory" {
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 100 },
+    });
+    const logical = [_]SliceAmount{
+        .{ .slice = .inference_model_residency, .bytes = 240 },
+        .{ .slice = .inference_kv_working_set, .bytes = 60 },
+    };
+    try manager.reserveBatchClassifiedWithHostCharge(&logical, 80);
+    try std.testing.expectEqual(@as(u64, 300), manager.sliceStats(.inference_model_residency).used_bytes +
+        manager.sliceStats(.inference_kv_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 80), manager.snapshot().memory.used_bytes);
+    manager.releaseBatchWithHostCharge(&logical, 80);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "bounded oversized progress cannot bypass aggregate host memory" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.text_merge_buffers)] = .{ .hard_limit_bytes = 10 };
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 15 },
+        .budgets = budgets,
+    });
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        manager.reserveBoundedOversizedSingle(.text_merge_buffers, 18, 2),
+    );
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 
 test "resource manager coordinates growable capacity by physical domain" {
