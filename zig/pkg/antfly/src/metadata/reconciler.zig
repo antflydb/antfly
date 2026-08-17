@@ -112,6 +112,12 @@ pub const PlannedMergeStep = struct {
 pub const PlacementRemoval = struct {
     group_id: u64,
     local_node_id: u64,
+    expected_metadata_version: u64,
+};
+
+pub const PlacementUpsertPrecondition = struct {
+    expected_metadata_version: ?u64,
+    expected_target_drain_requested: bool,
 };
 
 pub const SplitAdmission = struct {
@@ -127,6 +133,7 @@ pub const PlacementChangeKind = enum {
 
 pub const ReconciliationPlan = struct {
     placement_upserts: []raft_reconciler.PlacementIntent,
+    placement_upsert_preconditions: []PlacementUpsertPrecondition,
     table_upserts: []table_manager.TableRecord,
     range_upserts: []table_manager.RangeRecord,
     split_admissions: []SplitAdmission,
@@ -147,6 +154,7 @@ pub const ReconciliationPlan = struct {
     pub fn empty() ReconciliationPlan {
         return .{
             .placement_upserts = &.{},
+            .placement_upsert_preconditions = &.{},
             .table_upserts = &.{},
             .range_upserts = &.{},
             .split_admissions = &.{},
@@ -169,6 +177,7 @@ pub const ReconciliationPlan = struct {
     pub fn deinit(self: *ReconciliationPlan, alloc: std.mem.Allocator) void {
         for (self.placement_upserts) |intent| raft_reconciler.freeIntentOwned(alloc, intent);
         alloc.free(self.placement_upserts);
+        alloc.free(self.placement_upsert_preconditions);
         for (self.table_upserts) |record| table_manager.freeTable(alloc, record);
         alloc.free(self.table_upserts);
         for (self.range_upserts) |record| table_manager.freeRange(alloc, record);
@@ -329,10 +338,12 @@ pub const Reconciler = struct {
         );
         var table_upserts = std.ArrayListUnmanaged(table_manager.TableRecord).empty;
         var placement_upserts = std.ArrayListUnmanaged(raft_reconciler.PlacementIntent).empty;
+        var placement_upsert_preconditions = std.ArrayListUnmanaged(PlacementUpsertPrecondition).empty;
         errdefer {
             for (placement_upserts.items) |intent| raft_reconciler.freeIntentOwned(self.alloc, intent);
             placement_upserts.deinit(self.alloc);
         }
+        errdefer placement_upsert_preconditions.deinit(self.alloc);
         errdefer {
             for (table_upserts.items) |record| table_manager.freeTable(self.alloc, record);
             table_upserts.deinit(self.alloc);
@@ -397,9 +408,14 @@ pub const Reconciler = struct {
                 const existing = membership_index.currentIntent(effective.record.group_id, effective.record.local_node_id);
                 if (existing == null or !placementIntentsEqual(existing.?, effective)) {
                     try placement_upserts.ensureUnusedCapacity(self.alloc, 1);
+                    try placement_upsert_preconditions.ensureUnusedCapacity(self.alloc, 1);
                     placement_upserts.appendAssumeCapacity(
                         try clonePlacementIntent(self.alloc, effective),
                     );
+                    placement_upsert_preconditions.appendAssumeCapacity(.{
+                        .expected_metadata_version = if (existing) |intent| intent.record.metadata_version else null,
+                        .expected_target_drain_requested = placementTargetDrainRequested(current.stores, effective),
+                    });
                 }
             }
         }
@@ -594,6 +610,7 @@ pub const Reconciler = struct {
                     try placement_removals.append(self.alloc, .{
                         .group_id = intent.record.group_id,
                         .local_node_id = intent.record.local_node_id,
+                        .expected_metadata_version = intent.record.metadata_version,
                     });
                 } else {
                     var draining = intent;
@@ -619,9 +636,14 @@ pub const Reconciler = struct {
                     applyRelocationWatermark(&draining, watermark);
                     if (!placementIntentsEqual(intent, draining)) {
                         try placement_upserts.ensureUnusedCapacity(self.alloc, 1);
+                        try placement_upsert_preconditions.ensureUnusedCapacity(self.alloc, 1);
                         placement_upserts.appendAssumeCapacity(
                             try clonePlacementIntent(self.alloc, draining),
                         );
+                        placement_upsert_preconditions.appendAssumeCapacity(.{
+                            .expected_metadata_version = intent.record.metadata_version,
+                            .expected_target_drain_requested = placementTargetDrainRequested(current.stores, intent),
+                        });
                     }
                 }
             }
@@ -700,6 +722,7 @@ pub const Reconciler = struct {
         var plan = ReconciliationPlan.empty();
         errdefer plan.deinit(self.alloc);
         plan.placement_upserts = try placement_upserts.toOwnedSlice(self.alloc);
+        plan.placement_upsert_preconditions = try placement_upsert_preconditions.toOwnedSlice(self.alloc);
         plan.table_upserts = try table_upserts.toOwnedSlice(self.alloc);
         plan.range_upserts = try range_upserts.toOwnedSlice(self.alloc);
         plan.split_admissions = try split_admissions.toOwnedSlice(self.alloc);
@@ -1200,6 +1223,21 @@ fn findPlacementIntent(intents: []const raft_reconciler.PlacementIntent, group_i
     return null;
 }
 
+fn placementTargetDrainRequested(
+    stores: []const table_manager.StoreRecord,
+    intent: raft_reconciler.PlacementIntent,
+) bool {
+    for (stores) |store| {
+        if (intent.store_id != 0) {
+            if (store.store_id != intent.store_id) continue;
+        } else if (store.node_id != intent.record.local_node_id) {
+            continue;
+        }
+        return store.drain_requested;
+    }
+    return false;
+}
+
 fn normalizeRestoreBootstrapIntent(
     current: CurrentMetadataState,
     tables: []const table_manager.TableRecord,
@@ -1259,6 +1297,7 @@ fn effectivePlacementIntent(
     applyRelocationWatermark(&effective, watermark);
 
     if (existing) |current_intent| {
+        effective.record.metadata_version = current_intent.record.metadata_version;
         effective.relocation_generation = current_intent.relocation_generation;
         if (effective.relocation_generation == 0 and current_intent.serving_state != .serving) {
             effective.relocation_generation = current_intent.record.metadata_version + 1;

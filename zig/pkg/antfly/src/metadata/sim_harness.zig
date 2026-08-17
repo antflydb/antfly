@@ -2712,8 +2712,17 @@ pub const MetadataHttpNodeSimulation = struct {
         return try self.proposeTransitionCommands(&.{command});
     }
 
-    pub fn upsertReplicaIntent(self: MetadataHttpNodeSimulation, intent: raft_reconciler.PlacementIntent) !void {
-        try self.proposeTransitionCommand(.{ .upsert_replica_intent = intent });
+    pub fn upsertReplicaIntent(
+        self: MetadataHttpNodeSimulation,
+        intent: raft_reconciler.PlacementIntent,
+        expected_metadata_version: ?u64,
+        expected_target_drain_requested: bool,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .upsert_replica_intent = .{
+            .expected_metadata_version = expected_metadata_version,
+            .expected_target_drain_requested = expected_target_drain_requested,
+            .replacement = intent,
+        } });
     }
 
     pub fn upsertNode(self: MetadataHttpNodeSimulation, record: metadata_table_manager.NodeRecord) !void {
@@ -2773,10 +2782,11 @@ pub const MetadataHttpNodeSimulation = struct {
         try self.proposeTransitionCommand(.{ .remove_store = .{ .store_id = store_id } });
     }
 
-    pub fn removeReplicaIntent(self: MetadataHttpNodeSimulation, group_id: u64, local_node_id: u64) !void {
+    pub fn removeReplicaIntent(self: MetadataHttpNodeSimulation, group_id: u64, local_node_id: u64, expected_metadata_version: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_replica_intent = .{
             .group_id = group_id,
             .local_node_id = local_node_id,
+            .expected_metadata_version = expected_metadata_version,
         } });
     }
 
@@ -2852,9 +2862,14 @@ pub const MetadataHttpNodeSimulation = struct {
         var commands = std.ArrayListUnmanaged(metadata_storage.TransitionCommand).empty;
         defer commands.deinit(self.cluster.alloc);
 
-        for (plan.placement_upserts) |intent| {
+        std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
+        for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
             if (containsProjectedPlacementIntent(projected_intents, intent)) continue;
-            try commands.append(self.cluster.alloc, .{ .upsert_replica_intent = intent });
+            try commands.append(self.cluster.alloc, .{ .upsert_replica_intent = .{
+                .expected_metadata_version = precondition.expected_metadata_version,
+                .expected_target_drain_requested = precondition.expected_target_drain_requested,
+                .replacement = intent,
+            } });
         }
         for (plan.table_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_table = record });
         for (plan.split_admissions) |admission| try commands.append(self.cluster.alloc, .{ .admit_split_transition = .{
@@ -2866,10 +2881,10 @@ pub const MetadataHttpNodeSimulation = struct {
         for (plan.merge_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_merge_transition = record });
         for (plan.placement_removals) |record| {
             if (!containsProjectedPlacementIntentGroup(projected_intents, record.group_id)) continue;
-            _ = record.local_node_id;
             try commands.append(self.cluster.alloc, .{ .remove_replica_intent = .{
                 .group_id = record.group_id,
                 .local_node_id = record.local_node_id,
+                .expected_metadata_version = record.expected_metadata_version,
             } });
         }
         for (plan.table_removals) |table_id| {

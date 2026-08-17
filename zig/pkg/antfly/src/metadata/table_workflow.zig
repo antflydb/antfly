@@ -157,15 +157,21 @@ pub const TableWorkflow = struct {
         var summary: PlacementReconcileSummary = .{};
         for (desired) |intent| {
             const existing = findPlacementIntent(current, intent.record.group_id, intent.record.local_node_id);
-            if (existing == null or !placementIntentsEqual(existing.?, intent)) {
-                try service.upsertReplicaIntent(intent);
+            var replacement = intent;
+            if (existing) |current_intent| replacement.record.metadata_version = current_intent.record.metadata_version;
+            if (existing == null or !placementIntentsEqual(existing.?, replacement)) {
+                try service.upsertReplicaIntent(
+                    replacement,
+                    if (existing) |current_intent| current_intent.record.metadata_version else null,
+                    false,
+                );
                 summary.upserts += 1;
             }
         }
         for (current) |intent| {
             if (intent.record.local_node_id != local_node_id) continue;
             if (findPlacementIntent(desired, intent.record.group_id, local_node_id) == null) {
-                try service.removeReplicaIntent(intent.record.group_id, local_node_id);
+                try service.removeReplicaIntent(intent.record.group_id, local_node_id, intent.record.metadata_version);
                 summary.removals += 1;
             }
         }
@@ -791,7 +797,12 @@ test "table workflow can reconcile projected local placement intents" {
             alloc.free(intents);
         }
 
-        fn upsertReplicaIntent(self: *@This(), intent: raft_reconciler.PlacementIntent) !void {
+        fn upsertReplicaIntent(
+            self: *@This(),
+            intent: raft_reconciler.PlacementIntent,
+            _: ?u64,
+            _: bool,
+        ) !void {
             for (self.intents.items) |*existing| {
                 if (existing.record.group_id != intent.record.group_id or existing.record.local_node_id != intent.record.local_node_id) continue;
                 if (existing.peer_node_ids.len > 0) self.alloc.free(existing.peer_node_ids);
@@ -807,7 +818,7 @@ test "table workflow can reconcile projected local placement intents" {
             });
         }
 
-        fn removeReplicaIntent(self: *@This(), group_id: u64, local_node_id: u64) !void {
+        fn removeReplicaIntent(self: *@This(), group_id: u64, local_node_id: u64, _: u64) !void {
             var i: usize = 0;
             while (i < self.intents.items.len) : (i += 1) {
                 const intent = self.intents.items[i];

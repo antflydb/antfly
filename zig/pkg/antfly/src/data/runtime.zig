@@ -10349,13 +10349,6 @@ pub const DataServer = struct {
             snapshot.tables,
             snapshot.ranges,
         );
-        self.annotateLocalPlacementStatus(
-            group_statuses,
-            snapshot.placement_intents,
-            registration.node_id,
-            registration.store_id,
-        );
-        retainCurrentReallocationRequestObservations(group_statuses, snapshot.reallocation_request);
         const runtime_statuses = try self.collectStoreRuntimeStatusReports(
             self.alloc,
             local_group_ids,
@@ -10364,6 +10357,14 @@ pub const DataServer = struct {
             registration,
         );
         defer antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
+        overlayLiveRuntimeGroupFacts(group_statuses, runtime_statuses);
+        self.annotateLocalPlacementStatus(
+            group_statuses,
+            snapshot.placement_intents,
+            registration.node_id,
+            registration.store_id,
+        );
+        retainCurrentReallocationRequestObservations(group_statuses, snapshot.reallocation_request);
 
         const capacity = self.observeStoreCapacityForStatus();
 
@@ -15732,6 +15733,42 @@ fn collectLocalGroupStatusFromRuntimeStatus(
     };
 }
 
+fn overlayLiveRuntimeGroupFacts(
+    group_statuses: []antfly.metadata.table_manager.GroupStatusReport,
+    runtime_statuses: []const antfly.metadata.table_manager.RuntimeGroupStatusReport,
+) void {
+    for (group_statuses) |*group_status| {
+        for (runtime_statuses) |runtime_report| {
+            if (runtime_report.group_id != group_status.group_id) continue;
+            if (!std.mem.eql(u8, runtime_report.source, "live_writer_publish")) continue;
+
+            // Group-status collection is intentionally cached and
+            // ownership-safe. A relocation target can publish its hydrated
+            // writer snapshot just after that cache retained a conservative
+            // empty observation. Advance only monotonic liveness facts here:
+            // stale runtime state may delay convergence, but can never make a
+            // new placement look less complete or borrow another replica's
+            // evidence.
+            if (runtime_report.doc_count > group_status.doc_count) {
+                group_status.doc_count = runtime_report.doc_count;
+                group_status.empty = false;
+            }
+            if (runtime_report.disk_bytes_known and !group_status.disk_bytes_known) {
+                group_status.disk_bytes = runtime_report.disk_bytes;
+                group_status.disk_bytes_known = true;
+            }
+            if (group_status.created_at_millis == 0 and runtime_report.created_at_millis != 0) {
+                group_status.created_at_millis = runtime_report.created_at_millis;
+            }
+            group_status.updated_at_millis = @max(
+                group_status.updated_at_millis,
+                runtime_report.updated_at_ns / std.time.ns_per_ms,
+            );
+            break;
+        }
+    }
+}
+
 fn controlPlaneDocumentCount(stats: antfly.db.types.DBStats) u64 {
     // `doc_count` is derived-index visibility and may be partial by design.
     // Placement, range ownership, and split safety require primary source
@@ -19121,6 +19158,51 @@ test "data runtime local split key cache is scoped by root and change generation
     var cached_empty = (try cache.snapshot(alloc, 7, 1, 11)).?;
     defer cached_empty.deinit(alloc);
     try std.testing.expect(cached_empty.split_key == null);
+}
+
+test "data runtime live writer facts advance a conservative group status cache" {
+    var groups = [_]antfly.metadata.table_manager.GroupStatusReport{
+        .{ .group_id = 77, .empty = true, .updated_at_millis = 10 },
+        .{ .group_id = 88, .doc_count = 15, .empty = false, .updated_at_millis = 20 },
+    };
+    const runtime_reports = [_]antfly.metadata.table_manager.RuntimeGroupStatusReport{
+        .{
+            .group_id = 77,
+            .source = "live_writer_publish",
+            .updated_at_ns = 30 * std.time.ns_per_ms,
+            .doc_count = 12,
+            .disk_bytes = 4096,
+            .disk_bytes_known = true,
+            .created_at_millis = 5,
+        },
+        .{
+            .group_id = 88,
+            .source = "live_writer_publish",
+            .updated_at_ns = 30 * std.time.ns_per_ms,
+            .doc_count = 12,
+        },
+    };
+
+    overlayLiveRuntimeGroupFacts(&groups, &runtime_reports);
+
+    try std.testing.expectEqual(@as(u64, 12), groups[0].doc_count);
+    try std.testing.expect(!groups[0].empty);
+    try std.testing.expectEqual(@as(u64, 4096), groups[0].disk_bytes);
+    try std.testing.expect(groups[0].disk_bytes_known);
+    try std.testing.expectEqual(@as(u64, 5), groups[0].created_at_millis);
+    try std.testing.expectEqual(@as(u64, 30), groups[0].updated_at_millis);
+    // The overlay is monotonic: an older/lower writer observation cannot
+    // regress already-published relocation evidence.
+    try std.testing.expectEqual(@as(u64, 15), groups[1].doc_count);
+    try std.testing.expect(!groups[1].empty);
+
+    const synthetic = [_]antfly.metadata.table_manager.RuntimeGroupStatusReport{.{
+        .group_id = 77,
+        .source = "synthetic_config",
+        .doc_count = 99,
+    }};
+    overlayLiveRuntimeGroupFacts(&groups, &synthetic);
+    try std.testing.expectEqual(@as(u64, 12), groups[0].doc_count);
 }
 
 test "data runtime store status reuses stale cache while refreshing local group status" {
