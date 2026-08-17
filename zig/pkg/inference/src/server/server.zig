@@ -6319,6 +6319,11 @@ pub const Node = struct {
                 .message = "request exceeds the configured inference resource budget",
             }),
             error.ResourceTemporarilyUnavailable => return modelResourceBusyResponse(ctx),
+            // Ownership configuration errors should have failed startup before
+            // request surfaces were published. Keep the HTTP boundary total so
+            // a violated invariant is reported as an internal failure instead
+            // of widening this inferred error set into a compile failure.
+            else => return inferenceFailureResponse(ctx, err),
         };
         defer admission_lease.release();
 
