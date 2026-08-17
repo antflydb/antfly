@@ -2490,6 +2490,7 @@ pub fn build(b: *std.Build) void {
     capi_package_test_step.dependOn(&run_cabi_packaging_tests.step);
 
     const capi_default_filters = [_][]const u8{
+        "capi artifact decode and lookup json",
         "capi lite opens exports imports checks and vacuums aflite",
         "capi zero buffer helper wipes bytes before free",
         "capi lite exposes hosted and status-only profiles",
@@ -4240,6 +4241,7 @@ pub fn build(b: *std.Build) void {
             "db document unit payload preserves pdf page provenance",
             "db document extraction asset materializes unit artifacts from data url",
             "db document extraction chunks units through source artifact enrichment",
+            "db public artifact lookup strips private hierarchy metadata without changing internal records",
             "db hierarchy navigation seeks only the descriptor blocks needed by the page",
             "db hierarchy cursor binds every unit artifact revision under its source",
         },
@@ -5256,7 +5258,7 @@ pub fn build(b: *std.Build) void {
             "distributed join rejects doc identity rebuild before right-table fanout",
             "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
             "internal worker doc identity exchange audit covers every boundary",
-            "typed internal HTTP errors preserve doc identity conflict semantics",
+            "typed internal HTTP errors preserve conflict semantics",
             "api http client preserves group doc identity conflicts",
             "aggregation context rejects non-current identity generation",
             "aggregation full-result rerun can reuse snapped result identity generation",
@@ -5524,6 +5526,7 @@ pub fn build(b: *std.Build) void {
             "aggregation completeness requires exact total relation",
             "distributed grouped hierarchy expands only the globally merged page",
             "distributed grouped unit expansion rejects a cross-revision result",
+            "distributed grouped unit expansion rejects a missing selected group",
             "distributed query shard request preserves sorted cursor contract",
             "distributed unit grouping round trips deferred shard hydration",
             "distributed unit group hydration routes selected units and deduplicates sources",
@@ -6889,6 +6892,7 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("antfly_resolver", resolver_mod);
     db_test_mod.addImport("antfly_chunking", chunking_mod);
     db_test_mod.addImport("antfly_regex", regex_mod);
+    db_test_mod.addImport("antfly-json", json_mod);
     db_test_mod.addImport("raft_engine", raft_engine_mod);
     db_test_mod.addImport("inference_chunker", inference_chunker_mod);
     db_test_mod.addImport("inference_api", inference_api_mod);

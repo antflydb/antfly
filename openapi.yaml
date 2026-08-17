@@ -13426,6 +13426,8 @@ components:
                   - required:
                       - reranker
                   - required:
+                      - analyses
+                  - required:
                       - aggregations
                   - required:
                       - graph_searches

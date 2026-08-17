@@ -6503,6 +6503,7 @@ components:
                   - required: [count]
                   - required: [profile]
                   - required: [reranker]
+                  - required: [analyses]
                   - required: [aggregations]
                   - required: [graph_searches]
                   - required: [expand_strategy]

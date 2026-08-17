@@ -5291,6 +5291,39 @@ test "distributed grouped unit expansion rejects a cross-revision result" {
     try std.testing.expectEqual(@as(usize, 1), expanded.hits[0].chunk_hits.len);
 }
 
+test "distributed grouped unit expansion rejects a missing selected group" {
+    const alloc = std.testing.allocator;
+    const selected_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    selected_hits[0] = .{
+        .id = try alloc.dupe(u8, "unit:0"),
+        .stored_data = try alloc.dupe(u8, "{\"_hierarchy_unit_revision_token\":\"selected-revision\"}"),
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "document_units_v1"),
+            .kind = .asset,
+            .unit_id = try alloc.dupe(u8, "page:000001"),
+        },
+    };
+    var selected = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = selected_hits,
+        .total_hits = 1,
+    };
+    defer selected.deinit();
+
+    var expanded = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+    };
+    defer expanded.deinit();
+
+    try std.testing.expectError(
+        error.StorageReadTemporarilyUnavailable,
+        applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded),
+    );
+}
+
 test "distributed unit group hydration routes selected units and deduplicates sources" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
@@ -6505,7 +6538,13 @@ fn applyCanonicalGroupedMatchExpansion(
         if (selected_hit.chunk_hits.len > 0) alloc.free(selected_hit.chunk_hits);
         selected_hit.chunk_hits = &.{};
 
-        const expanded_index = expanded_by_id.get(selected_hit.id) orelse continue;
+        // Selection proves that every returned group has at least one matching
+        // descendant. A missing expansion therefore means the two distributed
+        // phases observed different query or extraction revisions. Returning
+        // the selected identity with an empty `matches` array would turn a
+        // transient race into a plausible but false public result.
+        const expanded_index = expanded_by_id.get(selected_hit.id) orelse
+            return error.StorageReadTemporarilyUnavailable;
         const expanded_hit = &expanded.hits[expanded_index];
         if (selected_hit.artifact_ref != null and selected_hit.artifact_ref.?.unit_id != null) {
             const selected_revision = try groupedUnitRevisionEnvelopeFingerprintAlloc(

@@ -108,6 +108,31 @@ class McpSchemaFragmentTests(unittest.TestCase):
         with generator.SPEC.open(encoding="utf-8") as handle:
             schemas = yaml.safe_load(handle)["components"]["schemas"]
 
+        query_schema = schemas["QueryRequest"]
+        child_mode_rejection = next(
+            branch
+            for branch in query_schema["not"]["anyOf"]
+            if branch.get("description", "").startswith("Relevance, filtering, backward/offset pagination")
+        )
+        rejected_child_fields = {
+            item["required"][0]
+            for item in child_mode_rejection["allOf"][1]["anyOf"]
+        }
+        allowed_child_fields = {
+            "table",
+            "fields",
+            "hierarchy",
+            "limit",
+            "timeout_ms",
+            "order_by",
+            "search_after",
+        }
+        self.assertEqual(
+            set(query_schema["properties"]),
+            allowed_child_fields | rejected_child_fields,
+            "every QueryRequest property must be explicitly allowed or rejected for hierarchy.children",
+        )
+
         validator = Draft202012Validator(generator.compact_query_request_schema(schemas))
         valid = {
             "fields": ["unit_id", "unit_type", "text"],
@@ -129,6 +154,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
             ("filter_query", {"term": {"path": "/tenant", "value": "acme"}}),
             ("offset", 0),
             ("search_before", []),
+            ("analyses", {"pca": True}),
             ("limit", 101),
             ("search_after", ["position-only"]),
             ("order_by", [{"field": "_hierarchy.position", "desc": True}]),

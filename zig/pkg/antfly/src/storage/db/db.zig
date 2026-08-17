@@ -7876,6 +7876,19 @@ pub const DB = struct {
         };
     }
 
+    /// Returns an artifact through a public response boundary. Raw artifact
+    /// values are retained internally because compute/apply transports need
+    /// storage metadata, while public lookup must never expose hierarchy
+    /// revision fingerprints or coordinator envelopes.
+    pub fn getPublicArtifact(self: *DB, alloc: Allocator, artifact_id: []const u8) !?types.ArtifactRecord {
+        var artifact = (try self.getArtifact(alloc, artifact_id)) orelse return null;
+        errdefer artifact.deinit(alloc);
+        const public_value = try hierarchy_navigation.publicArtifactPayloadAlloc(alloc, artifact.value);
+        alloc.free(artifact.value);
+        artifact.value = public_value;
+        return artifact;
+    }
+
     pub fn getDocumentArtifactManifest(
         self: *DB,
         alloc: Allocator,
@@ -62019,7 +62032,7 @@ test "db ttl broad live filter preserves all-doc sentinel" {
     try std.testing.expect(filtered == .all);
 }
 
-test "db getArtifact loads stored chunk artifacts by public id" {
+test "db public artifact lookup strips private hierarchy metadata without changing internal records" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -62033,7 +62046,10 @@ test "db getArtifact loads stored chunk artifacts by public id" {
     defer alloc.free(chunk_zero);
     const internal_key = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(internal_key);
-    try db.core.store.put(internal_key, "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0}");
+    try db.core.store.put(
+        internal_key,
+        "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0,\"_artifact_unit_fingerprint\":\"private\"}",
+    );
 
     var artifact = (try db.getArtifact(alloc, chunk_zero)) orelse return error.TestUnexpectedResult;
     defer artifact.deinit(alloc);
@@ -62043,8 +62059,20 @@ test "db getArtifact loads stored chunk artifacts by public id" {
     try std.testing.expectEqualStrings("doc:a", artifact.artifact_ref.document_id);
     try std.testing.expectEqualStrings("body_chunks_v1", artifact.artifact_ref.name);
     try std.testing.expectEqual(@as(?u32, 0), artifact.artifact_ref.chunk_id);
-    try std.testing.expect(std.mem.indexOf(u8, artifact.value, "\"_chunk_id\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, artifact.value, "\"body\":\"abcdefgh\"") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"body\":\"abcdefgh\",\"_chunk_id\":0,\"_artifact_unit_fingerprint\":\"private\"}",
+        artifact.value,
+    );
+
+    var public_artifact = (try db.getPublicArtifact(alloc, chunk_zero)) orelse return error.TestUnexpectedResult;
+    defer public_artifact.deinit(alloc);
+    try std.testing.expectEqualStrings(chunk_zero, public_artifact.id);
+    try ant_json.testing.expectEqualJsonText(
+        alloc,
+        "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0}",
+        public_artifact.value,
+    );
 }
 
 test "canonical grouped match requests isolate nested pagination and work" {

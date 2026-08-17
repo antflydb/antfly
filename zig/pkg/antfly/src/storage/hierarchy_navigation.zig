@@ -311,6 +311,123 @@ pub fn stripUnitFingerprintAlloc(alloc: std.mem.Allocator, stored: []const u8) !
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
 }
 
+/// Produces the public representation of an artifact payload while preserving
+/// byte-for-byte compatibility for payloads that do not contain private
+/// hierarchy metadata. Artifact lookup is also valid for opaque, non-JSON
+/// values, so only parse object-shaped payloads that may require sanitization.
+/// The allocation-free lexical probe recognizes both literal and JSON-escaped
+/// reserved keys, so ordinary payloads avoid semantic parsing even when their
+/// user data contains escapes. Malformed opaque payloads retain their byte
+/// representation unless a key-shaped token decodes to a private marker, which
+/// fails closed.
+pub fn publicArtifactPayloadAlloc(alloc: std.mem.Allocator, stored: []const u8) ![]u8 {
+    var first_non_whitespace: usize = 0;
+    while (first_non_whitespace < stored.len and std.ascii.isWhitespace(stored[first_non_whitespace])) : (first_non_whitespace += 1) {}
+    if (first_non_whitespace == stored.len or stored[first_non_whitespace] != '{') {
+        return try alloc.dupe(u8, stored);
+    }
+    if (!objectContainsPrivateFieldToken(stored)) {
+        return try alloc.dupe(u8, stored);
+    }
+
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var parsed = std.json.parseFromSlice(std.json.Value, scratch.allocator(), stored, .{}) catch
+        return error.InvalidDocumentExtractionState;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionState;
+    if (parsed.value.object.get(unit_fingerprint_field) == null and
+        parsed.value.object.get(grouped_unit_revision_envelope_field) == null)
+    {
+        return try alloc.dupe(u8, stored);
+    }
+    stripPublicInternalFieldsValue(scratch.allocator(), &parsed.value);
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}
+
+/// Detects reserved key-shaped tokens in object-shaped payloads without first
+/// parsing them. Because the payload may be malformed, nesting and comma state
+/// are untrustworthy, so every quote is treated as an independent
+/// resynchronization point. Each probe decodes at most one reserved-field name
+/// and must be followed by a closing quote, optional whitespace, and `:`. The
+/// resulting scan is allocation-free and O(payload length) with a small fixed
+/// constant.
+fn objectContainsPrivateFieldToken(stored: []const u8) bool {
+    var index: usize = 0;
+    while (index < stored.len and std.ascii.isWhitespace(stored[index])) : (index += 1) {}
+    if (index == stored.len or stored[index] != '{') return false;
+    index += 1;
+
+    while (index < stored.len) {
+        if (stored[index] == '"') {
+            const content_start = index + 1;
+            if (jsonQuotedAsciiEnd(stored, content_start, unit_fingerprint_field) orelse
+                jsonQuotedAsciiEnd(stored, content_start, grouped_unit_revision_envelope_field)) |closing_quote|
+            {
+                var after = closing_quote + 1;
+                while (after < stored.len and std.ascii.isWhitespace(stored[after])) : (after += 1) {}
+                if (after < stored.len and stored[after] == ':') return true;
+            }
+        }
+        index += 1;
+    }
+    return false;
+}
+
+/// Matches one quoted JSON string against an ASCII field name, decoding in
+/// place and returning the closing quote. It never scans beyond the expected
+/// decoded length, which bounds recovery work even for attacker-controlled
+/// unterminated strings. Reserved hierarchy fields are ASCII, so non-ASCII
+/// code points and surrogate pairs cannot match.
+fn jsonQuotedAsciiEnd(stored: []const u8, content_start: usize, expected: []const u8) ?usize {
+    var stored_index = content_start;
+    for (expected) |expected_byte| {
+        if (stored_index == stored.len) return null;
+        const decoded: u8 = if (stored[stored_index] == '\\') blk: {
+            stored_index += 1;
+            if (stored_index == stored.len) return null;
+            const escaped = stored[stored_index];
+            stored_index += 1;
+            break :blk switch (escaped) {
+                '"', '\\', '/' => escaped,
+                'b' => 0x08,
+                'f' => 0x0c,
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'u' => unicode: {
+                    if (stored.len - stored_index < 4) return null;
+                    var code_point: u16 = 0;
+                    for (stored[stored_index .. stored_index + 4]) |hex| {
+                        code_point = code_point * 16 + (jsonHexNibble(hex) orelse return null);
+                    }
+                    stored_index += 4;
+                    if (code_point > std.math.maxInt(u8)) return null;
+                    break :unicode @intCast(code_point);
+                },
+                else => return null,
+            };
+        } else blk: {
+            const plain = stored[stored_index];
+            stored_index += 1;
+            if (plain < 0x20 or plain == '"') return null;
+            break :blk plain;
+        };
+        if (decoded != expected_byte) return null;
+    }
+    if (stored_index == stored.len or stored[stored_index] != '"') return null;
+    return stored_index;
+}
+
+fn jsonHexNibble(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => null,
+    };
+}
+
 fn lowerHexAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
     const encoded_len = std.math.mul(usize, raw.len, 2) catch return error.OutOfMemory;
     const out = try alloc.alloc(u8, encoded_len);
@@ -394,4 +511,78 @@ test "hierarchy stored-value sanitizer always removes the unit fingerprint" {
     try std.testing.expect(value.object.get(unit_fingerprint_field) == null);
     try std.testing.expect(value.object.get(grouped_unit_revision_envelope_field) == null);
     try std.testing.expectEqualStrings("alpha", value.object.get("text").?.string);
+}
+
+test "public artifact payload sanitizer preserves opaque values and strips every private hierarchy field" {
+    const alloc = std.testing.allocator;
+
+    const opaque_payload = "opaque-artifact-bytes _artifact_unit_fingerprint";
+    const unchanged = try publicArtifactPayloadAlloc(alloc, opaque_payload);
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings(opaque_payload, unchanged);
+
+    const ordinary_json = "{ \"text\": \"_artifact_unit_fingerprint\" }";
+    const unchanged_json = try publicArtifactPayloadAlloc(alloc, ordinary_json);
+    defer alloc.free(unchanged_json);
+    try std.testing.expectEqualStrings(ordinary_json, unchanged_json);
+
+    const escaped_value_json = "{ \"text\": \"_artifact_unit_finger\\u0070rint\" }";
+    const unchanged_escaped_value = try publicArtifactPayloadAlloc(alloc, escaped_value_json);
+    defer alloc.free(unchanged_escaped_value);
+    try std.testing.expectEqualStrings(escaped_value_json, unchanged_escaped_value);
+
+    const nested_private_name = "{ \"metadata\": { \"_artifact_unit_fingerprint\": \"user-data\" } }";
+    const unchanged_nested_private_name = try publicArtifactPayloadAlloc(alloc, nested_private_name);
+    defer alloc.free(unchanged_nested_private_name);
+    try std.testing.expectEqualStrings(nested_private_name, unchanged_nested_private_name);
+
+    const sanitized = try publicArtifactPayloadAlloc(
+        alloc,
+        "{\"text\":\"alpha\",\"_artifact_unit_fingerprint\":\"secret\",\"_hierarchy_unit_revision_token\":\"private\"}",
+    );
+    defer alloc.free(sanitized);
+    try ant_json.testing.expectEqualJsonText(alloc, "{\"text\":\"alpha\"}", sanitized);
+
+    const escaped_private_fields = try publicArtifactPayloadAlloc(
+        alloc,
+        "{\"text\":\"alpha\",\"_artifact_unit_finger\\u0070rint\":\"secret\",\"_hierarchy_unit_revision_toke\\u006e\":\"private\"}",
+    );
+    defer alloc.free(escaped_private_fields);
+    try ant_json.testing.expectEqualJsonText(alloc, "{\"text\":\"alpha\"}", escaped_private_fields);
+
+    const malformed_opaque = "{opaque\\artifact";
+    const unchanged_malformed_opaque = try publicArtifactPayloadAlloc(alloc, malformed_opaque);
+    defer alloc.free(unchanged_malformed_opaque);
+    try std.testing.expectEqualStrings(malformed_opaque, unchanged_malformed_opaque);
+
+    const malformed_escaped_value = "{\"text\":\"_artifact_unit_finger\\u0070rint\"";
+    const unchanged_malformed_escaped_value = try publicArtifactPayloadAlloc(alloc, malformed_escaped_value);
+    defer alloc.free(unchanged_malformed_escaped_value);
+    try std.testing.expectEqualStrings(malformed_escaped_value, unchanged_malformed_escaped_value);
+
+    const malformed_literal_value = "{\"text\":\"_artifact_unit_fingerprint\"";
+    const unchanged_malformed_literal_value = try publicArtifactPayloadAlloc(alloc, malformed_literal_value);
+    defer alloc.free(unchanged_malformed_literal_value);
+    try std.testing.expectEqualStrings(malformed_literal_value, unchanged_malformed_literal_value);
+
+    try std.testing.expectError(
+        error.InvalidDocumentExtractionState,
+        publicArtifactPayloadAlloc(alloc, "{\"_artifact_unit_fingerprint\":"),
+    );
+    try std.testing.expectError(
+        error.InvalidDocumentExtractionState,
+        publicArtifactPayloadAlloc(alloc, "{\"text\":\"alpha\",\"_artifact_unit_finger\\u0070rint\" : \"secret\""),
+    );
+    try std.testing.expectError(
+        error.InvalidDocumentExtractionState,
+        publicArtifactPayloadAlloc(alloc, "{\"_hierarchy_unit_revision_toke\\u006e\":\"private\","),
+    );
+    try std.testing.expectError(
+        error.InvalidDocumentExtractionState,
+        publicArtifactPayloadAlloc(alloc, "{\"text\":\"alpha\" \"_artifact_unit_finger\\u0070rint\":\"secret\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidDocumentExtractionState,
+        publicArtifactPayloadAlloc(alloc, "{\"text\":\"unterminated, \"_hierarchy_unit_revision_toke\\u006e\":\"private\"}"),
+    );
 }
