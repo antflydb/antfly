@@ -2699,7 +2699,7 @@ pub const Node = struct {
             .inference_admission = inference_admission_mod.InferenceAdmission.init(config.max_concurrent_requests),
             .compatibility_cache = .empty,
         };
-        node.model_manager.configureResourceOwnership(config.resource_ownership);
+        try node.model_manager.configureResourceOwnership(config.resource_ownership);
         node.model_manager.configureProcessMemoryLimit(config.process_memory_limit_bytes);
         node.model_manager.configureServingPolicy(.{
             .allow_unknown = config.allow_unknown_models,
@@ -2721,7 +2721,7 @@ pub const Node = struct {
                 .{ @tagName(config.resource_ownership), config.process_memory_limit_bytes },
             );
         }
-        node.model_manager.tokenizer_cache_config = config.tokenizer_cache;
+        try node.model_manager.configureTokenizerCaches(config.tokenizer_cache);
         node.model_manager.tokenizer_parallel_bpe_config =
             config.tokenizer_parallel_bpe;
         node.updateAdmissionMetrics();
@@ -2744,14 +2744,19 @@ pub const Node = struct {
         config: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig,
     ) !void {
         try self.model_manager.configureTokenizerCaches(config);
-        self.config.tokenizer_cache = config;
+        self.config.tokenizer_cache = self.model_manager.tokenizer_cache_config;
     }
 
-    pub fn configureAdmissionResourceBudget(
+    pub fn configureExternalResourceBudgets(
         self: *Node,
-        resource_budget: ?runtime.tier.memory.AdmissionResourceBudget,
-    ) void {
-        self.model_manager.configureAdmissionResourceBudget(resource_budget);
+        admission_budget: runtime.tier.memory.AdmissionResourceBudget,
+        tokenizer_config: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig,
+    ) !void {
+        try self.model_manager.configureExternalResourceBudgets(
+            admission_budget,
+            tokenizer_config,
+        );
+        self.config.tokenizer_cache = tokenizer_config;
     }
 
     pub fn configureForcedRunAdmissionDenialsForTesting(

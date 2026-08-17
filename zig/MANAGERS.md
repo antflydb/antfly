@@ -206,6 +206,13 @@ addresses are registered with their slice and last accepted total, so a stale
 same-slice value cannot debit another observer. External ABI boundaries add
 monotonic owner identities to avoid pointer-reuse ambiguity.
 
+Local tokenizer credits remain ordinary `AdmissionLease` values held privately
+inside their ModelManager observer record. Each lease retains its controller,
+backend attribution, and admitted amount; shrinking uses `retain`, while full
+credit release uses the lease itself. There is no public detach or raw-byte
+release API, so a callback cannot reconstruct a release, select another backend
+ledger, or debit accounting owned by another tokenizer.
+
 Prompt and tokenizer caches both report `(observer identity, previous total,
 next total)`. Each tokenizer serializes only cold allocation, eviction, and
 teardown transitions; cache hits remain callback-free. Standalone maintains a
@@ -217,10 +224,27 @@ the logical tokenizer slice and the process host aggregate before allocation,
 while a validated decrease is always allowed so an over-limit owner can
 converge to zero. Embedded inference applies that transition to the node
 `ResourceManager`. Direct and distributed inference install a ModelManager-owned
-adapter that keeps one exact total per tokenizer and charges deltas to the same
-local `AdmissionController` used by model and request leases. The adapter never
-evicts while called from a tokenizer lock; denial simply skips optional cache
-growth, keeping the hot cache-hit path callback- and allocation-free.
+adapter that keeps one exact usage total per tokenizer and charges bounded 1 MiB
+admission credits to the same local `AdmissionController` used by model and
+request leases. Unused credit is bounded to less than one quantum per tokenizer;
+near a policy boundary, a denied preferred quantum is retried with only the
+required bytes so usable capacity is not stranded. Shrink releases whole unused
+credits and teardown releases the exact remainder.
+
+Tokenizer identities are distributed over independent accounting shards. A
+shard lock marks one identity transition in flight, then is released before an
+OS/cgroup live-memory probe; other tokenizer owners continue independently.
+Growth inside existing credit performs no probe at all, so filesystem sampling
+is amortized across thousands of small cache entries rather than paid per miss.
+The adapter never evicts while called from a tokenizer lock; denial simply skips
+optional cache growth, keeping the hot cache-hit path callback- and
+allocation-free.
+
+Ownership provenance is explicit and immutable once attached. Local mode
+installs only the ModelManager adapter. Embedded mode attaches the admission
+lease bridge and tokenizer observer bridge as one external pair; supplying only
+one half, mixing an external tokenizer callback into local mode, or changing
+ownership after attachment fails before model loading.
 
 Observer records are manager-owned accounting snapshots, not leases. An owner
 that continues using the manager reconciles its snapshot to zero when its

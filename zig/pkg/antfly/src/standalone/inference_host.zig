@@ -311,12 +311,14 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
     ))
         return error.UnsupportedVersion;
     state.resource_budget = context.resource_budget.*;
-    state.node.configureAdmissionResourceBudget(inferenceAdmissionResourceBudget(state));
     state.node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(state);
-    try state.node.configureTokenizerCaches(.{
-        .bulk_slots_per_shard = 16 * 1024,
-        .resource_budget = tokenizerCacheResourceBudget(state),
-    });
+    try state.node.configureExternalResourceBudgets(
+        inferenceAdmissionResourceBudget(state),
+        .{
+            .bulk_slots_per_shard = 16 * 1024,
+            .resource_budget = tokenizerCacheResourceBudget(state),
+        },
+    );
     state.node.warmConfiguredModelsBeforeServing(state.alloc) catch |err| {
         std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
         return err;
