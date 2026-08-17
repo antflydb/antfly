@@ -1521,7 +1521,11 @@ pub const ResourceManager = struct {
             return error.ResourceBudgetExceeded;
         const memory_next = std.math.add(u64, self.memory.used_bytes - previous, next) catch
             return error.ResourceBudgetExceeded;
-        if (enforce_limits) {
+        // Observation-only callers may report allocations that already exist,
+        // but admission callers must reject growth before allocation. A
+        // validated decrease is always accepted, even while the aggregate is
+        // still above a hard limit, so owners can converge out of pressure.
+        if (enforce_limits and next > previous) {
             if ((state.budget.hard_limit_bytes > 0 and slice_next > state.budget.hard_limit_bytes) or
                 (self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes))
             {
@@ -1587,6 +1591,29 @@ pub const ResourceManager = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.reconcileUsageLocked(slice, observer_id, previous, next, false) catch {
+            return false;
+        };
+        return true;
+    }
+
+    /// Reconcile an owner-issued stable identity as an admission operation.
+    /// Growth is rejected before it crosses either the slice or aggregate hard
+    /// limit. Validated shrink and teardown always remain possible so pressure
+    /// cannot strand cache memory above a newly tightened limit.
+    pub fn tryAdjustUsageIdentity(
+        self: *ResourceManager,
+        slice: Slice,
+        observer_id: usize,
+        previous: u64,
+        next: u64,
+    ) bool {
+        if (observer_id == 0) {
+            self.recordAccountingError();
+            return false;
+        }
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.reconcileUsageLocked(slice, observer_id, previous, next, true) catch {
             return false;
         };
         return true;
@@ -2713,6 +2740,71 @@ test "resource manager observes over-budget external usage" {
     try std.testing.expectEqual(@as(u64, 5), current);
     try std.testing.expectEqual(@as(u64, 5), stats.slices[sliceIndex(.lsm_block_table_cache)].used_bytes);
     try std.testing.expectEqual(Pressure.normal, stats.slices[sliceIndex(.lsm_block_table_cache)].pressure);
+}
+
+test "identity-aware cache admission rejects growth and always permits shrink" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.inference_tokenizer_cache)] = .{
+        .soft_limit_bytes = 10,
+        .hard_limit_bytes = 20,
+    };
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 24 },
+        .budgets = budgets,
+        .identity_allocator = std.testing.allocator,
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    try std.testing.expect(manager.tryAdjustUsageIdentity(
+        .inference_tokenizer_cache,
+        41,
+        0,
+        18,
+    ));
+    try std.testing.expect(!manager.tryAdjustUsageIdentity(
+        .inference_tokenizer_cache,
+        41,
+        18,
+        21,
+    ));
+    try std.testing.expectEqual(
+        @as(u64, 18),
+        manager.sliceStats(.inference_tokenizer_cache).used_bytes,
+    );
+    try std.testing.expect(!manager.tryAdjustUsageIdentity(
+        .inference_tokenizer_cache,
+        42,
+        0,
+        7,
+    ));
+    try std.testing.expect(manager.tryAdjustUsageIdentity(
+        .inference_tokenizer_cache,
+        42,
+        0,
+        0,
+    ));
+
+    // Simulate an allocation that was observed after an operator tightened a
+    // limit. Admission must still allow the owner to converge to zero.
+    try std.testing.expect(manager.tryObserveUsageIdentity(
+        .inference_tokenizer_cache,
+        41,
+        18,
+        30,
+    ));
+    try std.testing.expect(manager.tryAdjustUsageIdentity(
+        .inference_tokenizer_cache,
+        41,
+        30,
+        12,
+    ));
+    try std.testing.expect(manager.tryAdjustUsageIdentity(
+        .inference_tokenizer_cache,
+        41,
+        12,
+        0,
+    ));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 
 test "resource manager evaluates projected admission with configured action" {

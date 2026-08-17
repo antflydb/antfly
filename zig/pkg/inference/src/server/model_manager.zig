@@ -3301,6 +3301,8 @@ pub const ModelManager = struct {
         *ComponentPlanCacheEntry,
     ) = .empty,
     component_plan_cache_lock: std.atomic.Mutex = .unlocked,
+    tokenizer_cache_budget_mutex: std.atomic.Mutex = .unlocked,
+    tokenizer_cache_budget_totals: std.AutoHashMapUnmanaged(usize, usize) = .empty,
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
     tokenizer_parallel_bpe_config: hf_tokenizer.HfTokenizer.ParallelBpeConfig = .{},
 
@@ -3342,10 +3344,102 @@ pub const ModelManager = struct {
         self.admission.configureProcessMemoryLimit(limit_bytes);
     }
 
-    pub fn ensureResourceOwnerReady(self: *const ModelManager) !void {
-        if (self.resource_ownership == .external_required and
-            !self.external_resource_budget_attached)
-            return error.ExternalResourceManagerNotConfigured;
+    pub fn ensureResourceOwnerReady(self: *ModelManager) !void {
+        spinLock(&self.tokenizer_cache_budget_mutex);
+        defer self.tokenizer_cache_budget_mutex.unlock();
+        switch (self.resource_ownership) {
+            .local => {
+                if (self.tokenizer_cache_config.resource_budget == null) {
+                    self.tokenizer_cache_config.resource_budget =
+                        self.localTokenizerCacheResourceBudget();
+                }
+            },
+            .external_required => {
+                if (!self.external_resource_budget_attached)
+                    return error.ExternalResourceManagerNotConfigured;
+                if (self.tokenizer_cache_config.resource_budget == null)
+                    return error.ExternalTokenizerResourceManagerNotConfigured;
+            },
+        }
+    }
+
+    fn localTokenizerCacheResourceBudget(
+        self: *ModelManager,
+    ) hf_tokenizer.HfTokenizer.BpeCacheResourceBudget {
+        return .{
+            .context = self,
+            .observe = observeLocalTokenizerCacheUsage,
+        };
+    }
+
+    fn observeLocalTokenizerCacheUsage(
+        context: *anyopaque,
+        observer_id: usize,
+        previous: usize,
+        next: usize,
+    ) bool {
+        const self: *ModelManager = @ptrCast(@alignCast(context));
+        return self.reconcileLocalTokenizerCacheUsage(observer_id, previous, next);
+    }
+
+    /// Maintain one exact total per tokenizer while charging only deltas to
+    /// AdmissionController. Cold cache growth is serialized across tokenizers;
+    /// cache hits never call this path, and no eviction is attempted while a
+    /// tokenizer lock is held.
+    fn reconcileLocalTokenizerCacheUsage(
+        self: *ModelManager,
+        observer_id: usize,
+        previous: usize,
+        next: usize,
+    ) bool {
+        if (observer_id == 0) return false;
+        spinLock(&self.tokenizer_cache_budget_mutex);
+        defer self.tokenizer_cache_budget_mutex.unlock();
+
+        var inserted = false;
+        const current = self.tokenizer_cache_budget_totals.getPtr(observer_id) orelse blk: {
+            if (previous != 0) return false;
+            if (next == 0) return true;
+            const entry = self.tokenizer_cache_budget_totals.getOrPut(
+                self.allocator,
+                observer_id,
+            ) catch return false;
+            entry.value_ptr.* = 0;
+            inserted = true;
+            break :blk entry.value_ptr;
+        };
+        if (current.* != previous) return false;
+
+        if (next > previous) {
+            const growth = next - previous;
+            const amounts = runtime.tier.memory.AdmissionAmounts{
+                .host_weight_bytes = growth,
+            };
+            var pressure: ?runtime.tier.memory.AdmissionPressure = null;
+            var lease = self.admission.tryAcquireWithPressure(
+                .cpu,
+                self.admissionLimitsForBackend(.{ .backend = .native }),
+                amounts,
+                true,
+                &pressure,
+            ) catch {
+                if (inserted) _ = self.tokenizer_cache_budget_totals.remove(observer_id);
+                return false;
+            };
+            lease.commitPersistentLocal() catch {
+                lease.release();
+                if (inserted) _ = self.tokenizer_cache_budget_totals.remove(observer_id);
+                return false;
+            };
+        } else if (next < previous) {
+            self.admission.releasePersistentLocal(.cpu, .{
+                .host_weight_bytes = previous - next,
+            });
+        }
+
+        current.* = next;
+        if (next == 0) _ = self.tokenizer_cache_budget_totals.remove(observer_id);
+        return true;
     }
 
     pub fn configureModelCache(
@@ -4433,6 +4527,9 @@ pub const ModelManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.loaded_aliases.deinit(self.allocator);
+        std.debug.assert(self.tokenizer_cache_budget_totals.count() == 0);
+        self.tokenizer_cache_budget_totals.deinit(self.allocator);
+        self.tokenizer_cache_budget_totals = .empty;
     }
 
     pub fn attachIo(self: *ModelManager, io: std.Io) void {
@@ -6371,7 +6468,58 @@ test "external resource ownership fails closed until budget is attached" {
         .retain = Bridge.retain,
         .release = Bridge.release,
     });
+    try std.testing.expectError(
+        error.ExternalTokenizerResourceManagerNotConfigured,
+        manager.ensureResourceOwnerReady(),
+    );
+    const CacheBridge = struct {
+        fn observe(_: *anyopaque, _: usize, _: usize, _: usize) bool {
+            return true;
+        }
+    };
+    try manager.configureTokenizerCaches(.{
+        .resource_budget = .{
+            .context = &context,
+            .observe = CacheBridge.observe,
+        },
+    });
     try manager.ensureResourceOwnerReady();
+}
+
+test "local resource ownership admits exact tokenizer cache totals" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer manager.deinit();
+
+    manager.configureServingPolicy(.{});
+    manager.configureAdmissionLimits(.{
+        .host_limit_bytes = 20,
+        .combined_limit_bytes = 20,
+    });
+    try manager.ensureResourceOwnerReady();
+    const budget = manager.tokenizer_cache_config.resource_budget.?;
+
+    try std.testing.expect(budget.observe(budget.context, 71, 0, 16));
+    try std.testing.expectEqual(
+        @as(usize, 16),
+        manager.admission.snapshot().host_weight_bytes,
+    );
+    try std.testing.expect(!budget.observe(budget.context, 71, 16, 21));
+    try std.testing.expectEqual(
+        @as(usize, 16),
+        manager.admission.snapshot().host_weight_bytes,
+    );
+    try std.testing.expect(!budget.observe(budget.context, 71, 0, 0));
+    try std.testing.expect(budget.observe(budget.context, 71, 16, 7));
+    try std.testing.expectEqual(
+        @as(usize, 7),
+        manager.admission.snapshot().host_weight_bytes,
+    );
+    try std.testing.expect(budget.observe(budget.context, 71, 7, 0));
+    try std.testing.expectEqual(
+        runtime.tier.memory.AdmissionAmounts{},
+        manager.admission.snapshot(),
+    );
 }
 
 test "model loading preserves retryable admission errors across backend probes" {

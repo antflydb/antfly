@@ -4951,6 +4951,7 @@ const InferenceResourceBudgetOwner = struct {
             observer_id,
             previous,
             next,
+            false,
         );
     }
 
@@ -4967,6 +4968,7 @@ const InferenceResourceBudgetOwner = struct {
             observer_id,
             previous,
             next,
+            true,
         );
     }
 
@@ -4978,6 +4980,7 @@ const InferenceResourceBudgetOwner = struct {
         observer_id: usize,
         previous: u64,
         next: u64,
+        enforce_growth_limits: bool,
     ) bool {
         lockAtomic(mutex);
         defer mutex.unlock();
@@ -5008,12 +5011,11 @@ const InferenceResourceBudgetOwner = struct {
             self.manager.recordAccountingError();
             return false;
         }
-        if (!self.manager.tryObserveUsageIdentity(
-            slice,
-            observer_id,
-            current.*,
-            next,
-        )) {
+        const accepted = if (enforce_growth_limits)
+            self.manager.tryAdjustUsageIdentity(slice, observer_id, current.*, next)
+        else
+            self.manager.tryObserveUsageIdentity(slice, observer_id, current.*, next);
+        if (!accepted) {
             if (inserted) _ = observers.remove(observer_id);
             return false;
         }
@@ -7145,6 +7147,41 @@ test "inference admission bridge charges combined native residency to resource m
     try std.testing.expectEqual(@as(u8, 1), observeInferenceTokenizerCache(&owner, 11, 10, 0));
     try std.testing.expectEqual(@as(u64, 10), manager.snapshot().memory.used_bytes);
     try std.testing.expectEqual(@as(u8, 1), observeInferenceTokenizerCache(&owner, 22, 10, 0));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "standalone tokenizer bridge enforces growth and permits exact teardown" {
+    var budgets = antfly.resource_manager.Options.defaultBudgets();
+    budgets[@intFromEnum(antfly.resource_manager.Slice.inference_tokenizer_cache)] =
+        .{ .hard_limit_bytes = 16 };
+    var manager = antfly.resource_manager.ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 20 },
+        .budgets = budgets,
+        .identity_allocator = std.testing.allocator,
+    });
+    defer manager.deinit(std.testing.allocator);
+    var owner = InferenceResourceBudgetOwner{
+        .alloc = std.testing.allocator,
+        .manager = &manager,
+    };
+    defer owner.deinit();
+
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        observeInferenceTokenizerCache(&owner, 101, 0, 12),
+    );
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        observeInferenceTokenizerCache(&owner, 101, 12, 18),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 12),
+        manager.sliceStats(.inference_tokenizer_cache).used_bytes,
+    );
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        observeInferenceTokenizerCache(&owner, 101, 12, 0),
+    );
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 

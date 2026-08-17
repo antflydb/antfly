@@ -212,6 +212,16 @@ teardown transitions; cache hits remain callback-free. Standalone maintains a
 separate registry entry per tokenizer, so a duplicate teardown can never
 consume bytes retained by a different tokenizer.
 
+Tokenizer callbacks are admission operations, not telemetry: growth must fit
+the logical tokenizer slice and the process host aggregate before allocation,
+while a validated decrease is always allowed so an over-limit owner can
+converge to zero. Embedded inference applies that transition to the node
+`ResourceManager`. Direct and distributed inference install a ModelManager-owned
+adapter that keeps one exact total per tokenizer and charges deltas to the same
+local `AdmissionController` used by model and request leases. The adapter never
+evicts while called from a tokenizer lock; denial simply skips optional cache
+growth, keeping the hot cache-hit path callback- and allocation-free.
+
 Observer records are manager-owned accounting snapshots, not leases. An owner
 that continues using the manager reconciles its snapshot to zero when its
 allocation disappears. Destroying the manager is the terminal cancellation

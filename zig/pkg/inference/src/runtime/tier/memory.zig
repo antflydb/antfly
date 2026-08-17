@@ -678,6 +678,26 @@ pub const AdmissionLease = struct {
         self.external_lease = null;
         self.live_reserved_bytes = 0;
     }
+
+    /// Convert a local-only provisional lease into persistent owner-accounted
+    /// memory. The caller must retain an exact ownership record and later use
+    /// `releasePersistentLocal`; external leases remain opaque and therefore
+    /// cannot be detached through this path.
+    pub fn commitPersistentLocal(self: *AdmissionLease) !void {
+        const controller = self.controller orelse return error.AdmissionLeaseReleased;
+        if (self.external_lease != null) return error.ExternalAdmissionLeaseCannotDetach;
+        const retained_live_bytes = liveHostBytes(self.amounts) catch
+            return error.InvalidAdmissionLeaseReduction;
+        controller.settleLiveReservation(
+            self.live_reserved_bytes,
+            retained_live_bytes,
+        );
+        self.controller = null;
+        self.amounts = .{};
+        self.amounts_by_backend = emptyAdmissionAmountsByBackend();
+        self.retain_backend_class = null;
+        self.live_reserved_bytes = 0;
+    }
 };
 
 pub const AdmissionController = struct {
@@ -1032,6 +1052,18 @@ pub const AdmissionController = struct {
         var amounts_by_backend = emptyAdmissionAmountsByBackend();
         amounts_by_backend[backendClassIndex(backend_class)] = amounts;
         self.releaseLocal(amounts_by_backend, amounts);
+    }
+
+    /// Release exact persistent local ownership previously detached with
+    /// `AdmissionLease.commitPersistentLocal`. Identity validation belongs to
+    /// the owner that detached the lease; this method only mutates the local
+    /// aggregate and backend-domain ledgers.
+    pub fn releasePersistentLocal(
+        self: *AdmissionController,
+        backend_class: BackendClass,
+        amounts: AdmissionAmounts,
+    ) void {
+        self.releaseSingle(backend_class, amounts);
     }
 
     fn release(
