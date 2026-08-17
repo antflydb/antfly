@@ -6054,6 +6054,7 @@ pub fn build(b: *std.Build) void {
     const resource_budget_runtime_filters = [_][]const u8{
         "default tokenizer cache budget is aligned with its resource slice",
         "identity allocation failure rolls back every memory ledger",
+        "manager teardown retires live observer snapshots",
         "batch reservation is atomic across inference resource slices",
         "classified batch reservation distinguishes size from contention",
         "aggregate host memory admission is atomic across slices",

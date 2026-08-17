@@ -686,6 +686,14 @@ pub const ResourceManager = struct {
 
     /// Required only for managers that have admitted capacity reservations.
     /// Owners must call this after all reservations have been released.
+    ///
+    /// Observations are manager-owned accounting snapshots rather than leases:
+    /// destroying the manager is the terminal cancellation boundary for any
+    /// observer that was not explicitly reconciled to zero. This matters for
+    /// shutdown and failed-open paths, where the observed allocation and its
+    /// manager are torn down together and there is no later consumer of the
+    /// ledger. Reservation handles remain strict because they can outlive the
+    /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -693,7 +701,6 @@ pub const ResourceManager = struct {
         while (it.next()) |domain| std.debug.assert(domain.reserved_bytes == 0);
         std.debug.assert(self.reservation_identities.count() == 0);
         std.debug.assert(self.batch_reservation_identities.count() == 0);
-        std.debug.assert(self.observer_identities.count() == 0);
         self.capacity_domains.deinit(alloc);
         self.capacity_domains = .empty;
         self.reservation_identities.deinit(self.identity_allocator);
@@ -2112,6 +2119,24 @@ test "identity allocation failure rolls back every memory ledger" {
     );
     try std.testing.expectEqual(@as(u64, 0), observed);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "manager teardown retires live observer snapshots" {
+    var manager = ResourceManager.init(.{
+        .identity_allocator = std.testing.allocator,
+    });
+    var observed: u64 = 0;
+    try std.testing.expect(manager.tryObserveUsage(
+        .inference_prompt_cache,
+        &observed,
+        4096,
+    ));
+    try std.testing.expectEqual(@as(u64, 4096), manager.snapshot().memory.used_bytes);
+
+    // The observed allocation and manager share this shutdown boundary. The
+    // manager owns and frees the identity registry even when no final zero
+    // observation is useful to a caller.
+    manager.deinit(std.testing.allocator);
 }
 
 fn sliceIndex(slice: Slice) usize {

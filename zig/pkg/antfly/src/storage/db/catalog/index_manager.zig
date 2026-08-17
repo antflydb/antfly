@@ -11799,6 +11799,7 @@ pub const IndexManager = struct {
             defer self.alloc.free(planned);
             var reservation = self.reserveTextMergeBuffers(&entry.persistent, snap, planned, .strict) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
+                else => return err,
             };
             defer if (reservation) |*active| active.release();
 

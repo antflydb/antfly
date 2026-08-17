@@ -212,6 +212,14 @@ teardown transitions; cache hits remain callback-free. Standalone maintains a
 separate registry entry per tokenizer, so a duplicate teardown can never
 consume bytes retained by a different tokenizer.
 
+Observer records are manager-owned accounting snapshots, not leases. An owner
+that continues using the manager reconciles its snapshot to zero when its
+allocation disappears. Destroying the manager is the terminal cancellation
+boundary for any remaining snapshots because the observed allocations and
+their ledger are being torn down together. Reservation handles remain strict:
+they must be released before manager destruction because they are transferable
+ownership tokens whose lifetime is independent of the observed allocation.
+
 ## Failure semantics
 
 - A request larger than a stable hard limit is a permanent resource-limit
