@@ -275,7 +275,7 @@ fn nodeFinalizeUnsafe(snapshot: *const metadata_api.AdminSnapshot, node_id: u64)
     for (snapshot.stores) |store| {
         if (store.node_id != node_id) continue;
         if (!draining_node and !store.drain_requested) return true;
-        if (store.group_statuses.len != 0 or store.runtime_statuses.len != 0) return true;
+        if (table_manager.storeHasTerminationDebt(store)) return true;
     }
     return false;
 }
@@ -346,5 +346,11 @@ test "metadata node operations reject finalization while termination debt remain
     stores[0].group_statuses = &.{};
     try std.testing.expect(nodeFinalizeUnsafe(&snapshot, 9));
     stores[0].runtime_statuses = &.{};
+    try std.testing.expect(!nodeFinalizeUnsafe(&snapshot, 9));
+
+    // A retained observation explicitly owned by another store is not debt
+    // for this store in either shutdown status or mutation admission.
+    runtime_statuses[0] = .{ .group_id = 102, .node_id = 9, .store_id = 10 };
+    stores[0].runtime_statuses = runtime_statuses[0..];
     try std.testing.expect(!nodeFinalizeUnsafe(&snapshot, 9));
 }

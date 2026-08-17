@@ -17419,7 +17419,11 @@ pub const DB = struct {
     const artifact_repair_metadata_active_poll_ns: u64 = 100 * std.time.ns_per_ms;
     const artifact_repair_metadata_sleep_slice_ns: u64 = 25 * std.time.ns_per_ms;
 
-    fn startArtifactRepairMetadataWorkerIfNeeded(self: *DB) void {
+    /// Start only after the DB has reached its final address. DB.open returns
+    /// by value, so cache owners invoke this after installing that value in a
+    /// stable heap entry rather than letting an async task capture the open
+    /// function's temporary stack address.
+    pub fn startArtifactRepairMetadataWorkerIfNeeded(self: *DB) void {
         if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
         if (comptime builtin.is_test) return;
         if (!self.start_index_workers) return;
